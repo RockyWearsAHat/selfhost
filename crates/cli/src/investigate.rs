@@ -20,7 +20,11 @@
 //! - **Name the person who can fix it.** Reverse DNS cannot be changed by the
 //!   address holder. The zone's `SOA` names the responsible party, so the tool
 //!   prints the address to email rather than telling somebody to go look it up.
+//!
+//! When the cause is a machine on your own network, [`crate::identify`] turns
+//! the address this module shortlists into hardware you can walk over to.
 
+use crate::identify::{self, DeviceIdentity};
 use selfhost_dns::{Resolver, blocklist_name, is_real_listing, reverse_name};
 use std::net::{Ipv4Addr, SocketAddr, UdpSocket};
 use std::time::Duration;
@@ -213,7 +217,7 @@ pub struct OpenService {
 /// Chosen for what earns an XBL listing: open proxies relaying somebody else's
 /// traffic, an open mail relay, and remote-access services that get brute-forced
 /// and then used as a foothold.
-const SUSPICIOUS_PORTS: [(u16, &str); 12] = [
+const SUSPICIOUS_PORTS: [(u16, &str); 13] = [
     (23, "telnet — unencrypted remote access, heavily targeted"),
     (25, "SMTP — an open relay here would earn a listing directly"),
     (445, "SMB — a common malware spreading path"),
@@ -224,9 +228,123 @@ const SUSPICIOUS_PORTS: [(u16, &str); 12] = [
     (8080, "HTTP proxy — abused as an open proxy when unauthenticated"),
     (8081, "HTTP proxy alternate — same risk as 8080"),
     (8118, "Privoxy — HTTP proxy; relays for anyone if left open"),
+    (8888, "HTTP proxy alternate — the default for several proxy toolkits"),
     (9050, "Tor SOCKS — expected on a Tor relay, abused if reachable from the LAN"),
     (1900, "UPnP — device control; can open port forwards without you asking"),
 ];
+
+/// An open port, and what it turned out to actually be.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OpenPort {
+    /// The port number.
+    pub port: u16,
+    /// Why this port number is on the watch list in the first place.
+    pub note: &'static str,
+    /// What the service there actually speaks, established by asking it.
+    pub nature: ServiceNature,
+}
+
+/// What a listening port turned out to be, established by talking to it.
+///
+/// # Why the port number is not the answer
+///
+/// A port number is a convention, not a fact. Treating `1080` as "a SOCKS proxy"
+/// and `8009` as "harmless" is guessing with extra steps: the interesting device
+/// is precisely the one not following convention. Every variant here records
+/// what a service *did* when spoken to, so a conclusion can rest on behaviour.
+///
+/// These are observations only. They carry no verdict, because the same
+/// observation means different things on different hardware — a SOCKS server is
+/// unremarkable on a developer's laptop and alarming on a streaming stick. That
+/// judgement belongs in [`crate::assess`], with the rest of the context.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ServiceNature {
+    /// It speaks SOCKS5.
+    Socks5 {
+        /// Whether it began a session with no credentials at all.
+        accepts_anonymous: bool,
+        /// Whether it actually opened a connection to an external host.
+        relayed: bool,
+        /// The `REP` byte it answered a `CONNECT` with, when it refused.
+        refusal_code: Option<u8>,
+    },
+    /// It understands HTTP `CONNECT` tunnelling, so it is an HTTP proxy.
+    HttpProxy {
+        /// Whether the tunnel it opened actually succeeded.
+        relayed: bool,
+    },
+    /// It answers HTTP, as an ordinary web server rather than a proxy.
+    HttpServer {
+        /// The status line it replied with.
+        status: String,
+    },
+    /// It accepted the connection and then said nothing to anything we asked.
+    ///
+    /// Common for protocols that expect the client to speak first in a format
+    /// we did not guess — but also what a service does when it only answers a
+    /// caller that knows the right opening.
+    Silent,
+    /// It closed or reset the connection as soon as we spoke.
+    Refused,
+}
+
+impl ServiceNature {
+    /// Whether this service relays traffic for whoever asks.
+    ///
+    /// The only observation on its own that proves a device is being abused.
+    pub fn is_open_relay(&self) -> bool {
+        matches!(
+            self,
+            ServiceNature::Socks5 { relayed: true, .. } | ServiceNature::HttpProxy { relayed: true }
+        )
+    }
+
+    /// Whether this is proxy software at all, relaying or not.
+    ///
+    /// The distinction that matters for a consumer appliance: a speaker or a
+    /// streaming stick has no reason to run a proxy in either state.
+    pub fn is_proxy_software(&self) -> bool {
+        matches!(self, ServiceNature::Socks5 { .. } | ServiceNature::HttpProxy { .. })
+    }
+
+    /// Whether it answered in a way the protocol's specification does not define.
+    ///
+    /// Stock software uses the reply codes in `RFC 1928`. Anything else is a
+    /// custom build, which is worth knowing on a device that should be running
+    /// none.
+    pub fn is_non_standard(&self) -> bool {
+        matches!(self, ServiceNature::Socks5 { refusal_code: Some(code), .. } if *code > 0x08)
+    }
+
+    /// A short description of what was observed, without interpreting it.
+    pub fn describe(&self) -> String {
+        match self {
+            ServiceNature::Socks5 { accepts_anonymous, relayed, refusal_code } => {
+                if *relayed {
+                    return "SOCKS5 proxy that RELAYED our connection to an external host".to_owned();
+                }
+                let door = if *accepts_anonymous {
+                    "accepted a session with no credentials"
+                } else {
+                    "demanded credentials"
+                };
+                match refusal_code {
+                    Some(code) => format!("SOCKS5 proxy: {door}, then refused the destination ({code:#04x})"),
+                    None => format!("SOCKS5 proxy: {door}"),
+                }
+            }
+            ServiceNature::HttpProxy { relayed: true } => {
+                "HTTP proxy that TUNNELLED to an external host".to_owned()
+            }
+            ServiceNature::HttpProxy { relayed: false } => {
+                "HTTP proxy, but it refused to tunnel for us".to_owned()
+            }
+            ServiceNature::HttpServer { status } => format!("web server ({status})"),
+            ServiceNature::Silent => "accepted the connection and said nothing".to_owned(),
+            ServiceNature::Refused => "closed the connection as soon as we spoke".to_owned(),
+        }
+    }
+}
 
 /// Probes this machine's own loopback for services that could earn a listing.
 ///
@@ -262,12 +380,36 @@ pub fn local_address() -> Option<Ipv4Addr> {
 pub struct LanDevice {
     /// Its address.
     pub address: Ipv4Addr,
-    /// Ports found open, with why each matters.
-    pub open: Vec<(u16, &'static str)>,
-    /// What its proxy port actually did when asked to relay, if it has one.
-    ///
-    /// An open port is a lead; a port that relays is a cause.
-    pub proxy: Option<ProxyVerdict>,
+    /// Ports found open, each with what it turned out to actually be.
+    pub open: Vec<OpenPort>,
+    /// What hardware this is, so the finding names a device and not an address.
+    pub identity: Option<DeviceIdentity>,
+}
+
+impl LanDevice {
+    /// Any service here that relays traffic for whoever asks.
+    pub fn open_relay(&self) -> Option<&OpenPort> {
+        self.open.iter().find(|open| open.nature.is_open_relay())
+    }
+
+    /// Any proxy software running here, relaying or not.
+    pub fn proxy_software(&self) -> Vec<&OpenPort> {
+        self.open.iter().filter(|open| open.nature.is_proxy_software()).collect()
+    }
+}
+
+/// The result of looking at the local network: what is on it, and what is odd.
+///
+/// Both halves are needed to reach a conclusion. The shortlist says which
+/// devices hold interesting ports open; the inventory is what makes one of them
+/// look *unusual*, because a device that publishes no name is only notable when
+/// you can see that its neighbours all do.
+#[derive(Debug, Clone, Default)]
+pub struct LanSurvey {
+    /// Devices exposing a service worth investigating.
+    pub devices: Vec<LanDevice>,
+    /// Every device that answered on the network, identified as far as possible.
+    pub inventory: Vec<DeviceIdentity>,
 }
 
 /// Sweeps the local /24 for devices exposing services worth investigating.
@@ -279,30 +421,34 @@ pub struct LanDevice {
 /// Deliberately opt-in and bounded — a short timeout, a fixed port list, and
 /// capped concurrency, so it finishes in seconds and does not look like an
 /// attack to anything watching.
-pub async fn sweep_lan(local: Ipv4Addr) -> Vec<LanDevice> {
+///
+/// The port sweep runs *before* identification on purpose: touching every
+/// address populates the operating system's ARP cache, which is what makes the
+/// hardware behind each address readable afterwards.
+pub async fn sweep_lan(local: Ipv4Addr) -> LanSurvey {
     let [a, b, c, _] = local.octets();
     let mut tasks = tokio::task::JoinSet::new();
 
     for host in 1_u8..=254 {
         let address = Ipv4Addr::new(a, b, c, host);
         tasks.spawn(async move {
-            let mut open = Vec::new();
+            let mut listening = Vec::new();
             for (port, note) in SUSPICIOUS_PORTS {
                 if probe(address, port, Duration::from_millis(300)).await {
-                    open.push((port, note));
+                    listening.push((port, note));
                 }
             }
-            if open.is_empty() {
+            if listening.is_empty() {
                 return None;
             }
-            // A listening proxy port proves nothing on its own — ask whether it
-            // would actually carry a stranger's traffic.
-            let proxy = if open.iter().any(|(port, _)| *port == 1080) {
-                Some(probe_socks_relay(address, 1080).await)
-            } else {
-                None
-            };
-            Some(LanDevice { address, open, proxy })
+            // An open port is only a lead. What the service actually speaks is
+            // the fact worth having, so every one of them gets asked.
+            let mut open = Vec::new();
+            for (port, note) in listening {
+                let nature = probe_service(address, port).await;
+                open.push(OpenPort { port, note, nature });
+            }
+            Some(LanDevice { address, open, identity: None })
         });
     }
 
@@ -313,7 +459,13 @@ pub async fn sweep_lan(local: Ipv4Addr) -> Vec<LanDevice> {
         }
     }
     devices.sort_by_key(|device| device.address);
-    devices
+
+    let inventory = identify::survey(local).await;
+    for device in &mut devices {
+        device.identity =
+            inventory.iter().find(|identity| identity.address == device.address).cloned();
+    }
+    LanSurvey { devices, inventory }
 }
 
 /// Whether a TCP port accepts a connection.
@@ -324,46 +476,49 @@ async fn probe(address: Ipv4Addr, port: u16, timeout: Duration) -> bool {
     )
 }
 
-/// What a listening proxy port actually does when asked to relay.
+/// Establishes what a listening port actually is, by speaking to it.
 ///
-/// An open port is not an open proxy. This distinction is the difference between
-/// a lead and a wild goose chase: plenty of devices listen on proxy ports and
-/// then refuse every request, and reporting those as "the classic cause of your
-/// blocklisting" sends somebody hunting a device that is behaving perfectly.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ProxyVerdict {
-    /// It relayed a connection to an external host. This is an open proxy.
-    Relays,
-    /// It speaks the protocol but refused to relay.
-    RefusedToRelay,
-    /// Something is listening, but it is not a proxy.
-    NotAProxy,
-    /// Could not be determined.
-    Unknown,
+/// Tries each protocol on its own connection, because a service that does not
+/// recognise an opening usually resets rather than waiting for a better one.
+/// The order runs from most specific to least: SOCKS5, then HTTP tunnelling,
+/// then plain HTTP, and only then falls back to describing the silence.
+///
+/// Nothing is sent through any tunnel that opens. The question is only whether
+/// it *would* carry somebody else's traffic.
+pub async fn probe_service(address: Ipv4Addr, port: u16) -> ServiceNature {
+    if let Some(socks) = probe_socks5(address, port).await {
+        return socks;
+    }
+    if let Some(http) = probe_http(address, port).await {
+        return http;
+    }
+    match exchange(address, port, b"\r\n").await {
+        Some(reply) if reply.is_empty() => ServiceNature::Silent,
+        Some(_) => ServiceNature::Silent,
+        None => ServiceNature::Refused,
+    }
 }
 
-/// Asks a SOCKS5 port to relay to an external host, and reports what happened.
-///
-/// The request is a `CONNECT` to a well-known public address. Nothing is sent
-/// through it beyond the handshake — the question is only whether it *would*
-/// carry somebody else's traffic.
-pub async fn probe_socks_relay(address: Ipv4Addr, port: u16) -> ProxyVerdict {
+/// Asks whether a port speaks SOCKS5, and if so how far it will go.
+async fn probe_socks5(address: Ipv4Addr, port: u16) -> Option<ServiceNature> {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-    let attempt = tokio::time::timeout(Duration::from_secs(6), async {
+    let work = async {
         let mut stream = TcpStream::connect((address, port)).await.ok()?;
-
-        // Greeting: SOCKS5, one method offered, "no authentication".
-        stream.write_all(&[0x05, 0x01, 0x00]).await.ok()?;
+        // Offer every method a client can claim, so a proxy that wants
+        // credentials still identifies itself as SOCKS5 rather than hanging up.
+        stream.write_all(&[0x05, 0x03, 0x00, 0x01, 0x02]).await.ok()?;
         let mut greeting = [0_u8; 2];
         stream.read_exact(&mut greeting).await.ok()?;
         if greeting[0] != 0x05 {
-            return Some(ProxyVerdict::NotAProxy);
+            return None;
         }
         if greeting[1] != 0x00 {
-            // Speaks SOCKS5 but demands credentials, so it will not relay for
-            // a stranger.
-            return Some(ProxyVerdict::RefusedToRelay);
+            return Some(ServiceNature::Socks5 {
+                accepts_anonymous: false,
+                relayed: false,
+                refusal_code: None,
+            });
         }
 
         let host = b"example.com";
@@ -375,11 +530,73 @@ pub async fn probe_socks_relay(address: Ipv4Addr, port: u16) -> ProxyVerdict {
         let mut reply = [0_u8; 4];
         stream.read_exact(&mut reply).await.ok()?;
         // Byte 1 is the reply code; 0x00 alone means the relay succeeded.
-        Some(if reply[1] == 0x00 { ProxyVerdict::Relays } else { ProxyVerdict::RefusedToRelay })
-    })
-    .await;
+        Some(ServiceNature::Socks5 {
+            accepts_anonymous: true,
+            relayed: reply[1] == 0x00,
+            refusal_code: (reply[1] != 0x00).then_some(reply[1]),
+        })
+    };
 
-    attempt.ok().flatten().unwrap_or(ProxyVerdict::Unknown)
+    tokio::time::timeout(Duration::from_secs(5), work).await.ok().flatten()
+}
+
+/// Asks whether a port tunnels HTTP, or merely serves it.
+///
+/// `CONNECT` is the discriminator. An ordinary web server rejects it with its
+/// own error; a proxy either opens the tunnel or refuses in a way that shows it
+/// understood the request.
+async fn probe_http(address: Ipv4Addr, port: u16) -> Option<ServiceNature> {
+    let tunnel = exchange(
+        address,
+        port,
+        b"CONNECT example.com:80 HTTP/1.1\r\nHost: example.com:80\r\n\r\n",
+    )
+    .await?;
+    let status = status_line(&tunnel);
+
+    if let Some(status) = &status
+        && status.contains(" 2")
+    {
+        return Some(ServiceNature::HttpProxy { relayed: true });
+    }
+
+    // It answered HTTP but would not tunnel. Whether it is a proxy at all is
+    // decided by whether it serves an absolute URI, which only a proxy does.
+    let absolute =
+        exchange(address, port, b"GET http://example.com/ HTTP/1.0\r\nHost: example.com\r\n\r\n")
+            .await;
+    if let Some(reply) = &absolute
+        && let Some(line) = status_line(reply)
+        && line.contains(" 2")
+    {
+        return Some(ServiceNature::HttpProxy { relayed: true });
+    }
+
+    status.map(|status| ServiceNature::HttpServer { status })
+}
+
+/// Sends bytes to a port and returns whatever came back.
+///
+/// `None` means the connection could not be made or was reset before anything
+/// was said, which is itself a distinguishing behaviour.
+async fn exchange(address: Ipv4Addr, port: u16, payload: &[u8]) -> Option<String> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let work = async {
+        let mut stream = TcpStream::connect((address, port)).await.ok()?;
+        stream.write_all(payload).await.ok()?;
+        let mut buffer = vec![0_u8; 512];
+        let read = stream.read(&mut buffer).await.ok()?;
+        Some(String::from_utf8_lossy(&buffer[..read]).into_owned())
+    };
+
+    tokio::time::timeout(Duration::from_secs(4), work).await.ok().flatten()
+}
+
+/// The HTTP status line from a reply, if the reply is HTTP at all.
+fn status_line(reply: &str) -> Option<String> {
+    let first = reply.lines().next()?.trim();
+    first.starts_with("HTTP/").then(|| first.chars().take(60).collect())
 }
 
 /// A port forward currently configured on the router.
@@ -708,26 +925,162 @@ mod evidence_tests {
         assert!(split_url("https://example.com/").is_err());
     }
 
-    #[tokio::test]
-    async fn a_port_that_is_not_a_proxy_is_not_reported_as_one() {
-        // The mistake this guards against: treating "something is listening" as
-        // "this is an open proxy", which sends somebody hunting a device that
-        // is behaving perfectly.
+    /// Runs a fake service that replies with `script` to each connection it
+    /// gets, and returns the port it is listening on.
+    ///
+    /// Each probe opens its own connection, so the script is served repeatedly
+    /// rather than once.
+    async fn fake_service(script: Vec<(usize, Vec<u8>)>) -> u16 {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
         tokio::spawn(async move {
-            if let Ok((mut stream, _)) = listener.accept().await {
-                use tokio::io::AsyncWriteExt;
-                let _ = stream.write_all(b"HTTP/1.1 200 OK\r\n\r\n").await;
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else { return };
+                let script = script.clone();
+                tokio::spawn(async move {
+                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                    for (expect, reply) in script {
+                        let mut scratch = vec![0_u8; expect.max(1)];
+                        if expect > 0 && stream.read(&mut scratch).await.is_err() {
+                            return;
+                        }
+                        if stream.write_all(&reply).await.is_err() {
+                            return;
+                        }
+                    }
+                });
             }
         });
-
-        let verdict = probe_socks_relay(Ipv4Addr::LOCALHOST, port).await;
-        assert_ne!(verdict, ProxyVerdict::Relays);
+        port
     }
 
     #[tokio::test]
-    async fn a_closed_port_is_unknown_rather_than_open() {
-        assert_eq!(probe_socks_relay(Ipv4Addr::LOCALHOST, 1).await, ProxyVerdict::Unknown);
+    async fn a_web_server_on_a_proxy_port_is_identified_as_a_web_server() {
+        // The mistake this guards against: reading the port number instead of
+        // asking the service. Plenty of devices listen on 1080 or 8888 and
+        // serve ordinary HTTP.
+        let port = fake_service(vec![(64, b"HTTP/1.1 404 Not Found\r\n\r\n".to_vec())]).await;
+
+        let nature = probe_service(Ipv4Addr::LOCALHOST, port).await;
+        assert_eq!(nature, ServiceNature::HttpServer { status: "HTTP/1.1 404 Not Found".to_owned() });
+        assert!(!nature.is_proxy_software(), "a web server is not a proxy");
+        assert!(!nature.is_open_relay());
+    }
+
+    #[tokio::test]
+    async fn a_socks_proxy_that_refuses_is_still_recorded_as_a_proxy() {
+        // 192.168.1.25 answered exactly like this: an anonymous session
+        // accepted, then every destination refused with a code RFC 1928 does
+        // not define. This was once reported as "not an open proxy and not the
+        // cause", which cleared the prime suspect during an active infection.
+        //
+        // Residential proxy malware is outbound-connected — it relays only for
+        // the controller it dialled — so refusing a probe from the LAN is what
+        // the malware does too. The refusal is recorded as an observation and
+        // never as an exoneration.
+        let port = fake_service(vec![
+            (5, vec![0x05, 0x00]),
+            (32, vec![0x05, 0x09, 0x00, 0x01, 0, 0, 0, 0, 0, 0]),
+        ])
+        .await;
+
+        let nature = probe_service(Ipv4Addr::LOCALHOST, port).await;
+        assert_eq!(
+            nature,
+            ServiceNature::Socks5 {
+                accepts_anonymous: true,
+                relayed: false,
+                refusal_code: Some(0x09),
+            }
+        );
+        assert!(nature.is_proxy_software(), "it speaks SOCKS5, refusal or not");
+        assert!(!nature.is_open_relay(), "but it did not carry our traffic");
+        assert!(nature.is_non_standard(), "0x09 is outside RFC 1928");
+    }
+
+    #[tokio::test]
+    async fn a_socks_proxy_that_relays_is_caught() {
+        let port = fake_service(vec![
+            (5, vec![0x05, 0x00]),
+            (32, vec![0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0]),
+        ])
+        .await;
+
+        let nature = probe_service(Ipv4Addr::LOCALHOST, port).await;
+        assert!(nature.is_open_relay(), "a 0x00 reply means it opened the connection");
+        assert!(nature.describe().contains("RELAYED"));
+    }
+
+    #[tokio::test]
+    async fn a_proxy_demanding_credentials_is_still_a_proxy() {
+        let port = fake_service(vec![(5, vec![0x05, 0xFF])]).await;
+
+        let nature = probe_service(Ipv4Addr::LOCALHOST, port).await;
+        assert_eq!(
+            nature,
+            ServiceNature::Socks5 { accepts_anonymous: false, relayed: false, refusal_code: None }
+        );
+        assert!(nature.is_proxy_software());
+        assert!(!nature.is_non_standard(), "declining a method is ordinary behaviour");
+    }
+
+    #[tokio::test]
+    async fn an_http_proxy_that_tunnels_is_caught() {
+        let port = fake_service(vec![(128, b"HTTP/1.1 200 Connection established\r\n\r\n".to_vec())]).await;
+
+        let nature = probe_service(Ipv4Addr::LOCALHOST, port).await;
+        assert_eq!(nature, ServiceNature::HttpProxy { relayed: true });
+        assert!(nature.is_open_relay());
+    }
+
+    #[tokio::test]
+    async fn a_port_that_says_nothing_is_reported_as_silent_not_as_clean() {
+        // Port 8888 on the real device behaved this way. "We could not tell"
+        // must stay distinct from "there is nothing here".
+        let port = fake_service(vec![]).await;
+
+        let nature = probe_service(Ipv4Addr::LOCALHOST, port).await;
+        assert!(
+            matches!(nature, ServiceNature::Silent | ServiceNature::Refused),
+            "got {nature:?}"
+        );
+        assert!(!nature.is_open_relay(), "silence is not evidence of relaying");
+        assert!(!nature.is_proxy_software(), "nor evidence of a proxy");
+    }
+
+    #[test]
+    fn only_relaying_reads_as_proof() {
+        // Exactly one observation is allowed to sound like proof, because only
+        // one of them is.
+        let observations = [
+            ServiceNature::Socks5 { accepts_anonymous: true, relayed: true, refusal_code: None },
+            ServiceNature::Socks5 {
+                accepts_anonymous: true,
+                relayed: false,
+                refusal_code: Some(0x09),
+            },
+            ServiceNature::HttpProxy { relayed: false },
+            ServiceNature::HttpServer { status: "HTTP/1.1 200 OK".to_owned() },
+            ServiceNature::Silent,
+            ServiceNature::Refused,
+        ];
+        assert_eq!(observations.iter().filter(|n| n.is_open_relay()).count(), 1);
+
+        // And every observation has to describe itself in words.
+        for nature in &observations {
+            assert!(nature.describe().len() > 20, "{nature:?} describes itself too thinly");
+        }
+    }
+
+    #[test]
+    fn a_standard_refusal_is_not_called_non_standard() {
+        // 0x02 is "connection not allowed by ruleset" — an ordinary answer.
+        // Calling it exotic would manufacture suspicion out of nothing.
+        let ordinary = ServiceNature::Socks5 {
+            accepts_anonymous: true,
+            relayed: false,
+            refusal_code: Some(0x02),
+        };
+        assert!(!ordinary.is_non_standard());
     }
 }

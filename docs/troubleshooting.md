@@ -157,31 +157,63 @@ the reverse zone's `SOA` and prints the exact address to email:
 ### Finding the compromised device
 
 An XBL listing says *a machine on your network* is compromised — and a home
-network rarely has an inventory. `--scan-lan` sweeps your local /24 for the
-services that actually earn these listings and prints a shortlist:
+network rarely has an inventory. `--scan-lan` builds one, works out what each
+device is, and **names the one to act on**:
 
 ```
-  [WARN] device 192.168.1.25
-         1080 (SOCKS proxy — the classic way a machine is abused to relay traffic)
-  [WARN] device 192.168.1.14
-         23 (telnet — unencrypted remote access, heavily targeted)
+  [PASS] what the local network shows
+         One device out of 10 stands out: 192.168.1.25 — Amazon, 14:0a:c5:23:51:20.
+      →  In the router, block outbound TCP 25 for all devices with logging turned
+         on. That stops any spam immediately, and the log then names the internal
+         address that tried to send. Power off 192.168.1.25 first.
+
+  [FAIL] 192.168.1.25 — PRIME SUSPECT
+         Amazon, 14:0a:c5:23:51:20
+      →  It is running proxy software on port 1080 (SOCKS5 proxy: accepted a
+         session with no credentials, then refused the destination (0x09)). This
+         is fixed-function consumer hardware — nothing the owner installs runs on
+         it, so a proxy had to arrive some other way. …
+
+  [PASS] other devices
+         8 behaving as expected — 192.168.1.1 (Netgear…), 192.168.1.6 (Sonos…), …
 ```
 
-**An open port is a lead, not a cause**, and the tool is careful about the
-difference — it learned this the hard way. A device listening on 1080 is only a
-problem if it *relays*, so the sweep asks it to, and reports what happened:
+Three ideas do the work, and each replaced something that did not.
 
-```
-  [PASS] device 192.168.1.25
-         1080 (SOCKS proxy — the classic way a machine is abused to relay traffic)
-      →  Listening, but it REFUSED to relay for a stranger, so it is not an open
-         proxy and not the cause of a blocklisting.
-```
+**It asks a port what it is, instead of reading the number.** A port number is a
+convention, not a fact, and the interesting device is exactly the one not
+following it. Every open port gets spoken to — SOCKS5, then HTTP tunnelling,
+then plain HTTP — so `1080` serving a web page is reported as a web server, and
+a proxy on `8888` is not missed for being in the wrong place.
 
-The first version reported that same device as "the classic cause of your XBL
-listing" purely because the port was open. It wasn't relaying, and the router
-wasn't forwarding it — the lead was worthless, and acting on it would have meant
-tearing apart a device that was behaving correctly.
+**It identifies the hardware.** `192.168.1.25` tells you nothing; *Amazon
+hardware that publishes no name* tells you where to walk. Three questions get
+asked, because a device that dodges one usually answers another: the vendor from
+its MAC address (which it cannot withhold, since the router already learned it),
+a reverse lookup over mDNS, and an SSDP search — which streaming devices answer
+with a model string precise enough to name the product.
+
+**It weighs the observation against the device.** A SOCKS proxy is unremarkable
+on a laptop and damning on a speaker, so nothing maps an observation straight to
+a verdict. Devices that behave as their hardware should are counted in one line,
+not listed — a diagnostic that prints everything it looked at has handed the
+diagnosis back to you.
+
+#### A refusal is not an alibi
+
+The first version of this tool reported the device above as **`PASS` — "not an
+open proxy and not the cause of a blocklisting"**, because it refused to relay
+when asked. That was wrong, and it cleared the prime suspect during an active
+infection.
+
+**Residential proxy malware does not accept connections from strangers.** It
+dials *out* to a controller and relays traffic back down that tunnel, so the
+only client it ever serves is the one it called. Probed from your LAN it refuses
+— exactly as innocent hardware would. The refusal is what the malware looks
+like, so it can never be the evidence that clears it.
+
+Only positive evidence clears a device now: it behaves as its hardware should.
+Being turned away at the door proves nothing either way, and the tool says so.
 
 **Reachability is the other half.** A service on your LAN cannot be abused by
 anyone outside if nothing reaches it, so the tool reads the router's port
@@ -202,6 +234,14 @@ locally and is driven by something else.
 
 The sweep is bounded on purpose — a fixed port list, short timeouts, capped
 concurrency — so it finishes in seconds. It only touches your own network.
+
+#### What it cannot do
+
+Nothing on your LAN can observe a device's *outbound* connections, and that is
+where this class of malware lives. When the tool names a prime suspect it also
+names the one vantage point that can settle it: **the router, blocking outbound
+TCP 25 with logging on.** The log names the internal address that tried to send.
+That is the answer; everything here is what narrows it down first.
 
 ### When the LAN scan finds nothing
 
