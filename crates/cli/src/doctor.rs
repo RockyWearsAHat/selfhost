@@ -889,6 +889,55 @@ async fn investigate_causes(
         }
     }
 
+    // --- what is actually reachable from the internet -----------------------
+    match investigate::port_mappings().await {
+        Ok(mappings) if mappings.is_empty() => section.checks.push(
+            Check::new(
+                "ports open to the internet",
+                Verdict::Pass,
+                "the router forwards nothing — no device on your network is reachable from outside",
+            )
+            .with_fix(
+                "This matters for a blocklisting: a service listening on your LAN cannot be abused \
+                 by anyone outside if nothing reaches it. It also means you must add a forward \
+                 before this machine can serve the internet.",
+            ),
+        ),
+        Ok(mappings) => {
+            for mapping in &mappings {
+                let abusable = mapping.exposes_abusable_service();
+                section.checks.push(
+                    Check::new(
+                        format!("port {} open to the internet", mapping.external_port),
+                        if abusable { Verdict::Fail } else { Verdict::Warn },
+                        format!(
+                            "{}/{} → {}:{} \"{}\"",
+                            mapping.external_port,
+                            mapping.protocol,
+                            mapping.internal_client,
+                            mapping.internal_port,
+                            mapping.description
+                        ),
+                    )
+                    .with_fix(if abusable {
+                        "This exposes a service commonly abused as a relay. If you did not create \
+                         this forward, something on your network opened it via UPnP — remove it and \
+                         consider turning UPnP off on the router."
+                    } else {
+                        "Confirm you meant to open this. UPnP lets any program on the network open \
+                         a hole in the firewall without asking, so a forward you do not recognise \
+                         is worth removing."
+                    }),
+                );
+            }
+        }
+        Err(reason) => section.checks.push(Check::new(
+            "ports open to the internet",
+            Verdict::Unknown,
+            format!("could not read the router's forwards: {reason}"),
+        )),
+    }
+
     // --- find the compromised device ---------------------------------------
     if scan_lan {
         match investigate::local_address() {
@@ -908,18 +957,31 @@ async fn investigate_causes(
                             .map(|(port, note)| format!("{port} ({note})"))
                             .collect::<Vec<_>>()
                             .join("; ");
-                        section.checks.push(
-                            Check::new(
-                                format!("device {}", device.address),
-                                Verdict::Warn,
-                                ports,
-                            )
-                            .with_fix(
-                                "Identify this device. An XBL listing means something on this \
-                                 network is compromised, and a home network rarely has an \
-                                 inventory — this is the shortlist worth checking.",
+
+                        // An open port is a lead. A port that actually relays is
+                        // a cause. Reporting the first as the second sends
+                        // somebody hunting a device that is behaving perfectly.
+                        let (verdict, fix) = match device.proxy {
+                            Some(investigate::ProxyVerdict::Relays) => (
+                                Verdict::Fail,
+                                "CONFIRMED open proxy: it relayed a connection to an external host. \
+                                 If the router also forwards this port, this is almost certainly \
+                                 what got you blocklisted. Shut it down.",
                             ),
-                        );
+                            Some(investigate::ProxyVerdict::RefusedToRelay) => (
+                                Verdict::Pass,
+                                "Listening, but it REFUSED to relay for a stranger, so it is not an \
+                                 open proxy and not the cause of a blocklisting. Worth identifying, \
+                                 not worth chasing.",
+                            ),
+                            _ => (
+                                Verdict::Warn,
+                                "Worth identifying. Being listed here means a port is open, not \
+                                 that the device is doing anything wrong.",
+                            ),
+                        };
+                        section.checks
+                            .push(Check::new(format!("device {}", device.address), verdict, ports).with_fix(fix));
                     }
                 }
             }

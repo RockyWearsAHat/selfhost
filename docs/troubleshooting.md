@@ -167,16 +167,56 @@ services that actually earn these listings and prints a shortlist:
          23 (telnet — unencrypted remote access, heavily targeted)
 ```
 
-An **open SOCKS or HTTP proxy** is the single most common cause. Something —
-often a "free VPN" app, sometimes malware — accepts connections and relays other
-people's traffic, and that traffic gets your address listed. Telnet and RDP
-matter differently: they are brute-forced constantly and become the foothold.
+**An open port is a lead, not a cause**, and the tool is careful about the
+difference — it learned this the hard way. A device listening on 1080 is only a
+problem if it *relays*, so the sweep asks it to, and reports what happened:
 
-It also checks this machine's own loopback, because malware frequently listens
+```
+  [PASS] device 192.168.1.25
+         1080 (SOCKS proxy — the classic way a machine is abused to relay traffic)
+      →  Listening, but it REFUSED to relay for a stranger, so it is not an open
+         proxy and not the cause of a blocklisting.
+```
+
+The first version reported that same device as "the classic cause of your XBL
+listing" purely because the port was open. It wasn't relaying, and the router
+wasn't forwarding it — the lead was worthless, and acting on it would have meant
+tearing apart a device that was behaving correctly.
+
+**Reachability is the other half.** A service on your LAN cannot be abused by
+anyone outside if nothing reaches it, so the tool reads the router's port
+forwards over UPnP:
+
+```
+  [PASS] ports open to the internet
+         the router forwards nothing — no device on your network is reachable
+```
+
+That check earns its place twice over: it also catches forwards **you never
+asked for**. UPnP lets any program on your network punch a hole in the firewall
+silently, which is a common way a machine becomes internet-reachable without its
+owner knowing.
+
+It also probes this machine's own loopback, because malware frequently listens
 locally and is driven by something else.
 
 The sweep is bounded on purpose — a fixed port list, short timeouts, capped
 concurrency — so it finishes in seconds. It only touches your own network.
+
+### When the LAN scan finds nothing
+
+Common, and it does not mean the listing is wrong. If nothing relays and nothing
+is forwarded, the abuse was **outbound** — a device making connections rather
+than accepting them — or the listing is **inherited from whoever held your
+address before you**, which happens constantly on residential connections with
+dynamic addresses.
+
+Either way the next step is the same, and it is the one thing this tool cannot
+do for you: **read the listing detail at**
+`https://check.spamhaus.org/query/ip/<your ip>`. An XBL entry records what was
+observed and when. If the last-seen timestamp predates your having the address,
+it is inherited — delist and move on. If it is recent, something on your network
+did it, and the detail usually names the malware family or protocol.
 
 ### Mail is not being delivered
 
