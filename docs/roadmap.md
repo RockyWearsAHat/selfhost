@@ -12,9 +12,9 @@ exercised against a running instance; anything else has not been written.
 | Proxy: TLS, static, caching, LB | `crates/proxy` | 60 | path traversal, Range, 304, health hysteresis |
 | SMTP session + addresses | `crates/mail` | 48 | open-relay defence, credential protection, framing |
 | DNS wire format + resolver | `crates/dns` | 19 | compression pointers, loops, truncation, SOA contacts |
-| `doctor` + LAN assessment | `crates/cli` | 50 | service identified by behaviour, hardware named, one conclusion |
+| `doctor` + LAN assessment | `crates/cli` | 55 | service identified by behaviour, hardware named, one conclusion |
 
-**252 tests.** Verified live: HTTPS 200, HTTP→HTTPS 308, `206` + `Content-Range`
+**257 tests.** Verified live: HTTPS 200, HTTP→HTTPS 308, `206` + `Content-Range`
 on a seek, `416` on an impossible range, `304` with zero bytes on both cache
 validators, `.m3u8`/`.ts` content types, traversal → 404, smuggling → 400, an
 ACME challenge served over cleartext while ordinary paths still redirect, and a
