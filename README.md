@@ -46,21 +46,29 @@ whose job is to stay up unattended.
 
 ## Status
 
-Under construction. What is finished and verified:
+**155 tests pass.** The proxy runs and serves. ACME, DNS, and the mail
+connection layer do not exist yet — see [`docs/roadmap.md`](docs/roadmap.md) for
+the honest breakdown.
 
-- **`crates/http`** — HTTP/1.1 messages, written from the specification. 49
-  unit tests covering header injection, request smuggling, and byte ranges.
+Verified against a running instance, not only in unit tests: HTTPS with
+keep-alive, HTTP→HTTPS redirect preserving path and query, `206` + `Content-Range`
+on a video seek, `416` on an impossible range, path traversal refused, malformed
+framing refused, and a full failover cycle across two live backends — one killed,
+traffic moves with no failed requests; restarted, it returns unaided.
 
-What is not built yet: the proxy, ACME, DNS, mail, supervision, and the CLI.
+New here? Start with [`docs/getting-started.md`](docs/getting-started.md).
 
 ## Layout
 
 ```
 crates/
   http/     HTTP/1.1 parsing and serialisation. Pure, no I/O, no dependencies.
-  config/   Deployment config model and validation.
+  config/   Deployment config model and validation. The source of truth.
   proxy/    TLS termination, static serving, reverse proxy, load balancing.
+  mail/     Addresses and the SMTP session state machine.
   cli/      The `selfhost` binary.
+gui/        Console rough draft (static, no API behind it yet).
+docs/       Getting started, measured constraints, roadmap.
 ```
 
 ## Security properties enforced in code
