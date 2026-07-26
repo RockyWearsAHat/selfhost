@@ -12,4 +12,11 @@ name = "selfhost"
 path = "src/main.rs"
 
 [dependencies]
+selfhost-config = { workspace = true }
+selfhost-proxy = { workspace = true }
 selfhost-http = { workspace = true }
+tokio = { workspace = true }
+rustls = { workspace = true }
+
+[lints.rust]
+unsafe_code = "forbid"
