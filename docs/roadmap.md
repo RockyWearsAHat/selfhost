@@ -7,17 +7,17 @@ exercised against a running instance; anything else has not been written.
 
 | area | crate | tests | evidence |
 |---|---|---|---|
-| HTTP/1.1 messages | `crates/http` | 49 | header injection, request smuggling, byte ranges |
+| HTTP/1.1 messages + dates | `crates/http` | 57 | header injection, request smuggling, byte ranges, cache validators |
 | Config model + validation | `crates/config` | 18 | every problem reported at once, field-named |
-| Health-checked load balancing | `crates/proxy` | 12 | hysteresis both ways, lease accounting |
-| Static serving, TLS, MIME, routing | `crates/proxy` | 38 | path traversal, Range, cert generation |
-| SMTP session + addresses | `crates/mail` | 38 | open-relay defence, credential protection |
+| Proxy: TLS, static, caching, LB | `crates/proxy` | 60 | path traversal, Range, 304, health hysteresis |
+| SMTP session + addresses | `crates/mail` | 48 | open-relay defence, credential protection, framing |
 
-**155 tests.** Verified live: HTTPS 200, HTTP→HTTPS 308, `206` + `Content-Range`
-on a seek, `416` on an impossible range, `.m3u8`/`.ts` content types, traversal
-→ 404, smuggling → 400, and a full failover cycle across two backends (5/5 split
-→ one killed → 10/10 to the survivor → restarted → back to 5/5 → both down →
-502).
+**183 tests.** Verified live: HTTPS 200, HTTP→HTTPS 308, `206` + `Content-Range`
+on a seek, `416` on an impossible range, `304` with zero bytes on both cache
+validators, `.m3u8`/`.ts` content types, traversal → 404, smuggling → 400, an
+ACME challenge served over cleartext while ordinary paths still redirect, and a
+full failover cycle across two backends (5/5 split → one killed → 10/10 to the
+survivor → restarted → back to 5/5 → both down → 502).
 
 ## Next, in the order I would do it
 
