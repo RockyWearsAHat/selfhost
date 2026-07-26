@@ -3,6 +3,8 @@
 //! Argument parsing and error presentation only. The work lives in the library
 //! crates so it stays callable from tests without going through `argv`.
 
+mod doctor;
+
 use selfhost_config::{AcmeEnvironment, Config};
 use selfhost_proxy::{CertificateStore, Server, serve_http, serve_https, server_config};
 use std::path::{Path, PathBuf};
@@ -23,6 +25,7 @@ Commands
   init [--email <address>]   Write a starter config into the current directory
   check                      Validate the config and report every problem
   routes                     Show which hostname maps to which site
+  doctor [--deep]            Diagnose the deployment and say how to fix it
   run                        Start the proxy in the foreground
   help                       Show this message
 
@@ -37,6 +40,7 @@ fn main() -> ExitCode {
         "init" => init(&arguments),
         "check" => check(),
         "routes" => routes(),
+        "doctor" => doctor_command(&arguments),
         "run" => run(),
         "help" | "--help" | "-h" => {
             eprint!("{USAGE}");
@@ -181,6 +185,27 @@ fn routes() -> Result<(), String> {
             (None, n) => format!("{n} instance(s)"),
         };
         println!("  {host:<width$}  →  {target}");
+    }
+    Ok(())
+}
+
+/// Runs the diagnostics and reports what to fix.
+///
+/// Exits non-zero when something failed, so it is usable in a script.
+fn doctor_command(arguments: &[String]) -> Result<(), String> {
+    let (config, project_dir) = load()?;
+    let deep = arguments.iter().any(|a| a == "--deep");
+
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| format!("could not start the async runtime: {e}"))?;
+
+    let report = runtime.block_on(doctor::run(&config, &project_dir, deep));
+    print!("{report}");
+
+    if report.has_failures() {
+        return Err("some checks failed — see the arrows above for what to do".into());
     }
     Ok(())
 }

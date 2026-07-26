@@ -1,0 +1,214 @@
+# Troubleshooting
+
+Start here:
+
+```sh
+selfhost doctor          # everything that can be checked without sending traffic
+selfhost doctor --deep   # also opens real connections to Gmail and Outlook
+```
+
+You do not need to know how any of this is built to read the output. Each check
+prints what was tested, what came back, and — when there is something to do — an
+arrow with the fix.
+
+```
+  [FAIL] forward-confirmed reverse DNS
+         PTR is 172-83-7-210.ip.fdtnet.net, but that name has no A record
+      →  Gmail and Outlook weight this heavily for inbox placement, and only
+         your ISP can fix it.
+```
+
+`doctor` exits non-zero when anything failed, so it works in a script or a
+health check.
+
+## Reading the verdicts
+
+| verdict | meaning |
+|---|---|
+| `PASS` | tested, working |
+| `WARN` | working, but you should know about it |
+| `FAIL` | broken; the deployment will not do its job until fixed |
+| `????` | **could not be tested from here** — not the same as passing |
+| `SKIP` | deliberately not configured |
+
+`????` is the one to pay attention to. A diagnostic that reports "could not
+test" as "fine" is how somebody ends up believing their mail works when it has
+never been tried once.
+
+## `--deep`
+
+Adds live SMTP handshakes with Gmail and Outlook. It opens a connection, sends
+`EHLO`, reads the reply, and sends `QUIT`. **No mail is sent and no message is
+delivered.**
+
+Worth running because it answers two things nothing else can:
+
+1. Whether major receivers will talk to your address at all.
+2. **Which address they see you as** — they echo it in the reply. If that
+   disagrees with what the rest of the report was checked against, every
+   blocklist and reverse-DNS result above it is worthless, and `doctor` says so
+   rather than letting you trust them.
+
+That second check exists because this tool got it wrong. See below.
+
+## The bug that shaped this tool
+
+The first version discovered the public IP by querying `whoami.akamai.net` — a
+standard trick. It reported a clean address, passed every blocklist check, passed
+reverse DNS, and declared mail healthy.
+
+It was checking **the ISP's resolver**, not this machine. Those `whoami` services
+answer with the address of *whoever asked*, and the query went through the router
+to the ISP's resolver. The ISP's own resolver is, unsurprisingly, not
+blocklisted and has correct reverse DNS.
+
+The real address was blocklisted with broken forward-confirmed reverse DNS.
+
+Two things changed as a result, and both are worth knowing when you extend this:
+
+- The address now comes from **an outbound TCP connection**, which is the path
+  that actually carries mail and visitors.
+- It is **cross-checked against what the receiver reports**, and a disagreement
+  is a `FAIL`, not a footnote.
+
+## Common problems
+
+### "It works on my machine but not from the internet"
+
+The single most common home-server problem, and `doctor` marks it `????` on
+purpose: **it cannot be tested from inside your own network.** Traffic to your
+public IP from your own LAN never leaves the building, so it proves nothing.
+
+Test it properly:
+
+1. Start `selfhost run`.
+2. On your phone, **turn Wi-Fi off** so you are on mobile data.
+3. Open `http://<your-public-ip>/`.
+
+Times out? Either the router is not forwarding 80 and 443 to this machine, or
+the ISP filters them. Both are outside this program.
+
+While you are in the router, give the machine a **static DHCP lease** — otherwise
+the port forward eventually points at whatever device took that address.
+
+### "Permission denied" binding port 80 or 443
+
+Unix reserves ports below 1024. Either:
+
+```sh
+sudo setcap 'cap_net_bind_service=+ep' ./target/release/selfhost   # Linux, once
+```
+
+or bind a high port and let the router forward 80 → 8080 and 443 → 8443.
+
+### "Address already in use"
+
+Usually `selfhost` is already running. Otherwise:
+
+```sh
+lsof -i :443                          # macOS / Linux
+netstat -ano | findstr :443           # Windows
+```
+
+### The browser warns about the certificate
+
+Expected when `acme = "self-signed"`. That is the default so a first run needs no
+network, no account, and cannot burn a rate limit.
+
+For a public site, climb the ladder in order — `self-signed` → `staging` →
+`production`. Production Let's Encrypt allows **five duplicate certificates per
+week**, and a retry loop against a domain that does not yet point at you will
+exhaust that in minutes and lock you out for a week.
+
+### Mail is not being delivered
+
+Run `selfhost doctor --deep` and work through the `Mail` section. The two
+problems it usually finds are **neither of them code**:
+
+**A blocklist listing.** Removal is free and self-service, but find the cause
+first or it comes straight back. A Spamhaus XBL listing (`127.0.0.4` through
+`127.0.0.7`) specifically means a device on your network looks *compromised* —
+most often malware, or a "free VPN" app quietly proxying traffic through your
+machine. Delisting without fixing that just restarts the clock.
+
+**Broken forward-confirmed reverse DNS.** Your ISP publishes a PTR record for
+your address, but the name it points at has no matching forward record. Gmail and
+Outlook both weight this heavily. Only the ISP can fix it.
+
+Find who to ask — the reverse zone's SOA names the contact:
+
+```sh
+selfhost doctor --deep     # prints the PTR name
+```
+
+Then ask them for **either** a forward `A` record for the PTR name, **or**
+delegation of the PTR so you can point it at your own mail hostname. Ask about a
+static IP at the same time; a residential lease can move.
+
+Note what a listing does and does not cost you. Gmail and Outlook do **not**
+consult Spamhaus — they use their own reputation systems, which is why the
+handshake can pass while the listing stands. What a listing does break is the
+large population of corporate filters, universities, and smaller providers that
+*do* query it.
+
+And a handshake passing is **not** delivery. A receiver can accept the connection
+and the envelope, then junk or drop the message. The only way to know about
+inbox placement is to send a real one.
+
+### Blocklist results say "the blocklist refused the query"
+
+Blocklists signal a refusal by answering in `127.255.255.0/24` — the same address
+space as a real verdict. `doctor` tells them apart, but the usual cause is
+querying through a large public resolver like `8.8.8.8` or `1.1.1.1`, which
+Spamhaus rejects outright.
+
+If `doctor` warns that it could not determine your system resolver, point it at
+your router or ISP resolver:
+
+```sh
+selfhost doctor --resolver 192.168.1.1
+```
+
+## Checking the config alone
+
+```sh
+selfhost check     # validates, reports every problem at once
+selfhost routes    # shows which hostname serves which site
+```
+
+`check` never stops at the first error — one run lists everything wrong, each
+naming the field responsible:
+
+```
+✗ config describes an unworkable deployment:
+  nodes: exactly one node must have role "owner" (found 2)
+  sites[1].domains[0]: "example.com" is already served by sites[0]
+  sites[0].health.timeout_secs: timeout (10s) must be shorter than the interval (5s)
+```
+
+## Watching a running server
+
+Health transitions and one line per request go to stderr:
+
+```
+[health] levelup: 127.0.0.1:5050 unreachable, removed from rotation
+[health] levelup: 127.0.0.1:5050 recovered, back in rotation
+[access] 203.0.113.9 https example.com GET /videos 4ms
+[proxy] 203.0.113.9: refused — ambiguous message framing: both Transfer-Encoding and Content-Length present
+```
+
+A `refused` line is the server rejecting a malformed or ambiguously framed
+request. That is deliberate, not a bug — see `docs/roadmap.md` under "Things not
+to do".
+
+## Reporting a problem
+
+Include the output of:
+
+```sh
+selfhost doctor --deep 2>&1
+selfhost check
+```
+
+`doctor` prints no passwords, no keys, and no message content. It does print
+your public IP and your domain names.
