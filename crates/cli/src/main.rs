@@ -3,8 +3,11 @@
 //! Argument parsing and error presentation only. The work lives in the library
 //! crates so it stays callable from tests without going through `argv`.
 
+mod assess;
 mod doctor;
+mod identify;
 mod investigate;
+mod oui;
 
 use selfhost_config::{AcmeEnvironment, Config};
 use selfhost_proxy::{CertificateStore, Server, serve_http, serve_https, server_config};

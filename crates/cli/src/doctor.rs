@@ -11,7 +11,7 @@
 //! "tested and fine" are different states, and collapsing them is how a
 //! diagnostic tells somebody their mail works when it has never been tried.
 
-use crate::investigate;
+use crate::{assess, investigate};
 use selfhost_config::Config;
 use selfhost_dns::{Resolver, ResolverSource, blocklist_name, is_real_listing};
 use std::fmt;
@@ -404,7 +404,7 @@ async fn check_dns(
         for domain in &site.domains {
             if domain == "localhost" || domain.parse::<IpAddr>().is_ok() {
                 section.checks.push(Check::new(
-                    format!("{domain}"),
+                    domain.to_string(),
                     Verdict::Skipped,
                     "local name, nothing to resolve",
                 ));
@@ -492,7 +492,7 @@ async fn check_mail(
             let name = blocklist_name(address, zone);
             match resolver.lookup_a(&name).await {
                 Ok(answers) if answers.is_empty() => section.checks.push(Check::new(
-                    format!("{zone}"),
+                    zone.to_string(),
                     Verdict::Pass,
                     "not listed",
                 )),
@@ -500,7 +500,7 @@ async fn check_mail(
                     let real: Vec<_> = answers.iter().filter(|a| is_real_listing(**a)).collect();
                     if real.is_empty() {
                         section.checks.push(Check::new(
-                            format!("{zone}"),
+                            zone.to_string(),
                             Verdict::Unknown,
                             "the blocklist refused the query (not a listing)",
                         ));
@@ -527,7 +527,7 @@ async fn check_mail(
                     }
                 }
                 Err(error) => section.checks.push(Check::new(
-                    format!("{zone}"),
+                    zone.to_string(),
                     Verdict::Unknown,
                     format!("lookup failed: {error}"),
                 )),
@@ -890,7 +890,10 @@ async fn investigate_causes(
     }
 
     // --- what is actually reachable from the internet -----------------------
-    match investigate::port_mappings().await {
+    // Kept for the device assessment below: whether a device can be reached
+    // from outside changes what its open ports mean.
+    let forwards = investigate::port_mappings().await;
+    match &forwards {
         Ok(mappings) if mappings.is_empty() => section.checks.push(
             Check::new(
                 "ports open to the internet",
@@ -904,7 +907,7 @@ async fn investigate_causes(
             ),
         ),
         Ok(mappings) => {
-            for mapping in &mappings {
+            for mapping in mappings {
                 let abusable = mapping.exposes_abusable_service();
                 section.checks.push(
                     Check::new(
@@ -942,48 +945,9 @@ async fn investigate_causes(
     if scan_lan {
         match investigate::local_address() {
             Some(local_ip) => {
-                let devices = investigate::sweep_lan(local_ip).await;
-                if devices.is_empty() {
-                    section.checks.push(Check::new(
-                        "devices on the local network",
-                        Verdict::Pass,
-                        "no device is exposing a commonly abused service",
-                    ));
-                } else {
-                    for device in &devices {
-                        let ports = device
-                            .open
-                            .iter()
-                            .map(|(port, note)| format!("{port} ({note})"))
-                            .collect::<Vec<_>>()
-                            .join("; ");
-
-                        // An open port is a lead. A port that actually relays is
-                        // a cause. Reporting the first as the second sends
-                        // somebody hunting a device that is behaving perfectly.
-                        let (verdict, fix) = match device.proxy {
-                            Some(investigate::ProxyVerdict::Relays) => (
-                                Verdict::Fail,
-                                "CONFIRMED open proxy: it relayed a connection to an external host. \
-                                 If the router also forwards this port, this is almost certainly \
-                                 what got you blocklisted. Shut it down.",
-                            ),
-                            Some(investigate::ProxyVerdict::RefusedToRelay) => (
-                                Verdict::Pass,
-                                "Listening, but it REFUSED to relay for a stranger, so it is not an \
-                                 open proxy and not the cause of a blocklisting. Worth identifying, \
-                                 not worth chasing.",
-                            ),
-                            _ => (
-                                Verdict::Warn,
-                                "Worth identifying. Being listed here means a port is open, not \
-                                 that the device is doing anything wrong.",
-                            ),
-                        };
-                        section.checks
-                            .push(Check::new(format!("device {}", device.address), verdict, ports).with_fix(fix));
-                    }
-                }
+                let survey = investigate::sweep_lan(local_ip).await;
+                let mappings = forwards.as_deref().unwrap_or(&[]);
+                report_lan(section, &assess::assess(&survey, mappings, local_ip));
             }
             None => section.checks.push(Check::new(
                 "devices on the local network",
@@ -995,7 +959,57 @@ async fn investigate_causes(
         section.checks.push(Check::new(
             "devices on the local network",
             Verdict::Skipped,
-            "run `selfhost doctor --scan-lan` to shortlist devices worth investigating",
+            "run `selfhost doctor --scan-lan` to identify every device and name the one at fault",
+        ));
+    }
+}
+
+/// Reports what the local network amounts to, strongest finding first.
+///
+/// Only devices that need attention get a line of their own. The rest are
+/// counted, because a diagnostic that prints every device it looked at buries
+/// the one finding that matters and leaves the reader to do the diagnosis.
+fn report_lan(section: &mut Section, conclusion: &assess::Conclusion) {
+    section.checks.push(
+        Check::new("what the local network shows", Verdict::Pass, conclusion.summary.clone())
+            .with_fix(conclusion.next_step.clone()),
+    );
+
+    for assessment in &conclusion.notable {
+        let verdict = match assessment.standing {
+            assess::Standing::Responsible => Verdict::Fail,
+            assess::Standing::PrimeSuspect => Verdict::Fail,
+            assess::Standing::Unresolved => Verdict::Warn,
+            assess::Standing::Consistent => Verdict::Pass,
+        };
+
+        let mut fix = assessment.because.join(" ");
+        if let Some(test) = &assessment.decisive_test {
+            fix.push(' ');
+            fix.push_str(test);
+        }
+
+        section.checks.push(
+            Check::new(
+                format!("{} — {}", assessment.address, assessment.standing.label()),
+                verdict,
+                assessment.what_it_is.clone(),
+            )
+            .with_fix(fix),
+        );
+    }
+
+    if !conclusion.consistent.is_empty() {
+        let listed = conclusion
+            .consistent
+            .iter()
+            .map(|assessment| format!("{} ({})", assessment.address, assessment.what_it_is))
+            .collect::<Vec<_>>()
+            .join(", ");
+        section.checks.push(Check::new(
+            "other devices",
+            Verdict::Pass,
+            format!("{} behaving as expected — {listed}", conclusion.consistent.len()),
         ));
     }
 }
