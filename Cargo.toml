@@ -1,0 +1,47 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/config",
+    "crates/http",
+    "crates/proxy",
+    "crates/cli",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "MIT"
+repository = "https://github.com/RockyWearsAHat/selfhost"
+
+# Dependency policy
+# -----------------
+# Two categories of dependency are permitted, and nothing else:
+#
+#   1. Foundations — the async runtime and the TLS/crypto implementation. These
+#      sit at the same level as the standard library. Hand-writing cryptography
+#      would make this project less safe, not more independent.
+#   2. Serialisation of our own config format.
+#
+# Everything above the socket is written here: HTTP parsing, the reverse proxy,
+# load balancing, health checking, Range handling, ACME, the DNS wire format,
+# SMTP, and IMAP. If a protocol is on the wire, we own it.
+[workspace.dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "fs", "time", "signal", "sync", "process"] }
+tokio-rustls = "0.26"
+rustls = "0.23"
+rustls-pemfile = "2"
+rcgen = "0.13"
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+
+selfhost-config = { path = "crates/config" }
+selfhost-http = { path = "crates/http" }
+selfhost-proxy = { path = "crates/proxy" }
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+panic = "abort"
+strip = true

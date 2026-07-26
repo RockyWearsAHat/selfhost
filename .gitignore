@@ -1,0 +1,25 @@
+# Rust build output
+/target/
+**/*.rs.bk
+
+# Persistent state: databases, mail spools, TLS keys and certificates, backups.
+# Deleting this loses the deployment — it is what the backups are for.
+data/
+
+# Generated artifacts, rebuilt by `selfhost render`.
+runtime/
+
+# Secrets. Only .env.example is tracked.
+.env
+.env.*
+!.env.example
+secrets/
+
+# The live config carries hostnames and mailbox addresses.
+selfhost.config.toml
+
+# Site content served by the proxy — the user's websites, not this project's source.
+sites/
+
+# OS noise
+.DS_Store
