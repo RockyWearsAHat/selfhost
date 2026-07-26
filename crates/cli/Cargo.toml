@@ -1,0 +1,15 @@
+[package]
+name = "selfhost-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "The selfhost command-line interface."
+
+[[bin]]
+name = "selfhost"
+path = "src/main.rs"
+
+[dependencies]
+selfhost-http = { workspace = true }
