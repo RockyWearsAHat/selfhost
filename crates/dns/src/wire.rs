@@ -165,6 +165,16 @@ pub enum RecordData {
     /// a long SPF or DKIM value is split across several — joining them is
     /// required, not cosmetic.
     Txt(String),
+    /// Start of authority. Names who runs a zone, which is how you find out who
+    /// to ask about a reverse-DNS record you cannot change yourself.
+    Soa {
+        /// Primary nameserver for the zone.
+        primary: String,
+        /// Responsible party, in DNS form — the first label is the local part
+        /// of an email address, so `ipadmin.example.com` means
+        /// `ipadmin@example.com`.
+        responsible: String,
+    },
     /// A record type this decoder does not interpret.
     Unknown {
         /// The record type.
@@ -239,6 +249,22 @@ impl Response {
         hosts
     }
 
+    /// The zone's responsible-party address, from an `SOA` in either section.
+    ///
+    /// Looked for in the authority section as well as the answer, because a
+    /// query for a name that does not exist still returns the enclosing zone's
+    /// `SOA` there — which is exactly the case when asking who runs a reverse
+    /// zone you have no records in.
+    pub fn soa_contact(&self) -> Option<String> {
+        self.answers
+            .iter()
+            .chain(self.authority.iter())
+            .find_map(|record| match &record.data {
+                RecordData::Soa { responsible, .. } => Some(email_from_rname(responsible)),
+                _ => None,
+            })
+    }
+
     /// Domain names in the answer, for `NS`, `PTR`, and `CNAME` queries.
     pub fn names(&self) -> Vec<String> {
         self.answers
@@ -251,6 +277,29 @@ impl Response {
     }
 }
 
+/// Converts a DNS responsible-party name into an email address.
+///
+/// The first label is the local part, so `ipadmin.firstdigital.com` means
+/// `ipadmin@firstdigital.com`. An escaped dot (`\\.`) inside the local part is
+/// literal, which is why this splits on the first *unescaped* separator rather
+/// than the first character.
+pub fn email_from_rname(rname: &str) -> String {
+    let bytes = rname.as_bytes();
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'\\' {
+            index += 2;
+            continue;
+        }
+        if bytes[index] == b'.' {
+            let local = rname[..index].replace("\\.", ".");
+            return format!("{local}@{}", &rname[index + 1..]);
+        }
+        index += 1;
+    }
+    rname.to_owned()
+}
+
 /// The record type a payload corresponds to.
 fn data_type(data: &RecordData) -> RecordType {
     match data {
@@ -259,6 +308,7 @@ fn data_type(data: &RecordData) -> RecordType {
         RecordData::Name(_) => RecordType::Cname,
         RecordData::Mx { .. } => RecordType::Mx,
         RecordData::Txt(_) => RecordType::Txt,
+        RecordData::Soa { .. } => RecordType::Soa,
         RecordData::Unknown { record_type, .. } => *record_type,
     }
 }
@@ -449,6 +499,11 @@ fn read_record(buffer: &[u8], start: usize) -> Result<(Record, usize), WireError
         RecordType::Ns | RecordType::Cname | RecordType::Ptr => {
             RecordData::Name(read_name(buffer, position)?.0)
         }
+        RecordType::Soa if length >= 2 => {
+            let (primary, next) = read_name(buffer, position)?;
+            let (responsible, _) = read_name(buffer, next)?;
+            RecordData::Soa { primary, responsible }
+        }
         RecordType::Mx if length >= 3 => {
             let preference = u16::from_be_bytes([payload[0], payload[1]]);
             let exchange = read_name(buffer, position + 2)?.0;
@@ -613,5 +668,30 @@ mod tests {
         ] {
             assert_eq!(RecordType::from_code(record_type.code()), record_type);
         }
+    }
+}
+
+#[cfg(test)]
+mod soa_tests {
+    use super::*;
+
+    #[test]
+    fn converts_a_responsible_name_into_an_address() {
+        // This is how you find out who to email about a reverse-DNS record you
+        // cannot change yourself.
+        assert_eq!(email_from_rname("ipadmin.firstdigital.com"), "ipadmin@firstdigital.com");
+        assert_eq!(email_from_rname("hostmaster.example.com"), "hostmaster@example.com");
+    }
+
+    #[test]
+    fn an_escaped_dot_stays_inside_the_local_part() {
+        // "first\.last.example.com" is first.last@example.com, not
+        // first@last.example.com.
+        assert_eq!(email_from_rname(r"first\.last.example.com"), "first.last@example.com");
+    }
+
+    #[test]
+    fn a_name_without_a_separator_is_returned_unchanged() {
+        assert_eq!(email_from_rname("hostmaster"), "hostmaster");
     }
 }

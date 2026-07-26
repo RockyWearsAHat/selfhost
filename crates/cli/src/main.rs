@@ -4,6 +4,7 @@
 //! crates so it stays callable from tests without going through `argv`.
 
 mod doctor;
+mod investigate;
 
 use selfhost_config::{AcmeEnvironment, Config};
 use selfhost_proxy::{CertificateStore, Server, serve_http, serve_https, server_config};
@@ -25,7 +26,8 @@ Commands
   init [--email <address>]   Write a starter config into the current directory
   check                      Validate the config and report every problem
   routes                     Show which hostname maps to which site
-  doctor [--deep]            Diagnose the deployment and say how to fix it
+  doctor [--deep] [--scan-lan]
+                             Diagnose, and chase the cause of anything broken
   run                        Start the proxy in the foreground
   help                       Show this message
 
@@ -195,13 +197,14 @@ fn routes() -> Result<(), String> {
 fn doctor_command(arguments: &[String]) -> Result<(), String> {
     let (config, project_dir) = load()?;
     let deep = arguments.iter().any(|a| a == "--deep");
+    let scan_lan = arguments.iter().any(|a| a == "--scan-lan");
 
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
         .map_err(|e| format!("could not start the async runtime: {e}"))?;
 
-    let report = runtime.block_on(doctor::run(&config, &project_dir, deep));
+    let report = runtime.block_on(doctor::run(&config, &project_dir, deep, scan_lan));
     print!("{report}");
 
     if report.has_failures() {

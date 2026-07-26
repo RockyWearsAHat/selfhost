@@ -11,6 +11,7 @@
 //! "tested and fine" are different states, and collapsing them is how a
 //! diagnostic tells somebody their mail works when it has never been tried.
 
+use crate::investigate;
 use selfhost_config::Config;
 use selfhost_dns::{Resolver, ResolverSource, blocklist_name, is_real_listing};
 use std::fmt;
@@ -164,7 +165,7 @@ const BLOCKLISTS: [(&str, &str); 4] = [
 ];
 
 /// Runs every check and returns the report.
-pub async fn run(config: &Config, project_dir: &Path, deep: bool) -> Report {
+pub async fn run(config: &Config, project_dir: &Path, deep: bool, scan_lan: bool) -> Report {
     let mut report = Report::default();
     let resolver = Resolver::system();
 
@@ -174,6 +175,9 @@ pub async fn run(config: &Config, project_dir: &Path, deep: bool) -> Report {
     let public_ip = check_network(&mut report, &resolver).await;
     check_dns(&mut report, config, &resolver, public_ip).await;
     check_mail(&mut report, config, &resolver, public_ip, deep).await;
+    if deep || scan_lan {
+        investigate_causes(&mut report, &resolver, public_ip, deep, scan_lan).await;
+    }
 
     report
 }
@@ -502,30 +506,25 @@ async fn check_mail(
                         ));
                         continue;
                     }
-                    let codes =
-                        real.iter().map(|a| a.to_string()).collect::<Vec<_>>().join(", ");
-                    let explanation = resolver
-                        .lookup_txt(&name)
-                        .await
-                        .ok()
-                        .map(|t| t.join("; "))
-                        .filter(|t| !t.is_empty())
-                        .unwrap_or_default();
-
-                    section.checks.push(
-                        Check::new(
-                            format!("{zone}"),
-                            Verdict::Fail,
-                            format!("LISTED ({codes}) — {significance}. {explanation}"),
-                        )
-                        .with_fix(
-                            "Removal is free and self-service, but find the cause first or it \
-                             re-lists.\n\
-                             https://check.spamhaus.org/query/ip/<your ip>\n\
-                             XBL (127.0.0.4-7) means a device on your network looks compromised — \
-                             commonly malware or a 'free VPN' app proxying through your machine.",
-                        ),
-                    );
+                    // Each code names a different list meaning a different
+                    // thing. Reporting them as one lump loses the distinction
+                    // between "residential address" and "compromised machine".
+                    for code in &real {
+                        let listing = investigate::describe(**code);
+                        let verdict = if listing.indicates_compromise || listing.list != "PBL" {
+                            Verdict::Fail
+                        } else {
+                            Verdict::Warn
+                        };
+                        section.checks.push(
+                            Check::new(
+                                format!("{zone} → {} ({})", listing.list, listing.code),
+                                verdict,
+                                format!("{} · {significance}", listing.meaning),
+                            )
+                            .with_fix(listing.action),
+                        );
+                    }
                 }
                 Err(error) => section.checks.push(Check::new(
                     format!("{zone}"),
@@ -558,10 +557,8 @@ async fn check_mail(
                     )
                     .with_fix(
                         "Gmail and Outlook weight this heavily for inbox placement, and only your \
-                         ISP can fix it. Find who to ask by looking up the reverse zone's contact:\n\
-                         the SOA for <reversed-ip>.in-addr.arpa names it.\n\
-                         Ask for EITHER a forward A record for the PTR name, OR delegation of the \
-                         PTR so you can point it at your own mail hostname.",
+                         ISP can fix it — you cannot set your own PTR.\n\
+                         The Investigation section below names the exact address to email.",
                     ),
                 ),
                 Ok(forward) => section.checks.push(Check::new(
@@ -748,6 +745,196 @@ async fn smtp_handshake(host: &str) -> (Check, Option<Ipv4Addr>) {
                 .with_fix("Usually means outbound port 25 is blocked; see the check above."),
             None,
         ),
+    }
+}
+
+/// Chases the causes behind whatever the checks above reported.
+///
+/// The checks say *what* is wrong. This says *why*, and *who can fix it* — which
+/// for the two problems that actually stop mail is never the person running this
+/// program.
+async fn investigate_causes(
+    report: &mut Report,
+    resolver: &Resolver,
+    public_ip: Option<Ipv4Addr>,
+    deep: bool,
+    scan_lan: bool,
+) {
+    let section = report.section("Investigation");
+
+    // --- who owns the reverse record --------------------------------------
+    if let Some(address) = public_ip {
+        let authority = investigate::reverse_authority(resolver, address).await;
+        match &authority.contact {
+            Some(contact) => section.checks.push(
+                Check::new(
+                    "who controls your reverse DNS",
+                    Verdict::Pass,
+                    format!("zone {} — contact {contact}", authority.zone),
+                )
+                .with_fix(format!(
+                    "You cannot change your own PTR; only they can. Email {contact} and ask for \
+                     EITHER:\n\
+                     · a forward A record for your PTR name, so forward-confirmed reverse DNS \
+                     resolves, OR\n\
+                     · delegation of the PTR so you can point it at your own mail hostname.\n\
+                     Worth asking about a static address in the same message — a residential lease \
+                     can move, and every record you set would then be wrong.",
+                )),
+            ),
+            None => section.checks.push(Check::new(
+                "who controls your reverse DNS",
+                Verdict::Unknown,
+                format!("no SOA contact found for {}", authority.zone),
+            )),
+        }
+
+        if !authority.nameservers.is_empty() {
+            section.checks.push(Check::new(
+                "reverse zone nameservers",
+                Verdict::Pass,
+                authority.nameservers.join(", "),
+            ));
+        }
+    }
+
+    // --- is it you, or the whole block ------------------------------------
+    if let (Some(address), true) = (public_ip, deep) {
+        let survey = investigate::survey_block(resolver, address, "zen.spamhaus.org").await;
+        if survey.sampled == 0 {
+            section.checks.push(Check::new(
+                "is the listing yours or your provider's",
+                Verdict::Unknown,
+                "could not sample neighbouring addresses",
+            ));
+        } else if survey.is_block_wide() {
+            let examples =
+                survey.examples.iter().map(|a| a.to_string()).collect::<Vec<_>>().join(", ");
+            section.checks.push(
+                Check::new(
+                    "is the listing yours or your provider's",
+                    Verdict::Warn,
+                    format!(
+                        "{}/{} sampled neighbours are also listed ({examples}) — this looks \
+                         provider-wide",
+                        survey.listed, survey.sampled
+                    ),
+                )
+                .with_fix(
+                    "Delisting your own address achieves nothing while the range is listed. This \
+                     is between your ISP and the blocklist — raise it with them, and plan on \
+                     relaying outbound mail meanwhile.",
+                ),
+            );
+        } else {
+            section.checks.push(
+                Check::new(
+                    "is the listing yours or your provider's",
+                    Verdict::Pass,
+                    format!(
+                        "0 of {} sampled neighbours are listed — this is specific to your address",
+                        survey.sampled
+                    ),
+                )
+                .with_fix(
+                    "Good news, in a sense: it is not a dirty provider range, so delisting should \
+                     hold once the cause is fixed. It also means the cause is on your network.",
+                ),
+            );
+        }
+    }
+
+    // --- what could be earning an XBL listing ------------------------------
+    let local = investigate::local_services().await;
+    if local.is_empty() {
+        section.checks.push(Check::new(
+            "services listening on this machine",
+            Verdict::Pass,
+            "none of the commonly abused ports are open here",
+        ));
+    } else {
+        for service in &local {
+            section.checks.push(
+                Check::new(
+                    format!("port {} open on this machine", service.port),
+                    Verdict::Warn,
+                    service.note.to_owned(),
+                )
+                .with_fix(
+                    "Confirm you meant to run this. An open proxy or relay is the most common \
+                     way a machine earns a compromised-host listing.",
+                ),
+            );
+        }
+    }
+
+    // --- outbound filtering -------------------------------------------------
+    if deep {
+        for (port, note, reachable) in investigate::outbound_matrix().await {
+            if reachable {
+                section.checks.push(Check::new(
+                    format!("outbound port {port}"),
+                    Verdict::Pass,
+                    note.to_owned(),
+                ));
+            } else {
+                section.checks.push(
+                    Check::new(format!("outbound port {port}"), Verdict::Fail, note.to_owned())
+                        .with_fix(
+                            "Blocked by the network, not by this software. The distinction matters: \
+                             no amount of configuration here will open it.",
+                        ),
+                );
+            }
+        }
+    }
+
+    // --- find the compromised device ---------------------------------------
+    if scan_lan {
+        match investigate::local_address() {
+            Some(local_ip) => {
+                let devices = investigate::sweep_lan(local_ip).await;
+                if devices.is_empty() {
+                    section.checks.push(Check::new(
+                        "devices on the local network",
+                        Verdict::Pass,
+                        "no device is exposing a commonly abused service",
+                    ));
+                } else {
+                    for device in &devices {
+                        let ports = device
+                            .open
+                            .iter()
+                            .map(|(port, note)| format!("{port} ({note})"))
+                            .collect::<Vec<_>>()
+                            .join("; ");
+                        section.checks.push(
+                            Check::new(
+                                format!("device {}", device.address),
+                                Verdict::Warn,
+                                ports,
+                            )
+                            .with_fix(
+                                "Identify this device. An XBL listing means something on this \
+                                 network is compromised, and a home network rarely has an \
+                                 inventory — this is the shortlist worth checking.",
+                            ),
+                        );
+                    }
+                }
+            }
+            None => section.checks.push(Check::new(
+                "devices on the local network",
+                Verdict::Unknown,
+                "could not determine this machine's LAN address",
+            )),
+        }
+    } else {
+        section.checks.push(Check::new(
+            "devices on the local network",
+            Verdict::Skipped,
+            "run `selfhost doctor --scan-lan` to shortlist devices worth investigating",
+        ));
     }
 }
 
