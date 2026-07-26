@@ -138,7 +138,7 @@ impl CertificateStore {
         let mut key_reader = io::BufReader::new(fs::File::open(&key_path)?);
         let key = rustls_pemfile::private_key(&mut key_reader)
             .map_err(TlsError::Io)?
-            .ok_or_else(|| TlsError::NoUsableMaterial(key_path))?;
+            .ok_or(TlsError::NoUsableMaterial(key_path))?;
 
         Ok((chain, key))
     }

@@ -162,20 +162,20 @@ device is, and **names the one to act on**:
 
 ```
   [PASS] what the local network shows
-         One device out of 10 stands out: 192.168.1.25 — Amazon, 14:0a:c5:23:51:20.
+         Nothing is implicated outright. 1 of 10 devices could not be fully ruled out.
       →  In the router, block outbound TCP 25 for all devices with logging turned
          on. That stops any spam immediately, and the log then names the internal
-         address that tried to send. Power off 192.168.1.25 first.
+         address that tried to send.
 
-  [FAIL] 192.168.1.25 — PRIME SUSPECT
-         Amazon, 14:0a:c5:23:51:20
-      →  It is running proxy software on port 1080 (SOCKS5 proxy: accepted a
-         session with no credentials, then refused the destination (0x09)). This
-         is fixed-function consumer hardware — nothing the owner installs runs on
-         it, so a proxy had to arrive some other way. …
+  [WARN] 192.168.1.14 — not ruled out
+         Brother, "BRN001BA9326ED8.local", 00:1b:a9:32:6e:d8
+      →  It also exposes 23 (accepted the connection and said nothing), which
+         fixed-function consumer hardware has no need for.
 
   [PASS] other devices
-         8 behaving as expected — 192.168.1.1 (Netgear…), 192.168.1.6 (Sonos…), …
+         9 behaving as expected — 192.168.1.1 (Netgear…), 192.168.1.6 (Sonos…),
+         192.168.1.25 (Amazon, 14:0a:c5:23:51:20 — matches Amazon Echo / Alexa
+         device), …
 ```
 
 Three ideas do the work, and each replaced something that did not.
@@ -214,6 +214,40 @@ like, so it can never be the evidence that clears it.
 
 Only positive evidence clears a device now: it behaves as its hardware should.
 Being turned away at the door proves nothing either way, and the tool says so.
+
+#### …and stock behaviour is not an accusation
+
+The correction above was then overcorrected, on the same device. Rewritten to
+weigh a proxy against the hardware running it, the tool reported the Amazon
+device at `192.168.1.25` as a **`PRIME SUSPECT`** — fixed-function consumer
+hardware has no business running a SOCKS server, and this one answered with a
+reply code the specification does not define.
+
+It is an **Amazon Echo, and that is exactly what a stock Echo does.** Ports 1080
+and 8888 are open out of the box — reported on
+[r/AmazonEchoDev](https://www.reddit.com/r/AmazonEchoDev/comments/cyk24g/), on
+the [Amazon device forum](https://www.amazonforum.com/s/question/0D54P00007y83AzSAI/),
+and in an IACIS scan of an Echo Dot. Port 1080 carries audio-group traffic
+between Alexa devices, which is why it accepts a session and then refuses every
+destination you ask for.
+
+The test that settled it was a **control**: the Fire TV on the same network
+exposes 8009 and 9080 and neither 1080 nor 8888. Same vendor, different product,
+different fingerprint — so the ports were specific to that device, not to Amazon.
+Comparing a suspect against a known-good sibling should have been the first move
+and was nearly the last.
+
+`assess::STOCK_BEHAVIOURS` now records service patterns a vendor is documented to
+ship, and a device whose every open port is accounted for by one is not accused.
+Each entry carries its source so you can check the claim instead of trusting it.
+Two guards keep this from becoming the original bug again: the match is tested
+*after* the open-relay test, so a device caught actually relaying is never
+excused, and a device that matches the pattern **and does anything else** stops
+matching — the extra thing is exactly what would matter.
+
+Both mistakes were the same one: a verdict outrunning the evidence. Reporting a
+refusal as innocence sends you past the guilty device; reporting stock behaviour
+as guilt sends you to factory-reset an innocent one.
 
 **Reachability is the other half.** A service on your LAN cannot be abused by
 anyone outside if nothing reaches it, so the tool reads the router's port

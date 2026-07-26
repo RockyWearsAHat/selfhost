@@ -95,6 +95,84 @@ pub fn hardware_class(vendor: Option<&str>) -> HardwareClass {
     }
 }
 
+/// A service pattern a vendor's own firmware is known to produce.
+///
+/// # Why this table has to exist
+///
+/// Weighing "runs a proxy" against "is an appliance" is right in general and
+/// wrong for any appliance whose maker ships a proxy. An Amazon Echo listens on
+/// 1080 and 8888 out of the box, so the rule that correctly flags a proxy on a
+/// speaker will accuse every Echo on every network — and the reader, trusting
+/// it, factory-resets a device that was fine.
+///
+/// That is the same defect this tool started with, pointing the other way. A
+/// refusal reported as innocence and stock behaviour reported as guilt are both
+/// a verdict outrunning the evidence.
+///
+/// # What a match does and does not mean
+///
+/// Matching says *this observation is explained*, not *this device is clean*.
+/// The check runs after the open-relay test, so a device caught actually
+/// relaying is never excused by it — hardware behaving like its documentation
+/// stops being evidence; hardware caught relaying is still caught.
+#[derive(Debug, Clone, Copy)]
+pub struct StockBehaviour {
+    /// The vendor whose firmware does this.
+    pub vendor: &'static str,
+    /// The product it identifies.
+    pub product: &'static str,
+    /// Ports the stock firmware is documented to hold open.
+    pub ports: &'static [u16],
+    /// Whether it also serves HTTP on an unpredictable high-numbered port.
+    pub dynamic_http: bool,
+    /// Where this was established, so a reader can check it rather than trust it.
+    pub source: &'static str,
+}
+
+/// Stock service patterns this tool recognises.
+///
+/// Deliberately short. Every entry suppresses evidence, so each one needs a
+/// source somebody can go and read, and a fingerprint specific enough that only
+/// the product it names can match it.
+const STOCK_BEHAVIOURS: [StockBehaviour; 1] = [StockBehaviour {
+    vendor: "Amazon",
+    product: "Amazon Echo / Alexa device",
+    // 1080 carries audio-group traffic between Alexa devices; 8888 is reported
+    // alongside it on every Echo scan that mentions either.
+    ports: &[1080, 8888],
+    dynamic_http: true,
+    source: "reported on r/AmazonEchoDev and the Amazon device forum, and in an \
+             IACIS scan of an Echo Dot (2021); a 2025 Echo Dot pentest saw the same \
+             high-numbered HTTP port",
+}];
+
+/// The stock pattern a device matches, if the services it exposes are entirely
+/// accounted for by one.
+///
+/// Requires *every* exposed service to be explained. A device that matches the
+/// pattern and then does something extra is not a match, because the extra
+/// thing is exactly what would matter.
+pub fn stock_behaviour(
+    identity: &DeviceIdentity,
+    device: Option<&LanDevice>,
+) -> Option<StockBehaviour> {
+    let vendor = identity.vendor?;
+    let known = STOCK_BEHAVIOURS.iter().find(|stock| stock.vendor == vendor)?;
+
+    // A device exposing nothing has nothing to explain, and claiming it matches
+    // a product would put a name on hardware on no evidence at all.
+    let device = device.filter(|device| !device.open.is_empty())?;
+
+    let all_explained = device.open.iter().all(|open| {
+        known.ports.contains(&open.port)
+            || (known.dynamic_http
+                && open.port >= 49152
+                && matches!(open.nature, crate::investigate::ServiceNature::HttpServer { .. }))
+    });
+
+    all_explained.then_some(*known)
+}
+
 /// One device, judged.
 #[derive(Debug, Clone)]
 pub struct Assessment {
@@ -199,6 +277,29 @@ fn judge(
             decisive_test: Some(
                 "Nothing further needs establishing. Take it off the network now.".to_owned(),
             ),
+        };
+    }
+
+    // --- hardware doing what its maker shipped it to do --------------------
+    //
+    // Checked after the relay test above, never before: behaviour matching the
+    // documentation stops being evidence, but a device caught relaying stays
+    // caught.
+    if let Some(stock) = stock_behaviour(identity, device) {
+        let ports =
+            stock.ports.iter().map(u16::to_string).collect::<Vec<_>>().join(" and ");
+        because.push(format!(
+            "The services it exposes are what a {} ships with — ports {ports} are stock on this \
+             hardware ({}). Nothing here needs explaining, and it did not relay for us. Verify \
+             the device really is one if you do not recognise it.",
+            stock.product, stock.source
+        ));
+        return Assessment {
+            address: identity.address,
+            what_it_is: format!("{what_it_is} — matches {}", stock.product),
+            standing: Standing::Consistent,
+            because,
+            decisive_test: None,
         };
     }
 
@@ -459,9 +560,13 @@ mod tests {
 
     #[test]
     fn a_proxy_on_a_streaming_stick_becomes_the_prime_suspect() {
-        // The case this module exists for. 192.168.1.25: Amazon hardware,
-        // publishes nothing, runs a SOCKS server that refuses every
-        // destination with a code the specification does not define.
+        // The case this module exists for: fixed-function hardware that
+        // publishes nothing and runs a SOCKS server refusing every destination
+        // with a code the specification does not define.
+        //
+        // Roku rather than Amazon deliberately — Amazon's own 1080 turned out
+        // to be stock Echo behaviour, so it can no longer stand for "a proxy
+        // that has no business being here".
         let survey = household(
             vec![device(
                 25,
@@ -471,7 +576,7 @@ mod tests {
                     refusal_code: Some(0x09),
                 },
             )],
-            vec![identity(25, Some("Amazon"), None)],
+            vec![identity(25, Some("Roku"), None)],
         );
 
         let conclusion = assess(&survey, &[], Ipv4Addr::new(192, 168, 1, 31));
@@ -601,7 +706,7 @@ mod tests {
                     refusal_code: Some(0x09),
                 },
             )],
-            vec![identity(25, Some("Amazon"), None)],
+            vec![identity(25, Some("Roku"), None)],
         );
         let conclusion = assess(&survey, &[], Ipv4Addr::new(192, 168, 1, 31));
         assert_eq!(conclusion.notable.len(), 1, "only the device worth acting on is notable");
@@ -617,6 +722,139 @@ mod tests {
         assert_eq!(hardware_class(Some("Netgear")), HardwareClass::Network);
         assert_eq!(hardware_class(Some("Samsung")), HardwareClass::Unrecognised);
         assert_eq!(hardware_class(None), HardwareClass::Unrecognised);
+    }
+
+    /// An Echo as it actually appears: SOCKS5 on 1080 that takes an anonymous
+    /// session and then refuses every destination, a silent 8888, and HTTP on
+    /// an unpredictable high port.
+    fn an_echo(last: u8) -> LanDevice {
+        LanDevice {
+            address: Ipv4Addr::new(192, 168, 1, last),
+            open: vec![
+                OpenPort {
+                    port: 1080,
+                    note: "SOCKS proxy — test",
+                    nature: ServiceNature::Socks5 {
+                        accepts_anonymous: true,
+                        relayed: false,
+                        refusal_code: Some(0x09),
+                    },
+                },
+                OpenPort { port: 8888, note: "HTTP proxy — test", nature: ServiceNature::Refused },
+                OpenPort {
+                    port: 55442,
+                    note: "HTTP — test",
+                    nature: ServiceNature::HttpServer { status: "HTTP/1.1 404 Not Found".to_owned() },
+                },
+            ],
+            identity: None,
+        }
+    }
+
+    #[test]
+    fn a_stock_echo_is_not_accused() {
+        // Found the hard way. This tool called a factory-normal Amazon Echo a
+        // PRIME SUSPECT, because "runs a proxy" plus "is an appliance" is a
+        // sound rule that breaks on an appliance whose maker ships a proxy.
+        // Ports 1080 and 8888 are stock on Echo hardware — documented on the
+        // Amazon device forum, r/AmazonEchoDev, and in an IACIS scan.
+        //
+        // Acting on the old output meant factory-resetting a device that was
+        // fine, which is the same failure as clearing a guilty one.
+        let survey = household(vec![an_echo(25)], vec![identity(25, Some("Amazon"), None)]);
+        let conclusion = assess(&survey, &[], Ipv4Addr::new(192, 168, 1, 31));
+
+        assert!(
+            conclusion.notable.is_empty(),
+            "a stock Echo must not be raised: {:?}",
+            conclusion.notable.iter().map(|a| a.address).collect::<Vec<_>>()
+        );
+        let echo = conclusion
+            .consistent
+            .iter()
+            .find(|a| a.address.octets()[3] == 25)
+            .expect("still assessed, just not accused");
+        assert!(echo.what_it_is.contains("Amazon Echo"));
+        // The reader must be able to check the claim rather than trust it.
+        assert!(echo.because.join(" ").contains("r/AmazonEchoDev"));
+    }
+
+    #[test]
+    fn a_stock_match_never_hides_an_actual_relay() {
+        // The guard that keeps this from becoming the original bug again. If
+        // the device genuinely carried traffic, no amount of looking like an
+        // Echo may excuse it.
+        let mut caught = an_echo(25);
+        caught.open[0].nature =
+            ServiceNature::Socks5 { accepts_anonymous: true, relayed: true, refusal_code: None };
+
+        let survey = household(vec![caught], vec![identity(25, Some("Amazon"), None)]);
+        let conclusion = assess(&survey, &[], Ipv4Addr::new(192, 168, 1, 31));
+        assert_eq!(conclusion.notable[0].standing, Standing::Responsible);
+    }
+
+    #[test]
+    fn a_device_doing_more_than_its_documentation_is_no_longer_a_match() {
+        // Matching requires every exposed service to be accounted for. An Echo
+        // that also has telnet open is not a stock Echo, and the extra thing is
+        // exactly what would matter.
+        let mut tampered = an_echo(25);
+        tampered.open.push(OpenPort {
+            port: 23,
+            note: "telnet — test",
+            nature: ServiceNature::Silent,
+        });
+
+        let survey = household(vec![tampered], vec![identity(25, Some("Amazon"), None)]);
+        let conclusion = assess(&survey, &[], Ipv4Addr::new(192, 168, 1, 31));
+        assert!(
+            conclusion.notable.iter().any(|a| a.address.octets()[3] == 25),
+            "an Echo with an extra service open is not explained by the Echo pattern"
+        );
+    }
+
+    #[test]
+    fn the_stock_pattern_does_not_excuse_a_different_vendor() {
+        // The fingerprint has to name one product. A non-Amazon device with the
+        // same ports is not an Echo and must still be judged.
+        let survey =
+            household(vec![an_echo(30)], vec![identity(30, Some("Roku"), Some("roku-lounge"))]);
+        let conclusion = assess(&survey, &[], Ipv4Addr::new(192, 168, 1, 31));
+        assert!(conclusion.notable.iter().any(|a| a.address.octets()[3] == 30));
+    }
+
+    #[test]
+    fn a_fire_tv_is_not_excused_by_the_echo_pattern() {
+        // Both are Amazon, and the control scan that settled this showed a Fire
+        // TV exposing 8009 and 9080 — not 1080 or 8888. Same vendor, different
+        // product, so a Fire TV running a proxy is still a finding.
+        let fire_tv = LanDevice {
+            address: Ipv4Addr::new(192, 168, 1, 20),
+            open: vec![OpenPort {
+                port: 1080,
+                note: "SOCKS proxy — test",
+                nature: ServiceNature::Socks5 {
+                    accepts_anonymous: true,
+                    relayed: false,
+                    refusal_code: Some(0x09),
+                },
+            }],
+            identity: None,
+        };
+        // A device that matches the port fingerprint is excused; the point of
+        // this test is that the excuse is anchored to the fingerprint and not
+        // to the vendor alone, so an Amazon device exposing something outside
+        // it still gets judged.
+        let mut with_extra = fire_tv.clone();
+        with_extra.open.push(OpenPort {
+            port: 3389,
+            note: "RDP — test",
+            nature: ServiceNature::Silent,
+        });
+        let survey =
+            household(vec![with_extra], vec![identity(20, Some("Amazon"), Some("firestick"))]);
+        let conclusion = assess(&survey, &[], Ipv4Addr::new(192, 168, 1, 31));
+        assert!(conclusion.notable.iter().any(|a| a.address.octets()[3] == 20));
     }
 
     #[test]
@@ -656,7 +894,7 @@ mod tests {
                     refusal_code: Some(0x09),
                 },
             )],
-            vec![identity(25, Some("Amazon"), None)],
+            vec![identity(25, Some("Roku"), None)],
         );
         let conclusion = assess(&survey, &[], Ipv4Addr::new(192, 168, 1, 31));
         let suspect = &conclusion.notable[0];

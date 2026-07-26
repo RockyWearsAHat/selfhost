@@ -60,7 +60,7 @@ up unattended. We hit this live during the session — the stack needed
 
 ## 3. State — done vs not
 
-**252 tests pass.** `cargo test --workspace`.
+**257 tests pass.** `cargo test --workspace`.
 
 | crate | what | tests |
 |---|---|---|
@@ -69,7 +69,7 @@ up unattended. We hit this live during the session — the stack needed
 | `crates/proxy` | TLS, static+Range, caching, routing, LB, health | 60 |
 | `crates/mail` | Addresses + SMTP session state machine | 48 |
 | `crates/dns` | DNS wire format + resolver | 19 |
-| `crates/cli` | The `selfhost` binary, `doctor`, LAN device assessment | 50 |
+| `crates/cli` | The `selfhost` binary, `doctor`, LAN device assessment | 55 |
 
 **Verified against a running instance,** not only in unit tests: HTTPS 200,
 HTTP→HTTPS 308 preserving path and query, `206` + `Content-Range` on a seek,
