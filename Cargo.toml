@@ -3,6 +3,7 @@ resolver = "3"
 members = [
     "crates/config",
     "crates/http",
+    "crates/mail",
     "crates/proxy",
     "crates/cli",
 ]
@@ -37,6 +38,7 @@ toml = "0.8"
 
 selfhost-config = { path = "crates/config" }
 selfhost-http = { path = "crates/http" }
+selfhost-mail = { path = "crates/mail" }
 selfhost-proxy = { path = "crates/proxy" }
 
 [profile.release]

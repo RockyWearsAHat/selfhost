@@ -1,0 +1,16 @@
+[package]
+name = "selfhost-mail"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "SMTP and IMAP, written from the specifications. Custom-domain email without a subscription."
+
+[dependencies]
+selfhost-config = { workspace = true }
+tokio = { workspace = true }
+
+[lints.rust]
+unsafe_code = "forbid"
+missing_docs = "warn"

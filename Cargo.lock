@@ -344,6 +344,14 @@ name = "selfhost-http"
 version = "0.1.0"
 
 [[package]]
+name = "selfhost-mail"
+version = "0.1.0"
+dependencies = [
+ "selfhost-config",
+ "tokio",
+]
+
+[[package]]
 name = "selfhost-proxy"
 version = "0.1.0"
 dependencies = [
