@@ -5,8 +5,12 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "Deployment config model and validation."
+description = "Deployment config model and validation. The single source of truth for a deployment."
 
 [dependencies]
 serde = { workspace = true }
 toml = { workspace = true }
+
+[lints.rust]
+unsafe_code = "forbid"
+missing_docs = "warn"
