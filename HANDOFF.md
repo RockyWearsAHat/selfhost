@@ -60,14 +60,14 @@ up unattended. We hit this live during the session — the stack needed
 
 ## 3. State — done vs not
 
-**155 tests pass.** `cargo test --workspace`.
+**183 tests pass.** `cargo test --workspace`.
 
 | crate | what | tests |
 |---|---|---|
-| `crates/http` | HTTP/1.1 messages, pure, no I/O | 49 |
+| `crates/http` | HTTP/1.1 messages + dates, pure, no I/O | 57 |
 | `crates/config` | Config model + validation | 18 |
-| `crates/proxy` | TLS, static+Range, routing, LB, health | 50 |
-| `crates/mail` | Addresses + SMTP session state machine | 38 |
+| `crates/proxy` | TLS, static+Range, caching, routing, LB, health | 60 |
+| `crates/mail` | Addresses + SMTP session state machine | 48 |
 | `crates/cli` | The `selfhost` binary | — |
 
 **Verified against a running instance,** not only in unit tests: HTTPS 200,
@@ -113,8 +113,9 @@ In order, with the reasoning in `docs/roadmap.md`:
 
 1. **ACME client (RFC 8555).** Unblocks everything public. HTTP-01, since we
    already own port 80 — do not couple it to the DNS server that does not exist
-   yet. **The trap:** the challenge path must be exempted from the
-   HTTPS redirect, which is currently unconditional in `server.rs::dispatch`.
+   yet. The redirect exemption and token serving are **already done**: write
+   tokens into `data/acme-challenges/<token>` and the proxy serves them over
+   cleartext without redirecting.
 2. **SNI certificate selection** — today one certificate carries every hostname.
 3. **Mail connection layer** → Maildir store → MIME → IMAP.
 4. **DNS**, with a free secondary (Hurricane Electric). A single authoritative

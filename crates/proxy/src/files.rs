@@ -14,8 +14,10 @@
 
 use crate::mime;
 use selfhost_http::range::{self, RangeOutcome};
+use selfhost_http::date;
 use selfhost_http::{Method, Request, Response, Status};
 use std::path::{Component, Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 /// What a request resolved to inside a site root.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -146,27 +148,46 @@ pub struct FileResponse {
     pub length: u64,
 }
 
-/// Builds the response for a resolved file, honouring `Range`.
+/// Builds the response for a resolved file, honouring `Range` and cache
+/// validators.
 ///
-/// `total` is the file's size, passed in so this stays a pure function and can
-/// be tested without touching a filesystem.
+/// `total` and `modified` are passed in rather than read here, so this stays a
+/// pure function testable without touching a filesystem.
 pub fn build_response(
     request: &Request,
     path: &Path,
     total: u64,
-    modified_http_date: Option<String>,
+    modified: Option<SystemTime>,
 ) -> FileResponse {
     let name = path.to_string_lossy();
     let content_type = mime::for_path(&name);
-    let range_header = request.headers.get_str("range");
+    let tag = date::entity_tag(total, modified);
 
     let mut response = Response::empty(Status::OK);
     let _ = response.headers.set("Content-Type", content_type);
     // Advertising range support is what makes a player attempt a seek at all.
     let _ = response.headers.set("Accept-Ranges", "bytes");
-    if let Some(date) = modified_http_date {
-        let _ = response.headers.set("Last-Modified", date);
+    let _ = response.headers.set("ETag", tag.clone());
+    if let Some(time) = modified {
+        let _ = response.headers.set("Last-Modified", date::format(time));
     }
+
+    // A cache validator that still matches means the client already has this
+    // representation. Answering 304 skips the transfer entirely — on a repeat
+    // visit to a video-heavy site that is most of the bytes.
+    if is_unchanged(request, &tag, modified) {
+        let mut not_modified = Response::empty(Status::NOT_MODIFIED);
+        // A 304 carries the validators so the client can refresh its freshness
+        // bookkeeping, but never a body.
+        let _ = not_modified.headers.set("ETag", tag);
+        if let Some(time) = modified {
+            let _ = not_modified.headers.set("Last-Modified", date::format(time));
+        }
+        let _ = not_modified.headers.set("Accept-Ranges", "bytes");
+        return FileResponse { response: not_modified, offset: 0, length: 0 };
+    }
+
+    let range_header = request.headers.get_str("range");
 
     // A range request against a HEAD is answered with the range's headers but no
     // body, so the player learns the size without downloading anything.
@@ -196,6 +217,31 @@ pub fn build_response(
             FileResponse { response: refused, offset: 0, length: 0 }
         }
     }
+}
+
+/// Whether the client's cached copy is still current.
+///
+/// `If-None-Match` wins outright when present: an entity tag is an exact
+/// identity check, while a modification date has one-second resolution and
+/// cannot distinguish two edits within the same second. Consulting the date as
+/// well when a tag was supplied would let the weaker validator override the
+/// stronger one.
+fn is_unchanged(request: &Request, tag: &str, modified: Option<SystemTime>) -> bool {
+    if let Some(header) = request.headers.get_str("if-none-match") {
+        return date::if_none_match_matches(header, tag);
+    }
+
+    let (Some(header), Some(time)) = (request.headers.get_str("if-modified-since"), modified) else {
+        return false;
+    };
+    let (Some(since), Ok(file_time)) = (date::parse(header), time.duration_since(UNIX_EPOCH)) else {
+        return false;
+    };
+
+    // Truncate to whole seconds before comparing: the header has no sub-second
+    // precision, so a file written mid-second would otherwise always look newer
+    // than a date derived from it.
+    (file_time.as_secs() as i64) <= since
 }
 
 /// Whether a method may be served from static files.
@@ -337,6 +383,108 @@ mod tests {
         assert_eq!(built.length, 0);
         // The declared length still describes what a GET would return.
         assert_eq!(built.response.body.len(), 1000);
+    }
+
+    fn request_with(headers: &[(&str, &str)]) -> Request {
+        let mut raw = String::from("GET /clip.mp4 HTTP/1.1\r\nHost: a.com\r\n");
+        for (name, value) in headers {
+            raw.push_str(&format!("{name}: {value}\r\n"));
+        }
+        raw.push_str("\r\n");
+        Request::parse(raw.as_bytes()).unwrap().request
+    }
+
+    fn at(seconds: u64) -> SystemTime {
+        UNIX_EPOCH + std::time::Duration::from_secs(seconds)
+    }
+
+    #[test]
+    fn a_fresh_response_carries_both_validators() {
+        let built = build_response(&request_with(&[]), Path::new("clip.mp4"), 1000, Some(at(1_785_089_368)));
+        assert_eq!(built.response.status, Status::OK);
+        assert_eq!(
+            built.response.headers.get_str("last-modified"),
+            Some("Sun, 26 Jul 2026 18:09:28 GMT")
+        );
+        assert!(built.response.headers.get_str("etag").is_some());
+    }
+
+    #[test]
+    fn a_matching_etag_answers_304_with_no_body() {
+        let modified = Some(at(1_785_089_368));
+        let first = build_response(&request_with(&[]), Path::new("clip.mp4"), 1000, modified);
+        let tag = first.response.headers.get_str("etag").unwrap().to_owned();
+
+        let second =
+            build_response(&request_with(&[("If-None-Match", &tag)]), Path::new("clip.mp4"), 1000, modified);
+        assert_eq!(second.response.status, Status::NOT_MODIFIED);
+        assert_eq!(second.length, 0);
+        // 304 keeps the validators so the client can refresh its bookkeeping.
+        assert_eq!(second.response.headers.get_str("etag"), Some(tag.as_str()));
+    }
+
+    #[test]
+    fn a_stale_etag_sends_the_file() {
+        let built = build_response(
+            &request_with(&[("If-None-Match", "W/\"deadbeef-1\"")]),
+            Path::new("clip.mp4"),
+            1000,
+            Some(at(1_785_089_368)),
+        );
+        assert_eq!(built.response.status, Status::OK);
+        assert_eq!(built.length, 1000);
+    }
+
+    #[test]
+    fn if_modified_since_answers_304_when_unchanged() {
+        let built = build_response(
+            &request_with(&[("If-Modified-Since", "Sun, 26 Jul 2026 18:09:28 GMT")]),
+            Path::new("clip.mp4"),
+            1000,
+            Some(at(1_785_089_368)),
+        );
+        assert_eq!(built.response.status, Status::NOT_MODIFIED);
+    }
+
+    #[test]
+    fn if_modified_since_sends_the_file_when_it_changed() {
+        let built = build_response(
+            &request_with(&[("If-Modified-Since", "Sun, 26 Jul 2026 18:09:28 GMT")]),
+            Path::new("clip.mp4"),
+            1000,
+            // One second newer than the client's copy.
+            Some(at(1_785_089_369)),
+        );
+        assert_eq!(built.response.status, Status::OK);
+    }
+
+    #[test]
+    fn an_etag_outranks_a_modification_date() {
+        // A date has one-second resolution and cannot distinguish two edits in
+        // the same second. Letting it override an exact tag match would serve a
+        // stale body.
+        let built = build_response(
+            &request_with(&[
+                ("If-None-Match", "W/\"deadbeef-1\""),
+                ("If-Modified-Since", "Sun, 26 Jul 2026 18:09:28 GMT"),
+            ]),
+            Path::new("clip.mp4"),
+            1000,
+            Some(at(1_785_089_368)),
+        );
+        assert_eq!(built.response.status, Status::OK, "stale tag should force a transfer");
+    }
+
+    #[test]
+    fn an_unparseable_date_falls_back_to_sending_the_file() {
+        // Failing open is always correct; failing closed would serve a stale page.
+        let built = build_response(
+            &request_with(&[("If-Modified-Since", "Sunday, 26-Jul-26 18:09:28 GMT")]),
+            Path::new("clip.mp4"),
+            1000,
+            Some(at(1_785_089_368)),
+        );
+        assert_eq!(built.response.status, Status::OK);
     }
 
     #[test]
