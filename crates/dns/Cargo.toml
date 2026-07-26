@@ -1,0 +1,15 @@
+[package]
+name = "selfhost-dns"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "DNS wire format and a stub resolver, written from RFC 1035. Shared by the diagnostics, mail delivery, and the authoritative server."
+
+[dependencies]
+tokio = { workspace = true }
+
+[lints.rust]
+unsafe_code = "forbid"
+missing_docs = "warn"

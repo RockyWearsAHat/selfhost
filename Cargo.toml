@@ -2,6 +2,7 @@
 resolver = "3"
 members = [
     "crates/config",
+    "crates/dns",
     "crates/http",
     "crates/mail",
     "crates/proxy",
@@ -37,6 +38,7 @@ serde = { version = "1", features = ["derive"] }
 toml = "0.8"
 
 selfhost-config = { path = "crates/config" }
+selfhost-dns = { path = "crates/dns" }
 selfhost-http = { path = "crates/http" }
 selfhost-mail = { path = "crates/mail" }
 selfhost-proxy = { path = "crates/proxy" }

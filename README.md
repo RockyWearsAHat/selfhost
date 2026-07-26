@@ -57,6 +57,8 @@ framing refused, and a full failover cycle across two live backends — one kill
 traffic moves with no failed requests; restarted, it returns unaided.
 
 New here? Start with [`docs/getting-started.md`](docs/getting-started.md).
+Something not working? Run `selfhost doctor --deep` and see
+[`docs/troubleshooting.md`](docs/troubleshooting.md).
 
 ## Layout
 
@@ -66,7 +68,8 @@ crates/
   config/   Deployment config model and validation. The source of truth.
   proxy/    TLS termination, static serving, reverse proxy, load balancing.
   mail/     Addresses and the SMTP session state machine.
-  cli/      The `selfhost` binary.
+  dns/      DNS wire format and a stub resolver.
+  cli/      The `selfhost` binary, including `doctor`.
 gui/        Console rough draft (static, no API behind it yet).
 docs/       Getting started, measured constraints, roadmap.
 ```
