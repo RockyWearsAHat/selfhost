@@ -3,8 +3,9 @@
 Start here:
 
 ```sh
-selfhost doctor          # everything that can be checked without sending traffic
-selfhost doctor --deep   # also opens real connections to Gmail and Outlook
+selfhost doctor              # everything checkable without sending traffic
+selfhost doctor --deep       # also opens real connections to Gmail and Outlook
+selfhost doctor --scan-lan   # also shortlists devices on your network
 ```
 
 You do not need to know how any of this is built to read the output. Each check
@@ -119,6 +120,63 @@ For a public site, climb the ladder in order — `self-signed` → `staging` →
 `production`. Production Let's Encrypt allows **five duplicate certificates per
 week**, and a retry loop against a domain that does not yet point at you will
 exhaust that in minutes and lock you out for a week.
+
+### Tracking down WHY you are blocklisted
+
+`--deep` adds an **Investigation** section that chases causes rather than
+restating symptoms. It answers three questions the listing itself does not.
+
+**Which list matched, and does it mean anything?** The return code's last octet
+says which. They are not interchangeable:
+
+| code | list | what it means |
+|---|---|---|
+| `127.0.0.2` | SBL | observed sending spam; reviewed by people |
+| `127.0.0.3` | CSS | snowshoe-pattern sending, low volume spread thin |
+| `127.0.0.4`–`.7` | **XBL / CBL** | **a machine here looks compromised** |
+| `127.0.0.9` | SBL DROP | the whole netblock is listed; not yours to fix |
+| `127.0.0.10`, `.11` | PBL | residential range — **expected, not a fault** |
+
+PBL is a *policy label*: "this is a home connection, mail should not come from
+it directly." Nothing is broken. XBL is an *observation*: something on your
+network behaved like a compromised host. Confusing the two wastes days.
+
+**Is it you or your provider?** It samples neighbouring addresses in your /24.
+If most are listed, the range is dirty and delisting yours achieves nothing —
+that is an ISP conversation. If only yours is, the cause is on your network and
+delisting will hold once you fix it.
+
+**Who can fix your reverse DNS?** You cannot set your own `PTR`. The tool reads
+the reverse zone's `SOA` and prints the exact address to email:
+
+```
+  [PASS] who controls your reverse DNS
+         zone 7.83.172.in-addr.arpa — contact ipadmin@firstdigital.com
+```
+
+### Finding the compromised device
+
+An XBL listing says *a machine on your network* is compromised — and a home
+network rarely has an inventory. `--scan-lan` sweeps your local /24 for the
+services that actually earn these listings and prints a shortlist:
+
+```
+  [WARN] device 192.168.1.25
+         1080 (SOCKS proxy — the classic way a machine is abused to relay traffic)
+  [WARN] device 192.168.1.14
+         23 (telnet — unencrypted remote access, heavily targeted)
+```
+
+An **open SOCKS or HTTP proxy** is the single most common cause. Something —
+often a "free VPN" app, sometimes malware — accepts connections and relays other
+people's traffic, and that traffic gets your address listed. Telnet and RDP
+matter differently: they are brute-forced constantly and become the foothold.
+
+It also checks this machine's own loopback, because malware frequently listens
+locally and is driven by something else.
+
+The sweep is bounded on purpose — a fixed port list, short timeouts, capped
+concurrency — so it finishes in seconds. It only touches your own network.
 
 ### Mail is not being delivered
 
