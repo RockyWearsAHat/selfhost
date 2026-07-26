@@ -22,11 +22,13 @@
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
+pub mod date;
 pub mod headers;
 pub mod range;
 pub mod request;
 pub mod response;
 
+pub use date::{entity_tag, if_none_match_matches};
 pub use headers::{Header, HeaderError, Headers};
 pub use range::{ByteRange, RangeOutcome};
 pub use request::{BodyLength, Method, ParseError, Parsed, Request};

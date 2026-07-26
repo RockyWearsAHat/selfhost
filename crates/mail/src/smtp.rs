@@ -100,6 +100,24 @@ pub enum Action {
     Close(Reply),
     /// Send the reply, then upgrade the connection to TLS.
     StartTls(Reply),
+    /// The client supplied credentials inline (SASL initial response).
+    ///
+    /// Nothing is sent first — the caller verifies and then replies. Answering
+    /// `334` here would be a protocol error: the client has already spoken and
+    /// is waiting for a verdict, not for a challenge.
+    VerifyCredentials {
+        /// SASL mechanism name, uppercased.
+        mechanism: String,
+        /// The base64 payload exactly as received.
+        initial_response: String,
+    },
+    /// Send the challenge, then read one line of credentials and verify it.
+    AwaitCredentials {
+        /// SASL mechanism name, uppercased.
+        mechanism: String,
+        /// The challenge to send first.
+        reply: Reply,
+    },
 }
 
 /// A message accepted for delivery.
@@ -213,6 +231,20 @@ impl Session {
             return Action::Reply(Reply::line(500, "line too long"));
         }
 
+        // While message content is being read, there are no commands — every
+        // line is body text. Interpreting one as a command here would mean this
+        // layer and the connection layer disagree about what the bytes are,
+        // which is precisely how content gets treated as instructions.
+        if self.state == State::ReadingData {
+            return Action::Reply(Reply::line(503, "message content in progress"));
+        }
+
+        // After QUIT the conversation is over. Continuing to answer would let a
+        // client keep a session alive past the point the server considers closed.
+        if self.state == State::Closed {
+            return Action::Close(Reply::line(421, "session already closed"));
+        }
+
         let trimmed = line.trim_end_matches(['\r', '\n']);
         let (verb, rest) = match trimmed.split_once(' ') {
             Some((verb, rest)) => (verb, rest.trim()),
@@ -236,7 +268,7 @@ impl Session {
                 Action::Reply(Reply::line(252, "cannot VRFY, but will accept and attempt delivery"))
             }
             "STARTTLS" => self.starttls(),
-            "AUTH" => self.auth(),
+            "AUTH" => self.auth(rest),
             "QUIT" => {
                 self.state = State::Closed;
                 Action::Close(Reply::line(221, format!("{} closing connection", self.policy.hostname)))
@@ -295,8 +327,25 @@ impl Session {
             return Action::Reply(Reply::line(501, "expected MAIL FROM:<address>"));
         };
 
-        // Trailing ESMTP parameters such as SIZE= are accepted and ignored.
         let path_text = argument.split_whitespace().next().unwrap_or(argument);
+
+        // RFC 1870: a client that saw the SIZE capability may declare the
+        // message size up front. Refusing here saves transferring a message we
+        // would only reject at the end — which on a home uplink is the
+        // difference between one round trip and 25 MB of wasted upload.
+        if let Some(declared) = size_parameter(argument) {
+            match declared {
+                Some(bytes) if bytes > self.policy.max_message_bytes => {
+                    return Action::Reply(Reply::line(
+                        552,
+                        format!("message exceeds the {} byte limit", self.policy.max_message_bytes),
+                    ));
+                }
+                Some(_) => {}
+                // SIZE= present but unparseable.
+                None => return Action::Reply(Reply::line(501, "malformed SIZE parameter")),
+            }
+        }
 
         match Path::parse(path_text) {
             Ok(path) => {
@@ -376,11 +425,12 @@ impl Session {
         Action::StartTls(Reply::line(220, "ready to start TLS"))
     }
 
-    /// Handles `AUTH`.
+    /// Handles `AUTH <mechanism> [initial-response]`.
     ///
-    /// The credential exchange itself is driven by the connection layer; this
-    /// only decides whether authentication may be attempted at all.
-    fn auth(&mut self) -> Action {
+    /// Verifying the credentials is the connection layer's job — this decides
+    /// whether authentication may be attempted, and which of the two SASL shapes
+    /// the client used.
+    fn auth(&mut self, rest: &str) -> Action {
         if self.authenticated {
             return Action::Reply(Reply::line(503, "already authenticated"));
         }
@@ -388,7 +438,37 @@ impl Session {
             // AUTH PLAIN is base64, which is encoding rather than encryption.
             return Action::Reply(Reply::line(538, "encryption required for authentication"));
         }
-        Action::Reply(Reply::line(334, ""))
+        if self.helo.is_none() {
+            return Action::Reply(Reply::line(503, "send EHLO first"));
+        }
+
+        let mut parts = rest.split_whitespace();
+        let Some(mechanism) = parts.next() else {
+            return Action::Reply(Reply::line(501, "AUTH requires a mechanism"));
+        };
+        let mechanism = mechanism.to_ascii_uppercase();
+        let initial_response = parts.next();
+
+        match (mechanism.as_str(), initial_response) {
+            // SASL-IR: credentials arrived with the command. The client is
+            // waiting for a verdict, so replying 334 here would desynchronise
+            // the exchange — it would read our challenge as the result.
+            ("PLAIN", Some(response)) => Action::VerifyCredentials {
+                mechanism,
+                initial_response: response.to_owned(),
+            },
+            ("PLAIN", None) => Action::AwaitCredentials {
+                mechanism,
+                reply: Reply::line(334, ""),
+            },
+            // LOGIN is a two-step exchange whose prompts are base64. "VXNlcm5hbWU6"
+            // decodes to "Username:".
+            ("LOGIN", _) => Action::AwaitCredentials {
+                mechanism,
+                reply: Reply::line(334, "VXNlcm5hbWU6"),
+            },
+            (other, _) => Action::Reply(Reply::line(504, format!("mechanism {other} not supported"))),
+        }
     }
 
     /// Completes a transaction, returning the envelope to deliver.
@@ -414,6 +494,28 @@ impl Session {
             self.state = State::Ready;
         }
     }
+}
+
+/// Extracts a `SIZE=` ESMTP parameter from a `MAIL FROM` argument.
+///
+/// Returns `None` when no `SIZE=` was given, `Some(None)` when one was given but
+/// is not a bare integer, and `Some(Some(n))` for a usable value. The three-way
+/// result keeps "absent" and "malformed" distinct — treating a malformed value
+/// as absent would let a client bypass the size limit by corrupting it.
+fn size_parameter(argument: &str) -> Option<Option<u64>> {
+    for parameter in argument.split_whitespace().skip(1) {
+        let Some((key, value)) = parameter.split_once('=') else {
+            continue;
+        };
+        if !key.eq_ignore_ascii_case("SIZE") {
+            continue;
+        }
+        if value.is_empty() || !value.bytes().all(|b| b.is_ascii_digit()) {
+            return Some(None);
+        }
+        return Some(value.parse().ok());
+    }
+    None
 }
 
 /// Strips a keyword such as `FROM:` from a command argument, case-insensitively.
@@ -470,7 +572,14 @@ mod tests {
 
     fn reply_of(action: Action) -> Reply {
         match action {
-            Action::Reply(r) | Action::ReadData(r) | Action::Close(r) | Action::StartTls(r) => r,
+            Action::Reply(r)
+            | Action::ReadData(r)
+            | Action::Close(r)
+            | Action::StartTls(r)
+            | Action::AwaitCredentials { reply: r, .. } => r,
+            Action::VerifyCredentials { .. } => {
+                panic!("VerifyCredentials carries no reply — the caller answers after verifying")
+            }
         }
     }
 
@@ -535,6 +644,63 @@ mod tests {
         // AUTH PLAIN is base64, not encryption.
         let mut s = session();
         assert_eq!(code_of(s.command("AUTH PLAIN")), 538);
+    }
+
+    #[test]
+    fn inline_credentials_are_verified_without_sending_a_challenge() {
+        // SASL-IR: the client already sent credentials and is waiting for a
+        // verdict. Replying 334 would desynchronise the exchange — the client
+        // would read the challenge as the result.
+        let mut s = session();
+        s.tls_established();
+        s.command("EHLO client.test");
+
+        match s.command("AUTH PLAIN AGRhdmUAaHVudGVyMg==") {
+            Action::VerifyCredentials { mechanism, initial_response } => {
+                assert_eq!(mechanism, "PLAIN");
+                assert_eq!(initial_response, "AGRhdmUAaHVudGVyMg==");
+            }
+            other => panic!("expected VerifyCredentials, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn auth_without_an_initial_response_challenges_first() {
+        let mut s = session();
+        s.tls_established();
+        s.command("EHLO client.test");
+
+        match s.command("AUTH PLAIN") {
+            Action::AwaitCredentials { mechanism, reply } => {
+                assert_eq!(mechanism, "PLAIN");
+                assert_eq!(reply.code, 334);
+            }
+            other => panic!("expected AwaitCredentials, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn auth_login_prompts_for_a_username() {
+        let mut s = session();
+        s.tls_established();
+        s.command("EHLO client.test");
+
+        match s.command("AUTH LOGIN") {
+            Action::AwaitCredentials { reply, .. } => {
+                // base64("Username:")
+                assert_eq!(reply.lines[0], "VXNlcm5hbWU6");
+            }
+            other => panic!("expected AwaitCredentials, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn unsupported_auth_mechanisms_are_declined() {
+        let mut s = session();
+        s.tls_established();
+        s.command("EHLO client.test");
+        assert_eq!(code_of(s.command("AUTH GSSAPI")), 504);
+        assert_eq!(code_of(s.command("AUTH")), 501);
     }
 
     #[test]
@@ -634,9 +800,75 @@ mod tests {
     }
 
     #[test]
-    fn esmtp_parameters_after_the_address_are_ignored() {
+    fn esmtp_parameters_after_the_address_are_accepted() {
         let mut s = session();
         assert_eq!(code_of(s.command("MAIL FROM:<a@b.com> SIZE=1024 BODY=8BITMIME")), 250);
+    }
+
+    #[test]
+    fn an_oversized_declared_message_is_refused_before_transfer() {
+        // Refusing at MAIL FROM costs one round trip; accepting and rejecting
+        // after DATA costs the whole upload, which on a home uplink matters.
+        let mut s = session();
+        let too_big = policy().max_message_bytes + 1;
+        let reply = reply_of(s.command(&format!("MAIL FROM:<a@b.com> SIZE={too_big}")));
+        assert_eq!(reply.code, 552);
+    }
+
+    #[test]
+    fn a_malformed_size_is_refused_rather_than_ignored() {
+        // Treating it as absent would let a client bypass the limit by
+        // corrupting the value.
+        let mut s = session();
+        assert_eq!(code_of(s.command("MAIL FROM:<a@b.com> SIZE=abc")), 501);
+        assert_eq!(code_of(s.command("MAIL FROM:<a@b.com> SIZE=")), 501);
+    }
+
+    #[test]
+    fn size_within_the_limit_is_accepted() {
+        let mut s = session();
+        assert_eq!(code_of(s.command("MAIL FROM:<a@b.com> SIZE=1024")), 250);
+    }
+
+    // ---- state machine holes ------------------------------------------------
+
+    #[test]
+    fn commands_are_not_interpreted_while_reading_message_content() {
+        // Every line during DATA is body text. Treating one as a command means
+        // this layer and the connection layer disagree about what the bytes
+        // are, which is how content becomes instructions.
+        let mut s = session();
+        s.command("MAIL FROM:<a@b.com>");
+        s.command("RCPT TO:<dave@example.com>");
+        s.command("DATA");
+        assert_eq!(s.state(), State::ReadingData);
+
+        assert_eq!(code_of(s.command("MAIL FROM:<attacker@evil.com>")), 503);
+        assert_eq!(code_of(s.command("RCPT TO:<victim@elsewhere.com>")), 503);
+        // The transaction is untouched.
+        let envelope = s.finish_data().unwrap();
+        assert_eq!(envelope.recipients.len(), 1);
+        assert_eq!(envelope.recipients[0].to_string(), "dave@example.com");
+    }
+
+    #[test]
+    fn the_session_stays_closed_after_quit() {
+        let mut s = session();
+        s.command("QUIT");
+        assert_eq!(s.state(), State::Closed);
+        // Continuing to answer would let a client keep a session alive past the
+        // point the server considers it over.
+        assert!(matches!(s.command("NOOP"), Action::Close(_)));
+        assert_eq!(code_of(s.command("MAIL FROM:<a@b.com>")), 421);
+    }
+
+    #[test]
+    fn finish_data_is_refused_outside_a_data_transfer() {
+        let mut s = session();
+        assert!(s.finish_data().is_none());
+        s.command("MAIL FROM:<a@b.com>");
+        s.command("RCPT TO:<dave@example.com>");
+        assert!(s.finish_data().is_none(), "envelope produced without DATA");
     }
 
     #[test]

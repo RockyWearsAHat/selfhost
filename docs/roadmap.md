@@ -37,11 +37,10 @@ can be published to a real browser.
 - **Test against the staging CA only.** Production allows five duplicate
   certificates per week.
 
-**Watch out:** the challenge must be served from the *cleartext* listener while
-the site itself redirects everything to HTTPS. The challenge path
-(`/.well-known/acme-challenge/*`) has to be exempted from that redirect, and it
-is easy to miss because the redirect is currently unconditional in
-`server.rs::dispatch`.
+**The redirect trap is already closed.** `/.well-known/acme-challenge/*` is
+exempt from the HTTPS redirect and served from `data/acme-challenges/`, with the
+token confined to a plain filename so a challenge fetch cannot become a
+traversal. The ACME client only has to write tokens into that directory.
 
 ### 2. SNI certificate selection
 
@@ -144,11 +143,7 @@ Written down so they are decisions rather than surprises.
 - **No response compression.** The matcher logic exists in `mime::is_compressible`
   but nothing calls it. Low priority for a video-heavy site, where most bytes are
   already compressed.
-- **No rate limiting.** Needed before exposing anything publicly.
-- **No access logging.** Health events log; requests do not.
-- **`Last-Modified` is never sent.** `files::build_response` accepts it and the
-  server passes `None`, so conditional requests always transfer the whole file.
-  Cheap to fix and a real bandwidth saving on repeat visits.
+- **No rate limiting.** The biggest remaining gap before public exposure.
 
 ## Things not to do
 

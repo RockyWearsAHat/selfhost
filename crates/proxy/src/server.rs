@@ -29,6 +29,11 @@ use tokio::net::{TcpListener, TcpStream};
 /// How long a connection may stay idle between requests before it is closed.
 const IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 
+/// Path prefix reserved for ACME HTTP-01 challenges.
+///
+/// Never routed to a site, and never redirected to HTTPS.
+pub const ACME_CHALLENGE_PREFIX: &str = "/.well-known/acme-challenge/";
+
 /// How long the request head may take to arrive.
 ///
 /// Bounds a slowloris: a client dribbling one byte at a time cannot hold a
@@ -53,6 +58,8 @@ pub struct Server {
     routes: BTreeMap<String, Arc<SiteRuntime>>,
     /// Sites in declaration order, for health tasks and diagnostics.
     sites: Vec<Arc<SiteRuntime>>,
+    /// Where ACME HTTP-01 tokens are written, when issuance is configured.
+    acme_challenge_dir: Option<PathBuf>,
 }
 
 impl Server {
@@ -82,7 +89,11 @@ impl Server {
             sites.push(runtime);
         }
 
-        Self { routes, sites }
+        Self {
+            routes,
+            sites,
+            acme_challenge_dir: Some(project_dir.join(&config.server.data_dir).join("acme-challenges")),
+        }
     }
 
     /// Looks up the site serving a hostname.
@@ -193,7 +204,20 @@ where
         buffer.drain(..consumed);
 
         let keep_alive = request.wants_keep_alive();
+        let started = std::time::Instant::now();
+        let host = request.host().unwrap_or_default();
+        let method = request.method.as_str().to_owned();
+        let target = request.target.clone();
+
         let outcome = dispatch(&server, &request, peer, is_tls, &mut stream, keep_alive).await?;
+
+        // One line per request. Without this there is no way to answer "is
+        // anyone actually reaching the site" except by guessing.
+        eprintln!(
+            "[access] {peer} {scheme} {host} {method} {target} {ms}ms",
+            scheme = if is_tls { "https" } else { "http" },
+            ms = started.elapsed().as_millis(),
+        );
 
         if !keep_alive || outcome == Outcome::MustClose {
             return Ok(());
@@ -273,8 +297,17 @@ where
         return Ok(Outcome::Reusable);
     };
 
-    // Cleartext exists only to send callers to HTTPS.
+    // Cleartext exists to send callers to HTTPS — with exactly one exception.
+    //
+    // An ACME HTTP-01 challenge is fetched over plain HTTP by the certificate
+    // authority, which does not follow redirects to a host whose certificate it
+    // has not issued yet. Redirecting this path would make issuance impossible,
+    // and the failure is confusing because everything else works. The exemption
+    // lives here so it cannot be forgotten when the ACME client lands.
     if !is_tls {
+        if request.path().starts_with(ACME_CHALLENGE_PREFIX) {
+            return serve_acme_challenge(server, request, stream, keep_alive).await;
+        }
         let target = format!("https://{}{}", runtime.site.canonical(), request.target);
         let response = Response::redirect(Status::PERMANENT_REDIRECT, &target)
             .unwrap_or_else(|_| Response::error_page(Status::BAD_REQUEST));
@@ -296,6 +329,43 @@ where
     }
 
     serve_static(runtime, request, stream, keep_alive).await
+}
+
+/// Serves an ACME HTTP-01 challenge token.
+///
+/// Tokens are written to `<data_dir>/acme-challenges/<token>` by the ACME client
+/// and removed once the order completes. Serving them here rather than through
+/// the normal static path keeps them off every site's document root — a token
+/// is proof of domain control and has no business being reachable as ordinary
+/// site content.
+async fn serve_acme_challenge<S>(
+    server: &Server,
+    request: &Request,
+    stream: &mut S,
+    keep_alive: bool,
+) -> io::Result<Outcome>
+where
+    S: AsyncWrite + Unpin,
+{
+    let token = &request.path()[ACME_CHALLENGE_PREFIX.len()..];
+
+    // The token is attacker-supplied, so it must be a single plain filename.
+    // Without this a challenge fetch would be a directory traversal.
+    let safe = !token.is_empty()
+        && token.len() <= 128
+        && token.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_');
+
+    let response = match (safe, &server.acme_challenge_dir) {
+        (true, Some(directory)) => match tokio::fs::read(directory.join(token)).await {
+            Ok(bytes) => Response::bytes(Status::OK, "text/plain", bytes)
+                .unwrap_or_else(|_| Response::error_page(Status::INTERNAL_SERVER_ERROR)),
+            Err(_) => Response::error_page(Status::NOT_FOUND),
+        },
+        _ => Response::error_page(Status::NOT_FOUND),
+    };
+
+    write_response(stream, response, keep_alive).await?;
+    Ok(Outcome::Reusable)
 }
 
 /// Serves a request from the site's static root.
@@ -334,7 +404,7 @@ where
 
     let mut file = tokio::fs::File::open(&path).await?;
     let metadata = file.metadata().await?;
-    let built = files::build_response(request, &path, metadata.len(), None);
+    let built = files::build_response(request, &path, metadata.len(), metadata.modified().ok());
 
     let mut head = Vec::new();
     built
@@ -571,6 +641,45 @@ mod tests {
         assert!(text.ends_with("\r\n\r\n"));
         // Exactly one blank line, or the body would start in the wrong place.
         assert_eq!(text.matches("\r\n\r\n").count(), 1);
+    }
+
+    #[test]
+    fn the_acme_challenge_prefix_is_the_well_known_path() {
+        // The CA fetches this over plain HTTP and does not follow a redirect to
+        // a host whose certificate it has not issued yet.
+        assert_eq!(ACME_CHALLENGE_PREFIX, "/.well-known/acme-challenge/");
+        assert!("/.well-known/acme-challenge/tok3n".starts_with(ACME_CHALLENGE_PREFIX));
+        assert!(!"/.well-known/other".starts_with(ACME_CHALLENGE_PREFIX));
+    }
+
+    #[test]
+    fn challenge_tokens_are_confined_to_plain_filenames() {
+        // The token comes off the wire, so without this a challenge fetch would
+        // be a directory traversal into the data directory.
+        let acceptable = |token: &str| {
+            !token.is_empty()
+                && token.len() <= 128
+                && token.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+        };
+
+        assert!(acceptable("LoqXcYV8q1ONbJls-hint7"));
+        assert!(!acceptable("../../../etc/passwd"));
+        assert!(!acceptable("a/b"));
+        assert!(!acceptable("a.b"));
+        assert!(!acceptable(""));
+        assert!(!acceptable(&"a".repeat(129)));
+    }
+
+    #[test]
+    fn the_challenge_directory_sits_under_the_data_directory() {
+        // Tokens are proof of domain control and must not be reachable as
+        // ordinary site content.
+        let config = config_with(vec![site("levelup", &["example.com"])]);
+        let server = Server::build(&config, std::path::Path::new("/srv/project"));
+        assert_eq!(
+            server.acme_challenge_dir.as_deref(),
+            Some(std::path::Path::new("/srv/project/./data/acme-challenges"))
+        );
     }
 
     #[test]

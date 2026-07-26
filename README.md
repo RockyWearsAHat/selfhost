@@ -46,7 +46,7 @@ whose job is to stay up unattended.
 
 ## Status
 
-**155 tests pass.** The proxy runs and serves. ACME, DNS, and the mail
+**183 tests pass.** The proxy runs and serves. ACME, DNS, and the mail
 connection layer do not exist yet — see [`docs/roadmap.md`](docs/roadmap.md) for
 the honest breakdown.
 
