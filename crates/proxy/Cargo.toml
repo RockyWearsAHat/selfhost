@@ -5,7 +5,17 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "TLS termination, static serving, reverse proxy, load balancing."
+description = "TLS termination, static serving with byte ranges, reverse proxy, and health-checked load balancing."
 
 [dependencies]
 selfhost-http = { workspace = true }
+selfhost-config = { workspace = true }
+tokio = { workspace = true }
+tokio-rustls = { workspace = true }
+rustls = { workspace = true }
+rustls-pemfile = { workspace = true }
+rcgen = { workspace = true }
+
+[lints.rust]
+unsafe_code = "forbid"
+missing_docs = "warn"
