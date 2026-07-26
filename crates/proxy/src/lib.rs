@@ -10,6 +10,14 @@
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
+pub mod files;
+pub mod health;
+pub mod mime;
+pub mod server;
+pub mod tls;
 pub mod upstream;
 
+pub use files::{Resolution, build_response, resolve};
+pub use server::{Server, SiteRuntime, serve_http, serve_https};
+pub use tls::{CertificateStore, TlsError, server_config};
 pub use upstream::{Lease, Pool, Upstream};
