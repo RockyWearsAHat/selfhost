@@ -1,0 +1,24 @@
+[package]
+name = "selfhost-admin"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "The loopback control API the console drives."
+
+[dependencies]
+selfhost-config = { workspace = true }
+selfhost-http = { workspace = true }
+selfhost-json = { workspace = true }
+selfhost-supervisor = { workspace = true }
+tokio = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time"] }
+
+[lints.rust]
+# Not `forbid`: generating the auth token asks the operating system for entropy,
+# which is FFI on Windows. Confined to `token::random_bytes`.
+unsafe_code = "deny"
+missing_docs = "warn"

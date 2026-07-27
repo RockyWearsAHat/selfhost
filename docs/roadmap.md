@@ -13,8 +13,11 @@ exercised against a running instance; anything else has not been written.
 | SMTP session + addresses | `crates/mail` | 48 | open-relay defence, credential protection, framing |
 | DNS wire format + resolver | `crates/dns` | 22 | compression pointers, loops, truncation, SOA contacts |
 | `doctor`, LAN assessment, DNS watch | `crates/cli` | 74 | service identified by behaviour, hardware named, one conclusion; a proxy lookup names the device that made it |
+| JSON values, parsing, serialisation | `crates/json` | 13 | control characters escaped, depth bounded, trailing input refused, surrogate pairs |
+| Service supervision | `crates/supervisor` | 45 | restart backoff and its reset, log gaps reported, process groups killed whole |
+| Service catalogue + control API | `crates/admin` | 26 | loopback-only bind, constant-time token, atomic catalogue writes |
 
-**279 tests.** Verified live: HTTPS 200, HTTP→HTTPS 308, `206` + `Content-Range`
+**384 tests.** Verified live: HTTPS 200, HTTP→HTTPS 308, `206` + `Content-Range`
 on a seek, `416` on an impossible range, `304` with zero bytes on both cache
 validators, `.m3u8`/`.ts` content types, traversal → 404, smuggling → 400, an
 ACME challenge served over cleartext while ordinary paths still redirect, and a
@@ -125,11 +128,24 @@ remote machine.
 Nightly dump plus an off-site copy. **Untested backups are not backups** —
 restore has to be exercised, not assumed.
 
-### 8. The GUI
+### 8. The console
 
-A rough draft exists at `gui/index.html` — static, with the real data shapes but
-no live data behind it. It needs a read-only admin API to become real. See
-[`gui.md`](gui.md).
+**The daemon half is done and verified.** `selfhost daemon` supervises arbitrary
+services — MongoDB, a NAS daemon, a site's backend — and serves a loopback
+control API the console drives. Restart policy, log capture, the catalogue, and
+process-group teardown are tested against real processes.
+
+What is left is the desktop client and the toolkit it is drawn with. Both are
+written here rather than depended on; see [`gui.md`](gui.md) for the shape, the
+daemon/client split, and why text rendering is delegated to the platform.
+
+Two things reach the console from elsewhere on this list: a **secured SSH
+transport**, so one console drives a remote machine without the control port ever
+being public, and **GitHub monitoring**, so a push redeploys and restarts a
+service. Both have working prior art in `RockyWearsAHat/windows-service-manager`.
+
+The old static mock at `gui/index.html` predates this design and survives only as
+a reference for the sites-and-certificates view.
 
 ## Known limitations in what is already built
 

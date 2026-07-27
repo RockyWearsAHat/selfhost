@@ -565,6 +565,7 @@ mod tests {
                 acme_email: "a@b.com".into(),
                 acme: AcmeEnvironment::SelfSigned,
                 data_dir: PathBuf::from("./data"),
+                admin_bind: "127.0.0.1:9191".into(),
             },
             nodes: vec![Node { name: "home".into(), role: Role::Owner, mesh_ip: None }],
             sites,

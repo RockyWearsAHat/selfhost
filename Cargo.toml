@@ -1,11 +1,14 @@
 [workspace]
 resolver = "3"
 members = [
+    "crates/admin",
     "crates/config",
     "crates/dns",
     "crates/http",
+    "crates/json",
     "crates/mail",
     "crates/proxy",
+    "crates/supervisor",
     "crates/cli",
 ]
 
@@ -37,11 +40,14 @@ rcgen = "0.13"
 serde = { version = "1", features = ["derive"] }
 toml = "0.8"
 
+selfhost-admin = { path = "crates/admin" }
 selfhost-config = { path = "crates/config" }
 selfhost-dns = { path = "crates/dns" }
 selfhost-http = { path = "crates/http" }
+selfhost-json = { path = "crates/json" }
 selfhost-mail = { path = "crates/mail" }
 selfhost-proxy = { path = "crates/proxy" }
+selfhost-supervisor = { path = "crates/supervisor" }
 
 [profile.release]
 opt-level = 3

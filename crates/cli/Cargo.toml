@@ -12,10 +12,12 @@ name = "selfhost"
 path = "src/main.rs"
 
 [dependencies]
+selfhost-admin = { workspace = true }
 selfhost-config = { workspace = true }
 selfhost-dns = { workspace = true }
 selfhost-proxy = { workspace = true }
 selfhost-http = { workspace = true }
+selfhost-supervisor = { workspace = true }
 tokio = { workspace = true }
 rustls = { workspace = true }
 
