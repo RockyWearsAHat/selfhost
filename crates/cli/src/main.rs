@@ -8,12 +8,17 @@ mod doctor;
 mod identify;
 mod investigate;
 mod oui;
+mod proxyware;
+mod watch;
 
 use selfhost_config::{AcmeEnvironment, Config};
+use selfhost_dns::Resolver;
 use selfhost_proxy::{CertificateStore, Server, serve_http, serve_https, server_config};
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+use std::time::Instant;
 use tokio::net::TcpListener;
 
 /// Name of the config file, looked for in the current directory and its parents.
@@ -31,6 +36,9 @@ Commands
   routes                     Show which hostname maps to which site
   doctor [--deep] [--scan-lan]
                              Diagnose, and chase the cause of anything broken
+  watch-dns [--bind <addr>] [--upstream <addr>]
+                             Answer DNS for the network and name the device
+                             asking for a residential proxy service
   run                        Start the proxy in the foreground
   help                       Show this message
 
@@ -46,6 +54,7 @@ fn main() -> ExitCode {
         "check" => check(),
         "routes" => routes(),
         "doctor" => doctor_command(&arguments),
+        "watch-dns" => watch_command(&arguments),
         "run" => run(),
         "help" | "--help" | "-h" => {
             eprint!("{USAGE}");
@@ -214,6 +223,87 @@ fn doctor_command(arguments: &[String]) -> Result<(), String> {
         return Err("some checks failed — see the arrows above for what to do".into());
     }
     Ok(())
+}
+
+/// The value following a named option, if it was given.
+fn value_of(arguments: &[String], name: &str) -> Option<String> {
+    arguments.iter().position(|argument| argument == name).and_then(|at| arguments.get(at + 1)).cloned()
+}
+
+/// Watches the network's DNS to find the device behind a compromised-host listing.
+///
+/// Needs no config: this diagnoses the network rather than the deployment, and
+/// requiring a config file would stop it running on the machine that happens to
+/// be handy.
+fn watch_command(arguments: &[String]) -> Result<(), String> {
+    let bind: SocketAddr = match value_of(arguments, "--bind") {
+        Some(given) => given.parse().map_err(|e| format!("--bind {given}: {e}"))?,
+        None => "0.0.0.0:53".parse().expect("literal bind address"),
+    };
+    let upstream: SocketAddr = match value_of(arguments, "--upstream") {
+        Some(given) => given.parse().map_err(|e| format!("--upstream {given}: {e}"))?,
+        None => Resolver::system().address(),
+    };
+
+    // Forwarding to ourselves would answer every question with the question.
+    if upstream.port() == bind.port()
+        && (upstream.ip() == bind.ip() || Some(upstream.ip()) == investigate::local_address().map(Into::into))
+    {
+        return Err(format!(
+            "--upstream {upstream} is this machine, so every query would be forwarded back here.\n  \
+             Pass the address of a resolver outside this network, for example:\n  \
+             selfhost watch-dns --upstream 1.1.1.1:53"
+        ));
+    }
+
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| format!("could not start the async runtime: {e}"))?;
+
+    runtime.block_on(watch_dns(bind, upstream))
+}
+
+/// Serves DNS until interrupted, then reports what was seen.
+async fn watch_dns(bind: SocketAddr, upstream: SocketAddr) -> Result<(), String> {
+    let watch = Arc::new(Mutex::new(watch::Watch::default()));
+    let here = investigate::local_address()
+        .map(|address| address.to_string())
+        .unwrap_or_else(|| "this machine's LAN address".to_owned());
+
+    println!("Watching DNS on {bind}, forwarding to {upstream}.\n");
+    println!("Nothing is blocked or rewritten — every query goes upstream unchanged.\n");
+    println!("For this to see anything, the devices have to ask *here*:");
+    println!("  1. In the router, set the DHCP DNS server to {here}.");
+    println!("  2. Reboot the devices, or wait for their leases to renew.");
+    println!("  3. Optionally block outbound 53 and 853 for every device except this one,");
+    println!("     which closes the gap for firmware with a hardcoded resolver.\n");
+    println!("Leave this running. Ctrl-C prints the conclusion.\n");
+
+    let started = Instant::now();
+    let serving = watch::serve(bind, upstream, Arc::clone(&watch));
+
+    let outcome = tokio::select! {
+        result = serving => result.map_err(|error| match error.kind() {
+            std::io::ErrorKind::PermissionDenied => format!(
+                "cannot bind {bind}: port 53 needs privilege.\n  \
+                 Run it with sudo, or on Linux grant the capability once:\n  \
+                 sudo setcap 'cap_net_bind_service=+ep' ./target/release/selfhost"
+            ),
+            std::io::ErrorKind::AddrInUse => format!(
+                "cannot bind {bind}: something already answers DNS on this machine.\n  \
+                 On macOS that is usually a VPN client or Internet Sharing."
+            ),
+            _ => format!("DNS watch stopped: {error}"),
+        }),
+        _ = tokio::signal::ctrl_c() => Ok(()),
+    };
+
+    let elapsed = started.elapsed();
+    let report = watch.lock().expect("the watch mutex is never held across a panic").report();
+    println!("\n─── after {} minute(s) ───\n\n{report}", elapsed.as_secs() / 60);
+
+    outcome
 }
 
 /// Starts the proxy and blocks until interrupted.

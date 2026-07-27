@@ -46,9 +46,9 @@ whose job is to stay up unattended.
 
 ## Status
 
-**183 tests pass.** The proxy runs and serves. ACME, DNS, and the mail
-connection layer do not exist yet — see [`docs/roadmap.md`](docs/roadmap.md) for
-the honest breakdown.
+**279 tests pass.** The proxy runs and serves. ACME, the authoritative DNS
+server, and the mail connection layer do not exist yet — see
+[`docs/roadmap.md`](docs/roadmap.md) for the honest breakdown.
 
 Verified against a running instance, not only in unit tests: HTTPS with
 keep-alive, HTTP→HTTPS redirect preserving path and query, `206` + `Content-Range`
@@ -58,7 +58,9 @@ traffic moves with no failed requests; restarted, it returns unaided.
 
 New here? Start with [`docs/getting-started.md`](docs/getting-started.md).
 Something not working? Run `selfhost doctor --deep` and see
-[`docs/troubleshooting.md`](docs/troubleshooting.md).
+[`docs/troubleshooting.md`](docs/troubleshooting.md). Blocklisted, and the LAN
+scan settles nothing? `selfhost watch-dns` answers DNS for the network and names
+the device asking for a residential proxy service.
 
 ## Layout
 

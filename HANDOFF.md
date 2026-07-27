@@ -60,7 +60,7 @@ up unattended. We hit this live during the session — the stack needed
 
 ## 3. State — done vs not
 
-**257 tests pass.** `cargo test --workspace`.
+**279 tests pass.** `cargo test --workspace`.
 
 | crate | what | tests |
 |---|---|---|
@@ -68,8 +68,8 @@ up unattended. We hit this live during the session — the stack needed
 | `crates/config` | Config model + validation | 18 |
 | `crates/proxy` | TLS, static+Range, caching, routing, LB, health | 60 |
 | `crates/mail` | Addresses + SMTP session state machine | 48 |
-| `crates/dns` | DNS wire format + resolver | 19 |
-| `crates/cli` | The `selfhost` binary, `doctor`, LAN device assessment | 55 |
+| `crates/dns` | DNS wire format + resolver | 22 |
+| `crates/cli` | The `selfhost` binary, `doctor`, LAN device assessment, `watch-dns` | 74 |
 
 **Verified against a running instance,** not only in unit tests: HTTPS 200,
 HTTP→HTTPS 308 preserving path and query, `206` + `Content-Range` on a seek,
@@ -97,9 +97,19 @@ tunnel-based designs that existed to survive CGNAT are unnecessary.
 
 **Mail is the genuinely hard part, and it is environmental, not code:**
 
-- Spamhaus **XBL + CSS listed** — but IP-specific; sampled `/24` neighbours are
-  clean, so self-service removal should stick. (XBL is the compromised-host
-  list, so something on the LAN may have earned it — worth telling him again.)
+- Spamhaus **XBL + CSS listed** — IP-specific; sampled `/24` neighbours are
+  clean, so the cause is on this network. **Read on 2026-07-27 from the listing
+  detail itself**, which is the evidence that matters and is not fetchable by
+  code (Cloudflare refuses non-browser requests):
+  - Spamhaus classifies `172.83.7.210` as **part of a proxy network** — malware
+    installing a proxy on some device, sending spam **directly to port 25**.
+  - Most recent connection they logged: **2026-07-26 19:30 UTC, HELO
+    `[172.19.0.8]`**. That address is not on the `192.168.1.0/24` LAN, so the
+    sender sits behind a *second* NAT layer — a container, a VM, or a VPN app's
+    virtual adapter on one of the devices. It is invisible to a LAN sweep twice
+    over.
+  - The delisting form **rejects free webmail** (`@gmail` and the rest). Use an
+    address at a domain he controls.
 - **FCrDNS fails**: the PTR `172-83-7-210.ip.fdtnet.net` has no forward A
   record. This one needs FirstDigital to fix or delegate.
 - Outbound port 25 is **open**, and inbound mail is unaffected by any of it.
@@ -126,9 +136,12 @@ In order, with the reasoning in `docs/roadmap.md`:
 
 ## 6. Open questions for him
 
-1. **Has he requested Spamhaus delisting, and opened a ticket with FirstDigital
-   about the missing forward record for his PTR?** Both are prerequisites for
-   `direct` outbound mail and neither is something code can do.
+1. **Has the proxy device been found and taken off the network, and has he
+   opened a ticket with FirstDigital about the missing forward record for his
+   PTR?** Delisting before the device is found earns a second, stickier listing —
+   XBL expires on its own once the behaviour stops. `selfhost watch-dns` is the
+   vantage point that names the device, but it only sees devices the router has
+   pointed at this machine, which is a change he has to make in the router.
 2. **Is the Windows PC available yet, and what are its specs?** Everything has
    been built and tested on the Mac. Nothing is Mac-specific, and the
    cross-compile targets are installed, but it has never been run on Windows.

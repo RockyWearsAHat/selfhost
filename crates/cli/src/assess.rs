@@ -234,6 +234,7 @@ pub fn assess(survey: &LanSurvey, mappings: &[PortMapping], local: Ipv4Addr) -> 
             judge(identity, device, mappings, local, network_is_talkative)
         })
         .collect();
+    assessments.extend(forwarded_but_unseen(survey, mappings, local));
 
     assessments.sort_by(|a, b| b.standing.cmp(&a.standing).then(a.address.cmp(&b.address)));
     let (notable, consistent): (Vec<_>, Vec<_>) =
@@ -242,6 +243,91 @@ pub fn assess(survey: &LanSurvey, mappings: &[PortMapping], local: Ipv4Addr) -> 
     let summary = summarise(&notable, &consistent);
     let next_step = next_step(&notable);
     Conclusion { summary, next_step, notable, consistent }
+}
+
+/// Addresses the router forwards to that answered nothing at all.
+///
+/// # Why an address with no device behind it is worth a line
+///
+/// The sweep and the router's forwarding table are two separate observations,
+/// and the interesting case is the one where they disagree. A mapping exists
+/// because something asked for it — almost always over UPnP, which any program
+/// can use without telling anyone — so an address holding a hole open while
+/// answering no probe, publishing no name, and not even appearing in the ARP
+/// cache is the one address on the network that went out of its way to be
+/// reachable and then said nothing.
+///
+/// It is [`Standing::Unresolved`] rather than a suspicion, because a mapping
+/// outlives whatever created it: a laptop that opened one and left the house
+/// leaves exactly this trace.
+fn forwarded_but_unseen(
+    survey: &LanSurvey,
+    mappings: &[PortMapping],
+    local: Ipv4Addr,
+) -> Vec<Assessment> {
+    let seen: Vec<Ipv4Addr> = survey
+        .inventory
+        .iter()
+        .map(|identity| identity.address)
+        .chain(survey.devices.iter().map(|device| device.address))
+        .chain(std::iter::once(local))
+        .collect();
+
+    let mut unseen: Vec<Ipv4Addr> = mappings
+        .iter()
+        .filter_map(|mapping| mapping.internal_client.parse::<Ipv4Addr>().ok())
+        .filter(|address| !seen.contains(address))
+        .collect();
+    unseen.sort();
+    unseen.dedup();
+
+    unseen
+        .into_iter()
+        .map(|address| {
+            let theirs: Vec<&PortMapping> = mappings
+                .iter()
+                .filter(|mapping| mapping.internal_client == address.to_string())
+                .collect();
+            let ports = theirs
+                .iter()
+                .map(|mapping| format!("{}/{}", mapping.external_port, mapping.protocol))
+                .collect::<Vec<_>>()
+                .join(", ");
+
+            let mut because = vec![format!(
+                "The router forwards {ports} to this address, so something there asked for a hole \
+                 through the firewall — but it answered nothing when the network was swept: no \
+                 open port, no name, and no entry in this machine's ARP cache.",
+            )];
+            if theirs.iter().any(|mapping| mapping.description.to_ascii_lowercase().contains("teredo"))
+            {
+                because.push(
+                    "The mapping calls itself Teredo, which is an IPv6 tunnel. While it is open \
+                     that device has a public IPv6 address of its own, so \"the router forwards \
+                     nothing\" does not cover it — it is reachable from the internet by a route \
+                     the IPv4 forwarding table does not describe."
+                        .to_owned(),
+                );
+            }
+            because.push(
+                "This is not an accusation. A mapping outlives whatever created it, so a device \
+                 that has since left the network leaves exactly this trace."
+                    .to_owned(),
+            );
+
+            Assessment {
+                address,
+                what_it_is: "did not answer the sweep at all".to_owned(),
+                standing: Standing::Unresolved,
+                because,
+                decisive_test: Some(format!(
+                    "The router's DHCP client list names whatever holds the {address} lease. If \
+                     nothing holds it, the mapping is stale and can be deleted; if something does, \
+                     it is the one device here that asked to be reachable and then stayed quiet."
+                )),
+            }
+        })
+        .collect()
 }
 
 /// Judges one device against what its hardware is supposed to do.
@@ -506,14 +592,20 @@ fn next_step(notable: &[Assessment]) -> String {
                        on. That stops any spam immediately, and the log then names the internal \
                        address that tried to send — which is the only vantage point that can see \
                        it, since a device relaying for its controller never answers us.";
+    // The scan can only ever report what answered it. Naming the device that
+    // answers nothing takes a different vantage point, so the reader is sent
+    // there rather than left with a shrug.
+    let watch_step = "Then run `selfhost watch-dns` and point the router's DHCP DNS at this \
+                      machine. Proxy software has to look its controller up by name before it can \
+                      relay anything, and that lookup names the device.";
 
     match suspects.first() {
         Some(suspect) => format!(
             "{router_step} Power off {} first: it is the strongest candidate, and if the log stays \
-             quiet while it is off, that is your answer.",
+             quiet while it is off, that is your answer. {watch_step}",
             suspect.address
         ),
-        None => router_step.to_owned(),
+        None => format!("{router_step} {watch_step}"),
     }
 }
 
@@ -691,6 +783,67 @@ mod tests {
         let laptop = conclusion.notable.iter().find(|a| a.address.octets()[3] == 30).unwrap();
         assert_eq!(laptop.standing, Standing::PrimeSuspect);
         assert!(laptop.because.join(" ").contains("forwards port 1080"));
+    }
+
+    /// The mapping a real scan of this network turned up: a UPnP hole punched
+    /// for an address that appeared nowhere else in the results.
+    fn teredo_mapping(last: u8) -> PortMapping {
+        PortMapping {
+            external_port: 56618,
+            internal_client: format!("192.168.1.{last}"),
+            internal_port: 56618,
+            protocol: "UDP".to_owned(),
+            description: format!("Teredo 192.168.1.{last}:56618->56618 UDP"),
+        }
+    }
+
+    #[test]
+    fn a_forward_to_a_device_that_answered_nothing_is_raised() {
+        // Found by running this for real: the router forwarded a port to
+        // 192.168.1.5, which appeared in no other part of the output — not in
+        // the inventory, not in the sweep. Two observations disagreeing is
+        // exactly the finding, and the old code printed each of them separately
+        // and never compared them.
+        let conclusion =
+            assess(&household(vec![], vec![]), &[teredo_mapping(5)], Ipv4Addr::new(192, 168, 1, 31));
+
+        let unseen = conclusion
+            .notable
+            .iter()
+            .find(|a| a.address == Ipv4Addr::new(192, 168, 1, 5))
+            .expect("an address with a forward but no device behind it is worth a line");
+        assert_eq!(unseen.standing, Standing::Unresolved);
+
+        let reasoning = unseen.because.join(" ");
+        assert!(reasoning.contains("56618/UDP"), "name the hole it holds open");
+        assert!(reasoning.contains("ARP cache"), "say what was looked for and not found");
+        assert!(reasoning.contains("IPv6 tunnel"), "Teredo changes what reachability means");
+        // The trap this whole module is built against.
+        assert!(reasoning.contains("not an accusation"));
+        assert!(unseen.decisive_test.as_ref().unwrap().contains("DHCP client list"));
+    }
+
+    #[test]
+    fn a_forward_to_a_device_the_sweep_already_saw_adds_nothing() {
+        // The printer is in the inventory, so it is judged once, by the rules
+        // that have its identity to work with.
+        let conclusion =
+            assess(&household(vec![], vec![]), &[teredo_mapping(14)], Ipv4Addr::new(192, 168, 1, 31));
+
+        let appearances = conclusion
+            .notable
+            .iter()
+            .chain(conclusion.consistent.iter())
+            .filter(|a| a.address == Ipv4Addr::new(192, 168, 1, 14))
+            .count();
+        assert_eq!(appearances, 1, "one device, one assessment");
+    }
+
+    #[test]
+    fn a_forward_to_this_machine_is_not_a_mystery_device() {
+        let local = Ipv4Addr::new(192, 168, 1, 31);
+        let conclusion = assess(&household(vec![], vec![]), &[teredo_mapping(31)], local);
+        assert!(conclusion.notable.iter().all(|a| a.address != local));
     }
 
     #[test]
