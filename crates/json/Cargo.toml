@@ -1,0 +1,14 @@
+[package]
+name = "selfhost-json"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "JSON values, parsing, and serialisation. Pure, no I/O, no dependencies."
+
+[dependencies]
+
+[lints.rust]
+unsafe_code = "forbid"
+missing_docs = "warn"

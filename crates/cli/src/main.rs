@@ -11,8 +11,10 @@ mod oui;
 mod proxyware;
 mod watch;
 
+use selfhost_admin::{Api, Store, Token};
 use selfhost_config::{AcmeEnvironment, Config};
 use selfhost_dns::Resolver;
+use selfhost_supervisor::Supervisor;
 use selfhost_proxy::{CertificateStore, Server, serve_http, serve_https, server_config};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
@@ -40,6 +42,9 @@ Commands
                              Answer DNS for the network and name the device
                              asking for a residential proxy service
   run                        Start the proxy in the foreground
+  daemon [--bind <addr>]     Run the services and the control API the console
+                             connects to
+  services                   List the installed services and what they are doing
   help                       Show this message
 
 Config lives in selfhost.config.toml. Everything else is derived from it.
@@ -56,6 +61,8 @@ fn main() -> ExitCode {
         "doctor" => doctor_command(&arguments),
         "watch-dns" => watch_command(&arguments),
         "run" => run(),
+        "daemon" => daemon_command(&arguments),
+        "services" => services_command(),
         "help" | "--help" | "-h" => {
             eprint!("{USAGE}");
             Ok(())
@@ -304,6 +311,140 @@ async fn watch_dns(bind: SocketAddr, upstream: SocketAddr) -> Result<(), String>
     println!("\n─── after {} minute(s) ───\n\n{report}", elapsed.as_secs() / 60);
 
     outcome
+}
+
+/// Runs the supervised services and the control API the console drives.
+///
+/// Separate from `run` for now: `run` serves websites, this runs services. They
+/// merge once the console can drive both from one place.
+fn daemon_command(arguments: &[String]) -> Result<(), String> {
+    let (config, project_dir) = load()?;
+    let bind = value_of(arguments, "--bind").unwrap_or_else(|| config.server.admin_bind.clone());
+    let address: SocketAddr = bind.parse().map_err(|e| format!("--bind {bind}: {e}"))?;
+
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| format!("could not start the async runtime: {e}"))?;
+
+    runtime.block_on(serve_daemon(config, project_dir, address))
+}
+
+/// Loads the catalogue, starts everything automatic, and serves the API.
+async fn serve_daemon(
+    config: Config,
+    project_dir: PathBuf,
+    address: SocketAddr,
+) -> Result<(), String> {
+    let data_dir = project_dir.join(&config.server.data_dir);
+    std::fs::create_dir_all(&data_dir)
+        .map_err(|e| format!("cannot create {}: {e}", data_dir.display()))?;
+
+    let store = Store::new(&data_dir);
+    let node_names: Vec<&str> = config.nodes.iter().map(|n| n.name.as_str()).collect();
+    let catalog = store.load(&node_names).map_err(|e| e.to_string())?;
+
+    let token = Token::load_or_create(&data_dir).map_err(|e| e.to_string())?;
+    let supervisor = Supervisor::new(&project_dir);
+
+    let listener = selfhost_admin::bind(address).await.map_err(|e| e.to_string())?;
+
+    println!("selfhost daemon");
+    println!("  control api  http://{address}");
+    println!("  token        {}", Token::path_in(&data_dir).display());
+    println!("  catalogue    {}", store.path().display());
+    if catalog.services.is_empty() {
+        println!("\nNo services installed yet. Install one from the console, or add it to");
+        println!("{}.", store.path().display());
+    } else {
+        println!("\n{} service(s):", catalog.services.len());
+        for spec in &catalog.services {
+            println!("  {:<20} {}", spec.name, spec.program.display());
+        }
+    }
+    println!("\nReach this from another machine by tunnelling, never by binding publicly:");
+    println!("  ssh -L {0}:127.0.0.1:{0} <this-host>", address.port());
+    println!("\nCtrl-C to stop.");
+
+    supervisor.load(&catalog).await;
+
+    let api = Api::new(supervisor.clone(), store, token);
+    let outcome = tokio::select! {
+        result = selfhost_admin::serve(listener, api) => {
+            result.map_err(|e| format!("the control api stopped: {e}"))
+        }
+        _ = shutdown_signal() => Ok(()),
+    };
+
+    // Stop children the way their specs ask rather than letting process teardown
+    // orphan or kill them.
+    println!("\nstopping services");
+    supervisor.shutdown().await;
+    outcome
+}
+
+/// Waits for whichever signal means "stop", so children are stopped rather than
+/// orphaned.
+///
+/// Ctrl-C alone is not enough. The daemon's whole purpose is to run under an
+/// operating-system service manager, and `systemd`, `launchd`, and the Windows
+/// SCM all stop a service by sending `SIGTERM` (or its equivalent) — never by
+/// sending an interrupt. A daemon that handles only Ctrl-C therefore dies without
+/// running its shutdown on every *real* stop, leaving every supervised service
+/// running and holding its ports, which then makes the restart fail to bind.
+#[cfg(unix)]
+async fn shutdown_signal() {
+    use tokio::signal::unix::{SignalKind, signal};
+
+    let mut terminate = match signal(SignalKind::terminate()) {
+        Ok(stream) => stream,
+        // Losing the handler must not take the daemon with it; Ctrl-C still works.
+        Err(error) => {
+            eprintln!("warning: cannot listen for SIGTERM ({error}); Ctrl-C still stops cleanly");
+            let _ = tokio::signal::ctrl_c().await;
+            return;
+        }
+    };
+
+    tokio::select! {
+        _ = tokio::signal::ctrl_c() => {}
+        _ = terminate.recv() => {}
+    }
+}
+
+/// On Windows, Ctrl-C and the SCM's stop both arrive through the console handler.
+#[cfg(not(unix))]
+async fn shutdown_signal() {
+    let _ = tokio::signal::ctrl_c().await;
+}
+
+/// Prints the installed services and their configured start behaviour.
+///
+/// Reads the catalogue directly rather than asking a running daemon, so it
+/// answers even when nothing is running — which is exactly when someone asks.
+fn services_command() -> Result<(), String> {
+    let (config, project_dir) = load()?;
+    let data_dir = project_dir.join(&config.server.data_dir);
+    let store = Store::new(&data_dir);
+    let node_names: Vec<&str> = config.nodes.iter().map(|n| n.name.as_str()).collect();
+    let catalog = store.load(&node_names).map_err(|e| e.to_string())?;
+
+    if catalog.services.is_empty() {
+        println!("no services installed — {} does not exist yet", store.path().display());
+        return Ok(());
+    }
+
+    let width = catalog.services.iter().map(|s| s.name.len()).max().unwrap_or(0).max(4);
+    println!("  {:<width$}  {:<10}  {}", "NAME", "START", "PROGRAM");
+    for spec in &catalog.services {
+        let mode = match spec.start_mode {
+            selfhost_config::StartMode::Automatic => "automatic",
+            selfhost_config::StartMode::Manual => "manual",
+            selfhost_config::StartMode::Disabled => "disabled",
+        };
+        println!("  {:<width$}  {mode:<10}  {}", spec.name, spec.program.display());
+    }
+    Ok(())
 }
 
 /// Starts the proxy and blocks until interrupted.

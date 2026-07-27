@@ -1,0 +1,23 @@
+[package]
+name = "selfhost-supervisor"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Starts services, keeps them running, and captures their output."
+
+[dependencies]
+selfhost-config = { workspace = true }
+selfhost-json = { workspace = true }
+tokio = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time"] }
+
+[lints.rust]
+# Not `forbid`: stopping a process gracefully means naming the platform's own
+# signal call, which is FFI. It is confined to child::stop_gracefully and every
+# use is individually allowed, so an accidental one still fails the build.
+unsafe_code = "deny"
+missing_docs = "warn"

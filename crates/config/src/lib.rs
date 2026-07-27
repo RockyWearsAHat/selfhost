@@ -11,6 +11,7 @@
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
+pub mod service;
 pub mod validate;
 
 use serde::{Deserialize, Serialize};
@@ -18,6 +19,7 @@ use std::collections::BTreeMap;
 use std::fmt;
 use std::path::{Path, PathBuf};
 
+pub use service::{RestartPolicy, ServiceCatalog, ServiceSpec, StartMode};
 pub use validate::{ConfigError, Problem};
 
 /// A complete deployment.
@@ -52,6 +54,14 @@ pub struct Server {
     /// Directory holding persistent state: certificates, databases, mail, backups.
     #[serde(default = "default_data_dir")]
     pub data_dir: PathBuf,
+    /// Address the service-control API binds.
+    ///
+    /// Loopback, and refused if it is not — whoever reaches this port controls
+    /// every service on the machine. The console reaches a remote daemon by
+    /// tunnelling this port over SSH, so the encryption and the authentication
+    /// are OpenSSH's rather than something invented here.
+    #[serde(default = "default_admin_bind")]
+    pub admin_bind: String,
 }
 
 fn default_http_bind() -> String {
@@ -64,6 +74,11 @@ fn default_https_bind() -> String {
 
 fn default_data_dir() -> PathBuf {
     PathBuf::from("./data")
+}
+
+/// The admin API's default bind: loopback, on a port unlikely to collide.
+fn default_admin_bind() -> String {
+    "127.0.0.1:9191".to_owned()
 }
 
 /// Which certificate authority to ask for certificates.
@@ -319,6 +334,7 @@ mod tests {
             acme_email: "a@b.com".into(),
             acme: AcmeEnvironment::SelfSigned,
             data_dir: default_data_dir(),
+            admin_bind: default_admin_bind(),
         }
     }
 

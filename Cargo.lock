@@ -321,14 +321,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "selfhost-admin"
+version = "0.1.0"
+dependencies = [
+ "selfhost-config",
+ "selfhost-http",
+ "selfhost-json",
+ "selfhost-supervisor",
+ "tokio",
+]
+
+[[package]]
 name = "selfhost-cli"
 version = "0.1.0"
 dependencies = [
  "rustls",
+ "selfhost-admin",
  "selfhost-config",
  "selfhost-dns",
  "selfhost-http",
  "selfhost-proxy",
+ "selfhost-supervisor",
  "tokio",
 ]
 
@@ -352,6 +365,10 @@ name = "selfhost-http"
 version = "0.1.0"
 
 [[package]]
+name = "selfhost-json"
+version = "0.1.0"
+
+[[package]]
 name = "selfhost-mail"
 version = "0.1.0"
 dependencies = [
@@ -370,6 +387,15 @@ dependencies = [
  "selfhost-http",
  "tokio",
  "tokio-rustls",
+]
+
+[[package]]
+name = "selfhost-supervisor"
+version = "0.1.0"
+dependencies = [
+ "selfhost-config",
+ "selfhost-json",
+ "tokio",
 ]
 
 [[package]]
