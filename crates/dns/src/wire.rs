@@ -433,6 +433,31 @@ fn read_name(buffer: &[u8], start: usize) -> Result<(String, usize), WireError> 
     Ok((labels.join("."), after_pointer.unwrap_or(position)))
 }
 
+/// Reads the question a message is asking, without decoding the rest of it.
+///
+/// Exists for the forwarding side of DNS rather than the resolving side: a
+/// server that relays a query onward still needs to know what was asked, and
+/// decoding the whole message to find out would mean parsing attacker-supplied
+/// records it has no reason to look at.
+///
+/// Returns `None` for a message carrying no question, which is malformed for a
+/// query but not worth an error — it is forwarded unchanged either way.
+pub fn question_of(buffer: &[u8]) -> Result<Option<(String, RecordType)>, WireError> {
+    if buffer.len() < 12 {
+        return Err(WireError::Truncated);
+    }
+    if u16::from_be_bytes([buffer[4], buffer[5]]) == 0 {
+        return Ok(None);
+    }
+
+    let (name, next) = read_name(buffer, 12)?;
+    let record_type = buffer
+        .get(next..next + 2)
+        .map(|bytes| RecordType::from_code(u16::from_be_bytes([bytes[0], bytes[1]])))
+        .ok_or(WireError::Truncated)?;
+    Ok(Some((name, record_type)))
+}
+
 /// Decodes a response message.
 pub fn decode_response(buffer: &[u8]) -> Result<Response, WireError> {
     if buffer.len() < 12 {
@@ -541,6 +566,34 @@ mod tests {
         assert_eq!(&query[4..6], &[0x00, 0x01], "one question");
         // 7"example" 3"com" 0
         assert_eq!(&query[12..], b"\x07example\x03com\x00\x00\x01\x00\x01");
+    }
+
+    #[test]
+    fn reads_the_question_out_of_a_query() {
+        // What a forwarding resolver needs: the name asked, without decoding
+        // records it has no reason to look at.
+        let query = encode_query(0x1234, "pawns.app", RecordType::A).unwrap();
+        assert_eq!(
+            question_of(&query).unwrap(),
+            Some(("pawns.app".to_owned(), RecordType::A))
+        );
+    }
+
+    #[test]
+    fn a_message_with_no_question_is_not_an_error() {
+        // Malformed for a query, but a forwarder passes it on either way, so
+        // failing here would turn a curiosity into an outage.
+        let mut header = vec![0_u8; 12];
+        header[0] = 0xab;
+        assert_eq!(question_of(&header).unwrap(), None);
+    }
+
+    #[test]
+    fn a_truncated_question_is_refused_rather_than_guessed() {
+        let query = encode_query(1, "example.com", RecordType::A).unwrap();
+        // Cut the type off the end: the name reads, the type cannot.
+        assert!(matches!(question_of(&query[..query.len() - 3]), Err(WireError::Truncated)));
+        assert!(matches!(question_of(&[0, 1, 2]), Err(WireError::Truncated)));
     }
 
     #[test]

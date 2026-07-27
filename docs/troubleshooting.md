@@ -6,6 +6,8 @@ Start here:
 selfhost doctor              # everything checkable without sending traffic
 selfhost doctor --deep       # also opens real connections to Gmail and Outlook
 selfhost doctor --scan-lan   # also shortlists devices on your network
+selfhost watch-dns           # answers DNS for the network and names the device
+                             # asking for a residential proxy service
 ```
 
 You do not need to know how any of this is built to read the output. Each check
@@ -263,6 +265,21 @@ asked for**. UPnP lets any program on your network punch a hole in the firewall
 silently, which is a common way a machine becomes internet-reachable without its
 owner knowing.
 
+The forwarding table and the sweep are compared, because the interesting case is
+where they disagree — a forward pointing at an address that answered nothing:
+
+```
+  [WARN] 192.168.1.5 — not ruled out
+         did not answer the sweep at all
+      →  The router forwards 56618/UDP to this address … no open port, no name,
+         and no entry in this machine's ARP cache. The mapping calls itself
+         Teredo, which is an IPv6 tunnel …
+```
+
+It is `not ruled out` rather than a suspicion: a mapping outlives whatever
+created it, so a laptop that opened one and left the house leaves exactly this
+trace. The router's DHCP client list settles which it is.
+
 It also probes this machine's own loopback, because malware frequently listens
 locally and is driven by something else.
 
@@ -272,10 +289,10 @@ concurrency — so it finishes in seconds. It only touches your own network.
 #### What it cannot do
 
 Nothing on your LAN can observe a device's *outbound* connections, and that is
-where this class of malware lives. When the tool names a prime suspect it also
-names the one vantage point that can settle it: **the router, blocking outbound
-TCP 25 with logging on.** The log names the internal address that tried to send.
-That is the answer; everything here is what narrows it down first.
+where this class of malware lives. Two vantage points can settle it, and the
+scan names both: **the router, blocking outbound TCP 25 with logging on** — the
+log names the internal address that tried to send — and **`selfhost watch-dns`**,
+below. Everything here is what narrows it down first.
 
 ### When the LAN scan finds nothing
 
@@ -291,6 +308,46 @@ do for you: **read the listing detail at**
 observed and when. If the last-seen timestamp predates your having the address,
 it is inherited — delist and move on. If it is recent, something on your network
 did it, and the detail usually names the malware family or protocol.
+
+### Naming the device: `selfhost watch-dns`
+
+The scan can only report what answered it, and residential proxy malware answers
+nothing. It does have to do one thing before it can relay anything at all: **look
+its controller up by name.** That lookup goes to whichever resolver the network
+handed out, so become that resolver and the device names itself.
+
+```
+selfhost watch-dns                     # binds :53, forwards to the system resolver
+selfhost watch-dns --upstream 1.1.1.1:53
+sudo selfhost watch-dns                # port 53 needs privilege
+```
+
+Then, in the router, set the DHCP DNS server to this machine's LAN address and
+let the devices renew their leases. Nothing is blocked or rewritten — every query
+goes upstream unchanged and every answer comes back unchanged, over UDP and TCP
+both, because a diagnostic that breaks the household's internet gets switched off
+before it finds anything.
+
+A hit prints the moment it happens:
+
+```
+!! 192.168.1.5 asked for pawns.app
+   Pawns.app (IPRoyal) — a paid bandwidth-sharing app feeding IPRoyal's proxy supply
+```
+
+`Ctrl-C` prints the conclusion. Two things it is careful about:
+
+**One lookup is a lead, not a verdict.** Somebody reading `honeygain.com` in a
+browser produces exactly one query. A proxy client comes back to its controller
+on a timer, and that repetition is what tells them apart — so a single sighting
+is reported as a lead and the wording says why.
+
+**Silence is not a clean bill of health,** and the report says so rather than
+printing a reassuring nothing. Three things make a device invisible here: it
+never renewed its lease, it resolves over DoH/DoT (reported separately, because
+it explains an *absence* of findings), or the service is one
+`proxyware::INDICATORS` does not know by name. Blocking outbound 53 and 853 for
+every device except this one closes the first two.
 
 ### Mail is not being delivered
 
