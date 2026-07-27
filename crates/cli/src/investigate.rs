@@ -612,6 +612,12 @@ pub struct PortMapping {
     pub protocol: String,
     /// Description supplied by whatever created the mapping.
     pub description: String,
+    /// Seconds left before the router drops this mapping; `0` means permanent.
+    ///
+    /// This is what separates "something here is awake and renewing a hole" from
+    /// "a hole was punched once and nothing has cleaned it up since". A permanent
+    /// mapping says nothing about when its owner was last on the network.
+    pub lease_seconds: u32,
 }
 
 impl PortMapping {
@@ -619,43 +625,142 @@ impl PortMapping {
     pub fn exposes_abusable_service(&self) -> bool {
         SUSPICIOUS_PORTS.iter().any(|(port, _)| *port == self.internal_port)
     }
+
+    /// Whether the router will hold this mapping open until something deletes it.
+    pub fn never_expires(&self) -> bool {
+        self.lease_seconds == 0
+    }
 }
 
-/// Reads the port forwards the router currently has open.
+/// What stands between this network and the internet.
 ///
-/// This is the question that decides whether a service on the LAN can be abused
-/// from the internet at all. A device listening on a proxy port behind a router
-/// with no forward for it is not reachable by anyone outside — so it cannot be
-/// the cause of a blocklisting, however alarming the open port looks.
-///
-/// It also surfaces forwards that **nothing asked for**: UPnP lets any program
-/// on the network open a hole in the firewall silently, which is a common way a
-/// machine becomes internet-reachable without its owner knowing.
-pub async fn port_mappings() -> Result<Vec<PortMapping>, String> {
-    let description_url = discover_gateway().await.ok_or("no UPnP gateway responded")?;
-    let (control_url, service_type) = gateway_control(&description_url).await?;
+/// A home router is assumed to *be* the edge — the box holding the public
+/// address, where a port forward decides what the internet can reach. When it is
+/// not, every conclusion drawn from its forwarding table is scoped to one hop of
+/// a longer chain, and saying "nothing is reachable from outside" on that basis
+/// is wrong.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NetworkEdge {
+    /// The address the local router believes is its own outside address.
+    pub router_wan: Ipv4Addr,
+    /// The address the internet actually sees traffic arrive from.
+    pub public: Ipv4Addr,
+}
 
-    let mut mappings = Vec::new();
-    for index in 0..40 {
-        let body = format!(
-            r#"<?xml version="1.0"?><s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/" s:encodingStyle="http://schemas.xmlsoap.org/soap/encoding/"><s:Body><u:GetGenericPortMappingEntry xmlns:u="{service_type}"><NewPortMappingIndex>{index}</NewPortMappingIndex></u:GetGenericPortMappingEntry></s:Body></s:Envelope>"#
-        );
-        let action = format!("\"{service_type}#GetGenericPortMappingEntry\"");
-        let Ok(response) = soap(&control_url, &action, &body).await else { break };
+/// How many translation layers separate this network from a routable address.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Edge {
+    /// The local router holds the public address; a forward here reaches the internet.
+    Direct,
+    /// Another router sits upstream, holding the public address on private space.
+    DoubleNat,
+    /// The provider shares one public address across customers (RFC 6598).
+    CarrierGrade,
+}
 
-        let field = |tag: &str| extract(&response, tag).unwrap_or_default();
-        let Ok(external_port) = field("NewExternalPort").parse::<u16>() else { break };
-        let internal_port = field("NewInternalPort").parse::<u16>().unwrap_or(0);
-
-        mappings.push(PortMapping {
-            external_port,
-            internal_client: field("NewInternalClient"),
-            internal_port,
-            protocol: field("NewProtocol"),
-            description: field("NewPortMappingDescription"),
-        });
+impl NetworkEdge {
+    /// Classifies the edge from the two addresses.
+    pub fn shape(&self) -> Edge {
+        if self.router_wan == self.public {
+            Edge::Direct
+        } else if is_shared_address_space(self.router_wan) {
+            Edge::CarrierGrade
+        } else {
+            // Any disagreement puts another translating hop in the path, whether
+            // this router's own outside address is private or a second public one.
+            Edge::DoubleNat
+        }
     }
-    Ok(mappings)
+
+    /// Whether a port forward on the local router is enough to reach the internet.
+    pub fn forwards_reach_the_internet(&self) -> bool {
+        self.shape() == Edge::Direct
+    }
+}
+
+/// Whether an address is in the carrier-grade NAT range, `100.64.0.0/10`.
+fn is_shared_address_space(address: Ipv4Addr) -> bool {
+    let [first, second, ..] = address.octets();
+    first == 100 && (64..=127).contains(&second)
+}
+
+/// A router's UPnP control interface, discovered once and queried repeatedly.
+///
+/// Discovery costs a multicast round trip and a description fetch, so the two
+/// questions worth asking a gateway — what it forwards, and what address it
+/// thinks it has — share one handle rather than each paying for their own.
+pub struct Gateway {
+    control_url: String,
+    service_type: String,
+}
+
+impl Gateway {
+    /// Finds the router's UPnP gateway service on the local network.
+    pub async fn discover() -> Result<Self, String> {
+        let description_url = discover_gateway().await.ok_or("no UPnP gateway responded")?;
+        let (control_url, service_type) = gateway_control(&description_url).await?;
+        Ok(Self { control_url, service_type })
+    }
+
+    /// Reads the port forwards the router currently has open.
+    ///
+    /// This is the question that decides whether a service on the LAN can be
+    /// abused from the internet at all. A device listening on a proxy port behind
+    /// a router with no forward for it is not reachable by anyone outside — so it
+    /// cannot be the cause of a blocklisting, however alarming the open port
+    /// looks. That reasoning holds only while this router is the edge; see
+    /// [`Gateway::external_address`].
+    ///
+    /// It also surfaces forwards that **nothing asked for**: UPnP lets any
+    /// program on the network open a hole in the firewall silently, which is a
+    /// common way a machine becomes internet-reachable without its owner knowing.
+    pub async fn mappings(&self) -> Vec<PortMapping> {
+        let mut mappings = Vec::new();
+        for index in 0..40 {
+            let Ok(response) = self
+                .invoke("GetGenericPortMappingEntry", &format!("<NewPortMappingIndex>{index}</NewPortMappingIndex>"))
+                .await
+            else {
+                break;
+            };
+
+            let field = |tag: &str| extract(&response, tag).unwrap_or_default();
+            let Ok(external_port) = field("NewExternalPort").parse::<u16>() else { break };
+
+            mappings.push(PortMapping {
+                external_port,
+                internal_client: field("NewInternalClient"),
+                internal_port: field("NewInternalPort").parse::<u16>().unwrap_or(0),
+                protocol: field("NewProtocol"),
+                description: field("NewPortMappingDescription"),
+                lease_seconds: field("NewLeaseDuration").parse::<u32>().unwrap_or(0),
+            });
+        }
+        mappings
+    }
+
+    /// Asks the router what address it believes the internet sees it as.
+    ///
+    /// Compared against the address a public echo reports, this is the one cheap
+    /// question that reveals a second layer of NAT — and with it, that the
+    /// router's forwarding table describes only the inner hop.
+    pub async fn external_address(&self) -> Result<Ipv4Addr, String> {
+        let response = self.invoke("GetExternalIPAddress", "").await?;
+        extract(&response, "NewExternalIPAddress")
+            .ok_or_else(|| "gateway reported no external address".to_owned())?
+            .trim()
+            .parse()
+            .map_err(|_| "gateway reported an unreadable external address".to_owned())
+    }
+
+    /// Calls one SOAP action on the gateway, returning the response body.
+    async fn invoke(&self, action: &str, arguments: &str) -> Result<String, String> {
+        let service_type = &self.service_type;
+        let body = format!(
+            r#"<?xml version="1.0"?><s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/" s:encodingStyle="http://schemas.xmlsoap.org/soap/encoding/"><s:Body><u:{action} xmlns:u="{service_type}">{arguments}</u:{action}></s:Body></s:Envelope>"#
+        );
+        soap(&self.control_url, &format!("\"{service_type}#{action}\""), &body).await
+    }
 }
 
 /// Finds the router's UPnP description URL by multicast discovery.
@@ -886,6 +991,7 @@ mod evidence_tests {
             internal_port: 1080,
             protocol: "TCP".into(),
             description: "".into(),
+            lease_seconds: 0,
         };
         assert!(socks.exposes_abusable_service());
 
@@ -896,8 +1002,65 @@ mod evidence_tests {
             internal_port: 56618,
             protocol: "UDP".into(),
             description: "Teredo".into(),
+            lease_seconds: 0,
         };
         assert!(!teredo.exposes_abusable_service());
+        assert!(teredo.never_expires(), "a zero lease is the router saying \"until deleted\"");
+    }
+
+    #[test]
+    fn a_router_holding_the_public_address_is_the_edge() {
+        let edge = NetworkEdge {
+            router_wan: Ipv4Addr::new(172, 83, 7, 210),
+            public: Ipv4Addr::new(172, 83, 7, 210),
+        };
+        assert_eq!(edge.shape(), Edge::Direct);
+        assert!(edge.forwards_reach_the_internet());
+    }
+
+    #[test]
+    fn a_private_wan_address_means_a_second_router_upstream() {
+        // Measured on a real line: the router NATs to 10.0.12.184, and only the
+        // box beyond it holds the address the internet answers to.
+        let edge = NetworkEdge {
+            router_wan: Ipv4Addr::new(10, 0, 12, 184),
+            public: Ipv4Addr::new(172, 83, 7, 210),
+        };
+        assert_eq!(edge.shape(), Edge::DoubleNat);
+        assert!(
+            !edge.forwards_reach_the_internet(),
+            "a forward on the inner router stops at the outer one"
+        );
+    }
+
+    #[test]
+    fn a_shared_address_space_wan_is_carrier_grade_nat() {
+        for wan in [Ipv4Addr::new(100, 64, 0, 1), Ipv4Addr::new(100, 127, 255, 254)] {
+            let edge = NetworkEdge { router_wan: wan, public: Ipv4Addr::new(172, 83, 7, 210) };
+            assert_eq!(edge.shape(), Edge::CarrierGrade, "{wan} is RFC 6598 space");
+        }
+        // 100.128.0.0 is ordinary public space, one address past the range.
+        let beyond = NetworkEdge {
+            router_wan: Ipv4Addr::new(100, 128, 0, 1),
+            public: Ipv4Addr::new(172, 83, 7, 210),
+        };
+        assert_eq!(beyond.shape(), Edge::DoubleNat);
+    }
+
+    #[test]
+    fn the_external_address_is_read_from_the_soap_reply() {
+        let reply = "<s:Body><u:GetExternalIPAddressResponse>\
+                     <NewExternalIPAddress>10.0.12.184</NewExternalIPAddress>\
+                     </u:GetExternalIPAddressResponse></s:Body>";
+        assert_eq!(extract(reply, "NewExternalIPAddress").as_deref(), Some("10.0.12.184"));
+    }
+
+    #[test]
+    fn a_lease_duration_is_read_from_a_mapping_entry() {
+        let permanent = "<a><NewLeaseDuration>0</NewLeaseDuration></a>";
+        let counting = "<a><NewLeaseDuration>604800</NewLeaseDuration></a>";
+        assert_eq!(extract(permanent, "NewLeaseDuration").as_deref(), Some("0"));
+        assert_eq!(extract(counting, "NewLeaseDuration").as_deref(), Some("604800"));
     }
 
     #[test]

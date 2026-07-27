@@ -892,20 +892,61 @@ async fn investigate_causes(
     // --- what is actually reachable from the internet -----------------------
     // Kept for the device assessment below: whether a device can be reached
     // from outside changes what its open ports mean.
-    let forwards = investigate::port_mappings().await;
+    let gateway = investigate::Gateway::discover().await;
+    let edge = match (&gateway, public_ip) {
+        (Ok(gateway), Some(public)) => gateway
+            .external_address()
+            .await
+            .ok()
+            .map(|router_wan| investigate::NetworkEdge { router_wan, public }),
+        _ => None,
+    };
+    report_edge(section, edge);
+
+    let forwards = match &gateway {
+        Ok(gateway) => Ok(gateway.mappings().await),
+        Err(reason) => Err(reason.clone()),
+    };
+    // Without the edge established, treat the router as the edge — the historical
+    // assumption — but never state the stronger conclusion as fact.
+    let router_is_the_edge = edge.map(|edge| edge.forwards_reach_the_internet());
     match &forwards {
-        Ok(mappings) if mappings.is_empty() => section.checks.push(
-            Check::new(
+        Ok(mappings) if mappings.is_empty() => section.checks.push(match router_is_the_edge {
+            Some(true) => Check::new(
                 "ports open to the internet",
                 Verdict::Pass,
-                "the router forwards nothing — no device on your network is reachable from outside",
+                "the router forwards nothing, and it holds the public address — so no device on \
+                 your network is reachable from outside",
             )
             .with_fix(
                 "This matters for a blocklisting: a service listening on your LAN cannot be abused \
                  by anyone outside if nothing reaches it. It also means you must add a forward \
                  before this machine can serve the internet.",
             ),
-        ),
+            Some(false) => Check::new(
+                "ports open to the internet",
+                Verdict::Unknown,
+                "this router forwards nothing — but it is not the edge, so that settles only the \
+                 inner hop",
+            )
+            .with_fix(
+                "Do not read this as \"nothing is reachable from outside\". The upstream router \
+                 holds the public address and has a forwarding table of its own that this machine \
+                 cannot read, and anything else behind it shares your public address. Sort the \
+                 edge out first; until then, treat inbound exposure as unmeasured.",
+            ),
+            None => Check::new(
+                "ports open to the internet",
+                Verdict::Unknown,
+                "the router forwards nothing, but would not say what its own outside address is",
+            )
+            .with_fix(
+                "Nothing is reachable through this router. Whether that means nothing is reachable \
+                 at all depends on whether another router sits upstream, which this check could \
+                 not establish — compare the router's WAN address in its status page against your \
+                 public address by hand.",
+            ),
+        }),
         Ok(mappings) => {
             for mapping in mappings {
                 let abusable = mapping.exposes_abusable_service();
@@ -948,6 +989,22 @@ async fn investigate_causes(
                 let survey = investigate::sweep_lan(local_ip).await;
                 let mappings = forwards.as_deref().unwrap_or(&[]);
                 report_lan(section, &assess::assess(&survey, mappings, local_ip));
+                if router_is_the_edge == Some(false) {
+                    section.checks.push(
+                        Check::new(
+                            "how far this scan could see",
+                            Verdict::Warn,
+                            "the sweep covers this router's network only, and it is not the edge",
+                        )
+                        .with_fix(
+                            "Everything behind the upstream router shares your public address, so \
+                             a device on a segment this machine cannot route to would earn the \
+                             same listing and never appear above. If the sweep names no culprit, \
+                             that is not an all-clear — ask your provider what else sits behind \
+                             that box.",
+                        ),
+                    );
+                }
             }
             None => section.checks.push(Check::new(
                 "devices on the local network",
@@ -962,6 +1019,66 @@ async fn investigate_causes(
             "run `selfhost doctor --scan-lan` to identify every device and name the one at fault",
         ));
     }
+}
+
+/// Reports whether the local router is where the internet actually arrives.
+///
+/// One comparison — the address the router claims on its outside interface
+/// against the address a public echo reports — decides how far every other
+/// inbound conclusion in this report can be trusted, so it is stated before
+/// them rather than inferred afterwards.
+fn report_edge(section: &mut Section, edge: Option<investigate::NetworkEdge>) {
+    let Some(edge) = edge else {
+        section.checks.push(Check::new(
+            "what sits between you and the internet",
+            Verdict::Unknown,
+            "the router would not say what address it holds on its outside interface",
+        ));
+        return;
+    };
+
+    let check = match edge.shape() {
+        investigate::Edge::Direct => Check::new(
+            "what sits between you and the internet",
+            Verdict::Pass,
+            format!("your router holds {} directly — nothing translates in between", edge.public),
+        )
+        .with_fix(
+            "This is the arrangement everything else here assumes: a forward on this router is a \
+             forward from the internet, and a certificate challenge can reach this machine.",
+        ),
+        investigate::Edge::DoubleNat => Check::new(
+            "what sits between you and the internet",
+            Verdict::Warn,
+            format!(
+                "your router's outside address is {}, but the internet sees {} — a second router \
+                 sits between them",
+                edge.router_wan, edge.public
+            ),
+        )
+        .with_fix(
+            "Outbound is unaffected: sending mail and fetching certificates keep working. Inbound \
+             does not — a forward has to exist on both boxes, and you have no login on the \
+             upstream one. Ask your provider, in this order: bridge or passthrough so this router \
+             holds the public address itself; failing that a static forward of 80 and 443 to your \
+             router's WAN address; failing that a DMZ to it.",
+        ),
+        investigate::Edge::CarrierGrade => Check::new(
+            "what sits between you and the internet",
+            Verdict::Fail,
+            format!(
+                "your router's outside address {} is carrier-grade NAT — the public address {} is \
+                 shared with other customers",
+                edge.router_wan, edge.public
+            ),
+        )
+        .with_fix(
+            "No port forward you can configure will make this machine reachable, because the \
+             address is not yours alone. Ask your provider for a static or dedicated public \
+             address; without one, hosting anything inbound here needs a tunnel or a relay.",
+        ),
+    };
+    section.checks.push(check);
 }
 
 /// Reports what the local network amounts to, strongest finding first.

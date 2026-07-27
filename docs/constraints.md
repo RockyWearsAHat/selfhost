@@ -13,6 +13,8 @@ server, so LAN-side numbers are a proxy for the server's own.
 | public IP | `172.83.7.210` | `curl -s https://ifconfig.me` |
 | ISP | FirstDigital Communications (AS13415), Salt Lake City | `ipinfo.io` |
 | CGNAT | **no** — routable address, not `100.64.0.0/10` | compare router WAN against the above |
+| router WAN | `10.0.12.184` — **not** the public address | UPnP `GetExternalIPAddress` |
+| NAT layers | **two** — a second router sits upstream | the two rows above disagree |
 | upload | 99–508 Mbps across two runs, over Wi-Fi | `networkQuality` |
 | download | 225–751 Mbps | `networkQuality` |
 | idle latency | ~31 ms | `networkQuality` |
@@ -26,15 +28,35 @@ floor is 99 Mbps — roughly 40 concurrent 1080p renditions at ~2.5 Mbps each, a
 the readings varied enough to suggest Wi-Fi contention rather than a link
 ceiling. Measure again from the server over Ethernet before sizing anything.
 
-### No CGNAT
+### No CGNAT, but two layers of NAT
 
 Both tunnel-based designs that had been proposed existed to survive CGNAT. The
 address is routable and has reverse DNS, so inbound port-forwarding is on the
 table and no third party is needed in the data path.
 
+It is not one hop, though. The Netgear NATs to `10.0.12.184`; a second router
+holds `172.83.7.210`. Measured by traceroute (`192.168.1.1` → `10.0.0.1` →
+`172.83.7.209`, the ISP gateway) and confirmed by asking the Netgear its own WAN
+address over UPnP. `10.0.0.1` answers ping but refuses 22/23/80/443/8443, so
+there is no admin surface on it from in here.
+
+**What this does not affect: outbound.** Sending mail, ACME's outbound calls, and
+every measurement in this file stay valid — they were taken through both layers.
+
+**What it does affect: inbound.** A forward has to exist on *both* boxes, and
+only one of them is administrable from here. Ask FirstDigital, in preference
+order: bridge/passthrough so the Netgear holds `172.83.7.210` directly; else a
+static forward of 80/443 to `10.0.12.184`; else a DMZ to it. Same call as the PTR
+forward-record request.
+
 **Still unverified:** whether FirstDigital filters inbound 80/443. This cannot be
-tested until something is listening and the router forwards — it is a build step,
-not a preliminary.
+tested until something is listening and *both* routers forward — it is a build
+step, not a preliminary.
+
+**Consequence for the spam hunt:** everything behind `10.0.0.1` shares the public
+address. If that box feeds anything besides the Netgear, a compromised device
+could sit where `--scan-lan` can never reach it, and `doctor` now says so rather
+than reporting an empty sweep as an all-clear.
 
 ## Mail deliverability
 

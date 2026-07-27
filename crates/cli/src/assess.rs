@@ -258,8 +258,10 @@ pub fn assess(survey: &LanSurvey, mappings: &[PortMapping], local: Ipv4Addr) -> 
 /// reachable and then said nothing.
 ///
 /// It is [`Standing::Unresolved`] rather than a suspicion, because a mapping
-/// outlives whatever created it: a laptop that opened one and left the house
-/// leaves exactly this trace.
+/// with no expiry outlives whatever created it: a laptop that opened one and
+/// left the house leaves exactly this trace. The mapping's lease is what tells
+/// the two apart, so the reasoning reports which case this is rather than
+/// assuming the pessimistic one.
 fn forwarded_but_unseen(
     survey: &LanSurvey,
     mappings: &[PortMapping],
@@ -309,11 +311,28 @@ fn forwarded_but_unseen(
                         .to_owned(),
                 );
             }
-            because.push(
-                "This is not an accusation. A mapping outlives whatever created it, so a device \
-                 that has since left the network leaves exactly this trace."
+            // The lease is the only evidence in the table about *when*. A hole
+            // with no expiry survives the device that punched it, so it dates
+            // nothing; one still counting down had to be renewed to be here.
+            // One expiring mapping is enough: it had to be renewed to still be
+            // here, whatever the permanent ones alongside it prove nothing about.
+            let expiring = theirs
+                .iter()
+                .filter(|mapping| !mapping.never_expires())
+                .map(|mapping| mapping.lease_seconds)
+                .min();
+            because.push(match expiring {
+                None => "This is not an accusation, and the mapping does not date itself: it has \
+                         no expiry, so the router will hold it until something deletes it. A \
+                         device that punched this hole and then left the network leaves exactly \
+                         this trace, indefinitely."
                     .to_owned(),
-            );
+                Some(lease) => format!(
+                    "The mapping still has {lease}s to run, and a lease has to be renewed before it \
+                     lapses — so something at this address was awake within the last {lease} \
+                     seconds. This is not a leftover from a device that has gone."
+                ),
+            });
 
             Assessment {
                 address,
@@ -765,6 +784,7 @@ mod tests {
             internal_port: 1080,
             protocol: "TCP".to_owned(),
             description: String::new(),
+            lease_seconds: 0,
         }];
         // A laptop proxy alone was Unresolved; reachable from the internet, it
         // is a different proposition entirely.
@@ -787,13 +807,17 @@ mod tests {
 
     /// The mapping a real scan of this network turned up: a UPnP hole punched
     /// for an address that appeared nowhere else in the results.
-    fn teredo_mapping(last: u8) -> PortMapping {
+    ///
+    /// `lease_seconds` is explicit at every call site because it decides whether
+    /// the mapping dates its owner or says nothing about it at all.
+    fn teredo_mapping(last: u8, lease_seconds: u32) -> PortMapping {
         PortMapping {
             external_port: 56618,
             internal_client: format!("192.168.1.{last}"),
             internal_port: 56618,
             protocol: "UDP".to_owned(),
             description: format!("Teredo 192.168.1.{last}:56618->56618 UDP"),
+            lease_seconds,
         }
     }
 
@@ -805,7 +829,7 @@ mod tests {
         // exactly the finding, and the old code printed each of them separately
         // and never compared them.
         let conclusion =
-            assess(&household(vec![], vec![]), &[teredo_mapping(5)], Ipv4Addr::new(192, 168, 1, 31));
+            assess(&household(vec![], vec![]), &[teredo_mapping(5, 0)], Ipv4Addr::new(192, 168, 1, 31));
 
         let unseen = conclusion
             .notable
@@ -824,11 +848,41 @@ mod tests {
     }
 
     #[test]
+    fn a_permanent_mapping_dates_nothing_but_an_expiring_one_does() {
+        let local = Ipv4Addr::new(192, 168, 1, 31);
+        let reasoning = |mappings: &[PortMapping]| {
+            assess(&household(vec![], vec![]), mappings, local)
+                .notable
+                .iter()
+                .find(|a| a.address == Ipv4Addr::new(192, 168, 1, 5))
+                .expect("a forward with nothing behind it is still worth a line")
+                .because
+                .join(" ")
+        };
+
+        // A lease of 0 means "until deleted", so the hole outlives its owner and
+        // says nothing about whether anything is at that address now.
+        let permanent = reasoning(&[teredo_mapping(5, 0)]);
+        assert!(permanent.contains("no expiry"), "{permanent}");
+        assert!(!permanent.contains("was awake"), "a permanent hole dates nothing: {permanent}");
+
+        // A live countdown had to be renewed, which does date it.
+        let expiring = reasoning(&[teredo_mapping(5, 7200)]);
+        assert!(expiring.contains("7200s to run"), "{expiring}");
+        assert!(expiring.contains("was awake within the last"), "{expiring}");
+        assert!(!expiring.contains("no expiry"), "{expiring}");
+
+        // Mixed: the expiring one is the evidence, the permanent one is not.
+        let mixed = reasoning(&[teredo_mapping(5, 0), teredo_mapping(5, 90)]);
+        assert!(mixed.contains("90s to run"), "one live lease outweighs a permanent one: {mixed}");
+    }
+
+    #[test]
     fn a_forward_to_a_device_the_sweep_already_saw_adds_nothing() {
         // The printer is in the inventory, so it is judged once, by the rules
         // that have its identity to work with.
         let conclusion =
-            assess(&household(vec![], vec![]), &[teredo_mapping(14)], Ipv4Addr::new(192, 168, 1, 31));
+            assess(&household(vec![], vec![]), &[teredo_mapping(14, 0)], Ipv4Addr::new(192, 168, 1, 31));
 
         let appearances = conclusion
             .notable
@@ -842,7 +896,7 @@ mod tests {
     #[test]
     fn a_forward_to_this_machine_is_not_a_mystery_device() {
         let local = Ipv4Addr::new(192, 168, 1, 31);
-        let conclusion = assess(&household(vec![], vec![]), &[teredo_mapping(31)], local);
+        let conclusion = assess(&household(vec![], vec![]), &[teredo_mapping(31, 0)], local);
         assert!(conclusion.notable.iter().all(|a| a.address != local));
     }
 
