@@ -257,13 +257,30 @@ forwards over UPnP:
 
 ```
   [PASS] ports open to the internet
-         the router forwards nothing — no device on your network is reachable
+         the router forwards nothing, and it holds the public address — so no
+         device on your network is reachable from outside
 ```
 
 That check earns its place twice over: it also catches forwards **you never
 asked for**. UPnP lets any program on your network punch a hole in the firewall
 silently, which is a common way a machine becomes internet-reachable without its
 owner knowing.
+
+**But an empty forwarding table only means something if that router is the
+edge.** So the tool asks it what address it holds on its outside interface and
+compares that against the address the internet actually sees:
+
+```
+  [WARN] what sits between you and the internet
+         your router's outside address is 10.0.12.184, but the internet sees
+         172.83.7.210 — a second router sits between them
+```
+
+When they disagree, "nothing is reachable from outside" is unprovable from here —
+the upstream box has a forwarding table this machine cannot read — so the verdict
+drops to unknown rather than passing. It also caps what `--scan-lan` can claim:
+everything behind the upstream router shares your public address, so a sweep that
+names no culprit is not an all-clear, and the report says so.
 
 The forwarding table and the sweep are compared, because the interesting case is
 where they disagree — a forward pointing at an address that answered nothing:

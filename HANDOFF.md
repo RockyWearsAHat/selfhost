@@ -92,8 +92,12 @@ assumptions from the prior handoff:
 Mbps over Wi-Fi. Even the low reading carries ~40 concurrent 1080p renditions.
 The prior handoff's central worry about home-hosting a video site is void.
 
-**Not behind CGNAT.** `172.83.7.210` is routable with real reverse DNS, so the
-tunnel-based designs that existed to survive CGNAT are unnecessary.
+**Not behind CGNAT, but behind two NATs.** `172.83.7.210` is routable with real
+reverse DNS, so the tunnel-based designs that existed to survive CGNAT are
+unnecessary. The Netgear is not the edge, though — it NATs to `10.0.12.184`, and
+an upstream box you cannot log into holds the public address. Outbound is
+unaffected; **inbound needs a forward on both boxes**, so settle it with
+FirstDigital before building anything that depends on port 80.
 
 **Mail is the genuinely hard part, and it is environmental, not code:**
 
@@ -104,10 +108,16 @@ tunnel-based designs that existed to survive CGNAT are unnecessary.
   - Spamhaus classifies `172.83.7.210` as **part of a proxy network** — malware
     installing a proxy on some device, sending spam **directly to port 25**.
   - Most recent connection they logged: **2026-07-26 19:30 UTC, HELO
-    `[172.19.0.8]`**. That address is not on the `192.168.1.0/24` LAN, so the
-    sender sits behind a *second* NAT layer — a container, a VM, or a VPN app's
-    virtual adapter on one of the devices. It is invisible to a LAN sweep twice
-    over.
+    `[172.19.0.8]`**. That address is not on the `192.168.1.0/24` LAN, and it is
+    **not** the upstream `10.0.0.0/8` hop either — `172.19.0.0/16` sits inside
+    Docker's default bridge pool (`172.17`–`172.31`). So the likeliest sender is
+    a **container** (or a VM / VPN virtual adapter) on one of the LAN devices,
+    announcing its private container address. It is invisible to a LAN sweep
+    twice over: the sweep sees the host, never the bridge network inside it.
+  - **Check the container hypothesis first**, on every device that runs Docker or
+    a VM: `docker network inspect bridge` and `docker ps` will name what holds
+    `172.19.0.x`. That is a cheaper and better-supported lead than the upstream
+    segment, which uses different address space entirely.
   - The delisting form **rejects free webmail** (`@gmail` and the rest). Use an
     address at a domain he controls.
 - **FCrDNS fails**: the PTR `172-83-7-210.ip.fdtnet.net` has no forward A
