@@ -1,0 +1,698 @@
+//! The Windows backend: Win32 for the window and input, GDI for the blit.
+//!
+//! # Events are read from the queue, not from the window procedure
+//!
+//! The usual shape is a `WndProc` that switches on every message and calls back
+//! into the application, which from Rust means a `static` callback reaching
+//! state it does not own. This does not do that. Messages are pulled off the
+//! queue with `PeekMessageW` and read directly, exactly as the macOS backend
+//! reads `NSEvent`s, so the whole translation is ordinary code with the state
+//! passed to it.
+//!
+//! The window procedure that remains is three lines. It exists because two
+//! messages must be answered rather than observed: `WM_PAINT` has to validate
+//! the update region or Windows re-sends it forever, and `WM_ERASEBKGND` has to
+//! be swallowed or the system paints the window grey before every frame and it
+//! flickers.
+//!
+//! # Blitting
+//!
+//! `StretchDIBits` onto the window's device context, from a top-down 32-bit
+//! `BI_RGB` bitmap — which is blue, green, red, unused per pixel, the same bytes
+//! [`Canvas`] already holds.
+
+use crate::theme::Appearance;
+use crate::{Canvas, Event, Key, Modifiers, Point, PointerButton};
+use std::ffi::c_void;
+use std::time::Duration;
+
+use crate::shell::{Backend, Error, WindowOptions};
+
+type Handle = *mut c_void;
+type WordParameter = usize;
+type LongParameter = isize;
+
+#[link(name = "user32")]
+unsafe extern "system" {
+    fn RegisterClassExW(class: *const WindowClass) -> u16;
+    fn CreateWindowExW(
+        extended_style: u32,
+        class_name: *const u16,
+        window_name: *const u16,
+        style: u32,
+        x: i32,
+        y: i32,
+        width: i32,
+        height: i32,
+        parent: Handle,
+        menu: Handle,
+        instance: Handle,
+        parameter: *mut c_void,
+    ) -> Handle;
+    fn DefWindowProcW(
+        window: Handle,
+        message: u32,
+        word: WordParameter,
+        long: LongParameter,
+    ) -> LongParameter;
+    fn ShowWindow(window: Handle, command: i32) -> i32;
+    fn UpdateWindow(window: Handle) -> i32;
+    fn DestroyWindow(window: Handle) -> i32;
+    fn PeekMessageW(
+        message: *mut Message,
+        window: Handle,
+        first: u32,
+        last: u32,
+        remove: u32,
+    ) -> i32;
+    fn TranslateMessage(message: *const Message) -> i32;
+    fn DispatchMessageW(message: *const Message) -> LongParameter;
+    fn MsgWaitForMultipleObjects(
+        count: u32,
+        handles: *const Handle,
+        wait_all: i32,
+        milliseconds: u32,
+        mask: u32,
+    ) -> u32;
+    fn GetClientRect(window: Handle, rect: *mut WindowRect) -> i32;
+    fn GetDC(window: Handle) -> Handle;
+    fn ReleaseDC(window: Handle, context: Handle) -> i32;
+    fn BeginPaint(window: Handle, paint: *mut PaintStruct) -> Handle;
+    fn EndPaint(window: Handle, paint: *const PaintStruct) -> i32;
+    fn GetKeyState(key: i32) -> i16;
+    fn SetProcessDPIAware() -> i32;
+    fn GetDpiForWindow(window: Handle) -> u32;
+    fn IsWindow(window: Handle) -> i32;
+    fn LoadCursorW(instance: Handle, name: *const u16) -> Handle;
+}
+
+#[link(name = "gdi32")]
+unsafe extern "system" {
+    fn StretchDIBits(
+        context: Handle,
+        destination_x: i32,
+        destination_y: i32,
+        destination_width: i32,
+        destination_height: i32,
+        source_x: i32,
+        source_y: i32,
+        source_width: i32,
+        source_height: i32,
+        bits: *const c_void,
+        info: *const BitmapInfo,
+        usage: u32,
+        operation: u32,
+    ) -> i32;
+}
+
+#[link(name = "kernel32")]
+unsafe extern "system" {
+    fn GetModuleHandleW(name: *const u16) -> Handle;
+}
+
+#[link(name = "advapi32")]
+unsafe extern "system" {
+    fn RegGetValueW(
+        key: Handle,
+        subkey: *const u16,
+        value: *const u16,
+        flags: u32,
+        kind: *mut u32,
+        data: *mut c_void,
+        size: *mut u32,
+    ) -> i32;
+}
+
+#[repr(C)]
+struct WindowClass {
+    size: u32,
+    style: u32,
+    procedure: Option<
+        unsafe extern "system" fn(Handle, u32, WordParameter, LongParameter) -> LongParameter,
+    >,
+    class_extra: i32,
+    window_extra: i32,
+    instance: Handle,
+    icon: Handle,
+    cursor: Handle,
+    background: Handle,
+    menu_name: *const u16,
+    class_name: *const u16,
+    small_icon: Handle,
+}
+
+#[repr(C)]
+#[derive(Default, Clone, Copy)]
+struct WindowPoint {
+    x: i32,
+    y: i32,
+}
+
+#[repr(C)]
+#[derive(Default, Clone, Copy)]
+struct WindowRect {
+    left: i32,
+    top: i32,
+    right: i32,
+    bottom: i32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct Message {
+    window: Handle,
+    message: u32,
+    word: WordParameter,
+    long: LongParameter,
+    time: u32,
+    point: WindowPoint,
+}
+
+impl Default for Message {
+    /// An empty message, for `PeekMessageW` to fill in.
+    ///
+    /// Written out rather than derived because a handle is a raw pointer, and a
+    /// derived `Default` would need one for a type this crate does not own.
+    fn default() -> Self {
+        Self {
+            window: std::ptr::null_mut(),
+            message: 0,
+            word: 0,
+            long: 0,
+            time: 0,
+            point: WindowPoint::default(),
+        }
+    }
+}
+
+#[repr(C)]
+struct PaintStruct {
+    context: Handle,
+    erase: i32,
+    paint: WindowRect,
+    restore: i32,
+    increment: i32,
+    reserved: [u8; 32],
+}
+
+#[repr(C)]
+struct BitmapHeader {
+    size: u32,
+    width: i32,
+    height: i32,
+    planes: u16,
+    bit_count: u16,
+    compression: u32,
+    image_size: u32,
+    x_pixels_per_meter: i32,
+    y_pixels_per_meter: i32,
+    colors_used: u32,
+    colors_important: u32,
+}
+
+#[repr(C)]
+struct BitmapInfo {
+    header: BitmapHeader,
+    colors: [u32; 3],
+}
+
+// Window styles and commands.
+const WS_OVERLAPPEDWINDOW: u32 = 0x00CF_0000;
+const SW_SHOW: i32 = 5;
+const CW_USEDEFAULT: i32 = i32::MIN;
+const IDC_ARROW: u32 = 32512;
+const CS_OWNDC: u32 = 0x0020;
+
+// Messages.
+const WM_DESTROY: u32 = 0x0002;
+const WM_CLOSE: u32 = 0x0010;
+const WM_QUIT: u32 = 0x0012;
+const WM_ERASEBKGND: u32 = 0x0014;
+const WM_PAINT: u32 = 0x000F;
+const WM_KEYDOWN: u32 = 0x0100;
+const WM_KEYUP: u32 = 0x0101;
+const WM_SYSKEYDOWN: u32 = 0x0104;
+const WM_SYSKEYUP: u32 = 0x0105;
+const WM_CHAR: u32 = 0x0102;
+const WM_MOUSEMOVE: u32 = 0x0200;
+const WM_LBUTTONDOWN: u32 = 0x0201;
+const WM_LBUTTONUP: u32 = 0x0202;
+const WM_RBUTTONDOWN: u32 = 0x0204;
+const WM_RBUTTONUP: u32 = 0x0205;
+const WM_MBUTTONDOWN: u32 = 0x0207;
+const WM_MBUTTONUP: u32 = 0x0208;
+const WM_MOUSEWHEEL: u32 = 0x020A;
+const WM_MOUSEHWHEEL: u32 = 0x020E;
+
+const PM_REMOVE: u32 = 0x0001;
+const QS_ALLINPUT: u32 = 0x04FF;
+
+// Virtual key codes.
+const VK_BACK: i32 = 0x08;
+const VK_TAB: i32 = 0x09;
+const VK_RETURN: i32 = 0x0D;
+const VK_SHIFT: i32 = 0x10;
+const VK_CONTROL: i32 = 0x11;
+const VK_MENU: i32 = 0x12;
+const VK_ESCAPE: i32 = 0x1B;
+const VK_SPACE: i32 = 0x20;
+const VK_PRIOR: i32 = 0x21;
+const VK_NEXT: i32 = 0x22;
+const VK_END: i32 = 0x23;
+const VK_HOME: i32 = 0x24;
+const VK_LEFT: i32 = 0x25;
+const VK_UP: i32 = 0x26;
+const VK_RIGHT: i32 = 0x27;
+const VK_DOWN: i32 = 0x28;
+const VK_DELETE: i32 = 0x2E;
+
+/// `BI_RGB`: uncompressed, and for 32 bits per pixel that is blue, green, red,
+/// unused — which is a [`Canvas`] word in memory.
+const BI_RGB: u32 = 0;
+/// `DIB_RGB_COLORS`.
+const DIB_RGB_COLORS: u32 = 0;
+/// `SRCCOPY`.
+const SRCCOPY: u32 = 0x00CC_0020;
+
+/// One notch of a wheel, as Windows counts it.
+const WHEEL_DELTA: f32 = 120.0;
+
+/// How many logical units one notch scrolls.
+const WHEEL_STEP: f32 = 48.0;
+
+/// The reference density Windows scales from.
+const BASE_DPI: f32 = 96.0;
+
+/// `HKEY_CURRENT_USER`.
+const HKEY_CURRENT_USER: Handle = 0x8000_0001usize as Handle;
+/// `RRF_RT_REG_DWORD`.
+const RRF_RT_REG_DWORD: u32 = 0x0000_0010;
+
+/// A window on Windows.
+pub(crate) struct Window {
+    handle: Handle,
+    open: bool,
+    /// Client area in device pixels, as of the last pump.
+    size: (u32, u32),
+    scale: f32,
+}
+
+impl Backend for Window {
+    fn open(options: &WindowOptions) -> Result<Self, Error> {
+        unsafe {
+            // Without this the system lies about sizes on a high-density
+            // display: it reports a scaled-down client area and then stretches
+            // what we draw, which turns crisp text into blurred text.
+            SetProcessDPIAware();
+
+            let instance = GetModuleHandleW(std::ptr::null());
+            let class_name = wide("rui.window");
+            let class = WindowClass {
+                size: std::mem::size_of::<WindowClass>() as u32,
+                // Its own device context, so presenting a frame does not fetch
+                // and release one from a shared pool sixty times a second.
+                style: CS_OWNDC,
+                procedure: Some(window_procedure),
+                class_extra: 0,
+                window_extra: 0,
+                instance,
+                icon: std::ptr::null_mut(),
+                cursor: LoadCursorW(std::ptr::null_mut(), IDC_ARROW as *const u16),
+                // No background brush: we paint every pixel ourselves, and a
+                // brush would paint over it first.
+                background: std::ptr::null_mut(),
+                menu_name: std::ptr::null(),
+                class_name: class_name.as_ptr(),
+                small_icon: std::ptr::null_mut(),
+            };
+            // A duplicate registration is not an error here: it means a window
+            // was opened before, and the class is still the one we want.
+            RegisterClassExW(&class);
+
+            let title = wide(&options.title);
+            let handle = CreateWindowExW(
+                0,
+                class_name.as_ptr(),
+                title.as_ptr(),
+                WS_OVERLAPPEDWINDOW,
+                CW_USEDEFAULT,
+                CW_USEDEFAULT,
+                options.width as i32,
+                options.height as i32,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                instance,
+                std::ptr::null_mut(),
+            );
+            if handle.is_null() {
+                return Err(Error::Platform("CreateWindowExW failed".into()));
+            }
+
+            ShowWindow(handle, SW_SHOW);
+            UpdateWindow(handle);
+
+            let mut window = Self { handle, open: true, size: (1, 1), scale: 1.0 };
+            window.refresh_geometry();
+            Ok(window)
+        }
+    }
+
+    fn pump(
+        &mut self,
+        timeout: Duration,
+        events: &mut Vec<Event>,
+        _redraw: &mut dyn FnMut(&Self),
+    ) -> Result<(), Error> {
+        unsafe {
+            // Blocks until something arrives or the timeout runs out, so an idle
+            // console costs nothing rather than spinning on PeekMessage.
+            let milliseconds = timeout.as_millis().min(u32::MAX as u128 - 1) as u32;
+            MsgWaitForMultipleObjects(0, std::ptr::null(), 0, milliseconds, QS_ALLINPUT);
+
+            let mut message = Message::default();
+            while PeekMessageW(&mut message, std::ptr::null_mut(), 0, 0, PM_REMOVE) != 0 {
+                if message.message == WM_QUIT {
+                    self.open = false;
+                    break;
+                }
+                self.translate(&message, events);
+                // Turns a key press into the character it types, according to
+                // the layout and any dead key before it — which is a question
+                // only the system can answer.
+                TranslateMessage(&message);
+                DispatchMessageW(&message);
+            }
+
+            self.refresh_geometry();
+            if IsWindow(self.handle) == 0 {
+                self.open = false;
+            }
+        }
+        Ok(())
+    }
+
+    fn surface(&self) -> (u32, u32, f32) {
+        (self.size.0.max(1), self.size.1.max(1), self.scale)
+    }
+
+    fn appearance(&self) -> Appearance {
+        // `AppsUseLightTheme` is how Windows records the choice; absent means
+        // light, which is what every version that lacks the setting used.
+        let subkey = wide(r"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize");
+        let value = wide("AppsUseLightTheme");
+        let mut data: u32 = 1;
+        let mut size = std::mem::size_of::<u32>() as u32;
+        let result = unsafe {
+            RegGetValueW(
+                HKEY_CURRENT_USER,
+                subkey.as_ptr(),
+                value.as_ptr(),
+                RRF_RT_REG_DWORD,
+                std::ptr::null_mut(),
+                (&raw mut data).cast::<c_void>(),
+                &mut size,
+            )
+        };
+        if result == 0 && data == 0 { Appearance::Dark } else { Appearance::Light }
+    }
+
+    fn present(&self, canvas: &Canvas) -> Result<(), Error> {
+        let width = canvas.width() as i32;
+        let height = canvas.height() as i32;
+        if width == 0 || height == 0 {
+            return Ok(());
+        }
+
+        let info = BitmapInfo {
+            header: BitmapHeader {
+                size: std::mem::size_of::<BitmapHeader>() as u32,
+                width,
+                // Negative means the rows run top to bottom, which is the order
+                // the canvas stores them; a positive height draws it upside down.
+                height: -height,
+                planes: 1,
+                bit_count: 32,
+                compression: BI_RGB,
+                image_size: 0,
+                x_pixels_per_meter: 0,
+                y_pixels_per_meter: 0,
+                colors_used: 0,
+                colors_important: 0,
+            },
+            colors: [0; 3],
+        };
+
+        unsafe {
+            let context = GetDC(self.handle);
+            if context.is_null() {
+                return Err(Error::Platform("the window has no device context".into()));
+            }
+            StretchDIBits(
+                context,
+                0,
+                0,
+                width,
+                height,
+                0,
+                0,
+                width,
+                height,
+                canvas.pixels().as_ptr().cast::<c_void>(),
+                &info,
+                DIB_RGB_COLORS,
+                SRCCOPY,
+            );
+            ReleaseDC(self.handle, context);
+        }
+        Ok(())
+    }
+
+    fn is_open(&self) -> bool {
+        self.open
+    }
+}
+
+impl Window {
+    /// Re-reads the client area and the display's density.
+    fn refresh_geometry(&mut self) {
+        unsafe {
+            let mut rect = WindowRect::default();
+            if GetClientRect(self.handle, &mut rect) != 0 {
+                let width = (rect.right - rect.left).max(0) as u32;
+                let height = (rect.bottom - rect.top).max(0) as u32;
+                if width > 0 && height > 0 {
+                    self.size = (width, height);
+                }
+            }
+            let dpi = GetDpiForWindow(self.handle);
+            if dpi > 0 {
+                self.scale = dpi as f32 / BASE_DPI;
+            }
+        }
+    }
+
+    /// Turns one message into the toolkit's events, if it is one we care about.
+    fn translate(&self, message: &Message, events: &mut Vec<Event>) {
+        let position = || self.position_of(message.long);
+        let modifiers = current_modifiers();
+
+        match message.message {
+            WM_CLOSE | WM_DESTROY => events.push(Event::CloseRequested),
+            WM_MOUSEMOVE => {
+                let at = position();
+                let (width, height) = self.logical_size();
+                if at.x < 0.0 || at.y < 0.0 || at.x > width || at.y > height {
+                    events.push(Event::PointerLeft);
+                } else {
+                    events.push(Event::PointerMoved(at));
+                }
+            }
+            WM_LBUTTONDOWN => {
+                events.push(Event::PointerDown { position: position(), button: PointerButton::Primary })
+            }
+            WM_LBUTTONUP => {
+                events.push(Event::PointerUp { position: position(), button: PointerButton::Primary })
+            }
+            WM_RBUTTONDOWN => events
+                .push(Event::PointerDown { position: position(), button: PointerButton::Secondary }),
+            WM_RBUTTONUP => events
+                .push(Event::PointerUp { position: position(), button: PointerButton::Secondary }),
+            WM_MBUTTONDOWN => {
+                events.push(Event::PointerDown { position: position(), button: PointerButton::Middle })
+            }
+            WM_MBUTTONUP => {
+                events.push(Event::PointerUp { position: position(), button: PointerButton::Middle })
+            }
+            WM_MOUSEWHEEL => {
+                events.push(Event::Scrolled { x: 0.0, y: wheel_amount(message.word) })
+            }
+            WM_MOUSEHWHEEL => {
+                events.push(Event::Scrolled { x: wheel_amount(message.word), y: 0.0 })
+            }
+            WM_KEYDOWN | WM_SYSKEYDOWN => {
+                if let Some(key) = key_for_code(message.word as i32) {
+                    events.push(Event::KeyDown { key, modifiers });
+                }
+            }
+            WM_KEYUP | WM_SYSKEYUP => {
+                if let Some(key) = key_for_code(message.word as i32) {
+                    events.push(Event::KeyUp { key, modifiers });
+                }
+            }
+            WM_CHAR => {
+                // A key held with the accelerator is a command, not typing.
+                if modifiers.command {
+                    return;
+                }
+                if let Some(character) =
+                    char::from_u32(message.word as u32).filter(|c| !c.is_control())
+                {
+                    events.push(Event::Text(character.to_string()));
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// The client size in logical units.
+    fn logical_size(&self) -> (f32, f32) {
+        (self.size.0 as f32 / self.scale, self.size.1 as f32 / self.scale)
+    }
+
+    /// The pointer position a mouse message carries, in logical units.
+    fn position_of(&self, long: LongParameter) -> Point {
+        // Packed as two signed 16-bit values; taking them unsigned puts the
+        // pointer at 65,000 the moment it leaves the window to the left.
+        let x = (long & 0xffff) as u16 as i16 as f32;
+        let y = ((long >> 16) & 0xffff) as u16 as i16 as f32;
+        Point::new(x / self.scale, y / self.scale)
+    }
+}
+
+impl Drop for Window {
+    fn drop(&mut self) {
+        unsafe {
+            if IsWindow(self.handle) != 0 {
+                DestroyWindow(self.handle);
+            }
+        }
+    }
+}
+
+/// How far one wheel message scrolls, in logical units.
+fn wheel_amount(word: WordParameter) -> f32 {
+    let notches = ((word >> 16) & 0xffff) as u16 as i16 as f32 / WHEEL_DELTA;
+    notches * WHEEL_STEP
+}
+
+/// Which modifiers are held right now.
+///
+/// Read from the keyboard rather than from the message, because a message
+/// carries the key that changed and not the state of the others.
+fn current_modifiers() -> Modifiers {
+    let held = |key: i32| unsafe { GetKeyState(key) < 0 };
+    let control = held(VK_CONTROL);
+    Modifiers {
+        shift: held(VK_SHIFT),
+        control,
+        alt: held(VK_MENU),
+        // Control is the accelerator on this platform, so a shortcut written
+        // once is correct here and on macOS without a conditional at its use.
+        command: control,
+    }
+}
+
+/// The named key a virtual key code stands for, if it is one.
+fn key_for_code(code: i32) -> Option<Key> {
+    Some(match code {
+        VK_RETURN => Key::Enter,
+        VK_TAB => Key::Tab,
+        VK_SPACE => Key::Space,
+        VK_BACK => Key::Backspace,
+        VK_DELETE => Key::Delete,
+        VK_ESCAPE => Key::Escape,
+        VK_HOME => Key::Home,
+        VK_END => Key::End,
+        VK_PRIOR => Key::PageUp,
+        VK_NEXT => Key::PageDown,
+        VK_LEFT => Key::Left,
+        VK_RIGHT => Key::Right,
+        VK_UP => Key::Up,
+        VK_DOWN => Key::Down,
+        // Letters and digits carry their ASCII code, which is what a shortcut
+        // is written against.
+        0x30..=0x39 => Key::Character(code as u8 as char),
+        0x41..=0x5A => Key::Character((code as u8 as char).to_ascii_lowercase()),
+        _ => return None,
+    })
+}
+
+/// A NUL-terminated UTF-16 string, as every wide Win32 entry point wants.
+fn wide(text: &str) -> Vec<u16> {
+    text.encode_utf16().chain(std::iter::once(0)).collect()
+}
+
+/// Answers the two messages that must be answered rather than merely observed.
+///
+/// Everything else is read off the queue in [`Window::pump`] and then handed to
+/// `DefWindowProcW`, so this stays the whole of the callback.
+unsafe extern "system" fn window_procedure(
+    window: Handle,
+    message: u32,
+    word: WordParameter,
+    long: LongParameter,
+) -> LongParameter {
+    match message {
+        // Painting is ours. Answering non-zero says the background needs no
+        // erasing, which is what stops the window flashing grey between frames.
+        WM_ERASEBKGND => 1,
+        // The update region has to be validated or Windows re-sends this
+        // forever. Nothing is drawn here: the frame loop presents whole frames.
+        WM_PAINT => unsafe {
+            let mut paint: PaintStruct = std::mem::zeroed();
+            BeginPaint(window, &mut paint);
+            EndPaint(window, &paint);
+            0
+        },
+        _ => unsafe { DefWindowProcW(window, message, word, long) },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn named_keys_come_from_their_virtual_codes() {
+        assert_eq!(key_for_code(VK_ESCAPE), Some(Key::Escape));
+        assert_eq!(key_for_code(VK_UP), Some(Key::Up));
+        assert_eq!(key_for_code(0x41), Some(Key::Character('a')), "letters arrive uppercase");
+        assert_eq!(key_for_code(0x35), Some(Key::Character('5')));
+        assert_eq!(key_for_code(0xFF), None);
+    }
+
+    #[test]
+    fn a_wheel_notch_scrolls_one_step_in_the_direction_it_turned() {
+        assert_eq!(wheel_amount((120i32 as u32 as usize) << 16), WHEEL_STEP);
+        assert_eq!(wheel_amount(((-120i32) as u32 as usize) << 16), -WHEEL_STEP);
+    }
+
+    #[test]
+    fn a_pointer_left_of_the_window_reads_as_negative_not_as_sixty_five_thousand() {
+        let window = Window { handle: std::ptr::null_mut(), open: true, size: (100, 100), scale: 1.0 };
+        let packed = (-4i16 as u16 as isize) | ((-9i16 as u16 as isize) << 16);
+        assert_eq!(window.position_of(packed), Point::new(-4.0, -9.0));
+    }
+
+    #[test]
+    fn pointer_positions_are_divided_by_the_display_scale() {
+        let window = Window { handle: std::ptr::null_mut(), open: true, size: (200, 200), scale: 2.0 };
+        let packed = 40isize | (60isize << 16);
+        assert_eq!(window.position_of(packed), Point::new(20.0, 30.0));
+    }
+
+    #[test]
+    fn wide_strings_are_terminated() {
+        assert_eq!(wide("hi"), vec![b'h' as u16, b'i' as u16, 0]);
+    }
+}
