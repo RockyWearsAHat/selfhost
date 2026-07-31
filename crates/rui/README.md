@@ -34,6 +34,7 @@ rasterises every pixel itself, and runs until the window is closed.
 cargo run -p rui --example counter    # the program above
 cargo run -p rui --example controls   # controls built from the primitives
 cargo run -p rui --example gallery -- .   # every element, to a PNG, with no window
+                                          # light, dark, and under a supplied theme
 ```
 
 ## The model
@@ -81,15 +82,34 @@ button as well, you are either sending a patch upstream or writing it from
 scratch anyway, and the catalogue you were handed turns out to be a list of the
 things you are allowed to want.
 
-What a foundation owes you instead is that any of them can be *written*. Four
+What a foundation owes you instead is that any of them can be *written*. Five
 primitives cover it:
 
 | primitive | what it gives you |
 |---|---|
 | `draw(size, \|painter, rect\|)` | a rectangle and the same painter every element here is made of |
 | `painter.visual()` | whether it is hovered, held, focused, disabled, and how far its hover has eased |
+| `painter.ease(name, target, seconds)` | the same frame-rate-independent curve every built-in animation runs on, for anything the hover does not already answer |
 | `.on_drag(\|state, drag\|)` | where the pointer is *within it*, every frame it is held — clamped by `drag.fraction()` |
 | `.on_key`, `.on_scroll`, `.on_hover`, `.layer` | the keyboard, the wheel, the pointer arriving, and somewhere to put what opens |
+
+`ease` is what makes "animates on the same curve" true rather than nearly true.
+A figure that counts up to its new number, a bar that sweeps to its reading, a
+row that settles after a click — each is one call, named so that two eased
+values in one drawing cannot come to share a number:
+
+```rust
+draw(Size::new(120.0, 10.0), move |painter, rect| {
+    let swept = painter.ease("needle", reading, painter.theme().metrics.motion);
+    let (filled, _) = rect.split_left(rect.w * swept);
+    painter.fill(rect, Radius::Cut(3.0), Tone::Sunken);
+    painter.fill(filled, Radius::Cut(3.0), Tone::Accent);
+})
+```
+
+Nothing in there reads a clock — the frame is *told* how long it lasted — so
+`harness.frames(60)` is exactly one second of it and the sweep is assertable to
+the pixel.
 
 A slider is then four lines, and is a real control — it animates on the same
 curve, answers the keyboard, and is reachable by Tab, because it is made of the
@@ -184,6 +204,33 @@ parent's padding would be the most confusing thing a layout engine can do.
 Everything else is a chained setter: `.pad`, `.gap`, `.fill`, `.gradient`,
 `.border`, `.round`, `.pill`, `.shadow`, `.clip`, `.align`, `.justify`,
 `.center`, `.hover_fill`, `.hover_color`, `.disabled`.
+
+### The theme, and the corner
+
+A style names a role — `Tone::Surface`, `Radius::Panel` — and the `Theme` says
+what roles come to. An application supplies its own, and every widget follows
+because none of them names a colour or a corner for itself:
+
+```rust
+App::new("Console", state, view)
+    .theme(|appearance, ui, mono| {
+        Theme::new(appearance, ui, mono).with_corners(CornerStyle::Cut)
+    })
+    .run()
+```
+
+That one word turns every panel, button, field, and tag in the window from a
+card into a machined plate — a rounded corner and a chamfered one are the same
+distance field and cost the same, so which one an interface is made of is a
+decision rather than a limitation. It is a function of the appearance rather
+than a value because a desktop can turn the lights out under a running window.
+`App::render` and `Harness` honour it as a window does, so a screenshot, a test,
+and the running program cannot disagree about what the interface looks like —
+`cargo run -p rui --example gallery -- .` writes the same interface under both.
+
+For the single element that is genuinely not what the rest of the interface is,
+`Radius::Cut(units)` chamfers that one thing and `Radius::None` squares it. They
+carry the same warning `Tone::Exact` does: a theme can no longer move them.
 
 ## Identity, and the state that outlives a frame
 
@@ -350,6 +397,7 @@ Windows, and X11 because the same code drew it.
 |---|---|
 | `element`, `widgets` | the description |
 | `style` | lengths, roles, alignment, radii |
+| `theme` | what those roles come to: palette, metrics, corner shape, type scale |
 | `accessibility` | what the description means, and the diff the platform is pushed |
 | `layout` | how room is divided |
 | `paint` | drawing it, and working out what it was told |

@@ -49,7 +49,11 @@
 //!
 //! **Colours are roles, not values.** A style names [`Tone::Surface`] or
 //! [`Tone::Muted`] rather than a particular grey, so one description of an
-//! interface is correct on a light desktop and on a dark one.
+//! interface is correct on a light desktop and on a dark one. Shape works the
+//! same way: a [`Radius`] says how big a corner is and the [`Theme`] says what
+//! shape corners *are*, so a program that hands the library its own theme with
+//! [`App::theme`] changes every panel, button, field, and tag at once — see
+//! [`CornerStyle`].
 //!
 //! **Everything is drawn here.** The rasteriser, the TrueType parser, the text
 //! layout, the antialiasing, and the platform windows are all in this crate,
@@ -71,6 +75,10 @@
 //! - [`Painter::visual`] — whether it is hovered, held, focused, or disabled,
 //!   and how far its hover has eased, so custom drawing reacts exactly as a
 //!   button does.
+//! - [`Painter::ease`] — the same frame-rate-independent curve every built-in
+//!   animation runs on, for anything the hover does not already answer: a
+//!   figure that counts to its new number, a bar that sweeps to its reading.
+//!   Nothing reads a clock, so a test steps it exactly.
 //! - [`El::on_drag`] — where the pointer is *within* it, every frame it is
 //!   held. The difference between a button and a slider, a splitter, a knob, or
 //!   a canvas that pans.
@@ -87,6 +95,9 @@
 //!
 //! - [`El`] and the constructors in [`widgets`] — the structure.
 //! - [`style`] — the look: lengths, roles, alignment, radii, inheritance.
+//! - [`theme`] — what those roles come to: the palette, the measurements, the
+//!   corner shape, and the type scale, either the library's or the
+//!   application's own.
 //! - [`accessibility`] — what the structure *means*: a [`Role`] on every
 //!   element, a name computed from the words inside it, and a frame-to-frame
 //!   diff of the whole for the platform to push.
@@ -146,7 +157,7 @@ pub use paint::{Painter, Visual};
 pub use shell::{Error, LoadedFonts, WindowOptions};
 pub use style::{Align, Anchor, Axis, Face, Ink, Justify, Length, Radius, Style, Tone};
 pub use text::{FontId, Fonts, TextStyle};
-pub use theme::{Appearance, Palette, Status, Theme};
+pub use theme::{Appearance, CornerStyle, Palette, Status, Theme};
 pub use widgets::{
     button, caption, code, col, divider, dot, draw, field, field_row, figure, heading, meter,
     micro, panel, paragraph, row, section, segmented, spacer, tabs, tag, text, title,

@@ -25,6 +25,10 @@
 //! state in [`Memory`] — which is why an interface written with this library
 //! cannot show something its data no longer says.
 //!
+//! Each of those frames is drawn from a [`Theme`], derived from whether the
+//! desktop is light or dark. An application supplies its own with
+//! [`App::theme`]; one that says nothing is drawn with [`Theme::new`].
+//!
 //! # What else a frame produces
 //!
 //! The same walk of the finished tree that hands a test its probes builds the
@@ -48,7 +52,7 @@ use crate::layout::{self, Ctx};
 use crate::memory::{Id, Memory};
 use crate::paint::{self, Frame};
 use crate::shell::{self, Error, LoadedFonts, WindowOptions};
-use crate::text::Fonts;
+use crate::text::{FontId, Fonts};
 use crate::theme::{Appearance, Theme};
 use std::time::Duration;
 
@@ -75,6 +79,8 @@ pub struct App<S> {
     options: WindowOptions,
     idle: Duration,
     running: Condition<S>,
+    /// What the interface is drawn from, given the desktop's appearance.
+    theme: ThemeFor,
     /// What the last frame amounted to, for anything that cannot see it.
     access: AccessTree,
     /// How that differed from the frame before, which is what gets pushed.
@@ -93,6 +99,14 @@ type View<S> = Box<dyn Fn(&S) -> El<S>>;
 
 /// Something the application is asked about its own state each frame.
 type Condition<S> = Box<dyn Fn(&S) -> bool>;
+
+/// What the interface is drawn from, derived once a frame from the appearance.
+///
+/// A function of the appearance and the two faces rather than a stored value,
+/// because none of the three is known when an application is built: the desktop
+/// can turn the lights out under a running window, and the faces are found on
+/// the machine the program is running on. See [`App::theme`].
+type ThemeFor = Box<dyn Fn(Appearance, FontId, FontId) -> Theme>;
 
 /// How long the loop waits for input before drawing again anyway.
 ///
@@ -115,6 +129,7 @@ impl<S> App<S> {
             options: WindowOptions { title: title.into(), ..WindowOptions::default() },
             idle: DEFAULT_IDLE,
             running: Box::new(|_| true),
+            theme: Box::new(Theme::new),
             access: AccessTree::new(),
             access_update: AccessUpdate::default(),
             #[cfg(feature = "reload")]
@@ -192,6 +207,62 @@ impl<S> App<S> {
     pub fn idle_timeout(mut self, timeout: Duration) -> Self {
         self.idle = timeout;
         self
+    }
+
+    /// What the interface is drawn from: its colours, sizes, corners, and type.
+    ///
+    /// The library's own is [`Theme::new`], and an application that says nothing
+    /// gets exactly that. Supplying one reaches every widget at once, because
+    /// none of them names a colour or a corner for itself:
+    ///
+    /// ```ignore
+    /// use rui::{App, CornerStyle, Theme};
+    ///
+    /// App::new("Console", state, view)
+    ///     .theme(|appearance, ui, mono| {
+    ///         Theme::new(appearance, ui, mono).with_corners(CornerStyle::Cut)
+    ///     })
+    ///     .run()
+    /// ```
+    ///
+    /// A function rather than a value, and called once a frame, because the
+    /// appearance is not knowable in advance: a desktop can turn the lights out
+    /// under a running window, and a theme is derived from that rather than
+    /// fixed against it. The faces are handed over for the same reason — they
+    /// are found on the machine the program is running on. Anything else the
+    /// theme depends on is the closure's own business, so long as it does not
+    /// read a clock; see [`Memory::begin_frame`](crate::Memory::begin_frame).
+    ///
+    /// [`App::render`] and [`Harness`](crate::testing::Harness) honour it as a
+    /// window does, so a screenshot, a test, and the running program cannot
+    /// disagree about what the interface looks like.
+    pub fn theme(
+        mut self,
+        theme: impl Fn(Appearance, FontId, FontId) -> Theme + 'static,
+    ) -> Self {
+        self.set_theme(Box::new(theme));
+        self
+    }
+
+    /// The same, on an application that is already built.
+    ///
+    /// For [`Harness`](crate::testing::Harness), which holds one rather than
+    /// building it; the builder above is what an application uses.
+    pub(crate) fn set_theme(&mut self, theme: ThemeFor) {
+        self.theme = theme;
+    }
+
+    /// The theme this application draws with, under `appearance`.
+    ///
+    /// Asked once a frame by whatever is about to draw one — a window, a test,
+    /// or [`App::render`] — so there is one answer and not three.
+    pub(crate) fn theme_for(
+        &self,
+        appearance: Appearance,
+        ui_font: FontId,
+        mono_font: FontId,
+    ) -> Theme {
+        (self.theme)(appearance, ui_font, mono_font)
     }
 
     /// When the application should close its own window.
@@ -277,7 +348,7 @@ impl<S> App<S> {
         let input = Input::new();
         fonts.fonts.set_scale(canvas.scale());
 
-        let theme = Theme::new(appearance, fonts.ui_font, fonts.mono_font);
+        let theme = self.theme_for(appearance, fonts.ui_font, fonts.mono_font);
         canvas.clear_vertical(theme.palette.background, theme.palette.background_deep);
         memory.begin_frame(std::time::Duration::from_millis(16));
         self.frame(canvas, &fonts.fonts, &input, memory, &theme);

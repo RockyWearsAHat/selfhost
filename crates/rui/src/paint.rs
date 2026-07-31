@@ -13,6 +13,15 @@
 //! take `&mut` of the application's whole state: while the description exists it
 //! borrows the state immutably, and by the time a handler runs it does not exist
 //! any more.
+//!
+//! # What an application's own drawing can reach
+//!
+//! Everything a widget in this library can: the canvas, the faces, the theme,
+//! what the pointer and keyboard are doing to it ([`Visual`]), and the easing
+//! every built-in animation runs on ([`Painter::ease`]). A control somebody
+//! writes is therefore not a picture that happens to be clickable — it moves,
+//! lights, and settles exactly as a shipped one does, without this module
+//! knowing what it is.
 
 use crate::canvas::{Canvas, Corner};
 use crate::color::Color;
@@ -55,15 +64,26 @@ pub struct Visual {
     pub disabled: bool,
 }
 
-/// The canvas, the faces, and the theme: everything drawing needs.
+/// The canvas, the faces, the theme, and the element's own easing: everything
+/// drawing needs.
 ///
 /// Handed to an application's own drawing, so a sparkline or a diagram is drawn
-/// with exactly what every widget in the library is drawn with.
+/// with exactly what every widget in the library is drawn with — including
+/// [`Painter::ease`], the curve every one of them animates on.
 pub struct Painter<'a> {
     canvas: &'a mut Canvas,
     fonts: &'a Fonts,
     theme: &'a Theme,
     visual: Visual,
+    /// Whose drawing this is, so an eased value needs no identity of its own.
+    id: Id,
+    /// Where eased values are kept between frames, or `None` outside a frame.
+    ///
+    /// The only mutable thing a painter holds. It is an `Option` because a
+    /// painter also draws with no frame around it — an icon, a thumbnail — and
+    /// there is no state to keep between frames that never happen. See
+    /// [`Painter::ease`].
+    memory: Option<&'a mut Memory>,
 }
 
 impl<'a> Painter<'a> {
@@ -72,14 +92,56 @@ impl<'a> Painter<'a> {
     /// What renders an icon, a thumbnail, or anything else an application draws
     /// with no window open: the same marks every widget is made of, on a canvas
     /// the caller owns. Nothing is being pointed at, so [`Painter::visual`]
-    /// reports an element at rest.
+    /// reports an element at rest, and nothing outlives a single drawing, so
+    /// [`Painter::ease`] answers its target at once.
     pub fn new(canvas: &'a mut Canvas, fonts: &'a Fonts, theme: &'a Theme) -> Self {
-        Self { canvas, fonts, theme, visual: Visual::default() }
+        Self { canvas, fonts, theme, visual: Visual::default(), id: Id::ROOT, memory: None }
     }
 
     /// What the pointer and keyboard are doing to the element being drawn.
     pub fn visual(&self) -> Visual {
         self.visual
+    }
+
+    /// Eases the value named `key` toward `target`, and answers where it got.
+    ///
+    /// The curve every control in this library moves on, reachable from drawing
+    /// the library has never seen: a value that counts up to its new number, a
+    /// bar that sweeps rather than jumps, a row that settles. `seconds` is the
+    /// time constant — how long the value takes to close most of the remaining
+    /// distance — and [`Metrics::motion`](crate::theme::Metrics::motion) is what
+    /// the interface's own animations use, so passing that is how a hand-built
+    /// control moves at the same speed as a button.
+    ///
+    /// # Two eased values in one drawing
+    ///
+    /// `key` names the value *within* this element, and the element's own
+    /// identity is supplied — so `painter.ease("sweep", …)` and
+    /// `painter.ease("glow", …)` are two values in every copy of a row, and the
+    /// same call in the row below is a third. A caller never invents an
+    /// identity, and two values in one drawing cannot silently share one number.
+    ///
+    /// It is a name and not the order the calls happen to run in, because an
+    /// eased value that lives behind an `if` would then take its neighbour's
+    /// number on the frame the branch changes — which looks like an animation
+    /// leaping and reads, from the code, like nothing at all.
+    ///
+    /// # What it does not do
+    ///
+    /// Read a clock. The frame is *told* how long it lasted, exactly as every
+    /// built-in animation is, so `harness.frames(60)` is one second of this and
+    /// a test can assert where it got to. See [`Memory::ease`].
+    ///
+    /// Outside a frame — a painter from [`Painter::new`] — there is nothing to
+    /// remember a value in, so this answers `target`. That is what a first sight
+    /// of a value does inside a frame too, and it is why an icon rendered to a
+    /// file draws the interface at rest rather than mid-animation.
+    pub fn ease(&mut self, key: &str, target: f32, seconds: f32) -> f32 {
+        let id = self.id.with(APPLICATION_EASING).with(key);
+        match &mut self.memory {
+            Some(memory) => memory.ease(id, target, seconds),
+            None => target,
+        }
     }
 
     /// The pixels being marked.
@@ -149,6 +211,13 @@ pub(crate) struct Hit {
     /// to — so a list inside a page scrolls the list, not the page.
     pub(crate) scroll: Option<Id>,
 }
+
+/// The name every value an application eases is kept under.
+///
+/// One step of its own between an element's identity and the caller's key, so
+/// that a drawing which eases something called `hover` cannot land on the value
+/// this module eases under that name for the same element.
+const APPLICATION_EASING: &str = "draw";
 
 /// How far outside its own edge a focus ring is drawn.
 const FOCUS_OFFSET: f32 = 2.0;
@@ -529,8 +598,16 @@ fn content<'tree, S>(
                 lit,
                 disabled: el.disabled,
             };
-            let mut painter =
-                Painter { canvas: frame.canvas, fonts: frame.fonts, theme: frame.theme, visual };
+            let mut painter = Painter {
+                canvas: frame.canvas,
+                fonts: frame.fonts,
+                theme: frame.theme,
+                visual,
+                id: el.id,
+                // The same store every built-in animation is kept in, reached
+                // under the element's own identity — see [`Painter::ease`].
+                memory: Some(frame.memory),
+            };
             paint(&mut painter, el.rect);
         }
     }
@@ -986,6 +1063,10 @@ fn draw_wrapped(
 }
 
 /// The corner shape a radius amounts to on a particular rectangle.
+///
+/// Four of the six take the theme's own shape and differ only in size, which is
+/// what makes one word in the theme change the whole interface. The other two
+/// state a shape of their own; see [`Radius`].
 fn corner_of(radius: Radius, rect: Rect, theme: &Theme) -> Corner {
     match radius {
         Radius::None => Corner::Square,
@@ -993,6 +1074,7 @@ fn corner_of(radius: Radius, rect: Rect, theme: &Theme) -> Corner {
         Radius::Control => theme.corner_small(),
         Radius::Units(units) => theme.corner().resized(units),
         Radius::Pill => theme.corner().resized(rect.w.min(rect.h) / 2.0),
+        Radius::Cut(units) => Corner::Cut(units),
     }
 }
 
@@ -1053,6 +1135,20 @@ mod tests {
     fn a_press_lifts_further_than_a_hover() {
         let base = Color::rgb(40, 90, 200);
         assert!(lift(base, 1.0, true).luminance() > lift(base, 1.0, false).luminance());
+    }
+
+    #[test]
+    fn a_painter_outside_a_frame_answers_an_easing_with_its_target() {
+        // An icon drawn to a file has no frames to ease over and nowhere to
+        // remember a value between them, so it draws the interface at rest —
+        // which is what a first sight of a value does inside a frame too.
+        let mut canvas = Canvas::new(16, 16, 1.0);
+        let fonts = crate::testing::test_fonts();
+        let theme =
+            Theme::new(crate::theme::Appearance::Dark, fonts.ui_font, fonts.mono_font);
+        let mut painter = Painter::new(&mut canvas, &fonts.fonts, &theme);
+        assert_eq!(painter.ease("sweep", 0.75, 0.1), 0.75);
+        assert_eq!(painter.ease("sweep", 0.25, 0.1), 0.25, "and it does not accumulate");
     }
 
     #[test]

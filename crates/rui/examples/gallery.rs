@@ -1,9 +1,12 @@
 //! Every element in the library, drawn to a PNG with no window open.
 //!
 //! Run with `cargo run -p rui --example gallery -- <directory>`. It writes
-//! `gallery-light.png` and `gallery-dark.png`, which is how this library's own
-//! appearance is reviewed: the renderer is pure, so a frame drawn with no
-//! display is the same frame a window would show.
+//! `gallery-light.png`, `gallery-dark.png`, and `gallery-cut.png`, which is how
+//! this library's own appearance is reviewed: the renderer is pure, so a frame
+//! drawn with no display is the same frame a window would show.
+//!
+//! The third of those is the same interface under a theme the application
+//! supplied — one word different, and every framed thing in the window follows.
 //!
 //! The state and the view are public so that `tests/accessibility.rs` can hold
 //! this exact interface — every element the library ships, in one place — to the
@@ -11,9 +14,9 @@
 
 use rui::style::{Align, Justify, Length, Radius};
 use rui::{
-    App, Appearance, El, Size, Status, Tone, button, caption, code, col, divider, dot, draw, field,
-    field_row, figure, heading, image, meter, micro, panel, paragraph, row, section, segmented,
-    spacer, tabs, tag, title,
+    App, Appearance, CornerStyle, El, Size, Status, Theme, Tone, button, caption, code, col,
+    divider, dot, draw, field, field_row, figure, heading, image, meter, micro, panel, paragraph,
+    row, section, segmented, spacer, tabs, tag, title,
 };
 
 /// What the gallery is showing, so the interactive parts have something to say.
@@ -35,7 +38,7 @@ pub fn view(gallery: &Gallery) -> El<Gallery> {
         tabs(&["Overview", "Definition", "Output"], gallery.tab, |gallery: &mut Gallery, tab| {
             gallery.tab = tab
         }),
-        row((counts(), states())).gap(12.0),
+        row((counts(), states(), readout(gallery))).gap(12.0),
         row((controls(gallery), form(gallery))).gap(12.0).grow(),
     ))
     .pad(16.0)
@@ -125,6 +128,54 @@ fn states() -> El<Gallery> {
     .grow()
 }
 
+/// A chamfered plate holding a gauge that sweeps to its reading.
+///
+/// The two things an application reaches past the widget set for, together:
+///
+/// - `Radius::Cut` gives *this* container a machined corner while the panels
+///   beside it keep the theme's own. A whole interface of them is asked for
+///   from the theme instead — see `main`, which renders exactly that.
+/// - `Painter::ease` moves the needle on the same curve every button in this
+///   window lights on, so a control the library has never seen does not have to
+///   choose between jumping and inventing its own timing. Choosing a tab above
+///   moves the reading, and the sweep is what carries it there.
+fn readout(gallery: &Gallery) -> El<Gallery> {
+    // Something on screen that changes, so the sweep has somewhere to go.
+    let reading = [0.28, 0.64, 0.93][gallery.tab.min(2)];
+    col((
+        section("READOUT", Some("eased".into())),
+        row((
+            draw(Size::new(120.0, 10.0), move |painter, rect| {
+                // The interface's own motion constant, so this moves at the
+                // pace the rest of the window does.
+                let swept = painter.ease("needle", reading, painter.theme().metrics.motion);
+                painter.fill(rect, Radius::Cut(3.0), Tone::Sunken);
+                painter.stroke(rect, Radius::Cut(3.0), 1.0, Tone::Border);
+
+                let filled = rui::Rect::new(rect.x, rect.y, (rect.w * swept).max(1.0), rect.h);
+                painter.fill(filled, Radius::Cut(3.0), Tone::Accent);
+            })
+            .grow()
+            .h(10.0)
+            .role(rui::Role::Meter)
+            .label("Load")
+            .value(format!("{:.0}%", reading * 100.0)),
+            caption(format!("{:.0}%", reading * 100.0)),
+        ))
+        .gap(8.0)
+        .align(Align::Center),
+        micro("Cut corners, an eased sweep."),
+        spacer().grow(),
+    ))
+    .gap(8.0)
+    .w(200.0)
+    .pad(12.0)
+    .gradient(Tone::Surface, Tone::SurfaceDeep)
+    .border(1.0, Tone::Border)
+    .round(Radius::Cut(10.0))
+    .shadow(9.0)
+}
+
 /// Every emphasis a button has, and a paragraph of prose.
 fn controls(gallery: &Gallery) -> El<Gallery> {
     panel(col((
@@ -193,11 +244,24 @@ fn form(gallery: &Gallery) -> El<Gallery> {
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let directory = std::env::args().nth(1).unwrap_or_else(|| ".".into());
     let mut fonts = rui::shell::load_system_fonts()?;
-    let mut app = App::new("Gallery", demo(), view);
 
-    for (name, appearance) in
-        [("light", Appearance::Light), ("dark", Appearance::Dark)]
-    {
+    // The same description, drawn three times. The third supplies a theme of
+    // its own, and one word in it turns every panel, button, field, and tag in
+    // the window from a card into a machined plate — with not one of them
+    // touched, because none of them names a corner shape for itself.
+    let renders: [(&str, Appearance, Option<CornerStyle>); 3] = [
+        ("light", Appearance::Light, None),
+        ("dark", Appearance::Dark, None),
+        ("cut", Appearance::Dark, Some(CornerStyle::Cut)),
+    ];
+
+    for (name, appearance, corners) in renders {
+        let mut app = App::new("Gallery", demo(), view);
+        if let Some(corners) = corners {
+            app = app.theme(move |appearance, ui, mono| {
+                Theme::new(appearance, ui, mono).with_corners(corners)
+            });
+        }
         let canvas = app.render(1000, 640, 2.0, appearance, &mut fonts);
         let pixels = image::rgba(&canvas);
         let png = image::png(canvas.width(), canvas.height(), &pixels)

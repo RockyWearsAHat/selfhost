@@ -66,7 +66,7 @@ use crate::input::{Event, Input};
 use crate::memory::Memory;
 use crate::font::FontError;
 use crate::text::{FontId, Fonts};
-use crate::theme::{Appearance, Theme};
+use crate::theme::Appearance;
 use std::time::{Duration, Instant};
 
 pub use fonts::{LoadedFonts, load_system_fonts};
@@ -282,7 +282,10 @@ impl Surface {
         }
         fonts.set_scale(scale);
 
-        let theme = Theme::new(window.appearance(), self.ui_font, self.mono_font);
+        // The application's own, if it supplied one — asked here rather than
+        // built here, so a window and a test cannot come to disagree about what
+        // the interface looks like. See [`App::theme`].
+        let theme = app.theme_for(window.appearance(), self.ui_font, self.mono_font);
         self.drawn.clear_vertical(theme.palette.background, theme.palette.background_deep);
         app.frame(&mut self.drawn, fonts, &self.input, &mut self.memory, &theme);
         self.memory.end_frame(&self.input);
