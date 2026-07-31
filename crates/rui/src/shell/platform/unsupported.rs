@@ -5,6 +5,7 @@
 //! missing rather than with a linker error about an absent module — which is
 //! what someone porting this would otherwise meet first.
 
+use crate::geom::Rect;
 use crate::theme::Appearance;
 use crate::{Canvas, Event};
 use std::time::Duration;
@@ -42,5 +43,17 @@ impl Backend for Window {
 
     fn is_open(&self) -> bool {
         false
+    }
+
+    fn clipboard_text(&self) -> Result<Option<String>, Error> {
+        Err(Error::Unsupported)
+    }
+
+    fn set_clipboard_text(&self, _text: &str) -> Result<(), Error> {
+        Err(Error::Unsupported)
+    }
+
+    fn set_composition_area(&self, _area: Option<Rect>) -> Result<(), Error> {
+        Err(Error::Unsupported)
     }
 }

@@ -9,8 +9,26 @@
 //! exists. A button that fired while the pointer was merely held down would
 //! repeat every frame, and one that fired on press would activate under a
 //! pointer that arrived already held from somewhere else.
+//!
+//! # Typing arrives in two forms, and only one of them is finished
+//!
+//! [`Event::Text`] is text the platform's input method has *decided*: it is
+//! inserted and it is done. [`Event::Composing`] is the other half — the
+//! [`Composition`] an input method is still assembling, which the person can
+//! still change or abandon. Composing "にほん" takes five keystrokes and produces
+//! six different in-progress strings before any of it is typed, and pressing
+//! Option-E on a US layout leaves an accent waiting for the letter it belongs
+//! to.
+//!
+//! The two are kept apart because they belong to different owners. Committed
+//! text belongs to the application's state and goes through the field's input
+//! handler; a composition belongs to the *interaction*, lives in [`Input`] until
+//! the input method resolves it, and is drawn underlined in place so the person
+//! can see what they are still choosing. A composition that reached the
+//! application's state would be a value the application had to learn to un-type.
 
 use crate::geom::{Point, Rect};
+use std::ops::Range;
 
 /// Which pointer button.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -185,6 +203,37 @@ pub enum Key {
     Character(char),
 }
 
+/// Text an input method is still assembling, shown but not yet typed.
+///
+/// The in-progress half of typing: what a Japanese, Chinese, or Korean input
+/// method has been given so far, or the accent a dead key is holding until it
+/// learns which letter it belongs to. It is drawn at the caret, underlined, and
+/// is replaced wholesale every time the input method changes its mind — never
+/// appended to, because backing up over a composition is the input method's
+/// business and not the field's.
+///
+/// It reaches the application only when the input method commits it, as an
+/// ordinary [`Event::Text`].
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Composition {
+    /// What is being composed. Empty means the composition was abandoned.
+    pub text: String,
+    /// The part of `text` the input method has singled out, in byte offsets.
+    ///
+    /// Where the caret sits within the composition, and — when it covers more
+    /// than one character — which clause of a longer phrase is being edited.
+    /// Always on character boundaries of `text`, and always within it, so a
+    /// field can slice by it without checking.
+    pub selection: Range<usize>,
+}
+
+impl Composition {
+    /// Whether there is nothing being composed.
+    pub fn is_empty(&self) -> bool {
+        self.text.is_empty()
+    }
+}
+
 /// Something the window told us happened.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Event {
@@ -227,8 +276,15 @@ pub enum Event {
         /// What was held with it.
         modifiers: Modifiers,
     },
-    /// Text was typed, already resolved by the platform's input method.
+    /// Text was typed, and the platform's input method has committed to it.
     Text(String),
+    /// What the input method is still composing changed.
+    ///
+    /// Sent on every keystroke of a composition, carrying the whole of it each
+    /// time. An empty [`Composition`] means the composition ended — either
+    /// abandoned, or committed, in which case an [`Event::Text`] carrying the
+    /// result comes with it.
+    Composing(Composition),
     /// The user asked to close the window.
     CloseRequested,
 }
@@ -256,6 +312,13 @@ pub struct Input {
     scroll: (f32, f32),
     keys: Vec<(Key, Modifiers)>,
     text: String,
+    /// What an input method is still assembling.
+    ///
+    /// Unlike `text`, this survives the frame boundary: a composition is a thing
+    /// that *is*, for as long as the input method holds it, rather than a thing
+    /// that happened. Clearing it each frame would make it flicker on screen and
+    /// vanish for every frame no key was pressed on.
+    composition: Composition,
     modifiers: Modifiers,
     close_requested: bool,
 }
@@ -269,7 +332,8 @@ impl Input {
     /// Discards everything that only applied to the frame just drawn.
     ///
     /// What persists is what is still *true* — where the pointer is, what is
-    /// held down. What is cleared is what merely *happened*.
+    /// held down, what an input method is still composing. What is cleared is
+    /// what merely *happened*.
     pub fn begin_frame(&mut self) {
         self.pressed = [false; 3];
         self.released = [false; 3];
@@ -308,6 +372,7 @@ impl Input {
             }
             Event::KeyUp { modifiers, .. } => self.modifiers = modifiers,
             Event::Text(text) => self.text.push_str(&text),
+            Event::Composing(composition) => self.composition = within_bounds(composition),
             Event::CloseRequested => self.close_requested = true,
         }
     }
@@ -374,6 +439,14 @@ impl Input {
         &self.text
     }
 
+    /// What an input method is still composing, if it is composing anything.
+    ///
+    /// Whatever has the keyboard draws this at its caret. Nothing else should
+    /// act on it: it is not typed yet, and it may never be.
+    pub fn composition(&self) -> Option<&Composition> {
+        if self.composition.is_empty() { None } else { Some(&self.composition) }
+    }
+
     /// Which modifiers were last seen held.
     pub fn modifiers(&self) -> Modifiers {
         self.modifiers
@@ -383,6 +456,31 @@ impl Input {
     pub fn close_requested(&self) -> bool {
         self.close_requested
     }
+}
+
+/// A composition whose selection is certainly inside its own text.
+///
+/// [`Input::apply`] is the one place a composition crosses from a platform into
+/// the library, so it is the one place the invariant [`Composition::selection`]
+/// promises can be established. A field slices its composition by that range
+/// every frame it draws one, and an input method counts in UTF-16 units while a
+/// [`String`] is bytes — so a range landing past the end, or halfway through a
+/// character, is a mistranslation waiting to panic the interface rather than
+/// merely draw it oddly.
+fn within_bounds(mut composition: Composition) -> Composition {
+    let start = boundary_at_or_before(&composition.text, composition.selection.start);
+    let end = boundary_at_or_before(&composition.text, composition.selection.end).max(start);
+    composition.selection = start..end;
+    composition
+}
+
+/// The character boundary of `text` at or before `offset`.
+fn boundary_at_or_before(text: &str, offset: usize) -> usize {
+    let mut offset = offset.min(text.len());
+    while offset > 0 && !text.is_char_boundary(offset) {
+        offset -= 1;
+    }
+    offset
 }
 
 #[cfg(test)]
@@ -476,6 +574,57 @@ mod tests {
 
         input.begin_frame();
         assert_eq!(input.text(), "");
+    }
+
+    /// The event an input method sends while it is still assembling something.
+    fn composing(text: &str, selection: Range<usize>) -> Event {
+        Event::Composing(Composition { text: text.to_owned(), selection })
+    }
+
+    #[test]
+    fn a_composition_replaces_the_last_one_rather_than_adding_to_it() {
+        let mut input = Input::new();
+        input.apply(composing("に", 0..3));
+        input.apply(composing("にほ", 0..6));
+        assert_eq!(input.composition().map(|c| c.text.as_str()), Some("にほ"));
+    }
+
+    #[test]
+    fn a_composition_outlives_the_frame_it_started_on() {
+        // Unlike typed text: it is still on screen, and still undecided, on
+        // every frame until the input method resolves it.
+        let mut input = Input::new();
+        input.apply(composing("にほ", 0..6));
+        input.begin_frame();
+        assert!(input.composition().is_some(), "the composition vanished between frames");
+    }
+
+    #[test]
+    fn an_empty_composition_is_the_end_of_one_rather_than_a_composition() {
+        let mut input = Input::new();
+        input.apply(composing("に", 0..3));
+        input.apply(composing("", 0..0));
+        assert_eq!(input.composition(), None);
+    }
+
+    #[test]
+    fn committing_a_composition_types_text_and_ends_the_composition() {
+        let mut input = Input::new();
+        input.apply(composing("にほん", 0..9));
+        input.apply(composing("", 0..0));
+        input.apply(Event::Text("日本".into()));
+        assert_eq!(input.text(), "日本");
+        assert_eq!(input.composition(), None);
+    }
+
+    #[test]
+    fn a_selection_reported_past_the_end_or_mid_character_is_pulled_inside() {
+        // What a platform counting UTF-16 units hands over when it is translated
+        // carelessly. The field slices by this range, so it has to hold.
+        let mut input = Input::new();
+        input.apply(composing("é", 1..99));
+        let composition = input.composition().expect("the composition should survive clamping");
+        assert_eq!(composition.selection, 0..2, "é is one character of two bytes");
     }
 
     #[test]

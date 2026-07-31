@@ -21,7 +21,7 @@ use crate::geom::{Insets, Point, Rect};
 use crate::input::{Drag, Input, Key, Phase, PointerButton};
 use crate::memory::{Caret, Id, Memory, Response};
 use crate::style::{Align, Ink, Radius, Tone};
-use crate::text::{Fonts, TextStyle};
+use crate::text::{Fonts, TextStyle, grapheme};
 use crate::theme::Theme;
 
 /// Something an interaction asked to be done to the application's state.
@@ -543,10 +543,13 @@ fn field<'tree, S>(
     let style = ink.style(frame.theme);
     let mut caret = frame.memory.caret(el.id);
     caret.offset = clamp_to_boundary(value, caret.offset);
+    caret.anchor = clamp_to_boundary(value, caret.anchor);
 
     let mut text = value.to_owned();
-    if response.focused && !el.disabled {
-        let edit = apply_edits(frame.input, &mut text, &mut caret);
+    let editing = response.focused && !el.disabled;
+    if editing {
+        aim_caret(frame, &style, &text, &mut caret, response, inner.w);
+        let edit = apply_edits(frame.input, frame.memory, &mut text, &mut caret);
         if edit.changed {
             if let Some(action) = &el.on_input {
                 let edited = text.clone();
@@ -566,33 +569,198 @@ fn field<'tree, S>(
     }
     frame.memory.set_caret(el.id, caret);
 
-    if text.is_empty() && !response.focused {
+    if text.is_empty() && !response.focused && frame.input.composition().is_none() {
         let hint = style.colored(Tone::Muted.resolve(frame.theme));
         draw_line(frame.canvas, frame.fonts, &hint, inner, Align::Start, placeholder, false);
         return;
     }
 
+    // What is drawn is the field's text with any composition inserted at the
+    // caret. A composition belongs to the interaction and not to the value —
+    // the application never sees it — but the person choosing between 日 and 火
+    // has to be able to read what they are choosing, in place.
+    let composing = if editing { frame.input.composition() } else { None };
+    let (display, preedit) = match composing {
+        Some(composition) => {
+            let mut display = text;
+            display.insert_str(caret.offset, &composition.text);
+            let range = caret.offset..caret.offset + composition.text.len();
+            (display, Some((range, composition.selection.clone())))
+        }
+        None => (text, None),
+    };
+
+    // Where the caret is drawn: inside the composition while there is one,
+    // because that is where the next keystroke goes.
+    let caret_offset = match &preedit {
+        Some((range, selection)) => range.start + selection.start,
+        None => caret.offset,
+    };
+
     // Keep the caret on screen by sliding the text left when it would otherwise
     // sit past the right edge.
-    let caret_x = frame.fonts.measure(&style, &text[..caret.offset]);
-    let shift = (caret_x - inner.w + 2.0).max(0.0);
+    let caret_x = frame.fonts.measure(&style, &display[..caret_offset]);
+    let shift = scroll_shift(caret_x, inner.w);
     let metrics = frame.fonts.metrics(&style);
-    let baseline = inner.y + (inner.h - metrics.line_height()) / 2.0 + metrics.ascent;
+    let line_height = metrics.line_height();
+    let top = inner.y + (inner.h - line_height) / 2.0;
+    let baseline = top + metrics.ascent;
 
     let previous = frame.canvas.push_clip(inner);
-    let origin = Point::new(inner.x - shift, baseline);
-    frame.fonts.draw(frame.canvas, &style, origin, &text, style.color);
+    let left = inner.x - shift;
+
+    // Behind the text, so the text stays the thing being read.
+    let selection = caret.selection();
+    if editing && preedit.is_none() && !selection.is_empty() {
+        let start = frame.fonts.measure(&style, &display[..selection.start]);
+        let end = frame.fonts.measure(&style, &display[..selection.end]);
+        let rect = Rect::new(left + start, top, end - start, line_height);
+        frame.canvas.fill_rect(rect, Tone::Selection.resolve(frame.theme));
+    }
+
+    frame.fonts.draw(frame.canvas, &style, Point::new(left, baseline), &display, style.color);
+
+    if let Some((range, selection)) = &preedit {
+        underline_composition(frame, &style, &display, range, selection, left, baseline);
+    }
     frame.canvas.pop_clip(previous);
 
     if response.focused {
-        let caret_rect = Rect::new(
-            inner.x + caret_x - shift,
-            inner.y + (inner.h - metrics.line_height()) / 2.0,
-            1.5,
-            metrics.line_height(),
-        );
+        let caret_rect =
+            Rect::new(inner.x + caret_x - shift, top, CARET_THICKNESS, line_height);
         frame.canvas.fill_rect(caret_rect, Tone::Accent.resolve(frame.theme));
+        // What the platform's input method is told, so that a list of candidate
+        // characters opens beside the text being composed. Reported from here
+        // because this is the one place that knows where the caret came out.
+        if editing {
+            frame.memory.set_caret_area(caret_rect);
+        }
     }
+}
+
+/// How wide the caret is drawn, in logical units.
+const CARET_THICKNESS: f32 = 1.5;
+
+/// How much of a gap is kept between the caret and the right edge.
+const CARET_MARGIN: f32 = 2.0;
+
+/// How far below the baseline a composition is underlined.
+const UNDERLINE_DROP: f32 = 2.0;
+
+/// How thick that underline is, and how thick the part being edited is.
+const UNDERLINE: (f32, f32) = (1.0, 2.0);
+
+/// How far the text is slid left to keep a caret at `caret_x` in view.
+fn scroll_shift(caret_x: f32, width: f32) -> f32 {
+    (caret_x - width + CARET_MARGIN).max(0.0)
+}
+
+/// Underlines the text an input method is still composing.
+///
+/// Two weights: a hairline under the whole composition, and a thicker one under
+/// the part the input method has singled out. That is the convention every
+/// platform's own fields use, and it is the only thing on screen that
+/// distinguishes text which is merely proposed from text that has been typed.
+fn underline_composition(
+    frame: &mut Frame<'_>,
+    style: &TextStyle,
+    display: &str,
+    range: &std::ops::Range<usize>,
+    selection: &std::ops::Range<usize>,
+    left: f32,
+    baseline: f32,
+) {
+    let color = Tone::Accent.resolve(frame.theme);
+    let mut rule = |from: usize, to: usize, thickness: f32| {
+        let start = frame.fonts.measure(style, &display[..from]);
+        let end = frame.fonts.measure(style, &display[..to]);
+        if end > start {
+            let rect = Rect::new(left + start, baseline + UNDERLINE_DROP, end - start, thickness);
+            frame.canvas.fill_rect(rect, color);
+        }
+    };
+    rule(range.start, range.end, UNDERLINE.0);
+    rule(range.start + selection.start, range.start + selection.end, UNDERLINE.1);
+}
+
+/// Puts the caret where the pointer pressed, and selects where it dragged.
+///
+/// The pointer is aiming at the text as it was drawn on the *previous* frame,
+/// so the amount that frame was scrolled by has to be reconstructed — which it
+/// can be exactly, because it was derived from the caret and the caret has not
+/// moved yet.
+fn aim_caret(
+    frame: &mut Frame<'_>,
+    style: &TextStyle,
+    text: &str,
+    caret: &mut Caret,
+    response: &Response,
+    width: f32,
+) {
+    let Some(drag) = response.drag else {
+        return;
+    };
+    let drawn_at = frame.fonts.measure(style, &text[..caret.offset]);
+    let x = drag.at.x + scroll_shift(drawn_at, width);
+    // A press starts a new selection; every frame after it drags the far end.
+    move_caret(caret, offset_at(frame.fonts, style, text, x), drag.phase != Phase::Began);
+}
+
+/// The cluster boundary in `text` nearest to `x`, measured from its own origin.
+///
+/// The nearest rather than the one before, because a click on the right-hand
+/// half of a letter means the caret goes after it — which is what makes clicking
+/// at the end of a word land at the end of the word.
+fn offset_at(fonts: &Fonts, style: &TextStyle, text: &str, x: f32) -> usize {
+    let mut nearest = 0;
+    let mut best = f32::INFINITY;
+    for offset in boundaries(text) {
+        let distance = (fonts.measure(style, &text[..offset]) - x).abs();
+        if distance < best {
+            best = distance;
+            nearest = offset;
+        }
+    }
+    nearest
+}
+
+/// Every place in `text` a caret may sit, in order.
+fn boundaries(text: &str) -> impl Iterator<Item = usize> + '_ {
+    grapheme::clusters(text).map(|(start, _)| start).chain(std::iter::once(text.len()))
+}
+
+/// Moves the caret, dragging the selection with it or collapsing it.
+fn move_caret(caret: &mut Caret, to: usize, extend: bool) {
+    caret.offset = to;
+    if !extend {
+        caret.anchor = to;
+    }
+}
+
+/// Removes what is selected, and answers whether anything was.
+fn delete_selection(text: &mut String, caret: &mut Caret) -> bool {
+    let selection = caret.selection();
+    if selection.is_empty() {
+        return false;
+    }
+    text.replace_range(selection.clone(), "");
+    move_caret(caret, selection.start, false);
+    true
+}
+
+/// Puts `typed` in at the caret, replacing whatever was selected.
+fn insert(text: &mut String, caret: &mut Caret, typed: &str) {
+    delete_selection(text, caret);
+    text.insert_str(caret.offset, typed);
+    move_caret(caret, caret.offset + typed.len(), false);
+}
+
+/// Text with everything a single-line field cannot show taken out.
+///
+/// A newline pasted into a field would otherwise be stored and then silently not
+/// drawn, so the value would disagree with what is on screen.
+fn printable(text: &str) -> String {
+    text.chars().filter(|character| !character.is_control()).collect()
 }
 
 /// What a frame's typing did to a field.
@@ -604,44 +772,121 @@ struct Edit {
 }
 
 /// Applies this frame's typing to a focused field's text and caret.
-fn apply_edits(input: &Input, text: &mut String, caret: &mut Caret) -> Edit {
+///
+/// `memory` is here for the clipboard: cutting and copying leave a request on it
+/// for the window loop to perform, and pasting reads what the loop left there in
+/// answer to the last one. See [`Memory::copy_to_clipboard`].
+fn apply_edits(
+    input: &Input,
+    memory: &mut Memory,
+    text: &mut String,
+    caret: &mut Caret,
+) -> Edit {
     let mut edit = Edit { changed: false, submitted: false };
 
-    for (key, _) in input.keys() {
+    for &(key, modifiers) in input.keys() {
+        // The accelerator with a letter is a command and never typing, so it is
+        // decided before anything else looks at the key.
+        if modifiers.command_only() {
+            edit.changed |= apply_shortcut(key, memory, text, caret);
+            continue;
+        }
+        let extend = modifiers.shift;
         match key {
             Key::Backspace => {
-                if let Some(previous) = previous_boundary(text, caret.offset) {
+                if delete_selection(text, caret) {
+                    edit.changed = true;
+                } else if let Some(previous) = grapheme::before(text, caret.offset) {
                     text.replace_range(previous..caret.offset, "");
-                    caret.offset = previous;
+                    move_caret(caret, previous, false);
                     edit.changed = true;
                 }
             }
             Key::Delete => {
-                if let Some(next) = next_boundary(text, caret.offset) {
+                if delete_selection(text, caret) {
+                    edit.changed = true;
+                } else if let Some(next) = grapheme::after(text, caret.offset) {
                     text.replace_range(caret.offset..next, "");
                     edit.changed = true;
                 }
             }
-            Key::Left => caret.offset = previous_boundary(text, caret.offset).unwrap_or(0),
-            Key::Right => caret.offset = next_boundary(text, caret.offset).unwrap_or(text.len()),
-            Key::Home => caret.offset = 0,
-            Key::End => caret.offset = text.len(),
+            // An arrow with a selection and no shift collapses it to the
+            // matching end rather than moving from the caret: pressing left
+            // over a selection means "go to its start", everywhere.
+            Key::Left => {
+                let selection = caret.selection();
+                match selection.is_empty() || extend {
+                    true => move_caret(caret, grapheme::before(text, caret.offset).unwrap_or(0), extend),
+                    false => move_caret(caret, selection.start, false),
+                }
+            }
+            Key::Right => {
+                let selection = caret.selection();
+                match selection.is_empty() || extend {
+                    true => move_caret(
+                        caret,
+                        grapheme::after(text, caret.offset).unwrap_or(text.len()),
+                        extend,
+                    ),
+                    false => move_caret(caret, selection.end, false),
+                }
+            }
+            Key::Home => move_caret(caret, 0, extend),
+            Key::End => move_caret(caret, text.len(), extend),
             Key::Enter => edit.submitted = true,
             _ => {}
         }
     }
 
     // Typed text arrives already resolved by the platform's input method, so it
-    // is inserted whole rather than key by key. Control characters are dropped:
-    // a newline pasted into a single-line field would otherwise be stored and
-    // then silently not drawn.
-    let typed: String = input.text().chars().filter(|character| !character.is_control()).collect();
+    // is inserted whole rather than key by key.
+    let typed = printable(input.text());
     if !typed.is_empty() {
-        text.insert_str(caret.offset, &typed);
-        caret.offset += typed.len();
+        insert(text, caret, &typed);
         edit.changed = true;
     }
+
+    // What the clipboard answered the last frame's request with. A frame late by
+    // construction — see [`Memory::request_paste`] — and inserted here so that a
+    // paste behaves in every other way exactly like typing.
+    if let Some(pasted) = memory.take_pasted() {
+        let pasted = printable(&pasted);
+        if !pasted.is_empty() {
+            insert(text, caret, &pasted);
+            edit.changed = true;
+        }
+    }
     edit
+}
+
+/// Applies one accelerator shortcut, and answers whether the text changed.
+fn apply_shortcut(key: Key, memory: &mut Memory, text: &mut String, caret: &mut Caret) -> bool {
+    let selection = caret.selection();
+    match key {
+        Key::Character('a') => {
+            caret.anchor = 0;
+            caret.offset = text.len();
+            false
+        }
+        Key::Character('c') => {
+            if !selection.is_empty() {
+                memory.copy_to_clipboard(text[selection].to_owned());
+            }
+            false
+        }
+        Key::Character('x') => {
+            if selection.is_empty() {
+                return false;
+            }
+            memory.copy_to_clipboard(text[selection].to_owned());
+            delete_selection(text, caret)
+        }
+        Key::Character('v') => {
+            memory.request_paste();
+            false
+        }
+        _ => false,
+    }
 }
 
 /// Draws the indicator down the edge of a scrolling area.
@@ -757,25 +1002,22 @@ fn lift(base: Color, lit: f32, held: bool) -> Color {
     base.mix(toward, amount)
 }
 
-/// The nearest character boundary at or before `offset`.
+/// The nearest place a caret may sit at or before `offset`.
+///
+/// A cluster boundary and not merely a character one: a caret between a letter
+/// and the accent that belongs to it draws the accent over the letter after it,
+/// and one inside an emoji built from joined parts splits it into its pieces.
+/// See [`grapheme`](crate::text::grapheme).
+///
+/// Applied to a field's value on every frame, because the value comes from the
+/// application and may have been replaced by anything at all since the caret was
+/// last put somewhere in it.
 fn clamp_to_boundary(text: &str, offset: usize) -> usize {
-    let mut offset = offset.min(text.len());
-    while offset > 0 && !text.is_char_boundary(offset) {
-        offset -= 1;
+    let offset = offset.min(text.len());
+    if grapheme::is_boundary(text, offset) {
+        return offset;
     }
-    offset
-}
-
-/// The character boundary before `offset`, or `None` at the start.
-fn previous_boundary(text: &str, offset: usize) -> Option<usize> {
-    let offset = clamp_to_boundary(text, offset);
-    text[..offset].chars().next_back().map(|character| offset - character.len_utf8())
-}
-
-/// The character boundary after `offset`, or `None` at the end.
-fn next_boundary(text: &str, offset: usize) -> Option<usize> {
-    let offset = clamp_to_boundary(text, offset);
-    text[offset..].chars().next().map(|character| offset + character.len_utf8())
+    grapheme::before(text, offset).unwrap_or(0)
 }
 
 /// Where a scrolling area identified by `id` should sit to show its end.
@@ -812,33 +1054,55 @@ mod tests {
     }
 
     #[test]
-    fn caret_movement_lands_on_character_boundaries_in_multibyte_text() {
-        let text = "aé漢";
-        assert_eq!(next_boundary(text, 0), Some(1));
-        assert_eq!(next_boundary(text, 1), Some(3), "é is two bytes");
-        assert_eq!(next_boundary(text, 3), Some(6), "漢 is three bytes");
-        assert_eq!(next_boundary(text, 6), None);
-
-        assert_eq!(previous_boundary(text, 6), Some(3));
-        assert_eq!(previous_boundary(text, 3), Some(1));
-        assert_eq!(previous_boundary(text, 0), None);
-    }
-
-    #[test]
-    fn an_offset_inside_a_character_is_pulled_back_to_its_start() {
+    fn an_offset_inside_a_cluster_is_pulled_back_to_its_start() {
         assert_eq!(clamp_to_boundary("aé", 2), 1, "the middle of é");
         assert_eq!(clamp_to_boundary("aé", 999), 3);
+        // A letter and the accent that belongs to it are one place, not two:
+        // a caret between them would draw the accent over the next letter.
+        assert_eq!(clamp_to_boundary("e\u{301}f", 1), 0, "between e and its accent");
+    }
+
+    use crate::input::{Composition, Event, Modifiers};
+
+    /// One frame's worth of input, with `events` folded into it.
+    fn typed(events: impl IntoIterator<Item = Event>) -> Input {
+        let mut input = Input::new();
+        input.begin_frame();
+        for event in events {
+            input.apply(event);
+        }
+        input
+    }
+
+    /// The key `character` pressed with the platform accelerator held.
+    fn shortcut(character: char) -> Event {
+        Event::KeyDown {
+            key: Key::Character(character),
+            modifiers: Modifiers { command: true, ..Modifiers::NONE },
+        }
+    }
+
+    /// A key pressed with nothing, or with only shift, held.
+    fn press(key: Key, shift: bool) -> Event {
+        Event::KeyDown { key, modifiers: Modifiers { shift, ..Modifiers::NONE } }
+    }
+
+    /// A caret at `offset` with nothing selected.
+    fn at(offset: usize) -> Caret {
+        Caret { offset, anchor: offset }
+    }
+
+    /// A caret selecting `from..to`, dragged in that direction.
+    fn selecting(from: usize, to: usize) -> Caret {
+        Caret { offset: to, anchor: from }
     }
 
     #[test]
     fn typing_inserts_at_the_caret_and_moves_it_along() {
-        let mut input = Input::new();
-        input.begin_frame();
-        input.apply(crate::input::Event::Text("bc".into()));
-
+        let mut memory = Memory::new();
         let mut text = "ad".to_owned();
-        let mut caret = Caret { offset: 1 };
-        let edit = apply_edits(&input, &mut text, &mut caret);
+        let mut caret = at(1);
+        let edit = apply_edits(&typed([Event::Text("bc".into())]), &mut memory, &mut text, &mut caret);
 
         assert!(edit.changed);
         assert_eq!(text, "abcd");
@@ -847,16 +1111,167 @@ mod tests {
 
     #[test]
     fn backspace_at_the_start_of_a_field_changes_nothing() {
-        let mut input = Input::new();
-        input.begin_frame();
-        input.apply(crate::input::Event::KeyDown {
-            key: Key::Backspace,
-            modifiers: crate::input::Modifiers::default(),
-        });
-
+        let mut memory = Memory::new();
         let mut text = "abc".to_owned();
-        let mut caret = Caret { offset: 0 };
-        assert!(!apply_edits(&input, &mut text, &mut caret).changed);
+        let mut caret = at(0);
+        let input = typed([press(Key::Backspace, false)]);
+        assert!(!apply_edits(&input, &mut memory, &mut text, &mut caret).changed);
         assert_eq!(text, "abc");
+    }
+
+    #[test]
+    fn backspace_removes_a_whole_cluster_and_not_one_character_of_it() {
+        // The visible bug this fixes: one press leaving a bare accent behind,
+        // or an emoji collapsing into the parts it was joined from.
+        let mut memory = Memory::new();
+        let mut text = "ae\u{301}".to_owned();
+        let mut caret = at(text.len());
+        apply_edits(&typed([press(Key::Backspace, false)]), &mut memory, &mut text, &mut caret);
+        assert_eq!(text, "a");
+    }
+
+    #[test]
+    fn shift_and_an_arrow_extend_a_selection_from_where_it_started() {
+        let mut memory = Memory::new();
+        let mut text = "abcd".to_owned();
+        let mut caret = at(1);
+        let input = typed([press(Key::Right, true), press(Key::Right, true)]);
+        apply_edits(&input, &mut memory, &mut text, &mut caret);
+
+        assert_eq!(caret.selection(), 1..3);
+        assert_eq!(&text[caret.selection()], "bc");
+    }
+
+    #[test]
+    fn an_arrow_without_shift_collapses_a_selection_to_the_end_it_points_at() {
+        let mut memory = Memory::new();
+        let mut text = "abcd".to_owned();
+
+        let mut caret = selecting(1, 3);
+        apply_edits(&typed([press(Key::Left, false)]), &mut memory, &mut text, &mut caret);
+        assert_eq!(caret.offset, 1, "left over a selection goes to its start");
+
+        let mut caret = selecting(1, 3);
+        apply_edits(&typed([press(Key::Right, false)]), &mut memory, &mut text, &mut caret);
+        assert_eq!(caret.offset, 3, "and right to its end");
+    }
+
+    #[test]
+    fn typing_over_a_selection_replaces_it() {
+        let mut memory = Memory::new();
+        let mut text = "abcd".to_owned();
+        let mut caret = selecting(1, 3);
+        apply_edits(&typed([Event::Text("X".into())]), &mut memory, &mut text, &mut caret);
+
+        assert_eq!(text, "aXd");
+        assert_eq!(caret.selection(), 2..2, "the selection is gone, not merely moved");
+    }
+
+    #[test]
+    fn copying_leaves_the_selection_for_the_window_and_the_text_alone() {
+        let mut memory = Memory::new();
+        let mut text = "selfhost".to_owned();
+        let mut caret = selecting(0, 4);
+        let edit = apply_edits(&typed([shortcut('c')]), &mut memory, &mut text, &mut caret);
+
+        assert!(!edit.changed, "copying is not an edit");
+        assert_eq!(memory.take_clipboard_request().copy.as_deref(), Some("self"));
+        assert_eq!(text, "selfhost");
+    }
+
+    #[test]
+    fn cutting_copies_and_then_removes() {
+        let mut memory = Memory::new();
+        let mut text = "selfhost".to_owned();
+        let mut caret = selecting(0, 4);
+        let edit = apply_edits(&typed([shortcut('x')]), &mut memory, &mut text, &mut caret);
+
+        assert!(edit.changed);
+        assert_eq!(memory.take_clipboard_request().copy.as_deref(), Some("self"));
+        assert_eq!(text, "host");
+    }
+
+    #[test]
+    fn copying_nothing_asks_the_window_for_nothing() {
+        // A field with no selection is not an empty clipboard waiting to happen.
+        let mut memory = Memory::new();
+        let mut text = "selfhost".to_owned();
+        let mut caret = at(4);
+        apply_edits(&typed([shortcut('c')]), &mut memory, &mut text, &mut caret);
+        assert_eq!(memory.take_clipboard_request().copy, None);
+    }
+
+    #[test]
+    fn pasting_asks_this_frame_and_inserts_on_the_next() {
+        let mut memory = Memory::new();
+        let mut text = "ad".to_owned();
+        let mut caret = at(1);
+
+        apply_edits(&typed([shortcut('v')]), &mut memory, &mut text, &mut caret);
+        assert!(memory.take_clipboard_request().paste, "the window was never asked");
+        assert_eq!(text, "ad", "nothing can be pasted before the clipboard has answered");
+
+        // What the window loop does with the answer, and the frame after it.
+        memory.deliver_paste("bc".into());
+        let edit = apply_edits(&typed([]), &mut memory, &mut text, &mut caret);
+        assert!(edit.changed);
+        assert_eq!(text, "abcd");
+        assert_eq!(caret.offset, 3);
+    }
+
+    #[test]
+    fn a_pasted_newline_does_not_reach_a_single_line_field() {
+        // It would be stored and then not drawn, so the value would disagree
+        // with what is on screen.
+        let mut memory = Memory::new();
+        let mut text = String::new();
+        let mut caret = at(0);
+        memory.deliver_paste("one\ntwo".into());
+        apply_edits(&typed([]), &mut memory, &mut text, &mut caret);
+        assert_eq!(text, "onetwo");
+    }
+
+    #[test]
+    fn select_all_takes_the_whole_field_however_it_is_pressed() {
+        let mut memory = Memory::new();
+        let mut text = "selfhost".to_owned();
+        let mut caret = at(3);
+        apply_edits(&typed([shortcut('a')]), &mut memory, &mut text, &mut caret);
+        assert_eq!(caret.selection(), 0..text.len());
+    }
+
+    #[test]
+    fn a_shortcut_is_never_also_typed_into_the_field() {
+        // The bug this prevents: Command-V inserting a "v" as well as pasting.
+        let mut memory = Memory::new();
+        let mut text = String::new();
+        let mut caret = at(0);
+        apply_edits(&typed([shortcut('v')]), &mut memory, &mut text, &mut caret);
+        assert_eq!(text, "");
+    }
+
+    #[test]
+    fn a_composition_never_reaches_the_field_but_its_commit_does() {
+        // The whole of the composition contract: what the input method is still
+        // assembling is drawn, and only what it commits is typed.
+        let mut memory = Memory::new();
+        let mut text = String::new();
+        let mut caret = at(0);
+
+        let composing = typed([Event::Composing(Composition {
+            text: "にほん".into(),
+            selection: 0..9,
+        })]);
+        let edit = apply_edits(&composing, &mut memory, &mut text, &mut caret);
+        assert!(!edit.changed, "a composition is not an edit");
+        assert_eq!(text, "");
+        assert!(composing.composition().is_some(), "but it is there to be drawn");
+
+        let committed = typed([
+            Event::Composing(Composition::default()),
+            Event::Text("日本".into()),
+        ]);
+        assert!(apply_edits(&committed, &mut memory, &mut text, &mut caret).changed);
+        assert_eq!(text, "日本");
     }
 }
