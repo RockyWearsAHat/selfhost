@@ -79,7 +79,12 @@ pub struct Response {
     pub hovered: bool,
     /// It is being pressed right now.
     pub held: bool,
-    /// A press that began on it ended on it, this frame.
+    /// It was activated this frame, by whichever of the three routes.
+    ///
+    /// A press that began on it and ended on it, or Space or Enter while it had
+    /// the keyboard, or an assistive technology naming it — one flag for all
+    /// three, because an interface must not be able to tell them apart. See the
+    /// invariant in [`accessibility`](crate::accessibility).
     pub clicked: bool,
     /// The same, for the secondary button.
     pub secondary_clicked: bool,

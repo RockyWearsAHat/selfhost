@@ -14,6 +14,12 @@
 //! siblings collide on an identity, or the tab order stops being a forward walk
 //! of the tree.
 //!
+//! It holds the other half of the decision too — that there is one path from an
+//! intent to a handler — by driving the same interface twice from the same
+//! state, once with a click and once with the activation an assistive
+//! technology sends, and comparing what each leaves behind. A second dispatch
+//! is not something a reviewer has to notice; it is a failing test.
+//!
 //! The examples are included as modules rather than copied, so what is checked
 //! is the code that actually runs.
 
@@ -24,7 +30,7 @@ use rui::{
     figure, heading, meter, micro, panel, paragraph, row, section, segmented, spacer, tabs, tag,
     text, title,
 };
-use rui::{Point, Size};
+use rui::Size;
 
 #[path = "../examples/controls.rs"]
 #[allow(dead_code)]
@@ -323,38 +329,125 @@ fn two_siblings_sharing_a_key_are_a_failure() {
 // One path from intent to handler
 // ---------------------------------------------------------------------------
 
+/// What a route into the interface is asked to change.
+///
+/// Two counts and not one, so that a test can tell "the same handler ran twice"
+/// from "each route found a handler of its own".
+#[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
+struct Counted {
+    presses: u32,
+    dismissals: u32,
+}
+
+fn counted(_: &Counted) -> El<Counted> {
+    col((
+        button("Restart").on_click(|counted: &mut Counted| counted.presses += 1),
+        button("Dismiss").on_click(|counted: &mut Counted| counted.dismissals += 1),
+    ))
+    .align(Align::Start)
+}
+
 #[test]
 fn an_assistive_activation_runs_the_same_handler_a_click_would() {
-    /// What both routes into the interface are asked to change.
-    #[derive(Default)]
-    struct Counted {
-        presses: u32,
-    }
+    // The invariant as an assertion: the two routes are driven from the same
+    // starting state, and what each leaves behind is compared whole. Anything
+    // an activation did differently — a handler of its own, a handler missed,
+    // the wrong element — shows up as a difference here.
+    let mut clicked = Harness::new(Counted::default(), counted);
+    clicked.click_text("Restart");
 
-    fn view(_: &Counted) -> El<Counted> {
-        col(button("Restart").on_click(|counted: &mut Counted| counted.presses += 1))
-            .align(Align::Start)
+    let mut activated = Harness::new(Counted::default(), counted);
+    activated.activate_named("Restart");
+
+    assert_eq!(
+        *activated.state(),
+        *clicked.state(),
+        "a screen reader's press and a click must leave the interface in one state"
+    );
+    assert_eq!(clicked.state().presses, 1, "and it must be the state the handler produces");
+}
+
+#[test]
+fn an_assistive_activation_reaches_the_element_it_names() {
+    let mut harness = Harness::new(Counted::default(), counted);
+    harness.activate_named("Dismiss");
+    assert_eq!(
+        *harness.state(),
+        Counted { presses: 0, dismissals: 1 },
+        "an activation is aimed by identity, and must reach nothing else"
+    );
+}
+
+#[test]
+fn an_assistive_activation_says_so_before_it_is_offered() {
+    // What a platform reads to decide whether to offer a press at all. The two
+    // have to agree: an action advertised on something that answers none is a
+    // command a person is offered and then let down by.
+    let mut harness = Harness::new(Counted::default(), counted);
+    let nodes = harness.accessibility().nodes().to_vec();
+
+    let button = nodes.iter().find(|node| node.name == "Restart").expect("the button is drawn");
+    assert_eq!(button.role, Role::Button);
+    assert!(button.actions.press, "a button says it can be pressed");
+
+    assert!(
+        nodes.iter().filter(|node| node.role == Role::Text).all(|node| !node.actions.press),
+        "a run of words answers no press, and must not claim to"
+    );
+}
+
+#[test]
+fn an_assistive_activation_of_something_that_is_gone_does_nothing() {
+    // An assistive technology holds objects from trees that have since moved
+    // on, so a stale press is a race and not a failure. It must not panic, and
+    // it must not land on whatever happens to be there now.
+    let mut harness = Harness::new(Counted::default(), counted);
+    harness.frame();
+
+    harness.activate(rui::Id::new("nothing has ever been called this"));
+    assert_eq!(*harness.state(), Counted::default(), "an identity nobody has is a no-op");
+}
+
+#[test]
+fn an_assistive_activation_leaves_the_keyboard_where_it_was() {
+    // A click gives focus to what it pressed, because the pointer went there.
+    // An activation must not: an assistive technology moves the keyboard when
+    // it means to, and pressing a button while somebody is filling in a field
+    // must not take the field away from them.
+    let mut harness = Harness::new(Counted::default(), counted);
+    harness.tab();
+    let focused = harness.focused();
+    assert!(focused.is_some(), "Tab reached the first button");
+
+    harness.activate_named("Dismiss");
+    assert_eq!(harness.state().dismissals, 1, "the handler still ran");
+    assert_eq!(harness.focused(), focused, "and the keyboard did not move");
+}
+
+#[test]
+fn an_assistive_activation_of_a_disabled_control_does_nothing() {
+    fn view(counted: &Counted) -> El<Counted> {
+        col(button("Restart")
+            .on_click(|counted: &mut Counted| counted.presses += 1)
+            .disabled(counted.presses == 0))
+        .align(Align::Start)
     }
 
     let mut harness = Harness::new(Counted::default(), view);
-    harness.click_text("Restart");
-    assert_eq!(harness.state().presses, 1);
-
-    // What an assistive technology has is an identity and an intent. Resolving
-    // that identity reaches the same closure the pointer reached, because there
-    // is only the one.
-    let node = harness
+    let id = harness
         .accessibility()
         .nodes()
         .iter()
-        .find(|node| node.role == Role::Button)
-        .expect("the button is on screen")
-        .clone();
-    assert!(node.actions.press, "the node says it can be pressed");
+        .find(|node| node.name == "Restart")
+        .expect("the button is drawn")
+        .id;
 
-    let rect = node.bounds;
-    harness.click(Point::new(rect.center().x, rect.center().y));
-    assert_eq!(harness.state().presses, 2, "the same handler, reached the same way");
+    harness.activate(id);
+    assert_eq!(
+        harness.state().presses,
+        0,
+        "a disabled control ignores every route, or the two disagree about what disabled means"
+    );
 }
 
 // ---------------------------------------------------------------------------

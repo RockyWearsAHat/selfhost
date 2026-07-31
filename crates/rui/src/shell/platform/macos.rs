@@ -15,7 +15,7 @@
 //! shortcuts — are handed back to it; key presses are not, because forwarding a
 //! key nothing handles makes the system beep.
 //!
-//! # The one class this does build, and why it has to
+//! # The two classes this does build, and why it has to
 //!
 //! [`content_view_class`] assembles an `NSView` subclass at run time. It exists
 //! for exactly one reason: a program only receives typed text through
@@ -32,22 +32,47 @@
 //! variable pointing back at the [`Composer`] that holds what is being composed.
 //! Nothing about drawing, geometry, or the mouse goes through it.
 //!
-//! # Accessibility is a mirror, and it is not yet two-way
+//! [`element_class`] assembles the second, an `NSAccessibilityElement`
+//! subclass, and exists for the mirror image of that reason: a screen reader
+//! presses a control by sending `accessibilityPerformPress` to an *object*, so
+//! there has to be an object that answers. See below.
 //!
-//! [`Accessibility`] keeps one `NSAccessibilityElement` per node of the
-//! interface and applies each frame's difference to them, because a screen
-//! reader is handed those objects and asks them questions at moments of its own
-//! choosing — long after the frame that produced them.
+//! # Accessibility is a mirror, and the way back is an event
 //!
-//! What is missing, and is missing by the shape of the seam rather than by
-//! oversight: `accessibilityPerformPress`. Answering it means reaching a
-//! handler, and [`Backend::update_accessibility`] only carries facts *outwards*
-//! — there is no way back from a backend to an element's `click_action`. The
-//! honest form of that path is an event, the same way a click is one, so that
-//! the invariant holds and there is still exactly one route from an intent to a
-//! handler. Until it exists a screen reader can read every control here and move
-//! the keyboard to it, and activation is done with the keyboard rather than from
-//! the rotor.
+//! [`Accessibility`] keeps one element per node of the interface and applies
+//! each frame's difference to them, because a screen reader is handed those
+//! objects and asks them questions at moments of its own choosing — long after
+//! the frame that produced them.
+//!
+//! A press comes the other way, and cannot answer itself. It arrives at an
+//! object, not at a frame; there is no `&mut` anything to be had inside it, and
+//! reaching a handler from here would be a second dispatch beside the one a
+//! click already takes. So it is not answered — it is *reported*, exactly as a
+//! click is: [`Activation::press`] resolves the object back to the [`Id`] it
+//! stands for and leaves it in the window's [`Inbox`], and [`Window::pump`]
+//! drains that into [`Event::Activated`] along with the mouse and the keyboard.
+//! The seam did not widen; nothing here reaches an application; and the
+//! invariant in [`accessibility`](crate::accessibility) holds because the frame
+//! decides what a press means, in the same line that decides what a click does.
+//!
+//! Two details make that work rather than nearly work.
+//!
+//! *The press does not arrive when we are looking.* It is delivered on the main
+//! thread while the loop is asleep inside
+//! `nextEventMatchingMask:untilDate:inMode:dequeue:`, which returns only for an
+//! `NSEvent` — and an accessibility message is not one. Left alone, a press
+//! would be noticed whenever the window next woke for its own reasons, up to
+//! [`App::idle_timeout`](crate::App::idle_timeout) later, which for a window
+//! that has chosen a long idle is indistinguishable from a dead button. So
+//! [`wake`] posts an application-defined `NSEvent` the queue *does* return, and
+//! the press lands on the very next frame.
+//!
+//! *Not everything can be pressed.* AppKit advertises an action for every
+//! `accessibilityPerform…` a class implements, so implementing it once on the
+//! class would offer "press" on every heading and every rule in the window.
+//! [`is_selector_allowed`] answers that question per element from what the node
+//! actually carries, and defers to the superclass for every other selector
+//! rather than claiming to know.
 
 use crate::accessibility::{AccessNode, AccessUpdate, Role};
 use crate::input::Composition;
@@ -111,6 +136,13 @@ unsafe extern "C" {
     /// passes arguments differently from a normal one, so a variadic
     /// declaration produces calls the runtime misreads.
     fn objc_msgSend();
+
+    /// The same, for a message sent to the superclass's implementation.
+    ///
+    /// Declared and transmuted for the same reasons as [`objc_msgSend`]. The
+    /// receiver is an [`ObjcSuper`] rather than the object, which is the whole
+    /// of the difference: it names where to *start* looking for the method.
+    fn objc_msgSendSuper();
 
     /// The same, for messages returning a struct too large for registers.
     ///
@@ -313,6 +345,27 @@ unsafe fn send4<R, A, B, C, D>(receiver: Object, selector: Sel, a: A, b: B, c: C
     unsafe { dispatch(receiver, selector, a, b, c, d) }
 }
 
+/// `struct objc_super`: an object, and where in its ancestry to start dispatch.
+#[repr(C)]
+struct ObjcSuper {
+    receiver: Object,
+    superclass: Object,
+}
+
+/// Sends a message to the superclass's implementation, taking one argument.
+///
+/// What `[super …]` compiles to. Needed once here, in
+/// [`is_selector_allowed`]: overriding a question the framework already
+/// answers means answering the one case that is ours and handing back every
+/// other, and there is no way to hand one back but to ask the class we
+/// inherited it from.
+unsafe fn send1_super<R, A>(receiver: Object, superclass: Object, selector: Sel, a: A) -> R {
+    let mut owner = ObjcSuper { receiver, superclass };
+    let dispatch: unsafe extern "C" fn(*mut ObjcSuper, Sel, A) -> R =
+        unsafe { std::mem::transmute(objc_msgSendSuper as *const ()) };
+    unsafe { dispatch(&mut owner, selector, a) }
+}
+
 /// Sends a message that answers a rectangle.
 ///
 /// Split out because a 32-byte struct return goes through a different dispatch
@@ -394,6 +447,12 @@ const EVENT_SCROLL: u64 = 22;
 const EVENT_OTHER_DOWN: u64 = 25;
 const EVENT_OTHER_UP: u64 = 26;
 const EVENT_OTHER_DRAGGED: u64 = 27;
+/// `NSEventTypeApplicationDefined`: an event the program invented for itself.
+///
+/// Nothing reads it. It exists to be *delivered*, which is the only thing that
+/// ends a wait inside `nextEventMatchingMask:untilDate:inMode:dequeue:` before
+/// its deadline; see [`wake`].
+const EVENT_APPLICATION_DEFINED: u64 = 15;
 
 // `NSEventModifierFlags`.
 const MODIFIER_SHIFT: u64 = 1 << 17;
@@ -531,6 +590,10 @@ extern "C" fn draw_during_live_resize(_observer: *mut c_void, _activity: u64, in
 
 impl Backend for Window {
     fn open(options: &WindowOptions) -> Result<Self, Error> {
+        // Before anything is allocated, because a window whose nodes could not
+        // be built is one an assistive technology cannot use, and that is worth
+        // refusing to open rather than discovering a frame later.
+        let elements = element_class()?;
         unsafe {
             let pool = objc_autoreleasePoolPush();
 
@@ -644,7 +707,7 @@ impl Backend for Window {
                 presented_scale: Cell::new(0.0),
                 live: Box::new(LiveResize::default()),
                 composer,
-                accessibility: Accessibility::default(),
+                accessibility: Accessibility::new(elements),
             };
             window.refresh_geometry();
             window.observe_live_resize();
@@ -922,6 +985,14 @@ impl Window {
                 }
             }
 
+            // The other half of the two-way accessibility seam, and the only
+            // half that is not a `pump` of AppKit's queue: a press arrives at
+            // an element rather than in that queue, so it waits in an inbox of
+            // its own and joins the frame here. After the drain above, so that
+            // a press delivered during this very wait is not held over to the
+            // next one; see [`Activation::press`] and [`wake`].
+            self.accessibility.inbox.drain(events);
+
             self.refresh_geometry();
             let visible: bool = send(self.window, sel(c"isVisible"));
             if !visible {
@@ -1145,10 +1216,78 @@ impl Composer {
     }
 }
 
+/// Where a press waits between the object that received it and the next frame.
+///
+/// Filled from an accessibility callback and drained by [`Window::pump_events`],
+/// which is the whole of the two-way traffic. A list, not a flag: a screen
+/// reader can press twice between frames the way a finger can.
+///
+/// Owned by the window, in a box, so that its address survives the window being
+/// moved — the same arrangement, for the same reason, as [`Composer`].
+#[derive(Default)]
+struct Inbox {
+    presses: RefCell<Vec<Id>>,
+}
+
+impl Inbox {
+    /// Notes that something was pressed.
+    fn push(&self, id: Id) {
+        self.presses.borrow_mut().push(id);
+    }
+
+    /// Takes everything waiting, as the events a frame reads.
+    fn drain(&self, events: &mut Vec<Event>) {
+        events.extend(self.presses.borrow_mut().drain(..).map(Event::Activated));
+    }
+}
+
+/// What one accessibility object needs in order to report a press.
+///
+/// Boxed per element and pointed at by the element's instance variable, because
+/// a press arrives at the object and the object is an Objective-C one with no
+/// room for a Rust structure in it.
+struct Activation {
+    /// The node this object stands for.
+    id: Id,
+    /// Whether that node answers a press at all, as of the last frame.
+    ///
+    /// A cell because the answer changes without the object doing so: a button
+    /// that has just been disabled is the same element and no longer presses.
+    pressable: Cell<bool>,
+    /// Where to leave a press. Null once the window that owned the inbox has
+    /// gone, which is the one thing that can outlive it.
+    inbox: Cell<*const Inbox>,
+}
+
+impl Activation {
+    /// Reports a press, and says whether there was one to report.
+    ///
+    /// False is not a failure: it is an element whose node no longer answers a
+    /// press, or one belonging to a window that has closed. Either way nothing
+    /// was queued, and saying so is what stops an assistive technology
+    /// announcing that something happened when nothing did.
+    fn press(&self) -> bool {
+        let inbox = self.inbox.get();
+        if !self.pressable.get() || inbox.is_null() {
+            return false;
+        }
+        // SAFETY: the pointer is the address of the window's own boxed `Inbox`,
+        // written when this element was built and cleared before the window
+        // lets the element go; see [`Accessibility::forget`].
+        unsafe { &*inbox }.push(self.id);
+        true
+    }
+}
+
 /// One node of the interface, as the platform's own accessibility object.
 struct Mirror {
     /// The `NSAccessibilityElement` standing for it, retained by us.
     element: Object,
+    /// What that element reads to answer a press, and what it points at.
+    ///
+    /// Boxed so its address is settled before the element is given it, and so
+    /// that moving the mirror does not move it.
+    activation: Box<Activation>,
     /// What holds it, or `None` for a node hanging off the view itself.
     parent: Option<Id>,
     /// Which of its containing set it is, when it is one of a set.
@@ -1173,7 +1312,10 @@ struct Mirror {
 /// any frame has been drawn. So the tree has to exist as platform objects that
 /// outlive the frame, and what arrives from above — a difference — is applied to
 /// them rather than answered from.
-#[derive(Default)]
+///
+/// A press is the one thing that travels the other way, and it does not travel
+/// far: it is left in [`Accessibility::inbox`] for the next pump to report. See
+/// the module header for why that is an event and not a call.
 struct Accessibility {
     /// One mirror per node of the interface, by the identity it keeps.
     nodes: RefCell<HashMap<Id, Mirror>>,
@@ -1182,14 +1324,36 @@ struct Accessibility {
     /// Which node has the keyboard, so the last one can be told it no longer
     /// does.
     focused: Cell<Option<Id>>,
+    /// Presses waiting to be reported as events.
+    ///
+    /// Boxed because every element built here is given its address, and the
+    /// window this belongs to is returned by value from [`Backend::open`].
+    inbox: Box<Inbox>,
+    /// The class every one of those elements is built from.
+    ///
+    /// Held rather than looked up each time: it is settled once for the process
+    /// by [`element_class`], and a window that could not build it never opened.
+    elements: Object,
 }
 
 impl Accessibility {
+    /// An empty mirror, whose elements will be of `elements`.
+    fn new(elements: Object) -> Self {
+        Self {
+            nodes: RefCell::default(),
+            seen: Cell::default(),
+            focused: Cell::default(),
+            inbox: Box::default(),
+            elements,
+        }
+    }
+
     /// Applies one frame's difference to the mirror.
     fn apply(&self, view: Object, update: &AccessUpdate) {
         let mut nodes = self.nodes.borrow_mut();
         for id in &update.removed {
             if let Some(mirror) = nodes.remove(id) {
+                forget(&mirror);
                 // Ours since it was created; nothing else holds it once the
                 // parent's children are rebuilt below.
                 let _: () = unsafe { send(mirror.element, sel(c"release")) };
@@ -1199,10 +1363,19 @@ impl Accessibility {
             let seen = self.seen.get();
             let mirror = nodes.entry(node.id).or_insert_with(|| {
                 self.seen.set(seen + 1);
-                Mirror { element: new_element(), parent: node.parent, position: None, seen }
+                let activation = Box::new(Activation {
+                    id: node.id,
+                    pressable: Cell::new(false),
+                    inbox: Cell::new(std::ptr::from_ref(&*self.inbox)),
+                });
+                let element = new_element(self.elements, &activation);
+                Mirror { element, activation, parent: node.parent, position: None, seen }
             });
             mirror.parent = node.parent;
             mirror.position = node.position_in_set;
+            // A disabled control does not answer a press, so neither does its
+            // object: what a person is offered has to be what would happen.
+            mirror.activation.pressable.set(node.actions.press && !node.state.disabled);
             describe(mirror.element, node, view);
         }
         relink(view, &nodes);
@@ -1238,15 +1411,48 @@ impl Accessibility {
     }
 }
 
-/// A fresh, empty accessibility element, retained.
+impl Drop for Accessibility {
+    /// Lets go of every element, and cuts each one loose from this window first.
+    ///
+    /// An assistive technology may still hold one: the objects are handed out,
+    /// and nothing obliges it to give them back before the window closes. An
+    /// element cut loose answers no press and reads nothing — which is the only
+    /// safe thing it can be once the inbox it pointed at has gone.
+    fn drop(&mut self) {
+        for mirror in self.nodes.borrow().values() {
+            forget(mirror);
+            let _: () = unsafe { send(mirror.element, sel(c"release")) };
+        }
+    }
+}
+
+/// Cuts an element loose from the window it was reporting to.
 ///
-/// `NSAccessibilityElement` is AppKit's own class for a thing that is part of an
-/// interface without being a view, which is exactly what every node here is —
-/// so there is no second run-time class to build, only objects to fill in.
-fn new_element() -> Object {
+/// Both halves matter and both are here so they cannot be done singly: the
+/// element stops reading the [`Activation`] that is about to be dropped, and
+/// the activation stops pointing at an inbox it may outlive.
+fn forget(mirror: &Mirror) {
+    mirror.activation.inbox.set(std::ptr::null());
     unsafe {
-        let element: Object = send(class(c"NSAccessibilityElement"), sel(c"alloc"));
-        send(element, sel(c"init"))
+        object_setInstanceVariable(mirror.element, ACTIVATION_IVAR.as_ptr(), std::ptr::null_mut())
+    };
+}
+
+/// A fresh, empty accessibility element that reports to `activation`, retained.
+///
+/// Built from [`element_class`] rather than from `NSAccessibilityElement`
+/// itself, which is the subclass's only reason to exist: AppKit's own class is
+/// everything a node needs to be *read*, and cannot be pressed.
+fn new_element(elements: Object, activation: &Activation) -> Object {
+    unsafe {
+        let element: Object = send(elements, sel(c"alloc"));
+        let element: Object = send(element, sel(c"init"));
+        object_setInstanceVariable(
+            element,
+            ACTIVATION_IVAR.as_ptr(),
+            std::ptr::from_ref(activation).cast_mut().cast::<c_void>(),
+        );
+        element
     }
 }
 
@@ -1335,6 +1541,9 @@ const VIEW_CLASS: &CStr = c"RuiContentView";
 /// The instance variable pointing a view back at its [`Composer`].
 const COMPOSER_IVAR: &CStr = c"rui_composer";
 
+/// How the content-view class is named in a failure to build it.
+const VIEW_OWNER: &str = "content view";
+
 /// The `NSView` subclass that can receive text, built once per process.
 ///
 /// A second window finds the class the first one built rather than failing on
@@ -1373,44 +1582,74 @@ fn content_view_class() -> Result<Object, Error> {
     // hold the keyboard at all. The type strings describe each signature to the
     // runtime; `Q` is an unsigned word, `@` an object, `:` a selector, `B` a
     // boolean, and `{...}` a struct passed by value.
-    add_method(built, c"acceptsFirstResponder", accepts_first_responder as *const c_void, c"B@:")?;
     add_method(
         built,
+        VIEW_OWNER,
+        c"acceptsFirstResponder",
+        accepts_first_responder as *const c_void,
+        c"B@:",
+    )?;
+    add_method(
+        built,
+        VIEW_OWNER,
         c"insertText:replacementRange:",
         insert_text as *const c_void,
         c"v@:@{_NSRange=QQ}",
     )?;
-    add_method(built, c"doCommandBySelector:", do_command_by_selector as *const c_void, c"v@::")?;
     add_method(
         built,
+        VIEW_OWNER,
+        c"doCommandBySelector:",
+        do_command_by_selector as *const c_void,
+        c"v@::",
+    )?;
+    add_method(
+        built,
+        VIEW_OWNER,
         c"setMarkedText:selectedRange:replacementRange:",
         set_marked_text as *const c_void,
         c"v@:@{_NSRange=QQ}{_NSRange=QQ}",
     )?;
-    add_method(built, c"unmarkText", unmark_text as *const c_void, c"v@:")?;
-    add_method(built, c"hasMarkedText", has_marked_text as *const c_void, c"B@:")?;
-    add_method(built, c"markedRange", marked_range as *const c_void, c"{_NSRange=QQ}@:")?;
-    add_method(built, c"selectedRange", selected_range as *const c_void, c"{_NSRange=QQ}@:")?;
+    add_method(built, VIEW_OWNER, c"unmarkText", unmark_text as *const c_void, c"v@:")?;
+    add_method(built, VIEW_OWNER, c"hasMarkedText", has_marked_text as *const c_void, c"B@:")?;
     add_method(
         built,
+        VIEW_OWNER,
+        c"markedRange",
+        marked_range as *const c_void,
+        c"{_NSRange=QQ}@:",
+    )?;
+    add_method(
+        built,
+        VIEW_OWNER,
+        c"selectedRange",
+        selected_range as *const c_void,
+        c"{_NSRange=QQ}@:",
+    )?;
+    add_method(
+        built,
+        VIEW_OWNER,
         c"validAttributesForMarkedText",
         valid_attributes_for_marked_text as *const c_void,
         c"@@:",
     )?;
     add_method(
         built,
+        VIEW_OWNER,
         c"attributedSubstringForProposedRange:actualRange:",
         attributed_substring as *const c_void,
         c"@@:{_NSRange=QQ}^{_NSRange=QQ}",
     )?;
     add_method(
         built,
+        VIEW_OWNER,
         c"firstRectForCharacterRange:actualRange:",
         first_rect_for_character_range as *const c_void,
         c"{CGRect={CGPoint=dd}{CGSize=dd}}@:{_NSRange=QQ}^{_NSRange=QQ}",
     )?;
     add_method(
         built,
+        VIEW_OWNER,
         c"characterIndexForPoint:",
         character_index_for_point as *const c_void,
         c"Q@:{CGPoint=dd}",
@@ -1429,8 +1668,12 @@ fn content_view_class() -> Result<Object, Error> {
 }
 
 /// Installs one method on the class being built.
+///
+/// `owner` names that class in the failure, because two of them are built here
+/// and "a method would not go on" is not a message anybody can act on.
 fn add_method(
     class: Object,
+    owner: &str,
     name: &CStr,
     implementation: *const c_void,
     types: &CStr,
@@ -1438,7 +1681,200 @@ fn add_method(
     if unsafe { class_addMethod(class, sel(name), implementation, types.as_ptr()) } {
         return Ok(());
     }
-    Err(Error::Platform(format!("the content view would not take {}", name.to_string_lossy())))
+    Err(Error::Platform(format!("the {owner} would not take {}", name.to_string_lossy())))
+}
+
+/// The name of the accessibility-element class this backend builds at run time.
+const ELEMENT_CLASS: &CStr = c"RuiAccessibleElement";
+
+/// The instance variable pointing an element back at its [`Activation`].
+const ACTIVATION_IVAR: &CStr = c"rui_activation";
+
+/// How the element class is named in a failure to build it.
+const ELEMENT_OWNER: &str = "accessibility element";
+
+/// The `NSAccessibilityElement` subclass that can be pressed, built once per
+/// process.
+///
+/// AppKit's own class is everything a node needs in order to be read, and
+/// nothing it needs in order to be *used*: a press is delivered as
+/// `accessibilityPerformPress` to the object itself, so answering one means
+/// having a class of our own. It adds exactly two methods and one instance
+/// variable, and nothing about how a node is described goes through it.
+///
+/// Found rather than rebuilt for a second window, as [`content_view_class`] is.
+fn element_class() -> Result<Object, Error> {
+    let existing = class(ELEMENT_CLASS);
+    if !existing.is_null() {
+        return Ok(existing);
+    }
+
+    let superclass = class(c"NSAccessibilityElement");
+    if superclass.is_null() {
+        return Err(Error::Platform(
+            "AppKit is not loaded: there is no NSAccessibilityElement".into(),
+        ));
+    }
+    let built = unsafe { objc_allocateClassPair(superclass, ELEMENT_CLASS.as_ptr(), 0) };
+    if built.is_null() {
+        return Err(Error::Platform("an accessibility element class could not be created".into()));
+    }
+
+    let pointer_size = std::mem::size_of::<*mut c_void>();
+    let added = unsafe {
+        class_addIvar(
+            built,
+            ACTIVATION_IVAR.as_ptr(),
+            pointer_size,
+            pointer_size.trailing_zeros() as u8,
+            c"^v".as_ptr(),
+        )
+    };
+    if !added {
+        return Err(Error::Platform(
+            "the accessibility element would not take its instance variable".into(),
+        ));
+    }
+
+    add_method(
+        built,
+        ELEMENT_OWNER,
+        c"accessibilityPerformPress",
+        perform_press as *const c_void,
+        c"B@:",
+    )?;
+    add_method(
+        built,
+        ELEMENT_OWNER,
+        c"isAccessibilitySelectorAllowed:",
+        is_selector_allowed as *const c_void,
+        c"B@::",
+    )?;
+
+    unsafe { objc_registerClassPair(built) };
+    Ok(built)
+}
+
+/// The activation an element was built with, or `None` for one cut loose.
+///
+/// The reference is described as `'static` for the reason
+/// [`composer_of`]'s is: the pointer is the address of a box the window owns,
+/// and the one thing that can outlive it — an element an assistive technology
+/// kept hold of — has had the variable cleared by then. See [`forget`].
+fn activation_of(element: Object) -> Option<&'static Activation> {
+    if element.is_null() {
+        return None;
+    }
+    let mut pointer: *mut c_void = std::ptr::null_mut();
+    unsafe { object_getInstanceVariable(element, ACTIVATION_IVAR.as_ptr(), &mut pointer) };
+    if pointer.is_null() {
+        return None;
+    }
+    // SAFETY: the only thing ever written to that variable is the address of
+    // the boxed `Activation` the element's own `Mirror` holds.
+    Some(unsafe { &*pointer.cast::<Activation>() })
+}
+
+/// `-accessibilityPerformPress`: a screen reader activated this node.
+///
+/// It does not run anything. The press is reported, the loop is woken so that
+/// it is reported *now*, and the next frame decides what it means — which is
+/// the same frame, and the same line of it, that decides what a click means.
+extern "C" fn perform_press(element: Object, _selector: Sel) -> bool {
+    let Some(activation) = activation_of(element) else {
+        return false;
+    };
+    if !activation.press() {
+        return false;
+    }
+    wake();
+    true
+}
+
+/// Ends the loop's wait, so that something just reported is acted on now.
+///
+/// The wait in [`Window::pump_events`] is
+/// `nextEventMatchingMask:untilDate:inMode:dequeue:`, which comes back for an
+/// `NSEvent` and for nothing else. An accessibility message is not one: it is
+/// delivered to the main thread by the same run loop, from inside that call,
+/// and leaves it none the wiser. So one event is posted purely to be returned.
+/// Nothing reads it — [`Window::translate`] has no case for its type — and the
+/// pump it interrupts goes on to drain the inbox as it always does.
+///
+/// Without this a press would be noticed whenever the window next woke for its
+/// own reasons, which is up to [`App::idle_timeout`](crate::App::idle_timeout)
+/// and by default a quarter of a second. A window that has chosen a long idle
+/// because it shows something slow would have a button that looks broken.
+fn wake() {
+    unsafe {
+        let pool = objc_autoreleasePoolPush();
+        let application: Object = send(class(c"NSApplication"), sel(c"sharedApplication"));
+        if !application.is_null() {
+            // The one message here with more arguments than [`send4`] takes,
+            // and the only one that will ever need this many: an `NSEvent` has
+            // no shorter constructor. The signature is Apple's, spelled out so
+            // that each argument goes where the ABI puts it.
+            let build: unsafe extern "C" fn(
+                Object,
+                Sel,
+                u64,
+                CgPoint,
+                u64,
+                f64,
+                isize,
+                Object,
+                i16,
+                isize,
+                isize,
+            ) -> Object = std::mem::transmute(objc_msgSend as *const ());
+            let event = build(
+                class(c"NSEvent"),
+                sel(
+                    c"otherEventWithType:location:modifierFlags:timestamp:\
+                       windowNumber:context:subtype:data1:data2:",
+                ),
+                EVENT_APPLICATION_DEFINED,
+                CgPoint::default(),
+                0,
+                0.0,
+                0,
+                std::ptr::null_mut(),
+                0,
+                0,
+                0,
+            );
+            if !event.is_null() {
+                // At the front of the queue: the point is to be seen at once,
+                // and there is nothing behind it this should wait for.
+                let _: () = send2(application, sel(c"postEvent:atStart:"), event, true);
+            }
+        }
+        objc_autoreleasePoolPop(pool);
+    }
+}
+
+/// `-isAccessibilitySelectorAllowed:`: whether this element answers that.
+///
+/// Asked before an action is offered to a person. Only the press is ours to
+/// answer — a node with no `on_click` must not be offered one, or the rotor
+/// fills with headings and rules that do nothing. Everything else is the
+/// superclass's own question about attributes this backend never set, and is
+/// handed straight back to it.
+extern "C" fn is_selector_allowed(element: Object, _selector: Sel, asked: Sel) -> bool {
+    if asked == sel(c"accessibilityPerformPress") {
+        return activation_of(element).is_some_and(|activation| activation.pressable.get());
+    }
+    // `NSAccessibilityElement` and not `RuiAccessibleElement`: dispatch starts
+    // *above* the override, and starting at the class that defines it would be
+    // this function calling itself.
+    unsafe {
+        send1_super(
+            element,
+            class(c"NSAccessibilityElement"),
+            sel(c"isAccessibilitySelectorAllowed:"),
+            asked,
+        )
+    }
 }
 
 /// The composer a view was built with, or `None` for a view built elsewhere.

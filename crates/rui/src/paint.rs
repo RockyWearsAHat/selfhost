@@ -365,6 +365,12 @@ fn interact<S>(el: &El<S>, frame: &mut Frame<'_>) -> Response {
         && el.on_click.is_some()
         && !el.is_field()
         && (input.key_pressed(Key::Space) || input.key_pressed(Key::Enter));
+    // And an assistive technology's press is the third: a click with no pointer
+    // and no key behind it, which names what to activate instead of where. It
+    // joins the other two *here*, in the one place a click is decided, so that
+    // a screen reader cannot reach a handler by any route a pointer could not.
+    // Focus is deliberately not taken — see [`Event::Activated`].
+    let by_assistive = el.on_click.is_some() && input.activated(el.id);
 
     // A drag is reported from where the press *began*, so the pointer leaving
     // the element does not end it — dragging a slider past its own end and back
@@ -387,7 +393,9 @@ fn interact<S>(el: &El<S>, frame: &mut Frame<'_>) -> Response {
         drag,
         hovered,
         held: pressed_here && input.held(PointerButton::Primary),
-        clicked: (pressed_here && input.released(PointerButton::Primary) && hovered) || by_key,
+        clicked: (pressed_here && input.released(PointerButton::Primary) && hovered)
+            || by_key
+            || by_assistive,
         secondary_clicked: hovered
             && input.released(PointerButton::Secondary)
             && input

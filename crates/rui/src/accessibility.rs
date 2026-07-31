@@ -65,6 +65,43 @@
 //! that would need a separate handler for assistive technology is a defect in
 //! this seam, not a feature.
 //!
+//! ## How that is held, rather than promised
+//!
+//! An activation arrives as [`Event::Activated`](crate::Event::Activated),
+//! carrying the [`Id`] the platform was given here. A backend pushes it through
+//! `pump` the way it pushes a click — so the seam did not have to widen for
+//! this, and a backend still only ever reports what happened.
+//! [`Input`](crate::Input) folds
+//! it into the frame beside the pointer and the keys, and the frame answers it
+//! in the *one* place a click is decided: an element is clicked if a press
+//! ended on it, or Space or Enter reached it while focused, or an assistive
+//! technology named it. All three set the same flag and reach the same
+//! `on_click`, which is why `tests/accessibility.rs` can assert that both
+//! routes leave the application in the same state.
+//!
+//! What deliberately does *not* have a route, and why — each of these would
+//! have to invent something the interface never said:
+//!
+//! - **Increment and decrement**, which a platform offers for a
+//!   [`Role::Slider`]. A slider here is [`draw`](crate::widgets::draw) with an
+//!   [`El::on_drag`] on it: the value lives in the application's state, this
+//!   library never sees it, and a [`Drag`](crate::Drag) reports a *position*.
+//!   Answering an increment would mean choosing a step, and then a position
+//!   that produces it — a value decided in this module rather than by the
+//!   control. That is a second interaction wearing the first one's name. The
+//!   route becomes honest the day an element tells the library its range, and
+//!   not before.
+//! - **Setting a value** on a [`Role::Field`]. [`El::input_action`] would take
+//!   it faithfully — a platform hands over a whole new string and so does
+//!   typing — but it would buy no capability that is missing: a field is
+//!   already reachable, focusable, and typable through routes that exist, and
+//!   an assistive technology edits one by focusing it and typing. A second way
+//!   into the same handler is exactly what this seam is for avoiding.
+//!
+//! [`AccessActions`] still reports both `set_value` and `drag`, because they
+//! say what the *node* carries. What a platform may ask for is narrower, and
+//! each backend is what decides that.
+//!
 //! # The platform seam
 //!
 //! [`AccessUpdate`] is defined here, above the backend, and is plain data.
@@ -222,9 +259,10 @@ pub struct AccessState {
 
 /// Which of the library's handlers a node actually carries.
 ///
-/// What an assistive technology may ask of it — and the only things it may ask,
-/// because each one resolves to the handler a pointer or a keyboard would have
-/// reached. See the module's invariant.
+/// The outer bound on what an assistive technology may ask of this node:
+/// nothing outside this list resolves to a handler at all. What a platform may
+/// actually ask for today is narrower — see the module's invariant for which
+/// of these have a route and why the rest deliberately do not.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct AccessActions {
     /// It can be activated: [`El::click_action`].
