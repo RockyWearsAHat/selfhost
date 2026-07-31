@@ -455,12 +455,14 @@ round while a connection is being made. Read against the section above that look
 what makes this the *other* thing has to be said plainly. Three rules, and they
 are the whole difference:
 
-- **The platform still owns what you press.** `Theme::corners` is left as the
-  library's `Round`, so every button, field and segmented control in the window
-  is the desktop's shape. What is cut is what the console *reports on* — the
-  plates, the rail's rows, the lamps, the log's well — and each of those is
-  named with an explicit `Radius::Cut` rather than by changing the one word that
-  would chamfer the controls too.
+- **The shape is the only word the console respells.** The console sets
+  `Theme::corners` to `Cut`, so its controls are milled from the same stock as
+  the plates they are set into — but that is the *whole* departure. Sizes, the
+  type scale, hover and focus behaviour all stay the library's, so a button is
+  still unmistakably the desktop's button; it is simply pressed on this
+  machine. (The window kept the split for a while — cut readouts, rounded
+  controls — and the rounded button on a chamfered plate read as a sticker from
+  a different machine, not as the desktop's control lent to an instrument.)
 - **Glow is a fact, not a filter.** A halo appears on a lit lamp, on the chosen
   row, on a gauge's swept arc, and on the sweep itself. Nothing else has one.
   The costume's halo was behind *every* panel, button, tab and dot, which is
@@ -476,7 +478,11 @@ painted on the *ground*, through the `App::ground` seam, and the plates are
 opaque — so it exists only in the chassis around and between them, at a
 twentieth of the accent, and cannot sit behind a single word. The margins used
 to be the one part of the window that read as nothing; now they read as the
-surface the instruments are bolted to.
+surface the instruments are bolted to. The ground also closes itself with a
+viewport frame at the window's own edge — a chamfered hairline, a calibration
+tick where each graticule line meets it, corner arms in the brackets' weight —
+which is the plates' three marks at the outermost scale: the window is not a
+desktop rectangle with an instrument inside it, it is the instrument's face.
 
 Motion obeys the same test. There are exactly two loops in the program: the
 sweep, which is drawn only while the link is being made or the tunnel is
@@ -484,38 +490,38 @@ opening, and the pulse under a lamp that wants attention. A frame that asks for
 a loop asks for another frame, so a window with nothing outstanding still idles
 — which is the mechanical version of *motion means state that is in flux*.
 
-### Where the chamfer went instead
+### Where the chamfer lives now
 
 The argument above is about `Theme::corner()`, which is what every *framed* thing
 takes when it asks the theme for its shape: a panel, a button, a field, a tag.
-The console leaves it a radius on purpose.
+The *library's* default stays a radius; the console sets it to `Cut`.
 
-That is a choice and not a limitation, because the seam exists: `App::theme`
-takes a *function* of the appearance, `Theme::with_corners` swaps the shape and
+Both halves of that are choices the seam exists for: `App::theme` takes a
+*function* of the appearance, `Theme::with_corners` swaps the shape and
 `Theme::with_palette` swaps the colours, and everything below reads whatever
 comes back — and `App::ground` hands over the bare window the same way, so an
 application can paint the surface its interface sits on without the library
 growing an opinion about graticules. `crates/console/src/view/style.rs` is
-where the console spends both — on the palette and the ground, and on nothing
-else. Changing `corners` there would be one word,
-and it would chamfer every control in the window, which is exactly the line the
-list below draws.
+where the console spends all three — the palette, the corner, and the ground —
+and nothing else.
 
-What the console also owns is the marks it draws with its own painter, in the
-same file. The line it draws is what a mark is *for*:
+The console kept the corner split for a while — controls in the desktop's
+`Round`, readouts in explicit `Radius::Cut` — on the rule that there is no
+credit for disagreeing with the platform about what a button looks like. What
+that produced on screen was the opposite of what the rule promised: a rounded
+button on a chamfered plate did not read as the platform's control respected,
+it read as a part from a different machine glued onto this one. A physical
+console's switches are milled by whoever milled the panel. So the corner is
+now one word, said once, and what keeps it from being the costume again is
+that the *shape* is the entire departure — the costume was a chamfer arriving
+with monospaced headings, halos on everything and a grid over the window, and
+none of those came back.
 
-- **Anything the operator presses keeps the desktop's shape.** A button, a
-  field and a segmented control are things every program on the machine also
-  has.
-- **Anything the console *reports on* is cut.** The plates, the rail's rows, the
-  lamp beside a service, the wedge against the chosen row, the flag down a line
-  of standard error and down a banner, the mark in the masthead, the well the
-  log is written in. None of these is a control, none has an equivalent in the
-  desktop's own vocabulary, and every one exists to state a fact about a
-  machine. A chamfer on those is not a costume, because there is nothing
-  underneath it pretending to be something else. A row is on this side of the
-  line even though it can be chosen: it is a readout, and being selectable does
-  not make it a button.
+The marks the console draws with its own painter — the plates, the rail's
+rows, the lamp beside a service, the wedge against the chosen row, the flag
+down a line of standard error, the well the log is written in — were cut
+before the controls were and are cut still, because every one of them exists
+to state a fact about a machine.
 
 The corner brackets are the same argument at the corners themselves — four short
 strokes where each plate's chamfer ends, drawn as a `layer` so they take no room
