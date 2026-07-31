@@ -17,56 +17,49 @@
 //!
 //! The console also supplies its own ground, through the seam
 //! [`rui::App::ground`] opens for exactly this: [`ground`] scribes a faint
-//! graticule under the plates. An earlier design ruled a graph-paper grid
-//! *across* the window and it went, rightly, as costume — the difference here
-//! is where the mark lives and how loud it is. The plates are opaque, so the
-//! graticule exists only in the chassis around and between them, at a
-//! twentieth of the accent; it decorates the one part of the window that
-//! reports nothing, and it cannot sit behind a single word.
+//! graticule under the plates and closes it with a viewport frame at the
+//! window's own edge. An earlier design ruled a graph-paper grid *across* the
+//! window and it went, rightly, as costume — the difference here is where the
+//! mark lives and how loud it is. The plates are opaque, so the graticule and
+//! the frame exist only in the chassis around and between them, at a twentieth
+//! of the accent; they decorate the one part of the window that reports
+//! nothing, and they cannot sit behind a single word.
 //!
 //! [`App::theme`]: rui::App::theme
 //! [`Theme`]: rui::Theme
 //! [`Theme::with_palette`]: rui::Theme::with_palette
 //!
-//! # The corner: the desktop owns what you press, the console owns what it
-//! reports with
+//! # The corner: everything in this window is machined
 //!
 //! `Canvas` draws a rectangle's corners as [`Corner::Round`] or
 //! [`Corner::Cut`], for the same money, and says why the choice matters: a
 //! rounded corner reads as a card in a document and a cut one reads as a panel
-//! bolted into a rack. The library's own theme then rounds *everything*, and
-//! its reasoning is worth reading before disagreeing with it — a chamfer
-//! repeated on every panel, button, field and tag stopped saying *this program
-//! is about a machine* and started saying *this program is pretending to be
-//! from a film*.
+//! bolted into a rack. An earlier revision split the window down that line —
+//! chamfers on what the console reports with, the desktop's rounding on what
+//! the operator presses — on the argument that a button is the desktop's word
+//! and there is no credit for respelling it.
 //!
-//! Both arguments are right, about different things, and the line between them
-//! is what a mark is *for*:
-//!
-//! - **Anything the operator presses keeps the desktop's shape.** A button, a
-//!   field and a segmented control are things every program on the machine also
-//!   has, and there is no credit for disagreeing with the platform about what a
-//!   button looks like. Those stay rounded, because the theme rounds them and
-//!   the console does not fight it — which is also why the theme's own
-//!   [`CornerStyle`] is left alone rather than set to [`CornerStyle::Cut`]:
-//!   one word there would chamfer every control in the window.
-//! - **Anything the console *reports on* is cut.** The plates, the rail's rows,
-//!   the lamp beside a service, the wedge against the chosen row, the bar
-//!   against a line of standard error, the mark in the masthead — none of these
-//!   is a control, none has an equivalent in the desktop's own vocabulary, and
-//!   every one of them exists to state a fact about a machine. A chamfer on
-//!   those is not a costume, because there is nothing underneath it pretending
-//!   to be something else. A row is on this side of the line even though it can
-//!   be chosen: what it is is a readout, and being selectable does not make it a
-//!   button.
+//! That argument was half right, and the half it got wrong is *whose panel the
+//! button is on*. A rounded button on a chamfered plate does not read as the
+//! desktop's control lent to an instrument; it reads as a sticker that came
+//! from a different machine. A physical console does not borrow its switches
+//! from an office: the switch is milled by whoever milled the panel, and what
+//! says *pressing this commands the machine* is exactly that the control and
+//! the plate it is set into are one make. So the theme's own [`CornerStyle`]
+//! is set to [`CornerStyle::Cut`], and one word there chamfers every button,
+//! field and tag in the window — which is the point. What keeps this from
+//! being costume is the same discipline as everywhere else: the *shape* is the
+//! only thing that changes. Controls keep the library's sizes, its type scale,
+//! its hover and focus behaviour, so they are still unmistakably things to
+//! press; they are simply pressed on this machine.
 //!
 //! [`CornerStyle`]: rui::CornerStyle
 //! [`CornerStyle::Cut`]: rui::CornerStyle::Cut
 //!
-//! What that buys is the character without the cost: a rack of chamfered plates
-//! carrying rounded buttons reads as instrumentation laid on a desktop program,
-//! which is exactly what this is. [`brackets`] is the same argument at the
-//! corners themselves.
+//! [`brackets`] is the same argument at the corners themselves, and the
+//! viewport frame [`ground`] scribes at the window's own edge is it once more
+//! at the outermost scale: the window is not a desktop rectangle with an
+//! instrument inside it, it is the instrument's face, edge to edge.
 //!
 //! # One accent, and status only where there is something to report
 //!
@@ -104,51 +97,59 @@
 //! element is a filter over the window, and the fact is gone.
 
 use rui::{
-    Align, Anchor, Appearance, Canvas, Color, Corner, El, FontId, Palette, Point, Radius, Rect,
-    Role, Size, Status, Theme, Tone, button, col, draw, heading, micro, row, spacer, text,
+    Align, Anchor, Appearance, Canvas, Color, Corner, CornerStyle, El, FontId, Palette, Point,
+    Radius, Rect, Role, Size, Status, Theme, Tone, button, col, draw, heading, micro, row, spacer,
+    text,
 };
 use std::f32::consts::{FRAC_PI_2, TAU};
 
 /// The colours the console is drawn in: an instrument's display, not paper.
 ///
-/// A near-black navy ground, one electric cyan, and steel for everything that is
-/// merely present. The cyan is the only saturated colour at rest, which is what
-/// lets amber and red mean something the moment either appears — see the
-/// module's own notes on where a hue is allowed to be spent.
+/// A ground one step off black, one electric cyan, and steel for everything
+/// that is merely present. The cyan is the only saturated colour at rest,
+/// which is what lets amber and red mean something the moment either appears —
+/// see the module's own notes on where a hue is allowed to be spent.
+///
+/// The ground is darker than a desktop would choose, on purpose: a display in
+/// a dark room is read by what it *emits*, and every step the chassis takes
+/// toward black is a step of contrast handed to the marks that report. The
+/// navy cast survives — pure black is a switched-off screen, and a powered
+/// instrument's dark carries the colour of its own light.
 ///
 /// Healthy is deliberately not a green. It is a cyan-tinted steel, a step above
 /// the muted ink and a step below the accent, so that a lamp on a running
 /// service reads as *lit* without a rail of them lighting up the window.
 pub const HUD: Palette = Palette {
-    background: Color::rgb(0x0a, 0x12, 0x20),
-    background_deep: Color::rgb(0x05, 0x0a, 0x12),
-    surface: Color::rgb(0x0d, 0x18, 0x26),
-    surface_deep: Color::rgb(0x0a, 0x14, 0x20),
-    sheen: Color::rgb(0x16, 0x2c, 0x40),
-    raised: Color::rgb(0x12, 0x22, 0x36),
-    sunken: Color::rgb(0x06, 0x0e, 0x18),
-    // The hairline every panel is outlined in: the accent at just over a third,
-    // so an edge is cyan where it is looked at and grey where it is not.
-    border: Color::rgba(0x5f, 0xd9, 0xf2, 0x59),
+    background: Color::rgb(0x05, 0x0b, 0x16),
+    background_deep: Color::rgb(0x01, 0x03, 0x08),
+    surface: Color::rgb(0x0a, 0x15, 0x24),
+    surface_deep: Color::rgb(0x06, 0x0f, 0x1b),
+    sheen: Color::rgb(0x14, 0x2e, 0x44),
+    raised: Color::rgb(0x10, 0x22, 0x38),
+    sunken: Color::rgb(0x02, 0x07, 0x0f),
+    // The hairline every panel is outlined in: the accent at two fifths, so an
+    // edge is cyan where it is looked at and grey where it is not.
+    border: Color::rgba(0x5f, 0xd9, 0xf2, 0x66),
     border_focus: Color::rgb(0x8f, 0xe9, 0xff),
-    text: Color::rgb(0xdf, 0xf6, 0xff),
-    text_muted: Color::rgb(0x6e, 0x8c, 0xa0),
-    text_on_accent: Color::rgb(0x04, 0x12, 0x1c),
+    text: Color::rgb(0xe6, 0xf7, 0xff),
+    text_muted: Color::rgb(0x72, 0x92, 0xa8),
+    text_on_accent: Color::rgb(0x03, 0x0f, 0x18),
     accent: Color::rgb(0x5f, 0xd9, 0xf2),
     accent_deep: Color::rgb(0x2b, 0x93, 0xb4),
     accent_light: Color::rgb(0x9b, 0xeb, 0xfb),
     ok: Color::rgb(0x6e, 0x9a, 0xac),
-    ok_tint: Color::rgb(0x0c, 0x1c, 0x28),
+    ok_tint: Color::rgb(0x0a, 0x1a, 0x26),
     warn: Color::rgb(0xff, 0xb4, 0x54),
-    warn_tint: Color::rgb(0x26, 0x1a, 0x0c),
+    warn_tint: Color::rgb(0x24, 0x18, 0x0a),
     bad: Color::rgb(0xff, 0x52, 0x52),
-    bad_tint: Color::rgb(0x2a, 0x11, 0x16),
+    bad_tint: Color::rgb(0x28, 0x0f, 0x14),
     idle: Color::rgb(0x4c, 0x64, 0x76),
-    idle_tint: Color::rgb(0x0c, 0x16, 0x22),
-    shadow: Color::rgba(0x00, 0x02, 0x06, 0x4c),
+    idle_tint: Color::rgb(0x0a, 0x14, 0x20),
+    shadow: Color::rgba(0x00, 0x01, 0x04, 0x59),
 };
 
-/// The theme every frame is drawn with: the library's, in the console's colours.
+/// The theme every frame is drawn with: the library's, in the console's colours
+/// and the console's corner.
 ///
 /// A function of the appearance because that is the shape of the seam, and it
 /// answers the same palette either way. A display is not a document: the room's
@@ -157,8 +158,15 @@ pub const HUD: Palette = Palette {
 /// first for the sake of a window nobody would recognise as the same program.
 /// [`rui::Theme::is_dark`] reads the palette rather than what it was built with,
 /// so everything derived from it is derived correctly under either desktop.
+///
+/// [`CornerStyle::Cut`] is the one other word the console says to the library:
+/// every control is milled from the same stock as the plate it is set into.
+/// See the module's own notes on the corner for why the earlier split — cut
+/// readouts, rounded controls — was the costume, not this.
 pub fn theme(_appearance: Appearance, ui_font: FontId, mono_font: FontId) -> Theme {
-    Theme::new(Appearance::Dark, ui_font, mono_font).with_palette(HUD)
+    Theme::new(Appearance::Dark, ui_font, mono_font)
+        .with_palette(HUD)
+        .with_corners(CornerStyle::Cut)
 }
 
 /// How far apart the graticule the window's ground is scribed with repeats.
@@ -186,7 +194,34 @@ const GRID_CROSS: f32 = 3.5;
 /// How much of the accent a cross keeps: a step above the lines it registers.
 const GRID_CROSS_ALPHA: f32 = 0.11;
 
-/// The window's ground: the palette's gradient, scribed with a graticule.
+/// How far inside the window's edge the viewport frame is scribed.
+///
+/// Inside the sixteen units the layout keeps as margin, so the frame lives in
+/// the chassis the plates never cover and cannot sit behind a word.
+const FRAME_INSET: f32 = 6.0;
+
+/// How much of the accent the frame's hairline keeps: above the graticule it
+/// closes, below the plates it surrounds.
+const FRAME_ALPHA: f32 = 0.14;
+
+/// How long the calibration ticks along the frame's edges are.
+const FRAME_TICK: f32 = 3.5;
+
+/// How much of the accent a calibration tick keeps.
+const FRAME_TICK_ALPHA: f32 = 0.3;
+
+/// How long each arm of the frame's corner marks is.
+const FRAME_ARM: f32 = 18.0;
+
+/// How thick the corner marks are drawn: the same weight as a plate's
+/// [`brackets`], because they are the same mark at the outermost scale.
+const FRAME_ARM_WEIGHT: f32 = 1.8;
+
+/// How much of the accent a corner mark keeps.
+const FRAME_ARM_ALPHA: f32 = 0.5;
+
+/// The window's ground: the palette's gradient, scribed with a graticule and
+/// closed by a viewport frame.
 ///
 /// This is the console's half of the [`rui::App::ground`] seam. The library
 /// paints a bare window as a flat gradient, which is right for a document and
@@ -196,6 +231,14 @@ const GRID_CROSS_ALPHA: f32 = 0.11;
 /// strength, registered every fourth crossing with a small cross, is that
 /// something — visible in the margins and gutters, and covered without
 /// ceremony wherever a plate has a reading to make.
+///
+/// The frame is what makes the ground a *face* rather than a wall. A hairline
+/// chamfered rectangle just inside the window's own edge, calibrated with a
+/// short tick at every graticule crossing and held at its corners by arms in
+/// the brackets' weight: the same three marks every plate makes, at the scale
+/// of the whole window, so the window reads as the outermost plate of the
+/// instrument it shows. It lives entirely inside the margin the layout already
+/// keeps, so it costs the plates nothing.
 ///
 /// It asks for no phase and draws nothing that moves, so it costs the window
 /// none of its ability to idle.
@@ -227,6 +270,65 @@ pub fn ground(canvas: &mut Canvas, theme: &Theme) {
         }
         x += step;
     }
+
+    frame(canvas, theme, bounds);
+}
+
+/// The viewport frame: the outermost plate's own edge, ticks, and corners.
+///
+/// Split from [`ground`] so the graticule and the frame each read as one
+/// paragraph, not because either is reused.
+fn frame(canvas: &mut Canvas, theme: &Theme, bounds: Rect) {
+    let edge = Rect::new(
+        FRAME_INSET,
+        FRAME_INSET,
+        bounds.w - FRAME_INSET * 2.0,
+        bounds.h - FRAME_INSET * 2.0,
+    );
+    if edge.w <= PLATE_CUT * 2.0 || edge.h <= PLATE_CUT * 2.0 {
+        return;
+    }
+    canvas.stroke(edge, Corner::Cut(PLATE_CUT), 1.0, theme.palette.accent.fade(FRAME_ALPHA));
+
+    // A calibration tick wherever a graticule line meets the frame, pointing
+    // inward: the frame is ruled in the same divisions the ground is scribed
+    // in, which is what says the two are one drawing.
+    let tick = theme.palette.accent.fade(FRAME_TICK_ALPHA);
+    let mut x = GRID;
+    while x < bounds.w - GRID / 2.0 {
+        canvas.line(Point::new(x, edge.y), Point::new(x, edge.y + FRAME_TICK), 1.0, tick);
+        canvas.line(Point::new(x, edge.max_y() - FRAME_TICK), Point::new(x, edge.max_y()), 1.0, tick);
+        x += GRID;
+    }
+    let mut y = GRID;
+    while y < bounds.h - GRID / 2.0 {
+        canvas.line(Point::new(edge.x, y), Point::new(edge.x + FRAME_TICK, y), 1.0, tick);
+        canvas.line(Point::new(edge.max_x() - FRAME_TICK, y), Point::new(edge.max_x(), y), 1.0, tick);
+        y += GRID;
+    }
+
+    // The corners, held in the brackets' own weight. Drawn from where the
+    // chamfer ends, exactly as a plate's brackets are, so the frame and the
+    // plates agree about what a held corner looks like.
+    let arm = theme.palette.accent.fade(FRAME_ARM_ALPHA);
+    let mut corner = |x: f32, y: f32, along: f32, down: f32| {
+        canvas.line(
+            Point::new(x + along * PLATE_CUT, y),
+            Point::new(x + along * (PLATE_CUT + FRAME_ARM), y),
+            FRAME_ARM_WEIGHT,
+            arm,
+        );
+        canvas.line(
+            Point::new(x, y + down * PLATE_CUT),
+            Point::new(x, y + down * (PLATE_CUT + FRAME_ARM)),
+            FRAME_ARM_WEIGHT,
+            arm,
+        );
+    };
+    corner(edge.x, edge.y, 1.0, 1.0);
+    corner(edge.max_x(), edge.y, -1.0, 1.0);
+    corner(edge.x, edge.max_y(), 1.0, -1.0);
+    corner(edge.max_x(), edge.max_y(), -1.0, -1.0);
 }
 
 /// How far a plate's corner is chamfered, in logical units.
@@ -308,15 +410,15 @@ const TOP: f32 = -FRAC_PI_2;
 
 /// How big a ring gauge is drawn.
 ///
-/// Held to the height of the two lines beside it rather than to the strip it
+/// Held near the height of the two lines beside it rather than to the strip it
 /// sits in. Every unit it takes is a unit off the sentence and the readings on a
 /// narrow window, and a larger dial does not report a proportion any better.
 ///
-/// Four units over what first read as a dial: at the original size the scale,
-/// the ring and the sweep had no air between them to be told apart in, and
-/// widening the strip's tallest mark by four units is still short of the room
-/// the sentence beside it needs.
-const GAUGE: f32 = 38.0;
+/// Six units over what the scale and ring alone needed, and they are what the
+/// core paid for: a lit centre inside a ring this small either touches the
+/// track or does not exist, and the readings beside the gauge still keep the
+/// room the sentence needs.
+const GAUGE: f32 = 44.0;
 
 /// How wide its band is.
 ///
@@ -359,6 +461,18 @@ const GAUGE_TICK_GAP: f32 = 2.5;
 
 /// How much of the accent a gauge's unlit track keeps.
 const TRACK: f32 = 0.16;
+
+/// How big the lit core at the gauge's centre is drawn.
+const CORE: f32 = 5.0;
+
+/// How far the core's halo reaches past it at full brightness.
+const CORE_HALO: f32 = 7.0;
+
+/// How dim the core burns with nothing running, as a share of full brightness.
+///
+/// Never out, for the lamp's own reason: a centre that vanishes at zero makes
+/// the gauge read as broken exactly when it is reporting the worst news it has.
+const CORE_FLOOR: f32 = 0.2;
 
 /// How big the sweep that reports a connection being made is drawn.
 const SWEEP: f32 = 14.0;
@@ -532,7 +646,16 @@ fn pulse(phase: f32) -> f32 {
     PULSE_FLOOR + (1.0 - PULSE_FLOOR) * wave
 }
 
+/// What share of the outer sweep's radius the counter-arc runs at.
+const SWEEP_INNER: f32 = 0.55;
+
 /// A sweep going round: what a connection being made looks like.
+///
+/// Two arcs on one phase: the outer runs the way a dial reads and an inner,
+/// shorter one runs against it at just over half the radius. One arc going
+/// round is a wait cursor; two passing each other are a mechanism *turning*,
+/// which is the fact this mark exists to state. Both are driven off the same
+/// phase, so the pair costs the window exactly the frames one arc did.
 ///
 /// The one mark in the console that moves while nothing has changed, and it is
 /// allowed to because what it reports *is* the movement — the console is
@@ -544,11 +667,21 @@ pub fn sweep<S>(status: Status) -> El<S> {
         let color = painter.color(tone);
         let center = Point::new(rect.x + rect.w / 2.0, rect.y + rect.h / 2.0);
         let radius = rect.w.min(rect.h) / 2.0 - SWEEP_BAND;
-        let start = TOP + painter.phase("sweep", SWEEP_PERIOD) * TAU;
+        let phase = painter.phase("sweep", SWEEP_PERIOD);
+        let start = TOP + phase * TAU;
+        let counter = TOP - phase * TAU;
         let canvas = painter.canvas();
         canvas.ring(center, radius, SWEEP_BAND, color.fade(TRACK * 1.5));
         canvas.arc_glow(center, radius, SWEEP_BAND, start, SWEEP_ARC, SWEEP_GLOW, color.fade(0.45));
         canvas.arc(center, radius, SWEEP_BAND, start, SWEEP_ARC, color);
+        canvas.arc(
+            center,
+            radius * SWEEP_INNER,
+            SWEEP_BAND,
+            counter,
+            SWEEP_ARC * 0.6,
+            color.fade(0.6),
+        );
     })
     .w(SWEEP)
     .h(SWEEP)
@@ -574,13 +707,20 @@ fn spoken(status: Status) -> &'static str {
 
 /// A ring reporting a share of a whole: how much of the machine is up.
 ///
-/// Three rings, drawn outside in, each with air between it and its neighbour:
-/// a scale of short ticks, then a gap, then a thin low-alpha track, then the
-/// lit arc on that same track with a subtle glow of its own. The scale and the
-/// track used to be drawn back to back with no gap and ticks nearly as long as
-/// the track's own radius, which is what made the whole mark read as one
-/// spiked blot rather than as three things at three radii — see [`GAUGE_TICK`]
-/// and [`GAUGE_TICK_GAP`].
+/// Three rings and a core, drawn outside in, each with air between it and its
+/// neighbour: a scale of short ticks, then a gap, then a thin low-alpha track,
+/// then the lit arc on that same track with a subtle glow of its own, and at
+/// the centre a small disc whose brightness *is* the reading. The scale and
+/// the track used to be drawn back to back with no gap and ticks nearly as
+/// long as the track's own radius, which is what made the whole mark read as
+/// one spiked blot rather than as three things at three radii — see
+/// [`GAUGE_TICK`] and [`GAUGE_TICK_GAP`].
+///
+/// The core states the same share the arc does, by a means readable at a
+/// distance the arc is not: a machine fully up burns bright at the centre of
+/// its dial, and a machine down to nothing has gone dark there — though never
+/// out; see [`CORE_FLOOR`]. It eases on the arc's own key, so the two cannot
+/// disagree mid-motion.
 ///
 /// The track is what states the scale — without it a reader knows how far the
 /// arc has got but not how far *all of it* would be — and it is the same
@@ -625,6 +765,13 @@ pub fn gauge<S>(fraction: f32) -> El<S> {
             canvas.arc_glow(center, radius, GAUGE_BAND, TOP, swept, GAUGE_GLOW, accent.fade(0.4));
             canvas.arc(center, radius, GAUGE_BAND, TOP, swept, accent);
         }
+
+        // The core: brightness follows the eased share, so the disc and the
+        // arc report the same number by two different means.
+        let lit = CORE_FLOOR + (1.0 - CORE_FLOOR) * (swept / TAU);
+        let socket = Rect::new(center.x - CORE, center.y - CORE, CORE * 2.0, CORE * 2.0);
+        canvas.shadow(socket, Corner::Round(CORE), CORE_HALO, 0.0, accent.fade(0.5 * lit));
+        canvas.ring(center, CORE / 2.0, CORE, accent.fade(lit));
     })
     .w(GAUGE)
     .h(GAUGE)
@@ -662,11 +809,22 @@ const RETICLE_TICKS: u32 = 8;
 /// a claim that it was.
 const RETICLE_ALPHA: f32 = 0.2;
 
-/// A faint reticle, centred behind an empty pane's own words.
+/// What share of the outer ring's radius the inner ring is drawn at.
+const RETICLE_INNER: f32 = 0.62;
+
+/// How long the crosshair stubs reaching out past the outer ring are.
+const RETICLE_STUB: f32 = 10.0;
+
+/// How much air a crosshair stub keeps between itself and the ring it leaves.
+const RETICLE_STUB_GAP: f32 = 3.0;
+
+/// A faint targeting reticle, centred behind an empty pane's own words.
 ///
-/// The room a pane's watermark used to sit in was true blank space, and a
-/// window that has never had a service chosen read as unfinished rather than
-/// as waiting. This is the same argument the sweep and the gauge make at the
+/// Two rings, a scale, four crosshair stubs at the cardinal points, and a
+/// centre mark: an instrument's aperture with nothing sighted in it yet. The
+/// room a pane's watermark used to sit in was true blank space, and a window
+/// that has never had a service chosen read as unfinished rather than as
+/// waiting. This is the same argument the sweep and the gauge make at the
 /// other end of the window — an instrument's face is marked everywhere, not
 /// only where it currently has a reading — carried to the one panel that had
 /// been left bare.
@@ -687,6 +845,24 @@ pub fn reticle<S>() -> El<S> {
         let canvas = painter.canvas();
         canvas.ring(center, radius, RETICLE_BAND, color);
         canvas.ticks(center, radius - RETICLE_TICK, radius, RETICLE_BAND, RETICLE_TICKS, TOP, color);
+        canvas.ring(center, radius * RETICLE_INNER, RETICLE_BAND, color);
+        // The centre mark: a dot, not a cross, so the words over it are not
+        // read through a plus sign.
+        canvas.ring(center, 1.0, 2.0, color);
+        // The stubs leave a gap before they set off, so the ring stays a ring
+        // rather than a wheel with four spokes through it.
+        for (dx, dy) in [(1.0, 0.0), (-1.0, 0.0), (0.0, 1.0), (0.0, -1.0f32)] {
+            let from = radius + RETICLE_STUB_GAP;
+            canvas.line(
+                Point::new(center.x + dx * from, center.y + dy * from),
+                Point::new(
+                    center.x + dx * (from + RETICLE_STUB),
+                    center.y + dy * (from + RETICLE_STUB),
+                ),
+                RETICLE_BAND,
+                color,
+            );
+        }
     })
     .layer(Anchor::Over)
 }
@@ -924,12 +1100,13 @@ mod tests {
     }
 
     #[test]
-    fn the_supplied_palette_changes_the_colours_and_nothing_else() {
-        // What the seam is for: the console names colours, and leaves the sizes,
-        // the type scale and the corner shape to the library that chose them.
+    fn the_console_says_two_words_to_the_library_and_no_more() {
+        // The palette and the corner are supplied; the sizes and the type scale
+        // are the library's. Restating those to change the look is how a theme
+        // comes to disagree with the library about what a heading is.
         let library = Theme::new(Appearance::Dark, FontId::FIRST, FontId::FIRST);
         assert_eq!(hud().metrics, library.metrics);
-        assert_eq!(hud().corners, library.corners, "a control keeps the desktop's shape");
+        assert_eq!(hud().corners, CornerStyle::Cut, "every control is milled, not borrowed");
     }
 
     #[test]
@@ -948,11 +1125,24 @@ mod tests {
         // The graticule is the chassis the plates are mounted on: a line where
         // the grid says one goes, and the palette's own gradient everywhere
         // else — a texture over the whole ground would be noise, not a scribe.
+        // Sampled mid-window, clear of the viewport frame at the edges.
         let mut canvas = Canvas::new(100, 100, 1.0);
         ground(&mut canvas, &hud());
         let at = |x: u32, y: u32| canvas.pixels()[(y * 100 + x) as usize];
-        assert_ne!(at(32, 10), at(16, 10), "a graticule line is a step above the ground");
-        assert_eq!(at(16, 10), at(48, 10), "the ground between lines is untouched");
+        assert_ne!(at(32, 50), at(16, 50), "a graticule line is a step above the ground");
+        assert_eq!(at(16, 50), at(48, 50), "the ground between lines is untouched");
+    }
+
+    #[test]
+    fn the_window_is_framed_at_its_own_edge() {
+        // The viewport frame: a hairline at the inset, and a calibration tick
+        // wherever a graticule line meets it — the marks that make the window
+        // the outermost plate rather than a wall behind some plates.
+        let mut canvas = Canvas::new(100, 100, 1.0);
+        ground(&mut canvas, &hud());
+        let at = |x: u32, y: u32| canvas.pixels()[(y * 100 + x) as usize];
+        assert_ne!(at(6, 50), at(2, 50), "the frame's hairline is a step above the ground");
+        assert_ne!(at(32, 8), at(20, 8), "a graticule line meets the frame in a tick");
     }
 
     #[test]

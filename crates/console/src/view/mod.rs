@@ -42,9 +42,10 @@
 //! brackets, which is the console's whole frame: an outline that says where a
 //! reading is taken, and nothing inside it repeating the claim.
 //!
-//! What each mark is *made* of, and why the console's own marks are chamfered
-//! while everything the operator presses keeps the desktop's shape, is
-//! [`style`]. Nothing here picks a colour or a corner for itself.
+//! What each mark is *made* of, and why everything in the window — the marks
+//! the console draws and the controls the operator presses alike — is cut from
+//! the same stock, is [`style`]. Nothing here picks a colour or a corner for
+//! itself.
 //!
 //! # Every frame is described from the snapshot
 //!
@@ -109,7 +110,10 @@ const STRIP_CUT: f32 = 5.0;
 const ROW_CUT: f32 = 4.0;
 
 /// How far the halo around the chosen row reaches past it.
-const CHOSEN_GLOW: f32 = 7.0;
+const CHOSEN_GLOW: f32 = 9.0;
+
+/// How wide the gutter carrying a row's unit number is.
+const UNIT_GUTTER: f32 = 16.0;
 
 /// How tall the readout bank is.
 ///
@@ -773,8 +777,9 @@ fn rail(snapshot: &Snapshot) -> El<Console> {
     let rows: Vec<El<Console>> = snapshot
         .services
         .iter()
-        .map(|service| {
-            service_row(service, snapshot.selected.as_deref() == Some(service.name.as_str()))
+        .enumerate()
+        .map(|(index, service)| {
+            service_row(index, service, snapshot.selected.as_deref() == Some(service.name.as_str()))
         })
         .collect();
 
@@ -813,7 +818,15 @@ fn rail(snapshot: &Snapshot) -> El<Console> {
     .max_w(RAIL_MAX)
 }
 
-/// One service in the rail: a lamp, a name, its state, and what it is doing.
+/// One service in the rail: its unit number, a lamp, a name, its state, and
+/// what it is doing.
+///
+/// The number is the row's position in the rack, in the gutter's dimmest ink.
+/// A rack's units are numbered whether or not anything is bolted into them,
+/// and the count is what lets two operators on a call say "unit three" instead
+/// of spelling a service's name at each other — the same job the log's
+/// sequence gutter does, done in the same voice: a column to be pointed at,
+/// never read.
 ///
 /// The state's word is quiet unless it needs looking at, and the lamp carries
 /// it the rest of the time — see [`style::state_ink`] for why a rail where
@@ -825,13 +838,18 @@ fn rail(snapshot: &Snapshot) -> El<Console> {
 /// of value so small that the wedge was doing all the work anyway — while an
 /// outline that glows is what a selected plate looks like on an instrument, and
 /// it is the second of the two places in the window a glow is spent.
-fn service_row(service: &ServiceStatus, chosen: bool) -> El<Console> {
+fn service_row(index: usize, service: &ServiceStatus, chosen: bool) -> El<Console> {
     let name = service.name.clone();
     let (status, _, summary) = present(&service.state);
     let state_label = service.state.label().to_uppercase();
 
     let row = row((
         style::wedge(chosen),
+        micro(format!("{:02}", index + 1))
+            .color(Tone::Idle)
+            .w(UNIT_GUTTER)
+            .text_align(Align::End)
+            .align_self(Align::Center),
         style::lamp(status),
         col((
             row((
@@ -1041,7 +1059,7 @@ mod tests {
         // ordinary function of the console, so it is tested without a frame,
         // a pointer, or a window.
         let mut console = console(populated());
-        let row = service_row(&console.snapshot().services[0].clone(), false);
+        let row = service_row(0, &console.snapshot().services[0].clone(), false);
         (row.click_action().expect("a row is clickable"))(&mut console);
         assert_eq!(console.snapshot().selected.as_deref(), Some("mongod"));
     }
