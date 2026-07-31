@@ -37,7 +37,8 @@
 //! Built with `--features reload`, a window notices that the file it is running
 //! from has been rebuilt, saves what it is showing, and starts the new build in
 //! its place. Off by default and absent from a release build entirely — see
-//! [`App::reloadable`] and [`reload`](crate::reload).
+//! `App::reloadable` and the `reload` module, neither of which exists in a
+//! build without the feature, which is why neither is linked here.
 
 use crate::accessibility::{AccessTree, AccessUpdate};
 use crate::canvas::Canvas;

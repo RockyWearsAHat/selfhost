@@ -300,8 +300,9 @@ impl Memory {
 
     /// Asks for `text` to be placed on the system clipboard.
     ///
-    /// Performed by the window once this frame is finished; see
-    /// [`ClipboardRequest`]. The last request of a frame wins, because two
+    /// Performed by the window once this frame is finished, by the loop in
+    /// [`shell`](crate::shell) — a field cannot reach a window, so it leaves
+    /// its intention here instead. The last request of a frame wins, because two
     /// controls both copying on the same frame is a mistake and the alternative
     /// — concatenating them — would be a stranger one.
     pub fn copy_to_clipboard(&mut self, text: String) {

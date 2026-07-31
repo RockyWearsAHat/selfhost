@@ -73,8 +73,52 @@
 //! [`is_selector_allowed`] answers that question per element from what the node
 //! actually carries, and defers to the superclass for every other selector
 //! rather than claiming to know.
+//!
+//! # What each fact of a node comes to, exhaustively
+//!
+//! [`attributes_of`] is the whole of the mapping, and it destructures
+//! [`AccessNode`] and [`AccessState`] without a rest pattern — so a field added
+//! to either stops this file compiling until somebody decides what macOS should
+//! do with it. That is the guarantee, rather than a test: a test can only check
+//! the fields whoever wrote it knew about.
+//!
+//! | fact | what it becomes here |
+//! |---|---|
+//! | `id` | the element object itself; AppKit has no attribute for identity |
+//! | `parent` | `AXParent` and `AXChildren`, rebuilt wholesale by [`relink`] |
+//! | `role` | `AXRole`, through [`ax_role`] |
+//! | `name` | `AXDescription`, via `setAccessibilityLabel:` |
+//! | `value` | `AXValue`, as a string |
+//! | `state.disabled` | `AXEnabled`, inverted |
+//! | `state.focusable` | *nothing* — see below |
+//! | `state.focused` | `AXFocused` |
+//! | `state.selected` | `AXValue` as a number on a checkbox, radio, or tab; `AXSelected` on a row |
+//! | `bounds` | `AXFrame`, converted to screen coordinates by [`on_screen`] |
+//! | `position_in_set` | the order of the parent's `AXChildren`; see below |
+//! | `set_size` | how many those children are; see below |
+//! | `actions.press` | `accessibilityPerformPress`, offered per element |
+//! | `actions.set_value` | *nothing* — see below |
+//! | `actions.keys` | *nothing* — a key reaches a focused element by being typed |
+//! | `actions.drag` | *nothing* — see below |
+//!
+//! Selection is two attributes and not one because AppKit makes it two:
+//! VoiceOver reads a checkbox and a radio button as "checked" or "selected"
+//! from the *number* in `AXValue`, and reads a row from the boolean in
+//! `AXSelected`. A checkbox given `AXSelected` is announced as neither.
+//!
+//! A position in a set has no per-element attribute on macOS and does not need
+//! one: an assistive technology counts a set by walking the parent's children,
+//! and [`relink`] already sorts those into set order. `AXIndex` exists, and
+//! means a row's index in a *table* — using it for a list would say something
+//! AppKit does not mean by it.
+//!
+//! `focusable`, `set_value`, and `drag` are the honest gaps, and they are all
+//! the same gap: this backend can say what is true, and cannot yet be *told*
+//! anything but a press. So the writes that would carry those — setting a
+//! value, moving focus, choosing a row — are refused rather than accepted and
+//! dropped; see [`UNROUTED_WRITES`]. Each closes the way the press did.
 
-use crate::accessibility::{AccessNode, AccessUpdate, Role};
+use crate::accessibility::{AccessNode, AccessState, AccessUpdate, Role};
 use crate::input::Composition;
 use crate::memory::Id;
 use crate::theme::Appearance;
@@ -1321,9 +1365,6 @@ struct Accessibility {
     nodes: RefCell<HashMap<Id, Mirror>>,
     /// How many nodes have ever been seen, for ordering new ones.
     seen: Cell<usize>,
-    /// Which node has the keyboard, so the last one can be told it no longer
-    /// does.
-    focused: Cell<Option<Id>>,
     /// Presses waiting to be reported as events.
     ///
     /// Boxed because every element built here is given its address, and the
@@ -1339,13 +1380,7 @@ struct Accessibility {
 impl Accessibility {
     /// An empty mirror, whose elements will be of `elements`.
     fn new(elements: Object) -> Self {
-        Self {
-            nodes: RefCell::default(),
-            seen: Cell::default(),
-            focused: Cell::default(),
-            inbox: Box::default(),
-            elements,
-        }
+        Self { nodes: RefCell::default(), seen: Cell::default(), inbox: Box::default(), elements }
     }
 
     /// Applies one frame's difference to the mirror.
@@ -1385,16 +1420,16 @@ impl Accessibility {
     }
 
     /// Tells the assistive technology what changed beyond the nodes themselves.
+    ///
+    /// Only notifications. Which element *is* focused was already applied by
+    /// [`describe`], from the node's own [`AccessState::focused`] — a node whose
+    /// focus changed is by definition a node that differs from the last frame,
+    /// so the diff carries it here without this having to work it out a second
+    /// time. What the diff cannot carry is the announcement, which is an event
+    /// rather than a fact and is the whole of what is left to do.
     fn announce(&self, view: Object, update: &AccessUpdate) {
         let nodes = self.nodes.borrow();
         if update.focus_moved {
-            let was = self.focused.replace(update.focused);
-            for (id, focused) in [(was, false), (update.focused, true)] {
-                if let Some(mirror) = id.and_then(|id| nodes.get(&id)) {
-                    let _: () =
-                        unsafe { send1(mirror.element, sel(c"setAccessibilityFocused:"), focused) };
-                }
-            }
             let focused = update
                 .focused
                 .and_then(|id| nodes.get(&id))
@@ -1456,25 +1491,161 @@ fn new_element(elements: Object, activation: &Activation) -> Object {
     }
 }
 
+/// What a node holds, in whichever of AppKit's two vocabularies fits its role.
+///
+/// A checked checkbox and a chosen row are the same fact in this library —
+/// [`AccessState::selected`] — and two different attributes on macOS. Keeping
+/// that as a decision with a name, rather than an `if` inside the setters,
+/// is what lets [`attributes_of`] be tested without a window.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Value {
+    /// Nothing to say. The attribute is cleared rather than set to an empty
+    /// string, which a screen reader would announce as "blank".
+    None,
+    /// Words: a field's text, or whatever [`El::value`](crate::El::value) said.
+    Words(String),
+    /// On or off, as `AXValue`'s number — how AppKit reports a checkbox, a
+    /// radio button, and a tab, and what VoiceOver reads as "checked" or
+    /// "selected" for them.
+    Toggle(bool),
+}
+
+/// Every attribute one node comes to, worked out before anything is sent.
+///
+/// Plain data on purpose. The mapping from this library's vocabulary to
+/// AppKit's is the part that can be got wrong and the part worth testing, and
+/// it needs no window, no view, and no Objective-C to check — see the tests at
+/// the foot of this file.
+#[derive(Debug, Clone, PartialEq)]
+struct Attributes {
+    /// `AXRole`.
+    role: &'static CStr,
+    /// `AXDescription`, which is what `setAccessibilityLabel:` sets.
+    label: String,
+    /// `AXValue`, in whichever form the role calls for.
+    value: Value,
+    /// `AXEnabled`.
+    enabled: bool,
+    /// `AXFocused`.
+    focused: bool,
+    /// `AXSelected`, for the roles that are chosen rather than switched on.
+    ///
+    /// `None` leaves the attribute alone: selection means nothing to a heading,
+    /// and a checkbox says the same thing through [`Value::Toggle`] instead.
+    selected: Option<bool>,
+}
+
+/// Whether this role reports being chosen as its *value* rather than as
+/// `AXSelected`.
+///
+/// AppKit's own division, and not a preference: VoiceOver reads a checkbox and
+/// a radio button as "checked" or "selected" from the number in `AXValue`, and
+/// reads a row or a menu item from the boolean in `AXSelected`. A checkbox
+/// given `AXSelected` and no value is announced as neither.
+fn selection_is_value(role: Role) -> bool {
+    matches!(role, Role::Checkbox | Role::Radio | Role::Tab)
+}
+
+/// What one node comes to in AppKit's vocabulary.
+///
+/// Every field of [`AccessNode`] and [`AccessState`] is destructured here
+/// without a rest pattern, so a field added to either stops this compiling
+/// until somebody decides what the platform should do with it. That is the
+/// guarantee that this mapping cannot quietly fall behind the tree — a test
+/// can only check the fields it was written to know about.
+fn attributes_of(node: &AccessNode) -> Attributes {
+    let AccessNode {
+        // The object standing for the node *is* its identity here; AppKit has
+        // no attribute for one. `AXIdentifier` would want the author's own
+        // `El::key`, which does not reach this far.
+        id: _,
+        // Applied by `relink` as `AXParent` and `AXChildren`, not here: a link
+        // is a fact about two elements and is rebuilt from all of them at once.
+        parent: _,
+        role,
+        name,
+        value,
+        state,
+        bounds: _,
+        // Both are carried by the *order* of the children `relink` builds, which
+        // is how an assistive technology counts a set on macOS — it walks the
+        // parent. There is no per-element attribute for either, and inventing
+        // `AXIndex` for a list that is not a table would say something AppKit
+        // does not mean by it.
+        position_in_set: _,
+        set_size: _,
+        // `press` is answered by `accessibilityPerformPress` and offered by
+        // `is_selector_allowed`; the other three deliberately have no route,
+        // for the reasons in `accessibility`'s invariant.
+        actions: _,
+    } = node;
+    let AccessState { disabled, focusable: _, focused, selected } = state;
+
+    let chosen = *selected;
+    Attributes {
+        role: ax_role(*role),
+        label: name.clone(),
+        value: match (chosen, selection_is_value(*role), value) {
+            // A checked checkbox's value is its state, in AppKit's vocabulary
+            // as in this one — and it wins over words, because a checkbox
+            // announced by a string is a checkbox whose state is never read.
+            (Some(on), true, _) => Value::Toggle(on),
+            (_, _, Some(words)) => Value::Words(words.clone()),
+            _ => Value::None,
+        },
+        enabled: !*disabled,
+        focused: *focused,
+        selected: chosen.filter(|_| !selection_is_value(*role)),
+    }
+}
+
 /// Fills an element in from the node it stands for.
+///
+/// Every decision was made in [`attributes_of`]; this only sends them. `bounds`
+/// is the one thing it works out for itself, because turning a rectangle in the
+/// window into one on the screen needs the view.
 fn describe(element: Object, node: &AccessNode, view: Object) {
+    let attributes = attributes_of(node);
     unsafe {
-        let _: () = send1(element, sel(c"setAccessibilityRole:"), ns_string(ax_role(node.role)));
-        let label = std::ffi::CString::new(node.name.as_str()).unwrap_or_default();
-        let _: () = send1(element, sel(c"setAccessibilityLabel:"), ns_string(&label));
-        // Nothing rather than an empty string for a node that holds no value: a
-        // screen reader announces the empty string as "blank", and a button
-        // does not have a blank value, it has none.
-        let value: Object = match &node.value {
-            Some(value) => match std::ffi::CString::new(value.as_str()) {
-                Ok(value) => ns_string(&value),
-                Err(_) => std::ptr::null_mut(),
-            },
-            None => std::ptr::null_mut(),
+        let _: () = send1(element, sel(c"setAccessibilityRole:"), ns_string(attributes.role));
+        let _: () = send1(element, sel(c"setAccessibilityLabel:"), text(&attributes.label));
+        let value: Object = match &attributes.value {
+            Value::None => std::ptr::null_mut(),
+            Value::Words(words) => text(words),
+            Value::Toggle(on) => send1(class(c"NSNumber"), sel(c"numberWithBool:"), *on),
         };
         let _: () = send1(element, sel(c"setAccessibilityValue:"), value);
-        let _: () = send1(element, sel(c"setAccessibilityEnabled:"), !node.state.disabled);
+        let _: () = send1(element, sel(c"setAccessibilityEnabled:"), attributes.enabled);
+        // Set from the node rather than only when focus moves, so that the one
+        // walk of the frame is the only thing this reads: a fact applied in two
+        // places is a fact that can be applied in one of them and not the other.
+        let _: () = send1(element, sel(c"setAccessibilityFocused:"), attributes.focused);
+        // Sent even when selection means nothing here, which collapses `None`
+        // and `Some(false)` — `AXSelected` is a boolean and has no third state
+        // to collapse them into anything else. Writing it unconditionally is
+        // what stops a stale one surviving: a row that stops being one, or an
+        // element that changes role, would otherwise keep the last answer it
+        // was given. Every attribute above is written every time for the same
+        // reason.
+        let _: () = send1(
+            element,
+            sel(c"setAccessibilitySelected:"),
+            attributes.selected.unwrap_or(false),
+        );
         let _: () = send1(element, sel(c"setAccessibilityFrame:"), on_screen(view, node.bounds));
+    }
+}
+
+/// An `NSString` holding `words`, or nothing if they cannot be one.
+///
+/// A Rust string may hold a NUL and a C string may not. Answering null rather
+/// than a string cut short at the NUL is the honest outcome: a name that
+/// silently loses its second half is worse than one that is missing, because
+/// only the second is obviously wrong.
+fn text(words: &str) -> Object {
+    match std::ffi::CString::new(words) {
+        Ok(words) => ns_string(&words),
+        Err(_) => std::ptr::null_mut(),
     }
 }
 
@@ -1853,16 +2024,40 @@ fn wake() {
     }
 }
 
+/// Everything an assistive technology may *write* that nothing here reads.
+///
+/// `NSAccessibilityElement` implements all three, so its own answer to
+/// [`is_selector_allowed`] is yes for every one of them — which would offer a
+/// person a value they can type into a field that will not take it, a focus
+/// they can move that the keyboard will not follow, and a row they can select
+/// that the interface will not show as selected. All three would be accepted
+/// and silently do nothing.
+///
+/// They are refused instead. Each is a gap of exactly the shape the press had
+/// before it was given an event, and each closes the same way — see the module
+/// header. A refusal is a gap somebody can find; an accepted write that does
+/// nothing is a bug report from a person who thought their screen reader was
+/// broken.
+const UNROUTED_WRITES: [&CStr; 3] =
+    [c"setAccessibilityValue:", c"setAccessibilityFocused:", c"setAccessibilitySelected:"];
+
 /// `-isAccessibilitySelectorAllowed:`: whether this element answers that.
 ///
-/// Asked before an action is offered to a person. Only the press is ours to
-/// answer — a node with no `on_click` must not be offered one, or the rotor
-/// fills with headings and rules that do nothing. Everything else is the
-/// superclass's own question about attributes this backend never set, and is
-/// handed straight back to it.
+/// Asked before an attribute is offered as writable or an action as available.
+/// Two answers are ours: the press, which a node without an `on_click` must not
+/// be offered, and the writes in [`UNROUTED_WRITES`], which nothing here reads.
+/// Everything else is the superclass's own question about attributes this
+/// backend sets through the ordinary setters, and is handed straight back.
+///
+/// Reading is unaffected. `AXValue`, `AXFocused`, and `AXSelected` are all
+/// still reported — [`describe`] sets them every frame from the node. It is
+/// only *setting them from outside* that is refused.
 extern "C" fn is_selector_allowed(element: Object, _selector: Sel, asked: Sel) -> bool {
     if asked == sel(c"accessibilityPerformPress") {
         return activation_of(element).is_some_and(|activation| activation.pressable.get());
+    }
+    if UNROUTED_WRITES.iter().any(|name| asked == sel(name)) {
+        return false;
     }
     // `NSAccessibilityElement` and not `RuiAccessibleElement`: dispatch starts
     // *above* the override, and starting at the class that defines it would be
@@ -2188,6 +2383,7 @@ fn install_menu(application: Object, title: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::accessibility::AccessActions;
 
     #[test]
     fn named_keys_come_from_positions_not_characters() {
@@ -2320,6 +2516,121 @@ mod tests {
         draw_during_live_resize(std::ptr::null_mut(), RUN_LOOP_BEFORE_WAITING, info);
         draw_during_live_resize(std::ptr::null_mut(), RUN_LOOP_BEFORE_WAITING, std::ptr::null_mut());
         assert!(!live.drawing.get(), "a firing with nothing set should not have drawn");
+    }
+
+    /// A node carrying one fact, so a test can say which fact it is asserting.
+    ///
+    /// Every field is named, and none is defaulted away, for the reason
+    /// [`attributes_of`] destructures rather than reads: a field added to
+    /// [`AccessNode`] has to be answered for here too.
+    fn node(role: Role) -> AccessNode {
+        AccessNode {
+            id: Id::new("a node"),
+            parent: None,
+            role,
+            name: "Notify on failure".into(),
+            value: None,
+            state: AccessState {
+                disabled: false,
+                focusable: false,
+                focused: false,
+                selected: None,
+            },
+            bounds: Rect::new(0.0, 0.0, 10.0, 10.0),
+            position_in_set: None,
+            set_size: None,
+            actions: AccessActions::default(),
+        }
+    }
+
+    #[test]
+    fn a_checked_box_is_reported_as_a_number_because_that_is_what_voiceover_reads() {
+        // The division AppKit makes and this library does not: a checkbox, a
+        // radio button, and a tab report being chosen as their *value*. Given
+        // `AXSelected` instead, VoiceOver announces neither state.
+        for role in [Role::Checkbox, Role::Radio, Role::Tab] {
+            let mut checked = node(role);
+            checked.state.selected = Some(true);
+            let attributes = attributes_of(&checked);
+            assert_eq!(attributes.value, Value::Toggle(true), "{role:?} reports its state");
+            assert_eq!(attributes.selected, None, "{role:?} does not also claim AXSelected");
+
+            let mut unchecked = node(role);
+            unchecked.state.selected = Some(false);
+            assert_eq!(attributes_of(&unchecked).value, Value::Toggle(false));
+        }
+    }
+
+    #[test]
+    fn a_chosen_row_is_reported_as_selected_because_that_is_what_a_row_is() {
+        for role in [Role::ListItem, Role::MenuItem] {
+            let mut chosen = node(role);
+            chosen.state.selected = Some(true);
+            let attributes = attributes_of(&chosen);
+            assert_eq!(attributes.selected, Some(true), "{role:?} reports AXSelected");
+            assert_eq!(attributes.value, Value::None, "{role:?} does not also claim a value");
+        }
+    }
+
+    #[test]
+    fn a_node_that_selection_means_nothing_to_claims_neither() {
+        // The reason `selected` is an `Option`: a heading is not unselected, it
+        // is a heading. Reporting `false` would have a screen reader offer a
+        // distinction the interface never drew.
+        let attributes = attributes_of(&node(Role::Heading));
+        assert_eq!(attributes.selected, None);
+        assert_eq!(attributes.value, Value::None);
+    }
+
+    #[test]
+    fn a_fields_words_are_its_value() {
+        let mut field = node(Role::Field);
+        field.value = Some("mongod".into());
+        assert_eq!(attributes_of(&field).value, Value::Words("mongod".into()));
+    }
+
+    #[test]
+    fn a_checkboxs_state_wins_over_words_it_was_also_given() {
+        // Both cannot be `AXValue`, and a checkbox announced by a string is one
+        // whose checked state is never read out at all.
+        let mut both = node(Role::Checkbox);
+        both.value = Some("on".into());
+        both.state.selected = Some(true);
+        assert_eq!(attributes_of(&both).value, Value::Toggle(true));
+    }
+
+    #[test]
+    fn every_other_fact_of_a_node_reaches_the_attribute_it_belongs_to() {
+        let mut every = node(Role::Button);
+        every.state.disabled = true;
+        every.state.focused = true;
+        let attributes = attributes_of(&every);
+
+        assert_eq!(attributes.role, c"AXButton");
+        assert_eq!(attributes.label, "Notify on failure");
+        assert!(!attributes.enabled, "AXEnabled is the inverse of disabled");
+        assert!(attributes.focused, "AXFocused comes from the node, not from the diff");
+    }
+
+    #[test]
+    fn a_name_that_cannot_be_a_c_string_is_absent_rather_than_cut_short() {
+        // A name losing its second half at a NUL is worse than one that is
+        // missing: only the second is obviously wrong to whoever hears it.
+        assert!(text("Notify\0on failure").is_null());
+        assert!(!text("Notify on failure").is_null());
+    }
+
+    #[test]
+    fn nothing_a_screen_reader_writes_is_accepted_and_dropped() {
+        // Each of these is a fact this backend can report and cannot be told.
+        // Accepting the write would be worse than refusing it; see
+        // `UNROUTED_WRITES`.
+        for name in UNROUTED_WRITES {
+            assert!(
+                !is_selector_allowed(std::ptr::null_mut(), std::ptr::null(), sel(name)),
+                "{name:?} must not be offered as writable"
+            );
+        }
     }
 
     #[test]
