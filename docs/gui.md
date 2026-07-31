@@ -430,12 +430,11 @@ about a machine* and started reading as *this program is pretending to be from a
 film* — which is the one thing a tool somebody opens every day must not look
 like.
 
-So the corner is a radius, the grid is gone, the halos are gone, the brackets
-are gone, the gauge is a bar, and the accent is a blue. The rule that replaced
-the old argument is narrower and holds up better: **the console should look like
-the desktop it is running on, and be distinguished by what it says rather than
-by what it is wearing.** There is no credit for disagreeing with the platform
-about what a button looks like.
+So `Theme::corners` became a radius, the grid went, the halos went, the brackets
+went, the gauge became a bar, and `rui`'s own accent is a blue. That is still
+what the *library* is, and the rule behind it still holds for anything the
+operator presses: **there is no credit for disagreeing with the platform about
+what a button looks like.**
 
 The lesson is worth keeping, because the failure was not any one of those
 decisions. It was that each was justified in isolation, against the thing it
@@ -443,31 +442,84 @@ replaced, and nothing ever asked what all of them looked like at once. The
 sample frame is the answer to that: `cargo run -p rui --example gallery -- .`
 draws every element to an image in both appearances, and the console's own
 `reference_frames` test writes the whole window the same way — as it opens, at
-the smallest size the backend allows, with the form open, and with nothing
-connected. A decision about appearance is not made until it has been looked at
-there.
+the smallest size the backend allows, with the form open, with nothing
+connected, with a link still being made, and with a failure announced. A
+decision about appearance is not made until it has been looked at there.
+
+### And then it was made an instrument on purpose
+
+The console is now a lit HUD again: a near-black navy ground scribed with a
+faint graticule, one electric cyan, chamfered plates marked at their corners by
+brackets, a ring gauge for how much of the machine is up, and a sweep that goes
+round while a connection is being made. Read against the section above that looks like the costume coming back, so
+what makes this the *other* thing has to be said plainly. Three rules, and they
+are the whole difference:
+
+- **The platform still owns what you press.** `Theme::corners` is left as the
+  library's `Round`, so every button, field and segmented control in the window
+  is the desktop's shape. What is cut is what the console *reports on* — the
+  plates, the rail's rows, the lamps, the log's well — and each of those is
+  named with an explicit `Radius::Cut` rather than by changing the one word that
+  would chamfer the controls too.
+- **Glow is a fact, not a filter.** A halo appears on a lit lamp, on the chosen
+  row, on a gauge's swept arc, and on the sweep itself. Nothing else has one.
+  The costume's halo was behind *every* panel, button, tab and dot, which is
+  what made it a filter over the window and told the reader nothing.
+- **Two hues at rest.** Cyan and steel. Amber and red appear only with a cause —
+  a countdown, a service that has stalled — and healthy is deliberately a
+  cyan-tinted steel rather than a green, so a rail of working services stays
+  quiet and the one that is not can be seen.
+
+The graticule deserves its own sentence, because the costume had a grid and it
+went. That one was ruled across the window, behind everything; this one is
+painted on the *ground*, through the `App::ground` seam, and the plates are
+opaque — so it exists only in the chassis around and between them, at a
+twentieth of the accent, and cannot sit behind a single word. The margins used
+to be the one part of the window that read as nothing; now they read as the
+surface the instruments are bolted to.
+
+Motion obeys the same test. There are exactly two loops in the program: the
+sweep, which is drawn only while the link is being made or the tunnel is
+opening, and the pulse under a lamp that wants attention. A frame that asks for
+a loop asks for another frame, so a window with nothing outstanding still idles
+— which is the mechanical version of *motion means state that is in flux*.
 
 ### Where the chamfer went instead
 
-The argument above is about `Theme::corner()`, which is what every *framed*
-thing takes: a panel, a button, a field, a tag. It is still a radius, and the
-console does not fight it — there is no seam through which an application hands
-`rui` a different `Theme` anyway, since one is built inside `App::draw_into`
-from an appearance and two faces.
+The argument above is about `Theme::corner()`, which is what every *framed* thing
+takes when it asks the theme for its shape: a panel, a button, a field, a tag.
+The console leaves it a radius on purpose.
 
-What the console does own is the marks it draws with its own painter, and
-`crates/console/src/view/style.rs` is where they live. The line it draws is what
-a mark is *for*:
+That is a choice and not a limitation, because the seam exists: `App::theme`
+takes a *function* of the appearance, `Theme::with_corners` swaps the shape and
+`Theme::with_palette` swaps the colours, and everything below reads whatever
+comes back — and `App::ground` hands over the bare window the same way, so an
+application can paint the surface its interface sits on without the library
+growing an opinion about graticules. `crates/console/src/view/style.rs` is
+where the console spends both — on the palette and the ground, and on nothing
+else. Changing `corners` there would be one word,
+and it would chamfer every control in the window, which is exactly the line the
+list below draws.
+
+What the console also owns is the marks it draws with its own painter, in the
+same file. The line it draws is what a mark is *for*:
 
 - **Anything the operator presses keeps the desktop's shape.** A button, a
-  field, a segmented control and the plates they sit on are things every program
-  on the machine also has.
-- **Anything the console *reports with* is cut.** The lamp beside a service, the
-  wedge against the chosen row, the flag down a line of standard error and down
-  a banner, the mark in the masthead. None of these is a control, none has an
-  equivalent in the desktop's own vocabulary, and every one exists to state a
-  fact about a machine. A chamfer on those is not a costume, because there is
-  nothing underneath it pretending to be something else.
+  field and a segmented control are things every program on the machine also
+  has.
+- **Anything the console *reports on* is cut.** The plates, the rail's rows, the
+  lamp beside a service, the wedge against the chosen row, the flag down a line
+  of standard error and down a banner, the mark in the masthead, the well the
+  log is written in. None of these is a control, none has an equivalent in the
+  desktop's own vocabulary, and every one exists to state a fact about a
+  machine. A chamfer on those is not a costume, because there is nothing
+  underneath it pretending to be something else. A row is on this side of the
+  line even though it can be chosen: it is a readout, and being selectable does
+  not make it a button.
+
+The corner brackets are the same argument at the corners themselves — four short
+strokes where each plate's chamfer ends, drawn as a `layer` so they take no room
+from what they frame and cannot change what fits inside it.
 
 One thing had to be *looked at* before it could be settled, and the swatch is
 why the lamp is the shape it is. **A chamfer has to be seen to mean anything,
@@ -502,11 +554,13 @@ Three marks above a flat fill, each drawn by the scan that was already there:
   horizontal or angled gradient would be a mix *per pixel* and is deliberately
   not offered. A test asserts the shift stays under six percent: past that it
   stops reading as material and starts reading as a texture.
-- **The accent is one blue, and it is the only saturated colour in the chrome.**
-  It fills the primary button, underlines the chosen tab, washes the selected
+- **The accent is one hue, and it is the only saturated colour in the chrome.**
+  It fills the primary button, underlines the chosen tab, outlines the selected
   row, and rings whatever has the keyboard. Nothing else. It is a hue none of
   the four status colours is near, so the primary action can never be mistaken
-  for a health signal, and a test asserts the distance.
+  for a health signal, and a test asserts the distance. It is a blue in `rui`'s
+  own palette and an electric cyan in the console's, which is the seam being
+  spent on the one thing a program's own character is actually made of.
 
 A panel is separated from the window by **value** as well as by its outline, and
 a test asserts that too. The dark palette used to hold its surfaces within a
@@ -516,26 +570,31 @@ looking for their outlines.
 
 ### Ruled, not boxed
 
-The window holds exactly **three framed surfaces** — the readout bank, the rail
-of services, and the detail pane — and everything inside them is separated by
-ruling instead of by more outlines. That is a correction that survived the
-redesign. An earlier revision put four rounded cards of counts inside a rounded
-page inside a window, which is three frames drawn around every fact, and the
-result read as a diagram of an interface rather than as one.
+The window holds exactly **four framed surfaces** — the masthead strip, the
+readout bank, the rail of services, and the detail pane — and everything inside
+them is separated by ruling instead of by more outlines. That is a correction
+that survived every redesign. An earlier revision put four rounded cards of
+counts inside a rounded page inside a window, which is three frames drawn around
+every fact, and the result read as a diagram of an interface rather than as one.
 
-A **section rule** is `section`: a small-capital label, a hairline
-running from it to the far edge, and an optional aside set at the right end. It
-does a box's job — saying where a block ends — for a fiftieth of the ink, and it
-does the job a floating label cannot, which is to state how far down the block
-extends rather than leaving the eye to guess. `SERVICES`, `DEFINITION`,
-`OUTPUT`, and `POLICY` are each introduced this way, and so is the window's own
-title bar, where the rule is what stops a wide window reading as a mark at one
-edge and an address at the other with nothing between them.
+A **section rule** is the console's `style::section_rule`: a small-capital label,
+a hairline running from it to the far edge with a short tick standing on its end,
+and an optional aside set at the right. It does a box's job — saying where a
+block ends — for a fiftieth of the ink, and it does the job a floating label
+cannot, which is to state how far down the block extends rather than leaving the
+eye to guess. `SERVICES`, `DEFINITION`, `OUTPUT`, and `POLICY` are each
+introduced this way, and so is the window's own title bar, where the rule is what
+stops a wide window reading as a mark at one edge and an address at the other
+with nothing between them. The tick is what separates a rule from a border: a
+hairline that runs out at the pane's edge reads as the top of a box nobody
+finished, and the same line stopped by an upright reads as a measurement.
 
-The rules are plain hairlines in `Palette::border` — the same line every panel is
-outlined in. They were the accent dimmed toward the border, which tinted every
-rule in the window faintly cyan; over a page of them that read as the interface
-being *lit* rather than as it being ruled.
+The rules are hairlines in `Palette::border` — the same line every panel is
+outlined in, which in the console's palette is the accent at about a third of its
+opacity. That was once a mistake and is now the point: dimming the accent toward
+a grey border tinted every rule faintly cyan, which over a page of them read as
+the interface being *lit* rather than ruled, and a HUD is exactly the interface
+that means it.
 
 **A state is a lamp and a word, and the console draws no tags at all.** `tag` is
 still in `rui` and is still a tint of the status's hue with the word in the hue
@@ -763,9 +822,10 @@ symptom is a stale pixel still showing a service as running after it has died.
 the services; `selfhost-console` shows them, follows their output, and starts,
 stops, restarts, installs, and uninstalls them.
 
-Verified by running it: the window opens, picks up the desktop's light or dark
-appearance, polls a live daemon twice a second, and renders four services in
-four different states with their definitions and their captured output.
+Verified by running it: the window opens in the console's own palette under
+either desktop appearance, polls a live daemon twice a second, and renders four
+services in four different states with their definitions and their captured
+output.
 
 **The appearance and the motion are verified headlessly, not by eye in a running
 window.** This happens two ways, and they check different things.
@@ -789,13 +849,20 @@ SELFHOST_FRAME_DIR=/tmp/frames \
   cargo test -p selfhost-console --release reference_frames -- --nocapture
 ```
 
-`reference_frames` draws both appearances, with the detail pane and with the
-install form open, at the real backing scale and through the real layout, to
-four PNGs — and then prints what a frame costs at three window sizes. It is how
-the *look* is judged on a machine that is not the target, and how the two
-appearances are compared without switching the desktop over, which the font-less
-tests by construction cannot do. It skips itself, saying so, unless
-`SELFHOST_FRAME_DIR` names somewhere to write and a font is installed.
+`reference_frames` draws every screen the console can be on — watching a
+service, the install form, the smallest window the backend allows, nothing
+connected, a failure announced, and a link still being made — at the real
+backing scale and through the real layout, to six PNGs, and then prints what a
+frame costs at three window sizes. It is how the *look* is judged on a machine
+that is not the target, which the font-less tests by construction cannot do. It
+skips itself, saying so, unless `SELFHOST_FRAME_DIR` names somewhere to write and
+a font is installed.
+
+It writes one appearance rather than two. The console supplies its own palette
+and draws the same instrument under a light desktop and a dark one — a display
+does not turn white because the room's lights came on — so a second pass would
+have written the same picture beside itself under a name claiming it was
+different. The room that freed pays for the states that were missing.
 
 A log drawn this way is already at its end on the *first* frame, which it did
 not used to be. A scrolling area does not know how tall its content is until it

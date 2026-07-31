@@ -230,7 +230,7 @@ impl<S: 'static> Harness<S> {
 
         self.fonts.fonts.set_scale(self.canvas.scale());
         let theme = self.theme_in_force();
-        self.canvas.clear_vertical(theme.palette.background, theme.palette.background_deep);
+        self.app.paint_ground(&mut self.canvas, &theme);
 
         self.memory.begin_frame(self.elapsed);
         let mut probes = Vec::new();
@@ -625,7 +625,7 @@ impl<S: 'static> Harness<S> {
     fn ground(&self) -> Vec<u32> {
         let theme = self.theme_in_force();
         let mut strip = Canvas::new(1, self.canvas.height(), self.canvas.scale());
-        strip.clear_vertical(theme.palette.background, theme.palette.background_deep);
+        self.app.paint_ground(&mut strip, &theme);
         strip.pixels().to_vec()
     }
 

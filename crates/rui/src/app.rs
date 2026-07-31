@@ -81,6 +81,11 @@ pub struct App<S> {
     running: Condition<S>,
     /// What the interface is drawn from, given the desktop's appearance.
     theme: ThemeFor,
+    /// How the bare window is painted before anything is laid on it.
+    ///
+    /// `None` for the library's own ground — the palette's vertical gradient —
+    /// which is what nearly every application wants. See [`App::ground`].
+    ground: Option<Ground>,
     /// What the last frame amounted to, for anything that cannot see it.
     access: AccessTree,
     /// How that differed from the frame before, which is what gets pushed.
@@ -108,6 +113,13 @@ type Condition<S> = Box<dyn Fn(&S) -> bool>;
 /// the machine the program is running on. See [`App::theme`].
 type ThemeFor = Box<dyn Fn(Appearance, FontId, FontId) -> Theme>;
 
+/// How an application paints the bare window under its interface.
+///
+/// Handed the whole canvas and the theme in force, before layout has its say;
+/// it is responsible for covering every pixel, gradient and all, because it
+/// *replaces* the library's clear rather than following it.
+type Ground = Box<dyn Fn(&mut Canvas, &Theme)>;
+
 /// How long the loop waits for input before drawing again anyway.
 ///
 /// A quarter of a second by default: enough that an interface showing something
@@ -130,6 +142,7 @@ impl<S> App<S> {
             idle: DEFAULT_IDLE,
             running: Box::new(|_| true),
             theme: Box::new(Theme::new),
+            ground: None,
             access: AccessTree::new(),
             access_update: AccessUpdate::default(),
             #[cfg(feature = "reload")]
@@ -252,6 +265,36 @@ impl<S> App<S> {
         self.theme = theme;
     }
 
+    /// How the bare window is painted, when the palette's gradient is not it.
+    ///
+    /// The same seam [`App::theme`] is: the library owns what a frame *is*, and
+    /// the application owns what it looks like. A ground replaces the clear
+    /// entirely — it is handed the whole canvas first thing each frame and must
+    /// cover every pixel — so an instrument can scribe a graticule under its
+    /// panels without the library growing an opinion about graticules.
+    ///
+    /// It is drawing, not layout: nothing behind it is measured, hit, or read
+    /// by accessibility, which is what makes it safe for decoration and wrong
+    /// for anything a person is meant to notice.
+    pub fn ground(mut self, ground: impl Fn(&mut Canvas, &Theme) + 'static) -> Self {
+        self.ground = Some(Box::new(ground));
+        self
+    }
+
+    /// Paints the bare window: the application's ground, or the library's.
+    ///
+    /// Called by whatever is about to draw a frame — a window, a test, or
+    /// [`App::render`] — so the three cannot come to disagree about what an
+    /// empty window looks like.
+    pub(crate) fn paint_ground(&self, canvas: &mut Canvas, theme: &Theme) {
+        match &self.ground {
+            Some(ground) => ground(canvas, theme),
+            None => {
+                canvas.clear_vertical(theme.palette.background, theme.palette.background_deep);
+            }
+        }
+    }
+
     /// The theme this application draws with, under `appearance`.
     ///
     /// Asked once a frame by whatever is about to draw one — a window, a test,
@@ -349,7 +392,7 @@ impl<S> App<S> {
         fonts.fonts.set_scale(canvas.scale());
 
         let theme = self.theme_for(appearance, fonts.ui_font, fonts.mono_font);
-        canvas.clear_vertical(theme.palette.background, theme.palette.background_deep);
+        self.paint_ground(canvas, &theme);
         memory.begin_frame(std::time::Duration::from_millis(16));
         self.frame(canvas, &fonts.fonts, &input, memory, &theme);
         memory.end_frame(&input);
