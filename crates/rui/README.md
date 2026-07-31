@@ -239,6 +239,24 @@ resolves an `Id` to a node and runs the same `on_click` a mouse would; there is
 no second dispatch, so an interface cannot behave one way for a screen reader
 and another for a pointer.
 
+It arrives as `Event::Activated(id)` — an event, pushed by a backend the way a
+click is, so the platform seam did not have to widen to carry it and a backend
+still only ever reports what happened. The frame answers it in the one line that
+decides what a click is: an element is clicked if a press ended on it, *or* Space
+or Enter reached it while focused, *or* an assistive technology named it. All
+three set the same flag and reach the same closure. On macOS a screen reader's
+`accessibilityPerformPress` lands on the mirrored element, which reports the
+node's `Id` and wakes the loop; the element offers the action only when the node
+it stands for actually carries an `on_click` and is not disabled.
+
+Increment, decrement, and setting a value have deliberately *not* been given a
+route. A slider here is `draw()` with an `on_drag`: its value lives in the
+application's state and this library never sees it, so answering an increment
+would mean choosing a step and inventing a position that produces it — a value
+decided by the toolkit rather than by the control. And a field is already
+reachable, focusable, and typable through routes that exist. Each would be a
+second way into a handler, which is the one thing this seam is for avoiding.
+
 **What is pushed to the platform is a difference, not a tree.** Each frame's
 nodes are compared with the last frame's and only what changed is sent — the
 same decision as presenting a frame only when its pixels differ, for the same
@@ -251,7 +269,11 @@ a tab list, or two siblings sharing an identity; `assert_tab_order()` fails if
 Tab stops walking the interface the way it is written.
 `tests/accessibility.rs` runs both over every example, and `tests/recipes.rs`
 runs them over every hand-built control, so the convention breaks the build the
-moment somebody adds a widget in a hurry.
+moment somebody adds a widget in a hurry. The one-path decision is held the same
+way: the same interface is driven twice from the same state, once with
+`click_text` and once with `activate_named`, and what each leaves behind is
+compared whole. A second dispatch is a failing test rather than something a
+reviewer has to spot.
 
 ## Testing an interface
 
@@ -273,10 +295,12 @@ assert_eq!(harness.state().count, 1);
 assert!(harness.frame().shows("1"));
 ```
 
-It can aim at what a person would aim at (`click_text`, `hover_text`), drive
-anything else (`drag`, `key`, `type_text`, `scroll`, `tab`), ask where things
-came out (`rect_of`, `probes`), ask what the interface says (`text`, `shows`),
-and ask what was actually drawn (`pixel`, `marked`, `save_png`).
+It can aim at what a person would aim at (`click_text`, `hover_text`), aim the
+way a screen reader does — by the name it reads out rather than by where the
+words are (`activate_named`, `activate`) — drive anything else (`drag`, `key`,
+`type_text`, `scroll`, `tab`), ask where things came out (`rect_of`, `probes`),
+ask what the interface says (`text`, `shows`), and ask what was actually drawn
+(`pixel`, `marked`, `save_png`).
 
 Two decisions elsewhere make this work. Nothing reads a clock — `Memory` is
 *told* how long a frame took — so an animation is stepped rather than waited

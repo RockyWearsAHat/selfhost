@@ -159,6 +159,15 @@ trait Backend: Sized {
 
     /// Collects pending events, waiting up to `timeout` for the first.
     ///
+    /// Not only the ones the window system queued. An assistive technology
+    /// activates a control by messaging an object the backend handed it, at a
+    /// moment of its own choosing, and the answer is to report that here as an
+    /// [`Event::Activated`] rather than to act on it — which is why this seam
+    /// did not have to grow a method for it, and why a screen reader reaches a
+    /// handler by the route a click already takes. See
+    /// [`accessibility`](crate::accessibility) for the invariant that rests on
+    /// it.
+    ///
     /// `redraw` draws and presents one frame immediately, for a backend to call
     /// when the platform has taken the loop away and will not give it back until
     /// a gesture ends. It takes `&Self` and not `&mut Self` because the backend

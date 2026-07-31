@@ -354,6 +354,56 @@ impl<S: 'static> Harness<S> {
         self.move_pointer(at)
     }
 
+    /// Activates an element the way an assistive technology does, by identity.
+    ///
+    /// The other route into a handler, with no pointer and no key involved: a
+    /// screen reader holds the [`Id`] of a node and asks for it. It reaches the
+    /// same `on_click` a click reaches, which is the whole point of it and what
+    /// `tests/accessibility.rs` asserts.
+    ///
+    /// An identity that belongs to nothing on screen, or to something that
+    /// answers no press, draws a frame and changes nothing — the same as a
+    /// click on empty space, and for the same reason.
+    pub fn activate(&mut self, id: Id) -> &mut Self {
+        self.event(Event::Activated(id)).frame()
+    }
+
+    /// The same, aimed at whatever an assistive technology would *call* this.
+    ///
+    /// How a test of the accessible route should nearly always aim: at the name
+    /// a screen reader would read out, which is what a person using one has to
+    /// go on. That name is computed from the subtree, so this finds
+    /// `button("Restart")` as "Restart" with nothing written to make it so.
+    ///
+    /// # Panics
+    ///
+    /// If no node is named that, listing the names that are there — a test that
+    /// silently activated nothing would pass for the wrong reason.
+    pub fn activate_named(&mut self, name: &str) -> &mut Self {
+        let found =
+            self.accessibility().nodes().iter().find(|node| node.name == name).map(|node| node.id);
+        match found {
+            Some(id) => self.activate(id),
+            None => panic!(
+                "nothing on screen is named {name:?}; what is named is {:?}",
+                self.accessible_names()
+            ),
+        }
+    }
+
+    /// Every name an assistive technology would have to choose between.
+    ///
+    /// Only the nodes that carry one, because a group that holds other things
+    /// has no name of its own and listing empty strings would bury the answer.
+    pub fn accessible_names(&mut self) -> Vec<String> {
+        self.accessibility()
+            .nodes()
+            .iter()
+            .filter(|node| !node.name.is_empty())
+            .map(|node| node.name.clone())
+            .collect()
+    }
+
     /// Where whatever shows this text was drawn.
     ///
     /// Answers the first match in drawing order, which is the topmost thing a

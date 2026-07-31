@@ -26,8 +26,19 @@
 //! the input method resolves it, and is drawn underlined in place so the person
 //! can see what they are still choosing. A composition that reached the
 //! application's state would be a value the application had to learn to un-type.
+//!
+//! # Not every event has a position
+//!
+//! [`Event::Activated`] names *what* rather than *where*: an assistive
+//! technology holds the [`Id`] of a node and asks for it to be activated, with
+//! no pointer anywhere near it. It is an event, and not a call from a backend
+//! into a handler, for the reason a click is one — so that both arrive at the
+//! same frame, are folded into the same [`Input`], and reach the same handler
+//! by the same route. See the invariant in
+//! [`accessibility`](crate::accessibility).
 
 use crate::geom::{Point, Rect};
+use crate::memory::Id;
 use std::ops::Range;
 
 /// Which pointer button.
@@ -285,6 +296,27 @@ pub enum Event {
     /// abandoned, or committed, in which case an [`Event::Text`] carrying the
     /// result comes with it.
     Composing(Composition),
+    /// An assistive technology asked for something to be activated.
+    ///
+    /// A screen reader's press, arriving as an event because that is the only
+    /// shape that keeps one route from an intent to a handler: it is folded
+    /// into the frame the way a click is, and the element it names runs the
+    /// same [`El::click_action`](crate::El::click_action) a pointer and the
+    /// keyboard run.
+    ///
+    /// The [`Id`] is the one the platform was handed in
+    /// [`AccessNode`](crate::accessibility::AccessNode), which is stable from
+    /// frame to frame. An identity that no longer belongs to anything on
+    /// screen, or belongs to something that answers no press, does nothing —
+    /// an assistive technology holds objects from trees that have since moved
+    /// on, and a stale press is a race rather than a failure.
+    ///
+    /// It does not move the keyboard. A click gives focus to what it pressed
+    /// because the pointer went there; an assistive technology keeps a reading
+    /// cursor of its own and moves the keyboard when *it* means to, so
+    /// activating a button must not take the keyboard away from the field
+    /// somebody was filling in.
+    Activated(Id),
     /// The user asked to close the window.
     CloseRequested,
 }
@@ -311,6 +343,12 @@ pub struct Input {
     released: [bool; 3],
     scroll: (f32, f32),
     keys: Vec<(Key, Modifiers)>,
+    /// What an assistive technology asked to activate this frame.
+    ///
+    /// A list rather than one identity, because two presses can arrive between
+    /// frames the way two keystrokes can, and a frame that dropped one would
+    /// lose an activation somebody made.
+    activated: Vec<Id>,
     text: String,
     /// What an input method is still assembling.
     ///
@@ -339,6 +377,7 @@ impl Input {
         self.released = [false; 3];
         self.scroll = (0.0, 0.0);
         self.keys.clear();
+        self.activated.clear();
         self.text.clear();
     }
 
@@ -373,6 +412,7 @@ impl Input {
             Event::KeyUp { modifiers, .. } => self.modifiers = modifiers,
             Event::Text(text) => self.text.push_str(&text),
             Event::Composing(composition) => self.composition = within_bounds(composition),
+            Event::Activated(id) => self.activated.push(id),
             Event::CloseRequested => self.close_requested = true,
         }
     }
@@ -425,6 +465,15 @@ impl Input {
     /// Whether a key was pressed this frame, whatever was held with it.
     pub fn key_pressed(&self, key: Key) -> bool {
         self.keys.iter().any(|(pressed, _)| *pressed == key)
+    }
+
+    /// Whether an assistive technology asked to activate this element.
+    ///
+    /// What a frame asks in the same breath as "was I clicked": the answer
+    /// joins the pointer's and the keyboard's at the one place a click is
+    /// decided, so there is nothing here for an interface to handle separately.
+    pub fn activated(&self, id: Id) -> bool {
+        self.activated.contains(&id)
     }
 
     /// Whether a key was pressed with exactly the platform accelerator held.
