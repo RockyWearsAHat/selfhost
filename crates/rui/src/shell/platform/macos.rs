@@ -31,11 +31,31 @@
 //! methods of the protocol, `acceptsFirstResponder`, and a single instance
 //! variable pointing back at the [`Composer`] that holds what is being composed.
 //! Nothing about drawing, geometry, or the mouse goes through it.
+//!
+//! # Accessibility is a mirror, and it is not yet two-way
+//!
+//! [`Accessibility`] keeps one `NSAccessibilityElement` per node of the
+//! interface and applies each frame's difference to them, because a screen
+//! reader is handed those objects and asks them questions at moments of its own
+//! choosing — long after the frame that produced them.
+//!
+//! What is missing, and is missing by the shape of the seam rather than by
+//! oversight: `accessibilityPerformPress`. Answering it means reaching a
+//! handler, and [`Backend::update_accessibility`] only carries facts *outwards*
+//! — there is no way back from a backend to an element's `click_action`. The
+//! honest form of that path is an event, the same way a click is one, so that
+//! the invariant holds and there is still exactly one route from an intent to a
+//! handler. Until it exists a screen reader can read every control here and move
+//! the keyboard to it, and activation is done with the keyboard rather than from
+//! the rotor.
 
+use crate::accessibility::{AccessNode, AccessUpdate, Role};
 use crate::input::Composition;
+use crate::memory::Id;
 use crate::theme::Appearance;
 use crate::{Canvas, Event, Key, Modifiers, Point, PointerButton, Rect};
 use std::cell::{Cell, RefCell};
+use std::collections::HashMap;
 use std::ffi::{CStr, c_char, c_void};
 use std::time::Duration;
 
@@ -98,6 +118,12 @@ unsafe extern "C" {
     /// `objc_msgSend`.
     #[cfg(target_arch = "x86_64")]
     fn objc_msgSend_stret();
+
+    /// Tells whatever assistive technology is listening that something moved.
+    ///
+    /// The notification name is an `NSString`; the constants AppKit exports for
+    /// them are the plain strings used at the call sites below.
+    fn NSAccessibilityPostNotification(element: Object, notification: Object);
 
     fn CGColorSpaceCreateDeviceRGB() -> *mut c_void;
     fn CGColorSpaceRelease(space: *mut c_void);
@@ -425,6 +451,8 @@ pub(crate) struct Window {
     /// What the input method is composing. Boxed for the same reason: the view
     /// holds its address.
     composer: Box<Composer>,
+    /// The interface as an assistive technology sees it.
+    accessibility: Accessibility,
 }
 
 /// What the run-loop observer needs in order to draw a frame mid-gesture.
@@ -616,6 +644,7 @@ impl Backend for Window {
                 presented_scale: Cell::new(0.0),
                 live: Box::new(LiveResize::default()),
                 composer,
+                accessibility: Accessibility::default(),
             };
             window.refresh_geometry();
             window.observe_live_resize();
@@ -776,6 +805,18 @@ impl Backend for Window {
                 Err(Error::Platform("the pasteboard would not take the text".into()))
             }
         }
+    }
+
+    fn update_accessibility(&self, update: &AccessUpdate) -> Result<(), Error> {
+        unsafe {
+            // Every element and array built below is autoreleased, and this is
+            // called once a frame; without a pool of its own the whole tree
+            // would accumulate until the loop next went round.
+            let pool = objc_autoreleasePoolPush();
+            self.accessibility.apply(self.view, update);
+            objc_autoreleasePoolPop(pool);
+        }
+        Ok(())
     }
 
     fn set_composition_area(&self, area: Option<Rect>) -> Result<(), Error> {
@@ -1104,6 +1145,190 @@ impl Composer {
     }
 }
 
+/// One node of the interface, as the platform's own accessibility object.
+struct Mirror {
+    /// The `NSAccessibilityElement` standing for it, retained by us.
+    element: Object,
+    /// What holds it, or `None` for a node hanging off the view itself.
+    parent: Option<Id>,
+    /// Which of its containing set it is, when it is one of a set.
+    position: Option<usize>,
+    /// How many nodes had been seen when this one first appeared.
+    ///
+    /// The order to read children in, for children that are not a numbered set.
+    /// The tree arrives as a difference and a difference does not carry the
+    /// order of the nodes that did not change, so first-seen is the best
+    /// available answer — and is the right one for every interface whose rows
+    /// are added at the end, which is what a log and a service list are.
+    seen: usize,
+}
+
+/// The interface as an assistive technology sees it.
+///
+/// # Why a mirror rather than an answer
+///
+/// The other seams here are questions the platform asks and this backend
+/// answers. Accessibility is not: AppKit hands a screen reader *objects* and
+/// lets it ask them things directly, at moments of its own choosing, long after
+/// any frame has been drawn. So the tree has to exist as platform objects that
+/// outlive the frame, and what arrives from above — a difference — is applied to
+/// them rather than answered from.
+#[derive(Default)]
+struct Accessibility {
+    /// One mirror per node of the interface, by the identity it keeps.
+    nodes: RefCell<HashMap<Id, Mirror>>,
+    /// How many nodes have ever been seen, for ordering new ones.
+    seen: Cell<usize>,
+    /// Which node has the keyboard, so the last one can be told it no longer
+    /// does.
+    focused: Cell<Option<Id>>,
+}
+
+impl Accessibility {
+    /// Applies one frame's difference to the mirror.
+    fn apply(&self, view: Object, update: &AccessUpdate) {
+        let mut nodes = self.nodes.borrow_mut();
+        for id in &update.removed {
+            if let Some(mirror) = nodes.remove(id) {
+                // Ours since it was created; nothing else holds it once the
+                // parent's children are rebuilt below.
+                let _: () = unsafe { send(mirror.element, sel(c"release")) };
+            }
+        }
+        for node in &update.changed {
+            let seen = self.seen.get();
+            let mirror = nodes.entry(node.id).or_insert_with(|| {
+                self.seen.set(seen + 1);
+                Mirror { element: new_element(), parent: node.parent, position: None, seen }
+            });
+            mirror.parent = node.parent;
+            mirror.position = node.position_in_set;
+            describe(mirror.element, node, view);
+        }
+        relink(view, &nodes);
+        drop(nodes);
+
+        self.announce(view, update);
+    }
+
+    /// Tells the assistive technology what changed beyond the nodes themselves.
+    fn announce(&self, view: Object, update: &AccessUpdate) {
+        let nodes = self.nodes.borrow();
+        if update.focus_moved {
+            let was = self.focused.replace(update.focused);
+            for (id, focused) in [(was, false), (update.focused, true)] {
+                if let Some(mirror) = id.and_then(|id| nodes.get(&id)) {
+                    let _: () =
+                        unsafe { send1(mirror.element, sel(c"setAccessibilityFocused:"), focused) };
+                }
+            }
+            let focused = update
+                .focused
+                .and_then(|id| nodes.get(&id))
+                .map_or(view, |mirror| mirror.element);
+            unsafe {
+                NSAccessibilityPostNotification(focused, ns_string(c"AXFocusedUIElementChanged"));
+            }
+        }
+        if update.structure_changed {
+            // An object model built from the previous shape is now wrong, and
+            // this is the only way to say so.
+            unsafe { NSAccessibilityPostNotification(view, ns_string(c"AXLayoutChanged")) };
+        }
+    }
+}
+
+/// A fresh, empty accessibility element, retained.
+///
+/// `NSAccessibilityElement` is AppKit's own class for a thing that is part of an
+/// interface without being a view, which is exactly what every node here is —
+/// so there is no second run-time class to build, only objects to fill in.
+fn new_element() -> Object {
+    unsafe {
+        let element: Object = send(class(c"NSAccessibilityElement"), sel(c"alloc"));
+        send(element, sel(c"init"))
+    }
+}
+
+/// Fills an element in from the node it stands for.
+fn describe(element: Object, node: &AccessNode, view: Object) {
+    unsafe {
+        let _: () = send1(element, sel(c"setAccessibilityRole:"), ns_string(ax_role(node.role)));
+        let label = std::ffi::CString::new(node.name.as_str()).unwrap_or_default();
+        let _: () = send1(element, sel(c"setAccessibilityLabel:"), ns_string(&label));
+        // Nothing rather than an empty string for a node that holds no value: a
+        // screen reader announces the empty string as "blank", and a button
+        // does not have a blank value, it has none.
+        let value: Object = match &node.value {
+            Some(value) => match std::ffi::CString::new(value.as_str()) {
+                Ok(value) => ns_string(&value),
+                Err(_) => std::ptr::null_mut(),
+            },
+            None => std::ptr::null_mut(),
+        };
+        let _: () = send1(element, sel(c"setAccessibilityValue:"), value);
+        let _: () = send1(element, sel(c"setAccessibilityEnabled:"), !node.state.disabled);
+        let _: () = send1(element, sel(c"setAccessibilityFrame:"), on_screen(view, node.bounds));
+    }
+}
+
+/// Rebuilds every parent and child link from the mirror's own records.
+///
+/// Wholesale rather than patched, for the reason a frame is compared rather than
+/// tracked: an interface has tens of nodes, and a set of links rebuilt from the
+/// parent each node carries cannot drift out of step with them.
+fn relink(view: Object, nodes: &HashMap<Id, Mirror>) {
+    let mut children: HashMap<Option<Id>, Vec<&Mirror>> = HashMap::new();
+    for mirror in nodes.values() {
+        children.entry(mirror.parent).or_default().push(mirror);
+    }
+
+    for (parent, mut group) in children {
+        // A numbered set reads in its own order; everything else reads in the
+        // order it first appeared. See [`Mirror::seen`].
+        group.sort_by_key(|mirror| (mirror.position.unwrap_or(usize::MAX), mirror.seen));
+
+        let owner = parent.and_then(|id| nodes.get(&id)).map_or(view, |mirror| mirror.element);
+        unsafe {
+            let list: Object = send(class(c"NSMutableArray"), sel(c"array"));
+            for mirror in group {
+                let _: () = send1(list, sel(c"addObject:"), mirror.element);
+                let _: () = send1(mirror.element, sel(c"setAccessibilityParent:"), owner);
+            }
+            let _: () = send1(owner, sel(c"setAccessibilityChildren:"), list);
+        }
+    }
+}
+
+/// What a role is called in the platform's own vocabulary.
+///
+/// Every one of these is a role AppKit already knows, so a screen reader
+/// describes a `rui` control in the same words it describes the rest of the
+/// desktop. Where this library draws a distinction the platform does not — a
+/// status, a meter — the nearest true thing is used rather than a role invented
+/// here, which no assistive technology would recognise.
+fn ax_role(role: Role) -> &'static CStr {
+    match role {
+        Role::Group | Role::Dialog => c"AXGroup",
+        Role::Text | Role::Label | Role::Status => c"AXStaticText",
+        Role::Heading => c"AXHeading",
+        Role::Button => c"AXButton",
+        Role::Field => c"AXTextField",
+        Role::List => c"AXList",
+        Role::ListItem => c"AXRow",
+        Role::TabList => c"AXTabGroup",
+        Role::Tab => c"AXRadioButton",
+        Role::Meter => c"AXProgressIndicator",
+        Role::Separator => c"AXSplitter",
+        Role::Menu => c"AXMenu",
+        Role::MenuItem => c"AXMenuItem",
+        Role::Image => c"AXImage",
+        Role::Checkbox => c"AXCheckBox",
+        Role::Radio => c"AXRadioButton",
+        Role::Slider => c"AXSlider",
+    }
+}
+
 /// The name of the content-view class this backend builds at run time.
 const VIEW_CLASS: &CStr = c"RuiContentView";
 
@@ -1360,19 +1585,25 @@ extern "C" fn first_rect_for_character_range(
         // SAFETY: an out-parameter the caller allocated, or null.
         unsafe { *actual = NsRange::EMPTY };
     }
-    let frame = unsafe { send_rect(view, sel(c"frame")) };
-    let caret = composer_of(view).and_then(|composer| composer.caret.get());
-    let in_view = match caret {
-        // AppKit measures up from the bottom of the view; a caret, like
-        // everything else above this file, is measured down from the top.
-        Some(area) => CgRect {
-            origin: CgPoint {
-                x: f64::from(area.x),
-                y: frame.size.height - f64::from(area.y + area.h),
-            },
-            size: CgSize { width: f64::from(area.w), height: f64::from(area.h) },
-        },
+    match composer_of(view).and_then(|composer| composer.caret.get()) {
+        Some(caret) => on_screen(view, caret),
         None => CgRect::default(),
+    }
+}
+
+/// Where a rectangle of the interface is on the screen.
+///
+/// Two changes of frame in one: AppKit measures a view up from its bottom edge
+/// while everything above this file measures down from the top, and the window
+/// is somewhere on a desktop that neither of them knows about.
+fn on_screen(view: Object, area: Rect) -> CgRect {
+    let frame = unsafe { send_rect(view, sel(c"frame")) };
+    let in_view = CgRect {
+        origin: CgPoint {
+            x: f64::from(area.x),
+            y: frame.size.height - f64::from(area.y + area.h),
+        },
+        size: CgSize { width: f64::from(area.w), height: f64::from(area.h) },
     };
 
     let window: Object = unsafe { send(view, sel(c"window")) };

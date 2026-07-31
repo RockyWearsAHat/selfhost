@@ -31,6 +31,7 @@
 //! `BI_RGB` bitmap — which is blue, green, red, unused per pixel, the same bytes
 //! [`Canvas`] already holds.
 
+use crate::accessibility::AccessUpdate;
 use crate::input::Composition;
 use crate::theme::Appearance;
 use crate::{Canvas, Event, Key, Modifiers, Point, PointerButton, Rect};
@@ -622,6 +623,21 @@ impl Backend for Window {
                 return Err(Error::Platform("the input method refused a position".into()));
             }
         }
+        Ok(())
+    }
+
+    /// Nothing yet: this backend has no UI Automation provider.
+    ///
+    /// The way to on this platform is to answer `WM_GETOBJECT` with an
+    /// `IRawElementProviderSimple` — a COM object, which means a vtable built by
+    /// hand here, reference counting, and a fragment provider on top of it to
+    /// express the tree at all. It is the next platform to do and it is not done,
+    /// so Narrator finds a `rui` window and is told nothing about what is in it.
+    ///
+    /// Accepting the update rather than refusing it is deliberate: a refusal
+    /// would end the frame loop, and a screen reader that is not there must not
+    /// stop the program running.
+    fn update_accessibility(&self, _update: &AccessUpdate) -> Result<(), Error> {
         Ok(())
     }
 }

@@ -33,14 +33,23 @@
 //! program whose whole job is to take ownership from windows that are about to
 //! close.
 //!
-//! # There is no input method here
+//! # Two things this backend does not do, stated rather than hidden
 //!
-//! Composition needs XIM, a protocol spoken over a second connection to a
-//! separate input-method server. It is not implemented; see
-//! [`Backend::set_composition_area`]. Typing works for anything
+//! **No input method.** Composition needs XIM, a protocol spoken over a second
+//! connection to a separate input-method server. Typing works for anything
 //! `XLookupString` can resolve, which is the Latin layouts, and does not work
-//! for the writing systems that need an input method.
+//! for the writing systems that need an input method. See
+//! [`Backend::set_composition_area`].
+//!
+//! **No accessibility.** That is AT-SPI over D-Bus, an object model of its own
+//! with nothing shared with the other two platforms'. A screen reader on Linux
+//! finds a `rui` window and is told nothing about what is inside it. See
+//! [`Backend::update_accessibility`].
+//!
+//! Both are gaps rather than decisions, and both are written down here so that
+//! the next person meets them in the module header rather than in a bug report.
 
+use crate::accessibility::AccessUpdate;
 use crate::theme::Appearance;
 use crate::{Canvas, Event, Key, Modifiers, Point, PointerButton, Rect};
 use std::cell::RefCell;
@@ -810,6 +819,21 @@ impl Backend for Window {
     /// the layout resolves them itself, and there is no way to type Japanese,
     /// Chinese, or Korean into a `rui` window.
     fn set_composition_area(&self, _area: Option<Rect>) -> Result<(), Error> {
+        Ok(())
+    }
+
+    /// Nothing: this backend does not speak to an assistive technology.
+    ///
+    /// The way to on this platform is AT-SPI, which is a D-Bus service with an
+    /// object model of its own — a whole second interface to implement and no
+    /// part of it shared with the two that are. It is not done, and this says so
+    /// rather than leaving a method that looks implemented: a screen reader on
+    /// Linux finds a `rui` window and is told nothing about what is in it.
+    ///
+    /// Accepting the update rather than refusing it is deliberate. A refusal
+    /// would end the frame loop, which would mean a platform without a screen
+    /// reader could not run a program at all.
+    fn update_accessibility(&self, _update: &AccessUpdate) -> Result<(), Error> {
         Ok(())
     }
 }

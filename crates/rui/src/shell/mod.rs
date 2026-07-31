@@ -3,8 +3,9 @@
 //! Deliberately the smallest part. A backend opens a window, says how big it is
 //! and whether the desktop is light or dark, hands over the events it received,
 //! copies a buffer of pixels onto the screen, carries text to and from the
-//! system clipboard, and tells the platform's input method where the text being
-//! composed is on screen. Everything else is decided above it, identically
+//! system clipboard, tells the platform's input method where the text being
+//! composed is on screen, and hands the platform's assistive technology what
+//! the interface now means. Everything else is decided above it, identically
 //! everywhere, which is why porting to a new platform is a few hundred lines
 //! against that surface and why a defect in a widget can never be a platform
 //! defect.
@@ -57,6 +58,7 @@
 pub mod fonts;
 mod platform;
 
+use crate::accessibility::AccessUpdate;
 use crate::app::App;
 use crate::canvas::Canvas;
 use crate::geom::Rect;
@@ -202,6 +204,15 @@ trait Backend: Sized {
     /// Told only when it moves, so a platform is free to make this an expensive
     /// call.
     fn set_composition_area(&self, area: Option<Rect>) -> Result<(), Error>;
+
+    /// Hands the platform the accessibility nodes that changed since the last
+    /// frame.
+    ///
+    /// A diff and not the whole tree, for the reason [`Backend::present`] sends
+    /// a frame only when it differs: an interface spends most of its life
+    /// unchanged, and pushing an identical tree every frame costs the assistive
+    /// technology, not us.
+    fn update_accessibility(&self, update: &AccessUpdate) -> Result<(), Error>;
 }
 
 /// Everything one frame is drawn from, apart from the window and the program.
@@ -267,6 +278,16 @@ impl Surface {
         app.frame(&mut self.drawn, fonts, &self.input, &mut self.memory, &theme);
         self.memory.end_frame(&self.input);
         self.serve_requests(window)?;
+
+        // The same idea as the comparison below, applied to what the interface
+        // *means* rather than to what it looks like: work out the difference
+        // from the finished result, and send nothing when there is none. Both
+        // are here, next to each other, because they are one principle —
+        // compare the outcome, do not track what you believe is dirty.
+        let update = app.accessibility_update();
+        if !update.is_empty() {
+            window.update_accessibility(update)?;
+        }
 
         if self.drawn.pixels() != self.presented.pixels() {
             window.present(&self.drawn)?;

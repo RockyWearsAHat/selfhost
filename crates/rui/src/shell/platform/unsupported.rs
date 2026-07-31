@@ -5,6 +5,7 @@
 //! missing rather than with a linker error about an absent module — which is
 //! what someone porting this would otherwise meet first.
 
+use crate::accessibility::AccessUpdate;
 use crate::geom::Rect;
 use crate::theme::Appearance;
 use crate::{Canvas, Event};
@@ -54,6 +55,10 @@ impl Backend for Window {
     }
 
     fn set_composition_area(&self, _area: Option<Rect>) -> Result<(), Error> {
+        Err(Error::Unsupported)
+    }
+
+    fn update_accessibility(&self, _update: &AccessUpdate) -> Result<(), Error> {
         Err(Error::Unsupported)
     }
 }
