@@ -97,6 +97,9 @@
 //! - [`testing`] — driving the whole of it with no window: the real frame, into
 //!   a buffer, with a font built rather than borrowed so that a width in a test
 //!   is a round number.
+//! - `reload` — a developer's rebuild replacing a running window without losing
+//!   what was on screen. Behind the `reload` feature, off by default, and
+//!   compiled out of everything else entirely.
 //!
 //! # Where the state lives
 //!
@@ -121,6 +124,8 @@ pub mod input;
 mod layout;
 pub mod memory;
 pub mod paint;
+#[cfg(feature = "reload")]
+pub mod reload;
 pub mod shell;
 pub mod style;
 pub mod testing;

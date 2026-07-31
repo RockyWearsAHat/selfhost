@@ -31,6 +31,13 @@
 //! accessibility tree and compares it with the last frame's, so what an
 //! assistive technology is told is a difference rather than a repetition. See
 //! [`App::accessibility_update`] and [`accessibility`](crate::accessibility).
+//!
+//! # Reloading it while it runs
+//!
+//! Built with `--features reload`, a window notices that the file it is running
+//! from has been rebuilt, saves what it is showing, and starts the new build in
+//! its place. Off by default and absent from a release build entirely — see
+//! [`App::reloadable`] and [`reload`](crate::reload).
 
 use crate::accessibility::{AccessTree, AccessUpdate};
 use crate::canvas::Canvas;
@@ -43,6 +50,18 @@ use crate::shell::{self, Error, LoadedFonts, WindowOptions};
 use crate::text::Fonts;
 use crate::theme::{Appearance, Theme};
 use std::time::Duration;
+
+/// What running an application in a window amounts to.
+///
+/// Ordinarily the window loop and nothing else. With developer reload compiled
+/// in it is that same loop, wrapped: the executable is watched while the window
+/// is up, and the program starts its successor once the window has closed. The
+/// two have the same signature on purpose, so there is one call site rather
+/// than a branch in [`App::run_with_fonts`].
+#[cfg(not(feature = "reload"))]
+use crate::shell::run as run_windowed;
+#[cfg(feature = "reload")]
+use crate::reload::run as run_windowed;
 
 /// An application: some state, and a function from that state to a description.
 ///
@@ -59,6 +78,13 @@ pub struct App<S> {
     access: AccessTree,
     /// How that differed from the frame before, which is what gets pushed.
     access_update: AccessUpdate,
+    /// How to save this and start the new build, once asked for.
+    ///
+    /// `None` until [`App::reloadable`], which an application only calls in a
+    /// build that wants it. Reached from [`crate::reload`], which owns
+    /// everything the field means.
+    #[cfg(feature = "reload")]
+    pub(crate) reload: Option<crate::reload::Reload<S>>,
 }
 
 /// What describes the interface: a function from the state to a description.
@@ -90,7 +116,54 @@ impl<S> App<S> {
             running: Box::new(|_| true),
             access: AccessTree::new(),
             access_update: AccessUpdate::default(),
+            #[cfg(feature = "reload")]
+            reload: None,
         }
+    }
+
+    /// Lets a developer's rebuild replace this program without losing what is
+    /// on screen.
+    ///
+    /// Only compiled with `--features reload`, which an application turns on
+    /// for its own development and never for a release. `save` writes the state
+    /// down and `restore` reads it back; between them this library never learns
+    /// what `S` is, which is why it needs no serialisation library to do this.
+    /// Neither is called unless a rebuild actually happens.
+    ///
+    /// ```ignore
+    /// let app = App::new("Counter", Counter { count: 0 }, view);
+    /// #[cfg(feature = "reload")]
+    /// let app = app.reloadable(
+    ///     |counter: &Counter| counter.count.to_string().into_bytes(),
+    ///     |saved: &[u8]| {
+    ///         let text = std::str::from_utf8(saved).map_err(|e| e.to_string())?;
+    ///         let count = text.parse().map_err(|e: std::num::ParseIntError| e.to_string())?;
+    ///         Ok(Counter { count })
+    ///     },
+    /// )?;
+    /// app.run()
+    /// ```
+    ///
+    /// Called once, before [`App::run`]. If this process *is* a restart, the
+    /// previous run's state is read here and replaces the one this was built
+    /// with — so the state passed to [`App::new`] is what a first run shows and
+    /// what a broken handoff never silently falls back to. The message in
+    /// `restore`'s `Err` is what the developer is shown; nothing else reads it.
+    ///
+    /// See [`reload`](crate::reload) for what does and does not survive a
+    /// restart. It is a restart, not hot module replacement.
+    #[cfg(feature = "reload")]
+    pub fn reloadable(
+        mut self,
+        save: impl Fn(&S) -> Vec<u8> + 'static,
+        restore: impl Fn(&[u8]) -> Result<S, String> + 'static,
+    ) -> Result<Self, Error> {
+        let (reload, restored) = crate::reload::begin(Box::new(save), &restore)?;
+        if let Some(state) = restored {
+            self.state = state;
+        }
+        self.reload = Some(reload);
+        Ok(self)
     }
 
     /// How big the window opens.
@@ -163,7 +236,7 @@ impl<S> App<S> {
 
     /// The same, with the faces supplied rather than searched for.
     pub fn run_with_fonts(self, fonts: LoadedFonts) -> Result<(), Error> {
-        shell::run(self.options.clone(), fonts, self)
+        run_windowed(self.options.clone(), fonts, self)
     }
 
     /// Draws one frame with no window at all, and answers the pixels.
@@ -220,6 +293,21 @@ impl<S> App<S> {
         memory: &mut Memory,
         theme: &Theme,
     ) {
+        // The one place a developer reload does anything, and only once a
+        // window has armed it. A test drives [`App::frame_observed`] directly
+        // and [`App::render`] never arms anything, so neither can tell whether
+        // the feature is compiled in at all.
+        #[cfg(feature = "reload")]
+        if self.reload.as_ref().is_some_and(|reload| reload.is_armed()) {
+            let mut order = Vec::new();
+            self.frame_observed(canvas, fonts, input, memory, theme, &mut |el, _| {
+                order.push(el.id);
+            });
+            if let Some(reload) = self.reload.as_mut() {
+                reload.after_frame(&self.state, memory, &order);
+            }
+            return;
+        }
         self.frame_observed(canvas, fonts, input, memory, theme, &mut |_, _| {});
     }
 
@@ -281,6 +369,13 @@ impl<S> App<S> {
 
     /// Whether the loop should keep going.
     pub(crate) fn is_running(&self) -> bool {
+        // A reload stops the loop the ordinary way rather than ending the
+        // process where it stands, so the window is taken down properly and the
+        // new build is started from outside the loop that drew the last frame.
+        #[cfg(feature = "reload")]
+        if self.reload.as_ref().is_some_and(|reload| reload.is_restarting()) {
+            return false;
+        }
         (self.running)(&self.state)
     }
 }
