@@ -568,10 +568,12 @@ pub fn audit(tree: &AccessTree) -> Vec<Violation> {
         }
 
         if node.is_interactive() {
+            // One defect, one line. A group has no name because a group is not
+            // named from its contents, so saying it is unnamed as well would be
+            // reporting the same mistake twice and advising the wrong fix.
             if node.role == Role::Group {
                 violations.push(fault(Fault::NoRole));
-            }
-            if node.name.trim().is_empty() {
+            } else if node.name.trim().is_empty() {
                 violations.push(fault(Fault::NoName));
             }
         }
