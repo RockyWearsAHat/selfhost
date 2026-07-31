@@ -1,0 +1,315 @@
+//! Running an interface: the loop, and the one call that starts it.
+//!
+//! ```ignore
+//! struct Counter { count: i32 }
+//!
+//! fn view(counter: &Counter) -> El<Counter> {
+//!     col((
+//!         title(format!("Count: {}", counter.count)),
+//!         button("Increment").on_click(|counter: &mut Counter| counter.count += 1),
+//!     ))
+//!     .gap(12.0)
+//!     .pad(24.0)
+//!     .center()
+//! }
+//!
+//! fn main() -> Result<(), rui::Error> {
+//!     rui::run("Counter", Counter { count: 0 }, view)
+//! }
+//! ```
+//!
+//! # What a frame is
+//!
+//! Describe, lay out, draw, then run whatever was clicked. Four steps in that
+//! order, every frame, with no state carried between them but the interaction
+//! state in [`Memory`] — which is why an interface written with this library
+//! cannot show something its data no longer says.
+//!
+//! # What else a frame produces
+//!
+//! The same walk of the finished tree that hands a test its probes builds the
+//! accessibility tree and compares it with the last frame's, so what an
+//! assistive technology is told is a difference rather than a repetition. See
+//! [`App::accessibility_update`] and [`accessibility`](crate::accessibility).
+
+use crate::accessibility::{AccessTree, AccessUpdate};
+use crate::canvas::Canvas;
+use crate::element::El;
+use crate::input::Input;
+use crate::layout::{self, Ctx};
+use crate::memory::{Id, Memory};
+use crate::paint::{self, Frame};
+use crate::shell::{self, Error, LoadedFonts, WindowOptions};
+use crate::text::Fonts;
+use crate::theme::{Appearance, Theme};
+use std::time::Duration;
+
+/// An application: some state, and a function from that state to a description.
+///
+/// Built with [`App::new`], adjusted with the setters, and started with
+/// [`App::run`]. [`run`] is the same thing in one call, for the common case
+/// where the defaults will do.
+pub struct App<S> {
+    state: S,
+    view: View<S>,
+    options: WindowOptions,
+    idle: Duration,
+    running: Condition<S>,
+    /// What the last frame amounted to, for anything that cannot see it.
+    access: AccessTree,
+    /// How that differed from the frame before, which is what gets pushed.
+    access_update: AccessUpdate,
+}
+
+/// What describes the interface: a function from the state to a description.
+type View<S> = Box<dyn Fn(&S) -> El<S>>;
+
+/// Something the application is asked about its own state each frame.
+type Condition<S> = Box<dyn Fn(&S) -> bool>;
+
+/// How long the loop waits for input before drawing again anyway.
+///
+/// A quarter of a second by default: enough that an interface showing something
+/// which changes on its own — a service that crashed, a log that grew — keeps up
+/// without anyone touching it, and rare enough that an idle window costs
+/// nothing, since a frame identical to the one on screen is never presented.
+const DEFAULT_IDLE: Duration = Duration::from_millis(250);
+
+impl<S> App<S> {
+    /// An application showing `state`, described by `view`.
+    pub fn new(
+        title: impl Into<String>,
+        state: S,
+        view: impl Fn(&S) -> El<S> + 'static,
+    ) -> Self {
+        Self {
+            state,
+            view: Box::new(view),
+            options: WindowOptions { title: title.into(), ..WindowOptions::default() },
+            idle: DEFAULT_IDLE,
+            running: Box::new(|_| true),
+            access: AccessTree::new(),
+            access_update: AccessUpdate::default(),
+        }
+    }
+
+    /// How big the window opens.
+    pub fn size(mut self, width: f32, height: f32) -> Self {
+        self.options.width = width;
+        self.options.height = height;
+        self
+    }
+
+    /// The smallest the window may be dragged to.
+    ///
+    /// Worth setting: a layout has a size below which it stops being readable,
+    /// and refusing to go there is better than drawing an unusable interface.
+    pub fn min_size(mut self, width: f32, height: f32) -> Self {
+        self.options.min_width = width;
+        self.options.min_height = height;
+        self
+    }
+
+    /// How long the loop may wait for input before drawing again.
+    ///
+    /// Shorter keeps up better with a machine that changes on its own; longer
+    /// costs less while nothing is happening. It never delays input, which ends
+    /// the wait the moment it arrives.
+    pub fn idle_timeout(mut self, timeout: Duration) -> Self {
+        self.idle = timeout;
+        self
+    }
+
+    /// When the application should close its own window.
+    ///
+    /// Checked each frame, so a program can end after a fatal error rather than
+    /// only the person using it being able to close it.
+    pub fn while_running(mut self, running: impl Fn(&S) -> bool + 'static) -> Self {
+        self.running = Box::new(running);
+        self
+    }
+
+    /// The state, for a caller that kept a handle on the application.
+    pub fn state(&self) -> &S {
+        &self.state
+    }
+
+    /// What the last frame amounted to, for anything that cannot see it.
+    ///
+    /// Built from the description that was just drawn, so it cannot disagree
+    /// with what is on screen. Empty before the first frame.
+    pub fn accessibility(&self) -> &AccessTree {
+        &self.access
+    }
+
+    /// How that differed from the frame before it.
+    ///
+    /// What a platform hands to its assistive technology, and nothing else: an
+    /// interface spends most of its life unchanged, and this is empty on every
+    /// frame that changed nothing. The same reasoning as presenting a frame
+    /// only when its pixels differ.
+    pub fn accessibility_update(&self) -> &AccessUpdate {
+        &self.access_update
+    }
+
+    /// Opens a window and runs until it is closed.
+    ///
+    /// Fonts are found on this machine rather than shipped, so an interface
+    /// looks like the desktop it is running on.
+    pub fn run(self) -> Result<(), Error> {
+        let fonts = shell::load_system_fonts()?;
+        self.run_with_fonts(fonts)
+    }
+
+    /// The same, with the faces supplied rather than searched for.
+    pub fn run_with_fonts(self, fonts: LoadedFonts) -> Result<(), Error> {
+        shell::run(self.options.clone(), fonts, self)
+    }
+
+    /// Draws one frame with no window at all, and answers the pixels.
+    ///
+    /// What makes an interface written with this library testable, and what a
+    /// packaging step draws a screenshot with. It is the same code path a window
+    /// uses — there is no second renderer that might disagree with the real one.
+    pub fn render(
+        &mut self,
+        width: u32,
+        height: u32,
+        scale: f32,
+        appearance: Appearance,
+        fonts: &mut LoadedFonts,
+    ) -> Canvas {
+        let mut canvas =
+            Canvas::new((width as f32 * scale) as u32, (height as f32 * scale) as u32, scale);
+        let mut memory = Memory::new();
+        self.draw_into(&mut canvas, fonts, appearance, &mut memory);
+        canvas
+    }
+
+    /// Draws one frame into a canvas that already exists.
+    ///
+    /// What [`App::render`] does without allocating a surface or forgetting
+    /// where everything was scrolled to — which is what the window's own loop
+    /// does, and therefore what a measurement of a frame should measure. It is
+    /// also the way in for an application that owns its own surface and wants
+    /// this library to draw part of it.
+    pub fn draw_into(
+        &mut self,
+        canvas: &mut Canvas,
+        fonts: &mut LoadedFonts,
+        appearance: Appearance,
+        memory: &mut Memory,
+    ) {
+        let input = Input::new();
+        fonts.fonts.set_scale(canvas.scale());
+
+        let theme = Theme::new(appearance, fonts.ui_font, fonts.mono_font);
+        canvas.clear_vertical(theme.palette.background, theme.palette.background_deep);
+        memory.begin_frame(std::time::Duration::from_millis(16));
+        self.frame(canvas, &fonts.fonts, &input, memory, &theme);
+        memory.end_frame(&input);
+    }
+
+    /// Describes, lays out, draws, and then applies whatever was interacted
+    /// with.
+    pub(crate) fn frame(
+        &mut self,
+        canvas: &mut Canvas,
+        fonts: &Fonts,
+        input: &Input,
+        memory: &mut Memory,
+        theme: &Theme,
+    ) {
+        self.frame_observed(canvas, fonts, input, memory, theme, &mut |_, _| {});
+    }
+
+    /// The same, handing every laid-out element and its parent to `observe`
+    /// before the description is dropped.
+    ///
+    /// What [`crate::testing::Harness`] is built on. It exists so that testing
+    /// an interface goes through the *real* frame rather than a second, simpler
+    /// path that could come to disagree with it — the window's loop calls
+    /// [`App::frame`], which is this with an observer that does nothing, so
+    /// there is exactly one implementation of what a frame is.
+    ///
+    /// The accessibility tree is built on the same walk, for the same reason:
+    /// one traversal of the finished frame, from which everything that has to
+    /// know what came out reads its answer.
+    pub(crate) fn frame_observed(
+        &mut self,
+        canvas: &mut Canvas,
+        fonts: &Fonts,
+        input: &Input,
+        memory: &mut Memory,
+        theme: &Theme,
+        observe: &mut dyn FnMut(&El<S>, Option<Id>),
+    ) {
+        let mut tree = (self.view)(&self.state);
+        let ctx = Ctx { fonts, theme, bounds: canvas.bounds() };
+        layout::solve(&mut tree, canvas.bounds(), &ctx, memory);
+
+        let mut frame = Frame { canvas, fonts, theme, input, memory, hit: paint::Hit::default() };
+        let actions = paint::render(&tree, &mut frame);
+
+        let mut access = AccessTree::new();
+        visit(&tree, None, &mut |el, parent| {
+            access.push(el, parent);
+            observe(el, parent);
+        });
+        access.finish(memory.focused());
+        self.access_update = access.diff(&self.access);
+        self.access = access;
+
+        // Nothing has been called yet. Every handler the frame collected runs
+        // here, with the description still alive but no longer being read, which
+        // is what lets a handler take the state mutably.
+        if !actions.is_empty() {
+            for action in actions {
+                action(&mut self.state);
+            }
+            // What was just changed is not what was just drawn, so the frame on
+            // screen is one behind. Asking for another one is what makes a click
+            // land visibly at once rather than at the next wake-up.
+            memory.request_frame();
+        }
+    }
+
+    /// How long the loop may wait before drawing again.
+    pub(crate) fn idle(&self) -> Duration {
+        self.idle
+    }
+
+    /// Whether the loop should keep going.
+    pub(crate) fn is_running(&self) -> bool {
+        (self.running)(&self.state)
+    }
+}
+
+/// Hands every element of a laid-out tree, and what holds it, to `observe`.
+///
+/// Parents before their children, so anything rebuilding the tree from this can
+/// do it in one pass.
+fn visit<S>(
+    el: &El<S>,
+    parent: Option<Id>,
+    observe: &mut dyn FnMut(&El<S>, Option<Id>),
+) {
+    observe(el, parent);
+    for child in el.children() {
+        visit(child, Some(el.id), observe);
+    }
+}
+
+/// Opens a window showing `state`, described by `view`, and runs until it is
+/// closed.
+///
+/// The whole of the setup for an ordinary program. [`App`] is the same thing
+/// with the window's size, the idle timeout, and the closing condition open to
+/// being changed.
+pub fn run<S: 'static>(
+    title: impl Into<String>,
+    state: S,
+    view: impl Fn(&S) -> El<S> + 'static,
+) -> Result<(), Error> {
+    App::new(title, state, view).run()
+}

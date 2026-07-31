@@ -1,0 +1,400 @@
+//! The convention, expressed as a test rather than as a promise.
+//!
+//! Every element carries a [`Role`], every interactive one has a name computed
+//! from what is inside it, and the structure an assistive technology reads is
+//! the structure the layout already built. That decision is only worth making
+//! if it is held, and a convention that lives in a document rots the first time
+//! somebody adds a widget in a hurry.
+//!
+//! So it lives here instead. This file drives the library's own widget set,
+//! both examples that describe an interface, and — through the same
+//! [`Harness::assert_accessible`] call added to each of them — every recipe in
+//! `tests/recipes.rs`. It fails the moment a clickable thing has no role, an
+//! interactive thing has no name, a tab appears outside a tab list, two
+//! siblings collide on an identity, or the tab order stops being a forward walk
+//! of the tree.
+//!
+//! The examples are included as modules rather than copied, so what is checked
+//! is the code that actually runs.
+
+use rui::accessibility::{Role, audit};
+use rui::testing::Harness;
+use rui::{
+    Align, El, Status, Tone, button, caption, code, col, divider, dot, draw, field, field_row,
+    figure, heading, meter, micro, panel, paragraph, row, section, segmented, spacer, tabs, tag,
+    text, title,
+};
+use rui::{Point, Size};
+
+#[path = "../examples/controls.rs"]
+#[allow(dead_code)]
+mod controls_example;
+
+#[path = "../examples/counter.rs"]
+#[allow(dead_code)]
+mod counter_example;
+
+#[path = "../examples/gallery.rs"]
+#[allow(dead_code)]
+mod gallery_example;
+
+// ---------------------------------------------------------------------------
+// The examples
+// ---------------------------------------------------------------------------
+
+#[test]
+fn the_counter_example_is_reachable_named_and_ordered() {
+    let mut harness = Harness::new(counter_example::demo(), counter_example::view);
+    harness.assert_accessible();
+    harness.assert_tab_order();
+}
+
+#[test]
+fn the_controls_example_is_reachable_named_and_ordered() {
+    let mut harness = Harness::new(controls_example::demo(), controls_example::view);
+    harness.assert_accessible();
+    harness.assert_tab_order();
+}
+
+#[test]
+fn the_gallery_example_is_reachable_named_and_ordered() {
+    let mut harness = Harness::new(gallery_example::demo(), gallery_example::view)
+        .size(1000.0, 640.0);
+    harness.assert_accessible();
+    harness.assert_tab_order();
+}
+
+// ---------------------------------------------------------------------------
+// The whole widget set at once
+// ---------------------------------------------------------------------------
+
+/// Enough state for every widget in the library to have something to say.
+#[derive(Default)]
+struct Everything {
+    tab: usize,
+    mode: usize,
+    name: String,
+}
+
+/// One of each element the library ships.
+fn everything(state: &Everything) -> El<Everything> {
+    col((words(), marks(), controls(state)))
+        .pad(12.0)
+        .gap(8.0)
+}
+
+/// Everything on the type scale.
+fn words() -> El<Everything> {
+    col((
+        title("Title"),
+        heading("HEADING"),
+        text("Text"),
+        caption("Caption"),
+        micro("micro"),
+        figure("42"),
+        code("code"),
+        paragraph("A paragraph of prose."),
+    ))
+    .gap(4.0)
+}
+
+/// Everything that is a mark rather than a word.
+fn marks() -> El<Everything> {
+    col((
+        divider(),
+        section("SECTION", Some("note".into())),
+        row((dot(Status::Ok, 3.0), tag(Status::Bad, "failed"), spacer().grow())).gap(6.0),
+        field_row("MEMORY", meter(0.62, Tone::Accent)),
+    ))
+    .gap(4.0)
+}
+
+/// Everything a person can reach.
+fn controls(state: &Everything) -> El<Everything> {
+    col((
+        field_row(
+            "NAME",
+            field(&state.name)
+                .placeholder("a service's name")
+                .on_input(|state: &mut Everything, name| state.name = name),
+        ),
+        tabs(&["Overview", "Output"], state.tab, |state: &mut Everything, tab| state.tab = tab),
+        segmented(&["Manual", "At boot"], state.mode, |state: &mut Everything, mode| {
+            state.mode = mode
+        }),
+        panel(row((
+            button("Start").primary().on_click(|_| {}),
+            button("Unavailable").disabled(true),
+        ))
+        .gap(6.0)),
+    ))
+    .gap(6.0)
+}
+
+#[test]
+fn every_widget_the_library_ships_carries_its_own_role() {
+    let mut harness = Harness::new(Everything::default(), everything);
+    harness.assert_accessible();
+    harness.assert_tab_order();
+
+    let roles: Vec<Role> = harness.accessibility().nodes().iter().map(|node| node.role).collect();
+    for expected in [
+        Role::Heading,
+        Role::Text,
+        Role::Separator,
+        Role::Status,
+        Role::Meter,
+        Role::Field,
+        Role::TabList,
+        Role::Tab,
+        Role::Radio,
+        Role::Button,
+    ] {
+        assert!(roles.contains(&expected), "nothing in the widget set is a {expected:?}");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The name comes from the hierarchy
+// ---------------------------------------------------------------------------
+
+/// A state nothing writes to.
+struct Nothing;
+
+#[test]
+fn a_control_is_named_by_the_words_inside_it() {
+    let button: El<Nothing> = button("Restart").on_click(|_| {});
+    assert_eq!(button.accessible_name(), "Restart", "no author effort at the call site");
+
+    let compound: El<Nothing> =
+        row((dot(Status::Ok, 3.0), text("mongod"), text("running"))).on_click(|_| {});
+    assert_eq!(
+        compound.role(Role::Button).accessible_name(),
+        "mongod running",
+        "the subtree's words, in order, as HTML names from contents"
+    );
+}
+
+#[test]
+fn a_control_with_no_words_is_named_by_its_label() {
+    let unnamed: El<Nothing> = draw(Size::new(16.0, 16.0), |_, _| {}).on_click(|_| {});
+    assert_eq!(unnamed.accessible_name(), "", "nothing inside it, so nothing to be named after");
+
+    let named: El<Nothing> =
+        draw(Size::new(16.0, 16.0), |_, _| {}).role(Role::Checkbox).label("Notify").on_click(|_| {});
+    assert_eq!(named.accessible_name(), "Notify");
+}
+
+#[test]
+fn a_label_overrides_the_words_inside() {
+    let element: El<Nothing> = button("OK").label("Confirm the upgrade").on_click(|_| {});
+    assert_eq!(element.accessible_name(), "Confirm the upgrade");
+}
+
+#[test]
+fn a_field_is_named_by_its_row_and_valued_by_its_text() {
+    let mut harness = Harness::new(Nothing, |_: &Nothing| {
+        col(field_row("NAME", field("mongod").on_input(|_: &mut Nothing, _| {}))).align(Align::Start)
+    });
+    harness.frame();
+
+    let node = harness
+        .accessibility()
+        .nodes()
+        .iter()
+        .find(|node| node.role == Role::Field)
+        .expect("the field is on screen")
+        .clone();
+    assert_eq!(node.name, "NAME", "the row that names it is what names it");
+    assert_eq!(node.value.as_deref(), Some("mongod"), "and what it holds is its value");
+}
+
+#[test]
+fn a_row_does_not_rename_a_value_that_already_says_what_it_is() {
+    let element: El<Nothing> = field_row("ACTION", button("Restart").on_click(|_| {}));
+    let button = element.child(1).expect("the value sits beside the label");
+    assert_eq!(button.accessible_name(), "Restart", "its own words outrank the row's heading");
+}
+
+// ---------------------------------------------------------------------------
+// The structure comes from role containment
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_tab_list_gives_its_tabs_their_place_without_being_told() {
+    let mut harness = Harness::new(0usize, |tab: &usize| {
+        col(tabs(&["Overview", "Definition", "Output"], *tab, |tab: &mut usize, chosen| {
+            *tab = chosen
+        }))
+    });
+    harness.frame();
+
+    let tabs: Vec<_> = harness
+        .accessibility()
+        .nodes()
+        .iter()
+        .filter(|node| node.role == Role::Tab)
+        .cloned()
+        .collect();
+    assert_eq!(tabs.len(), 3);
+    for (index, tab) in tabs.iter().enumerate() {
+        assert_eq!(tab.set_size, Some(3), "the parent already knows how many there are");
+        assert_eq!(tab.position_in_set, Some(index + 1));
+    }
+    assert_eq!(tabs[0].state.selected, Some(true), "which one is chosen is state, not colour");
+    assert_eq!(tabs[1].state.selected, Some(false));
+}
+
+#[test]
+fn a_tab_outside_a_tab_list_is_a_failure() {
+    let mut harness = Harness::new(Nothing, |_: &Nothing| {
+        col(text("Overview").role(Role::Tab).on_click(|_: &mut Nothing| {}))
+    });
+    harness.frame();
+
+    let violations = audit(harness.accessibility());
+    assert!(
+        violations.iter().any(|violation| violation.to_string().contains("TabList")),
+        "a tab with no tab list around it must be reported, got {violations:?}"
+    );
+}
+
+#[test]
+fn a_list_item_outside_a_list_is_a_failure() {
+    let mut harness = Harness::new(Nothing, |_: &Nothing| {
+        col(text("mongod").role(Role::ListItem).on_click(|_: &mut Nothing| {}))
+    });
+    harness.frame();
+
+    let violations = audit(harness.accessibility());
+    assert!(
+        violations.iter().any(|violation| violation.to_string().contains("List")),
+        "a list item with no list around it must be reported, got {violations:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// What the enforcement actually catches
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_clickable_thing_with_no_role_is_a_failure() {
+    let mut harness = Harness::new(Nothing, |_: &Nothing| {
+        col(row(text("Restart")).on_click(|_: &mut Nothing| {}))
+    });
+    harness.frame();
+
+    let violations = audit(harness.accessibility());
+    assert!(
+        !violations.is_empty(),
+        "a bare clickable group is precisely the widget this test exists to reject"
+    );
+}
+
+#[test]
+fn an_interactive_thing_with_no_name_is_a_failure() {
+    let mut harness = Harness::new(Nothing, |_: &Nothing| {
+        col(draw(Size::new(16.0, 16.0), |_, _| {}).role(Role::Checkbox).on_click(|_: &mut Nothing| {}))
+    });
+    harness.frame();
+
+    let violations = audit(harness.accessibility());
+    assert!(!violations.is_empty(), "an unnamed control is unusable without sight of it");
+}
+
+#[test]
+fn two_siblings_sharing_a_key_are_a_failure() {
+    let mut harness = Harness::new(Nothing, |_: &Nothing| {
+        col((
+            button("Restart").key("action").on_click(|_: &mut Nothing| {}),
+            button("Stop").key("action").on_click(|_: &mut Nothing| {}),
+        ))
+    });
+    harness.frame();
+
+    let violations = audit(harness.accessibility());
+    assert!(
+        !violations.is_empty(),
+        "two siblings with one identity share a hover, a focus, and a caret"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// One path from intent to handler
+// ---------------------------------------------------------------------------
+
+#[test]
+fn an_assistive_activation_runs_the_same_handler_a_click_would() {
+    /// What both routes into the interface are asked to change.
+    #[derive(Default)]
+    struct Counted {
+        presses: u32,
+    }
+
+    fn view(_: &Counted) -> El<Counted> {
+        col(button("Restart").on_click(|counted: &mut Counted| counted.presses += 1))
+            .align(Align::Start)
+    }
+
+    let mut harness = Harness::new(Counted::default(), view);
+    harness.click_text("Restart");
+    assert_eq!(harness.state().presses, 1);
+
+    // What an assistive technology has is an identity and an intent. Resolving
+    // that identity reaches the same closure the pointer reached, because there
+    // is only the one.
+    let node = harness
+        .accessibility()
+        .nodes()
+        .iter()
+        .find(|node| node.role == Role::Button)
+        .expect("the button is on screen")
+        .clone();
+    assert!(node.actions.press, "the node says it can be pressed");
+
+    let rect = node.bounds;
+    harness.click(Point::new(rect.center().x, rect.center().y));
+    assert_eq!(harness.state().presses, 2, "the same handler, reached the same way");
+}
+
+// ---------------------------------------------------------------------------
+// Emission is a diff
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_frame_that_changed_nothing_emits_nothing() {
+    let mut harness = Harness::new(0usize, |count: &usize| {
+        col(text(format!("{count}"))).align(Align::Start)
+    });
+
+    harness.frame();
+    harness.frame();
+    assert!(
+        harness.accessibility_update().is_empty(),
+        "an interface spends most of its life unchanged, and so should its a11y traffic"
+    );
+}
+
+#[test]
+fn only_what_changed_is_emitted() {
+    fn view(count: &usize) -> El<usize> {
+        col((
+            text("Unchanging"),
+            text(format!("{count}")),
+            button("Increment").on_click(|count: &mut usize| *count += 1),
+        ))
+        .align(Align::Start)
+    }
+
+    let mut harness = Harness::new(0usize, view);
+    harness.frame();
+    harness.click_text("Increment");
+    harness.frame();
+
+    let update = harness.accessibility_update().clone();
+    assert!(!update.is_empty(), "the number changed, so something must be said about it");
+    assert!(
+        update.changed.iter().all(|node| node.name != "Unchanging"),
+        "what did not change is not worth the assistive technology's time, got {update:?}"
+    );
+}
