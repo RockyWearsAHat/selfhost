@@ -1,11 +1,27 @@
 //! The window: the only part of the library that talks to an operating system.
 //!
-//! Deliberately the smallest part. A backend does five things — open a window,
-//! say how big it is and whether the desktop is light or dark, hand over the
-//! events it received, and copy a buffer of pixels onto the screen. Everything
-//! else is decided above it, identically everywhere, which is why porting to a
-//! new platform is a few hundred lines against that surface and why a defect in
-//! a widget can never be a platform defect.
+//! Deliberately the smallest part. A backend opens a window, says how big it is
+//! and whether the desktop is light or dark, hands over the events it received,
+//! copies a buffer of pixels onto the screen, carries text to and from the
+//! system clipboard, and tells the platform's input method where the text being
+//! composed is on screen. Everything else is decided above it, identically
+//! everywhere, which is why porting to a new platform is a few hundred lines
+//! against that surface and why a defect in a widget can never be a platform
+//! defect.
+//!
+//! # What belongs on that list is a choice, not a fixed number
+//!
+//! The list grows when something *can only* be answered by the operating
+//! system. A clipboard is the clear case: it is not a buffer this library could
+//! keep for itself, because the entire point of it is that other programs can
+//! read it. Composition is the same — which characters a keystroke produces is a
+//! question about the person's chosen input method, not about this program.
+//!
+//! Everything else stays out, and the cost of each addition is what keeps that
+//! honest: one method here is three implementations and a documented gap on any
+//! platform that cannot honour it. A capability that a widget could compute for
+//! itself, or that one platform has and the others do not, is not one to widen
+//! the seam for.
 //!
 //! # The loop
 //!
@@ -43,6 +59,7 @@ mod platform;
 
 use crate::app::App;
 use crate::canvas::Canvas;
+use crate::geom::Rect;
 use crate::input::{Event, Input};
 use crate::memory::Memory;
 use crate::font::FontError;
@@ -162,6 +179,29 @@ trait Backend: Sized {
 
     /// Whether the window is still on screen.
     fn is_open(&self) -> bool;
+
+    /// The plain text on the system clipboard, if it holds any.
+    ///
+    /// `Ok(None)` is a clipboard holding something that is not text, or nothing
+    /// at all, or — on X11, where reading it means asking whichever program owns
+    /// it — an owner that did not answer. All three are the same to a field
+    /// pasting: there is nothing to paste. An `Err` is the platform refusing.
+    fn clipboard_text(&self) -> Result<Option<String>, Error>;
+
+    /// Puts `text` on the system clipboard, replacing whatever was there.
+    fn set_clipboard_text(&self, text: &str) -> Result<(), Error>;
+
+    /// Says where the text being composed is, in the same logical units from
+    /// the top left of the window that an element is drawn in.
+    ///
+    /// An input method draws its own window — the list of candidate characters
+    /// for a syllable, the accent a dead key is holding — and needs to put it
+    /// beside the text it belongs to. `None` means nothing has the keyboard, so
+    /// there is nowhere for it to be.
+    ///
+    /// Told only when it moves, so a platform is free to make this an expensive
+    /// call.
+    fn set_composition_area(&self, area: Option<Rect>) -> Result<(), Error>;
 }
 
 /// Everything one frame is drawn from, apart from the window and the program.
@@ -189,6 +229,11 @@ struct Surface {
     /// There is nothing to return it to from in there, and dropping it would
     /// turn a window that can no longer present into one that silently freezes.
     failed: Option<Error>,
+    /// The caret position the input method was last told about.
+    ///
+    /// Kept so it is told only when the answer changes, for the same reason a
+    /// frame is presented only when it differs from the one on screen.
+    composition_area: Option<Rect>,
 }
 
 impl Surface {
@@ -221,10 +266,40 @@ impl Surface {
         self.drawn.clear_vertical(theme.palette.background, theme.palette.background_deep);
         app.frame(&mut self.drawn, fonts, &self.input, &mut self.memory, &theme);
         self.memory.end_frame(&self.input);
+        self.serve_requests(window)?;
 
         if self.drawn.pixels() != self.presented.pixels() {
             window.present(&self.drawn)?;
             std::mem::swap(&mut self.drawn, &mut self.presented);
+        }
+        Ok(())
+    }
+
+    /// Does what the finished frame asked of the operating system.
+    ///
+    /// The other half of [`crate::memory::ClipboardRequest`]: a field cannot
+    /// reach a window, because the description it is drawn from borrows the
+    /// application's state and knows nothing about one. It leaves its intention
+    /// in [`Memory`] and this performs it, one frame's worth at a time, in the
+    /// one place that holds both.
+    ///
+    /// After the frame rather than before it, so that a copy carries what the
+    /// field decided *this* frame rather than what it held on the last one.
+    fn serve_requests<B: Backend>(&mut self, window: &B) -> Result<(), Error> {
+        let request = self.memory.take_clipboard_request();
+        if let Some(text) = request.copy {
+            window.set_clipboard_text(&text)?;
+        }
+        if request.paste {
+            if let Some(text) = window.clipboard_text()? {
+                self.memory.deliver_paste(text);
+            }
+        }
+
+        let area = self.memory.caret_area();
+        if area != self.composition_area {
+            window.set_composition_area(area)?;
+            self.composition_area = area;
         }
         Ok(())
     }
@@ -252,6 +327,7 @@ pub(crate) fn run<S>(
         ui_font,
         mono_font,
         failed: None,
+        composition_area: None,
     };
     let mut events = Vec::new();
 

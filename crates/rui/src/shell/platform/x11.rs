@@ -15,9 +15,35 @@
 //! for is `TrueColor` at depth 24 with the channels in the order `0xRRGGBB`,
 //! which on a little-endian machine is blue, green, red, unused in memory — the
 //! same bytes [`Canvas`] holds, so presenting a frame is a copy.
+//!
+//! # The clipboard is a conversation, not a buffer
+//!
+//! X11 has nowhere to put copied text. The server remembers only *which window*
+//! owns each selection, and every paste anywhere on the desktop is a message to
+//! that window asking it to write the text onto the asker's own. So copying here
+//! means claiming ownership and then answering questions for as long as we hold
+//! it — [`Window::answer_selection_request`] — and pasting means asking and
+//! waiting for a reply that a wedged or departed owner may never send.
+//!
+//! Two consequences worth knowing before reading the code. A paste has a
+//! deadline and can come back empty, which is why [`Backend::clipboard_text`] is
+//! allowed to answer `Ok(None)` for reasons other than an empty clipboard. And
+//! text copied out of this program disappears from the desktop when it exits,
+//! because the thing holding the text was the process — a clipboard manager is a
+//! program whose whole job is to take ownership from windows that are about to
+//! close.
+//!
+//! # There is no input method here
+//!
+//! Composition needs XIM, a protocol spoken over a second connection to a
+//! separate input-method server. It is not implemented; see
+//! [`Backend::set_composition_area`]. Typing works for anything
+//! `XLookupString` can resolve, which is the Latin layouts, and does not work
+//! for the writing systems that need an input method.
 
 use crate::theme::Appearance;
-use crate::{Canvas, Event, Key, Modifiers, Point, PointerButton};
+use crate::{Canvas, Event, Key, Modifiers, Point, PointerButton, Rect};
+use std::cell::RefCell;
 use std::ffi::{CStr, c_char, c_int, c_long, c_uint, c_ulong, c_void};
 use std::time::Duration;
 
@@ -69,7 +95,62 @@ unsafe extern "C" {
 
     fn XPending(display: Display) -> c_int;
     fn XNextEvent(display: Display, event: *mut XEvent) -> c_int;
+    fn XCheckTypedWindowEvent(
+        display: Display,
+        window: XWindow,
+        kind: c_int,
+        event: *mut XEvent,
+    ) -> c_int;
+    fn XSendEvent(
+        display: Display,
+        window: XWindow,
+        propagate: c_int,
+        mask: c_long,
+        event: *mut XEvent,
+    ) -> c_int;
     fn XFlush(display: Display) -> c_int;
+
+    // The selection protocol; see the module header.
+    fn XSetSelectionOwner(
+        display: Display,
+        selection: Atom,
+        owner: XWindow,
+        time: c_ulong,
+    ) -> c_int;
+    fn XGetSelectionOwner(display: Display, selection: Atom) -> XWindow;
+    fn XConvertSelection(
+        display: Display,
+        selection: Atom,
+        target: Atom,
+        property: Atom,
+        requestor: XWindow,
+        time: c_ulong,
+    ) -> c_int;
+    fn XChangeProperty(
+        display: Display,
+        window: XWindow,
+        property: Atom,
+        kind: Atom,
+        format: c_int,
+        mode: c_int,
+        data: *const u8,
+        count: c_int,
+    ) -> c_int;
+    #[allow(clippy::too_many_arguments)]
+    fn XGetWindowProperty(
+        display: Display,
+        window: XWindow,
+        property: Atom,
+        offset: c_long,
+        length: c_long,
+        delete: c_int,
+        request_type: Atom,
+        actual_type: *mut Atom,
+        actual_format: *mut c_int,
+        count: *mut c_ulong,
+        remaining: *mut c_ulong,
+        data: *mut *mut u8,
+    ) -> c_int;
     fn XLookupString(
         event: *mut XKeyEvent,
         buffer: *mut c_char,
@@ -209,6 +290,50 @@ struct XClientMessageEvent {
     data: [c_long; 5],
 }
 
+/// `XSelectionRequestEvent`: another program is asking for our selection.
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct XSelectionRequestEvent {
+    kind: c_int,
+    serial: c_ulong,
+    send_event: c_int,
+    display: Display,
+    owner: XWindow,
+    requestor: XWindow,
+    selection: Atom,
+    target: Atom,
+    property: Atom,
+    time: c_ulong,
+}
+
+/// `XSelectionEvent`: the answer to such a request, in either direction.
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct XSelectionEvent {
+    kind: c_int,
+    serial: c_ulong,
+    send_event: c_int,
+    display: Display,
+    requestor: XWindow,
+    selection: Atom,
+    target: Atom,
+    property: Atom,
+    time: c_ulong,
+}
+
+/// `XSelectionClearEvent`: something else took the selection from us.
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct XSelectionClearEvent {
+    kind: c_int,
+    serial: c_ulong,
+    send_event: c_int,
+    display: Display,
+    window: XWindow,
+    selection: Atom,
+    time: c_ulong,
+}
+
 #[repr(C)]
 struct WindowAttributes {
     x: c_int,
@@ -294,6 +419,9 @@ const BUTTON_PRESS: c_int = 4;
 const BUTTON_RELEASE: c_int = 5;
 const MOTION_NOTIFY: c_int = 6;
 const LEAVE_NOTIFY: c_int = 8;
+const SELECTION_CLEAR: c_int = 29;
+const SELECTION_REQUEST: c_int = 30;
+const SELECTION_NOTIFY: c_int = 31;
 const CLIENT_MESSAGE: c_int = 33;
 
 // Event masks.
@@ -317,6 +445,37 @@ const Z_PIXMAP: c_int = 2;
 /// `PMinSize` in a size hint's flags.
 const P_MIN_SIZE: c_long = 1 << 4;
 
+/// `XA_ATOM`, one of the atoms the protocol defines rather than interns.
+const XA_ATOM: Atom = 4;
+/// `XA_STRING`, the Latin-1 text every X client has always understood.
+const XA_STRING: Atom = 31;
+/// `CurrentTime`: let the server date the request itself.
+const CURRENT_TIME: c_ulong = 0;
+/// `AnyPropertyType`: read a property whatever type it turns out to have.
+const ANY_PROPERTY_TYPE: Atom = 0;
+/// `PropModeReplace`.
+const PROP_MODE_REPLACE: c_int = 0;
+/// `Success`, which is what every Xlib call answering a status returns on one.
+const SUCCESS: c_int = 0;
+
+/// How many words of a selection are read at once.
+///
+/// A quarter of a million 32-bit words is a megabyte of text — past anything a
+/// person pastes into a field, and well under the point where the owner would
+/// switch to sending it in pieces. See [`Window::read_selection`].
+const SELECTION_WORDS: c_long = 262_144;
+
+/// How many times the clipboard is looked at before giving up on an answer.
+///
+/// Reading the clipboard on X11 is asking another program a question, and a
+/// program that is busy, wedged, or has just exited will not answer at all. The
+/// budget is counted in attempts rather than measured against a clock, and the
+/// worst case is a fifth of a second of a paste doing nothing.
+const SELECTION_ATTEMPTS: usize = 40;
+
+/// How long each of those attempts waits for the socket, in milliseconds.
+const SELECTION_WAIT: c_int = 5;
+
 /// How many logical units one press of a wheel button scrolls.
 const WHEEL_STEP: f32 = 48.0;
 
@@ -326,6 +485,27 @@ const BASE_DPI: f32 = 96.0;
 /// Millimetres per inch, for turning the screen's physical size into a density.
 const MM_PER_INCH: f32 = 25.4;
 
+/// The atoms this backend interns, gathered because they travel together.
+///
+/// Interned once at startup rather than per use: `XInternAtom` is a round trip
+/// to the server, and a paste that made four of them before it could ask for the
+/// text would be four times slower for no reason.
+#[derive(Debug, Clone, Copy)]
+struct Atoms {
+    /// `WM_DELETE_WINDOW`: the close button, reported rather than fatal.
+    delete_window: Atom,
+    /// `CLIPBOARD`: the one copy and paste use, as opposed to `PRIMARY`.
+    clipboard: Atom,
+    /// `UTF8_STRING`: the text encoding to ask for and to offer.
+    utf8_string: Atom,
+    /// `TARGETS`: the question "what forms can you supply this in?"
+    targets: Atom,
+    /// `INCR`: an answer too big to send at once, which we decline to assemble.
+    incremental: Atom,
+    /// The property on our own window that answers are delivered into.
+    delivery: Atom,
+}
+
 /// A window on X11.
 pub(crate) struct Window {
     display: Display,
@@ -333,10 +513,18 @@ pub(crate) struct Window {
     context: GraphicsContext,
     visual: Visual,
     depth: c_uint,
-    delete_window: Atom,
+    atoms: Atoms,
     open: bool,
     size: (u32, u32),
     scale: f32,
+    /// The text this window has put on the clipboard, while it still owns it.
+    ///
+    /// X11 has no clipboard buffer to write into. Copying means telling the
+    /// server that this window *is* the clipboard, and then answering, one by
+    /// one, every program that asks what it holds — so the text has to stay
+    /// here for as long as the answer might be wanted. A [`RefCell`] because
+    /// answering happens through `&self`: see [`Backend::set_clipboard_text`].
+    owned: RefCell<Option<String>>,
 }
 
 impl Backend for Window {
@@ -393,10 +581,19 @@ impl Backend for Window {
                     | STRUCTURE_NOTIFY_MASK,
             );
 
+            let atoms = Atoms {
+                delete_window: XInternAtom(display, c"WM_DELETE_WINDOW".as_ptr(), 0),
+                clipboard: XInternAtom(display, c"CLIPBOARD".as_ptr(), 0),
+                utf8_string: XInternAtom(display, c"UTF8_STRING".as_ptr(), 0),
+                targets: XInternAtom(display, c"TARGETS".as_ptr(), 0),
+                incremental: XInternAtom(display, c"INCR".as_ptr(), 0),
+                delivery: XInternAtom(display, c"RUI_SELECTION".as_ptr(), 0),
+            };
+
             // Without this the window manager's close button kills the
             // connection outright rather than telling us, and the process dies
             // with a command possibly half-written to the daemon.
-            let mut delete_window = XInternAtom(display, c"WM_DELETE_WINDOW".as_ptr(), 0);
+            let mut delete_window = atoms.delete_window;
             XSetWMProtocols(display, window, &mut delete_window, 1);
 
             XMapWindow(display, window);
@@ -408,10 +605,11 @@ impl Backend for Window {
                 context: XDefaultGC(display, screen),
                 visual: XDefaultVisual(display, screen),
                 depth: XDefaultDepth(display, screen) as c_uint,
-                delete_window,
+                atoms,
                 open: true,
                 size: (width.max(1), height.max(1)),
                 scale,
+                owned: RefCell::new(None),
             };
             window.refresh_geometry();
             Ok(window)
@@ -518,6 +716,102 @@ impl Backend for Window {
     fn is_open(&self) -> bool {
         self.open
     }
+
+    /// Asks whoever owns the clipboard what it holds, and waits for the answer.
+    ///
+    /// The whole of the difference between X11 and every other platform here:
+    /// there is no buffer to read. The server only remembers *which window* owns
+    /// the selection, so this sends that window a request and waits for it to
+    /// send the text back through a property on ours.
+    ///
+    /// `Ok(None)` covers every ordinary way that can come to nothing — nobody
+    /// owns the clipboard, the owner has no text form of it, the owner declined,
+    /// the owner never answered, or the answer was too large to send in one
+    /// piece. None of those is a failure of this program, and all of them mean
+    /// the same thing to a field: there is nothing to paste.
+    fn clipboard_text(&self) -> Result<Option<String>, Error> {
+        unsafe {
+            if XGetSelectionOwner(self.display, self.atoms.clipboard) == 0 {
+                return Ok(None);
+            }
+            XConvertSelection(
+                self.display,
+                self.atoms.clipboard,
+                self.atoms.utf8_string,
+                self.atoms.delivery,
+                self.window,
+                CURRENT_TIME,
+            );
+            XFlush(self.display);
+
+            for _ in 0..SELECTION_ATTEMPTS {
+                // Requests from other programs — including the one this window
+                // sends itself when it owns the clipboard — are answered while
+                // waiting. Leaving them for the frame loop would deadlock that
+                // one case: the answer we are waiting for is one we owe.
+                self.answer_pending_requests();
+
+                let mut event: XEvent = std::mem::zeroed();
+                if XCheckTypedWindowEvent(self.display, self.window, SELECTION_NOTIFY, &mut event)
+                    != 0
+                {
+                    let notify = &*(&raw const event).cast::<XSelectionEvent>();
+                    // A property of `None` is the owner saying it cannot supply
+                    // the selection in the form that was asked for.
+                    if notify.property == 0 {
+                        return Ok(None);
+                    }
+                    return Ok(self.read_selection(notify.property));
+                }
+
+                let mut descriptor = PollDescriptor {
+                    descriptor: XConnectionNumber(self.display),
+                    events: POLLIN,
+                    returned: 0,
+                };
+                poll(&mut descriptor, 1, SELECTION_WAIT);
+                // Moves whatever arrived on the socket into Xlib's own queue,
+                // which is where the check above looks.
+                XPending(self.display);
+            }
+            Ok(None)
+        }
+    }
+
+    /// Takes ownership of the clipboard and remembers what to answer with.
+    ///
+    /// Copying on X11 is not writing anywhere. It is telling the server that
+    /// this window now *is* the clipboard, after which every program that wants
+    /// the text asks this one for it — see [`Window::answer_selection_request`].
+    /// The text therefore lives here until something else takes ownership, and
+    /// disappears when this program exits, which is why a desktop that keeps a
+    /// clipboard after the program that filled it has closed is running a
+    /// clipboard manager to do exactly that.
+    fn set_clipboard_text(&self, text: &str) -> Result<(), Error> {
+        *self.owned.borrow_mut() = Some(text.to_owned());
+        unsafe {
+            XSetSelectionOwner(self.display, self.atoms.clipboard, self.window, CURRENT_TIME);
+            XFlush(self.display);
+            if XGetSelectionOwner(self.display, self.atoms.clipboard) != self.window {
+                *self.owned.borrow_mut() = None;
+                return Err(Error::Platform("the X server would not hand over the clipboard".into()));
+            }
+        }
+        Ok(())
+    }
+
+    /// Nothing: this backend has no input method, so there is nothing to place.
+    ///
+    /// Composing on X11 means XIM — a protocol spoken to a separate input-method
+    /// server over its own connection, with its own event filtering and its own
+    /// callbacks, which is a backend's worth of work on its own. It is not done
+    /// here, and this says so rather than pretending: on this platform a
+    /// keystroke is whatever `XLookupString` makes of it, dead keys included if
+    /// the layout resolves them itself, and there is no way to type Japanese,
+    /// Chinese, or Korean into a `rui` window.
+    fn set_composition_area(&self, _area: Option<Rect>) -> Result<(), Error> {
+        Ok(())
+    }
 }
 
 impl Window {
@@ -534,10 +828,164 @@ impl Window {
         }
     }
 
+    /// Reads a delivered selection off our own window, and clears it away.
+    ///
+    /// The property is deleted as it is read, which is how the owner learns the
+    /// transfer finished. Leaving it would also leave the next paste reading the
+    /// last one.
+    fn read_selection(&self, property: Atom) -> Option<String> {
+        unsafe {
+            let mut kind: Atom = 0;
+            let mut format: c_int = 0;
+            let mut count: c_ulong = 0;
+            let mut remaining: c_ulong = 0;
+            let mut data: *mut u8 = std::ptr::null_mut();
+            let status = XGetWindowProperty(
+                self.display,
+                self.window,
+                property,
+                0,
+                SELECTION_WORDS,
+                1,
+                ANY_PROPERTY_TYPE,
+                &mut kind,
+                &mut format,
+                &mut count,
+                &mut remaining,
+                &mut data,
+            );
+            if status != SUCCESS || data.is_null() {
+                return None;
+            }
+
+            // `INCR` means the owner wants to send it a piece at a time, which
+            // is a conversation of its own — the requestor deletes the property
+            // and the owner refills it, over and over, until it sends an empty
+            // one. Declining is honest for a field someone is pasting a line
+            // into; a megabyte of text is not what that is.
+            let text = if kind == self.atoms.incremental || format != 8 {
+                None
+            } else {
+                let bytes = std::slice::from_raw_parts(data, count as usize);
+                Some(String::from_utf8_lossy(bytes).into_owned())
+            };
+            XFree(data.cast::<c_void>());
+            text
+        }
+    }
+
+    /// Answers every selection request already waiting in the queue.
+    fn answer_pending_requests(&self) {
+        loop {
+            let mut event: XEvent = unsafe { std::mem::zeroed() };
+            let waiting = unsafe {
+                XCheckTypedWindowEvent(self.display, self.window, SELECTION_REQUEST, &mut event)
+            };
+            if waiting == 0 {
+                return;
+            }
+            // SAFETY: the server filled the union's selection-request arm,
+            // which is what asking for that event kind means.
+            self.answer_selection_request(unsafe {
+                &*(&raw const event).cast::<XSelectionRequestEvent>()
+            });
+        }
+    }
+
+    /// Hands our copied text to a program that has asked for it.
+    ///
+    /// Every paste anywhere on the desktop, for as long as this window owns the
+    /// clipboard, arrives here.
+    fn answer_selection_request(&self, request: &XSelectionRequestEvent) {
+        // A requestor from before the conventions were written asks for the
+        // answer under the target's own name. Honouring it costs one line.
+        let property = if request.property == 0 { request.target } else { request.property };
+        let supplied = self.supply_selection(request, property);
+
+        unsafe {
+            let mut event: XEvent = std::mem::zeroed();
+            let notify = &mut *(&raw mut event).cast::<XSelectionEvent>();
+            notify.kind = SELECTION_NOTIFY;
+            notify.display = self.display;
+            notify.requestor = request.requestor;
+            notify.selection = request.selection;
+            notify.target = request.target;
+            // `None` for the property is how a refusal is spelled.
+            notify.property = if supplied { property } else { 0 };
+            notify.time = request.time;
+            XSendEvent(self.display, request.requestor, 0, 0, &mut event);
+            XFlush(self.display);
+        }
+    }
+
+    /// Writes what a requestor asked for onto its window, if we have it.
+    ///
+    /// Answers whether anything was written, which is what decides between an
+    /// answer and a refusal.
+    fn supply_selection(&self, request: &XSelectionRequestEvent, property: Atom) -> bool {
+        if request.target == self.atoms.targets {
+            // The conventional first question: what forms can you supply this
+            // in? Answering `TARGETS` is what makes a paste into a program that
+            // wants something else fail politely rather than hang.
+            let targets = [self.atoms.targets, self.atoms.utf8_string, XA_STRING];
+            unsafe {
+                XChangeProperty(
+                    self.display,
+                    request.requestor,
+                    property,
+                    XA_ATOM,
+                    32,
+                    PROP_MODE_REPLACE,
+                    targets.as_ptr().cast::<u8>(),
+                    targets.len() as c_int,
+                );
+            }
+            return true;
+        }
+
+        // `STRING` is Latin-1 by the letter of the protocol and UTF-8 by the
+        // practice of every program written since; a requestor that wanted the
+        // letter of it asks for `TEXT` or a specific encoding, and gets a
+        // refusal.
+        if request.target != self.atoms.utf8_string && request.target != XA_STRING {
+            return false;
+        }
+        let owned = self.owned.borrow();
+        let Some(text) = owned.as_deref() else {
+            return false;
+        };
+        unsafe {
+            XChangeProperty(
+                self.display,
+                request.requestor,
+                property,
+                request.target,
+                8,
+                PROP_MODE_REPLACE,
+                text.as_ptr(),
+                text.len() as c_int,
+            );
+        }
+        true
+    }
+
     /// Turns one X event into the toolkit's events, if it is one we care about.
     fn translate(&mut self, event: &XEvent, events: &mut Vec<Event>) {
         unsafe {
             match event.kind {
+                SELECTION_REQUEST => {
+                    self.answer_selection_request(
+                        &*(event as *const XEvent).cast::<XSelectionRequestEvent>(),
+                    );
+                }
+                SELECTION_CLEAR => {
+                    let clear = &*(event as *const XEvent).cast::<XSelectionClearEvent>();
+                    // Something else has become the clipboard. What we were
+                    // holding to answer with is no longer anybody's business.
+                    if clear.selection == self.atoms.clipboard {
+                        *self.owned.borrow_mut() = None;
+                    }
+                }
                 MOTION_NOTIFY => {
                     let motion = &*(event as *const XEvent).cast::<XMotionEvent>();
                     events.push(Event::PointerMoved(self.position(motion.x, motion.y)));
@@ -587,7 +1035,7 @@ impl Window {
                 KEY_PRESS | KEY_RELEASE => self.translate_key(event, events),
                 CLIENT_MESSAGE => {
                     let message = &*(event as *const XEvent).cast::<XClientMessageEvent>();
-                    if message.data[0] as Atom == self.delete_window {
+                    if message.data[0] as Atom == self.atoms.delete_window {
                         events.push(Event::CloseRequested);
                         self.open = false;
                     }

@@ -1,8 +1,18 @@
 //! The per-platform backends, and the choice between them.
 //!
-//! Exactly one is compiled, and each implements the same four-method
-//! [`Backend`](crate::Backend). `unsafe` is confined to these files: the run
-//! loop above them and the toolkit beneath them contain none.
+//! Exactly one is compiled, and each implements the same
+//! [`Backend`](crate::shell::Backend) — whatever that trait currently asks for,
+//! which is the point of naming it in one place. `unsafe` is confined to these
+//! files: the run loop above them and the toolkit beneath them contain none.
+//!
+//! # Where a platform cannot do what the seam asks
+//!
+//! It says so, in its own module header, and returns the honest empty answer —
+//! not a plausible-looking one. The X11 backend has no input method and says
+//! that in place of pretending to compose; `unsupported.rs` does the same for
+//! every method at once. A gap someone can read is a gap someone can close; a
+//! silent one is a bug report from a person who thought their keyboard was
+//! broken.
 
 #[cfg(target_os = "macos")]
 #[path = "macos.rs"]

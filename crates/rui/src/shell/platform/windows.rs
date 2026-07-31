@@ -15,14 +15,25 @@
 //! be swallowed or the system paints the window grey before every frame and it
 //! flickers.
 //!
+//! # The input method draws nothing
+//!
+//! `WM_IME_STARTCOMPOSITION`, `WM_IME_COMPOSITION`, and `WM_IME_CHAR` are read
+//! off the queue and then swallowed rather than passed to `DefWindowProcW`,
+//! because the default handling of them opens the system's own composition
+//! window and draws the text being composed into it — over the top of the same
+//! text the field is already drawing underlined at its caret. What is kept is
+//! the data: the string being composed, the string the input method settled on,
+//! and where its caret sits within them.
+//!
 //! # Blitting
 //!
 //! `StretchDIBits` onto the window's device context, from a top-down 32-bit
 //! `BI_RGB` bitmap — which is blue, green, red, unused per pixel, the same bytes
 //! [`Canvas`] already holds.
 
+use crate::input::Composition;
 use crate::theme::Appearance;
-use crate::{Canvas, Event, Key, Modifiers, Point, PointerButton};
+use crate::{Canvas, Event, Key, Modifiers, Point, PointerButton, Rect};
 use std::ffi::c_void;
 use std::time::Duration;
 
@@ -34,6 +45,12 @@ type LongParameter = isize;
 
 #[link(name = "user32")]
 unsafe extern "system" {
+    fn OpenClipboard(owner: Handle) -> i32;
+    fn CloseClipboard() -> i32;
+    fn EmptyClipboard() -> i32;
+    fn GetClipboardData(format: u32) -> Handle;
+    fn SetClipboardData(format: u32, memory: Handle) -> Handle;
+    fn IsClipboardFormatAvailable(format: u32) -> i32;
     fn RegisterClassExW(class: *const WindowClass) -> u16;
     fn CreateWindowExW(
         extended_style: u32,
@@ -108,6 +125,23 @@ unsafe extern "system" {
 #[link(name = "kernel32")]
 unsafe extern "system" {
     fn GetModuleHandleW(name: *const u16) -> Handle;
+    fn GlobalAlloc(flags: u32, bytes: usize) -> Handle;
+    fn GlobalFree(memory: Handle) -> Handle;
+    fn GlobalLock(memory: Handle) -> *mut c_void;
+    fn GlobalUnlock(memory: Handle) -> i32;
+}
+
+#[link(name = "imm32")]
+unsafe extern "system" {
+    fn ImmGetContext(window: Handle) -> Handle;
+    fn ImmReleaseContext(window: Handle, context: Handle) -> i32;
+    fn ImmGetCompositionStringW(
+        context: Handle,
+        index: u32,
+        buffer: *mut c_void,
+        bytes: u32,
+    ) -> i32;
+    fn ImmSetCompositionWindow(context: Handle, form: *const CompositionForm) -> i32;
 }
 
 #[link(name = "advapi32")]
@@ -216,6 +250,14 @@ struct BitmapInfo {
     colors: [u32; 3],
 }
 
+/// `COMPOSITIONFORM`: where the input method should draw what is being composed.
+#[repr(C)]
+struct CompositionForm {
+    style: u32,
+    current_position: WindowPoint,
+    area: WindowRect,
+}
+
 // Window styles and commands.
 const WS_OVERLAPPEDWINDOW: u32 = 0x00CF_0000;
 const SW_SHOW: i32 = 5;
@@ -243,6 +285,27 @@ const WM_MBUTTONDOWN: u32 = 0x0207;
 const WM_MBUTTONUP: u32 = 0x0208;
 const WM_MOUSEWHEEL: u32 = 0x020A;
 const WM_MOUSEHWHEEL: u32 = 0x020E;
+const WM_IME_STARTCOMPOSITION: u32 = 0x010D;
+const WM_IME_ENDCOMPOSITION: u32 = 0x010E;
+const WM_IME_COMPOSITION: u32 = 0x010F;
+const WM_IME_CHAR: u32 = 0x0286;
+
+// `ImmGetCompositionStringW` indices.
+/// The text being composed.
+const GCS_COMPSTR: u32 = 0x0008;
+/// Where the caret is within it, counted in UTF-16 units.
+const GCS_CURSORPOS: u32 = 0x0080;
+/// The text the input method has settled on.
+const GCS_RESULTSTR: u32 = 0x0800;
+
+/// `CFS_POINT`: place the composition window at a position we give.
+const CFS_POINT: u32 = 0x0002;
+
+/// `CF_UNICODETEXT`: the clipboard format that is not a code page.
+const CF_UNICODETEXT: u32 = 13;
+
+/// `GMEM_MOVEABLE`, which is what the clipboard requires of its memory.
+const GMEM_MOVEABLE: u32 = 0x0002;
 
 const PM_REMOVE: u32 = 0x0001;
 const QS_ALLINPUT: u32 = 0x04FF;
@@ -470,9 +533,160 @@ impl Backend for Window {
     fn is_open(&self) -> bool {
         self.open
     }
+
+    fn clipboard_text(&self) -> Result<Option<String>, Error> {
+        unsafe {
+            // Asked before the clipboard is opened, because opening it locks
+            // every other program out of it for as long as we hold it.
+            if IsClipboardFormatAvailable(CF_UNICODETEXT) == 0 {
+                return Ok(None);
+            }
+            if OpenClipboard(self.handle) == 0 {
+                return Err(Error::Platform("another program is holding the clipboard".into()));
+            }
+            let memory = GetClipboardData(CF_UNICODETEXT);
+            if memory.is_null() {
+                CloseClipboard();
+                return Ok(None);
+            }
+            let text = read_wide(GlobalLock(memory).cast::<u16>());
+            GlobalUnlock(memory);
+            CloseClipboard();
+            Ok(text)
+        }
+    }
+
+    fn set_clipboard_text(&self, text: &str) -> Result<(), Error> {
+        let wide_text = wide(text);
+        let bytes = std::mem::size_of_val(wide_text.as_slice());
+        unsafe {
+            if OpenClipboard(self.handle) == 0 {
+                return Err(Error::Platform("another program is holding the clipboard".into()));
+            }
+            // The clipboard takes ownership of the block handed to it, so it is
+            // never freed here once `SetClipboardData` has accepted it — and it
+            // has to be freed on every path where it has not.
+            let memory = GlobalAlloc(GMEM_MOVEABLE, bytes);
+            let destination = if memory.is_null() { std::ptr::null_mut() } else { GlobalLock(memory) };
+            if destination.is_null() {
+                if !memory.is_null() {
+                    GlobalFree(memory);
+                }
+                CloseClipboard();
+                return Err(Error::Platform("there was no memory for the copied text".into()));
+            }
+            std::ptr::copy_nonoverlapping(
+                wide_text.as_ptr(),
+                destination.cast::<u16>(),
+                wide_text.len(),
+            );
+            GlobalUnlock(memory);
+
+            // Emptying it is what transfers ownership to this program; a
+            // clipboard written to without it keeps the last owner's formats.
+            EmptyClipboard();
+            let accepted = SetClipboardData(CF_UNICODETEXT, memory);
+            CloseClipboard();
+            if accepted.is_null() {
+                GlobalFree(memory);
+                return Err(Error::Platform("the clipboard would not take the text".into()));
+            }
+        }
+        Ok(())
+    }
+
+    fn set_composition_area(&self, area: Option<Rect>) -> Result<(), Error> {
+        let Some(area) = area else {
+            return Ok(());
+        };
+        unsafe {
+            let context = ImmGetContext(self.handle);
+            if context.is_null() {
+                // No input context means no input method is loaded, which is the
+                // ordinary case for a keyboard that needs none.
+                return Ok(());
+            }
+            // The bottom left of the caret, in client pixels: an input method
+            // hangs its window below the point it is given.
+            let form = CompositionForm {
+                style: CFS_POINT,
+                current_position: WindowPoint {
+                    x: (area.x * self.scale) as i32,
+                    y: ((area.y + area.h) * self.scale) as i32,
+                },
+                area: WindowRect::default(),
+            };
+            let placed = ImmSetCompositionWindow(context, &form);
+            ImmReleaseContext(self.handle, context);
+            if placed == 0 {
+                return Err(Error::Platform("the input method refused a position".into()));
+            }
+        }
+        Ok(())
+    }
 }
 
 impl Window {
+    /// What the input method has in progress, and where its caret sits in it.
+    ///
+    /// `index` selects which string to read — the one being composed, or the one
+    /// the input method has settled on. Both arrive as UTF-16 and are measured
+    /// in bytes, which is why the length is halved before it becomes a buffer.
+    fn composition_string(&self, index: u32) -> Option<(String, usize)> {
+        unsafe {
+            let context = ImmGetContext(self.handle);
+            if context.is_null() {
+                return None;
+            }
+            let bytes = ImmGetCompositionStringW(context, index, std::ptr::null_mut(), 0);
+            if bytes <= 0 {
+                ImmReleaseContext(self.handle, context);
+                return None;
+            }
+            let mut buffer = vec![0u16; bytes as usize / 2];
+            ImmGetCompositionStringW(
+                context,
+                index,
+                buffer.as_mut_ptr().cast::<c_void>(),
+                bytes as u32,
+            );
+            // Negative means the input method has no opinion about the caret, in
+            // which case the end of the composition is where it goes.
+            let caret = ImmGetCompositionStringW(context, GCS_CURSORPOS, std::ptr::null_mut(), 0);
+            ImmReleaseContext(self.handle, context);
+
+            let text = String::from_utf16_lossy(&buffer);
+            let caret = if caret < 0 { buffer.len() } else { caret as usize };
+            Some((text, caret))
+        }
+    }
+
+    /// Turns one of the input method's messages into the toolkit's events.
+    ///
+    /// A commit and a change to the composition arrive in the same message, and
+    /// in that order: the input method says what it settled on and then shows
+    /// what is left being composed.
+    fn translate_composition(&self, message: &Message, events: &mut Vec<Event>) {
+        let flags = message.long as u32;
+        if flags & GCS_RESULTSTR != 0 {
+            if let Some((text, _)) = self.composition_string(GCS_RESULTSTR) {
+                events.push(Event::Composing(Composition::default()));
+                let typed: String = text.chars().filter(|c| !c.is_control()).collect();
+                if !typed.is_empty() {
+                    events.push(Event::Text(typed));
+                }
+            }
+        }
+        if flags & GCS_COMPSTR != 0 {
+            match self.composition_string(GCS_COMPSTR) {
+                Some((text, caret)) if !text.is_empty() => {
+                    let at = utf16_offset(&text, caret);
+                    events.push(Event::Composing(Composition { text, selection: at..at }));
+                }
+                _ => events.push(Event::Composing(Composition::default())),
+            }
+        }
+    }
     /// Re-reads the client area and the display's density.
     fn refresh_geometry(&mut self) {
         unsafe {
@@ -550,6 +764,11 @@ impl Window {
                     events.push(Event::Text(character.to_string()));
                 }
             }
+            WM_IME_COMPOSITION => self.translate_composition(message, events),
+            // The composition was abandoned. A commit ends it too, but arrives
+            // as a result string on the message above and has already been
+            // reported by the time this is sent.
+            WM_IME_ENDCOMPOSITION => events.push(Event::Composing(Composition::default())),
             _ => {}
         }
     }
@@ -632,7 +851,40 @@ fn wide(text: &str) -> Vec<u16> {
     text.encode_utf16().chain(std::iter::once(0)).collect()
 }
 
-/// Answers the two messages that must be answered rather than merely observed.
+/// The text at a NUL-terminated wide pointer, or `None` for a null one.
+///
+/// Only ever pointed at memory the system locked for us and which stays locked
+/// for the length of the call.
+unsafe fn read_wide(text: *const u16) -> Option<String> {
+    if text.is_null() {
+        return None;
+    }
+    let mut length = 0;
+    // SAFETY: the clipboard's own block, which the system guarantees is
+    // terminated for the format that was asked for.
+    while unsafe { *text.add(length) } != 0 {
+        length += 1;
+    }
+    let units = unsafe { std::slice::from_raw_parts(text, length) };
+    Some(String::from_utf16_lossy(units))
+}
+
+/// The byte offset in `text` of a position counted in UTF-16 units.
+///
+/// The input method counts the way the system stores a string; a Rust [`String`]
+/// is bytes. Saturates at the end rather than panicking.
+fn utf16_offset(text: &str, utf16: usize) -> usize {
+    let mut counted = 0;
+    for (offset, character) in text.char_indices() {
+        if counted >= utf16 {
+            return offset;
+        }
+        counted += character.len_utf16();
+    }
+    text.len()
+}
+
+/// Answers the messages that must be answered rather than merely observed.
 ///
 /// Everything else is read off the queue in [`Window::pump`] and then handed to
 /// `DefWindowProcW`, so this stays the whole of the callback.
@@ -646,6 +898,14 @@ unsafe extern "system" fn window_procedure(
         // Painting is ours. Answering non-zero says the background needs no
         // erasing, which is what stops the window flashing grey between frames.
         WM_ERASEBKGND => 1,
+        // So is the composition. `DefWindowProcW` would open the system's own
+        // little window and draw the text being composed into it, on top of the
+        // one the field is already drawing underlined at the caret. Swallowing
+        // these three says "we are drawing it", which is true. The messages are
+        // still read off the queue before this is reached, so nothing is lost:
+        // `WM_IME_CHAR` in particular would otherwise be turned into a
+        // `WM_CHAR` and type the committed text a second time.
+        WM_IME_STARTCOMPOSITION | WM_IME_COMPOSITION | WM_IME_CHAR => 0,
         // The update region has to be validated or Windows re-sends this
         // forever. Nothing is drawn here: the frame loop presents whole frames.
         WM_PAINT => unsafe {

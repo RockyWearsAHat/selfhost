@@ -102,11 +102,51 @@ impl Response {
     }
 }
 
-/// Where a caret sits in a field being edited.
+/// Where a caret sits in a field being edited, and what it has selected.
+///
+/// Two offsets rather than a range, because a selection has a direction: the
+/// anchor is where the selection began and does not move, and the offset is the
+/// end being dragged. Extending a selection leftwards and then rightwards has to
+/// come back to where it started, which a sorted pair cannot express.
 #[derive(Debug, Clone, Copy, Default)]
 pub(crate) struct Caret {
-    /// Byte offset within the field's text.
+    /// Byte offset within the field's text: where the caret is drawn.
     pub(crate) offset: usize,
+    /// Byte offset the selection is anchored at; equal to `offset` when there
+    /// is no selection.
+    pub(crate) anchor: usize,
+}
+
+impl Caret {
+    /// What is selected, in byte offsets, low end first.
+    ///
+    /// Empty when nothing is, which is the case a caller can treat as "act on
+    /// the caret" without asking a second question.
+    pub(crate) fn selection(self) -> std::ops::Range<usize> {
+        self.offset.min(self.anchor)..self.offset.max(self.anchor)
+    }
+}
+
+/// What a frame asked the window to do with the system clipboard.
+///
+/// # Why a request and not a call
+///
+/// A handler is `fn(&mut S)` and captures nothing, and drawing a field has no
+/// window in reach either — the whole point of [`crate::shell`] is that nothing
+/// above it knows what a window is. So a field leaves its intention here and the
+/// window loop performs it once the frame is finished, which is exactly the
+/// shape [`Memory::request_frame`] already uses for "do this once I am done".
+///
+/// It also happens to be the only shape X11 can honour. There is no clipboard
+/// buffer to read there: asking for the selection sends a message to whichever
+/// client owns it and the answer arrives later, so a `paste()` that returned a
+/// string on the spot is not a thing that platform has.
+#[derive(Debug, Default)]
+pub(crate) struct ClipboardRequest {
+    /// Text to be placed on the clipboard.
+    pub(crate) copy: Option<String>,
+    /// Whether the clipboard's own text was asked for.
+    pub(crate) paste: bool,
 }
 
 /// How far an eased value has travelled, and when it was last asked for.
@@ -158,6 +198,17 @@ pub struct Memory {
     /// longer drawn drops out by simply not being added again — hover state for
     /// a row that scrolled away is state that could otherwise only grow.
     hovered: HashSet<Id>,
+    /// What the frame being drawn asked of the system clipboard.
+    clipboard: ClipboardRequest,
+    /// What the window last read back from the clipboard, for whoever asked.
+    pasted: Option<String>,
+    /// Where the caret of whatever has the keyboard was last drawn.
+    ///
+    /// Not for drawing — the field draws its own caret. This is what the window
+    /// tells the platform's input method, so that a list of candidate characters
+    /// opens beside the text being composed rather than in the corner of the
+    /// screen.
+    caret_area: Option<Rect>,
 }
 
 impl Memory {
@@ -242,6 +293,56 @@ impl Memory {
         self.animating = true;
     }
 
+    /// Asks for `text` to be placed on the system clipboard.
+    ///
+    /// Performed by the window once this frame is finished; see
+    /// [`ClipboardRequest`]. The last request of a frame wins, because two
+    /// controls both copying on the same frame is a mistake and the alternative
+    /// — concatenating them — would be a stranger one.
+    pub fn copy_to_clipboard(&mut self, text: String) {
+        self.clipboard.copy = Some(text);
+    }
+
+    /// Asks for the system clipboard's text, which arrives on the next frame.
+    ///
+    /// A frame later rather than at once, because reading a clipboard is asking
+    /// another program a question, and on X11 it is literally that. The extra
+    /// frame is asked for here, so the paste appears immediately rather than
+    /// whenever something else next woke the interface up.
+    pub fn request_paste(&mut self) {
+        self.clipboard.paste = true;
+        self.request_frame();
+    }
+
+    /// Takes what this frame asked of the clipboard, for the window to perform.
+    pub(crate) fn take_clipboard_request(&mut self) -> ClipboardRequest {
+        std::mem::take(&mut self.clipboard)
+    }
+
+    /// Hands over what the clipboard answered, for the next frame to read.
+    pub(crate) fn deliver_paste(&mut self, text: String) {
+        self.pasted = Some(text);
+        self.request_frame();
+    }
+
+    /// Takes the clipboard's answer, if one is waiting for this frame.
+    ///
+    /// Consumed rather than read, so it is pasted once and not on every frame
+    /// until the next paste.
+    pub(crate) fn take_pasted(&mut self) -> Option<String> {
+        self.pasted.take()
+    }
+
+    /// Notes where the caret of whatever has the keyboard was drawn.
+    pub(crate) fn set_caret_area(&mut self, area: Rect) {
+        self.caret_area = Some(area);
+    }
+
+    /// Where that caret was, if anything drew one this frame.
+    pub(crate) fn caret_area(&self) -> Option<Rect> {
+        self.caret_area
+    }
+
     /// Whether a following area is still stuck to the end of its content.
     pub(crate) fn is_following(&self, id: Id) -> bool {
         !self.detached.get(&id).copied().unwrap_or(false)
@@ -281,6 +382,10 @@ impl Memory {
         self.delta = elapsed.as_secs_f32().clamp(SHORTEST, LONGEST);
         self.frame = self.frame.wrapping_add(1);
         self.animating = false;
+        // Where the caret is belongs to the frame that draws it. Kept from the
+        // last one, it would go on pointing at a field that has since lost the
+        // keyboard or scrolled off the screen.
+        self.caret_area = None;
     }
 
     /// Whether anything is mid-animation and the frame should be drawn again.
@@ -362,6 +467,12 @@ impl Memory {
         // What the pointer was over is now what it *was* over. Anything this
         // frame did not draw is simply not in the new set.
         self.was_hovered = std::mem::take(&mut self.hovered);
+
+        // A paste is delivered *after* this, so anything still here was offered
+        // to the frame that asked for it and not taken — the field that wanted
+        // it has since lost the keyboard or gone. Pasting it into whatever holds
+        // the keyboard next would be text arriving in a place nobody aimed it.
+        self.pasted = None;
     }
 
     /// Notes that Tab was pressed, to be resolved at the end of the frame.
@@ -543,6 +654,56 @@ mod tests {
         memory.end_frame(&Input::new());
         assert_eq!(memory.eased.len(), 1);
         assert!(memory.eased.contains_key(&Id::new("row-2")));
+    }
+
+    #[test]
+    fn a_copy_is_queued_for_the_window_and_handed_over_once() {
+        let mut memory = Memory::new();
+        memory.copy_to_clipboard("selfhost".into());
+
+        let request = memory.take_clipboard_request();
+        assert_eq!(request.copy.as_deref(), Some("selfhost"));
+        assert!(!request.paste, "copying is not also asking to paste");
+        assert_eq!(memory.take_clipboard_request().copy, None, "the copy was performed twice");
+    }
+
+    #[test]
+    fn asking_to_paste_also_asks_for_the_frame_that_will_show_it() {
+        let mut memory = Memory::new();
+        stepped(&mut memory, 1.0 / 60.0);
+        memory.request_paste();
+
+        assert!(memory.take_clipboard_request().paste);
+        assert!(memory.is_animating(), "the paste would not appear until something else woke us");
+    }
+
+    #[test]
+    fn the_clipboards_answer_is_read_by_the_next_frame_exactly_once() {
+        let mut memory = Memory::new();
+        memory.deliver_paste("pasted".into());
+        assert_eq!(memory.take_pasted().as_deref(), Some("pasted"));
+        assert_eq!(memory.take_pasted(), None, "the same paste arrived twice");
+    }
+
+    #[test]
+    fn an_answer_nobody_took_is_dropped_rather_than_kept_for_later() {
+        // The field that asked has lost the keyboard by the time the answer
+        // arrives. Holding it would paste it into whatever is focused next.
+        let mut memory = Memory::new();
+        memory.deliver_paste("pasted".into());
+        memory.end_frame(&Input::new());
+        assert_eq!(memory.take_pasted(), None);
+    }
+
+    #[test]
+    fn where_the_caret_is_belongs_to_one_frame_only() {
+        let mut memory = Memory::new();
+        stepped(&mut memory, 1.0 / 60.0);
+        memory.set_caret_area(Rect::new(4.0, 8.0, 2.0, 16.0));
+        assert!(memory.caret_area().is_some());
+
+        stepped(&mut memory, 1.0 / 60.0);
+        assert_eq!(memory.caret_area(), None, "a frame that drew no caret still reported one");
     }
 
     #[test]
