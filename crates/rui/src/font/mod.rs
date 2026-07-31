@@ -15,8 +15,11 @@
 //! - **No complex-script shaping.** One character becomes one glyph. Scripts
 //!   whose letters join or reorder — Arabic, Devanagari — will not render
 //!   correctly. Latin, Greek, Cyrillic, numerals, and punctuation will.
-//! - **No kerning.** Modern fonts carry it in `GPOS`, which is a layout engine's
-//!   worth of work for a small optical improvement in a console.
+//! - **No ligatures or substitutions.** `GSUB` is not read, so `fi` sets as two
+//!   letters. Pair kerning *is* read, from both the `kern` table and `GPOS`,
+//!   because it is a table lookup rather than the reordering engine a
+//!   substitution needs; the `kern` module states exactly how much of each
+//!   format that covers.
 //! - **No hinting.** The bytecode exists to snap stems to a coarse pixel grid,
 //!   a problem that HiDPI displays largely removed, and interpreting it would
 //!   mean implementing and sandboxing a second language.
@@ -27,11 +30,13 @@
 //! takes bytes, so a face with the coverage a deployment needs is a matter of
 //! which file gets loaded.
 
+mod kern;
 mod outline;
 mod raster;
 mod sfnt;
 
 use crate::canvas::Mask;
+use kern::Kerning;
 use outline::{Edges, Transform};
 use raster::Rasteriser;
 use sfnt::{CharMap, Directory, Reader, Table};
@@ -138,6 +143,7 @@ pub struct Font {
     hmtx: Table,
     horizontal_metric_count: u16,
     character_map: CharMap,
+    kerning: Kerning,
 }
 
 impl Font {
@@ -210,6 +216,9 @@ impl Font {
 
         let character_map =
             CharMap::read(&data, cmap).ok_or(FontError::MalformedTable("cmap"))?;
+        // Kerning is optional and answers nothing when the font has none, so
+        // it cannot fail the load the way a missing `cmap` does.
+        let kerning = Kerning::read(&data, &directory);
 
         Ok(Self {
             data,
@@ -226,6 +235,7 @@ impl Font {
             hmtx,
             horizontal_metric_count,
             character_map,
+            kerning,
         })
     }
 
@@ -262,6 +272,31 @@ impl Font {
         let mut reader = Reader::at(&self.data, self.hmtx.offset + index * 4);
         let units = reader.u16().unwrap_or(0) as f32;
         units * self.scale_for(size)
+    }
+
+    /// How much closer `right` should sit after `left`, in pixels.
+    ///
+    /// Almost always negative or zero: kerning closes up the gaps a pair like
+    /// `AV` leaves when both glyphs are set at their own advance. Zero for a
+    /// pair the font says nothing about, and for every pair in a font that
+    /// carries no kerning at all.
+    ///
+    /// This belongs to the *pair*, so it is only meaningful for two glyphs of
+    /// the same face — a caller mixing faces must not carry an adjustment
+    /// across the join.
+    pub fn kerning(&self, left: GlyphId, right: GlyphId, size: f32) -> f32 {
+        if self.kerning.is_empty() {
+            return 0.0;
+        }
+        self.kerning.adjustment(left.0, right.0) as f32 * self.scale_for(size)
+    }
+
+    /// Whether the font states any kerning at all.
+    ///
+    /// Lets a caller that walks a string pair by pair skip the lookup entirely
+    /// for the many faces — most monospaced ones among them — that carry none.
+    pub fn has_kerning(&self) -> bool {
+        !self.kerning.is_empty()
     }
 
     /// Renders a glyph at `size` pixels, offset `subpixel_x` into its pixel.

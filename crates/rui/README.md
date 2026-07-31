@@ -323,6 +323,28 @@ Windows, and X11 because the same code drew it.
 | `shell` | the window, and the loop |
 | `testing` | driving all of it with no window |
 
+### Text, and where it stops
+
+Every path through text — measuring, fitting, wrapping, drawing — walks one
+advance function, so a run can never be fitted to one width and drawn at
+another. Tab stops, tracking, and **pair kerning** all live in that one place;
+the adjustments come from a face's `kern` table or its `GPOS` `kern` feature,
+so `AV` closes up the way the face's designer intended.
+
+Anywhere text is *cut* — a caret, a wrapped line, an ellipsis — the unit is a
+**grapheme cluster** rather than a `char`, so a caret steps over a letter and
+its accent together and a line never breaks a flag in half. The cluster rules
+are a stated subset of UAX #29: combining marks, joined emoji, regional
+indicator pairs, and variation selectors, written out by hand because this
+crate carries no data it did not write. Brahmic scripts and Hangul spelled out
+as separate jamo are **not** covered and will cluster wrongly;
+`src/text/grapheme.rs` says exactly what is in and what is out.
+
+What is genuinely missing is shaping. One character still becomes one glyph, so
+there are no ligatures, no bidirectional reordering, and no Arabic or
+Devanagari. That is a HarfBuzz-sized body of work, and the limit is stated here
+rather than approximated in the renderer.
+
 `unsafe` is confined to `shell/platform/`, one file per platform, each of which
 does five things: open a window, say how big it is, say whether the desktop is
 light or dark, hand over events, and copy a buffer of pixels onto the screen.

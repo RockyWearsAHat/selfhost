@@ -6,6 +6,36 @@
 //! one width and then drawn at another — the bug that makes labels overrun the
 //! boxes they were fitted to.
 //!
+//! # One advance, and everything walks it
+//!
+//! `Fonts::advance_of` is that path. Measuring, fitting, wrapping, and drawing
+//! each walk a string through it and sum what it answers, so anything that
+//! changes how wide text is — tab stops, tracking, and now kerning — is added
+//! there and nowhere else. A second place would be a second answer, and the two
+//! would drift the first time one of them was edited.
+//!
+//! Kerning makes that rule load-bearing rather than tidy, because it is the
+//! first thing here that depends on the character *before* the one being
+//! measured. So the advance is asked for a pair, and it answers two numbers:
+//! how far the pen moves before the glyph is drawn, and how far after. Drawing
+//! uses both in order; every other path only needs their sum.
+//!
+//! # Clusters, not characters
+//!
+//! Anything a person can land on or break at is a grapheme cluster: [`fit`]
+//! answers a cluster boundary, [`wrap`] breaks at one, and [`grapheme`] is what
+//! a caret should step by. A `char` is the wrong unit — it would put a caret
+//! between a letter and its accent, and cut a flag in half. See [`grapheme`]
+//! for exactly which of UAX #29 is implemented and which of it is not.
+//!
+//! Measuring and drawing still walk `char`s, because a cluster's width is the
+//! sum of its characters' advances either way — a combining mark advances the
+//! pen by nothing and draws over its base. The unit only matters where the run
+//! is *cut*.
+//!
+//! [`fit`]: Fonts::fit
+//! [`wrap`]: Fonts::wrap
+//!
 //! # Subpixel positioning
 //!
 //! A glyph is rendered at the fractional offset the pen actually sits at, in one
@@ -21,6 +51,8 @@
 //! varies continuously would fill the cache with near-duplicates. Sizes round to
 //! [`SIZE_QUANTUM`] of a pixel before rendering *and* before measuring, which
 //! keeps the two consistent.
+
+pub mod grapheme;
 
 use crate::canvas::Canvas;
 use crate::color::Color;
@@ -120,6 +152,63 @@ struct GlyphKey {
     phase: u32,
 }
 
+/// What one character does to the pen, in device pixels.
+///
+/// Two numbers rather than one because kerning moves the pen *before* the glyph
+/// is drawn and the advance moves it after. Every path that only wants a width
+/// adds them; drawing is the one that needs them apart.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct Advance {
+    /// Movement before the glyph: how much this pair closes up.
+    kern: f32,
+    /// Movement after it: the glyph's own advance, and any tracking.
+    width: f32,
+}
+
+impl Advance {
+    /// What a character that marks nothing and moves nothing contributes.
+    const NOTHING: Self = Self { kern: 0.0, width: 0.0 };
+}
+
+/// A pen walking one line of text.
+///
+/// Holds the character before, because kerning belongs to the pair rather than
+/// to either glyph, and the size to render at, so that every path walking a run
+/// asks [`Fonts::advance_of`] exactly the same question. Copied rather than
+/// borrowed so that [`Fonts::fit`] can measure a cluster speculatively and keep
+/// the result only if the whole of it fits.
+#[derive(Debug, Clone, Copy)]
+struct Run {
+    /// How far the pen has moved from the start of the line, in device pixels.
+    pen: f32,
+    /// The character just set, or `None` at the start of the line.
+    previous: Option<char>,
+    /// The size glyphs are rendered at, in quantised device pixels.
+    device_size: f32,
+}
+
+impl Run {
+    /// A pen at the start of a line to be set at `device_size`.
+    fn new(device_size: f32) -> Self {
+        Self { pen: 0.0, previous: None, device_size }
+    }
+
+    /// Moves the pen over one character, answering where its glyph belongs.
+    ///
+    /// That is the pen position *after* the pair's kerning and before the
+    /// glyph's own advance — which is why drawing calls this rather than
+    /// summing widths itself.
+    fn add(&mut self, fonts: &Fonts, style: &TextStyle, character: char) -> f32 {
+        let advance =
+            fonts.advance_of(style, self.previous, character, self.device_size, self.pen);
+        self.pen += advance.kern;
+        let at = self.pen;
+        self.pen += advance.width;
+        self.previous = Some(character);
+        at
+    }
+}
+
 /// One loaded face and the glyphs rendered from it so far.
 struct Face {
     font: Font,
@@ -187,27 +276,33 @@ impl Fonts {
     /// string through one advance, `Fonts::advance_of`.
     pub fn measure(&self, style: &TextStyle, text: &str) -> f32 {
         let device = self.device_size(style);
-        let mut pen = 0.0;
+        let mut run = Run::new(device);
         for character in text.chars() {
-            pen += self.advance_of(style, character, device, pen);
+            run.add(self, style, character);
         }
-        pen / self.scale
+        run.pen / self.scale
     }
 
     /// How many bytes of `text` fit within `max_width` logical units.
     ///
-    /// Answers a byte count on a character boundary, so the prefix it describes
-    /// is always a valid string.
+    /// Answers a byte count on a grapheme cluster boundary, so the prefix it
+    /// describes is a valid string *and* a whole one: a letter is never left
+    /// without its accent, nor a flag without its other half.
     pub fn fit(&self, style: &TextStyle, text: &str, max_width: f32) -> usize {
         let device = self.device_size(style);
         let limit = max_width * self.scale;
-        let mut pen = 0.0;
-        for (offset, character) in text.char_indices() {
-            let advance = self.advance_of(style, character, device, pen);
-            if pen + advance > limit {
+        let mut run = Run::new(device);
+        for (offset, cluster) in grapheme::clusters(text) {
+            // A cluster is all or nothing, so it is measured on a copy of the
+            // pen and only committed once it is known to fit.
+            let mut attempt = run;
+            for character in cluster.chars() {
+                attempt.add(self, style, character);
+            }
+            if attempt.pen > limit {
                 return offset;
             }
-            pen += advance;
+            run = attempt;
         }
         text.len()
     }
@@ -241,16 +336,15 @@ impl Fonts {
         let baseline_x = origin.x * self.scale;
         let baseline_y = (origin.y * self.scale).round() as i32;
 
-        let mut pen = 0.0;
+        let mut run = Run::new(device);
         for character in text.chars() {
-            let advance = self.advance_of(style, character, device, pen);
-            if let Some(glyph) = self.rendered_glyph(style, character, device, baseline_x + pen) {
-                let left = (baseline_x + pen).floor() as i32 + glyph.left;
+            let at = run.add(self, style, character);
+            if let Some(glyph) = self.rendered_glyph(style, character, device, baseline_x + at) {
+                let left = (baseline_x + at).floor() as i32 + glyph.left;
                 canvas.fill_mask(left, baseline_y + glyph.top, &glyph.mask, color);
             }
-            pen += advance;
         }
-        pen / self.scale
+        run.pen / self.scale
     }
 
     /// Draws one line, cut short with an ellipsis if it will not fit.
@@ -283,26 +377,68 @@ impl Fonts {
         quantise(quantise(style.size) * self.scale)
     }
 
-    /// The pen advance for one character, in device pixels.
+    /// The pen movement for one character, in device pixels.
     ///
-    /// `pen` is where the pen already is, which a tab needs in order to reach
-    /// the next stop rather than simply being some fixed width.
-    fn advance_of(&self, style: &TextStyle, character: char, device_size: f32, pen: f32) -> f32 {
+    /// `previous` is the character before it, which kerning needs because the
+    /// adjustment belongs to the pair and not to either glyph. `pen` is where
+    /// the pen already is, which a tab needs in order to reach the next stop
+    /// rather than simply being some fixed width.
+    ///
+    /// The one place any of this is decided: every path walks a string through
+    /// here, so measuring, fitting, wrapping, and drawing cannot disagree about
+    /// how wide a run is.
+    fn advance_of(
+        &self,
+        style: &TextStyle,
+        previous: Option<char>,
+        character: char,
+        device_size: f32,
+        pen: f32,
+    ) -> Advance {
         let Some((face, glyph)) = self.resolve(style, character) else {
-            return 0.0;
+            return Advance::NOTHING;
         };
         if character == '\t' {
             let stop = self.faces[face].font.advance(glyph_of(&self.faces[face].font, ' '), device_size)
                 * TAB_WIDTH as f32;
             if stop > 0.0 {
-                return stop - pen.rem_euclid(stop);
+                // A tab reaches an absolute stop, so nothing before it can
+                // move it: no kerning, whatever the pair.
+                return Advance { kern: 0.0, width: stop - pen.rem_euclid(stop) };
             }
         }
-        // Tracking is added here, in the one place every path already goes
-        // through, so measuring and drawing cannot disagree about how wide a
-        // tracked run is. It is a logical measurement like the size, so it is
-        // scaled to device pixels the same way.
-        self.faces[face].font.advance(glyph, device_size) + style.tracking * self.scale
+        Advance {
+            kern: self.kerning_before(style, previous, face, glyph, device_size),
+            // Tracking is added here, in the one place every path already goes
+            // through, so measuring and drawing cannot disagree about how wide
+            // a tracked run is. It is a logical measurement like the size, so
+            // it is scaled to device pixels the same way.
+            width: self.faces[face].font.advance(glyph, device_size)
+                + style.tracking * self.scale,
+        }
+    }
+
+    /// How much the pair `previous`–`glyph` closes up, in device pixels.
+    ///
+    /// Zero unless both glyphs came from the same face: an adjustment states
+    /// how two of *one* font's letterforms fit together, and carrying it across
+    /// a fallback would be applying one face's opinion to another's shapes.
+    fn kerning_before(
+        &self,
+        style: &TextStyle,
+        previous: Option<char>,
+        face: usize,
+        glyph: GlyphId,
+        device_size: f32,
+    ) -> f32 {
+        let font = &self.faces[face].font;
+        if !font.has_kerning() {
+            return 0.0;
+        }
+        match previous.and_then(|character| self.resolve(style, character)) {
+            Some((before, left)) if before == face => font.kerning(left, glyph, device_size),
+            _ => 0.0,
+        }
     }
 
     /// The glyph image for a character at the pen position, if it marks anything.
@@ -379,16 +515,13 @@ impl Fonts {
                 return;
             }
 
-            // Prefer the last space that still fits. `fits` is exclusive, so
-            // searching one byte further lets a break land on a space that sits
-            // exactly at the limit and would otherwise start the next line.
-            let window = &remaining[..(fits + 1).min(remaining.len())];
-            let break_at = window
-                .rfind(char::is_whitespace)
-                .map(|at| at + 1)
+            // Prefer the last space that still fits, counting one that starts
+            // exactly at the limit: it would otherwise begin the next line as a
+            // leading space nobody asked for.
+            let break_at = last_space(remaining, fits)
                 // Nowhere to break: cut inside the word, but never to nothing,
-                // or a single too-wide character would loop forever.
-                .unwrap_or_else(|| fits.max(next_boundary(remaining)));
+                // or a single too-wide cluster would loop forever.
+                .unwrap_or_else(|| fits.max(grapheme::first_cluster_len(remaining)));
 
             lines.push((line_start, line_start + break_at));
             line_start += break_at;
@@ -420,9 +553,20 @@ fn glyph_of(font: &Font, character: char) -> GlyphId {
     font.glyph_for(character)
 }
 
-/// The byte length of the first character, or one for an empty string.
-fn next_boundary(text: &str) -> usize {
-    text.chars().next().map_or(1, char::len_utf8)
+/// Where to break after the last space starting at or before `fits`.
+///
+/// Answers the byte just past that space, which is where the next line begins.
+/// `None` when the text has none, which is a word too long to break politely.
+///
+/// Walks forwards and keeps the last match rather than searching backwards from
+/// `fits`, because `fits` is a cluster boundary and the byte after it need not
+/// be a character boundary at all — slicing there would panic.
+fn last_space(text: &str, fits: usize) -> Option<usize> {
+    text.char_indices()
+        .take_while(|(offset, _)| *offset <= fits)
+        .filter(|(_, character)| character.is_whitespace())
+        .map(|(offset, character)| offset + character.len_utf8())
+        .last()
 }
 
 /// The byte ranges of the hard lines in `text`, excluding their terminators.
@@ -517,8 +661,88 @@ mod tests {
     }
 
     #[test]
-    fn the_first_character_of_an_empty_string_still_advances_the_wrap() {
-        assert_eq!(next_boundary(""), 1);
-        assert_eq!(next_boundary("é"), 2);
+    fn a_line_breaks_after_the_last_space_that_fits() {
+        assert_eq!(last_space("one two three", 7), Some(8), "a space at the limit still breaks");
+        assert_eq!(last_space("one two three", 6), Some(4));
+        assert_eq!(last_space("unbreakable", 5), None);
+        // A space that is more than one byte still leaves the break on a
+        // character boundary.
+        assert_eq!(last_space("a\u{a0}b", 1), Some(3));
+    }
+
+    /// The synthetic face, at a size where a character is ten units wide and
+    /// the one kerned pair closes up by two.
+    fn loaded() -> (Fonts, TextStyle) {
+        let mut fonts = Fonts::new();
+        let face = fonts.add(crate::testing::font::test_font());
+        (fonts, TextStyle::new(face, 20.0, Color::WHITE))
+    }
+
+    #[test]
+    fn a_kerned_pair_sets_narrower_than_an_unkerned_one() {
+        let (fonts, style) = loaded();
+        assert_eq!(fonts.measure(&style, "AA"), 20.0);
+        assert_eq!(fonts.measure(&style, "AV"), 18.0, "the pair the face kerns");
+        assert_eq!(fonts.measure(&style, "VA"), 20.0, "kerning is not symmetric");
+        assert_eq!(fonts.measure(&style, "AVA"), 28.0, "one pair in a longer run");
+    }
+
+    #[test]
+    fn drawing_a_kerned_run_advances_exactly_as_far_as_measuring_it_said() {
+        // The invariant the whole module exists to hold, at the point kerning
+        // is most likely to break it: drawing applies the adjustment before the
+        // glyph and measuring only ever sees a sum.
+        let (fonts, style) = loaded();
+        let mut canvas = Canvas::new(200, 40, 1.0);
+        for run in ["AV", "AVAV", "A V", "\tAV", "AVé…"] {
+            let drawn = fonts.draw(&mut canvas, &style, Point::new(0.0, 30.0), run, Color::WHITE);
+            assert_eq!(drawn, fonts.measure(&style, run), "{run:?}");
+        }
+    }
+
+    #[test]
+    fn kerning_reaches_fitting_as_well_as_measuring() {
+        let (fonts, style) = loaded();
+        // Nineteen units is not enough for two characters, but is enough for
+        // two that kern.
+        assert_eq!(fonts.fit(&style, "AV", 19.0), 2);
+        assert_eq!(fonts.fit(&style, "AA", 19.0), 1);
+    }
+
+    #[test]
+    fn a_run_is_cut_between_clusters_and_never_inside_one() {
+        let (fonts, style) = loaded();
+        // `e` and a combining acute: one cluster, and in this face two
+        // characters wide because the mark falls back to `.notdef`.
+        let text = "e\u{301}x";
+        assert_eq!(fonts.fit(&style, text, 15.0), 0, "half a cluster is no cluster");
+        assert_eq!(fonts.fit(&style, text, 20.0), 3, "the whole of it fits");
+        for width in [0.0, 5.0, 12.0, 19.0, 25.0, 40.0] {
+            let fits = fonts.fit(&style, text, width);
+            assert!(grapheme::is_boundary(text, fits), "cut at {fits} for width {width}");
+        }
+    }
+
+    #[test]
+    fn wrapping_breaks_on_cluster_boundaries_even_with_nowhere_to_break() {
+        let (fonts, style) = loaded();
+        // No spaces, so every break is a cut inside the word.
+        let text = "e\u{301}e\u{301}e\u{301}";
+        for (start, end) in fonts.wrap(&style, text, 25.0) {
+            assert!(grapheme::is_boundary(text, start), "line starts at {start}");
+            assert!(grapheme::is_boundary(text, end), "line ends at {end}");
+        }
+        assert_eq!(fonts.wrap(&style, text, 25.0).len(), 3, "one cluster to a line");
+    }
+
+    #[test]
+    fn a_face_with_no_kerning_measures_exactly_as_it_did_before() {
+        // Everything else in the crate asserts widths as a count of characters
+        // times half the size; kerning must not have quietly changed that for
+        // the pairs the face says nothing about.
+        let (fonts, style) = loaded();
+        for word in ["abcd", "Increment", "one two three"] {
+            assert_eq!(fonts.measure(&style, word), word.chars().count() as f32 * 10.0);
+        }
     }
 }

@@ -31,6 +31,19 @@
 //! Every character draws a filled box of a height that depends on which
 //! character it is, so two different words are two different pictures — enough
 //! for a rendering test to tell them apart, and no more than that.
+//!
+//! # What it kerns
+//!
+//! One pair, and a conspicuous one: `A` followed by `V` closes up by a tenth of
+//! an em, so `"AV"` measures a tenth of the text size narrower than any other
+//! two characters and nothing else in the face moves. Enough to prove that a
+//! kerned pair reaches measuring, fitting, wrapping, and drawing alike, and
+//! little enough that every other width in every other test stays arithmetic.
+//!
+//! | at text size | `"AV"` | any other two characters |
+//! |---|---|---|
+//! | 10 | 9.0 | 10.0 |
+//! | 20 | 18.0 | 20.0 |
 
 use crate::font::Font;
 
@@ -61,6 +74,11 @@ const LAST: char = '~';
 /// with — between them they cover the two things a text test needs that plain
 /// ASCII cannot say.
 const EXTRAS: [char; 2] = ['é', '…'];
+
+/// The pairs the face kerns, and by how much, in font units.
+///
+/// See this module's header for why there is exactly one.
+const KERN_PAIRS: [(char, char, i16); 1] = [('A', 'V', -100)];
 
 /// The left edge of every glyph's box, in font units.
 const BOX_LEFT: i16 = 50;
@@ -104,6 +122,7 @@ pub fn test_font_bytes() -> Vec<u8> {
         (*b"head", head()),
         (*b"hhea", horizontal_header()),
         (*b"hmtx", horizontal_metrics(glyph_count)),
+        (*b"kern", kerning(&characters)),
         (*b"loca", loca),
         (*b"maxp", maximum_profile(glyph_count)),
     ])
@@ -270,6 +289,59 @@ fn horizontal_metrics(glyph_count: u16) -> Vec<u8> {
     table
 }
 
+/// The `kern` table: the pairs that sit closer than their advances say.
+///
+/// Format 0 in the OpenType layout — a flat list of glyph pairs — which is the
+/// older of the two ways a font can state kerning and the one a face this small
+/// would really use. The `GPOS` path is exercised by the font module's own
+/// tests, which assemble that table directly.
+fn kerning(characters: &[char]) -> Vec<u8> {
+    let mut pairs: Vec<(u16, u16, i16)> = KERN_PAIRS
+        .iter()
+        .map(|(left, right, value)| {
+            (glyph_for(characters, *left), glyph_for(characters, *right), *value)
+        })
+        .collect();
+    // The format requires the list sorted, so a reader may binary search it.
+    pairs.sort_unstable_by_key(|(left, right, _)| (*left, *right));
+
+    let mut body = Vec::new();
+    push_u16(&mut body, pairs.len() as u16);
+    // searchRange, entrySelector, and rangeShift, which this crate's reader
+    // ignores for the same reason it ignores the directory's.
+    for _ in 0..3 {
+        push_u16(&mut body, 0);
+    }
+    for (left, right, value) in &pairs {
+        push_u16(&mut body, *left);
+        push_u16(&mut body, *right);
+        push_i16(&mut body, *value);
+    }
+
+    let mut table = Vec::new();
+    push_u16(&mut table, 0); // version
+    push_u16(&mut table, 1); // one subtable
+    push_u16(&mut table, 0); // subtable version
+    push_u16(&mut table, (6 + body.len()) as u16); // its length, header included
+    push_u16(&mut table, 0x0001); // format 0, horizontal, added to the advance
+    table.extend(body);
+    table
+}
+
+/// The glyph a character was numbered as, which is its place in the coverage.
+///
+/// # Panics
+///
+/// If the character is not covered, which would mean this module kerns a pair
+/// its own face does not have.
+fn glyph_for(characters: &[char], character: char) -> u16 {
+    let index = characters
+        .iter()
+        .position(|covered| *covered == character)
+        .expect("a kerned character must be one the face covers");
+    index as u16 + 1 // `.notdef` holds zero
+}
+
 /// The `maxp` table: how many glyphs there are.
 fn maximum_profile(glyph_count: u16) -> Vec<u8> {
     let mut table = Vec::new();
@@ -357,6 +429,17 @@ mod tests {
             let glyph = font.glyph_for(character);
             assert_eq!(font.advance(glyph, 20.0), 10.0, "{character} should be half an em");
         }
+    }
+
+    #[test]
+    fn one_pair_kerns_and_no_other_does() {
+        let font = test_font();
+        assert!(font.has_kerning());
+        let glyph = |character| font.glyph_for(character);
+        // A tenth of an em, at a size where an em is twenty units.
+        assert_eq!(font.kerning(glyph('A'), glyph('V'), 20.0), -2.0);
+        assert_eq!(font.kerning(glyph('V'), glyph('A'), 20.0), 0.0, "kerning is not symmetric");
+        assert_eq!(font.kerning(glyph('a'), glyph('b'), 20.0), 0.0);
     }
 
     #[test]
