@@ -34,6 +34,37 @@ pub fn view(counter: &Counter) -> El<Counter> {
     .center()
 }
 
+/// Everything this program would hate to lose across a developer reload.
+///
+/// A count is one number, so it is one number written down. A real application
+/// writes whatever its own format is here — this library never looks inside it.
+#[cfg(feature = "reload")]
+fn save(counter: &Counter) -> Vec<u8> {
+    counter.count.to_string().into_bytes()
+}
+
+/// The state those bytes came from, or why they could not be read.
+#[cfg(feature = "reload")]
+fn restore(saved: &[u8]) -> Result<Counter, String> {
+    let text = std::str::from_utf8(saved).map_err(|error| error.to_string())?;
+    let count = text.trim().parse().map_err(|error: std::num::ParseIntError| error.to_string())?;
+    Ok(Counter { count })
+}
+
 fn main() -> Result<(), rui::Error> {
-    rui::run("Counter", demo(), view)
+    let app = rui::App::new("Counter", demo(), view);
+
+    // Developer reload, and the whole of what it costs at the call site. Off
+    // unless this crate is built with the feature, so an ordinary
+    // `cargo run --example counter` compiles none of it:
+    //
+    //     cargo run -p rui --features reload --example counter
+    //
+    // Then count up to something, edit this file, and in another terminal run
+    // `cargo build -p rui --features reload --example counter`. The window
+    // comes back as the new build, still showing the number.
+    #[cfg(feature = "reload")]
+    let app = app.reloadable(save, restore)?;
+
+    app.run()
 }

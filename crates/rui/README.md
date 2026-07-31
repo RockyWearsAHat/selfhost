@@ -363,6 +363,73 @@ nothing. Animation advances by *elapsed time*, and the library reads no clock �
 it is told how long the last frame took, which is what makes an animation
 assertable in a test.
 
+## Reloading it while you work
+
+Built with the `reload` feature, a window notices that the file it is running
+from has been rebuilt, saves what it is showing, and comes back as the new build
+still showing it.
+
+```rust
+let app = App::new("Counter", Counter { count: 0 }, view);
+
+#[cfg(feature = "reload")]
+let app = app.reloadable(
+    |counter: &Counter| counter.count.to_string().into_bytes(),
+    |saved: &[u8]| {
+        let text = std::str::from_utf8(saved).map_err(|e| e.to_string())?;
+        Ok(Counter { count: text.parse().map_err(|e: ParseIntError| e.to_string())? })
+    },
+);
+
+app.run()
+```
+
+```
+cargo run -p rui --features reload --example counter
+cargo build -p rui --features reload --example counter   # in another terminal
+```
+
+**It is a restart, not hot module replacement.** Nothing is patched into a live
+process: the program writes its state down, replaces itself with the new
+executable, and reads the state back. The window closes and opens, and anything
+that was in flight — a thread, an open socket — is gone unless `save` carried
+it.
+
+What a restart buys instead is that it survives *any* edit. A change to a widget,
+a layout rule, the renderer, or a field of your own `struct` all reload the same
+way, because what comes back is a whole program rather than a fragment being
+reconciled with an old one. For a language that costs a compile either way, that
+trade is the right one: no dynamic linking, no stable ABI, no `unsafe`, and no
+dependency — the application supplies its own `save` and `restore`, so the
+library never learns what your state is.
+
+It is cheap here because a view is a plain `fn(&S) -> El<S>` and this library
+keeps no state but `Memory`. There is no widget tree to rebuild and nothing to
+migrate: restore the state, describe a frame from it, and the interface is right
+by construction.
+
+| carried over | not carried over |
+|---|---|
+| your state, as far as your `save` and `restore` carry it | the pointer's hover, and what was being pressed |
+| scroll offsets, and which element had the keyboard | the caret's offset within a field |
+| | how far each animation had eased |
+| | the window's size and position |
+
+Scroll and focus are restored by *position in the frame's traversal*, not by
+`Id` — an `Id` is a hash of an element's path through the tree, and the edit
+being reloaded is quite likely what changed that path. Position is the same
+guess a person makes, and it is right whenever the edit was below or beside the
+list rather than above it. The first frame after a restart is described before
+those offsets are known, so a scrolled list jumps into place on the frame after
+it.
+
+The feature is off by default and compiled out entirely, because a released
+program should not watch a file on every frame or be able to restart itself. It
+reads no clock: the trigger is a comparison of two modification times the
+filesystem reported. A test cannot observe any of it — the watch is armed by
+`App::run` and by nothing else, so `App::render` and `testing::Harness` behave
+exactly as they do without the feature.
+
 ## Using it
 
 ```toml
