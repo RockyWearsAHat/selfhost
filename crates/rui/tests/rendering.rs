@@ -60,6 +60,22 @@ fn an_empty_window_is_marked_nowhere() {
 }
 
 #[test]
+fn an_application_may_paint_the_ground_its_interface_sits_on() {
+    // The seam: the application's ground replaces the library's clear, through
+    // the same frame a window draws — see [`App::ground`].
+    let claret = Color::rgb(0x20, 0x08, 0x08);
+    let app = App::new("grounded", Nothing, |_: &Nothing| col(()))
+        .ground(move |canvas, _| canvas.clear(claret));
+    let mut harness = Harness::with_app(app).size(200.0, 100.0);
+    harness.frame();
+
+    assert_eq!(harness.pixel(100, 50), Some(claret), "the ground is the application's");
+    // What `marked` calls "nothing was drawn here" comes from the same ground,
+    // so an empty window over a custom ground still counts as empty.
+    assert!(!harness.marked(rui::Rect::new(0.0, 0.0, 200.0, 100.0)));
+}
+
+#[test]
 fn the_same_description_twice_is_the_same_picture() {
     // What the loop relies on to decide it has nothing to present: a frame that
     // came out identical is one the screen already shows. A renderer with any
@@ -413,6 +429,103 @@ fn an_easing_an_application_names_hover_is_not_the_hover_the_library_eases() {
 fn grey(value: f32) -> Color {
     let level = (value.clamp(0.0, 1.0) * 255.0).round() as u8;
     Color::rgb(level, level, level)
+}
+
+// ----- the light an element casts ------------------------------------------
+
+/// A plate of a known size, with `decorate` applied to it.
+fn lit(decorate: fn(El<Nothing>) -> El<Nothing>) -> El<Nothing> {
+    col(decorate(col(()).size(60.0, 30.0).fill(Tone::Surface).key("plate")))
+        .pad(20.0)
+        .align(Align::Start)
+}
+
+#[test]
+fn a_glow_carries_a_hue_where_a_shadow_stays_the_absence_of_light() {
+    // The two are deliberately different things. A shadow says a panel is lying
+    // on the window; a glow says the thing is live — so one is the theme's own
+    // black and the other is whatever colour it was asked for.
+    let mut plain = showing(|_| lit(|el| el));
+    let mut glowing = showing(|_| lit(|el| el.glow(8.0, Color::rgb(255, 40, 40))));
+    let mut shadowed = showing(|_| lit(|el| el.shadow(8.0)));
+    plain.frame();
+    glowing.frame();
+    shadowed.frame();
+
+    let plate = plain.find_key("plate").expect("the plate is on screen").rect;
+    let (x, y) = ((plate.x - 3.0) as u32, plate.center().y as u32);
+    let ground = plain.pixel(x, y).expect("a pixel");
+    let halo = glowing.pixel(x, y).expect("a pixel");
+    let shade = shadowed.pixel(x, y).expect("a pixel");
+
+    let hue = |color: Color| color.r as i32 - color.b as i32;
+    assert_ne!(halo, ground, "the halo never reached outside the element");
+    assert!(hue(halo) > hue(ground), "a glow should carry the colour it was given");
+    assert!((hue(shade) - hue(ground)).abs() <= 1, "a shadow must never take a hue");
+    assert!(shade.luminance() < ground.luminance(), "and it darkens what it falls on");
+}
+
+#[test]
+fn a_glow_is_cast_evenly_where_a_shadow_falls_downward() {
+    // What says a panel is *lying* on the window is that the light comes from
+    // above. A halo has no light to come from anywhere: it is the light.
+    let mut glowing = showing(|_| lit(|el| el.glow(8.0, Color::rgb(255, 40, 40))));
+    let mut shadowed = showing(|_| lit(|el| el.shadow(8.0)));
+    glowing.frame();
+    shadowed.frame();
+
+    let plate = glowing.find_key("plate").expect("on screen").rect;
+    let x = plate.center().x as u32;
+    let read = |harness: &Harness<Nothing>, y: f32| {
+        harness.pixel(x, y as u32).expect("a pixel").luminance()
+    };
+    let ground = read(&glowing, plate.y - 12.0);
+
+    assert!(read(&glowing, plate.y - 3.0) > ground, "a halo reaches above what casts it");
+    assert!(
+        read(&shadowed, plate.y - 3.0) >= read(&shadowed, plate.max_y() + 3.0),
+        "a shadow should be deeper below the panel than above it"
+    );
+}
+
+// ----- an application's own loop -------------------------------------------
+
+/// A sweep reporting where its loop has got to, as a grey.
+///
+/// The phase *is* the pixel, so a test reads the loop off the buffer exactly
+/// rather than inferring it from something moving.
+fn sweep(_: &Nothing) -> El<Nothing> {
+    col(draw(Size::new(60.0, 30.0), |painter, rect| {
+        let phase = painter.phase("sweep", 1.0);
+        painter.fill(rect, Radius::None, grey(phase));
+    })
+    .key("sweep")
+    .label("Sweep"))
+}
+
+#[test]
+fn an_applications_own_loop_comes_round_and_keeps_the_window_awake() {
+    let mut harness = Harness::new(Nothing, sweep).size(200.0, 100.0);
+    let read = |harness: &mut Harness<Nothing>| {
+        let rect = harness.find_key("sweep").expect("the sweep is on screen").rect;
+        harness.pixel(rect.center().x as u32, rect.center().y as u32).expect("a pixel").r
+    };
+
+    harness.frame();
+    let started = read(&mut harness);
+    assert!(harness.is_animating(), "a loop that never arrives has to keep drawing");
+
+    // A quarter of a second of a one-second loop, stepped rather than waited
+    // for: nothing here reads a clock either.
+    harness.frames(15);
+    let quarter = read(&mut harness);
+    assert!(quarter > started, "the loop should have moved on: {started} then {quarter}");
+
+    // And past the end of it, where a value that merely counted up would not go.
+    harness.frames(45);
+    let round = read(&mut harness);
+    assert!(round < quarter, "the loop should have come back round, and stopped at {round}");
+    assert!(harness.is_animating(), "a loop does not settle");
 }
 
 #[test]

@@ -286,7 +286,7 @@ impl Surface {
         // built here, so a window and a test cannot come to disagree about what
         // the interface looks like. See [`App::theme`].
         let theme = app.theme_for(window.appearance(), self.ui_font, self.mono_font);
-        self.drawn.clear_vertical(theme.palette.background, theme.palette.background_deep);
+        app.paint_ground(&mut self.drawn, &theme);
         app.frame(&mut self.drawn, fonts, &self.input, &mut self.memory, &theme);
         self.memory.end_frame(&self.input);
         self.serve_requests(window)?;

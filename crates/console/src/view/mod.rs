@@ -10,20 +10,37 @@
 //!
 //! Above both, two full-width strips that are about the machine rather than
 //! about any one service: a masthead naming what this is and whether it is
-//! connected, and a readout bank carrying the machine's own account of itself
-//! beside the counts behind it. They are strips and not cards because they are
-//! read in a glance and never dwelt on — the vertical space a card spends on
-//! its own edges is space the log below it does not get.
+//! connected, and a readout bank in which the machine states its own condition
+//! in a sentence, cites the counts it read that off, and says what it is about
+//! to do next. They are strips and not cards because they are read in a glance
+//! and never dwelt on — the vertical space a card spends on its own edges is
+//! space the log below it does not get.
+//!
+//! The sentence is the largest type in the window. That is the one hierarchy
+//! decision everything else here defers to: the console's job is to tell the
+//! operator what is going on before being asked, and a report is a line of
+//! words. Numbers sit under it as what it was read off, never beside it as its
+//! equals — see [`bank`].
+//!
+//! The bank's other half is the tense the sentence cannot use. A condition is
+//! written in the present: it says what the machine *is*. A supervisor that has
+//! put a service in backoff has also decided what it will do and when, and that
+//! is knowledge the console holds and used to throw away — so the right-hand
+//! half of the bank states the next move and offers the one control that
+//! changes it. See [`next_move`], which is where the deciding happens.
 //!
 //! # What holds it together
 //!
 //! Rules, not boxes. Each block is introduced by a small-capital label with a
-//! hairline running from it to the far edge, which states where the block ends
-//! without drawing an outline around it. Nesting outlines is what made an
+//! ticked hairline running from it to the far edge, which states where the block
+//! ends without drawing an outline around it. Nesting outlines is what made an
 //! earlier revision read as a diagram of an interface rather than as one: four
 //! rounded cards inside a rounded panel inside a window is three frames around
-//! every fact. There are three framed surfaces on screen — the readout bank, the
-//! rail and the detail pane — and everything inside them is separated by ruling.
+//! every fact. There are four framed surfaces on screen — the masthead strip,
+//! the readout bank, the rail and the detail pane — and everything inside them
+//! is separated by ruling. Each is a chamfered plate marked at its corners by
+//! brackets, which is the console's whole frame: an outline that says where a
+//! reading is taken, and nothing inside it repeating the claim.
 //!
 //! What each mark is *made* of, and why the console's own marks are chamfered
 //! while everything the operator presses keeps the desktop's shape, is
@@ -45,7 +62,7 @@ use install::InstallForm;
 use rui::style::Justify;
 use rui::{
     Align, App, El, Radius, Role, Status, Tone, button, caption, col, figure, heading, micro,
-    paragraph, row, section, spacer, text, title,
+    paragraph, row, spacer, text, title,
 };
 use selfhost_supervisor::state::{ServiceState, ServiceStatus};
 use std::net::SocketAddr;
@@ -72,14 +89,55 @@ const RAIL_MAX: f32 = 300.0;
 const ROW_HEIGHT: f32 = 42.0;
 
 /// How tall the masthead is: the mark, the name, and what it is connected to.
-const MASTHEAD: f32 = 28.0;
+const MASTHEAD: f32 = 30.0;
+
+/// How far the wordmark's capitals are opened up.
+///
+/// More than any heading in the window, because it is the one piece of type that
+/// is not reporting anything: a name held open reads as a plate screwed to the
+/// front of an instrument, which is what the strip carrying it is.
+const WORDMARK: f32 = 2.4;
+
+/// How far the corners of a strip — the masthead, an alert — are chamfered.
+///
+/// Smaller than a plate's, because the shape has less edge to run along; the
+/// same cut on a thirty-unit strip would take a third of its height off each
+/// end.
+const STRIP_CUT: f32 = 5.0;
+
+/// How far a row in the rail is chamfered.
+const ROW_CUT: f32 = 4.0;
+
+/// How far the halo around the chosen row reaches past it.
+const CHOSEN_GLOW: f32 = 7.0;
 
 /// How tall the readout bank is.
 ///
-/// Taller than the strip it replaces. It carries the one line that reads as the
-/// machine speaking — the condition — beside the counts that back it up, and a
-/// sentence set at fifteen units in a cell of forty-six had nowhere to sit.
+/// Unchanged by the restaging that put the condition above the counts rather
+/// than beside them, and deliberately so: a label stacked over a figure and a
+/// sentence stacked over a line of readings come to the same two lines of type,
+/// so the bank now says something quite different for exactly the height it
+/// cost before. Height is what the log below it does not get, and a change in
+/// hierarchy should not be charged to the log.
 const BANK: f32 = 54.0;
+
+/// What share of the bank the next move takes, at the far end of it.
+///
+/// A share and not a width, for the reason [`RAIL_SHARE`] is one: the condition
+/// is a sentence whose length nobody controls, and a fixed column beside it
+/// would be a third of the smallest window and a tenth of the largest.
+///
+/// Stated against the bank rather than grown from what the block asks for, and
+/// that is the part worth defending. The block's own content is a countdown —
+/// `retries in 40s`, then `retries in 9s` a moment later — so a block sized to
+/// it would be a block that changed width every time the daemon answered, and
+/// the control at the end of it would walk left and right under the pointer
+/// reaching for it. A share holds the button still while the words inside it
+/// change, which is the whole of what a strip of instruments is for.
+const NEXT_SHARE: f32 = 0.34;
+
+/// The widest it is drawn, past which it is a short line of words in a hall.
+const NEXT_MAX: f32 = 380.0;
 
 /// How long the loop waits for input before drawing again anyway.
 ///
@@ -117,7 +175,7 @@ impl Console {
     /// Opens the window and runs until it is closed.
     pub fn run(self, title: String) -> Result<(), rui::Error> {
         let running = Arc::clone(&self.running);
-        App::new(title, self, view)
+        application(title, self)
             .size(980.0, 680.0)
             .min_size(560.0, 420.0)
             .idle_timeout(IDLE_REDRAW)
@@ -174,6 +232,17 @@ impl Console {
     }
 }
 
+/// The console as an application, drawn in the console's own theme.
+///
+/// One place, so that a frame drawn by a test is the frame the window shows.
+/// The palette reaches every widget through [`rui::App::theme`] and nowhere
+/// else, and an `App` built without it would be this same layout in the
+/// library's own colours — which is a thing worth being unable to do by
+/// accident. See [`style::theme`].
+pub(crate) fn application(title: impl Into<String>, console: Console) -> App<Console> {
+    App::new(title, console, view).theme(style::theme).ground(style::ground)
+}
+
 /// The whole console, as one description.
 pub fn view(console: &Console) -> El<Console> {
     let snapshot = console.snapshot();
@@ -203,19 +272,37 @@ pub fn view(console: &Console) -> El<Console> {
 /// drawn around one word, and here the word is `CONNECTED` on nearly every
 /// frame the console ever draws — so the capsule was chrome that lit the top of
 /// the window green to say that nothing was wrong.
+///
+/// While the console is still reaching — the first poll, or an `ssh` that has
+/// been started and is not forwarding yet — the lamp is a sweep going round
+/// instead. That is the one place a loop is worth the frames it asks for: a
+/// connection being made is a fact with a duration, and a still mark for it says
+/// only that something is amber.
 fn header(console: &Console, snapshot: &Snapshot) -> El<Console> {
     let (status, label, detail) =
         connection_summary(snapshot, console.address, console.via.as_deref());
+    let reaching =
+        snapshot.link == Link::Connecting || matches!(snapshot.tunnel, Some(Tunnel::Opening));
 
     row((
         style::mark(),
-        title("selfhost").align_self(Align::Center),
+        title("SELFHOST").tracking(WORDMARK).align_self(Align::Center),
+        // The instrument's designation, in the voice a block label uses. A
+        // wordmark alone names a product; a wordmark with what the instrument
+        // *is* set quietly beside it names a machine's front panel, and the
+        // masthead is the one strip in the window that is a panel rather than
+        // a reading.
+        heading("SUPERVISOR CONSOLE").tracking(1.8).align_self(Align::Center),
         style::rule(),
-        style::state_mark(status, label.to_uppercase()),
+        style::link_mark(status, label.to_uppercase(), reaching),
         micro(detail).max_w(300.0).align_self(Align::Center),
     ))
     .gap(10.0)
     .h(MASTHEAD)
+    .pad_x(10.0)
+    .border(1.0, Tone::Border)
+    .round(Radius::Cut(STRIP_CUT))
+    .add(style::brackets(Tone::Border))
 }
 
 /// What the header says about the connection: a state, a word, and a detail.
@@ -319,82 +406,136 @@ fn alert(status: Status) -> El<Console> {
         .gap(9.0)
         .fill(Tone::tint(status))
         .border(1.0, ink)
-        .round(Radius::Control)
+        // Cut and bracketed in the status's own hue, like every other surface
+        // the console reports on — an alert is the one that has pushed its way
+        // in above the panes, and a strip that arrived wearing the desktop's
+        // shape would read as a dialog rather than as a reading.
+        .round(Radius::Cut(STRIP_CUT))
         .color(ink)
+        .add(style::brackets(ink))
 }
 
-/// The readout bank: what the machine has to say about itself, and the counts
-/// behind it.
+/// The readout bank: the machine's own account of itself, and the counts it
+/// rests on.
 ///
-/// One surface with hairlines through it, not four cards with a gap between
-/// them. Four cards spend four sets of edges, four corner radii, and four
-/// shadows on four small numbers, and they were taking a fifth of the window's
-/// height to do it. The readings belong together — they are readings off the
-/// same machine — so they are drawn as one instrument that happens to be ruled.
+/// One surface, not four cards with a gap between them. Four cards spend four
+/// sets of edges, four corner radii, and four shadows on four small numbers,
+/// and they were taking a fifth of the window's height to do it.
 ///
-/// # The condition is a sentence, and it comes first
+/// # The sentence is the report; the counts are its evidence
 ///
-/// The leading cell is [`condition`]: one line, in words, saying what the
-/// machine amounts to right now. It is the only text in the window that is
-/// about the *whole* installation rather than about one service, and it is what
-/// turns four numbers into a report. The numbers stay because a sentence cannot
-/// say `2/4`, and the sentence stays because four numbers do not say whether
-/// that is fine.
+/// [`condition`] is one line, in words, saying what the machine amounts to
+/// right now. It is the only text in the window about the *whole* installation
+/// rather than about one service, and it is the console's answer to the
+/// question anybody actually opened it with. So it is set at the largest size
+/// the type scale has and given the width of the window to be a sentence in.
 ///
-/// The count of services is gone from the bank: `RUNNING 2/4` already states
-/// the total, and the rail's own heading states it again beside the list it
-/// belongs to. A cell that repeats its neighbour's denominator is a cell spent
-/// on nothing.
+/// The counts used to sit beside it in cells of their own, three figures at the
+/// same size as each other and larger than the line that interpreted them —
+/// which made the bank a row of four equals where only one of them was a
+/// verdict. `2/4` is not a report. It is what the report is *based on*, and it
+/// now reads as that: one quiet line underneath, in the size a citation is set
+/// in. Nothing was removed; the hierarchy was.
+///
+/// There is no `CONDITION` label above the sentence any more. A block in this
+/// window is introduced by a small-capital label because a block holds several
+/// facts and the label says what they have in common — and a single sentence
+/// naming its own subject does not need telling that it is a condition. The
+/// masthead carries no label either, for the same reason.
+///
+/// With nothing installed there is nothing for the counts to be evidence of,
+/// and `RUNNING 0/0 · RESTARTS 0 · ATTENTION 0` is three readings of a machine
+/// that has not been asked to do anything. The line goes; the sentence still
+/// says what is happening.
+///
+/// # What the other half is for
+///
+/// Report on the left, intention on the right, and the two are different tenses
+/// rather than two halves of one statement — which is why they are set as two
+/// columns and not as one wrapping paragraph. The right-hand half appears only
+/// when there is a next move to state; on a machine with nothing outstanding
+/// the bank is the sentence and its evidence, exactly as it was, and the room
+/// is left empty rather than filled with a line saying that nothing is
+/// happening. An instrument that reports when it has nothing to report is an
+/// instrument nobody reads.
 fn bank(snapshot: &Snapshot) -> El<Console> {
+    style::plate(
+        row((
+            live_share(snapshot).map(style::gauge),
+            col((figure(condition(snapshot)), evidence(snapshot)))
+                .gap(3.0)
+                .justify(Justify::Center)
+                .grow(),
+            next_move(snapshot).map(upcoming),
+        ))
+        .gap(12.0)
+        .h(BANK)
+        // The plate's own padding, applied here instead: the surface has to
+        // carry the sentence's full height itself, so it is the strip
+        // inside that is inset — and at the same twelve units every other
+        // plate in the window insets by, or the report would start a
+        // couple of units off the line SERVICES starts on.
+        .pad_x(12.0),
+    )
+    .pad_y(0.0)
+    .pad_x(0.0)
+}
+
+/// How much of the machine is up, as a share, or `None` with nothing installed.
+///
+/// The gauge drawn from it is the one mark in the bank that is read without
+/// being read *out*: an arc at a quarter and an arc at a whole turn are told
+/// apart across a room, which is what a strip glanced at from a desk chair is
+/// for. It states the same ratio the RUNNING reading beside it does, and that
+/// repetition is the point — the words are the exact figure and the arc is the
+/// proportion, and neither is the other.
+///
+/// Absent for the same reason the readings are: on a machine with nothing
+/// installed, an empty gauge would report that none of nothing is running.
+fn live_share(snapshot: &Snapshot) -> Option<f32> {
     let total = snapshot.services.len();
+    if total == 0 {
+        return None;
+    }
+    let running = snapshot.services.iter().filter(|service| service.state.is_live()).count();
+    Some(running as f32 / total as f32)
+}
+
+/// The counts the condition was read off, or nothing when there is none.
+///
+/// Exactly one of them can raise its voice, and it is the one that means
+/// somebody has to do something. A ratio is not a verdict — a service the
+/// operator stopped on purpose would turn RUNNING amber and leave it amber for
+/// the rest of the day — and a restart is something that already happened and
+/// that the supervisor already handled. A colour spent on either is a colour the
+/// reader learns to look past, which is the colour ATTENTION needs to still be
+/// worth something.
+///
+/// The count of services is not among them: `RUNNING 2/4` already states the
+/// total, and the rail's own heading states it again beside the list it belongs
+/// to. A reading that repeats its neighbour's denominator is spent on nothing.
+fn evidence(snapshot: &Snapshot) -> Option<El<Console>> {
+    let total = snapshot.services.len();
+    if total == 0 {
+        return None;
+    }
     let running = snapshot.services.iter().filter(|service| service.state.is_live()).count();
     let attention =
         snapshot.services.iter().filter(|service| service.state.needs_attention()).count();
     let restarts: u64 = snapshot.services.iter().map(|service| service.total_restarts).sum();
 
-    // Exactly one of these can raise its voice, and it is the one that means
-    // somebody has to do something. A ratio is not a verdict — a service the
-    // operator stopped on purpose would turn RUNNING amber and leave it amber
-    // for the rest of the day — and a restart is something that already
-    // happened and that the supervisor already handled. A colour spent on
-    // either is a colour the reader learns to look past, which is the colour
-    // ATTENTION needs to still be worth something.
-    let counts = [
-        ("RUNNING", format!("{running}/{total}"), None),
-        ("RESTARTS", restarts.to_string(), None),
-        (
-            "ATTENTION",
-            attention.to_string(),
-            (attention > 0).then_some(Status::Bad),
-        ),
-    ];
-
-    let mut cells: Vec<El<Console>> = vec![condition_cell(snapshot)];
-    for (label, value, alarm) in counts {
-        cells.push(spacer().w(1.0).fill(Tone::Border).pad_y(6.0));
-        let ink = alarm.map_or(Tone::Text, Tone::ink);
-        cells.push(cell(label, figure(value).color(ink)).grow());
-    }
-
-    style::plate(row(cells).h(BANK)).pad_y(0.0).pad_x(0.0)
-}
-
-/// The leading cell: the machine's own account of itself.
-///
-/// It grows harder than the counts beside it, because a sentence needs room to
-/// be a sentence and a count is four characters wide whatever room it is given.
-/// A share and not a minimum: a minimum is added to a growing child's share
-/// rather than absorbed by it, so a floor of 150 units here took the counts down
-/// to 72 at the smallest window the backend allows — narrow enough that
-/// `ATTENTION` was drawn as `ATTEN…`, which is a label that has stopped being
-/// one.
-fn condition_cell(snapshot: &Snapshot) -> El<Console> {
-    cell("CONDITION", text(condition(snapshot)).text_size(15.0)).grow_by(2.2)
-}
-
-/// One reading: a small-capital label, and the value under it.
-fn cell(label: &'static str, value: El<Console>) -> El<Console> {
-    col((heading(label), value)).gap(3.0).justify(Justify::Center).pad_x(12.0)
+    Some(
+        row((
+            style::reading("RUNNING", format!("{running}/{total}"), None),
+            style::reading("RESTARTS", restarts.to_string(), None),
+            style::reading(
+                "ATTENTION",
+                attention.to_string(),
+                (attention > 0).then_some(Status::Bad),
+            ),
+        ))
+        .gap(18.0),
+    )
 }
 
 /// What the machine amounts to, in one line.
@@ -437,14 +578,197 @@ fn condition(snapshot: &Snapshot) -> String {
     }
 }
 
+/// What the machine is about to do, and the one control that changes it.
+///
+/// Held as a struct rather than a formatted line because the block draws four
+/// separate marks from it — a lamp, a headline, its evidence, and a control —
+/// and a function that returned a sentence would have the view unpicking it
+/// again to find the service name to send the command about.
+struct NextMove {
+    /// How pressing the state is, which is what its lamp is lit from.
+    status: Status,
+    /// What is going to happen, in words: `backups retries in 40s`.
+    headline: String,
+    /// What that was read off, and what else is queued behind it.
+    detail: String,
+    /// The word on the control, and what pressing it asks the poller for.
+    control: (&'static str, Command),
+}
+
+/// What the machine will do next by itself, or `None` when it will do nothing.
+///
+/// Pure, and tested apart from the drawing, for the same reason [`condition`]
+/// is: this is the piece with the judgement in it, and the judgement is the
+/// whole of the block.
+///
+/// # Nothing is claimed about a machine that is not answering
+///
+/// A countdown is a live number. `retries in 40s` read off a poll that failed
+/// is not stale in the way a count is stale — it is wrong, and it goes on
+/// counting down convincingly while nothing at all is happening on the server.
+/// So a lost link or a broken tunnel suppresses the block outright, in the same
+/// order [`condition`] puts them: whether anyone is answering comes before
+/// anything they might have said.
+///
+/// # What gets the space when several want it
+///
+/// Whatever has a *when* first, soonest first — and that is the whole rule.
+///
+/// It is worth saying why this is not ranked by severity, because severity is
+/// the obvious answer and it is wrong here. A service that cannot start is
+/// already stated four times over on this screen: the condition names it, the
+/// ATTENTION count counts it, its row is lit red, and its state word is one of
+/// the two in the rail set in a colour. A supervisor quietly counting down to
+/// its third restart of `backups` is stated nowhere. Repeating the loudest fact
+/// in the window in the one place that had room for a new one is how a strip
+/// full of readings comes to say one thing.
+///
+/// So the block leads with the move that has a clock on it, and falls back to
+/// what has stalled — `Cannot start`, `Gave up` — only when nothing is
+/// scheduled, where it earns its place by carrying the reason and the control
+/// rather than the name a reader already has.
+///
+/// [`ServiceState::Starting`] and [`ServiceState::Stopping`] are deliberately
+/// not candidates. Both are moves already under way rather than ones about to
+/// be made, neither carries a time to state, and the only control that would
+/// change either is the one that fights it.
+fn next_move(snapshot: &Snapshot) -> Option<NextMove> {
+    if matches!(snapshot.tunnel, Some(Tunnel::Broken { .. })) || snapshot.link != Link::Connected {
+        return None;
+    }
+
+    let mut candidates: Vec<(u8, u64, NextMove)> =
+        snapshot.services.iter().filter_map(outstanding).collect();
+    // Sorted rather than picked with a minimum so that the count of what is left
+    // is the count of what this one is standing in front of, not a second walk
+    // that could disagree with the first about which was chosen.
+    candidates.sort_by_key(|(rank, due, _)| (*rank, *due));
+
+    let mut waiting = candidates.into_iter();
+    let (_, _, mut next) = waiting.next()?;
+    match waiting.count() {
+        0 => {}
+        1 => next.detail = format!("{} · 1 more waiting", next.detail),
+        more => next.detail = format!("{} · {more} more waiting", next.detail),
+    }
+    Some(next)
+}
+
+/// What one service is waiting on, ranked, or `None` when it wants nothing.
+///
+/// The rank is the order [`next_move`] argues for and the number beside it is
+/// how soon, in seconds, so that two services in backoff are separated by which
+/// one moves first rather than by where they happen to sit in the list.
+fn outstanding(service: &ServiceStatus) -> Option<(u8, u64, NextMove)> {
+    /// A move the supervisor has already scheduled.
+    const SOON: u8 = 0;
+    /// A service that has stopped and will not resume without being asked.
+    const STALLED: u8 = 1;
+
+    let name = display_name(service);
+    let (status, ..) = present(&service.state);
+    let move_of = |headline, detail, control| NextMove { status, headline, detail, control };
+
+    match &service.state {
+        ServiceState::Backoff { retry_in_secs, attempt } => Some((
+            SOON,
+            *retry_in_secs,
+            move_of(
+                format!("{name} retries in {}", duration(*retry_in_secs)),
+                format!("attempt {attempt}"),
+                // Restart and not Start: the supervisor is going to make this
+                // attempt anyway, and what the operator is asking for is that it
+                // be made now instead of at the end of the delay. Restart is the
+                // one command the daemon accepts whatever the state.
+                ("Retry now", Command::Restart(service.name.clone())),
+            ),
+        )),
+        ServiceState::GaveUp { attempts, reason } => Some((
+            STALLED,
+            0,
+            move_of(
+                format!("{name} gave up after {attempts} attempts"),
+                reason.clone(),
+                ("Start", Command::Start(service.name.clone())),
+            ),
+        )),
+        ServiceState::Unstartable { reason } => Some((
+            STALLED,
+            0,
+            move_of(
+                format!("{name} cannot start"),
+                reason.clone(),
+                // Offered even though it will fail again until whatever the
+                // reason names is fixed. That is what makes it the control that
+                // changes the outcome: it is the thing to press *after* fixing
+                // it, and a console that hid it would leave the operator
+                // hunting the rail for a way to try again.
+                ("Start", Command::Start(service.name.clone())),
+            ),
+        )),
+        _ => None,
+    }
+}
+
+/// The next move, drawn at the far end of the bank.
+///
+/// A hairline stands between it and the condition. The alternative was a second
+/// plate, and two surfaces touching along an edge is the four-cards defect the
+/// bank was restaged to be rid of — the strip is one instrument reporting two
+/// tenses, and one rule is what says so without drawing a box to say it.
+///
+/// The control is an ordinary button and not the primary one. The accent is
+/// spent on the action a screen is *for* and on which row is chosen, and the
+/// pane below already carries a primary; a second one on the same screen would
+/// make the accent mean "a button" rather than "the action". What earns this
+/// button its notice is that it is the only control in the window that is about
+/// a service the operator did not select.
+///
+/// The headline is the one line of ordinary type in the window set in a status's
+/// own hue, and it is set in one under exactly the rule [`style::state_ink`]
+/// applies everywhere else: a countdown is amber because something is waiting,
+/// and a service that has stalled is red because something has stopped. Neither
+/// appears without a cause, because the block itself does not.
+fn upcoming(next: NextMove) -> El<Console> {
+    let (label, command) = next.control;
+    row((
+        style::standing_rule(),
+        style::lamp(next.status),
+        col((
+            text(next.headline).text_size(13.5).color(style::state_ink(next.status)),
+            caption(next.detail),
+        ))
+            .gap(1.0)
+            .grow()
+            .justify(Justify::Center),
+        button(label)
+            .on_click(move |console: &mut Console| console.request(command.clone()))
+            .align_self(Align::Center),
+    ))
+    .gap(10.0)
+    .w(rui::Length::Fraction(NEXT_SHARE))
+    .max_w(NEXT_MAX)
+}
+
 /// The rail of services, and the button that adds one.
 ///
-/// The button is pinned to the bottom edge and runs the full width, rather than
-/// sitting beside the heading. Two reasons, and the second is the one that
-/// matters: a list rarely fills its rail, so the space under the last row was
-/// the largest empty area in the window; and an action that adds to a list
-/// belongs at the end of it, where the eye already is once it has read the list
-/// and not found what it wanted.
+/// The button runs the full width and follows the last row, rather than sitting
+/// beside the heading or pinned to the foot of the rail. An action that adds to
+/// a list belongs at the end of the list, where the eye already is once it has
+/// read down it and not found what it wanted.
+///
+/// It used to be pinned to the bottom edge, and the reason given for that was
+/// that a list rarely fills its rail and the room under the last row was the
+/// largest empty area in the window. That is a true observation and the wrong
+/// conclusion — pinning the button to the floor does not spend the room, it
+/// puts the room *above* the button, which is the one place a gap cannot be
+/// read as a list that has ended. Four services followed by a hand's width of
+/// nothing and then a control read as a row that had failed to draw. Below the
+/// button the same emptiness reads as what it is: a rail with space for more.
+///
+/// The list keeps its own scrolling, so a rail with more services than fit
+/// still shows them all — what shrinks when the room runs out is the list,
+/// which was going to be scrolled anyway, and never the button.
 fn rail(snapshot: &Snapshot) -> El<Console> {
     let rows: Vec<El<Console>> = snapshot
         .services
@@ -461,20 +785,24 @@ fn rail(snapshot: &Snapshot) -> El<Console> {
         })
         .wrap()
         .center_text())
-        .grow()
         .pad_y(24.0)
     } else {
         // A list of items, said as one. The role is what gives each row its
         // place in a set of four without anybody counting, and it is why a row
         // states its selection with `.selected` rather than with a fill: a
         // colour was never a semantic.
-        col(rows).grow().gap(2.0).scroll().role(Role::List)
+        col(rows).gap(2.0).scroll().role(Role::List)
     };
 
     style::plate((
-        section("SERVICES", Some(snapshot.services.len().to_string())),
+        style::section_rule("SERVICES", Some(snapshot.services.len().to_string())),
         list,
         button("+  ADD SERVICE").on_click(|console: &mut Console| console.form_mut().open_blank()),
+        // The room the list did not need, kept below everything rather than
+        // between the list and the button. It grows so that it is what gives
+        // way first when the list is long: a rail that has run out of room
+        // takes it back from here before it takes anything from the list.
+        spacer().grow(),
     ))
     .gap(8.0)
     // A share of the window, held between a minimum and a maximum: the layout
@@ -490,12 +818,19 @@ fn rail(snapshot: &Snapshot) -> El<Console> {
 /// The state's word is quiet unless it needs looking at, and the lamp carries
 /// it the rest of the time — see [`style::state_ink`] for why a rail where
 /// every healthy row is lit green cannot say when one is not.
+///
+/// The chosen row is *lit* rather than washed: a cyan hairline and a faint halo
+/// in the same colour, over the ground every other row sits on. A wash of the
+/// accent is what a desktop list does, and on a ground this dark it is a change
+/// of value so small that the wedge was doing all the work anyway — while an
+/// outline that glows is what a selected plate looks like on an instrument, and
+/// it is the second of the two places in the window a glow is spent.
 fn service_row(service: &ServiceStatus, chosen: bool) -> El<Console> {
     let name = service.name.clone();
     let (status, _, summary) = present(&service.state);
     let state_label = service.state.label().to_uppercase();
 
-    row((
+    let row = row((
         style::wedge(chosen),
         style::lamp(status),
         col((
@@ -519,18 +854,16 @@ fn service_row(service: &ServiceStatus, chosen: bool) -> El<Console> {
     .h(ROW_HEIGHT)
     .gap(7.0)
     .pad_x(6.0)
-    .round(Radius::Control)
-    // A wash of the accent, and no outline: a filled row that is also outlined
-    // in the same hue is a row wearing two selections, and against the hovered
-    // row beside it the fill alone is already the difference.
-    .fill(if chosen { Tone::Selection } else { Tone::Clear })
+    .round(Radius::Cut(ROW_CUT))
     .hover_fill(Tone::Raised)
     .role(Role::ListItem)
     .selected(chosen)
     .on_click(move |console: &mut Console| {
         let name = name.clone();
         console.with_snapshot(|snapshot| snapshot.selected = Some(name));
-    })
+    });
+
+    if chosen { row.border(1.0, Tone::Accent).glow(CHOSEN_GLOW, Tone::Accent) } else { row }
 }
 
 /// The right-hand pane: the form if it is open, and the selected service if not.
@@ -670,7 +1003,7 @@ mod tests {
             ui_font: FontId::FIRST,
             mono_font: FontId::FIRST,
         };
-        let mut app = App::new("test", console, view);
+        let mut app = application("test", console);
         app.render(width, height, 1.0, Appearance::Dark, &mut fonts);
     }
 
@@ -777,6 +1110,78 @@ mod tests {
         assert_eq!(condition(&snapshot), "The tunnel to the server is down");
     }
 
+    #[test]
+    fn the_next_move_is_the_one_with_a_clock_on_it() {
+        // `populated` holds both cases at once: a service that cannot start,
+        // which the condition line already names, and a service the supervisor
+        // is counting down to retrying, which nothing else on screen says.
+        let next = next_move(&populated()).expect("a machine with something outstanding");
+        assert_eq!(next.headline, "backups retries in 40s");
+        assert_eq!(next.detail, "attempt 3 · 1 more waiting");
+        assert_eq!(next.control.0, "Retry now");
+        assert_eq!(next.control.1, Command::Restart("backups".into()));
+    }
+
+    #[test]
+    fn two_services_counting_down_are_separated_by_which_one_moves_first() {
+        let mut snapshot = populated();
+        snapshot.services[0].state = ServiceState::Backoff { retry_in_secs: 9, attempt: 1 };
+        let next = next_move(&snapshot).expect("two services in backoff");
+        assert_eq!(next.headline, "mongod retries in 9s");
+        assert_eq!(next.detail, "attempt 1 · 2 more waiting");
+    }
+
+    #[test]
+    fn a_stalled_service_is_surfaced_once_nothing_is_scheduled() {
+        // With the countdown gone, the one thing left waiting is waiting on a
+        // person — and what the block adds over the condition line is the
+        // reason and the button, not the name.
+        let mut snapshot = populated();
+        snapshot.services.retain(|service| !matches!(service.state, ServiceState::Backoff { .. }));
+        let next = next_move(&snapshot).expect("a service that cannot start");
+        assert_eq!(next.headline, "a-service-with-a-very-long-name cannot start");
+        assert_eq!(next.detail, "no such file or directory");
+        assert_eq!(next.control.1, Command::Start("a-service-with-a-very-long-name".into()));
+    }
+
+    #[test]
+    fn a_machine_with_nothing_outstanding_states_no_next_move() {
+        // The block is absent rather than saying so. A strip that reports when
+        // it has nothing to report is a strip nobody reads.
+        let mut snapshot = populated();
+        snapshot.services.retain(|service| service.state.is_live());
+        assert!(next_move(&snapshot).is_none());
+        assert!(next_move(&Snapshot::default()).is_none());
+    }
+
+    #[test]
+    fn nothing_is_claimed_about_a_machine_that_is_not_answering() {
+        // A countdown read off a poll that failed is not merely stale. It goes
+        // on counting down convincingly while nothing at all is happening.
+        let mut snapshot = populated();
+        snapshot.link = Link::Lost("connection refused".into());
+        assert!(next_move(&snapshot).is_none());
+
+        snapshot.link = Link::Connected;
+        snapshot.tunnel = Some(Tunnel::Broken { reason: "denied".into(), advice: None });
+        assert!(next_move(&snapshot).is_none());
+    }
+
+    #[test]
+    fn the_next_move_acts_on_the_service_it_names_and_not_on_the_selected_one() {
+        // The one control in the window that is about a service the operator
+        // did not choose, which is the whole point of surfacing it.
+        let mut console = console(populated());
+        let next = next_move(&console.snapshot()).expect("something outstanding");
+        let block = upcoming(next);
+        let control = block.child(3).expect("the control at the end of the block");
+        (control.click_action().expect("the control is clickable"))(&mut console);
+
+        let snapshot = console.snapshot();
+        assert_eq!(snapshot.selected.as_deref(), Some("levelup-api"), "the selection is untouched");
+        assert_eq!(snapshot.commands.front(), Some(&Command::Restart("backups".into())));
+    }
+
     // -----------------------------------------------------------------------
     // What the console means, for anything that cannot see it
     // -----------------------------------------------------------------------
@@ -799,6 +1204,10 @@ mod tests {
         vec![
             ("a console watching a service", console(busy()), (980.0, 680.0)),
             ("a console that has not connected", console(Snapshot::default()), (980.0, 680.0)),
+            // The one screen with a sweep on it rather than a lamp, so that the
+            // mark which replaces the lamp is audited for saying what the lamp
+            // said.
+            ("a console opening a tunnel", console(reaching()), (980.0, 680.0)),
             ("a console announcing a failure", console(announcing), (980.0, 680.0)),
             ("the install form", form_open, (980.0, 680.0)),
             ("the smallest window the backend allows", console(busy()), (560.0, 420.0)),
@@ -809,7 +1218,11 @@ mod tests {
     fn every_screen_is_reachable_named_and_ordered() {
         for (name, console, (width, height)) in screens() {
             println!("auditing {name}");
-            let mut harness = Harness::new(console, view).size(width, height);
+            // Through the console's own application, so what is audited is the
+            // window as it is actually built rather than the same tree under the
+            // library's default theme.
+            let mut harness =
+                Harness::with_app(application("selfhost", console)).size(width, height);
             harness.assert_accessible();
             harness.assert_tab_order();
         }
@@ -817,7 +1230,8 @@ mod tests {
 
     #[test]
     fn the_rail_is_a_list_whose_chosen_row_says_so_without_relying_on_its_colour() {
-        let mut harness = Harness::new(console(busy()), view).size(980.0, 680.0);
+        let mut harness = Harness::with_app(application("selfhost", console(busy())))
+            .size(980.0, 680.0);
         harness.frame();
 
         let rows: Vec<&rui::AccessNode> = harness
@@ -849,7 +1263,8 @@ mod tests {
         // their labels fails with the reason rather than with a role.
         let mut announcing = busy();
         announcing.report_problem("mongod would not start");
-        let mut harness = Harness::new(console(announcing), view).size(980.0, 680.0);
+        let mut harness =
+            Harness::with_app(application("selfhost", console(announcing))).size(980.0, 680.0);
         harness.frame();
 
         let named: Vec<&str> = harness
@@ -883,6 +1298,39 @@ mod tests {
             })
             .collect();
         snapshot
+    }
+
+    #[test]
+    fn the_window_moves_only_while_something_is_in_flux() {
+        // What a loop costs: a frame that asks for one asks for another, so a
+        // console watching a machine with nothing outstanding has to be able to
+        // stop drawing. The two marks allowed a loop — the sweep while a link is
+        // being made, and the pulse under a lamp that wants attention — are
+        // therefore the two states this may be true in, and no others.
+        let mut settled = Snapshot { link: Link::Connected, ..populated() };
+        settled.services.retain(|service| service.state.is_live());
+        settled.selected = None;
+
+        let mut idle = Harness::with_app(application("selfhost", console(settled)));
+        idle.frame();
+        assert!(!idle.is_animating(), "a healthy machine must let the window idle");
+
+        let mut sweeping = Harness::with_app(application("selfhost", console(reaching())));
+        sweeping.frame();
+        assert!(sweeping.is_animating(), "a link being made is drawn going round");
+
+        let mut pulsing = Harness::with_app(application("selfhost", console(populated())));
+        pulsing.frame();
+        assert!(pulsing.is_animating(), "a service that wants attention pulses");
+    }
+
+    /// A console that has not reached the daemon yet: `ssh` is still opening.
+    ///
+    /// The one state the window animates in — the masthead sweeps instead of
+    /// lamping — which makes it the one worth auditing and photographing apart
+    /// from the state it becomes a moment later.
+    fn reaching() -> Snapshot {
+        Snapshot { tunnel: Some(Tunnel::Opening), ..Snapshot::default() }
     }
 
     /// The window sizes the reference frames are drawn at.
@@ -932,34 +1380,38 @@ mod tests {
             snapshot
         };
 
-        for (name, snapshot, open_form, (width, height)) in [
-            ("console", busy(), false, (1000, 660)),
-            ("install", busy(), true, (1000, 660)),
-            ("console-narrow", busy(), false, (560, 420)),
-            ("console-empty", Snapshot::default(), false, (1000, 660)),
-            ("console-alarmed", alarmed, false, (1000, 660)),
-        ] {
+        // Each state once, rather than each state in two appearances: the
+        // console supplies its own palette and draws the same instrument under
+        // either desktop, so a second pass would have written the same picture
+        // beside itself under a name claiming it was different. What the room
+        // freed pays for is the states that were missing — a link being made,
+        // and a machine that is up but counting down to a retry.
+        let mut written = |name: &str, snapshot: Snapshot, open_form: bool, size: (u32, u32)| {
             let mut console = console(snapshot);
             if open_form {
                 console.form_mut().open_blank();
             }
-            let mut app = App::new("selfhost", console, view);
+            let mut app = application("selfhost", console);
+            let canvas = app.render(size.0, size.1, 2.0, Appearance::Dark, &mut fonts);
+            let pixels = rui::image::rgba(&canvas);
+            let png = rui::image::png(canvas.width(), canvas.height(), &pixels)
+                .expect("a frame should encode");
+            let path = format!("{directory}/{name}.png");
+            std::fs::write(&path, png).expect("the directory should be writable");
+            println!("wrote {path}");
+        };
 
-            for (suffix, appearance) in [("light", Appearance::Light), ("dark", Appearance::Dark)] {
-                let canvas = app.render(width, height, 2.0, appearance, &mut fonts);
-                let pixels = rui::image::rgba(&canvas);
-                let png = rui::image::png(canvas.width(), canvas.height(), &pixels)
-                    .expect("a frame should encode");
-                let path = format!("{directory}/{name}-{suffix}.png");
-                std::fs::write(&path, png).expect("the directory should be writable");
-                println!("wrote {path}");
-            }
-        }
+        written("console", busy(), false, (1000, 660));
+        written("install", busy(), true, (1000, 660));
+        written("console-narrow", busy(), false, (560, 420));
+        written("console-empty", Snapshot::default(), false, (1000, 660));
+        written("console-alarmed", alarmed, false, (1000, 660));
+        written("console-reaching", reaching(), false, (1000, 660));
 
         // What a frame costs, at the sizes the window is actually used at. The
         // glyph cache is warmed first: the first frame at a new size rasterises
         // every glyph in it, and that is a start-up cost rather than a frame's.
-        let mut app = App::new("selfhost", console(busy()), view);
+        let mut app = application("selfhost", console(busy()));
         println!("\n| window | pixels | draw the whole interface | describe it |");
         println!("|---|---|---|---|");
         for (width, height) in FRAME_SIZES {
