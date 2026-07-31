@@ -67,7 +67,7 @@ use crate::input::{Event, Input, Key, Modifiers, PointerButton};
 use crate::accessibility::Role;
 use crate::memory::{Id, Memory};
 use crate::shell::LoadedFonts;
-use crate::text::Fonts;
+use crate::text::{FontId, Fonts};
 use crate::theme::{Appearance, Theme};
 use std::collections::HashSet;
 use std::time::Duration;
@@ -192,6 +192,21 @@ impl<S: 'static> Harness<S> {
         self
     }
 
+    /// Draws with this theme rather than the library's own.
+    ///
+    /// The same call as [`App::theme`], on an application the harness built.
+    /// One that was built by hand and handed to [`Harness::with_app`] carries
+    /// its own theme in already, which is the point: a test drives the theme the
+    /// program actually runs with, so a window and a test cannot disagree about
+    /// what the interface looks like.
+    pub fn theme(
+        mut self,
+        theme: impl Fn(Appearance, FontId, FontId) -> Theme + 'static,
+    ) -> Self {
+        self.app.set_theme(Box::new(theme));
+        self
+    }
+
     /// Takes every frame to have lasted this long.
     ///
     /// What makes an animation assertable: nothing here reads a clock, so a
@@ -214,7 +229,7 @@ impl<S: 'static> Harness<S> {
         }
 
         self.fonts.fonts.set_scale(self.canvas.scale());
-        let theme = Theme::new(self.appearance, self.fonts.ui_font, self.fonts.mono_font);
+        let theme = self.theme_in_force();
         self.canvas.clear_vertical(theme.palette.background, theme.palette.background_deep);
 
         self.memory.begin_frame(self.elapsed);
@@ -608,7 +623,7 @@ impl<S: 'static> Harness<S> {
     /// as "nothing was drawn here" comes from the same code that draws nothing
     /// rather than from a guess about what it would have produced.
     fn ground(&self) -> Vec<u32> {
-        let theme = Theme::new(self.appearance, self.fonts.ui_font, self.fonts.mono_font);
+        let theme = self.theme_in_force();
         let mut strip = Canvas::new(1, self.canvas.height(), self.canvas.scale());
         strip.clear_vertical(theme.palette.background, theme.palette.background_deep);
         strip.pixels().to_vec()
@@ -652,6 +667,15 @@ impl<S: 'static> Harness<S> {
     /// stops animating never stops drawing.
     pub fn is_animating(&self) -> bool {
         self.memory.is_animating()
+    }
+
+    /// The theme this harness draws with, at its appearance and faces.
+    ///
+    /// Asked of the application rather than built here, so that what a test
+    /// measures against — the ground [`Harness::marked`] compares to — is the
+    /// same theme the frame was drawn from.
+    fn theme_in_force(&self) -> Theme {
+        self.app.theme_for(self.appearance, self.fonts.ui_font, self.fonts.mono_font)
     }
 
     /// Draws a frame if nothing has been drawn yet.
