@@ -252,6 +252,65 @@ fn a_tab_list_gives_its_tabs_their_place_without_being_told() {
 }
 
 #[test]
+fn a_chosen_row_of_a_list_says_so_and_an_unchosen_one_says_so_too() {
+    // What a list of services amounts to, and the fact a platform layer has to
+    // be handed if a screen reader is ever to say which row is the one. The
+    // three answers are distinct on purpose: chosen, not chosen, and *the
+    // question does not apply* — a heading is not an unselected heading.
+    fn view(chosen: &usize) -> El<usize> {
+        let rows: Vec<El<usize>> = ["mongod", "caddy", "postgres"]
+            .iter()
+            .enumerate()
+            .map(|(index, name)| {
+                text(*name)
+                    .key(*name)
+                    .role(Role::ListItem)
+                    .selected(index == *chosen)
+                    .on_click(move |chosen: &mut usize| *chosen = index)
+            })
+            .collect();
+        col(rows).role(Role::List).align(Align::Start)
+    }
+
+    let mut harness = Harness::new(1usize, view);
+    let rows: Vec<_> = harness
+        .accessibility()
+        .nodes()
+        .iter()
+        .filter(|node| node.role == Role::ListItem)
+        .cloned()
+        .collect();
+
+    assert_eq!(rows.len(), 3);
+    assert_eq!(rows[0].state.selected, Some(false), "a row nobody chose says it was not chosen");
+    assert_eq!(rows[1].state.selected, Some(true), "and the chosen one says it was");
+    assert!(
+        harness
+            .accessibility()
+            .nodes()
+            .iter()
+            .filter(|node| node.role == Role::Heading || node.role == Role::Group)
+            .all(|node| node.state.selected.is_none()),
+        "selection is not a question anyone asks of a heading or a box"
+    );
+
+    // The click's frame is the one the handler runs at the *end* of, so the
+    // tree built during it still describes the interface as it was. One more
+    // frame is what a window does too; see `Harness`.
+    harness.click_text("postgres");
+    harness.frame();
+    let rows: Vec<_> = harness
+        .accessibility()
+        .nodes()
+        .iter()
+        .filter(|node| node.role == Role::ListItem)
+        .cloned()
+        .collect();
+    assert_eq!(rows[1].state.selected, Some(false), "and it moves when the interface says so");
+    assert_eq!(rows[2].state.selected, Some(true));
+}
+
+#[test]
 fn a_tab_outside_a_tab_list_is_a_failure() {
     let mut harness = Harness::new(Nothing, |_: &Nothing| {
         col(text("Overview").role(Role::Tab).on_click(|_: &mut Nothing| {}))
@@ -466,6 +525,47 @@ fn a_frame_that_changed_nothing_emits_nothing() {
         harness.accessibility_update().is_empty(),
         "an interface spends most of its life unchanged, and so should its a11y traffic"
     );
+}
+
+#[test]
+fn the_node_that_lost_the_keyboard_is_in_the_difference_too() {
+    // What a platform layer is entitled to assume, and the reason the macOS
+    // backend applies focus from the node rather than working out for itself
+    // which element used to have it: a node whose focus changed *is* a node
+    // that differs, so the diff carries both ends of the move. A backend that
+    // had to remember the previous holder would be a second place the truth
+    // lived, and the symptom is two elements both claiming the keyboard.
+    fn view(_: &Nothing) -> El<Nothing> {
+        col((
+            button("First").on_click(|_: &mut Nothing| {}),
+            button("Second").on_click(|_: &mut Nothing| {}),
+        ))
+        .align(Align::Start)
+    }
+
+    let mut harness = Harness::new(Nothing, view);
+    harness.tab();
+    let first = harness.focused().expect("Tab reached the first button");
+
+    harness.tab();
+    let second = harness.focused().expect("Tab reached the second");
+    assert_ne!(first, second, "Tab moved the keyboard");
+
+    // Tab is taken by the frame it arrives on and settled at the end of it, so
+    // the tree that frame built still describes where the keyboard *was*. The
+    // frame after is the one that says it moved — the same one-frame lag a
+    // click has, and the one a window shows too.
+    harness.frame();
+    let update = harness.accessibility_update().clone();
+    assert!(update.focus_moved, "the move itself is announced");
+    let lost = update.changed.iter().find(|node| node.id == first);
+    let gained = update.changed.iter().find(|node| node.id == second);
+    assert_eq!(
+        lost.map(|node| node.state.focused),
+        Some(false),
+        "the node that lost the keyboard is in the difference, saying it no longer has it"
+    );
+    assert_eq!(gained.map(|node| node.state.focused), Some(true));
 }
 
 #[test]

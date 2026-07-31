@@ -263,6 +263,17 @@ same decision as presenting a frame only when its pixels differ, for the same
 reason: compare the finished result rather than tracking what you think is
 dirty.
 
+**A backend translates, and says what it cannot translate.** The same fact is
+not the same attribute everywhere: `.selected(true)` is a *number* to macOS on a
+checkbox, a radio button, or a tab — which is what VoiceOver reads as "checked"
+— and a boolean on a row. Each backend's own module header carries the whole
+table, node field by node field, and the mapping destructures `AccessNode`
+without a rest pattern, so a field added to the tree stops that backend
+compiling until somebody decides what the platform should do with it. Where a
+fact has no route *inbound* — setting a value, moving focus, choosing a row —
+the write is refused rather than accepted and dropped, because a screen reader
+told "done" by something that did nothing is worse than one told "no".
+
 And it is enforced rather than promised. `harness.assert_accessible()` fails on
 a clickable element with no role, an interactive one with no name, a tab outside
 a tab list, or two siblings sharing an identity; `assert_tab_order()` fails if
