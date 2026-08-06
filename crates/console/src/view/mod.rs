@@ -103,6 +103,23 @@ const WORDMARK: f32 = 2.4;
 /// How wide the gutter carrying a row's unit number is.
 const UNIT_GUTTER: f32 = 16.0;
 
+/// The width a row's state word may be squeezed to, and no further.
+///
+/// On a narrow rail the name and the state want the same line, and the name is
+/// the only thing telling the rows apart — the state is already said twice by
+/// the lamp, in a hue and in a fill. The name therefore grows *from its words*
+/// and the state word is what gives way when the line is short: without that,
+/// the name was the payer by construction — it was the grower, a grower's
+/// floor is zero, and the layout never takes from a content-sized child while
+/// a grower can still give — so `backups` read `back…` beside an untouched
+/// `RESTARTING`, the priority exactly inverted. The floor is what stops the
+/// trade at the other extreme: a state squeezed to nothing is a fact deleted,
+/// not a fact deferred, so the word keeps enough room to open with a few
+/// characters and say the rest with its ellipsis. It is below the narrowest
+/// word a state can be, so a row with room never draws a wider element than
+/// its own text.
+const STATE_FLOOR: f32 = 36.0;
+
 /// How tall the readout bank is at rest.
 ///
 /// Unchanged by the restaging that put the condition above the counts rather
@@ -870,9 +887,11 @@ fn service_row(index: usize, service: &ServiceStatus, chosen: bool) -> El<Consol
                 // chrome around one word, and on every row of a narrow rail
                 // that chrome was taking the room the service's own name needed
                 // — the name is what tells the rows apart, and it was the part
-                // being truncated.
-                text(display_name(service)).grow().text_size(13.5),
-                style::state_word(status, state_label),
+                // being truncated. Growing the name from its words finishes
+                // that argument: a short line takes from the state word first,
+                // down to [`STATE_FLOOR`], and only then from the name.
+                text(display_name(service)).grow_from_content().text_size(13.5),
+                style::state_word(status, state_label).min_w(STATE_FLOOR),
             ))
             .gap(4.0),
             caption(summary),
@@ -1107,6 +1126,32 @@ mod tests {
             Some("levelup-api"),
             "other keys are left to the controls that own them"
         );
+    }
+
+    #[test]
+    fn the_state_word_gives_way_before_the_name_on_a_narrow_rail() {
+        // The name is what tells the rows apart, so a short line takes from
+        // the state word — already said twice by the lamp — before it takes
+        // from the name. The synthetic face makes the widths exact: every
+        // character is half its text size wide, plus its tracking.
+        let mut harness =
+            Harness::new(console(populated()), |console: &Console| rail(&console.snapshot()))
+                .size(RAIL_MIN, 420.0);
+        harness.frame();
+
+        // The one row that cannot fit: the state is squeezed to its floor and
+        // the name keeps everything the floor did not claim.
+        let name =
+            harness.rect_of("a-service-with-a-very-long-name").expect("the name is drawn");
+        let state = harness.rect_of("CANNOT START").expect("the state is drawn");
+        assert!(state.w <= STATE_FLOOR + 0.5, "the state word is the payer: {}", state.w);
+        assert!(name.w > state.w, "what the floor spared goes to the name: {}", name.w);
+
+        // A row whose name fits pays nothing at all: `RESTARTING` stands at
+        // the width its own characters ask for.
+        let unshrunk = 10.0 * (10.5 / 2.0 + 0.4);
+        let resting = harness.rect_of("RESTARTING").expect("the state is drawn").w;
+        assert!(resting >= unshrunk - 0.5, "a fitting row gives nothing: {resting}");
     }
 
     #[test]
