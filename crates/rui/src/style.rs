@@ -375,6 +375,13 @@ pub struct Style {
     /// keeps meaning "take the rest of the room" when a row is later rewritten
     /// as a column, which the axis-specific lengths cannot.
     pub grow: Option<f32>,
+    /// Whether growing starts from what the content needs rather than from
+    /// nothing.
+    ///
+    /// A pane or a spacer grows from zero — its content is whatever fits. A
+    /// control is the other way round: its words come first, and only the room
+    /// past them is up for sharing. See [`El::grow_from_content`](crate::El::grow_from_content).
+    pub grow_from_content: bool,
     /// The narrowest it may be laid out.
     pub min_width: f32,
     /// The shortest it may be laid out.
@@ -409,6 +416,13 @@ pub struct Style {
     pub radius: Radius,
     /// How far a shadow beneath it is blurred, if it casts one.
     pub shadow: Option<f32>,
+    /// How far a halo around it reaches, and what colour it is.
+    ///
+    /// Held apart from [`Style::shadow`] rather than being a colour on it,
+    /// because the two say opposite things: a shadow is the absence of light,
+    /// is always the theme's own black, and falls downward; a glow is light,
+    /// takes a hue, and is cast evenly. See [`El::glow`](crate::El::glow).
+    pub glow: Option<(f32, Tone)>,
     /// The text properties it sets, and passes to its children.
     pub ink: InkOverride,
     /// Where its own text sits within it.
@@ -462,6 +476,7 @@ impl Default for Style {
             width: Length::Auto,
             height: Length::Auto,
             grow: None,
+            grow_from_content: false,
             min_width: 0.0,
             min_height: 0.0,
             max_width: f32::INFINITY,
@@ -477,6 +492,7 @@ impl Default for Style {
             border: None,
             radius: Radius::None,
             shadow: None,
+            glow: None,
             ink: InkOverride::default(),
             text_align: Align::Start,
             wrap: false,
@@ -491,7 +507,10 @@ impl Default for Style {
 impl Style {
     /// Whether anything about this element has to be drawn behind its content.
     pub(crate) fn has_decoration(&self) -> bool {
-        self.fill.is_some() || self.border.is_some() || self.shadow.is_some()
+        self.fill.is_some()
+            || self.border.is_some()
+            || self.shadow.is_some()
+            || self.glow.is_some()
     }
 }
 

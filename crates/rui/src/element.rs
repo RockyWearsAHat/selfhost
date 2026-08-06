@@ -263,6 +263,21 @@ impl<S> El<S> {
         self
     }
 
+    /// Grows from what its content needs rather than from nothing.
+    ///
+    /// [`El::grow`] deals a share of the leftover measured from zero, which is
+    /// right for a pane or a spacer — their content is whatever fits. A control
+    /// is the other way round: its words come first, and only the room past
+    /// them is up for sharing. A row of buttons growing from content toward a
+    /// stated maximum are uniform whenever the room allows it, share what there
+    /// is when it does not, and no label is squeezed below what it says while a
+    /// shorter sibling still has slack to give.
+    pub fn grow_from_content(mut self) -> Self {
+        self.style.grow = Some(1.0);
+        self.style.grow_from_content = true;
+        self
+    }
+
     /// Refuses to be laid out narrower than this.
     pub fn min_w(mut self, width: f32) -> Self {
         self.style.min_width = width;
@@ -391,6 +406,23 @@ impl<S> El<S> {
         self
     }
 
+    /// Casts a halo of `tone` around it, reaching `blur` units past its edge.
+    ///
+    /// Not a coloured shadow. A shadow is the absence of light: it is the
+    /// theme's own black at whatever alpha survives the appearance, and it
+    /// falls a little downward because the light comes from above. A glow is
+    /// light — it takes a hue, it is cast evenly in every direction, and what
+    /// it says is that the thing is *live*: a lamp that is lit, the pane that
+    /// has been chosen, a state that wants attention.
+    ///
+    /// That is also why it is worth spending sparingly. A halo on one element
+    /// is a fact about that element; a halo on every element is a filter over
+    /// the window, and the fact is gone.
+    pub fn glow(mut self, blur: f32, tone: impl Into<Tone>) -> Self {
+        self.style.glow = Some((blur, tone.into()));
+        self
+    }
+
     /// Confines its own drawing, and its children's, to its rectangle.
     pub fn clip(mut self) -> Self {
         self.style.clip = true;
@@ -433,6 +465,11 @@ impl<S> El<S> {
     /// most irritating thing an interface can do, and deciding it here — from
     /// whether the reader is at the end — is what stops every application having
     /// to keep that flag itself.
+    ///
+    /// The end it stops at is the nearest join between two children rather than
+    /// the last pixel of the content, so the child at the top of the frame is a
+    /// whole one; see `layout::whole_child_at_top` for what that buys and what
+    /// it costs.
     pub fn follow(mut self) -> Self {
         self.follows = true;
         self.scroll()

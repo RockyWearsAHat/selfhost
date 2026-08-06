@@ -2,12 +2,9 @@
 
 use super::style;
 use super::{Console, present, title_rule};
-use crate::state::{Command, LogLine, Snapshot};
+use crate::state::{Command, Link, LogLine, Snapshot};
 use rui::style::Justify;
-use rui::{
-    Align, El, Radius, Tone, button, caption, code, col, field_row, micro, row, section, spacer,
-    text,
-};
+use rui::{Align, El, Radius, Tone, button, caption, code, col, field_row, micro, row, text};
 use selfhost_config::{RestartPolicy, ServiceSpec, StartMode};
 use selfhost_supervisor::state::ServiceState;
 
@@ -30,15 +27,29 @@ const SEQ_GUTTER: f32 = 34.0;
 /// one of them changes: a specification is read once and is the same the next
 /// time it is looked at, while the output is arriving. So the definition is what
 /// scrolls when the pane is short, and the log keeps its minimum.
-const LOG_MIN: f32 = 108.0;
+///
+/// Six lines, roughly. It was 108 when the bank above could not grow; a bank
+/// that now pays a line to wrap its sentence whole takes that line from here,
+/// because a promise the pane cannot cover is not kept — it is painted past
+/// the bottom of the window.
+const LOG_MIN: f32 = 92.0;
 
 /// The detail pane for whichever service is selected.
 pub fn view(snapshot: &Snapshot) -> El<Console> {
     let Some(service) = snapshot.selected_service() else {
+        // A faint reticle behind the words, so the pane reads as an instrument
+        // waiting for a reading rather than as a hole in the window. See
+        // [`style::reticle`] for why it is static and this quiet.
+        //
+        // The words follow the link: "choose a service on the left" beside a
+        // rail that is empty — or a daemon that has not answered — is an
+        // instruction that cannot be followed, and guidance that is wrong once
+        // is guidance that is doubted every time.
         return style::plate(
-            col(caption("Choose a service on the left, or add one.").center_text())
+            col(caption(guidance(snapshot)).center_text())
                 .grow()
-                .justify(Justify::Center),
+                .justify(Justify::Center)
+                .add(style::reticle()),
         );
     };
 
@@ -54,9 +65,9 @@ pub fn view(snapshot: &Snapshot) -> El<Console> {
             title_rule(label, Some(style::state_mark(status, state_label))),
             caption(summary),
             actions(&name, &service.state, startable),
-            section("DEFINITION", None),
+            style::section_rule("DEFINITION", None),
             definition(snapshot, service),
-            section(
+            style::section_rule(
                 "OUTPUT",
                 Some(match snapshot.logs.missed {
                     0 => "LIVE".to_owned(),
@@ -66,6 +77,23 @@ pub fn view(snapshot: &Snapshot) -> El<Console> {
             output(snapshot),
     ))
     .gap(8.0)
+}
+
+/// What the empty pane advises, given what the console actually knows.
+///
+/// Pure, so the words can be asserted against each link state without a frame.
+/// The daemon's absence outranks anything about services, in the same order
+/// [`super::condition`] reports it: an instruction the reader cannot follow yet
+/// is worse than none.
+fn guidance(snapshot: &Snapshot) -> &'static str {
+    match &snapshot.link {
+        Link::Connected if snapshot.services.is_empty() => {
+            "Nothing is installed yet. Add a service to begin."
+        }
+        Link::Connected => "Choose a service on the left, or add one.",
+        Link::Connecting => "Waiting for the daemon.",
+        Link::Lost(_) => "The daemon is not answering.",
+    }
 }
 
 /// The lifecycle buttons.
@@ -81,10 +109,15 @@ pub fn view(snapshot: &Snapshot) -> El<Console> {
 /// control and not a gap in it.
 fn actions(name: &str, state: &ServiceState, startable: bool) -> El<Console> {
     let stoppable = state.is_live();
+    // The buttons grow from their words toward one shared width, so the four
+    // are uniform whenever the pane allows it and share what there is when it
+    // does not — and no label is squeezed below what it says while a shorter
+    // sibling still has slack to give, which is what used to cut Restart and
+    // Uninstall to an ellipsis at the smallest window the backend allows.
     let action = |label: &str, command: Command| {
         button(label)
             .key(label)
-            .grow()
+            .grow_from_content()
             .max_w(ACTION_WIDTH)
             .on_click(move |console: &mut Console| console.request(command.clone()))
     };
@@ -102,9 +135,10 @@ fn actions(name: &str, state: &ServiceState, startable: bool) -> El<Console> {
         // make the operator work out which of two buttons is the live one.
         action("Restart", Command::Restart(name.to_owned())),
         // A rule across the space between the two groups, with a tick at the end
-        // of it. On a wide pane that space is most of the row, and empty it read
-        // as a button that had failed to draw rather than as distance kept on
-        // purpose. The rule says the gap is the point.
+        // of it — the same mark every heading in the window is ruled with. On a
+        // wide pane that space is most of the row, and empty it read as a button
+        // that had failed to draw rather than as distance kept on purpose. The
+        // rule says the gap is the point.
         // The rule takes a full share, not a smaller one. A smaller share looks
         // like the fix for the narrow window — the four labels get more room
         // and stop being cut — but the buttons are capped at [`ACTION_WIDTH`],
@@ -112,13 +146,7 @@ fn actions(name: &str, state: &ServiceState, startable: bool) -> El<Console> {
         // nothing gets: on a wide pane the rule shrank to a stub and left a
         // hand's width of nothing between it and Uninstall, which is the exact
         // defect the rule was drawn to answer.
-        row((
-            spacer().h(1.0).grow().fill(Tone::Border),
-            spacer().w(1.0).h(7.0).fill(Tone::Border),
-        ))
-        .grow()
-        .pad_x(12.0)
-        .align(Align::Center),
+        style::rule().pad_x(12.0),
         action("Uninstall", Command::Uninstall(name.to_owned())).danger(),
     ))
     .h(36.0)
@@ -176,10 +204,28 @@ fn definition(snapshot: &Snapshot, service: &selfhost_supervisor::state::Service
         text(format!("{} since the daemon started", service.total_restarts)),
     ));
     if !service.description.is_empty() {
-        rows.push(field_row("NOTES", caption(service.description.clone()).wrap()));
+        // `text`, not `caption`: every other value in this block is prose set
+        // at body size, and a caption here would be the one row reporting
+        // itself in a smaller, muted voice for no reason tied to its meaning.
+        //
+        // `align_self(Align::Center)` because `.wrap()` paints from the top of
+        // whatever height it is given, and the row stretches every value to
+        // its own height by default — an unwrapped sibling still looks centred
+        // there because `draw_line` centres it as it paints, but a wrapped
+        // block has no such correction. Sizing this one to its own content and
+        // centering *that* is what keeps a one-line note sitting on the same
+        // baseline as PROGRAM and ARGUMENTS beside it.
+        rows.push(field_row(
+            "NOTES",
+            text(service.description.clone()).wrap().align_self(Align::Center),
+        ));
     }
 
-    col(rows).gap(2.0).scroll()
+    // The definition is what gives way when the pane runs short — it scrolls,
+    // the log keeps its promise — but it never gives up its first whole row:
+    // a scroll pane clipped to half a line of a path reads as a defect, and
+    // one whole fact reads as a block that can be scrolled for the rest.
+    col(rows).gap(2.0).scroll().min_h(24.0)
 }
 
 /// The service's captured output.
@@ -207,7 +253,6 @@ fn output(snapshot: &Snapshot) -> El<Console> {
         .pad(8.0)
         .fill(Tone::Sunken)
         .border(1.0, Tone::Border)
-        .round(Radius::Control)
 }
 
 /// One captured line: its sequence number, and what the service printed.
@@ -216,10 +261,15 @@ fn output(snapshot: &Snapshot) -> El<Console> {
 /// dropped when lines were missed, and what two people comparing the same log
 /// can point at. It sits in a gutter of its own so the output beside it stays in
 /// the columns the program printed it in.
+///
+/// The gutter is set a step dimmer than the caption ink, because it is the one
+/// column on screen nobody is reading — it is there to be pointed at, and a
+/// stream of numbers as bright as the output beside it is a second column of
+/// text competing with the one that carries what the service said.
 fn log_line(line_of: &LogLine) -> El<Console> {
     let text = code(line_of.text.clone()).grow();
     row((
-        micro(line_of.seq.to_string()).w(SEQ_GUTTER).text_align(Align::End),
+        micro(line_of.seq.to_string()).color(Tone::Idle).w(SEQ_GUTTER).text_align(Align::End),
         if line_of.is_error {
             // A bar as well as a colour. Standard error is the half of the
             // output that matters, and a hue alone is exactly what a

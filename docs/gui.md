@@ -239,8 +239,8 @@ directly. Two crates, split by what they are about:
 
 | crate | what | `unsafe` | tests |
 |---|---|---|---|
-| `crates/rui` | The interface library: elements, style, layout, the rasteriser, the TrueType engine, text, animation, and the platform windows | confined to `shell/platform/` | 263 |
-| `crates/console` | The application: the client, the poller, and the views | **forbidden** | 91 |
+| `crates/rui` | The interface library: elements, style, layout, the rasteriser, the TrueType engine, text, animation, and the platform windows | confined to `shell/platform/` | 401 |
+| `crates/console` | The application: the client, the poller, and the views | **forbidden** | 110 |
 
 `rui` is not a selfhost component. It is a general interface library that this
 console happens to be the first program written in — it has no dependencies at
@@ -446,96 +446,86 @@ the smallest size the backend allows, with the form open, with nothing
 connected, with a link still being made, and with a failure announced. A
 decision about appearance is not made until it has been looked at there.
 
-### And then it was made an instrument on purpose
+### And then it was made an instrument on purpose — twice
 
-The console is now a lit HUD again: a near-black navy ground scribed with a
-faint graticule, one electric cyan, chamfered plates marked at their corners by
-brackets, a ring gauge for how much of the machine is up, and a sweep that goes
-round while a connection is being made. Read against the section above that looks like the costume coming back, so
-what makes this the *other* thing has to be said plainly. Three rules, and they
-are the whole difference:
+The first attempt at a character was a lit HUD: a near-black navy ground
+scribed with a faint graticule and framed at the window's own edge, one
+electric cyan, chamfered plates marked at their corners by brackets, and halos
+on the lamp, the chosen row, and the gauge's arc. It obeyed rules that kept it
+from being the costume — the shape was the only word respelled, glow was a
+fact rather than a filter, two hues at rest — and it was still a quotation:
+every mark said *instrument* by drawing a picture of one, and cyan-on-navy is
+a film's idea of a machine rather than any machine's idea of itself.
 
-- **The shape is the only word the console respells.** The console sets
-  `Theme::corners` to `Cut`, so its controls are milled from the same stock as
-  the plates they are set into — but that is the *whole* departure. Sizes, the
-  type scale, hover and focus behaviour all stay the library's, so a button is
-  still unmistakably the desktop's button; it is simply pressed on this
-  machine. (The window kept the split for a while — cut readouts, rounded
-  controls — and the rounded button on a chamfered plate read as a sticker from
-  a different machine, not as the desktop's control lent to an instrument.)
-- **Glow is a fact, not a filter.** A halo appears on a lit lamp, on the chosen
-  row, on a gauge's swept arc, and on the sweep itself. Nothing else has one.
-  The costume's halo was behind *every* panel, button, tab and dot, which is
-  what made it a filter over the window and told the reader nothing.
-- **Two hues at rest.** Cyan and steel. Amber and red appear only with a cause —
-  a countdown, a service that has stalled — and healthy is deliberately a
-  cyan-tinted steel rather than a green, so a rail of working services stays
-  quiet and the one that is not can be seen.
+What replaced it is the design the console now wears, and the observation
+behind it is that the interfaces which actually read as advanced — a surgical
+robot's console, a lab instrument's front panel — are not decorated at all.
+Futurism, done seriously, is precision: true black, structure in grey
+hairlines, right angles, and room. `THEATRE` in
+`crates/console/src/view/style.rs` is that palette, and three rules are the
+whole design:
 
-The graticule deserves its own sentence, because the costume had a grid and it
-went. That one was ruled across the window, behind everything; this one is
-painted on the *ground*, through the `App::ground` seam, and the plates are
-opaque — so it exists only in the chassis around and between them, at a
-twentieth of the accent, and cannot sit behind a single word. The margins used
-to be the one part of the window that read as nothing; now they read as the
-surface the instruments are bolted to. The ground also closes itself with a
-viewport frame at the window's own edge — a chamfered hairline, a calibration
-tick where each graticule line meets it, corner arms in the brackets' weight —
-which is the plates' three marks at the outermost scale: the window is not a
-desktop rectangle with an instrument inside it, it is the instrument's face.
+- **The accent is light, not a hue.** The one accent is an off-white — the
+  instrument's own light. Selection and the primary action are *lit*: the
+  chosen row is held by a white hairline and a lit bar, and the primary button
+  is a white face with dark lettering. Amber and red are the only saturated
+  colours the window can show, and neither appears without a cause, which is
+  what makes an alarm on this ground unmissable.
+- **Every corner is square.** `Theme::corners` is `Square`. The chamfer said
+  *machined* by quoting a rack panel; a right angle quotes nothing — it is the
+  shape of a thing that was not decorated. Controls keep the library's sizes,
+  its type scale, its hover and focus behaviour, so they are still
+  unmistakably things to press.
+- **Glow is spent on exactly one thing.** The pulse under a lamp that wants
+  attention. A lamp that is merely on is flat — a clinical display states
+  light by value — and the sweep, the gauge, and the chosen row are flat with
+  it.
 
-Motion obeys the same test. There are exactly two loops in the program: the
-sweep, which is drawn only while the link is being made or the tunnel is
-opening, and the pulse under a lamp that wants attention. A frame that asks for
-a loop asks for another frame, so a window with nothing outstanding still idles
-— which is the mechanical version of *motion means state that is in flux*.
+The ground kept one decoration, and it is the signature: a fine measurement
+ruler along the window's top edge, minor and major divisions in the ink
+everything else is read by, drawn through the `App::ground` seam in the margin
+the layout already keeps. The graticule and viewport frame it replaces were a
+drawing of an instrument; a scale is what an instrument actually carries, and
+it is the one thing on the ground because measurement is what the console is
+for. The masthead sits unframed beneath it — a nameplate is not a reading —
+so the wordmark and the white chip of the mark sit directly on the black,
+which is what an engraved front panel is.
 
-### Where the chamfer lives now
+Motion obeys the same test it always has. There are exactly two loops in the
+program: the sweep, which is drawn only while the link is being made or the
+tunnel is opening, and the pulse under a lamp that wants attention. A frame
+that asks for a loop asks for another frame, so a window with nothing
+outstanding still idles — which is the mechanical version of *motion means
+state that is in flux*.
 
-The argument above is about `Theme::corner()`, which is what every *framed* thing
-takes when it asks the theme for its shape: a panel, a button, a field, a tag.
-The *library's* default stays a radius; the console sets it to `Cut`.
+### Where the shape lives
+
+`Theme::corner()` is what every *framed* thing takes when it asks the theme
+for its shape: a panel, a button, a field, a tag. The *library's* default
+stays a radius; the console sets it to `Square`, and that one word squares
+every plate and control at once.
 
 Both halves of that are choices the seam exists for: `App::theme` takes a
 *function* of the appearance, `Theme::with_corners` swaps the shape and
 `Theme::with_palette` swaps the colours, and everything below reads whatever
 comes back — and `App::ground` hands over the bare window the same way, so an
 application can paint the surface its interface sits on without the library
-growing an opinion about graticules. `crates/console/src/view/style.rs` is
-where the console spends all three — the palette, the corner, and the ground —
-and nothing else.
+growing an opinion about rulers. `crates/console/src/view/style.rs` is where
+the console spends all three — the palette, the corner, and the ground — and
+nothing else.
 
-The console kept the corner split for a while — controls in the desktop's
-`Round`, readouts in explicit `Radius::Cut` — on the rule that there is no
-credit for disagreeing with the platform about what a button looks like. What
-that produced on screen was the opposite of what the rule promised: a rounded
-button on a chamfered plate did not read as the platform's control respected,
-it read as a part from a different machine glued onto this one. A physical
-console's switches are milled by whoever milled the panel. So the corner is
-now one word, said once, and what keeps it from being the costume again is
-that the *shape* is the entire departure — the costume was a chamfer arriving
-with monospaced headings, halos on everything and a grid over the window, and
-none of those came back.
+The history of that word is the history of the design: `Cut` in the costume, a
+radius in the correction, `Cut` again in the HUD — where keeping controls
+rounded while the plates were chamfered was tried first, and a rounded button
+on a chamfered plate read as a part from a different machine glued onto this
+one — and `Square` now. What survives every turn is the discipline: the shape
+is said once, on the theme, and never respelled widget by widget.
 
-The marks the console draws with its own painter — the plates, the rail's
-rows, the lamp beside a service, the wedge against the chosen row, the flag
-down a line of standard error, the well the log is written in — were cut
-before the controls were and are cut still, because every one of them exists
-to state a fact about a machine.
-
-The corner brackets are the same argument at the corners themselves — four short
-strokes where each plate's chamfer ends, drawn as a `layer` so they take no room
-from what they frame and cannot change what fits inside it.
-
-One thing had to be *looked at* before it could be settled, and the swatch is
-why the lamp is the shape it is. **A chamfer has to be seen to mean anything,
-and at eight or ten units square it is not seen.** Cut a tenth off each corner
-of a ten-unit square, antialias it at the size a screen actually draws it, and
-what comes out is a circle; cut it half and what comes out is a diamond, which
-reads as a warning sign whatever colour it is in. So the lamp is a *slot* — five
-by fourteen, two units off each corner — because a tall shape has edges long
-enough to carry the cut. It is most obviously a chamfer when it is **unlit**,
-which is the state that most needed telling apart.
+The lamp still had to be *looked at* before it was settled. At eight or ten
+units, any corner treatment antialiases away — a small cut square comes out a
+circle — so the lamp is a *slot*, five by fourteen, whose long edges are what
+read at drawing size. It is most obviously a machined slot when it is
+**unlit**, which is the state that most needed telling apart.
 
 That last part is the second thing the lamp does. It is filled when the service
 has something to assert and left as an outline when it does not, so the state is
@@ -551,7 +541,9 @@ Three marks above a flat fill, each drawn by the scan that was already there:
   never the area it surrounds — the trade that already made a one-pixel outline
   cheap. It is cast in `Palette::shadow`, offset slightly downward, and that
   offset is the whole difference between a shadow and a glow: light comes from
-  above, so there is more shadow below the panel than above it.
+  above, so there is more shadow below the panel than above it. (This is the
+  library's mark. The console's own plates cast none — on a ground a step off
+  black a shadow is invisible, so they separate by value and a hairline.)
 - **Surfaces shade downward, barely.** A panel is filled from `surface` at its
   top edge to `surface_deep` at its bottom, with a hairline of `sheen` inside
   the top edge. A vertical gradient is the one direction that costs nothing — a
@@ -560,13 +552,14 @@ Three marks above a flat fill, each drawn by the scan that was already there:
   horizontal or angled gradient would be a mix *per pixel* and is deliberately
   not offered. A test asserts the shift stays under six percent: past that it
   stops reading as material and starts reading as a texture.
-- **The accent is one hue, and it is the only saturated colour in the chrome.**
+- **The accent is one colour, and it is the only bright thing in the chrome.**
   It fills the primary button, underlines the chosen tab, outlines the selected
-  row, and rings whatever has the keyboard. Nothing else. It is a hue none of
-  the four status colours is near, so the primary action can never be mistaken
+  row, and rings whatever has the keyboard. Nothing else. It is a colour none
+  of the four status hues is near, so the primary action can never be mistaken
   for a health signal, and a test asserts the distance. It is a blue in `rui`'s
-  own palette and an electric cyan in the console's, which is the seam being
-  spent on the one thing a program's own character is actually made of.
+  own palette and an off-white — light itself — in the console's, which is the
+  seam being spent on the one thing a program's own character is actually made
+  of.
 
 A panel is separated from the window by **value** as well as by its outline, and
 a test asserts that too. The dark palette used to hold its surfaces within a
@@ -576,9 +569,10 @@ looking for their outlines.
 
 ### Ruled, not boxed
 
-The window holds exactly **four framed surfaces** — the masthead strip, the
-readout bank, the rail of services, and the detail pane — and everything inside
-them is separated by ruling instead of by more outlines. That is a correction
+The window holds exactly **three framed surfaces** — the readout bank, the
+rail of services, and the detail pane; the masthead is unframed, because a
+nameplate is not a reading — and everything inside them is separated by
+ruling instead of by more outlines. That is a correction
 that survived every redesign. An earlier revision put four rounded cards of
 counts inside a rounded page inside a window, which is three frames drawn around
 every fact, and the result read as a diagram of an interface rather than as one.
@@ -596,11 +590,11 @@ hairline that runs out at the pane's edge reads as the top of a box nobody
 finished, and the same line stopped by an upright reads as a measurement.
 
 The rules are hairlines in `Palette::border` — the same line every panel is
-outlined in, which in the console's palette is the accent at about a third of its
-opacity. That was once a mistake and is now the point: dimming the accent toward
-a grey border tinted every rule faintly cyan, which over a page of them read as
-the interface being *lit* rather than ruled, and a HUD is exactly the interface
-that means it.
+outlined in, which in the console's palette is a neutral grey. The HUD before
+it ruled the window in dimmed cyan, so every hairline was faintly *lit*;
+under `THEATRE` structure is never lit, because light is the accent and the
+accent is spent on what is chosen. A ruled page in grey is what lets the one
+white outline in the rail mean something.
 
 **A state is a lamp and a word, and the console draws no tags at all.** `tag` is
 still in `rui` and is still a tint of the status's hue with the word in the hue
@@ -711,6 +705,21 @@ sized by a number somebody picked:
   heading-and-all when even one row would not fit. All of it is now two words in
   the description — `min_h` on the log, `.scroll()` on the definition — because
   the rule it was implementing is a *layout* rule and belongs to the layout.
+- **Words are never cut where the layout can pay another way.** The smallest
+  window used to draw `Res…` on a lifecycle button, `RUNNI… 2…` in the bank,
+  and the condition sentence with its verdict clause cut off — each a mark
+  reporting nothing, drawn at the exact moment there was least room to waste on
+  it. Three payments replaced the cuts, each made in the currency the reader
+  misses least. The lifecycle buttons grow *from their words* toward one shared
+  width (`grow_from_content` in `rui`), so they are uniform whenever the pane
+  allows it and no label gives way while a shorter sibling still has slack. The
+  bank's sentence wraps — at a hyphen when the name carries one, since the
+  names machines wear are spaceless tokens joined by them — and the strip pays
+  for the extra line in height, capped at one line so the report cannot spend
+  the log's room. And the readings flow onto a second line whole rather than
+  truncating on one. What still gives way at the extreme is the definition,
+  then the title's caption — both facts the chosen rail row states again a
+  hand's width to the left.
 
 The output carries a gutter of **sequence numbers**, which are the daemon's own
 count — the thing that says how much was lost when `missed` is not zero, and the
@@ -773,6 +782,12 @@ carry:
   dismisses a notice is `Dismiss`, and the minus beside each argument is
   `Remove argument 2` — otherwise a screen reader reads "multiplication sign",
   and every remove button is called the same thing.
+- **The arrows walk the rail.** Up and Down on any focused row move the
+  *selection* to its neighbour — the handler reads the selection rather than
+  the row it is attached to, because focus and selection are different facts
+  and it is the selection being driven. A click, Tab-and-Enter, and an arrow
+  all end at the same field in the snapshot, so the rail cannot come to
+  disagree with itself about what is chosen.
 
 None of that is a promise. `every_screen_is_reachable_named_and_ordered` drives
 each screen the console can be on — watching a service, not yet connected,
@@ -792,9 +807,9 @@ prints exactly this table:
 
 | window | pixels | draw the whole interface | describe it |
 |---|---|---|---|
-| 560 × 420 | 0.9 M | **1.6 ms** | 13 µs |
-| 980 × 680 | 2.7 M | **2.9 ms** | 13 µs |
-| 1180 × 760 | 3.6 M | **3.4 ms** | 13 µs |
+| 560 × 420 | 0.9 M | **1.5 ms** | 16 µs |
+| 980 × 680 | 2.7 M | **2.2 ms** | 15 µs |
+| 1180 × 760 | 3.6 M | **2.6 ms** | 15 µs |
 
 That is the budget that matters: an animating frame has 8 ms, and drawing one
 takes rather under half of it.
@@ -844,9 +859,10 @@ rectangle comes out at its minimum and anything that only fits because a label
 happened to be short fails here rather than on somebody's screen. That is what
 caught the one defect the earlier style pass turned up — at 560 by 420 the
 lifecycle row's fixed button width ran Restart off the right of the detail pane
-and drew Uninstall on top of it. That arithmetic is gone: the buttons ask to
-grow and state a maximum, so four of them share a narrow row instead of keeping
-a width that does not fit.
+and drew Uninstall on top of it. That arithmetic is gone: the buttons grow from
+their words toward one shared maximum, so four of them share a narrow row
+instead of keeping a width that does not fit — and none is cut below its own
+label while a shorter sibling still has slack to give.
 
 *With the real faces, written out as an image.*
 
