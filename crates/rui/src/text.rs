@@ -518,7 +518,7 @@ impl Fonts {
             // Prefer the last space that still fits, counting one that starts
             // exactly at the limit: it would otherwise begin the next line as a
             // leading space nobody asked for.
-            let break_at = last_space(remaining, fits)
+            let break_at = last_break(remaining, fits)
                 // Nowhere to break: cut inside the word, but never to nothing,
                 // or a single too-wide cluster would loop forever.
                 .unwrap_or_else(|| fits.max(grapheme::first_cluster_len(remaining)));
@@ -553,19 +553,38 @@ fn glyph_of(font: &Font, character: char) -> GlyphId {
     font.glyph_for(character)
 }
 
-/// Where to break after the last space starting at or before `fits`.
+/// Where to break after the last space or hyphen starting at or before `fits`.
 ///
-/// Answers the byte just past that space, which is where the next line begins.
-/// `None` when the text has none, which is a word too long to break politely.
+/// Answers the byte just past that character, which is where the next line
+/// begins. `None` when the text has neither, which is a word too long to break
+/// politely.
+///
+/// A hyphen is a break opportunity because the names machines wear —
+/// `levelup-api`, `a-service-with-a-long-name`, a flag, a path — are single
+/// spaceless tokens joined by them, and a token that only breaks at spaces
+/// breaks in the middle of a word instead of at one of its own joints. The
+/// hyphen stays on the line it ends, exactly as a hyphenated line of prose
+/// would carry it.
 ///
 /// Walks forwards and keeps the last match rather than searching backwards from
 /// `fits`, because `fits` is a cluster boundary and the byte after it need not
 /// be a character boundary at all — slicing there would panic.
-fn last_space(text: &str, fits: usize) -> Option<usize> {
+fn last_break(text: &str, fits: usize) -> Option<usize> {
     text.char_indices()
         .take_while(|(offset, _)| *offset <= fits)
-        .filter(|(_, character)| character.is_whitespace())
-        .map(|(offset, character)| offset + character.len_utf8())
+        .filter_map(|(offset, character)| {
+            let past = offset + character.len_utf8();
+            if character.is_whitespace() {
+                // A space at the limit still breaks: it would otherwise open
+                // the next line, and it draws nothing where it is.
+                Some(past)
+            } else if character == '-' && past <= fits {
+                // A hyphen is ink, so it breaks only when the whole of it fits.
+                Some(past)
+            } else {
+                None
+            }
+        })
         .last()
 }
 
@@ -662,12 +681,12 @@ mod tests {
 
     #[test]
     fn a_line_breaks_after_the_last_space_that_fits() {
-        assert_eq!(last_space("one two three", 7), Some(8), "a space at the limit still breaks");
-        assert_eq!(last_space("one two three", 6), Some(4));
-        assert_eq!(last_space("unbreakable", 5), None);
+        assert_eq!(last_break("one two three", 7), Some(8), "a space at the limit still breaks");
+        assert_eq!(last_break("one two three", 6), Some(4));
+        assert_eq!(last_break("unbreakable", 5), None);
         // A space that is more than one byte still leaves the break on a
         // character boundary.
-        assert_eq!(last_space("a\u{a0}b", 1), Some(3));
+        assert_eq!(last_break("a\u{a0}b", 1), Some(3));
     }
 
     /// The synthetic face, at a size where a character is ten units wide and
@@ -733,6 +752,30 @@ mod tests {
             assert!(grapheme::is_boundary(text, end), "line ends at {end}");
         }
         assert_eq!(fonts.wrap(&style, text, 25.0).len(), 3, "one cluster to a line");
+    }
+
+    #[test]
+    fn a_hyphenated_name_breaks_at_its_own_joints_rather_than_mid_word() {
+        let (fonts, style) = loaded();
+        // Ten characters to a line at this width. Broken blindly that is
+        // "levelup-ap" + "i"; broken at the joint the name carries, the hyphen
+        // ends the first line and the word after it starts the next whole.
+        let text = "levelup-api";
+        let lines: Vec<&str> =
+            fonts.wrap(&style, text, 100.0).into_iter().map(|(a, b)| &text[a..b]).collect();
+        assert_eq!(lines, vec!["levelup-", "api"]);
+    }
+
+    #[test]
+    fn a_hyphen_that_does_not_fully_fit_is_not_hung_past_the_limit() {
+        let (fonts, style) = loaded();
+        // Seven characters fit and the hyphen is the eighth. A space there
+        // would break — it draws nothing — but a hyphen is ink, so with no
+        // joint that fits the break falls back to the plain cut.
+        let text = "levelup-api";
+        let lines: Vec<&str> =
+            fonts.wrap(&style, text, 70.0).into_iter().map(|(a, b)| &text[a..b]).collect();
+        assert_eq!(lines, vec!["levelup", "-api"], "the hyphen is not hung past the limit");
     }
 
     #[test]

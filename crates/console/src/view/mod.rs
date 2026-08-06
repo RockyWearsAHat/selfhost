@@ -36,11 +36,12 @@
 //! ends without drawing an outline around it. Nesting outlines is what made an
 //! earlier revision read as a diagram of an interface rather than as one: four
 //! rounded cards inside a rounded panel inside a window is three frames around
-//! every fact. There are four framed surfaces on screen — the masthead strip,
-//! the readout bank, the rail and the detail pane — and everything inside them
-//! is separated by ruling. Each is a chamfered plate marked at its corners by
-//! brackets, which is the console's whole frame: an outline that says where a
-//! reading is taken, and nothing inside it repeating the claim.
+//! every fact. There are three framed surfaces on screen — the readout bank,
+//! the rail and the detail pane — and everything inside them is separated by
+//! ruling. Each is a square plate one value above the ground, told by a grey
+//! hairline: an outline that says where a reading is taken, and nothing inside
+//! it repeating the claim. The masthead is not framed at all — a nameplate is
+//! not a reading, so the wordmark sits directly on the black.
 //!
 //! What each mark is *made* of, and why everything in the window — the marks
 //! the console draws and the controls the operator presses alike — is cut from
@@ -62,7 +63,7 @@ use crate::state::{Command, Link, NoticeKind, Snapshot, Tunnel};
 use install::InstallForm;
 use rui::style::Justify;
 use rui::{
-    Align, App, El, Radius, Role, Status, Tone, button, caption, col, figure, heading, micro,
+    Align, App, El, Key, Role, Status, Tone, button, caption, col, figure, heading, micro,
     paragraph, row, spacer, text, title,
 };
 use selfhost_supervisor::state::{ServiceState, ServiceStatus};
@@ -99,23 +100,10 @@ const MASTHEAD: f32 = 30.0;
 /// front of an instrument, which is what the strip carrying it is.
 const WORDMARK: f32 = 2.4;
 
-/// How far the corners of a strip — the masthead, an alert — are chamfered.
-///
-/// Smaller than a plate's, because the shape has less edge to run along; the
-/// same cut on a thirty-unit strip would take a third of its height off each
-/// end.
-const STRIP_CUT: f32 = 5.0;
-
-/// How far a row in the rail is chamfered.
-const ROW_CUT: f32 = 4.0;
-
-/// How far the halo around the chosen row reaches past it.
-const CHOSEN_GLOW: f32 = 9.0;
-
 /// How wide the gutter carrying a row's unit number is.
 const UNIT_GUTTER: f32 = 16.0;
 
-/// How tall the readout bank is.
+/// How tall the readout bank is at rest.
 ///
 /// Unchanged by the restaging that put the condition above the counts rather
 /// than beside them, and deliberately so: a label stacked over a figure and a
@@ -123,7 +111,19 @@ const UNIT_GUTTER: f32 = 16.0;
 /// so the bank now says something quite different for exactly the height it
 /// cost before. Height is what the log below it does not get, and a change in
 /// hierarchy should not be charged to the log.
+///
+/// A minimum, not a size: on a window too narrow for the sentence, the strip
+/// grows so the words wrap whole rather than truncating mid-verdict — and it
+/// is allowed [`BANK_GROWTH`] more units and no further, because every unit
+/// past that is taken off the log below it.
 const BANK: f32 = 54.0;
+
+/// The most the bank may grow past [`BANK`] to keep its words whole.
+///
+/// One more line of the sentence, roughly. A cap because the bank and the log
+/// want the same room and the log is why the console is open: a report may
+/// cost a line, but it may not cost the evidence.
+const BANK_GROWTH: f32 = 26.0;
 
 /// What share of the bank the next move takes, at the far end of it.
 ///
@@ -266,6 +266,11 @@ pub fn view(console: &Console) -> El<Console> {
 
 /// The masthead: what this is, whether it is connected, and to what.
 ///
+/// Unframed, alone among the window's strips: a nameplate is not a reading,
+/// and boxing the name gave the window one more outline saying nothing. The
+/// wordmark and the connection sit directly on the black, under the ground's
+/// own ruler, which is what an engraved front panel is.
+///
 /// The two ends are measured and a rule takes what is between them, so the bar
 /// reads as one instrument however wide the window is. Left to a plain row, a
 /// wide window put the mark at one edge and the address at the other with a
@@ -303,10 +308,6 @@ fn header(console: &Console, snapshot: &Snapshot) -> El<Console> {
     ))
     .gap(10.0)
     .h(MASTHEAD)
-    .pad_x(10.0)
-    .border(1.0, Tone::Border)
-    .round(Radius::Cut(STRIP_CUT))
-    .add(style::brackets(Tone::Border))
 }
 
 /// What the header says about the connection: a state, a word, and a detail.
@@ -409,14 +410,11 @@ fn alert(status: Status) -> El<Console> {
         .pad_each(6.0, 12.0, 6.0, 5.0)
         .gap(9.0)
         .fill(Tone::tint(status))
+        // Outlined in the status's own hue rather than the structural grey:
+        // an alert is the one strip that has pushed its way in above the
+        // panes, and its frame is part of the announcement.
         .border(1.0, ink)
-        // Cut and bracketed in the status's own hue, like every other surface
-        // the console reports on — an alert is the one that has pushed its way
-        // in above the panes, and a strip that arrived wearing the desktop's
-        // shape would read as a dialog rather than as a reading.
-        .round(Radius::Cut(STRIP_CUT))
         .color(ink)
-        .add(style::brackets(ink))
 }
 
 /// The readout bank: the machine's own account of itself, and the counts it
@@ -466,14 +464,21 @@ fn bank(snapshot: &Snapshot) -> El<Console> {
     style::plate(
         row((
             live_share(snapshot).map(style::gauge),
-            col((figure(condition(snapshot)), evidence(snapshot)))
+            // The sentence wraps and the strip states its height as a
+            // minimum, so a narrow window pays for the report in height —
+            // which the layout takes back off the log — rather than in
+            // legibility. A verdict cut to an ellipsis mid-clause is the one
+            // thing the bank must never show: the clause it cuts is the
+            // verdict.
+            col((figure(condition(snapshot)).wrap(), evidence(snapshot)))
                 .gap(3.0)
                 .justify(Justify::Center)
                 .grow(),
             next_move(snapshot).map(upcoming),
         ))
         .gap(12.0)
-        .h(BANK)
+        .min_h(BANK)
+        .max_h(BANK + BANK_GROWTH)
         // The plate's own padding, applied here instead: the surface has to
         // carry the sentence's full height itself, so it is the strip
         // inside that is inset — and at the same twelve units every other
@@ -529,6 +534,10 @@ fn evidence(snapshot: &Snapshot) -> Option<El<Console>> {
     let restarts: u64 = snapshot.services.iter().map(|service| service.total_restarts).sum();
 
     Some(
+        // A flow, not a row: a reading squeezed to an ellipsis reports
+        // nothing, so on a rail-narrow window the readings run onto a second
+        // line whole rather than truncating on one. On any window worth
+        // having they are one line, exactly as a row would have drawn them.
         row((
             style::reading("RUNNING", format!("{running}/{total}"), None),
             style::reading("RESTARTS", restarts.to_string(), None),
@@ -538,7 +547,8 @@ fn evidence(snapshot: &Snapshot) -> Option<El<Console>> {
                 (attention > 0).then_some(Status::Bad),
             ),
         ))
-        .gap(18.0),
+        .flow()
+        .gap(14.0),
     )
 }
 
@@ -739,7 +749,9 @@ fn upcoming(next: NextMove) -> El<Console> {
         style::standing_rule(),
         style::lamp(next.status),
         col((
-            text(next.headline).text_size(13.5).color(style::state_ink(next.status)),
+            // Wrapped, never cut: the headline is a countdown, and an
+            // ellipsis lands exactly on the clause with the clock in it.
+            text(next.headline).text_size(13.5).color(style::state_ink(next.status)).wrap(),
             caption(next.detail),
         ))
             .gap(1.0)
@@ -832,12 +844,13 @@ fn rail(snapshot: &Snapshot) -> El<Console> {
 /// it the rest of the time — see [`style::state_ink`] for why a rail where
 /// every healthy row is lit green cannot say when one is not.
 ///
-/// The chosen row is *lit* rather than washed: a cyan hairline and a faint halo
-/// in the same colour, over the ground every other row sits on. A wash of the
-/// accent is what a desktop list does, and on a ground this dark it is a change
-/// of value so small that the wedge was doing all the work anyway — while an
-/// outline that glows is what a selected plate looks like on an instrument, and
-/// it is the second of the two places in the window a glow is spent.
+/// The chosen row is *lit* rather than washed: a white hairline over the
+/// ground every other row sits on, and the lit bar of the wedge at its edge.
+/// A wash of the accent is what a desktop list does, and on a ground this dark
+/// it is a change of value so small that the wedge was doing all the work
+/// anyway — while a row whose outline has been switched on is what a selected
+/// channel looks like on an instrument. It does not glow: light here is
+/// stated by value, and the halo is kept for the marks that are waiting.
 fn service_row(index: usize, service: &ServiceStatus, chosen: bool) -> El<Console> {
     let name = service.name.clone();
     let (status, _, summary) = present(&service.state);
@@ -872,16 +885,27 @@ fn service_row(index: usize, service: &ServiceStatus, chosen: bool) -> El<Consol
     .h(ROW_HEIGHT)
     .gap(7.0)
     .pad_x(6.0)
-    .round(Radius::Cut(ROW_CUT))
     .hover_fill(Tone::Raised)
     .role(Role::ListItem)
     .selected(chosen)
     .on_click(move |console: &mut Console| {
         let name = name.clone();
         console.with_snapshot(|snapshot| snapshot.selected = Some(name));
+    })
+    // The arrows walk the rail from whichever row holds the keyboard. The
+    // handler reads the selection rather than this row's own index, so two
+    // presses from one focused row move two rows — focus and selection are
+    // different facts, and it is the selection being driven.
+    .on_key(|console: &mut Console, key, _modifiers| {
+        let step = match key {
+            Key::Up => -1,
+            Key::Down => 1,
+            _ => return,
+        };
+        console.with_snapshot(|snapshot| snapshot.select_step(step));
     });
 
-    if chosen { row.border(1.0, Tone::Accent).glow(CHOSEN_GLOW, Tone::Accent) } else { row }
+    if chosen { row.border(1.0, Tone::Accent) } else { row }
 }
 
 /// The right-hand pane: the form if it is open, and the selected service if not.
@@ -1062,6 +1086,27 @@ mod tests {
         let row = service_row(0, &console.snapshot().services[0].clone(), false);
         (row.click_action().expect("a row is clickable"))(&mut console);
         assert_eq!(console.snapshot().selected.as_deref(), Some("mongod"));
+    }
+
+    #[test]
+    fn an_arrow_on_any_row_moves_the_selection_through_the_rail() {
+        // The handler is an ordinary function of the console, so the keyboard's
+        // half of choosing is tested the same way the pointer's half is: no
+        // frame, no window, no synthetic keystroke.
+        let mut console = console(populated());
+        let row = service_row(0, &console.snapshot().services[0].clone(), false);
+        let keys = row.key_action().expect("a row listens to the keyboard");
+
+        keys(&mut console, Key::Down, rui::Modifiers::NONE);
+        assert_eq!(console.snapshot().selected.as_deref(), Some("backups"));
+        keys(&mut console, Key::Up, rui::Modifiers::NONE);
+        assert_eq!(console.snapshot().selected.as_deref(), Some("levelup-api"));
+        keys(&mut console, Key::Enter, rui::Modifiers::NONE);
+        assert_eq!(
+            console.snapshot().selected.as_deref(),
+            Some("levelup-api"),
+            "other keys are left to the controls that own them"
+        );
     }
 
     #[test]

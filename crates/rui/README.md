@@ -163,14 +163,18 @@ along one axis; each asks for a `Length` along it:
 | `Auto` (the default) | what its content needs |
 | `.w(120.0)` / `.h(28.0)` | exactly that |
 | `.grow()` | a share of what is left over |
+| `.grow_from_content()` | its content first, then a share of what is left |
 | `Length::Fraction(0.28)` | that share of what the parent offered |
 
 Room left over is divided between the growing children in proportion to what
-they asked for. Room that runs *short* is taken back off the children sized to
-their content — never off one that asked for a height in units, because a
-control asked for its height because that is how tall it has to be. Across the
-other axis a child is stretched unless it states a size or an `align_self`, and
-is never laid out wider than the box that owns it.
+they asked for, and dealt again when one of them hits a stated maximum — a
+capped grower's unclaimed share goes to its siblings rather than being
+stranded as dead room. Room that runs *short* is taken back off the children
+sized to their content first, then off the growers down to their minimums —
+never off one that asked for a height in units, because a control asked for
+its height because that is how tall it has to be. Across the other axis a
+child is stretched unless it states a size or an `align_self`, and is never
+laid out wider than the box that owns it.
 
 `.flow()` runs children onto further lines when they do not fit — a row of tags,
 a grid of cards, a toolbar that reflows on a narrow window. It is the one layout
