@@ -159,6 +159,14 @@ pub fn divider<S>() -> El<S> {
 
 /// A button: an outlined surface that lightens under the pointer.
 ///
+/// Its face is a step *above* the surface it sits on — [`Tone::Raised`] shading
+/// down to [`Tone::Surface`] — where a panel's own face shades from surface
+/// downward. A button drawn in the panel's exact gradient disappears into the
+/// panel, leaving a hairline rectangle that reads as a diagram of a button;
+/// raising the face is what says *key mounted on a panel*, and it pairs with
+/// [`field`], which is sunken for the opposite reason: what is pressed sits
+/// proud, what is typed into is a well.
+///
 /// Ordinary by default. [`El::primary`] fills it with the accent for the one
 /// action a screen is mostly for, [`El::danger`] tints it for something
 /// destructive, and [`El::ghost`] takes its chrome away entirely for an action
@@ -167,7 +175,7 @@ pub fn button<S>(label: impl Into<String>) -> El<S> {
     row(text(label).grow().text_align(Align::Center))
         .h(28.0)
         .pad_x(12.0)
-        .gradient(Tone::Surface, Tone::SurfaceDeep)
+        .gradient(Tone::Raised, Tone::Surface)
         .border(1.0, Tone::Border)
         .round(Radius::Control)
         .reactive()
@@ -462,6 +470,25 @@ pub fn field_row<S>(label: impl Into<String>, value: El<S>) -> El<S> {
         value
     };
     row((heading(label).w(78.0), value.grow())).gap(8.0).min_h(20.0)
+}
+
+/// A row that names a stack of values rather than one line of them.
+///
+/// [`field_row`] centres its label against the value beside it, which is right
+/// for one line and wrong for a stack: centred against four rows, the label
+/// floats beside the third and names none of them. Here the label keeps the
+/// height of one control and holds the top of the row, so the name sits level
+/// with the first entry — where a reader scanning the labels expects the stack
+/// to begin. The value keeps its own children's names: a stack's entries name
+/// themselves, and renaming the stack after its label would announce every
+/// entry identically.
+pub fn field_group<S>(label: impl Into<String>, value: El<S>) -> El<S> {
+    // The label's box matches a control's height so its word centres on the
+    // first entry's own centre line, exactly as `field_row` centres against a
+    // single control.
+    row((heading(label).w(78.0).h(28.0).align_self(Align::Start), value.grow()))
+        .gap(8.0)
+        .min_h(20.0)
 }
 
 #[cfg(test)]

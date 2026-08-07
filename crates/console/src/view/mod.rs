@@ -103,7 +103,7 @@ const WORDMARK: f32 = 2.4;
 /// How wide the gutter carrying a row's unit number is.
 const UNIT_GUTTER: f32 = 16.0;
 
-/// The width a row's state word may be squeezed to, and no further.
+/// The width a *quiet* row's state word may be squeezed to, and no further.
 ///
 /// On a narrow rail the name and the state want the same line, and the name is
 /// the only thing telling the rows apart — the state is already said twice by
@@ -118,7 +118,29 @@ const UNIT_GUTTER: f32 = 16.0;
 /// characters and say the rest with its ellipsis. It is below the narrowest
 /// word a state can be, so a row with room never draws a wider element than
 /// its own text.
+///
+/// A red word pays nothing, though — and only a red one. [`Status::Bad`] is
+/// the hue of *somebody must act*, and a red `CAN…` is that summons cut to a
+/// syllable on exactly the row that earned the words; so [`service_row`]
+/// floors a red word at its own full width and lets the name pay, which the
+/// name can afford — it is still told by the summary under it and by being
+/// chosen. An amber word stays a payer with the rest: amber is the machine
+/// already handling it, its countdown is restated in the summary below, and
+/// holding `RESTARTING` whole was measured to cut `backups` to `b…` — the
+/// priority inversion this floor exists to prevent.
 const STATE_FLOOR: f32 = 36.0;
+
+/// The width one character of a red state word is guaranteed, in units.
+///
+/// The layout's shrink pass takes from content-sized children first, floored
+/// at each one's stated minimum — a floor is the only guarantee a squeezed
+/// row honours, so "give the alarm its words" has to be said in units, and
+/// the units have to come from the word: a floor sized to the vocabulary's
+/// widest entry taxes a short alarm for letters it does not have. One unit is
+/// a small-capital character of the state's face with its tracking and a
+/// little air; a face change shows up as a cut alarm in the reference frames,
+/// which is where this gets re-measured.
+const ALARM_UNIT: f32 = 7.1;
 
 /// How tall the readout bank is at rest.
 ///
@@ -398,7 +420,10 @@ fn notice(notice: crate::state::Notice) -> El<Console> {
 fn tunnel_banner(snapshot: &Snapshot) -> Option<String> {
     match &snapshot.tunnel {
         Some(Tunnel::Broken { reason, advice }) => Some(match advice {
-            Some(advice) => format!("The SSH tunnel is down. {reason} {advice}"),
+            // The reason is `ssh`'s own sentence and the advice is this
+            // program's; a dash keeps them two voices rather than running the
+            // tool's complaint into the console's instruction mid-line.
+            Some(advice) => format!("The SSH tunnel is down. {reason} — {advice}"),
             None => format!("The SSH tunnel is down. {reason}"),
         }),
         _ => None,
@@ -894,10 +919,23 @@ fn service_row(index: usize, service: &ServiceStatus, chosen: bool) -> El<Consol
                 // that chrome was taking the room the service's own name needed
                 // — the name is what tells the rows apart, and it was the part
                 // being truncated. Growing the name from its words finishes
-                // that argument: a short line takes from the state word first,
-                // down to [`STATE_FLOOR`], and only then from the name.
+                // that argument: a short line takes from a quiet state word
+                // first, down to [`STATE_FLOOR`], and only then from the name.
+                // A troubled word is the exception argued at the floor's own
+                // doc: it keeps its words, and the name is the payer.
                 text(display_name(service)).grow_from_content().text_size(13.5),
-                style::state_word(status, state_label).min_w(STATE_FLOOR),
+                match status {
+                    // Floored at the word's own width so it stands whole, and
+                    // flush against the row's end so it sits where every other
+                    // state word sits when the floor lands a unit wide.
+                    Status::Bad => {
+                        let whole = state_label.len() as f32 * ALARM_UNIT;
+                        style::state_word(status, state_label)
+                            .min_w(whole)
+                            .text_align(Align::End)
+                    }
+                    _ => style::state_word(status, state_label).min_w(STATE_FLOOR),
+                },
             ))
             .gap(4.0),
             caption(summary),
@@ -1172,29 +1210,44 @@ mod tests {
     }
 
     #[test]
-    fn the_state_word_gives_way_before_the_name_on_a_narrow_rail() {
-        // The name is what tells the rows apart, so a short line takes from
-        // the state word — already said twice by the lamp — before it takes
-        // from the name. The synthetic face makes the widths exact: every
-        // character is half its text size wide, plus its tracking.
+    fn a_quiet_state_word_gives_way_and_a_troubled_one_keeps_its_words() {
+        // The synthetic face makes the widths exact: every character is half
+        // its text size wide, plus its tracking.
+        let width_of = |word: &str| word.len() as f32 * (10.5 / 2.0 + 0.4);
+
+        // A red word is the summons to act, so it is never the payer: CANNOT
+        // START stands whole on the narrowest rail the layout allows, and the
+        // long name beside it is what truncates.
         let mut harness =
             Harness::new(console(populated()), |console: &Console| rail(&console.snapshot()))
                 .size(RAIL_MIN, 420.0);
         harness.frame();
-
-        // The one row that cannot fit: the state is squeezed to its floor and
-        // the name keeps everything the floor did not claim.
-        let name =
-            harness.rect_of("a-service-with-a-very-long-name").expect("the name is drawn");
         let state = harness.rect_of("CANNOT START").expect("the state is drawn");
-        assert!(state.w <= STATE_FLOOR + 0.5, "the state word is the payer: {}", state.w);
-        assert!(name.w > state.w, "what the floor spared goes to the name: {}", name.w);
+        assert!(state.w >= width_of("CANNOT START") - 0.5, "an alarm is never cut: {}", state.w);
+        // An amber word is a payer like any quiet one — the machine is
+        // handling it and the summary restates the countdown — but on a row
+        // whose own line has room, nothing is taken from it.
+        assert!(
+            harness.rect_of("RESTARTING").expect("the state is drawn").w
+                >= width_of("RESTARTING") - 0.5,
+            "a fitting row gives nothing"
+        );
 
-        // A row whose name fits pays nothing at all: `RESTARTING` stands at
-        // the width its own characters ask for.
-        let unshrunk = 10.0 * (10.5 / 2.0 + 0.4);
-        let resting = harness.rect_of("RESTARTING").expect("the state is drawn").w;
-        assert!(resting >= unshrunk - 0.5, "a fitting row gives nothing: {resting}");
+        // A quiet word is already said twice by the lamp, so on a short line
+        // it is squeezed to its floor and the name keeps the difference.
+        let mut long_running = populated();
+        long_running.services.truncate(1);
+        long_running.services[0].name = "a-very-long-name-for-a-running-service".into();
+        let mut harness =
+            Harness::new(console(long_running), |console: &Console| rail(&console.snapshot()))
+                .size(RAIL_MIN, 420.0);
+        harness.frame();
+        let running = harness.rect_of("RUNNING").expect("the state is drawn");
+        assert!(running.w <= STATE_FLOOR + 0.5, "a quiet word is the payer: {}", running.w);
+        let name = harness
+            .rect_of("a-very-long-name-for-a-running-service")
+            .expect("the name is drawn");
+        assert!(name.w > running.w, "what the floor spared goes to the name: {}", name.w);
     }
 
     #[test]
@@ -1544,17 +1597,28 @@ mod tests {
         // beside itself under a name claiming it was different. What the room
         // freed pays for is the states that were missing — a link being made,
         // and a machine that is up but counting down to a retry.
+        std::fs::create_dir_all(format!("{directory}/web"))
+            .expect("the frame directory should be writable");
         let mut written = |name: &str, snapshot: Snapshot, prepare: fn(&mut Console), size: (u32, u32)| {
             let mut console = console(snapshot);
             prepare(&mut console);
             let mut app = application("selfhost", console);
-            let canvas = app.render(size.0, size.1, 2.0, Appearance::Dark, &mut fonts);
-            let pixels = rui::image::rgba(&canvas);
-            let png = rui::image::png(canvas.width(), canvas.height(), &pixels)
-                .expect("a frame should encode");
-            let path = format!("{directory}/{name}.png");
-            std::fs::write(&path, png).expect("the directory should be writable");
-            println!("wrote {path}");
+            // Twice, at both densities a reader actually has: the 2× original
+            // for pixel-level inspection, and a true 1× rasterisation in web/
+            // small enough to embed where the original is past a size limit —
+            // a real render at each density, never one image resampled into
+            // the other's.
+            for (scale, path) in [
+                (2.0, format!("{directory}/{name}.png")),
+                (1.0, format!("{directory}/web/{name}.png")),
+            ] {
+                let canvas = app.render(size.0, size.1, scale, Appearance::Dark, &mut fonts);
+                let pixels = rui::image::rgba(&canvas);
+                let png = rui::image::png(canvas.width(), canvas.height(), &pixels)
+                    .expect("a frame should encode");
+                std::fs::write(&path, png).expect("the directory should be writable");
+                println!("wrote {path}");
+            }
         };
 
         written("console", busy(), |_| {}, (1000, 660));
