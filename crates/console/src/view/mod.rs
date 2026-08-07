@@ -103,32 +103,15 @@ const WORDMARK: f32 = 2.4;
 /// How wide the gutter carrying a row's unit number is.
 const UNIT_GUTTER: f32 = 16.0;
 
-/// The width a *quiet* row's state word may be squeezed to, and no further.
-///
-/// On a narrow rail the name and the state want the same line, and the name is
-/// the only thing telling the rows apart — the state is already said twice by
-/// the lamp, in a hue and in a fill. The name therefore grows *from its words*
-/// and the state word is what gives way when the line is short: without that,
-/// the name was the payer by construction — it was the grower, a grower's
-/// floor is zero, and the layout never takes from a content-sized child while
-/// a grower can still give — so `backups` read `back…` beside an untouched
-/// `RESTARTING`, the priority exactly inverted. The floor is what stops the
-/// trade at the other extreme: a state squeezed to nothing is a fact deleted,
-/// not a fact deferred, so the word keeps enough room to open with a few
-/// characters and say the rest with its ellipsis. It is below the narrowest
-/// word a state can be, so a row with room never draws a wider element than
-/// its own text.
-///
-/// A red word pays nothing, though — and only a red one. [`Status::Bad`] is
-/// the hue of *somebody must act*, and a red `CAN…` is that summons cut to a
-/// syllable on exactly the row that earned the words; so [`service_row`]
-/// floors a red word at its own full width and lets the name pay, which the
-/// name can afford — it is still told by the summary under it and by being
-/// chosen. An amber word stays a payer with the rest: amber is the machine
-/// already handling it, its countdown is restated in the summary below, and
-/// holding `RESTARTING` whole was measured to cut `backups` to `b…` — the
-/// priority inversion this floor exists to prevent.
-const STATE_FLOOR: f32 = 36.0;
+// A quiet row's state word stands whole or is not drawn — `.whole()` in
+// [`service_row`], no floor constant left to tune. The old trade squeezed the
+// word to a floor and let it say the rest with an ellipsis, and the accepted
+// cost was a selected narrow row reading `RUNNI…` — a fact half-deleted on
+// exactly the row being looked at. The word's whole meaning is already said
+// twice by the lamp, in a hue and in a fill, so when the line runs short the
+// honest options are the word entire or the lamp alone; the layout now offers
+// exactly those two. A red word is the one exception, argued at
+// [`ALARM_UNIT`]: it is a summons, it never yields, and the name is the payer.
 
 /// The width one character of a red state word is guaranteed, in units.
 ///
@@ -503,9 +486,19 @@ fn alert(status: Status) -> El<Console> {
 /// happening. An instrument that reports when it has nothing to report is an
 /// instrument nobody reads.
 fn bank(snapshot: &Snapshot) -> El<Console> {
+    // Which face the gauge slot wears is a three-way fact, not a boolean: a
+    // measured machine gets the reading, a machine not yet reached gets the
+    // face with no reading on it (the share is unknown, not nought — see
+    // [`style::gauge_unread`]), and a connected machine with nothing
+    // installed gets nothing, exactly as `live_share` argues.
+    let gauge = match live_share(snapshot) {
+        Some(share) => Some(style::gauge(share)),
+        None if !matches!(snapshot.link, Link::Connected) => Some(style::gauge_unread()),
+        None => None,
+    };
     style::plate(
         row((
-            live_share(snapshot).map(style::gauge),
+            gauge,
             // The sentence wraps and the strip states its height as a
             // minimum, so a narrow window pays for the report in height —
             // which the layout takes back off the log — rather than in
@@ -919,22 +912,23 @@ fn service_row(index: usize, service: &ServiceStatus, chosen: bool) -> El<Consol
                 // that chrome was taking the room the service's own name needed
                 // — the name is what tells the rows apart, and it was the part
                 // being truncated. Growing the name from its words finishes
-                // that argument: a short line takes from a quiet state word
-                // first, down to [`STATE_FLOOR`], and only then from the name.
-                // A troubled word is the exception argued at the floor's own
-                // doc: it keeps its words, and the name is the payer.
+                // that argument: a short line takes the quiet state word
+                // first — whole, or not at all; the lamp still says it — and
+                // only then takes from the name. A troubled word is the
+                // exception argued at [`ALARM_UNIT`]: it keeps its words, and
+                // the name is the payer.
                 text(display_name(service)).grow_from_content().text_size(13.5),
                 match status {
                     // Floored at the word's own width so it stands whole, and
                     // flush against the row's end so it sits where every other
-                    // state word sits when the floor lands a unit wide.
+                    // state word sits.
                     Status::Bad => {
                         let whole = state_label.len() as f32 * ALARM_UNIT;
                         style::state_word(status, state_label)
                             .min_w(whole)
                             .text_align(Align::End)
                     }
-                    _ => style::state_word(status, state_label).min_w(STATE_FLOOR),
+                    _ => style::state_word(status, state_label).whole(),
                 },
             ))
             .gap(4.0),
@@ -1233,8 +1227,9 @@ mod tests {
             "a fitting row gives nothing"
         );
 
-        // A quiet word is already said twice by the lamp, so on a short line
-        // it is squeezed to its floor and the name keeps the difference.
+        // A quiet word is already said twice by the lamp, so on a line too
+        // short to hold it whole it is not drawn at all — whole or nothing —
+        // and every unit it held goes to the name.
         let mut long_running = populated();
         long_running.services.truncate(1);
         long_running.services[0].name = "a-very-long-name-for-a-running-service".into();
@@ -1242,12 +1237,14 @@ mod tests {
             Harness::new(console(long_running), |console: &Console| rail(&console.snapshot()))
                 .size(RAIL_MIN, 420.0);
         harness.frame();
-        let running = harness.rect_of("RUNNING").expect("the state is drawn");
-        assert!(running.w <= STATE_FLOOR + 0.5, "a quiet word is the payer: {}", running.w);
+        assert!(
+            harness.rect_of("RUNNING").is_none_or(|word| word.w <= 0.5),
+            "a quiet word that cannot stand whole is not drawn"
+        );
         let name = harness
             .rect_of("a-very-long-name-for-a-running-service")
             .expect("the name is drawn");
-        assert!(name.w > running.w, "what the floor spared goes to the name: {}", name.w);
+        assert!(name.w > width_of("RUNNING"), "the word's whole room goes to the name: {}", name.w);
     }
 
     #[test]

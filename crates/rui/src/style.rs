@@ -382,6 +382,16 @@ pub struct Style {
     /// control is the other way round: its words come first, and only the room
     /// past them is up for sharing. See [`El::grow_from_content`](crate::El::grow_from_content).
     pub grow_from_content: bool,
+    /// Whether it stands whole or is not laid out at all.
+    ///
+    /// A squeezed element normally gives ground gradually — text truncates to
+    /// an ellipsis, a pane loses rows. An element that says `whole` refuses
+    /// the middle state: when a shrinking container would cut into what it
+    /// measured, it collapses to nothing and its room goes to its siblings.
+    /// For a mark whose meaning is carried elsewhere too — a state word beside
+    /// a lamp — half the word is worse than none of it. See
+    /// [`El::whole`](crate::El::whole).
+    pub whole: bool,
     /// The narrowest it may be laid out.
     pub min_width: f32,
     /// The shortest it may be laid out.
@@ -477,6 +487,7 @@ impl Default for Style {
             height: Length::Auto,
             grow: None,
             grow_from_content: false,
+            whole: false,
             min_width: 0.0,
             min_height: 0.0,
             max_width: f32::INFINITY,

@@ -566,6 +566,45 @@ pub fn gauge<S>(fraction: f32) -> El<S> {
     .align_self(Align::Center)
 }
 
+/// The gauge's face with no reading on it: scale and track, no arc, no core.
+///
+/// Drawn while the console has not reached the daemon — the machine's share is
+/// not nought, it is *unknown*, and the two must not look alike. A zero
+/// reading keeps its dimly lit core ([`CORE_FLOOR`]: dark, never out); an
+/// instrument that has not measured anything has no reading to state, so its
+/// centre is empty and only the face marks the place a reading will appear.
+/// The connected-but-empty machine is a third case and stays bare (see
+/// `live_share` in view/mod.rs): with nothing installed there is nothing to
+/// measure, and a face would promise a reading that can never arrive.
+pub fn gauge_unread<S>() -> El<S> {
+    draw(Size::new(GAUGE, GAUGE), move |painter, rect| {
+        let accent = painter.color(Tone::Accent);
+        let center = Point::new(rect.x + rect.w / 2.0, rect.y + rect.h / 2.0);
+        // The same radii, worked in from the edge, as [`gauge`] — the face is
+        // the one thing the two states share, so it is drawn by the same
+        // arithmetic.
+        let half = rect.w.min(rect.h) / 2.0;
+        let tick_outer = half - 1.0;
+        let tick_inner = tick_outer - GAUGE_TICK;
+        let radius = tick_inner - GAUGE_TICK_GAP - GAUGE_BAND / 2.0;
+
+        let canvas = painter.canvas();
+        canvas.ticks(
+            center,
+            tick_inner,
+            tick_outer,
+            GAUGE_TICK_WEIGHT,
+            GAUGE_TICKS,
+            TOP,
+            accent.fade(TRACK * 1.6),
+        );
+        canvas.ring(center, radius, GAUGE_BAND, accent.fade(TRACK));
+    })
+    .w(GAUGE)
+    .h(GAUGE)
+    .align_self(Align::Center)
+}
+
 /// How large a reticle is drawn, at most.
 const RETICLE: f32 = 200.0;
 
