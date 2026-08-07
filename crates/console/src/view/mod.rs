@@ -875,8 +875,9 @@ fn rail(snapshot: &Snapshot) -> El<Console> {
 /// stated by value, and the halo is kept for the marks that are waiting.
 fn service_row(index: usize, service: &ServiceStatus, chosen: bool) -> El<Console> {
     let name = service.name.clone();
-    let (status, _, summary) = present(&service.state);
+    let (status, _, _) = present(&service.state);
     let state_label = service.state.label().to_uppercase();
+    let summary = rail_summary(service);
 
     let row = row((
         style::wedge(chosen),
@@ -930,6 +931,26 @@ fn service_row(index: usize, service: &ServiceStatus, chosen: bool) -> El<Consol
     });
 
     if chosen { row.border(1.0, Tone::Accent) } else { row }
+}
+
+/// What a rail row says under a service's name.
+///
+/// A running service wears its restart count: `pid 4821 · up 2h` on a service
+/// that has crashed twelve times today reads as health, and the rail is where
+/// a flapping service has to be *noticed* — the detail pane states the count
+/// only after the row has already been chosen. Only a live service carries it;
+/// every troubled state's summary already accounts for its restarts in its own
+/// words, and a stopped service's count is history rather than a warning.
+///
+/// Pure, so the rule about who carries the count is asserted without a frame.
+fn rail_summary(service: &ServiceStatus) -> String {
+    let (_, _, summary) = present(&service.state);
+    match service.total_restarts {
+        0 => summary,
+        _ if !service.state.is_live() => summary,
+        1 => format!("{summary} · 1 restart"),
+        restarts => format!("{summary} · {restarts} restarts"),
+    }
 }
 
 /// The right-hand pane: the form if it is open, and the selected service if not.
@@ -1071,6 +1092,23 @@ mod tests {
         };
         let mut app = application("test", console);
         app.render(width, height, 1.0, Appearance::Dark, &mut fonts);
+    }
+
+    #[test]
+    fn only_a_live_service_wears_its_restart_count_in_the_rail() {
+        let snapshot = populated();
+        let running = &snapshot.services[0];
+        assert!(rail_summary(running).ends_with("· 3 restarts"), "a live flapper says so");
+
+        let backoff = &snapshot.services[2];
+        assert!(
+            !rail_summary(backoff).contains("restarts"),
+            "a troubled state's own words already account for its restarts"
+        );
+
+        let mut quiet = running.clone();
+        quiet.total_restarts = 0;
+        assert!(!rail_summary(&quiet).contains("restart"), "a clean service says nothing");
     }
 
     #[test]
@@ -1307,6 +1345,12 @@ mod tests {
         let mut form_open = console(busy());
         form_open.form_mut().open_blank();
 
+        let mut form_editing = console(busy());
+        {
+            let spec = form_editing.snapshot().spec.clone().expect("busy carries a definition");
+            form_editing.form_mut().open_edit(&spec);
+        }
+
         let mut announcing = busy();
         announcing.report_problem("mongod would not start");
         announcing.tunnel = Some(Tunnel::Broken {
@@ -1323,6 +1367,7 @@ mod tests {
             ("a console opening a tunnel", console(reaching()), (980.0, 680.0)),
             ("a console announcing a failure", console(announcing), (980.0, 680.0)),
             ("the install form", form_open, (980.0, 680.0)),
+            ("the form editing a service", form_editing, (980.0, 680.0)),
             ("the smallest window the backend allows", console(busy()), (560.0, 420.0)),
         ]
     }
@@ -1499,11 +1544,9 @@ mod tests {
         // beside itself under a name claiming it was different. What the room
         // freed pays for is the states that were missing — a link being made,
         // and a machine that is up but counting down to a retry.
-        let mut written = |name: &str, snapshot: Snapshot, open_form: bool, size: (u32, u32)| {
+        let mut written = |name: &str, snapshot: Snapshot, prepare: fn(&mut Console), size: (u32, u32)| {
             let mut console = console(snapshot);
-            if open_form {
-                console.form_mut().open_blank();
-            }
+            prepare(&mut console);
             let mut app = application("selfhost", console);
             let canvas = app.render(size.0, size.1, 2.0, Appearance::Dark, &mut fonts);
             let pixels = rui::image::rgba(&canvas);
@@ -1514,12 +1557,24 @@ mod tests {
             println!("wrote {path}");
         };
 
-        written("console", busy(), false, (1000, 660));
-        written("install", busy(), true, (1000, 660));
-        written("console-narrow", busy(), false, (560, 420));
-        written("console-empty", Snapshot::default(), false, (1000, 660));
-        written("console-alarmed", alarmed, false, (1000, 660));
-        written("console-reaching", reaching(), false, (1000, 660));
+        written("console", busy(), |_| {}, (1000, 660));
+        written("install", busy(), |console| console.form_mut().open_blank(), (1000, 660));
+        // The form as Edit opens it: filled from the fetched definition, with
+        // the readback stating the exact invocation. The blank form cannot
+        // show either — an empty program is no claim about what will run.
+        written(
+            "install-edit",
+            busy(),
+            |console| {
+                let spec = console.snapshot().spec.clone().expect("busy carries a definition");
+                console.form_mut().open_edit(&spec);
+            },
+            (1000, 660),
+        );
+        written("console-narrow", busy(), |_| {}, (560, 420));
+        written("console-empty", Snapshot::default(), |_| {}, (1000, 660));
+        written("console-alarmed", alarmed, |_| {}, (1000, 660));
+        written("console-reaching", reaching(), |_| {}, (1000, 660));
 
         // What a frame costs, at the sizes the window is actually used at. The
         // glyph cache is warmed first: the first frame at a new size rasterises
