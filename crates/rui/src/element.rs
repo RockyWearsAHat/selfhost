@@ -278,6 +278,19 @@ impl<S> El<S> {
         self
     }
 
+    /// Stands whole or is not laid out at all.
+    ///
+    /// When the container shrinks, an ordinary element gives ground gradually
+    /// — its text truncates, its content clips. This one refuses the middle
+    /// state: the moment the layout would hand it less than it measured, it
+    /// collapses to nothing and the room it held goes to its siblings. Say it
+    /// on an element whose meaning is stated elsewhere too, where half the
+    /// words are worse than none of them.
+    pub fn whole(mut self) -> Self {
+        self.style.whole = true;
+        self
+    }
+
     /// Refuses to be laid out narrower than this.
     pub fn min_w(mut self, width: f32) -> Self {
         self.style.min_width = width;

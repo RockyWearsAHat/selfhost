@@ -533,11 +533,31 @@ fn shrink<S>(
     axis: Axis,
     deficit: f32,
 ) {
+    // The all-or-nothing children go first, and entirely. An element that
+    // said `whole` is never drawn squeezed, so the moment there is a deficit
+    // at all it hands over everything it measured — and if that is more than
+    // the deficit asked for, the surplus is dealt back out to the growers
+    // rather than stranded as a hole where the element stood.
+    let mut left = deficit;
+    for position in 0..order.len() {
+        if left <= SETTLED {
+            break;
+        }
+        if children[order[position]].style.whole && mains[position] > 0.0 {
+            left -= mains[position];
+            mains[position] = 0.0;
+        }
+    }
+    if left < -SETTLED {
+        distribute(children, order, mains, grows, axis, -left);
+        return;
+    }
+
     let content_sized = |position: usize| {
         let child = &children[order[position]];
         grows[position] == 0.0 && matches!(main_length(child, axis), Length::Auto)
     };
-    let left = reclaim(children, order, mains, axis, deficit, content_sized);
+    let left = reclaim(children, order, mains, axis, left, content_sized);
     if left > SETTLED {
         reclaim(children, order, mains, axis, left, |position| grows[position] > 0.0);
     }

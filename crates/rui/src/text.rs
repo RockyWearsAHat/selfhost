@@ -364,8 +364,14 @@ impl Fonts {
         }
 
         // The ellipsis has to fit too, so the text is fitted to what is left
-        // after reserving room for it rather than to the full width.
+        // after reserving room for it rather than to the full width. Room for
+        // not even the ellipsis draws nothing at all: a lone "…" overflowing
+        // a collapsed rectangle reports nothing and litters the pixels beside
+        // it.
         let ellipsis = self.measure(style, "…");
+        if max_width < ellipsis {
+            return 0.0;
+        }
         let kept = self.fit(style, text, (max_width - ellipsis).max(0.0));
         let advance = self.draw(canvas, style, origin, &text[..kept], color);
         advance
