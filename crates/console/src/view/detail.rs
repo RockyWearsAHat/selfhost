@@ -193,17 +193,21 @@ fn definition(snapshot: &Snapshot, service: &selfhost_supervisor::state::Service
 
     match spec_of(snapshot, &service.name) {
         Some(spec) => {
+            // The code face is a claim: this exact string is what the machine
+            // uses. A row whose value is a *description* — no arguments, the
+            // default directory — says so in the interface's own voice, or
+            // "none" reads as an argument and the default's name as a path.
             rows.push(field_row("PROGRAM", code(spec.program.display().to_string())));
             rows.push(field_row(
                 "ARGUMENTS",
-                code(if spec.args.is_empty() { "none".to_owned() } else { spec.args.join(" ") }),
+                if spec.args.is_empty() { text("none") } else { code(spec.args.join(" ")) },
             ));
             rows.push(field_row(
                 "RUNS IN",
-                code(match &spec.cwd {
-                    Some(path) => path.display().to_string(),
-                    None => "the daemon's data directory".to_owned(),
-                }),
+                match &spec.cwd {
+                    Some(path) => code(path.display().to_string()),
+                    None => text("the daemon's data directory"),
+                },
             ));
             rows.push(field_row(
                 "POLICY",
