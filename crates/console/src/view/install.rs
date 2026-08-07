@@ -23,7 +23,9 @@ use super::style;
 use super::{Console, title_rule};
 use crate::state::{Command, Snapshot};
 use rui::style::Justify;
-use rui::{El, Tone, button, caption, code, col, field, field_row, row, segmented, spacer};
+use rui::{
+    El, Tone, button, caption, code, col, field, field_group, field_row, row, segmented, spacer,
+};
 use selfhost_config::{RestartPolicy, ServiceSpec, StartMode};
 
 /// The start modes, in the order the control shows them.
@@ -311,7 +313,10 @@ fn arguments(form: &InstallForm) -> El<Console> {
         .collect();
 
     let full = form.arguments.len() >= MAX_ARGUMENTS;
-    field_row(
+    // A group, not a `field_row`: the label holds the top of the stack so it
+    // sits level with the first argument instead of floating beside whichever
+    // row happens to be the middle one.
+    field_group(
         "ARGUMENTS",
         col((
             col(rows).gap(4.0),

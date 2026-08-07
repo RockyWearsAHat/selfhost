@@ -79,6 +79,10 @@
 //!   animation runs on, for anything the hover does not already answer: a
 //!   figure that counts to its new number, a bar that sweeps to its reading.
 //!   Nothing reads a clock, so a test steps it exactly.
+//! - [`Painter::phase`] — the same, for motion that repeats rather than
+//!   arrives: a sweep going round while a connection is being made, a lamp
+//!   pulsing while something wants attention. It never settles, which is why it
+//!   is drawn only while the loop is what the interface is reporting.
 //! - [`El::on_drag`] — where the pointer is *within* it, every frame it is
 //!   held. The difference between a button and a slider, a splitter, a knob, or
 //!   a canvas that pans.
@@ -159,7 +163,8 @@ pub use style::{Align, Anchor, Axis, Face, Ink, Justify, Length, Radius, Style, 
 pub use text::{FontId, Fonts, TextStyle};
 pub use theme::{Appearance, CornerStyle, Palette, Status, Theme};
 pub use widgets::{
-    button, caption, code, col, divider, dot, draw, field, field_row, figure, heading, meter,
+    button, caption, code, col, divider, dot, draw, field, field_group, field_row, figure, heading,
+    meter,
     micro, panel, paragraph, row, section, segmented, spacer, tabs, tag, text, title,
 };
 
