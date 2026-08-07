@@ -769,6 +769,11 @@ fn upcoming(next: NextMove) -> El<Console> {
             // Wrapped, never cut: the headline is a countdown, and an
             // ellipsis lands exactly on the clause with the clock in it.
             text(next.headline).text_size(13.5).color(style::state_ink(next.status)).wrap(),
+            // The detail stays one line and truncates. Wrapping it was tried:
+            // in a bank whose height is capped, the detail's second line is
+            // taken from the headline's last — which on a narrow window is the
+            // clause with the clock in it. Of the two, the ellipsis belongs on
+            // the tail of the evidence, never on the countdown.
             caption(next.detail),
         ))
             .gap(1.0)

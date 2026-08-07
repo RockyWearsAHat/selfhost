@@ -78,3 +78,35 @@ all of the ~15 orientation reads this session needed. The claimed 100× speedup 
 realistic for this repo class until dx_run can execute builds (#3); the actual 100×-shaped
 win this session came from parallel subagent orchestration + a fast native test/render
 loop, with dx as the durable notebook beside it.
+
+---
+
+## Addendum — follow-up session, 2026-08-06 (later)
+
+Bug #3 is **wrong as stated** (or the sandbox changed): dx_run DOES grant writes, via
+`writes=` on the block, with one undocumented law — the grant must stay **inside the
+document's own folder, relative, walking downward**. The error only says so if you probe
+an absolute path; a relative miss surfaces as a bare "Operation not permitted". Recipe
+that makes a full cargo build/test/render loop work in-document, discovered by probing:
+
+- Doc lives at the repo root, block grants `writes=target`.
+- `export CARGO_HOME=/Users/<user>/.cargo` + `--offline` (fixes #1/#2 for cargo).
+- Absolute output dirs (`$PWD/target/frames`) — a test's cwd is its crate.
+- `reads=` = comma-separated **files** only; no directories, no globs. It drives
+  mechanical staleness: edit a listed file, the block re-runs on the next read/run.
+- Tests that spawn processes (ssh tunnel) still fail sandbox-only; `--skip` them.
+
+With that, `console-lab.dx` became genuinely self-verifying: 498 tests + 6 reference
+PNGs re-run themselves when the view/layout files change, and the staleness mechanism
+caught a real regression the same hour it was introduced (a wrap that clipped the
+bank's countdown clock showed up in the auto-rerun frame). Revised ratings:
+
+| Dimension | Score | Why |
+|---|---|---|
+| Helpfulness | 8/10 | The runnable-doc promise now holds for a compiled project; findings ledger + live verdicts are a real harness, not a notebook |
+| Efficiency improvement | 7/10 | Orientation this session ≈ 4 reads (dx_list → outline → 2 sections) vs ~15 cold; the verify loop is one dx_run instead of shell + re-derivation |
+| General usability | 7/10 | API stays excellent; the `writes=`/`reads=` laws are undocumented and cost ~6 probe cycles to reverse-engineer — document them and this is a 9 |
+
+Remaining asks, in value order: document the sandbox laws (#1/#2/#3 addendum), allow
+directory/glob `reads=`, an `::image src=` block (#5 — the PNG loop still ends outside
+dx), and pipefail-or-flag on swallowed failures (#4, still true).
