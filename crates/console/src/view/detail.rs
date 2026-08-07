@@ -65,7 +65,10 @@ pub fn view(snapshot: &Snapshot) -> El<Console> {
             title_rule(label, Some(style::state_mark(status, state_label))),
             caption(summary),
             actions(&name, &service.state, startable),
-            style::section_rule("DEFINITION", None),
+            style::section_rule_control(
+                "DEFINITION",
+                edit_button(spec_of(snapshot, &name).cloned()),
+            ),
             definition(snapshot, service),
             style::section_rule(
                 "OUTPUT",
@@ -155,6 +158,28 @@ fn actions(name: &str, state: &ServiceState, startable: bool) -> El<Console> {
     .fill(Tone::Sunken)
     .border(1.0, Tone::Border)
     .round(Radius::Control)
+}
+
+/// The control that opens the definition for editing.
+///
+/// It sits at the far end of the DEFINITION rule because it is about exactly
+/// what that block shows — not in the lifecycle well, where a fifth button
+/// cannot keep its word on the narrowest pane and an edit is not a lifecycle
+/// event. It opens the same form that installs, filled from the definition
+/// the daemon holds, and it is disabled until that definition has been
+/// fetched: a form filled from nothing would submit a service reset to
+/// defaults.
+fn edit_button(spec: Option<ServiceSpec>) -> El<Console> {
+    button("Edit")
+        .ghost()
+        .h(20.0)
+        .pad_x(10.0)
+        .disabled(spec.is_none())
+        .on_click(move |console: &mut Console| {
+            if let Some(spec) = &spec {
+                console.form_mut().open_edit(spec);
+            }
+        })
 }
 
 /// What the service is configured to be.
@@ -355,6 +380,22 @@ mod tests {
 
         let snapshot = console.snapshot();
         assert_eq!(snapshot.commands.front(), Some(&Command::Start("mongod".into())));
+    }
+
+    #[test]
+    fn pressing_edit_opens_the_form_filled_from_the_fetched_definition() {
+        let mut console = console(populated());
+        let spec = ServiceSpec::new("mongod", "/usr/local/bin/mongod");
+
+        let edit = edit_button(Some(spec));
+        assert!(!edit.is_disabled(), "a fetched definition makes Edit live");
+        (edit.click_action().expect("Edit is clickable"))(&mut console);
+        assert!(console.form().is_open(), "Edit opens the install form");
+    }
+
+    #[test]
+    fn edit_waits_for_the_definition_rather_than_offering_a_blank_form() {
+        assert!(edit_button(None).is_disabled(), "no definition fetched, nothing to edit");
     }
 
     #[test]

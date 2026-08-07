@@ -11,16 +11,19 @@
 //! would reintroduce the defect the model exists to prevent.
 //!
 //! So each argument is its own field, added and removed one at a time. It is
-//! more clicks and it cannot be wrong.
+//! more clicks and it cannot be wrong. What it all adds up to is read back in
+//! one fixed-width line above POLICY — see [`readback`] — so the operator sees
+//! the exact invocation before pressing Install rather than in a crash loop.
+//!
+//! The same form edits an installed service: [`InstallForm::open_edit`] fills
+//! it from the definition the daemon holds, and submitting starts from that
+//! definition so the fields the form does not show survive the round trip.
 
 use super::style;
 use super::{Console, title_rule};
 use crate::state::{Command, Snapshot};
 use rui::style::Justify;
-use rui::{
-    El, Radius, Tone, button, caption, code, col, field, field_row, row, section, segmented,
-    spacer,
-};
+use rui::{El, Tone, button, caption, code, col, field, field_row, row, segmented, spacer};
 use selfhost_config::{RestartPolicy, ServiceSpec, StartMode};
 
 /// The start modes, in the order the control shows them.
@@ -56,8 +59,14 @@ const MAX_ARGUMENTS: usize = 32;
 #[derive(Debug, Default)]
 pub struct InstallForm {
     open: bool,
-    /// The service being replaced, when editing rather than adding.
-    replacing: Option<String>,
+    /// The full definition being edited, when editing rather than adding.
+    ///
+    /// The whole spec and not just the name: the form shows only some of a
+    /// service's fields, and a submit built from a blank spec would silently
+    /// reset every field it does not show — the stop command, the restart
+    /// budget, a git watch. Editing starts from this and overwrites only what
+    /// the form actually asks about.
+    base: Option<Box<ServiceSpec>>,
     name: String,
     program: String,
     arguments: Vec<String>,
@@ -91,6 +100,36 @@ impl InstallForm {
         };
     }
 
+    /// Opens the form filled from an installed service's definition, to edit it.
+    ///
+    /// The name is shown but not editable — it is also the service's log
+    /// filename, so changing it would install a second service rather than
+    /// edit this one. Everything the form does not show survives untouched in
+    /// [`InstallForm::base`].
+    pub fn open_edit(&mut self, spec: &ServiceSpec) {
+        *self = Self {
+            open: true,
+            base: Some(Box::new(spec.clone())),
+            name: spec.name.clone(),
+            program: spec.program.display().to_string(),
+            arguments: spec.args.clone(),
+            working_directory: spec
+                .cwd
+                .as_ref()
+                .map(|path| path.display().to_string())
+                .unwrap_or_default(),
+            description: spec.description.clone(),
+            start_mode: index_of_start_mode(spec.start_mode),
+            restart: index_of_restart(spec.restart),
+            problems: Vec::new(),
+        };
+    }
+
+    /// The name of the service being edited, or `None` when adding a new one.
+    fn editing(&self) -> Option<&str> {
+        self.base.as_deref().map(|spec| spec.name.as_str())
+    }
+
     /// Closes the form, discarding what was typed.
     fn close(&mut self) {
         self.open = false;
@@ -117,7 +156,17 @@ impl InstallForm {
             return;
         }
 
-        let mut spec = ServiceSpec::new(name, program);
+        let mut spec = match &self.base {
+            // Start from the installed definition so the fields this form does
+            // not show — the stop command, the restart budget, a git watch —
+            // reach the daemon unchanged rather than reset to defaults.
+            Some(base) => {
+                let mut spec = (**base).clone();
+                spec.program = program.into();
+                spec
+            }
+            None => ServiceSpec::new(name, program),
+        };
         spec.args = self
             .arguments
             .iter()
@@ -152,7 +201,7 @@ impl InstallForm {
 /// undifferentiated form.
 pub fn view(console: &Console) -> El<Console> {
     let form = console.form();
-    let heading = match &form.replacing {
+    let heading = match form.editing() {
         Some(name) => format!("Edit {name}"),
         None => "Add a service".to_owned(),
     };
@@ -164,8 +213,8 @@ pub fn view(console: &Console) -> El<Console> {
                 // so changing it on an existing service would be an install of a
                 // different one rather than an edit. The daemon would agree, and
                 // leave two.
-                match &form.replacing {
-                    Some(name) => field_row("NAME", code(name.clone())),
+                match form.editing() {
+                    Some(name) => field_row("NAME", code(name.to_owned())),
                     None => text_row("NAME", &form.name, "mongod", |form, value| form.name = value),
                 },
                 text_row("PROGRAM", &form.program, "/usr/local/bin/mongod", |form, value| {
@@ -181,7 +230,8 @@ pub fn view(console: &Console) -> El<Console> {
                 text_row("NOTES", &form.description, "what this is for", |form, value| {
                     form.description = value
                 }),
-                section("POLICY", None),
+                readback(form),
+                style::section_rule("POLICY", None),
                 field_row(
                     "STARTS",
                     segmented(&labels(&START_MODES), form.start_mode, |console: &mut Console, mode| {
@@ -235,6 +285,10 @@ fn arguments(form: &InstallForm) -> El<Console> {
                     .grow()
                     .max_w(FIELD_MAX)
                     .placeholder("one argument")
+                    // Named for what cannot see it: a filled field has no
+                    // placeholder left to speak for it, and every unnamed
+                    // argument box would otherwise be announced identically.
+                    .label(format!("Argument {}", index + 1))
                     .on_input(move |console: &mut Console, value| {
                         if let Some(slot) = console.form_mut().arguments.get_mut(index) {
                             *slot = value;
@@ -271,6 +325,10 @@ fn arguments(form: &InstallForm) -> El<Console> {
 }
 
 /// What was wrong the last time Install was pressed.
+///
+/// A strip outlined in the failure's own hue, the same shape every other thing
+/// the console reports wears — the form is a place to type, and this is the
+/// console answering back about what was typed.
 fn problems(form: &InstallForm) -> Option<El<Console>> {
     (!form.problems.is_empty()).then(|| {
         col(form
@@ -281,13 +339,35 @@ fn problems(form: &InstallForm) -> Option<El<Console>> {
         .gap(2.0)
         .pad(8.0)
         .fill(Tone::BadTint)
-        .round(Radius::Control)
+        .border(1.0, Tone::Bad)
     })
+}
+
+/// The exact invocation the daemon will run, read back as the operator types.
+///
+/// Everything typed into this form is read back verbatim by the machine, and
+/// this is the one line that says what all of it adds up to *before* Install is
+/// pressed — a wrong flag is cheaper to see here than in a crash loop. It is
+/// absent until there is a program to state, because a readback of nothing is a
+/// claim that nothing will run. Set in the fixed-width face like every other
+/// string the machine will consume, and joined with spaces only for display:
+/// the arguments stay split in the spec, exactly as typed.
+fn readback(form: &InstallForm) -> Option<El<Console>> {
+    let program = form.program.trim();
+    if program.is_empty() {
+        return None;
+    }
+    let line = std::iter::once(program)
+        .chain(form.arguments.iter().map(|argument| argument.trim()))
+        .filter(|word| !word.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ");
+    Some(field_row("WILL RUN", code(line).wrap()))
 }
 
 /// The Install and Cancel buttons.
 fn footer(form: &InstallForm) -> El<Console> {
-    let submit = if form.replacing.is_some() { "Save" } else { "Install" };
+    let submit = if form.editing().is_some() { "Save" } else { "Install" };
     row((
         spacer().grow(),
         button("Cancel").w(96.0).on_click(|console: &mut Console| console.form_mut().close()),
@@ -451,6 +531,58 @@ mod tests {
         form.restart = 99;
         form.submit(&mut snapshot);
         assert!(snapshot.commands.pop_front().is_some());
+    }
+
+    #[test]
+    fn editing_fills_the_form_from_the_installed_definition() {
+        let mut spec = ServiceSpec::new("mongod", "/usr/local/bin/mongod");
+        spec.args = vec!["--config".into(), "/etc/mongod.conf".into()];
+        spec.description = "the database".into();
+
+        let mut form = InstallForm::default();
+        form.open_edit(&spec);
+
+        assert!(form.is_open());
+        assert_eq!(form.editing(), Some("mongod"));
+        assert_eq!(form.program, "/usr/local/bin/mongod");
+        assert_eq!(form.arguments, spec.args);
+        assert_eq!(form.description, "the database");
+    }
+
+    #[test]
+    fn editing_preserves_the_fields_the_form_does_not_show() {
+        let mut spec = ServiceSpec::new("mongod", "/usr/local/bin/mongod");
+        spec.max_restarts = 9;
+        spec.restart_delay_secs = 30;
+
+        let mut form = InstallForm::default();
+        form.open_edit(&spec);
+        form.description = "edited".into();
+
+        let mut snapshot = Snapshot::default();
+        form.submit(&mut snapshot);
+        match snapshot.commands.pop_front() {
+            Some(Command::Install(sent)) => {
+                assert_eq!(sent.max_restarts, 9, "a field the form never showed must survive");
+                assert_eq!(sent.restart_delay_secs, 30);
+                assert_eq!(sent.description, "edited", "and the edit itself must land");
+            }
+            other => panic!("expected an install, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn the_readback_states_the_exact_invocation_and_only_when_there_is_one() {
+        let mut form = filled();
+        assert!(readback(&form).is_some(), "a program alone is an invocation");
+        form.arguments = vec!["--config".into(), " ".into(), "/etc/mongod.conf".into()];
+
+        let row = readback(&form).expect("a program is typed");
+        // The value cell beside the label carries the joined line.
+        assert!(row.child(1).is_some());
+
+        form.program = "   ".into();
+        assert!(readback(&form).is_none(), "no program, no claim about what will run");
     }
 
     #[test]
