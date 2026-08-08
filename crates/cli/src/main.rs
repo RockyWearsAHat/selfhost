@@ -75,6 +75,9 @@ Commands
                              Register this daemon with the OS service manager
                              (launchd, systemd, or a Windows scheduled task) so it
                              starts on boot and restarts if it dies
+  mail hash-password [<password>]
+                             Hash a mailbox password for [[mail.mailboxes]] in
+                             selfhost.config.toml; reads from stdin if omitted
   help                       Show this message
 
 Config lives in selfhost.config.toml. Everything else is derived from it.
@@ -98,6 +101,7 @@ fn main() -> ExitCode {
         "services" => services_command(),
         "teardown" => teardown_command(&arguments),
         "service" => service_command(&arguments),
+        "mail" => mail_command(&arguments),
         "help" | "--help" | "-h" => {
             eprint!("{USAGE}");
             Ok(())
@@ -856,6 +860,39 @@ fn service_command(arguments: &[String]) -> Result<(), String> {
             "service needs a subcommand: install, uninstall, or status\n\n{USAGE}"
         )),
     }
+}
+
+/// Dispatches `mail`'s one subcommand.
+fn mail_command(arguments: &[String]) -> Result<(), String> {
+    match arguments.get(1).map(String::as_str) {
+        Some("hash-password") => mail_hash_password(arguments.get(2)),
+        Some(other) => {
+            Err(format!("unknown mail subcommand \"{other}\" — expected hash-password\n\n{USAGE}"))
+        }
+        None => Err(format!("mail needs a subcommand: hash-password\n\n{USAGE}")),
+    }
+}
+
+/// Hashes a mailbox password for `[[mail.mailboxes]] password_hash`.
+///
+/// Takes the password as an argument only if given one; otherwise reads a
+/// single line from stdin, so a real password need not sit in shell history
+/// or a process listing. The hash is PBKDF2, matching what
+/// `selfhost_mail::submission::ConfigAuthenticator` verifies against.
+fn mail_hash_password(argument: Option<&String>) -> Result<(), String> {
+    let password = match argument {
+        Some(password) => password.clone(),
+        None => {
+            let mut line = String::new();
+            std::io::stdin()
+                .read_line(&mut line)
+                .map_err(|error| format!("could not read the password from stdin: {error}"))?;
+            line.trim_end_matches(['\r', '\n']).to_owned()
+        }
+    };
+    let hash = selfhost_mail::hash_password(&password).map_err(|error| error.to_string())?;
+    println!("{hash}");
+    Ok(())
 }
 
 /// Writes the OS unit for `selfhost daemon` and registers it, after showing it.
