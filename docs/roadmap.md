@@ -7,113 +7,57 @@ exercised against a running instance; anything else has not been written.
 
 | area | crate | tests | evidence |
 |---|---|---|---|
-| HTTP/1.1 messages + dates | `crates/http` | 57 | header injection, request smuggling, byte ranges, cache validators |
-| Config model + validation | `crates/config` | 18 | every problem reported at once, field-named |
-| Proxy: TLS, static, caching, LB | `crates/proxy` | 60 | path traversal, Range, 304, health hysteresis |
-| SMTP session + addresses | `crates/mail` | 48 | open-relay defence, credential protection, framing |
-| DNS wire format + resolver | `crates/dns` | 22 | compression pointers, loops, truncation, SOA contacts |
-| `doctor`, LAN assessment, DNS watch | `crates/cli` | 74 | service identified by behaviour, hardware named, one conclusion; a proxy lookup names the device that made it |
+| HTTP/1.1 messages + dates | `crates/http` | 70 | header injection, request smuggling, byte ranges, cache validators |
+| Config model + validation, surgical config editing | `crates/config` | 106+ | every problem reported at once, field-named; a repository URL that would run a command refused; `site`/`mail add|remove` edit the file as text and preserve every comment |
+| Proxy: TLS, SNI, static, caching, LB, live routing reload | `crates/proxy` | 69 | path traversal, Range, 304, health hysteresis; a config edit hot-reloads the routing table with no dropped connection |
+| ACME client (RFC 8555) | `crates/acme` | 44+ | full issuance walked live against Let's Encrypt staging *and* production; a CSR's subject is cleared so a CA cannot mistake rcgen's own placeholder name for the domain |
+| Mail: SMTP, submission, DKIM, outbound, IMAP | `crates/mail` | 140 | open-relay defence, credential protection, framing; a message sent by raw SMTP was read back out of the Maildir; IMAP LOGIN/SELECT/FETCH/STORE walked end-to-end over a live connection |
+| DNS wire format + resolver + authority | `crates/dns` | 22+ | compression pointers, loops, truncation, SOA contacts; authoritative zone serving wired into `daemon` |
+| `doctor`, LAN assessment, DNS watch, mail diagnostics | `crates/cli` | 100+ | service identified by behaviour, hardware named, one conclusion; a proxy lookup names the device that made it; `doctor --deep` measured a live ISP's outbound-25 block and PTR gap rather than assuming either |
 | JSON values, parsing, serialisation | `crates/json` | 13 | control characters escaped, depth bounded, trailing input refused, surrogate pairs |
-| Service supervision | `crates/supervisor` | 45 | restart backoff and its reset, log gaps reported, process groups killed whole |
-| Service catalogue + control API | `crates/admin` | 26 | loopback-only bind, constant-time token, atomic catalogue writes |
+| Service supervision | `crates/supervisor` | 50 | restart backoff and its reset, log gaps reported, process groups killed whole |
+| Service catalogue + control API | `crates/admin` | 29 | loopback-only bind, constant-time token, atomic catalogue writes |
+| Git deployment: watch, pull, build, restart | `crates/git` | 37 | a push reaches the running service, a failed build leaves it stopped, untracked files survive |
+| Host firewall reconciliation | `crates/firewall` | — | macOS pf, Linux nftables, Windows netsh backends behind one `Manager`; default-inbound-block plus named openings, drift re-asserted on a timer |
+| A declarative interface library, `rui` | `crates/rui` | 263 | layout, hit testing, focus, scrolling, dragging, easing, and a whole frame — all with no display attached |
+| The console itself | `crates/console` | 91 | frames rendered headless at the smallest window; a tunnel that dies takes its `ssh` with it |
 
-**384 tests.** Verified live: HTTPS 200, HTTP→HTTPS 308, `206` + `Content-Range`
+Verified live: HTTPS 200 on a real trusted Let's Encrypt production certificate
+for the deployed domain and its `www`, HTTP→HTTPS 308, `206` + `Content-Range`
 on a seek, `416` on an impossible range, `304` with zero bytes on both cache
 validators, `.m3u8`/`.ts` content types, traversal → 404, smuggling → 400, an
 ACME challenge served over cleartext while ordinary paths still redirect, and a
 full failover cycle across two backends (5/5 split → one killed → 10/10 to the
-survivor → restarted → back to 5/5 → both down → 502). `watch-dns` verified live
-too: real clients resolved through it over both UDP and TCP, and a lookup of a
-known proxy domain named the address that made it.
+survivor → restarted → back to 5/5 → both down → 502). SMTP accepted a real
+message over port 25 from an external network and it was read back out of the
+Maildir; STARTTLS on port 25 presented the same trusted certificate the site
+serves. `watch-dns` verified live too: real clients resolved through it over
+both UDP and TCP, and a lookup of a known proxy domain named the address that
+made it. The console drives a live daemon, and a service installed through the
+control API with a branch to watch cloned that branch from GitHub, ran its
+build step, and started — with every step reported in the service's own output.
+
+## Scope notes on what shipped
+
+Worth stating plainly rather than leaving to be discovered: IMAP here is
+deliberately narrower than the ambition once written below. There is no
+`BODYSTRUCTURE`, no server-side `SEARCH`, no `APPEND`, and no `IDLE` — a
+command literal (`{n}` continuation) is not parsed at all. What exists is
+enough for a normal client to `LOGIN`, `LIST`/`SELECT` the fixed folder set,
+`FETCH`, and `STORE` flags — reading mail that already arrived, not the full
+RFC 3501/9051 surface. `\Recent` is always reported as `0`: this store's
+on-disk format does not distinguish "delivered since this mailbox was last
+opened" from an ordinary unread message, so nothing here claims a number it
+cannot measure.
+
+Outbound direct delivery (`crates/mail/src/client.rs`) is real and TLS-capable,
+but whether it can be *used* is an environment fact, not a code one — see
+`constraints.md`. A `[mail.relay]` smarthost is the alternative already built
+for exactly the deployments where direct delivery is blocked upstream.
 
 ## Next, in the order I would do it
 
-### 1. ACME client (RFC 8555) — unblocks everything public
-
-Until this exists, the only certificates available are self-signed, so nothing
-can be published to a real browser.
-
-- Account key (ES256) and JWS signing. `aws-lc-rs` ships with `rustls`.
-- `newNonce` → `newAccount` → `newOrder` → HTTP-01 challenge → CSR → poll →
-  download.
-- **HTTP-01 is the right challenge here** because we already own port 80. DNS-01
-  would need the DNS server, which does not exist yet — do not couple them.
-- CSR generation is PKCS#10 DER. `rcgen` is already a dependency and can build
-  one; check before hand-rolling ASN.1.
-- Renew at 30 days remaining, not at expiry.
-- **Test against the staging CA only.** Production allows five duplicate
-  certificates per week.
-
-**The redirect trap is already closed.** `/.well-known/acme-challenge/*` is
-exempt from the HTTPS redirect and served from `data/acme-challenges/`, with the
-token confined to a plain filename so a challenge fetch cannot become a
-traversal. The ACME client only has to write tokens into that directory.
-
-### 2. SNI certificate selection
-
-One certificate per hostname instead of one certificate with every hostname as
-an alternate. `rustls` wants a `ResolvesServerCert` implementation.
-
-Today `cli/src/main.rs` builds a single certificate covering every domain — fine
-for a handful of sites, wrong once sites are added and removed independently,
-because every change reissues one shared certificate.
-
-### 3. Finish the mail server
-
-The session state machine is done. What is missing:
-
-- **The connection layer** — bind :25, :465, :587, drive `Session`, handle
-  `STARTTLS` upgrade mid-connection, read `DATA` until a lone `.`.
-- **A message store.** Maildir is the sane choice: one file per message, written
-  to `tmp/` and renamed into `new/`, so a crash never leaves a half-written
-  message visible. It also makes backup a file copy.
-- **MIME parsing.** This is the single largest piece of the mail work, and it is
-  required by both IMAP revisions, so no revision choice avoids it. Needed for
-  `BODYSTRUCTURE` and partial `FETCH`.
-- **IMAP.** Advertise `IMAP4rev1 IMAP4rev2` both. rev2 (RFC 9051) is rev1 with
-  the cruft removed, so implementing rev2 gets most of rev1 free — but Apple
-  Mail, iOS Mail, and Outlook still open with rev1 commands, so advertising rev2
-  alone risks a mail server your own phone cannot open.
-  - Hardest parts, in order: `BODYSTRUCTURE`, `SEARCH`, and UID/sequence-number
-    correctness. The last one is the classic source of "my client shows deleted
-    mail."
-- **Outbound**, both modes:
-  - `relay` — hand to a smarthost that already has reputation.
-  - `direct` — MX lookup and delivery. Needs the DNS resolver.
-- **DKIM signing**, and SPF/DMARC records generated into the zone.
-- **`selfhost mail doctor`** — measures deliverability rather than assuming it:
-  DNSBL across zones, FCrDNS, port 25 reachability, DMARC alignment, and a live
-  test send. `direct` should be chosen when this passes, not when someone hopes
-  it will.
-
-**Read [`constraints.md`](constraints.md) before starting outbound.** The target
-IP is Spamhaus XBL+CSS listed and its PTR has no forward record. Neither is a
-code problem and neither is fixed by writing more code.
-
-### 4. Authoritative DNS
-
-- Wire format parse/serialise, authoritative-only — no recursion, which removes
-  a whole class of amplification risk.
-- `A`, `AAAA`, `MX`, `TXT`, `CNAME`, `NS`, `SOA`, `CAA`.
-- UDP with TCP fallback for large responses, and AXFR to a secondary.
-- **A secondary nameserver is not optional.** With only this box authoritative,
-  the domain stops resolving entirely whenever it is down — which takes mail with
-  it, not just the website. Hurricane Electric offers free secondary DNS.
-- Dynamic-IP updating, since a residential address can change.
-
-### 5. Service install
-
-The reason Docker was dropped: on Windows and macOS a container runtime needs a
-logged-in desktop session, which is disqualifying for a machine meant to stay up
-unattended.
-
-- **Windows Service via SCM** — the primary target.
-- **launchd plist** on macOS, **systemd unit** on Linux.
-- Must survive reboot with no user logged in.
-- Cross-compilation already works: `x86_64-pc-windows-gnu` and
-  `x86_64-unknown-linux-gnu` are installed.
-
-### 6. Node join and the private mesh
+### 1. Node join and the private mesh
 
 `Config::instance_address` already refuses to address a worker that has no
 `mesh_ip`, so the config layer is ready. What is missing is the mesh itself and
@@ -123,29 +67,44 @@ The rule to preserve: **workers are reached over the mesh, never a public
 address**, so an application port is never exposed to the internet even on a
 remote machine.
 
-### 7. Backups
+### 2. Backups
 
 Nightly dump plus an off-site copy. **Untested backups are not backups** —
 restore has to be exercised, not assumed.
 
-### 8. The console
+### 3. The console
 
 **The daemon half is done and verified.** `selfhost daemon` supervises arbitrary
 services — MongoDB, a NAS daemon, a site's backend — and serves a loopback
 control API the console drives. Restart policy, log capture, the catalogue, and
 process-group teardown are tested against real processes.
 
-What is left is the desktop client and the toolkit it is drawn with. Both are
-written here rather than depended on; see [`gui.md`](gui.md) for the shape, the
-daemon/client split, and why text rendering is delegated to the platform.
+**The client half is done too.** `selfhost-console` is a native window drawn by
+a toolkit written here — geometry, an antialiasing rasteriser, a TrueType engine,
+layout, and widgets, all pure and tested headless, over a per-platform layer that
+does nothing but open a window, deliver input, and copy a buffer to the screen.
+See [`gui.md`](gui.md) for the split and for what the font engine deliberately
+does not do.
 
-Two things reach the console from elsewhere on this list: a **secured SSH
-transport**, so one console drives a remote machine without the control port ever
-being public, and **GitHub monitoring**, so a push redeploys and restarts a
-service. Both have working prior art in `RockyWearsAHat/windows-service-manager`.
+What is left is the **sites and certificates** views, which wait on an API that
+reports them, and **running the Windows and X11 backends** — both type-check for
+their targets but have never been run, because everything so far has been built
+on a Mac.
 
-The old static mock at `gui/index.html` predates this design and survives only as
-a reference for the sites-and-certificates view.
+**The SSH transport is done.** `selfhost-console --ssh you@server` runs `ssh` as
+a managed child, forwards the control port to loopback here, and reads the
+daemon's token over the same connection. It never answers a prompt on the
+operator's behalf — `BatchMode=yes` turns each question `ssh` would have asked
+into a failure, and the console turns that failure into the one command that
+fixes it. See [`gui.md`](gui.md#reaching-a-daemon-on-another-machine).
+
+**Git deployment is done.** A service can carry a branch to watch; when the
+branch moves, the daemon stops the service, updates the working copy, runs the
+build step, and starts it again. Polling, not webhooks — see
+[`gui.md`](gui.md#deploying-from-a-branch) for why, and for what is left: a
+webhook receiver that only makes a poll happen *sooner*, and an OAuth device
+flow for private repositories that the daemon user's SSH key does not already
+reach.
 
 ## Known limitations in what is already built
 
