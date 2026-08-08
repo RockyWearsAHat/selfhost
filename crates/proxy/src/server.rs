@@ -21,7 +21,7 @@ use std::collections::BTreeMap;
 use std::io;
 use std::net::SocketAddr;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -54,11 +54,17 @@ pub struct SiteRuntime {
 /// The running proxy.
 #[derive(Debug)]
 pub struct Server {
-    /// Hostname to site, built once so routing is a lookup rather than a scan.
-    routes: BTreeMap<String, Arc<SiteRuntime>>,
+    /// Hostname to site. Behind a lock so [`Server::reload`] can swap in a
+    /// freshly built table without rebinding the listeners that hold this
+    /// `Server` — a request mid-flight keeps the `Arc<SiteRuntime>` it already
+    /// resolved, and the next lookup simply sees the new table.
+    routes: RwLock<BTreeMap<String, Arc<SiteRuntime>>>,
     /// Sites in declaration order, for health tasks and diagnostics.
-    sites: Vec<Arc<SiteRuntime>>,
+    sites: RwLock<Vec<Arc<SiteRuntime>>>,
     /// Where ACME HTTP-01 tokens are written, when issuance is configured.
+    ///
+    /// Derived from `data_dir`, which a reload never changes — recomputing it
+    /// on every reload would be pure churn for a value that cannot differ.
     acme_challenge_dir: Option<PathBuf>,
 }
 
@@ -67,6 +73,37 @@ impl Server {
     ///
     /// `project_dir` is where relative static roots resolve from.
     pub fn build(config: &Config, project_dir: &std::path::Path) -> Self {
+        let (routes, sites) = Self::routing(config, project_dir);
+        Self {
+            routes: RwLock::new(routes),
+            sites: RwLock::new(sites),
+            acme_challenge_dir: Some(project_dir.join(&config.server.data_dir).join("acme-challenges")),
+        }
+    }
+
+    /// Rebuilds the routing table from a freshly reloaded config and swaps it
+    /// in, live.
+    ///
+    /// Safe for sites that only serve static content or an already-running
+    /// pool of instances — routing takes effect on the next request with no
+    /// dropped connection. **Not** a full reconciliation: a site *added* by a
+    /// reload with its own instances gets routed immediately but its health
+    /// probe only starts on the next full restart, since
+    /// [`Server::spawn_health_tasks`] runs once at startup. Every site
+    /// deployed today is static-only, so this boundary costs nothing yet; it
+    /// is named here rather than silently assumed away.
+    pub fn reload(&self, config: &Config, project_dir: &std::path::Path) {
+        let (routes, sites) = Self::routing(config, project_dir);
+        *self.routes.write().unwrap_or_else(|poisoned| poisoned.into_inner()) = routes;
+        *self.sites.write().unwrap_or_else(|poisoned| poisoned.into_inner()) = sites;
+    }
+
+    /// The routing table and site list a config builds, shared by
+    /// [`Server::build`] and [`Server::reload`] so the two can never diverge.
+    fn routing(
+        config: &Config,
+        project_dir: &std::path::Path,
+    ) -> (BTreeMap<String, Arc<SiteRuntime>>, Vec<Arc<SiteRuntime>>) {
         let mut routes = BTreeMap::new();
         let mut sites = Vec::new();
 
@@ -89,26 +126,29 @@ impl Server {
             sites.push(runtime);
         }
 
-        Self {
-            routes,
-            sites,
-            acme_challenge_dir: Some(project_dir.join(&config.server.data_dir).join("acme-challenges")),
-        }
+        (routes, sites)
     }
 
     /// Looks up the site serving a hostname.
-    pub fn route(&self, host: &str) -> Option<&Arc<SiteRuntime>> {
-        self.routes.get(&host.to_ascii_lowercase())
+    pub fn route(&self, host: &str) -> Option<Arc<SiteRuntime>> {
+        self.routes
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(&host.to_ascii_lowercase())
+            .cloned()
     }
 
     /// Every site, in declaration order.
-    pub fn sites(&self) -> &[Arc<SiteRuntime>] {
-        &self.sites
+    pub fn sites(&self) -> Vec<Arc<SiteRuntime>> {
+        self.sites.read().unwrap_or_else(|poisoned| poisoned.into_inner()).clone()
     }
 
     /// Spawns one health-probe task per site that has instances.
+    ///
+    /// Called once at startup, not re-run by [`Server::reload`] — see its doc
+    /// for what that means for a site added later with its own instances.
     pub fn spawn_health_tasks(&self) {
-        for runtime in &self.sites {
+        for runtime in self.sites.read().unwrap_or_else(|poisoned| poisoned.into_inner()).iter() {
             if runtime.pool.is_empty() {
                 continue;
             }
@@ -330,10 +370,10 @@ where
     }
 
     if runtime.site.routes_to_app(request.path()) {
-        return forward(runtime, request, peer, stream).await;
+        return forward(&runtime, request, peer, stream).await;
     }
 
-    serve_static(runtime, request, stream, keep_alive).await
+    serve_static(&runtime, request, stream, keep_alive).await
 }
 
 /// Serves an ACME HTTP-01 challenge token.
@@ -603,6 +643,35 @@ mod tests {
         // Host matching is case-insensitive.
         assert!(server.route("EXAMPLE.com").is_some());
         assert!(server.route("other.com").is_none());
+    }
+
+    #[test]
+    fn reload_takes_effect_immediately_and_drops_what_the_new_config_removed() {
+        let config = config_with(vec![site("levelup", &["example.com"])]);
+        let server = Server::build(&config, std::path::Path::new("/tmp"));
+        assert!(server.route("example.com").is_some());
+        assert!(server.route("added.example.com").is_none());
+
+        let reconfigured =
+            config_with(vec![site("added", &["added.example.com"])]);
+        server.reload(&reconfigured, std::path::Path::new("/tmp"));
+
+        assert!(server.route("added.example.com").is_some(), "the new site is routed");
+        assert!(server.route("example.com").is_none(), "the removed site is gone");
+    }
+
+    #[test]
+    fn reload_leaves_a_route_resolved_before_it_unaffected() {
+        // A request that already resolved its site holds an owned `Arc`, not a
+        // borrow of the table — a reload racing a request in flight must not
+        // invalidate what that request is already holding.
+        let config = config_with(vec![site("levelup", &["example.com"])]);
+        let server = Server::build(&config, std::path::Path::new("/tmp"));
+        let held = server.route("example.com").expect("routed before reload");
+
+        server.reload(&config_with(vec![]), std::path::Path::new("/tmp"));
+
+        assert_eq!(held.site.name, "levelup");
     }
 
     #[test]

@@ -1053,23 +1053,91 @@ fn services_command() -> Result<(), String> {
 /// Starts the proxy and blocks until interrupted.
 fn run() -> Result<(), String> {
     let (config, project_dir) = load()?;
+    let config_path = project_dir.join(CONFIG_FILENAME);
 
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
         .map_err(|e| format!("could not start the async runtime: {e}"))?;
 
-    runtime.block_on(serve(config, project_dir))
+    runtime.block_on(serve(config, project_dir, config_path))
+}
+
+/// How often the config file is checked for changes to hot-reload.
+///
+/// A poll rather than an OS file-watch: the dependency policy admits no watch
+/// crate (see the workspace `Cargo.toml`), and a person edits this file at
+/// most a handful of times a day, so a few seconds of latency costs nothing
+/// real in exchange for staying dependency-free.
+const CONFIG_POLL_INTERVAL: Duration = Duration::from_secs(3);
+
+/// Watches the config file and hot-reloads the site routing table when it
+/// changes and still validates.
+///
+/// Only the routing table reloads live today — see [`Server::reload`] for
+/// exactly what that covers. A change that touches anything else (a bind
+/// address, `[mail]`, `[dns]`, the firewall) is picked up by `route`/`sites`
+/// on the next reload same as any other edit, but the *listeners* for those
+/// stay whatever they were at startup until the process restarts; this watch
+/// does not claim otherwise.
+///
+/// A config that fails to parse or validate is logged and left alone — the
+/// previous good routing table keeps serving rather than the daemon crashing
+/// on a typo, or worse, going dark mid-edit.
+async fn watch_config(server: Arc<Server>, config_path: PathBuf, project_dir: PathBuf) {
+    let mut last_modified = std::fs::metadata(&config_path).and_then(|m| m.modified()).ok();
+    let mut ticker = tokio::time::interval(CONFIG_POLL_INTERVAL);
+    // The first tick fires immediately; skip it, since `serve` just loaded
+    // the config this process is already running.
+    ticker.tick().await;
+    loop {
+        ticker.tick().await;
+        check_and_reload(&server, &config_path, &project_dir, &mut last_modified);
+    }
+}
+
+/// One check-and-maybe-reload cycle, pulled out of [`watch_config`]'s timing
+/// loop so it can be driven directly in a test rather than through several
+/// real seconds of ticks.
+///
+/// `last_modified` is the caller's own state, threaded through by `&mut`
+/// rather than closed over, so a test can observe it settle without needing
+/// its own copy of the watch loop.
+fn check_and_reload(
+    server: &Server,
+    config_path: &Path,
+    project_dir: &Path,
+    last_modified: &mut Option<std::time::SystemTime>,
+) {
+    let Ok(metadata) = std::fs::metadata(config_path) else { return };
+    let Ok(modified) = metadata.modified() else { return };
+    if Some(modified) == *last_modified {
+        return;
+    }
+    *last_modified = Some(modified);
+
+    match Config::load(config_path) {
+        Ok(config) => {
+            server.reload(&config, project_dir);
+            eprintln!("config: reloaded — {} site(s) now routed", config.sites.len());
+        }
+        Err(error) => eprintln!(
+            "config: {} changed but does not validate ({error}) — keeping the previous config \
+             live",
+            config_path.display()
+        ),
+    }
 }
 
 /// Binds the listeners and serves until interrupted.
-async fn serve(config: Config, project_dir: PathBuf) -> Result<(), String> {
+async fn serve(config: Config, project_dir: PathBuf, config_path: PathBuf) -> Result<(), String> {
     // A process-wide crypto provider must be installed before any rustls
     // configuration is built.
     let _ = rustls::crypto::ring::default_provider().install_default();
 
     let server = Arc::new(Server::build(&config, &project_dir));
     server.spawn_health_tasks();
+    tokio::spawn(watch_config(Arc::clone(&server), config_path, project_dir.clone()));
 
     let data_dir = project_dir.join(&config.server.data_dir);
     let store = CertificateStore::open(&data_dir).map_err(|e| e.to_string())?;
@@ -1142,5 +1210,102 @@ async fn serve(config: Config, project_dir: PathBuf) -> Result<(), String> {
             println!("\nstopping");
             Ok(())
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::SystemTime;
+
+    const BASE: &str = "\
+version = 1
+
+[server]
+acme_email = \"a@b.com\"
+acme = \"self-signed\"
+
+[[nodes]]
+name = \"home\"
+role = \"owner\"
+";
+
+    /// Writes `text` to `path` and stamps an explicit modification time, so a
+    /// test never depends on the filesystem's mtime resolution or a real sleep.
+    fn write_config(path: &Path, text: &str, modified: SystemTime) {
+        std::fs::write(path, text).expect("write the config");
+        let file = std::fs::File::options().write(true).open(path).expect("reopen the config");
+        file.set_modified(modified).expect("stamp the mtime");
+    }
+
+    /// A fresh temp directory holding `selfhost.config.toml`, and its path.
+    fn temp_project(tag: &str) -> (PathBuf, PathBuf) {
+        let dir = std::env::temp_dir().join(format!("selfhost-watch-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("create the temp project dir");
+        let config_path = dir.join(CONFIG_FILENAME);
+        (dir, config_path)
+    }
+
+    #[test]
+    fn a_changed_config_reloads_the_routing_table() {
+        let (dir, config_path) = temp_project("reload");
+        let t0 = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        write_config(&config_path, BASE, t0);
+
+        let config = Config::load(&config_path).unwrap();
+        let server = Server::build(&config, &dir);
+        let mut last_modified = Some(t0);
+        assert!(server.route("example.com").is_none(), "no site yet");
+
+        let with_site = format!(
+            "{BASE}\n[[sites]]\nname = \"a\"\ndomains = [\"example.com\"]\nstatic_root = \"./x\"\n"
+        );
+        write_config(&config_path, &with_site, t0 + Duration::from_secs(1));
+        check_and_reload(&server, &config_path, &dir, &mut last_modified);
+
+        assert!(server.route("example.com").is_some(), "the added site is now routed");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_edit_that_no_longer_validates_is_not_applied() {
+        let (dir, config_path) = temp_project("invalid");
+        let t0 = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        let with_site = format!(
+            "{BASE}\n[[sites]]\nname = \"a\"\ndomains = [\"example.com\"]\nstatic_root = \"./x\"\n"
+        );
+        write_config(&config_path, &with_site, t0);
+
+        let config = Config::load(&config_path).unwrap();
+        let server = Server::build(&config, &dir);
+        let mut last_modified = Some(t0);
+        assert!(server.route("example.com").is_some());
+
+        // Two sites claiming the same hostname does not validate.
+        let broken = format!(
+            "{with_site}\n[[sites]]\nname = \"b\"\ndomains = [\"example.com\"]\nstatic_root = \"./y\"\n"
+        );
+        write_config(&config_path, &broken, t0 + Duration::from_secs(1));
+        check_and_reload(&server, &config_path, &dir, &mut last_modified);
+
+        // The previous, valid routing table is still the one live.
+        assert!(server.route("example.com").is_some(), "the last-good config is still serving");
+    }
+
+    #[test]
+    fn an_unchanged_file_triggers_no_reload() {
+        let (dir, config_path) = temp_project("unchanged");
+        let t0 = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        write_config(&config_path, BASE, t0);
+
+        let config = Config::load(&config_path).unwrap();
+        let server = Server::build(&config, &dir);
+        let mut last_modified = Some(t0);
+
+        // Nothing on disk changed since `last_modified`, so this must be a
+        // no-op rather than re-reading and re-applying the same config.
+        check_and_reload(&server, &config_path, &dir, &mut last_modified);
+        assert_eq!(last_modified, Some(t0));
     }
 }
