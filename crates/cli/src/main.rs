@@ -3,25 +3,42 @@
 //! Argument parsing and error presentation only. The work lives in the library
 //! crates so it stays callable from tests without going through `argv`.
 
+mod acme_task;
 mod assess;
+mod dns_status;
 mod doctor;
 mod identify;
 mod investigate;
+mod mail_task;
 mod oui;
 mod proxyware;
+mod service_install;
+mod site;
+mod teardown;
 mod watch;
 
 use selfhost_admin::{Api, Store, Token};
 use selfhost_config::{AcmeEnvironment, Config};
 use selfhost_dns::Resolver;
+use selfhost_dns::authority::{Authority, DnsError};
 use selfhost_supervisor::Supervisor;
-use selfhost_proxy::{CertificateStore, Server, serve_http, serve_https, server_config};
+use selfhost_proxy::{
+    CertificateStore, Server, SniResolver, serve_http, serve_https, server_config_with_resolver,
+};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tokio::net::TcpListener;
+
+/// How often the daemon re-checks the host firewall for drift.
+///
+/// The firewall changes rarely and only from outside this daemon — a manual
+/// `pfctl -F`, a reboot that cleared an ephemeral table, some other tool
+/// rewriting the ruleset. A slow poll notices and re-asserts without adding
+/// meaningful load; the authoritative apply already happened at startup.
+const FIREWALL_DRIFT_INTERVAL: Duration = Duration::from_secs(300);
 
 /// Name of the config file, looked for in the current directory and its parents.
 const CONFIG_FILENAME: &str = "selfhost.config.toml";
@@ -36,15 +53,28 @@ Commands
   init [--email <address>]   Write a starter config into the current directory
   check                      Validate the config and report every problem
   routes                     Show which hostname maps to which site
+  site <list|show|add|remove>
+                             List, inspect, add, or unroute a website
+
   doctor [--deep] [--scan-lan]
                              Diagnose, and chase the cause of anything broken
   watch-dns [--bind <addr>] [--upstream <addr>]
                              Answer DNS for the network and name the device
                              asking for a residential proxy service
+  dns                        Show the zone this machine serves and whether it
+                             is answering on port 53
+  serve-dns [--bind <addr>]  Serve authoritative DNS for the configured zones in
+                             the foreground (the daemon serves them too)
   run                        Start the proxy in the foreground
   daemon [--bind <addr>]     Run the services and the control API the console
                              connects to
   services                   List the installed services and what they are doing
+  teardown [--everything] [--yes]
+                             Stop, uninstall, and remove what the daemon created
+  service <install|uninstall|status> [--system] [--yes]
+                             Register this daemon with the OS service manager
+                             (launchd, systemd, or a Windows scheduled task) so it
+                             starts on boot and restarts if it dies
   help                       Show this message
 
 Config lives in selfhost.config.toml. Everything else is derived from it.
@@ -58,11 +88,16 @@ fn main() -> ExitCode {
         "init" => init(&arguments),
         "check" => check(),
         "routes" => routes(),
+        "site" => find_config().and_then(|path| site::run(&arguments, &path)),
         "doctor" => doctor_command(&arguments),
         "watch-dns" => watch_command(&arguments),
+        "dns" => dns_command(),
+        "serve-dns" => serve_dns_command(&arguments),
         "run" => run(),
         "daemon" => daemon_command(&arguments),
         "services" => services_command(),
+        "teardown" => teardown_command(&arguments),
+        "service" => service_command(&arguments),
         "help" | "--help" | "-h" => {
             eprint!("{USAGE}");
             Ok(())
@@ -366,21 +401,323 @@ async fn serve_daemon(
     println!("  ssh -L {0}:127.0.0.1:{0} <this-host>", address.port());
     println!("\nCtrl-C to stop.");
 
+    // So a console opened from the Dock can find this daemon. An application
+    // launched by the Finder has no working directory to resolve `data/` against
+    // — see `selfhost_config::home`. A failure here costs that convenience and
+    // nothing else, so it is reported and not fatal.
+    if let Err(error) = selfhost_config::home::record(&project_dir) {
+        eprintln!(
+            "warning: could not record where this daemon is running ({error}); a console \
+             opened from the Dock will need --token-file"
+        );
+    }
+
     supervisor.load(&catalog).await;
 
-    let api = Api::new(supervisor.clone(), store, token);
+    // Stated rather than assumed: a branch that is silently not being watched
+    // looks exactly like one that has not been pushed to.
+    let watches = selfhost_git::Watches::default();
+    match watches.load(&supervisor, &catalog).await {
+        0 => {}
+        1 => println!("\nwatching 1 git branch for deployments"),
+        watched => println!("\nwatching {watched} git branches for deployments"),
+    }
+
+    // The firewall the daemon drives for the public listeners. Built from config,
+    // reconciled once here so the ports are open (or closed) before the API is
+    // reachable, then kept honest by the drift watch in the select! below.
+    //
+    // A firewall that could not be set is reported and non-fatal, exactly like
+    // `home::record`: the daemon still supervises services, and the listeners are
+    // left governed by whatever the host firewall already holds. A known-unset
+    // firewall the operator can see beats a daemon that refused to start.
+    let firewall = selfhost_firewall::Manager::for_server(&config.server);
+    match firewall.reconcile().await {
+        Ok(state) if state.managed => {
+            println!(
+                "\nfirewall: {} · {} rule(s) · inbound {}",
+                state.backend.label(),
+                state.rules.len(),
+                if state.default_inbound_block { "default-block" } else { "default-allow" }
+            );
+        }
+        // Unmanaged: the operator did not ask us to touch the firewall, so say
+        // nothing rather than imply we are governing it.
+        Ok(_) => {}
+        Err(error) => eprintln!(
+            "warning: could not set the firewall ({error}); the public listeners are \
+             governed by whatever the host firewall already holds"
+        ),
+    }
+
+    // Authoritative DNS, when the config asks for it. Built from the same
+    // validated `Config` as every other service, exactly like the firewall above.
+    // The public IP is discovered once to fill the apex-A default; the updater
+    // (below, in the `select!`) keeps it current afterwards.
+    //
+    // The edge is the operator's, not ours: for the internet to reach this server
+    // the router/edge must forward UDP *and* TCP port 53 to this machine. selfhost
+    // never rewrites a router or firewall port-forward — that stays a deliberate
+    // change the operator makes. See `crates/cli/src/dns_status.rs`.
+    //
+    // A DNS bind failure is fatal for the whole daemon (it returns from the
+    // `select!`), matching `run`'s bind handling rather than the firewall's
+    // best-effort one: the roadmap's stated worst case is a DNS server that is
+    // silently not listening, so the domain and its mail stop resolving with no
+    // sign why. Better to fail loudly at startup than to look healthy and be deaf.
+    let dns = match config.dns.as_ref() {
+        Some(_) => {
+            let public_ip = doctor::discover_public_ip().await;
+            Some(Authority::for_config(&config, public_ip))
+        }
+        None => None,
+    };
+    let dns_bind: Option<SocketAddr> = match config.dns.as_ref() {
+        Some(dns) => Some(dns.bind.parse().map_err(|e| format!("dns.bind {}: {e}", dns.bind))?),
+        None => None,
+    };
+    if let (Some(authority), Some(bind), Some(dns_config)) =
+        (dns.as_ref(), dns_bind, config.dns.as_ref())
+    {
+        println!("\nauthoritative DNS on {bind}");
+        for origin in authority.origins().await {
+            println!("  zone         {origin}");
+        }
+        if dns_config.secondaries.is_empty() {
+            println!("  secondaries  none — a single nameserver, see `selfhost dns`");
+        } else {
+            println!("  secondaries  {}", dns_config.secondaries.join(", "));
+        }
+        if dns_config.dynamic_ip {
+            println!("  dynamic ip   on — the apex A follows this machine's WAN IP");
+        }
+        println!("  reachability the router/edge must forward UDP+TCP 53 here (selfhost does not touch it)");
+    }
+
+    let api =
+        Api::new(supervisor.clone(), store, token, watches.clone(), firewall.clone());
     let outcome = tokio::select! {
         result = selfhost_admin::serve(listener, api) => {
             result.map_err(|e| format!("the control api stopped: {e}"))
         }
+        // Re-asserts the firewall on a slow timer so an out-of-band change is
+        // noticed and repaired. Never returns; this arm only exists so the daemon
+        // runs it alongside the API.
+        _ = watch_firewall_drift(firewall.clone()) => Ok(()),
+        // Serves :53 for the configured zones. When DNS is not configured this
+        // future pends forever, so the arm exists without ever firing. A bind
+        // failure returns here and stops the daemon (see the note above).
+        result = serve_dns(dns.clone(), dns_bind) => result,
+        // Tracks the WAN IP and rewrites the apex A when it moves. Pends forever
+        // when DNS or dynamic_ip is off, so it occupies an arm without firing.
+        _ = track_wan_ip_if_enabled(dns.clone(), &config) => Ok(()),
         _ = shutdown_signal() => Ok(()),
     };
+
+    // The note outlives nothing: a console reading it after this daemon has gone
+    // would look for a token beside a daemon that is not there.
+    if let Err(error) = selfhost_config::home::forget(&project_dir) {
+        eprintln!("warning: could not remove the record of this daemon ({error})");
+    }
+
+    // Watches first: one that polled through the shutdown could start a
+    // deployment of a service that is in the middle of being stopped.
+    watches.shutdown().await;
+
+    // The firewall rules are deliberately left in place: a firewall protecting
+    // the host should outlive the daemon that set it, so a restart — or a crash —
+    // never opens a window where the machine is unguarded. `teardown` removes them
+    // when the operator actually wants them gone.
 
     // Stop children the way their specs ask rather than letting process teardown
     // orphan or kill them.
     println!("\nstopping services");
     supervisor.shutdown().await;
     outcome
+}
+
+/// Watches the host firewall for out-of-band changes and re-asserts the policy.
+///
+/// Never returns: it is a branch of the daemon's `select!`, ended only when the
+/// daemon shuts down. Each tick observes the live firewall; any desired rule the
+/// firewall no longer holds, or a default-inbound block that has been turned off,
+/// is drift — logged so the record shows the firewall was changed from outside,
+/// then repaired by `reconcile`. An unmanaged firewall (`manage = false`) is left
+/// entirely alone. A reconcile that fails is reported and the watch keeps going;
+/// the next tick tries again.
+async fn watch_firewall_drift(firewall: selfhost_firewall::Manager) {
+    let mut ticker = tokio::time::interval(FIREWALL_DRIFT_INTERVAL);
+    // The first tick fires immediately; skip it, since startup already reconciled.
+    ticker.tick().await;
+    loop {
+        ticker.tick().await;
+
+        let observed = firewall.state().await;
+        if !observed.managed {
+            continue;
+        }
+
+        let missing: Vec<&str> =
+            observed.rules.iter().filter(|r| !r.applied).map(|r| r.rule.tag.as_str()).collect();
+        let block_lost = !observed.default_inbound_block;
+        if missing.is_empty() && !block_lost {
+            continue;
+        }
+
+        let mut what = String::new();
+        if block_lost {
+            what.push_str("default inbound block cleared");
+        }
+        if !missing.is_empty() {
+            if !what.is_empty() {
+                what.push_str("; ");
+            }
+            what.push_str(&format!("rule(s) {} gone", missing.join(", ")));
+        }
+        eprintln!("firewall drift: {what} — re-asserting");
+
+        if let Err(error) = firewall.reconcile().await {
+            eprintln!("warning: could not re-assert the firewall after drift ({error})");
+        }
+    }
+}
+
+/// Serves authoritative DNS for the daemon's `select!`, or pends forever.
+///
+/// One arm of the daemon has to run the DNS server, but DNS is opt-in — most
+/// deployments have no `[dns]` section. Rather than conditionally building the
+/// `select!`, this arm always exists and simply never resolves when there is
+/// nothing to serve, the same pend-forever shape the updater and the firewall
+/// watch use. A bind failure is surfaced as the daemon's outcome, with the same
+/// privilege hint `watch-dns` prints for port 53.
+async fn serve_dns(dns: Option<Authority>, bind: Option<SocketAddr>) -> Result<(), String> {
+    let (Some(authority), Some(bind)) = (dns, bind) else {
+        return std::future::pending().await;
+    };
+    authority.serve(bind).await.map_err(|error| dns_bind_error(bind, error))
+}
+
+/// Tracks the WAN IP and rewrites the apex A, or pends forever.
+///
+/// Gated twice — DNS present, and `dynamic_ip` on — because a static-IP
+/// deployment wants its apex A left exactly as configured. When either gate is
+/// closed this pends forever, occupying its `select!` arm without doing work.
+/// Otherwise it hands the live [`Authority`] to the updater, which owns the poll
+/// loop, the change detection, and the serial bump.
+async fn track_wan_ip_if_enabled(dns: Option<Authority>, config: &Config) {
+    let Some(authority) = dns else {
+        return std::future::pending().await;
+    };
+    let dynamic = config.dns.as_ref().is_some_and(|dns| dns.dynamic_ip);
+    if !dynamic {
+        return std::future::pending().await;
+    }
+    let zones = authority.origins().await;
+    selfhost_dns::updater::track_wan_ip(
+        authority,
+        zones,
+        selfhost_dns::updater::DEFAULT_INTERVAL,
+    )
+    .await;
+}
+
+/// Turns a DNS bind failure into a message that says what to do about it.
+///
+/// Port 53 is privileged and commonly already held by a stub resolver, so the
+/// two failures worth naming get the same guidance `watch-dns` gives — the whole
+/// point of this daemon is to run unattended, and "permission denied" with no
+/// remedy is a support ticket waiting to happen.
+fn dns_bind_error(bind: SocketAddr, error: DnsError) -> String {
+    match &error {
+        DnsError::Bind { source, .. }
+            if source.kind() == std::io::ErrorKind::PermissionDenied =>
+        {
+            format!(
+                "cannot bind {bind}: port 53 needs privilege.\n  \
+                 Run it with sudo, or on Linux grant the capability once:\n  \
+                 sudo setcap 'cap_net_bind_service=+ep' ./target/release/selfhost"
+            )
+        }
+        DnsError::Bind { source, .. } if source.kind() == std::io::ErrorKind::AddrInUse => {
+            format!(
+                "cannot bind {bind}: something already answers DNS on this machine.\n  \
+                 On macOS that is usually a VPN client or Internet Sharing; on Linux a local\n  \
+                 stub resolver such as systemd-resolved on 127.0.0.53."
+            )
+        }
+        _ => format!("the DNS server stopped: {error}"),
+    }
+}
+
+/// Shows the zone this machine serves and whether it is answering on port 53.
+///
+/// Read-only and needs no running daemon to describe the zone — the preview is
+/// derived from the config the same way the server derives it — but it also
+/// probes the bind so the reader learns whether the server is actually up.
+fn dns_command() -> Result<(), String> {
+    let (config, _project_dir) = load()?;
+
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| format!("could not start the async runtime: {e}"))?;
+
+    runtime.block_on(dns_status::show(&config))
+}
+
+/// Serves authoritative DNS in the foreground, without the rest of the daemon.
+///
+/// The `daemon` command already serves DNS alongside everything else; this is
+/// the `run`-to-`daemon` counterpart — a way to bring up and test just the
+/// authority. `watch-dns` is the other DNS command and does the opposite job: it
+/// *forwards* queries to diagnose the network, whereas this *answers* them
+/// authoritatively for the configured zones.
+fn serve_dns_command(arguments: &[String]) -> Result<(), String> {
+    let (config, _project_dir) = load()?;
+    let Some(dns) = config.dns.as_ref() else {
+        return Err(
+            "no [dns] section in the config, so there is no zone to serve.\n  \
+             Add one — `selfhost dns` shows what it would serve — then re-run."
+                .into(),
+        );
+    };
+    let bind: SocketAddr = match value_of(arguments, "--bind") {
+        Some(given) => given.parse().map_err(|e| format!("--bind {given}: {e}"))?,
+        None => dns.bind.parse().map_err(|e| format!("dns.bind {}: {e}", dns.bind))?,
+    };
+
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| format!("could not start the async runtime: {e}"))?;
+
+    runtime.block_on(serve_dns_foreground(config, bind))
+}
+
+/// Binds the authority and serves until interrupted.
+async fn serve_dns_foreground(config: Config, bind: SocketAddr) -> Result<(), String> {
+    let public_ip = doctor::discover_public_ip().await;
+    let authority = Authority::for_config(&config, public_ip);
+
+    println!("selfhost authoritative DNS");
+    println!("  bind    {bind}");
+    for origin in authority.origins().await {
+        println!("  zone    {origin}");
+    }
+    match public_ip {
+        Some(address) => println!("  apex A  {address} (discovered public IP)"),
+        None => println!("  apex A  unknown — could not discover this machine's public IP"),
+    }
+    println!(
+        "\nFor the internet to reach this server, the router/edge must forward UDP+TCP 53\n\
+         to this machine. selfhost does not change the router."
+    );
+    println!("\nCtrl-C to stop.");
+
+    tokio::select! {
+        result = authority.serve(bind) => result.map_err(|error| dns_bind_error(bind, error)),
+        _ = tokio::signal::ctrl_c() => Ok(()),
+    }
 }
 
 /// Waits for whichever signal means "stop", so children are stopped rather than
@@ -418,6 +755,174 @@ async fn shutdown_signal() {
     let _ = tokio::signal::ctrl_c().await;
 }
 
+/// Stops, uninstalls, and removes what the daemon created.
+///
+/// The plan is shown before anything happens and confirmed on the terminal,
+/// because every argument this takes is destructive and the difference between
+/// them is how much. See [`teardown`] for what it refuses to touch and why.
+fn teardown_command(arguments: &[String]) -> Result<(), String> {
+    let everything = arguments.iter().any(|argument| argument == "--everything");
+    let assumed_yes = arguments.iter().any(|argument| argument == "--yes");
+
+    let (config, project_dir) = load()?;
+    let address: SocketAddr = config
+        .server
+        .admin_bind
+        .parse()
+        .map_err(|error| format!("admin_bind {}: {error}", config.server.admin_bind))?;
+    if teardown::daemon_is_running(address) {
+        return Err(teardown::refuse_because_running(address));
+    }
+
+    let data_dir = teardown::data_dir(&config, &project_dir);
+    let store = Store::new(&data_dir);
+    let node_names: Vec<&str> = config.nodes.iter().map(|node| node.name.as_str()).collect();
+    let catalog = store.load(&node_names).map_err(|error| error.to_string())?;
+
+    let removals = teardown::plan(&project_dir, &data_dir, &catalog, everything);
+    let skipped = teardown::left_behind(&project_dir, &catalog);
+
+    if removals.is_empty() {
+        println!("Nothing to remove — this project has no daemon state on disk.");
+        report_left_behind(&skipped);
+        return Ok(());
+    }
+
+    println!("This will remove:\n");
+    for removal in &removals {
+        println!("  {:<34} {}", removal.what, removal.path.display());
+    }
+    if !everything {
+        println!(
+            "\nKeeping {} — certificates, mail, and backups live there.\n\
+             Pass --everything to remove it too.",
+            data_dir.display()
+        );
+    }
+    println!("Keeping {CONFIG_FILENAME} — you wrote it, and this did not.");
+
+    if !assumed_yes && !teardown::confirmed() {
+        println!("\nNothing was removed.");
+        return Ok(());
+    }
+
+    println!();
+    let failures = teardown::carry_out(&removals);
+
+    // The note is a hint about a daemon that is no longer here; removing it is
+    // not optional and not worth confirming.
+    if let Err(error) = selfhost_config::home::forget(&project_dir) {
+        println!("  FAILED   the record of where the daemon runs — {error}");
+    }
+
+    report_left_behind(&skipped);
+    if failures.is_empty() {
+        println!("\n✓ torn down");
+        return Ok(());
+    }
+    Err(format!(
+        "{} item(s) could not be removed and are listed above. Everything else was.",
+        failures.len()
+    ))
+}
+
+/// Names any working copy the teardown deliberately did not touch.
+fn report_left_behind(skipped: &[teardown::Removal]) {
+    if skipped.is_empty() {
+        return;
+    }
+    println!("\nLeft alone, because they are outside this project:");
+    for removal in skipped {
+        println!("  {:<34} {}", removal.what, removal.path.display());
+    }
+}
+
+/// Registers, removes, or reports the daemon's OS service registration.
+///
+/// The subcommand is dispatched here rather than as three top-level commands so
+/// `install`, `uninstall`, and `status` read as one feature and share the
+/// `--system`/`--yes` flags. See [`service_install`] for what each platform gets.
+fn service_command(arguments: &[String]) -> Result<(), String> {
+    let system = arguments.iter().any(|argument| argument == "--system");
+    let assumed_yes = arguments.iter().any(|argument| argument == "--yes");
+    match arguments.get(1).map(String::as_str) {
+        Some("install") => service_install_command(system, assumed_yes),
+        Some("uninstall") => service_uninstall_command(system, assumed_yes),
+        Some("status") => service_install::status(system),
+        Some(other) => Err(format!(
+            "unknown service subcommand \"{other}\" — expected install, uninstall, or status\n\n{USAGE}"
+        )),
+        None => Err(format!(
+            "service needs a subcommand: install, uninstall, or status\n\n{USAGE}"
+        )),
+    }
+}
+
+/// Writes the OS unit for `selfhost daemon` and registers it, after showing it.
+///
+/// The whole registration — the unit's text and the commands that load it — is
+/// printed and confirmed before anything is written, exactly as `teardown` shows
+/// its plan first: a boot service is a deliberate change to the machine, not a
+/// side effect of a typo. The daemon's executable is [`std::env::current_exe`]
+/// and its working directory is the project holding `selfhost.config.toml`, so
+/// the installed unit resolves `data/` the way the daemon does.
+fn service_install_command(system: bool, assumed_yes: bool) -> Result<(), String> {
+    let (_, project_dir) = load()?;
+    let exe = std::env::current_exe()
+        .map_err(|error| format!("cannot find this executable to register it: {error}"))?;
+    let plan = service_install::plan(&exe, &project_dir, system)?;
+
+    println!("This will register the selfhost daemon as a {} service:\n", plan.mechanism);
+    println!("  name          {}", plan.label);
+    println!("  runs          {}", plan.argv.join(" "));
+    println!("  working dir   {}", plan.working_dir.display());
+    println!("  unit file     {}", plan.path.display());
+    println!("\nThe unit that will be written:\n");
+    for line in plan.contents.lines() {
+        println!("  {line}");
+    }
+    println!("\nThen these commands register and start it:");
+    for step in &plan.activate {
+        println!("  {}", step.argv.join(" "));
+    }
+
+    if !assumed_yes && !service_install::confirm("\nRegister this service?") {
+        println!("\nNothing was installed.");
+        return Ok(());
+    }
+
+    println!();
+    service_install::carry_out(&plan)?;
+    println!("\n✓ installed — the daemon will start on boot and restart if it dies");
+    Ok(())
+}
+
+/// Unregisters the daemon's OS service and removes its unit file, after showing
+/// what it will do.
+fn service_uninstall_command(system: bool, assumed_yes: bool) -> Result<(), String> {
+    let plan = service_install::uninstall_plan(system)?;
+
+    println!("This will remove the selfhost daemon {} service:\n", plan.mechanism);
+    println!("  name        {}", plan.label);
+    if let Some(path) = &plan.path {
+        println!("  unit file   {}", path.display());
+    }
+    println!("\nCommands that will run:");
+    for step in &plan.steps {
+        println!("  {}", step.argv.join(" "));
+    }
+
+    if !assumed_yes && !service_install::confirm("\nRemove this service?") {
+        println!("\nNothing was removed.");
+        return Ok(());
+    }
+
+    println!();
+    service_install::carry_out_uninstall(&plan)?;
+    println!("\n✓ removed — the daemon no longer starts on boot");
+    Ok(())
+}
+
 /// Prints the installed services and their configured start behaviour.
 ///
 /// Reads the catalogue directly rather than asking a running daemon, so it
@@ -435,7 +940,7 @@ fn services_command() -> Result<(), String> {
     }
 
     let width = catalog.services.iter().map(|s| s.name.len()).max().unwrap_or(0).max(4);
-    println!("  {:<width$}  {:<10}  {}", "NAME", "START", "PROGRAM");
+    println!("  {:<width$}  {:<10}  PROGRAM", "NAME", "START");
     for spec in &catalog.services {
         let mode = match spec.start_mode {
             selfhost_config::StartMode::Automatic => "automatic",
@@ -463,7 +968,7 @@ fn run() -> Result<(), String> {
 async fn serve(config: Config, project_dir: PathBuf) -> Result<(), String> {
     // A process-wide crypto provider must be installed before any rustls
     // configuration is built.
-    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+    let _ = rustls::crypto::ring::default_provider().install_default();
 
     let server = Arc::new(Server::build(&config, &project_dir));
     server.spawn_health_tasks();
@@ -471,28 +976,46 @@ async fn serve(config: Config, project_dir: PathBuf) -> Result<(), String> {
     let data_dir = project_dir.join(&config.server.data_dir);
     let store = CertificateStore::open(&data_dir).map_err(|e| e.to_string())?;
 
-    // One certificate covering every configured hostname. Per-host selection via
-    // SNI arrives with the ACME client, which is the next piece of work.
+    // The fallback identity: served on :443 the instant the daemon binds, and for
+    // any SNI that has no certificate of its own. A self-signed pair is generated
+    // once so the resolver always has something to answer with, even on a first
+    // start with nothing on disk and before any ACME exchange has completed.
     let primary = config
         .sites
         .first()
         .map(|s| s.canonical().to_owned())
         .unwrap_or_else(|| "localhost".to_owned());
     let alternates: Vec<String> = config.sites.iter().flat_map(|s| s.domains.clone()).collect();
+    store
+        .load_or_generate_self_signed(&primary, &alternates)
+        .map_err(|e| e.to_string())?;
 
-    let (chain, key) = match config.server.acme {
-        AcmeEnvironment::SelfSigned => store
-            .load_or_generate_self_signed(&primary, &alternates)
-            .map_err(|e| e.to_string())?,
-        other => {
-            return Err(format!(
-                "ACME mode {other:?} is not implemented yet — the ACME client is the next piece \
-                 of work. Use acme = \"self-signed\" until then."
-            ));
-        }
-    };
+    // Per-host certificate selection via SNI. Rebuildable at runtime, so a
+    // freshly issued certificate takes effect without restarting the daemon.
+    let resolver = SniResolver::new(&store, &store.hosts(), &primary).map_err(|e| e.to_string())?;
 
-    let tls_config = server_config(chain, key).map_err(|e| e.to_string())?;
+    // For staging or production, fetch real certificates in the background. The
+    // task is spawned before the listeners bind so the HTTP-01 responder on :80
+    // is already answering when the CA calls back. Self-signed needs no CA, no
+    // network, and no task — the resolver already holds the generated pair.
+    //
+    // Staging is the safe default (config-enforced): a first run against a domain
+    // that does not yet resolve here cannot burn the production rate limit.
+    if !matches!(config.server.acme, AcmeEnvironment::SelfSigned) {
+        tokio::spawn(acme_task::issue_and_renew(
+            config.clone(),
+            project_dir.clone(),
+            store.clone(),
+            Arc::clone(&resolver),
+        ));
+    }
+
+    // Mail rides alongside the proxy rather than under `daemon`: it needs the
+    // certificate store above, and — like the proxy — is meant to be up for
+    // as long as `run` is. A no-op when `config.mail` is absent.
+    mail_task::run(config.clone(), project_dir.clone(), store.clone()).await;
+
+    let tls_config = server_config_with_resolver(resolver).map_err(|e| e.to_string())?;
 
     let http = TcpListener::bind(&config.server.http_bind)
         .await

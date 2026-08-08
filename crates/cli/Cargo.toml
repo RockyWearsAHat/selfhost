@@ -12,14 +12,19 @@ name = "selfhost"
 path = "src/main.rs"
 
 [dependencies]
+selfhost-acme = { workspace = true }
 selfhost-admin = { workspace = true }
 selfhost-config = { workspace = true }
 selfhost-dns = { workspace = true }
+selfhost-firewall = { workspace = true }
+selfhost-git = { workspace = true }
+selfhost-mail = { workspace = true }
 selfhost-proxy = { workspace = true }
 selfhost-http = { workspace = true }
 selfhost-supervisor = { workspace = true }
 tokio = { workspace = true }
 rustls = { workspace = true }
+tokio-rustls = { workspace = true }
 
 [lints.rust]
 unsafe_code = "forbid"

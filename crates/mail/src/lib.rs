@@ -23,7 +23,32 @@
 #![warn(missing_docs)]
 
 pub mod address;
+pub mod client;
+pub mod dkim;
+pub mod imap;
+pub mod message;
+pub mod outbound;
+pub mod receive;
 pub mod smtp;
+pub mod store;
+pub mod submission;
 
 pub use address::{Address, AddressError, Path};
+pub use client::{
+    deliver_to_host, mx_delivery_order, Delivery, ClientError, OutboundQueue, QueuedMessage,
+    SmtpClient,
+};
+pub use dkim::{Dkim, DkimError};
+pub use imap::{
+    FetchItem, FetchPlan, Flag, IAction, IConfig, IResponse, ISession, IState, MessageData,
+    MessageRef, SelectData, Section, StatusItem, StoreOp, StorePlan,
+};
+pub use message::{Message, MessageError};
+pub use outbound::{deliver, SendContext, SendReport, SigningIdentity};
+pub use receive::{serve_smtp, Greylist, Receiver};
 pub use smtp::{Action, Envelope, Policy, Reply, Session, State};
+pub use store::{Flags, Folder, Maildir, StoreError, StoredId, Uid};
+pub use submission::{
+    hash_password, serve_submission, Authenticator, ConfigAuthenticator, Submission,
+    SubmissionError,
+};
