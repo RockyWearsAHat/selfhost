@@ -308,7 +308,12 @@ where
         if request.path().starts_with(ACME_CHALLENGE_PREFIX) {
             return serve_acme_challenge(server, request, stream, keep_alive).await;
         }
-        let target = format!("https://{}{}", runtime.site.canonical(), request.target);
+        // Upgrade the scheme on the host the caller actually used, not the site's
+        // canonical name: redirecting http://<addr> to https://<canonical> would
+        // send every visitor to the first configured domain (e.g. "localhost") and
+        // present a certificate for the wrong name. Canonicalisation, if enabled,
+        // happens on the HTTPS side below where the certificate already matches.
+        let target = format!("https://{host}{}", request.target);
         let response = Response::redirect(Status::PERMANENT_REDIRECT, &target)
             .unwrap_or_else(|_| Response::error_page(Status::BAD_REQUEST));
         write_response(stream, response, keep_alive).await?;
@@ -566,9 +571,12 @@ mod tests {
                 acme: AcmeEnvironment::SelfSigned,
                 data_dir: PathBuf::from("./data"),
                 admin_bind: "127.0.0.1:9191".into(),
+                firewall: selfhost_config::Firewall::default(),
             },
             nodes: vec![Node { name: "home".into(), role: Role::Owner, mesh_ip: None }],
             sites,
+            dns: None,
+            mail: None,
         }
     }
 

@@ -9,7 +9,16 @@ description = "SMTP and IMAP, written from the specifications. Custom-domain ema
 
 [dependencies]
 selfhost-config = { workspace = true }
+selfhost-dns = { workspace = true }
 tokio = { workspace = true }
+# STARTTLS on submission (server side) and opportunistic TLS on outbound
+# delivery (client side). Same provider as the rest of the stack.
+tokio-rustls = { workspace = true }
+rustls = { workspace = true }
+# DKIM signing and key generation. `ring` is the one crypto provider the project
+# links; DKIM adds no second one — RSA keys, which `ring` cannot generate, are
+# loaded rather than generated (see `dkim`).
+ring = { workspace = true }
 
 [lints.rust]
 unsafe_code = "forbid"
