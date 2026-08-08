@@ -78,6 +78,10 @@ Commands
   mail hash-password [<password>]
                              Hash a mailbox password for [[mail.mailboxes]] in
                              selfhost.config.toml; reads from stdin if omitted
+  mail add <address> [<password>]
+                             Add a mailbox; reads the password from stdin if
+                             omitted. [mail] must already be configured.
+  mail remove <address>      Remove a mailbox
   help                       Show this message
 
 Config lives in selfhost.config.toml. Everything else is derived from it.
@@ -862,14 +866,80 @@ fn service_command(arguments: &[String]) -> Result<(), String> {
     }
 }
 
-/// Dispatches `mail`'s one subcommand.
+/// Dispatches `mail`'s subcommands.
 fn mail_command(arguments: &[String]) -> Result<(), String> {
     match arguments.get(1).map(String::as_str) {
         Some("hash-password") => mail_hash_password(arguments.get(2)),
-        Some(other) => {
-            Err(format!("unknown mail subcommand \"{other}\" — expected hash-password\n\n{USAGE}"))
+        Some("add") => mail_add(arguments),
+        Some("remove") => mail_remove(arguments),
+        Some(other) => Err(format!(
+            "unknown mail subcommand \"{other}\" — expected hash-password, add, or remove\n\n{USAGE}"
+        )),
+        None => Err(format!("mail needs a subcommand: hash-password, add, or remove\n\n{USAGE}")),
+    }
+}
+
+/// Adds a mailbox to `[mail].mailboxes`, hashing its password first.
+///
+/// `[mail]` itself is not created here — hostname, domains, and DKIM are
+/// deployment decisions an operator makes once by hand; this command only
+/// ever appends a `[[mail.mailboxes]]` block to a `[mail]` that already
+/// exists, the same division `site add` draws around `[server]`.
+fn mail_add(arguments: &[String]) -> Result<(), String> {
+    let address = arguments
+        .get(2)
+        .ok_or_else(|| format!("mail add needs an address: `selfhost mail add <address>`\n\n{USAGE}"))?;
+    let password = read_password(arguments.get(3))?;
+    let password_hash = selfhost_mail::hash_password(&password).map_err(|error| error.to_string())?;
+
+    let config_path = find_config()?;
+    let source = site::read_source(&config_path)?;
+    let mailbox = selfhost_config::Mailbox {
+        address: address.clone(),
+        password_hash,
+        aliases: Vec::new(),
+    };
+    let updated = selfhost_config::edit::add_mailbox(&source, &mailbox)
+        .map_err(|error| format!("that mailbox cannot be added:\n{error}"))?;
+    site::write_atomically(&config_path, &updated)?;
+
+    println!("✓ added mailbox \"{address}\"");
+    println!("  takes effect on the next `selfhost run` or daemon restart");
+    Ok(())
+}
+
+/// Removes a mailbox from `[mail].mailboxes`.
+fn mail_remove(arguments: &[String]) -> Result<(), String> {
+    let address = arguments.get(2).ok_or_else(|| {
+        format!("mail remove needs an address: `selfhost mail remove <address>`\n\n{USAGE}")
+    })?;
+
+    let config_path = find_config()?;
+    let source = site::read_source(&config_path)?;
+    let updated = selfhost_config::edit::remove_mailbox(&source, address)
+        .map_err(|error| format!("that mailbox cannot be removed:\n{error}"))?
+        .ok_or_else(|| format!("no mailbox \"{address}\" is configured"))?;
+    site::write_atomically(&config_path, &updated)?;
+
+    println!("✓ removed mailbox \"{address}\"");
+    println!("  takes effect on the next `selfhost run` or daemon restart");
+    Ok(())
+}
+
+/// The password an argument supplied, or one line read from stdin.
+///
+/// Shared by `hash-password` and `mail add` so a real password need not sit in
+/// shell history or a process listing unless the caller chooses that.
+fn read_password(argument: Option<&String>) -> Result<String, String> {
+    match argument {
+        Some(password) => Ok(password.clone()),
+        None => {
+            let mut line = String::new();
+            std::io::stdin()
+                .read_line(&mut line)
+                .map_err(|error| format!("could not read the password from stdin: {error}"))?;
+            Ok(line.trim_end_matches(['\r', '\n']).to_owned())
         }
-        None => Err(format!("mail needs a subcommand: hash-password\n\n{USAGE}")),
     }
 }
 
@@ -880,16 +950,7 @@ fn mail_command(arguments: &[String]) -> Result<(), String> {
 /// or a process listing. The hash is PBKDF2, matching what
 /// `selfhost_mail::submission::ConfigAuthenticator` verifies against.
 fn mail_hash_password(argument: Option<&String>) -> Result<(), String> {
-    let password = match argument {
-        Some(password) => password.clone(),
-        None => {
-            let mut line = String::new();
-            std::io::stdin()
-                .read_line(&mut line)
-                .map_err(|error| format!("could not read the password from stdin: {error}"))?;
-            line.trim_end_matches(['\r', '\n']).to_owned()
-        }
-    };
+    let password = read_password(argument)?;
     let hash = selfhost_mail::hash_password(&password).map_err(|error| error.to_string())?;
     println!("{hash}");
     Ok(())
