@@ -76,7 +76,7 @@ fn load(path: &Path) -> Result<Config, String> {
 }
 
 /// Reads the config source as text, for the edit functions that transform it.
-fn read_source(path: &Path) -> Result<String, String> {
+pub(crate) fn read_source(path: &Path) -> Result<String, String> {
     std::fs::read_to_string(path)
         .map_err(|error| format!("cannot read {}: {error}", path.display()))
 }
@@ -309,7 +309,7 @@ fn describe(site: &Site) -> String {
 /// The same discipline the admin store uses (see [`selfhost_admin::store`]): a
 /// crash or a full disk midway through leaves the previous config intact rather
 /// than a truncated one, because `rename` within a directory is atomic.
-fn write_atomically(path: &Path, text: &str) -> Result<(), String> {
+pub(crate) fn write_atomically(path: &Path, text: &str) -> Result<(), String> {
     let temporary = path.with_extension("toml.new");
     std::fs::write(&temporary, text)
         .map_err(|error| format!("cannot write {}: {error}", temporary.display()))?;
