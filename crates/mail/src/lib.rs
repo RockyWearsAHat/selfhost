@@ -26,12 +26,14 @@ pub mod address;
 pub mod client;
 pub mod dkim;
 pub mod imap;
+pub mod imap_net;
 pub mod message;
 pub mod outbound;
 pub mod receive;
 pub mod smtp;
 pub mod store;
 pub mod submission;
+mod time;
 
 pub use address::{Address, AddressError, Path};
 pub use client::{
@@ -43,6 +45,7 @@ pub use imap::{
     FetchItem, FetchPlan, Flag, IAction, IConfig, IResponse, ISession, IState, MessageData,
     MessageRef, SelectData, Section, StatusItem, StoreOp, StorePlan,
 };
+pub use imap_net::{serve_imap, ImapServer};
 pub use message::{Message, MessageError};
 pub use outbound::{deliver, SendContext, SendReport, SigningIdentity};
 pub use receive::{serve_smtp, Greylist, Receiver};
