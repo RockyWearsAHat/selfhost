@@ -239,6 +239,34 @@ impl Maildir {
             .unwrap_or(0)
     }
 
+    /// The UID the next delivered message will receive — `SELECT`/`STATUS`'s
+    /// `UIDNEXT`. Reads the same persisted counter [`Maildir::deliver`]
+    /// allocates from, without advancing it.
+    pub async fn uid_next(&self, mailbox: &Address) -> u32 {
+        let key = mailbox_key(mailbox);
+        let map = self.0.uid_next.lock().await;
+        match map.get(&key) {
+            Some(next) => *next,
+            None => read_uid_next(&mailbox_dir(&self.0.root, mailbox)).await,
+        }
+    }
+
+    /// When a message was delivered, read from its filesystem modification
+    /// time.
+    ///
+    /// Maildir's atomic rename-into-place (see the module doc) makes this
+    /// exactly the delivery moment, and it needs no extra bookkeeping the way
+    /// a value encoded in the filename would — the filesystem already keeps it.
+    pub async fn internal_date(
+        &self,
+        mailbox: &Address,
+        folder: Folder,
+        uid: Uid,
+    ) -> Result<SystemTime, StoreError> {
+        let path = self.locate(mailbox, folder, uid).await?.ok_or(StoreError::NotFound(uid))?;
+        Ok(tokio::fs::metadata(&path).await?.modified()?)
+    }
+
     /// Allocates the next UID for a mailbox and persists the counter.
     async fn allocate_uid(&self, mailbox: &Address, dir: &Path) -> Result<Uid, StoreError> {
         let key = mailbox_key(mailbox);
@@ -452,6 +480,34 @@ mod tests {
         let first = a.uid_validity(&dave).await;
         let b = Maildir::open(&root, std::slice::from_ref(&dave)).unwrap();
         assert_eq!(first, b.uid_validity(&dave).await);
+    }
+
+    #[tokio::test]
+    async fn uid_next_reports_without_advancing_it() {
+        let root = temp_root();
+        let dave = addr("dave@example.com");
+        let store = Maildir::open(&root, std::slice::from_ref(&dave)).unwrap();
+
+        assert_eq!(store.uid_next(&dave).await, 1, "nothing delivered yet");
+        let uid = store.deliver(&dave, &msg("a")).await.unwrap();
+        assert_eq!(uid, Uid(1));
+        assert_eq!(store.uid_next(&dave).await, 2, "advanced by exactly the one delivery");
+        // Reading it again must not itself advance the counter.
+        assert_eq!(store.uid_next(&dave).await, 2);
+    }
+
+    #[tokio::test]
+    async fn internal_date_is_the_delivery_moment() {
+        let root = temp_root();
+        let dave = addr("dave@example.com");
+        let store = Maildir::open(&root, std::slice::from_ref(&dave)).unwrap();
+
+        let before = SystemTime::now();
+        let uid = store.deliver(&dave, &msg("a")).await.unwrap();
+        let after = SystemTime::now();
+
+        let delivered = store.internal_date(&dave, Folder::Inbox, uid).await.unwrap();
+        assert!(delivered >= before && delivered <= after, "{delivered:?} not within [{before:?}, {after:?}]");
     }
 
     #[tokio::test]
