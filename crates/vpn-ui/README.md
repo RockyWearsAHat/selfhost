@@ -46,6 +46,12 @@ The panel drives the Secure-VPN client installed under `~/.securevpn/`:
 - `~/.securevpn/keys/client.key` + `server.pub` — this machine's identity and
   the pinned server key.
 - `~/.securevpn/rotate-keys.sh` — the rotation script (`build-app.sh` copies it).
+- **macOS Local Network permission.** On the LAN the endpoint resolves to the
+  box's private address (split-horizon DNS), so the app needs Local Network
+  access. Reinstalling the bundle resets that grant, and until it is restored
+  every connect fails with `[Errno 65] No route to host`: click Allow on the
+  prompt, then **relaunch the app** — the grant only takes effect on a fresh
+  launch.
 
 See `docs/VPN.md` for how those are set up and the tunnel's security model.
 
