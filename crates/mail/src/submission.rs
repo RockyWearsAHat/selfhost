@@ -31,6 +31,7 @@ use crate::smtp::{Action, Policy, Reply, Session};
 use ring::pbkdf2;
 use ring::rand::{SecureRandom, SystemRandom};
 use selfhost_config::Mailbox;
+use std::net::SocketAddr;
 use std::num::NonZeroU32;
 use std::sync::Arc;
 use std::{fmt, io};
@@ -196,28 +197,59 @@ impl std::error::Error for SubmissionError {}
 pub async fn serve_submission(listener: TcpListener, submission: Submission) -> io::Result<()> {
     let submission = Arc::new(submission);
     loop {
-        let (stream, _peer) = listener.accept().await?;
+        let (stream, peer) = listener.accept().await?;
         let submission = Arc::clone(&submission);
         tokio::spawn(async move {
-            let _ = handle_connection(stream, submission).await;
+            let _ = handle_connection(stream, peer, submission).await;
         });
+    }
+}
+
+/// One `[submission]`-tagged line into the daemon's log stream.
+///
+/// The same secrecy discipline as the IMAP driver's log: connection events,
+/// command verbs, and authentication *verdicts* only. An `AUTH` argument and
+/// every credential continuation line are base64-wrapped passwords, so client
+/// lines pass through [`verb_summary`] and the SASL reads are never echoed.
+fn log_submission(peer: SocketAddr, message: impl AsRef<str>) {
+    eprintln!("[submission] {peer} {}", message.as_ref());
+}
+
+/// The loggable form of one client line: its uppercased verb — plus, for
+/// `AUTH`, the mechanism name, which is public protocol, not credential.
+fn verb_summary(line: &str) -> String {
+    let mut tokens = line.split_whitespace();
+    let verb = tokens.next().unwrap_or("").to_ascii_uppercase();
+    match (verb.as_str(), tokens.next()) {
+        ("AUTH", Some(mechanism)) => format!("AUTH {}", mechanism.to_ascii_uppercase()),
+        _ => verb,
     }
 }
 
 /// Drives one connection: greeting, the cleartext phase, the STARTTLS upgrade,
 /// then the authenticated phase.
-async fn handle_connection(stream: TcpStream, submission: Arc<Submission>) -> io::Result<()> {
+async fn handle_connection(
+    stream: TcpStream,
+    peer: SocketAddr,
+    submission: Arc<Submission>,
+) -> io::Result<()> {
     let mut session = Session::new(submission.policy.clone());
     let mut stream = stream;
+    log_submission(peer, "connected");
     stream.write_all(session.greeting().to_wire().as_bytes()).await?;
 
-    match converse(&mut stream, &mut session, &submission).await? {
-        Flow::Done => Ok(()),
+    match converse(&mut stream, peer, &mut session, &submission).await? {
+        Flow::Done => {
+            log_submission(peer, "closed");
+            Ok(())
+        }
         Flow::StartTls => {
             let acceptor = TlsAcceptor::from(submission.tls.clone());
             let mut tls = acceptor.accept(stream).await?;
             session.tls_established();
-            let _ = converse(&mut tls, &mut session, &submission).await?;
+            log_submission(peer, "TLS established via STARTTLS");
+            let _ = converse(&mut tls, peer, &mut session, &submission).await?;
+            log_submission(peer, "closed");
             Ok(())
         }
     }
@@ -235,7 +267,12 @@ enum Flow {
 ///
 /// Generic over the transport so the identical loop runs on plaintext and TLS and
 /// can be driven by an in-memory duplex in tests.
-async fn converse<S>(stream: &mut S, session: &mut Session, submission: &Submission) -> io::Result<Flow>
+async fn converse<S>(
+    stream: &mut S,
+    peer: SocketAddr,
+    session: &mut Session,
+    submission: &Submission,
+) -> io::Result<Flow>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
@@ -249,9 +286,12 @@ where
             return Ok(Flow::Done);
         }
 
+        log_submission(peer, format!(">> {}", verb_summary(&line)));
+
         // AUTH before MAIL: submission is not an inbound exchanger, so a sender
         // that has not logged in is refused before a transaction can even begin.
         if is_mail(&line) && !session.authenticated() {
+            log_submission(peer, "<< 530 authentication required");
             write_reply(reader.get_mut(), &Reply::line(530, "authentication required")).await?;
             continue;
         }
@@ -281,12 +321,14 @@ where
             Action::VerifyCredentials { mechanism, initial_response } => {
                 let credential = decode_credential(&mechanism, &initial_response);
                 let verdict = credential.and_then(|(user, pass)| submission.auth.verify(&user, &pass));
+                log_submission(peer, if verdict.is_some() { "auth ok" } else { "auth FAILED" });
                 finish_auth(reader.get_mut(), session, verdict.is_some()).await?;
             }
             Action::AwaitCredentials { mechanism, reply } => {
                 write_reply(reader.get_mut(), &reply).await?;
                 let credential = read_credentials(&mut reader, &mechanism).await?;
                 let verdict = credential.and_then(|(user, pass)| submission.auth.verify(&user, &pass));
+                log_submission(peer, if verdict.is_some() { "auth ok" } else { "auth FAILED" });
                 finish_auth(reader.get_mut(), session, verdict.is_some()).await?;
             }
         }
@@ -612,8 +654,9 @@ mod tests {
         server.write_all(session.greeting().to_wire().as_bytes()).await.unwrap();
 
         let sub = submission.clone();
+        let peer: SocketAddr = "127.0.0.1:0".parse().expect("a valid dummy peer");
         let handle = tokio::spawn(async move {
-            let _ = converse(&mut server, &mut session, &sub).await;
+            let _ = converse(&mut server, peer, &mut session, &sub).await;
         });
         client.write_all(script.as_bytes()).await.unwrap();
         let mut out = String::new();

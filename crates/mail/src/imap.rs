@@ -507,6 +507,14 @@ impl ISession {
         self.tls_active = true;
     }
 
+    /// Whether the next line fed to [`ISession::command`] is a SASL secret
+    /// (the response to a continued `AUTHENTICATE`) rather than a command.
+    /// A driver that logs traffic must consult this first: that line is
+    /// nothing but base64-wrapped credentials.
+    pub fn awaiting_secret(&self) -> bool {
+        self.pending_auth.is_some()
+    }
+
     /// The capabilities advertised in the current state.
     fn capabilities(&self) -> Vec<String> {
         let mut caps = vec!["IMAP4rev1".to_string()];
