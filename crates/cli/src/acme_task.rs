@@ -125,11 +125,23 @@ struct CertOrder {
 /// when `[mail]` is configured — one for the client-autoconfig hosts
 /// ([`selfhost_config::Mail::client_hosts`]), so a mail client that guesses
 /// `imap.<domain>` meets a certificate that actually names it.
+///
+/// Only publicly certifiable names go in an order (see [`certifiable`]): a CA
+/// rejects IP literals and `localhost` outright, and one such name fails its
+/// whole order — a site listing them alongside real domains would never get a
+/// certificate at all, and a loopback-only site would fail every sweep forever.
+/// A site left with no certifiable name places no order and keeps serving the
+/// self-signed fallback, which is all a CA could ever give it anyway.
 fn certificate_orders(config: &Config) -> Vec<CertOrder> {
     let mut orders: Vec<CertOrder> = config
         .sites
         .iter()
-        .map(|site| CertOrder { canonical: site.canonical().to_owned(), domains: site.domains.clone() })
+        .filter_map(|site| {
+            let domains: Vec<String> =
+                site.domains.iter().filter(|domain| certifiable(domain)).cloned().collect();
+            let canonical = domains.first()?.clone();
+            Some(CertOrder { canonical, domains })
+        })
         .collect();
     if let Some(mail) = &config.mail {
         let domains = mail.client_hosts();
@@ -138,6 +150,14 @@ fn certificate_orders(config: &Config) -> Vec<CertOrder> {
         }
     }
     orders
+}
+
+/// Whether a public CA can issue for this name: a real DNS name, not an IP
+/// literal and not `localhost`. Mirrors the exclusion `lan_dns::overrides`
+/// applies for the same reason — these names are config conveniences for local
+/// access, never public identities.
+fn certifiable(domain: &str) -> bool {
+    domain != "localhost" && domain.parse::<std::net::IpAddr>().is_err()
 }
 
 /// Issues one certificate, installs it, and makes it live without a restart.
@@ -249,4 +269,91 @@ fn describe_environment(environment: AcmeEnvironment) -> &'static str {
 /// `acme:` prefix lets its output be told apart in the daemon's log stream.
 fn log(message: impl AsRef<str>) {
     eprintln!("acme: {}", message.as_ref());
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use selfhost_config::{AcmeEnvironment, Firewall, Health, Mail, MailBind, Node, Role, Server, Site};
+
+    fn site(domains: &[&str]) -> Site {
+        Site {
+            name: "site".into(),
+            domains: domains.iter().map(|d| (*d).to_owned()).collect(),
+            static_root: Some(PathBuf::from("./public")),
+            spa: false,
+            app_paths: vec![],
+            instances: vec![],
+            health: Health::default(),
+            canonical_redirect: true,
+            allowed_cidrs: vec![],
+            console: false,
+        }
+    }
+
+    fn config_with(sites: Vec<Site>, mail: Option<Mail>) -> Config {
+        Config {
+            version: 1,
+            server: Server {
+                http_bind: "0.0.0.0:80".into(),
+                https_bind: "0.0.0.0:443".into(),
+                acme_email: "a@b.com".into(),
+                acme: AcmeEnvironment::Production,
+                data_dir: PathBuf::from("./data"),
+                admin_bind: "127.0.0.1:9191".into(),
+                firewall: Firewall::default(),
+            },
+            nodes: vec![Node { name: "home".into(), role: Role::Owner, mesh_ip: None }],
+            sites,
+            dns: None,
+            mail,
+            namecheap_ddns: vec![],
+        }
+    }
+
+    fn mail(domain: &str) -> Mail {
+        Mail {
+            hostname: domain.into(),
+            domains: vec![domain.into()],
+            mailboxes: vec![],
+            dkim: None,
+            relay: None,
+            bind: MailBind::default(),
+            max_message_bytes: 1,
+            require_tls_for_auth: true,
+        }
+    }
+
+    #[test]
+    fn a_loopback_only_site_places_no_order() {
+        // ACME rejects IP identifiers and `localhost`; ordering for them fails
+        // every sweep forever and pointlessly contacts the CA each hour.
+        let config = config_with(vec![site(&["localhost", "127.0.0.1", "192.168.1.8"])], None);
+        assert!(certificate_orders(&config).is_empty());
+    }
+
+    #[test]
+    fn only_certifiable_names_survive_into_a_mixed_sites_order() {
+        // One bad identifier fails the whole ACME order, so the real domains
+        // must be ordered without their loopback companions.
+        let config = config_with(vec![site(&["127.0.0.1", "example.com", "www.example.com"])], None);
+        let orders = certificate_orders(&config);
+
+        assert_eq!(orders.len(), 1);
+        assert_eq!(orders[0].canonical, "example.com");
+        assert_eq!(orders[0].domains, vec!["example.com", "www.example.com"]);
+    }
+
+    #[test]
+    fn mail_client_hosts_get_one_order_keyed_by_the_first_host() {
+        let config = config_with(vec![], Some(mail("example.com")));
+        let orders = certificate_orders(&config);
+
+        assert_eq!(orders.len(), 1);
+        assert_eq!(orders[0].canonical, "mail.example.com");
+        assert_eq!(
+            orders[0].domains,
+            vec!["mail.example.com", "imap.example.com", "smtp.example.com"]
+        );
+    }
 }
