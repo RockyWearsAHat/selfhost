@@ -177,6 +177,29 @@ impl Mail {
         .collect()
     }
 
+    /// The hostnames a mail client's automatic account setup tries for these
+    /// domains: `mail.`, `imap.`, and `smtp.` under each, deduplicated, in
+    /// that order.
+    ///
+    /// Apple Mail, Thunderbird, and most other clients guess exactly these
+    /// names when the user types only an address and a password. Publishing
+    /// them (an `A` record each) and serving a valid certificate for them —
+    /// they join the ACME issuance set and the mail listeners' SNI resolver —
+    /// is what makes account setup work with no server fields typed. The
+    /// first name is the set's canonical host for certificate bookkeeping.
+    pub fn client_hosts(&self) -> Vec<String> {
+        let mut hosts = Vec::new();
+        for domain in &self.domains {
+            for prefix in ["mail", "imap", "smtp"] {
+                let host = format!("{prefix}.{domain}");
+                if !hosts.contains(&host) {
+                    hosts.push(host);
+                }
+            }
+        }
+        hosts
+    }
+
     /// The DNS records this mail domain must publish, as [`RecordConfig`] so they
     /// flow through `dns::Zone::from_config` unchanged and print identically for
     /// an operator whose authoritative DNS lives elsewhere.
@@ -526,6 +549,26 @@ domains = ["example.com"]
         assert_eq!(mail.bind.imaps, "0.0.0.0:993");
         assert_eq!(mail.max_message_bytes, 25 * 1024 * 1024);
         assert!(mail.require_tls_for_auth, "TLS-before-AUTH defaults on");
+    }
+
+    #[test]
+    fn client_hosts_are_the_autoconfig_guesses_per_domain_deduplicated() {
+        let text = config_with_mail(
+            "[mail]\nhostname = \"example.com\"\ndomains = [\"example.com\", \"other.net\"]\n",
+        );
+        let config = Config::parse(&text).expect("valid");
+        let mail = config.mail.expect("mail configured");
+        assert_eq!(
+            mail.client_hosts(),
+            vec![
+                "mail.example.com",
+                "imap.example.com",
+                "smtp.example.com",
+                "mail.other.net",
+                "imap.other.net",
+                "smtp.other.net",
+            ]
+        );
     }
 
     #[test]
