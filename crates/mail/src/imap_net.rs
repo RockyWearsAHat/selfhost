@@ -129,7 +129,16 @@ async fn handle_connection(
     if server.implicit_tls {
         let Some(tls) = server.tls.clone() else { return Ok(()) };
         log_imap(peer, "connected (implicit TLS)");
-        let mut tls_stream = TlsAcceptor::from(tls).accept(stream).await?;
+        // A handshake failure is logged rather than silently propagated: a
+        // client that aborts mid-handshake (certificate distrust, probe,
+        // version mismatch) otherwise looks identical to one that never spoke.
+        let mut tls_stream = match TlsAcceptor::from(tls).accept(stream).await {
+            Ok(tls_stream) => tls_stream,
+            Err(error) => {
+                log_imap(peer, format!("TLS handshake failed: {error}"));
+                return Err(error);
+            }
+        };
         session.tls_established();
         tls_stream.write_all(session.greeting().to_wire()).await?;
         let _ = converse(&mut tls_stream, peer, &mut session, &server).await?;
@@ -147,7 +156,13 @@ async fn handle_connection(
         }
         Flow::StartTls => {
             let Some(tls) = server.tls.clone() else { return Ok(()) };
-            let mut tls_stream = TlsAcceptor::from(tls).accept(stream).await?;
+            let mut tls_stream = match TlsAcceptor::from(tls).accept(stream).await {
+                Ok(tls_stream) => tls_stream,
+                Err(error) => {
+                    log_imap(peer, format!("STARTTLS handshake failed: {error}"));
+                    return Err(error);
+                }
+            };
             session.tls_established();
             log_imap(peer, "TLS established via STARTTLS");
             let _ = converse(&mut tls_stream, peer, &mut session, &server).await?;
@@ -187,6 +202,15 @@ where
         let read = read_command_line(&mut reader, &mut line).await?;
         if read == 0 {
             return Ok(Flow::Done);
+        }
+
+        // A bare CRLF between commands is tolerated silently (Postel's law):
+        // Apple Mail opens its sync connections with one, and answering it
+        // with a `BAD` makes the client drop the connection and give up. An
+        // awaited SASL response is exempt — there an empty line is real input.
+        if line.trim().is_empty() && !session.awaiting_secret() {
+            log_imap(peer, ">> (blank line ignored)");
+            continue;
         }
 
         if session.awaiting_secret() {
@@ -559,6 +583,23 @@ mod tests {
         client.read_to_string(&mut out).await.unwrap();
         handle.await.unwrap();
         out
+    }
+
+    #[tokio::test]
+    async fn a_blank_first_line_and_an_id_do_not_derail_the_conversation() {
+        // The exact opening Apple Mail's sync connections use: a bare CRLF,
+        // then ID, then authentication. The blank line must be swallowed
+        // (not answered with BAD, which makes Mail hang up) and ID answered OK.
+        let root = temp_root("apple-opening");
+        let server = server_with(&root);
+        let out = run_conversation(
+            &server,
+            "\r\nx1 ID (\"name\" \"Mac OS X Mail\")\r\nx2 LOGIN dave@example.com hunter2\r\nx3 LOGOUT\r\n",
+        )
+        .await;
+        assert!(!out.contains("BAD"), "{out}");
+        assert!(out.contains("* ID NIL"), "{out}");
+        assert!(out.contains("x2 OK"), "{out}");
     }
 
     #[tokio::test]
