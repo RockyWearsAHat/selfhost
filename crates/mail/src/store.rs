@@ -72,6 +72,15 @@ pub enum StoreError {
     Io(io::Error),
     /// The address is not a mailbox this store serves.
     NoSuchMailbox(Address),
+    /// An alias names a delivery target that is not one of the store's
+    /// mailboxes — a configuration the store refuses to open, because mail
+    /// accepted for that alias could never be delivered anywhere.
+    AliasWithoutMailbox {
+        /// The alias address as configured.
+        alias: Address,
+        /// The target it names, which no mailbox matches.
+        target: Address,
+    },
     /// No stored message carries the given UID.
     NotFound(Uid),
 }
@@ -81,6 +90,9 @@ impl std::fmt::Display for StoreError {
         match self {
             Self::Io(e) => write!(f, "mail store I/O error: {e}"),
             Self::NoSuchMailbox(a) => write!(f, "no such mailbox: {a}"),
+            Self::AliasWithoutMailbox { alias, target } => {
+                write!(f, "alias {alias} delivers to {target}, which is not a mailbox here")
+            }
             Self::NotFound(u) => write!(f, "no message with uid {}", u.0),
         }
     }
@@ -102,6 +114,9 @@ pub struct Maildir(Arc<Inner>);
 struct Inner {
     root: PathBuf,
     mailboxes: Vec<Address>,
+    /// Alias → mailbox routes. Every target is one of `mailboxes` — `open`
+    /// refuses anything else — so resolution can never dangle.
+    aliases: Vec<(Address, Address)>,
     /// Next UID to hand out, per mailbox, mirrored to `.uidnext` on disk so the
     /// sequence stays monotonic across restarts.
     uid_next: Mutex<HashMap<String, u32>>,
@@ -109,10 +124,29 @@ struct Inner {
 
 impl Maildir {
     /// Opens (creating as needed) the mail tree under `data_dir` for exactly the
-    /// given mailbox addresses, including their aliases if the caller expanded
-    /// them into the list. Each mailbox gets `tmp/`, `new/`, `cur/` and a stable
-    /// `.uidvalidity` stamped on first creation.
-    pub fn open(data_dir: &Path, mailboxes: &[Address]) -> Result<Self, StoreError> {
+    /// given mailbox addresses. Each mailbox gets `tmp/`, `new/`, `cur/` and a
+    /// stable `.uidvalidity` stamped on first creation.
+    ///
+    /// `aliases` are extra `(alias, target)` addresses that accept and deliver
+    /// into an existing mailbox — no directory of their own, so the same message
+    /// addressed to `postmaster@` and read over IMAP as the target mailbox is
+    /// one file, not two. An alias whose target is not in `mailboxes` is an
+    /// error: accepting mail that can never land anywhere is a black hole. An
+    /// alias that spells an existing mailbox address is inert, not an error —
+    /// [`Maildir::resolve`] checks mailboxes first, so the mailbox always wins.
+    pub fn open(
+        data_dir: &Path,
+        mailboxes: &[Address],
+        aliases: &[(Address, Address)],
+    ) -> Result<Self, StoreError> {
+        for (alias, target) in aliases {
+            if !mailboxes.iter().any(|known| known.matches(target)) {
+                return Err(StoreError::AliasWithoutMailbox {
+                    alias: alias.clone(),
+                    target: target.clone(),
+                });
+            }
+        }
         let root = data_dir.join("mail");
         for mailbox in mailboxes {
             let dir = mailbox_dir(&root, mailbox);
@@ -127,27 +161,46 @@ impl Maildir {
         Ok(Self(Arc::new(Inner {
             root,
             mailboxes: mailboxes.to_vec(),
+            aliases: aliases.to_vec(),
             uid_next: Mutex::new(HashMap::new()),
         })))
     }
 
-    /// Whether `address` (matched case-insensitively against the configured set)
-    /// is a real mailbox here. The receiver calls this at `RCPT` so mail for an
-    /// unknown local user is refused, not black-holed.
-    pub fn exists(&self, address: &Address) -> bool {
-        self.0.mailboxes.iter().any(|known| known.matches(address))
+    /// The mailbox `address` delivers to: the matching mailbox itself, or the
+    /// target of a matching alias. `None` means no mail for this address —
+    /// matching is case-insensitive, like every address comparison here.
+    pub fn resolve(&self, address: &Address) -> Option<&Address> {
+        self.0
+            .mailboxes
+            .iter()
+            .find(|known| known.matches(address))
+            .or_else(|| {
+                self.0
+                    .aliases
+                    .iter()
+                    .find(|(alias, _)| alias.matches(address))
+                    .map(|(_, target)| target)
+            })
     }
 
-    /// Delivers one message to one mailbox and returns its assigned UID.
+    /// Whether `address` is a mailbox or an alias of one. The receiver calls
+    /// this at `RCPT` so mail for an unknown local user is refused, not
+    /// black-holed.
+    pub fn exists(&self, address: &Address) -> bool {
+        self.resolve(address).is_some()
+    }
+
+    /// Delivers one message to one mailbox (or alias — the message lands in the
+    /// alias's target) and returns its assigned UID.
     ///
     /// Atomic: bytes are written to `tmp/`, fsynced, then renamed into `new/`.
     /// The UID is allocated first and persisted before the rename, so a crash
     /// cannot reuse it. Delivering to an address that is not a mailbox here is
     /// an error, never a silent drop.
     pub async fn deliver(&self, mailbox: &Address, msg: &Message) -> Result<Uid, StoreError> {
-        if !self.exists(mailbox) {
-            return Err(StoreError::NoSuchMailbox(mailbox.clone()));
-        }
+        let target =
+            self.resolve(mailbox).ok_or_else(|| StoreError::NoSuchMailbox(mailbox.clone()))?.clone();
+        let mailbox = &target;
         let dir = mailbox_dir(&self.0.root, mailbox);
         let uid = self.allocate_uid(mailbox, &dir).await?;
 
@@ -428,7 +481,7 @@ mod tests {
     async fn delivery_lands_the_message_in_new() {
         let root = temp_root();
         let dave = addr("dave@example.com");
-        let store = Maildir::open(&root, std::slice::from_ref(&dave)).unwrap();
+        let store = Maildir::open(&root, std::slice::from_ref(&dave), &[]).unwrap();
 
         let uid = store.deliver(&dave, &msg("hello")).await.unwrap();
         assert_eq!(uid, Uid(1));
@@ -447,7 +500,7 @@ mod tests {
     async fn uids_are_monotonic_and_unique_per_mailbox() {
         let root = temp_root();
         let dave = addr("dave@example.com");
-        let store = Maildir::open(&root, std::slice::from_ref(&dave)).unwrap();
+        let store = Maildir::open(&root, std::slice::from_ref(&dave), &[]).unwrap();
 
         let first = store.deliver(&dave, &msg("a")).await.unwrap();
         let second = store.deliver(&dave, &msg("b")).await.unwrap();
@@ -463,7 +516,7 @@ mod tests {
     async fn existence_is_case_insensitive_and_delivery_to_a_stranger_is_refused() {
         let root = temp_root();
         let dave = addr("dave@example.com");
-        let store = Maildir::open(&root, std::slice::from_ref(&dave)).unwrap();
+        let store = Maildir::open(&root, std::slice::from_ref(&dave), &[]).unwrap();
 
         assert!(store.exists(&addr("DAVE@EXAMPLE.COM")));
         assert!(!store.exists(&addr("nobody@example.com")));
@@ -473,12 +526,41 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn an_alias_accepts_and_delivers_into_its_target_mailbox() {
+        let root = temp_root();
+        let dave = addr("dave@example.com");
+        let aliases = [(addr("postmaster@example.com"), dave.clone())];
+        let store = Maildir::open(&root, std::slice::from_ref(&dave), &aliases).unwrap();
+
+        // The alias exists (case-insensitively) but is not a mailbox of its own.
+        assert!(store.exists(&addr("POSTMASTER@Example.com")));
+        assert!(!root.join("mail").join("example.com").join("postmaster").exists());
+
+        let uid = store.deliver(&addr("postmaster@example.com"), &msg("for the operator")).await.unwrap();
+        let fetched = store.fetch(&dave, Folder::Inbox, uid).await.unwrap();
+        assert_eq!(fetched.body(), b"for the operator");
+    }
+
+    #[test]
+    fn an_alias_whose_target_is_no_mailbox_refuses_to_open() {
+        // Accepting mail for an alias that routes nowhere would be a black
+        // hole, so the store refuses the configuration outright.
+        let root = temp_root();
+        let dave = addr("dave@example.com");
+        let aliases = [(addr("postmaster@example.com"), addr("ghost@example.com"))];
+        let Err(err) = Maildir::open(&root, std::slice::from_ref(&dave), &aliases) else {
+            panic!("a dangling alias must not open");
+        };
+        assert!(matches!(err, StoreError::AliasWithoutMailbox { .. }));
+    }
+
+    #[tokio::test]
     async fn uid_validity_is_stable_across_reopen() {
         let root = temp_root();
         let dave = addr("dave@example.com");
-        let a = Maildir::open(&root, std::slice::from_ref(&dave)).unwrap();
+        let a = Maildir::open(&root, std::slice::from_ref(&dave), &[]).unwrap();
         let first = a.uid_validity(&dave).await;
-        let b = Maildir::open(&root, std::slice::from_ref(&dave)).unwrap();
+        let b = Maildir::open(&root, std::slice::from_ref(&dave), &[]).unwrap();
         assert_eq!(first, b.uid_validity(&dave).await);
     }
 
@@ -486,7 +568,7 @@ mod tests {
     async fn uid_next_reports_without_advancing_it() {
         let root = temp_root();
         let dave = addr("dave@example.com");
-        let store = Maildir::open(&root, std::slice::from_ref(&dave)).unwrap();
+        let store = Maildir::open(&root, std::slice::from_ref(&dave), &[]).unwrap();
 
         assert_eq!(store.uid_next(&dave).await, 1, "nothing delivered yet");
         let uid = store.deliver(&dave, &msg("a")).await.unwrap();
@@ -500,7 +582,7 @@ mod tests {
     async fn internal_date_is_the_delivery_moment() {
         let root = temp_root();
         let dave = addr("dave@example.com");
-        let store = Maildir::open(&root, std::slice::from_ref(&dave)).unwrap();
+        let store = Maildir::open(&root, std::slice::from_ref(&dave), &[]).unwrap();
 
         let before = SystemTime::now();
         let uid = store.deliver(&dave, &msg("a")).await.unwrap();
@@ -514,7 +596,7 @@ mod tests {
     async fn flags_round_trip_through_the_filename() {
         let root = temp_root();
         let dave = addr("dave@example.com");
-        let store = Maildir::open(&root, std::slice::from_ref(&dave)).unwrap();
+        let store = Maildir::open(&root, std::slice::from_ref(&dave), &[]).unwrap();
         let uid = store.deliver(&dave, &msg("x")).await.unwrap();
 
         assert_eq!(store.flags(&dave, Folder::Inbox, uid).await.unwrap(), Flags::default());
@@ -533,7 +615,7 @@ mod tests {
         // shape `deliver` itself writes.
         let root = temp_root();
         let dave = addr("dave@example.com");
-        let store = Maildir::open(&root, std::slice::from_ref(&dave)).unwrap();
+        let store = Maildir::open(&root, std::slice::from_ref(&dave), &[]).unwrap();
 
         let sent = root.join("mail").join("example.com").join("dave").join(".Sent");
         std::fs::create_dir_all(sent.join("new")).unwrap();

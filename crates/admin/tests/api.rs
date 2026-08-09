@@ -15,8 +15,59 @@ const TOKEN: &str = "0123456789abcdef";
 fn api(name: &str) -> (Api, ScratchDir) {
     let dir = ScratchDir::new(name);
     let token = write_token(dir.path(), TOKEN);
-    let api = Api::new(Supervisor::new(dir.path()), Store::new(dir.path()), token);
-    (api, dir)
+    let watches = selfhost_git::Watches::default();
+    let api = Api::new(
+        Supervisor::new(dir.path()),
+        Store::new(dir.path()),
+        token,
+        watches.clone(),
+        firewall_manager(),
+    );
+    (api, watches, dir)
+}
+
+/// A firewall manager over a minimal, unmanaged config.
+///
+/// Built from real config text so the test does not have to track the shape of
+/// `Server`. `manage` is off by default, so `for_config` derives no rules and the
+/// firewall routes exercise the wiring without depending on a drivable firewall.
+fn firewall_manager() -> selfhost_firewall::Manager {
+    let config = selfhost_config::Config::parse(
+        "version = 1\n\
+         [server]\n\
+         http_bind = \"127.0.0.1:8080\"\n\
+         https_bind = \"127.0.0.1:8443\"\n\
+         acme_email = \"a@b.com\"\n\
+         acme = \"self-signed\"\n\
+         data_dir = \"./data\"\n\
+         [[nodes]]\n\
+         name = \"home\"\n\
+         role = \"owner\"\n\
+         [[sites]]\n\
+         name = \"hello\"\n\
+         domains = [\"localhost\"]\n\
+         static_root = \"./sites/hello\"\n",
+    )
+    .expect("a minimal valid config");
+    selfhost_firewall::Manager::for_config(&config)
+}
+
+/// A service definition carrying a Git watch, as JSON.
+fn watched_body(name: &str, interval: u64) -> String {
+    Json::object([
+        ("name", Json::string(name)),
+        ("program", Json::string("/bin/true")),
+        ("startMode", Json::string("manual")),
+        (
+            "git",
+            Json::object([
+                ("repository", Json::string("https://github.com/owner/repo.git")),
+                ("path", Json::string("checkouts/site")),
+                ("intervalSecs", Json::Number(interval as f64)),
+            ]),
+        ),
+    ])
+    .to_text()
 }
 
 /// Plants a known token so tests can authenticate deterministically.

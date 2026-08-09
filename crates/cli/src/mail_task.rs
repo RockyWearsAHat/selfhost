@@ -1,17 +1,11 @@
 //! Mail, spawned alongside the proxy: SMTP receiving, authenticated
-//! submission, and the outbound queue runner.
+//! submission, IMAP, and the outbound queue runner.
 //!
 //! Mirrors `acme_task` — a background job the `run` command starts when its
 //! config section is present, reusing the same [`CertificateStore`] the proxy
 //! already opened rather than provisioning trust material of its own. Mail is
 //! opt-in (see [`selfhost_config::Mail`]); [`run`] does nothing when the
 //! config carries no `[mail]` section.
-//!
-//! **Not wired here: IMAP.** `selfhost_mail::imap` is a complete, tested
-//! protocol state machine with no network listener built on top of it yet —
-//! there is no `serve_imap` to call. A configured deployment sends and
-//! receives mail today; reading it back over IMAP is unfinished and skipped
-//! here rather than silently claimed.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -23,8 +17,9 @@ use rustls::{ClientConfig, DigitallySignedStruct, ServerConfig, SignatureScheme}
 use selfhost_config::Config;
 use selfhost_dns::Resolver;
 use selfhost_mail::{
-    deliver, Address, Authenticator, ConfigAuthenticator, Dkim, Maildir, OutboundQueue, Policy,
-    Receiver, SendContext, SigningIdentity, Submission, serve_smtp, serve_submission,
+    deliver, Address, Authenticator, ConfigAuthenticator, Dkim, IConfig, ImapServer, Maildir,
+    OutboundQueue, Policy, Receiver, SendContext, SigningIdentity, Submission, serve_imap,
+    serve_smtp, serve_submission,
 };
 use selfhost_proxy::CertificateStore;
 use tokio::net::TcpListener;
@@ -50,17 +45,32 @@ pub async fn run(config: Config, project_dir: PathBuf, store: CertificateStore) 
         return;
     }
 
-    let mailboxes: Result<Vec<Address>, _> =
-        mail.mailboxes.iter().map(|mailbox| Address::parse(&mailbox.address)).collect();
-    let mailboxes = match mailboxes {
-        Ok(addresses) => addresses,
-        Err(error) => {
-            log(format!("a configured mailbox address does not parse ({error:?}) — mail is not running"));
-            return;
+    // One pass over the config mailboxes yields both the store's mailbox list
+    // and the (alias, target) routes, so an alias can never pair with anything
+    // but its own mailbox's parsed address.
+    let mut mailboxes = Vec::new();
+    let mut aliases = Vec::new();
+    for mailbox in &mail.mailboxes {
+        let target = match Address::parse(&mailbox.address) {
+            Ok(address) => address,
+            Err(error) => {
+                log(format!("a configured mailbox address does not parse ({error:?}) — mail is not running"));
+                return;
+            }
+        };
+        for alias in &mailbox.aliases {
+            match Address::parse(alias) {
+                Ok(alias) => aliases.push((alias, target.clone())),
+                Err(error) => {
+                    log(format!("a configured alias does not parse ({error:?}) — mail is not running"));
+                    return;
+                }
+            }
         }
-    };
+        mailboxes.push(target);
+    }
 
-    let maildir = match Maildir::open(&data_dir, &mailboxes) {
+    let maildir = match Maildir::open(&data_dir, &mailboxes, &aliases) {
         Ok(maildir) => maildir,
         Err(error) => {
             log(format!("could not open the mail store ({error}) — mail is not running"));
@@ -119,9 +129,28 @@ pub async fn run(config: Config, project_dir: PathBuf, store: CertificateStore) 
                     }
                 });
             }
-            other => log(format!(
-                "{other} on {address}: no network listener built for this yet — skipped"
-            )),
+            "imap" | "imaps" => {
+                let Some(listener) = bind(role, address).await else { continue };
+                let imap_config = IConfig {
+                    hostname: mail.hostname.clone(),
+                    tls_available: true,
+                    require_tls_for_auth: mail.require_tls_for_auth,
+                };
+                let imap = ImapServer {
+                    config: imap_config,
+                    store: maildir.clone(),
+                    authenticator: Arc::clone(&authenticator),
+                    tls: Some(Arc::clone(&tls_config)),
+                    implicit_tls: role == "imaps",
+                };
+                log(format!("{role} listening on {address}"));
+                tokio::spawn(async move {
+                    if let Err(error) = serve_imap(listener, imap).await {
+                        log(format!("{role}: listener stopped ({error})"));
+                    }
+                });
+            }
+            other => log(format!("{other} on {address}: unrecognised bind role — skipped")),
         }
     }
 
