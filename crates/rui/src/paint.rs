@@ -29,6 +29,7 @@ use crate::element::{El, Node};
 use crate::geom::{Insets, Point, Rect};
 use crate::input::{Drag, Input, Key, Phase, PointerButton};
 use crate::memory::{Caret, Id, Memory, Response};
+use crate::sdf::{Paint, Sculpt, Shape};
 use crate::style::{Align, Ink, Radius, Tone};
 use crate::text::{Fonts, TextStyle, grapheme};
 use crate::theme::Theme;
@@ -144,6 +145,31 @@ impl<'a> Painter<'a> {
         }
     }
 
+    /// Advances the looping value named `key`, and answers where it is.
+    ///
+    /// From zero to one and round again every `period` seconds. What
+    /// [`Painter::ease`] is to a value going somewhere, this is to one that
+    /// repeats: a sweep going round while a connection is being made, a lamp
+    /// pulsing while something wants attention. `key` names it within this
+    /// element exactly as it does there, so a drawing may have a sweep and a
+    /// pulse without the two sharing a number.
+    ///
+    /// A cycle has nowhere to arrive, so a frame that asks for one asks for
+    /// another frame. Ask for it only while the loop is what the interface is
+    /// *reporting* — motion that means nothing is a window that never idles.
+    ///
+    /// Outside a frame — a painter from [`Painter::new`] — there is nothing to
+    /// remember a position in, so this answers zero: an icon rendered to a file
+    /// is drawn at the start of its loop rather than somewhere in the middle of
+    /// one.
+    pub fn phase(&mut self, key: &str, period: f32) -> f32 {
+        let id = self.id.with(APPLICATION_EASING).with(key);
+        match &mut self.memory {
+            Some(memory) => memory.phase(id, period),
+            None => 0.0,
+        }
+    }
+
     /// The pixels being marked.
     pub fn canvas(&mut self) -> &mut Canvas {
         self.canvas
@@ -176,6 +202,17 @@ impl<'a> Painter<'a> {
         let color = self.color(tone);
         let corner = corner_of(radius, rect, self.theme);
         self.canvas.stroke(rect, corner, thickness, color);
+    }
+
+    /// Draws a composable signed-distance [`Shape`] in `paint`, read as `style`.
+    ///
+    /// The [`crate::sdf`] algebra reached from an application's own drawing: the
+    /// same [`Canvas::sculpt`] every sculpted shape is drawn with, so a hand-shaped
+    /// HUD frame animates and lights exactly as a built-in shape does.
+    ///
+    /// [`Canvas::sculpt`]: crate::canvas::Canvas::sculpt
+    pub fn sculpt(&mut self, shape: &Shape, paint: &Paint, style: Sculpt) {
+        self.canvas.sculpt(shape, paint, style);
     }
 
     /// Draws one line of text inside `rect`, cut short if it does not fit.
@@ -212,7 +249,7 @@ pub(crate) struct Hit {
     pub(crate) scroll: Option<Id>,
 }
 
-/// The name every value an application eases is kept under.
+/// The name every value an application eases or cycles is kept under.
 ///
 /// One step of its own between an element's identity and the caller's key, so
 /// that a drawing which eases something called `hover` cannot land on the value
@@ -490,6 +527,14 @@ fn decorate<S>(el: &El<S>, frame: &mut Frame<'_>, response: &Response, lit: f32)
         frame.canvas.shadow(cast, corner, blur, 0.0, shadow);
     }
 
+    // Over the shadow and under the fill: a halo is light thrown onto what is
+    // behind the element, and the element itself is drawn on top of it.
+    if let Some((blur, tone)) = style.glow {
+        // Cast from where the element is rather than offset downward — an even
+        // halo is what separates a glow from a shadow; see [`El::glow`].
+        frame.canvas.shadow(rect, corner, blur, 0.0, tone.resolve(theme));
+    }
+
     if let Some(fill) = style.fill {
         let top = surface(fill.resolve(theme), el, response, lit, theme);
         match style.fill_deep {
@@ -512,7 +557,11 @@ fn decorate<S>(el: &El<S>, frame: &mut Frame<'_>, response: &Response, lit: f32)
         frame.canvas.stroke(rect, corner, thickness, color);
     }
 
-    if response.focused && el.focusable {
+    // Only for focus the keyboard put there: a ring around what was just
+    // clicked repeats the click back at the person. A field is the exception —
+    // its caret earns the ring however focus arrived, and a well being typed
+    // into should look held either way.
+    if response.focused && el.focusable && (el.is_field() || frame.memory.focus_visible()) {
         let ring = rect.expand(Insets::uniform(FOCUS_OFFSET));
         let color = Tone::Focus.resolve(theme);
         frame.canvas.stroke(ring, corner.grown(FOCUS_OFFSET), FOCUS_THICKNESS, color);
@@ -633,8 +682,18 @@ fn field<'tree, S>(
     let mut text = value.to_owned();
     let editing = response.focused && !el.disabled;
     if editing {
+        let resting = caret;
         aim_caret(frame, &style, &text, &mut caret, response, inner.w);
         let edit = apply_edits(frame.input, frame.memory, &mut text, &mut caret);
+        // Any edit or caret move restarts the blink, so the caret holds solid
+        // while the person is typing — a mark mid-blink under active typing
+        // reads as the field dropping characters.
+        if edit.changed
+            || caret.offset != resting.offset
+            || caret.anchor != resting.anchor
+        {
+            frame.memory.reset_phase(el.id.with(CARET_BLINK_KEY));
+        }
         if edit.changed {
             if let Some(action) = &el.on_input {
                 let edited = text.clone();
@@ -655,7 +714,11 @@ fn field<'tree, S>(
     frame.memory.set_caret(el.id, caret);
 
     if text.is_empty() && !response.focused && frame.input.composition().is_none() {
-        let hint = style.colored(Tone::Muted.resolve(frame.theme));
+        // The idle ink, a step dimmer than muted: a placeholder is a hint
+        // about what could be typed, not a value that was, and drawn in the
+        // ink real text is read by it impersonates one — a blank field has to
+        // be unmistakably blank.
+        let hint = style.colored(Tone::Idle.resolve(frame.theme));
         draw_line(frame.canvas, frame.fonts, &hint, inner, Align::Start, placeholder, false);
         return;
     }
@@ -711,12 +774,22 @@ fn field<'tree, S>(
     frame.canvas.pop_clip(previous);
 
     if response.focused {
+        // The blink: lit for just over half of each turn, dark for the rest.
+        // The loop runs only while a field is focused — the blink *is* the
+        // report that typing has somewhere to land, which is what earns it the
+        // frames — and every edit resets it, so it holds solid under typing.
+        let lit =
+            frame.memory.phase(el.id.with(CARET_BLINK_KEY), CARET_BLINK_PERIOD) < CARET_BLINK_LIT;
         let caret_rect =
             Rect::new(inner.x + caret_x - shift, top, CARET_THICKNESS, line_height);
-        frame.canvas.fill_rect(caret_rect, Tone::Accent.resolve(frame.theme));
+        if lit {
+            frame.canvas.fill_rect(caret_rect, Tone::Accent.resolve(frame.theme));
+        }
         // What the platform's input method is told, so that a list of candidate
         // characters opens beside the text being composed. Reported from here
-        // because this is the one place that knows where the caret came out.
+        // because this is the one place that knows where the caret came out —
+        // and whether the blink has it lit this frame, because the caret is
+        // still *there* while it is dark.
         if editing {
             frame.memory.set_caret_area(caret_rect);
         }
@@ -725,6 +798,19 @@ fn field<'tree, S>(
 
 /// How wide the caret is drawn, in logical units.
 const CARET_THICKNESS: f32 = 1.5;
+
+/// How long one blink takes, lit and dark together, in seconds.
+const CARET_BLINK_PERIOD: f32 = 1.1;
+
+/// What share of each blink the caret is lit for.
+///
+/// Just over half, so the caret is present more than it is absent: the blink
+/// exists to catch the eye, not to make the insertion point a thing that has
+/// to be waited for.
+const CARET_BLINK_LIT: f32 = 0.55;
+
+/// The name the blink's loop is kept under, and reset under on every edit.
+const CARET_BLINK_KEY: &str = "caret";
 
 /// How much of a gap is kept between the caret and the right edge.
 const CARET_MARGIN: f32 = 2.0;
@@ -1149,6 +1235,18 @@ mod tests {
         let mut painter = Painter::new(&mut canvas, &fonts.fonts, &theme);
         assert_eq!(painter.ease("sweep", 0.75, 0.1), 0.75);
         assert_eq!(painter.ease("sweep", 0.25, 0.1), 0.25, "and it does not accumulate");
+    }
+
+    #[test]
+    fn a_painter_outside_a_frame_reports_a_loop_at_its_beginning() {
+        // An icon written to a file is not a frame of an animation: a loop with
+        // nowhere to be remembered is drawn where it starts.
+        let mut canvas = Canvas::new(16, 16, 1.0);
+        let fonts = crate::testing::test_fonts();
+        let theme =
+            Theme::new(crate::theme::Appearance::Dark, fonts.ui_font, fonts.mono_font);
+        let mut painter = Painter::new(&mut canvas, &fonts.fonts, &theme);
+        assert_eq!(painter.phase("sweep", 1.2), 0.0);
     }
 
     #[test]

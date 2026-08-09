@@ -56,6 +56,7 @@
 //! drawn as running by a widget that was not told.
 
 mod detail;
+mod exposure;
 mod install;
 mod style;
 
@@ -278,6 +279,10 @@ pub fn view(console: &Console) -> El<Console> {
         tunnel_banner(&snapshot).map(banner),
         snapshot.notice.clone().map(notice),
         bank(&snapshot),
+        // The exposure map is a full-width strip between the bank and the panes,
+        // and only when the firewall is managed — it returns `None` otherwise, so
+        // on the common unmanaged deployment it costs the log below it nothing.
+        exposure::view(snapshot.firewall.as_ref()),
         row((rail(&snapshot), pane(console, &snapshot)))
             .gap(8.0)
             .grow(),
@@ -786,7 +791,7 @@ fn upcoming(next: NextMove) -> El<Console> {
         col((
             // Wrapped, never cut: the headline is a countdown, and an
             // ellipsis lands exactly on the clause with the clock in it.
-            text(next.headline).text_size(13.5).color(style::state_ink(next.status)).wrap(),
+            style::emphatic(next.headline).color(style::state_ink(next.status)).wrap(),
             // The detail stays one line and truncates. Wrapping it was tried:
             // in a bank whose height is capped, the detail's second line is
             // taken from the headline's last — which on a narrow window is the
@@ -831,7 +836,12 @@ fn rail(snapshot: &Snapshot) -> El<Console> {
         .iter()
         .enumerate()
         .map(|(index, service)| {
-            service_row(index, service, snapshot.selected.as_deref() == Some(service.name.as_str()))
+            service_row(
+                index,
+                service,
+                snapshot.selected.as_deref() == Some(service.name.as_str()),
+                snapshot.requested(&service.name),
+            )
         })
         .collect();
 
@@ -891,11 +901,16 @@ fn rail(snapshot: &Snapshot) -> El<Console> {
 /// anyway — while a row whose outline has been switched on is what a selected
 /// channel looks like on an instrument. It does not glow: light here is
 /// stated by value, and the halo is kept for the marks that are waiting.
-fn service_row(index: usize, service: &ServiceStatus, chosen: bool) -> El<Console> {
+fn service_row(
+    index: usize,
+    service: &ServiceStatus,
+    chosen: bool,
+    requested: Option<&Command>,
+) -> El<Console> {
     let name = service.name.clone();
     let (status, _, _) = present(&service.state);
     let state_label = service.state.label().to_uppercase();
-    let summary = rail_summary(service);
+    let summary = rail_summary(service, requested);
 
     let row = row((
         style::wedge(chosen),
@@ -917,7 +932,7 @@ fn service_row(index: usize, service: &ServiceStatus, chosen: bool) -> El<Consol
                 // only then takes from the name. A troubled word is the
                 // exception argued at [`ALARM_UNIT`]: it keeps its words, and
                 // the name is the payer.
-                text(display_name(service)).grow_from_content().text_size(13.5),
+                style::emphatic(display_name(service)).grow_from_content(),
                 match status {
                     // Floored at the word's own width so it stands whole, and
                     // flush against the row's end so it sits where every other
@@ -967,15 +982,25 @@ fn service_row(index: usize, service: &ServiceStatus, chosen: bool) -> El<Consol
 
 /// What a rail row says under a service's name.
 ///
-/// A running service wears its restart count: `pid 4821 · up 2h` on a service
-/// that has crashed twelve times today reads as health, and the rail is where
-/// a flapping service has to be *noticed* — the detail pane states the count
-/// only after the row has already been chosen. Only a live service carries it;
-/// every troubled state's summary already accounts for its restarts in its own
-/// words, and a stopped service's count is history rather than a warning.
+/// While a command naming the service is still queued for the poller, the
+/// summary says the press was received — `stop requested…` — instead of a
+/// state the console already knows is about to be wrong. A pure function of
+/// the snapshot's own queue: no new state, and the words revert the frame the
+/// poller takes the command.
+///
+/// Otherwise, a running service wears its restart count: `pid 4821 · up 2h`
+/// on a service that has crashed twelve times today reads as health, and the
+/// rail is where a flapping service has to be *noticed* — the detail pane
+/// states the count only after the row has already been chosen. Only a live
+/// service carries it; every troubled state's summary already accounts for
+/// its restarts in its own words, and a stopped service's count is history
+/// rather than a warning.
 ///
 /// Pure, so the rule about who carries the count is asserted without a frame.
-fn rail_summary(service: &ServiceStatus) -> String {
+fn rail_summary(service: &ServiceStatus, requested: Option<&Command>) -> String {
+    if let Some(command) = requested {
+        return command.requested_message().to_owned();
+    }
     let (_, _, summary) = present(&service.state);
     match service.total_restarts {
         0 => summary,
@@ -1130,17 +1155,27 @@ mod tests {
     fn only_a_live_service_wears_its_restart_count_in_the_rail() {
         let snapshot = populated();
         let running = &snapshot.services[0];
-        assert!(rail_summary(running).ends_with("· 3 restarts"), "a live flapper says so");
+        assert!(rail_summary(running, None).ends_with("· 3 restarts"), "a live flapper says so");
 
         let backoff = &snapshot.services[2];
         assert!(
-            !rail_summary(backoff).contains("restarts"),
+            !rail_summary(backoff, None).contains("restarts"),
             "a troubled state's own words already account for its restarts"
         );
 
         let mut quiet = running.clone();
         quiet.total_restarts = 0;
-        assert!(!rail_summary(&quiet).contains("restart"), "a clean service says nothing");
+        assert!(!rail_summary(&quiet, None).contains("restart"), "a clean service says nothing");
+    }
+
+    #[test]
+    fn a_queued_press_is_acknowledged_in_the_row_before_the_poll_answers() {
+        // Pure function of the snapshot's queue: the row says the press was
+        // received, and says the state again the frame the poller takes it.
+        let snapshot = populated();
+        let stop = Command::Stop("mongod".into());
+        assert_eq!(rail_summary(&snapshot.services[0], Some(&stop)), "stop requested…");
+        assert!(rail_summary(&snapshot.services[0], None).starts_with("pid"), "and reverts");
     }
 
     #[test]
@@ -1177,7 +1212,7 @@ mod tests {
         // ordinary function of the console, so it is tested without a frame,
         // a pointer, or a window.
         let mut console = console(populated());
-        let row = service_row(0, &console.snapshot().services[0].clone(), false);
+        let row = service_row(0, &console.snapshot().services[0].clone(), false, None);
         (row.click_action().expect("a row is clickable"))(&mut console);
         assert_eq!(console.snapshot().selected.as_deref(), Some("mongod"));
     }
@@ -1188,7 +1223,7 @@ mod tests {
         // half of choosing is tested the same way the pointer's half is: no
         // frame, no window, no synthetic keystroke.
         let mut console = console(populated());
-        let row = service_row(0, &console.snapshot().services[0].clone(), false);
+        let row = service_row(0, &console.snapshot().services[0].clone(), false, None);
         let keys = row.key_action().expect("a row listens to the keyboard");
 
         keys(&mut console, Key::Down, rui::Modifiers::NONE);
@@ -1498,6 +1533,7 @@ mod tests {
             spec
         }));
         snapshot.logs.service = "levelup-api".into();
+        snapshot.logs.answered = true;
         snapshot.logs.lines = (0..24)
             .map(|seq| crate::state::LogLine {
                 seq,

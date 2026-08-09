@@ -65,6 +65,21 @@ fn fnv1a(seed: u64, bytes: &[u8]) -> u64 {
     hash
 }
 
+/// How the keyboard's attention came to be where it is.
+///
+/// What decides whether a focus ring is drawn. A pointer press puts focus
+/// where the pointer already is, so a ring there tells the person nothing they
+/// did not just do — but focus that arrived from the keyboard is invisible
+/// without one. See [`Memory::focus_visible`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum FocusSource {
+    /// A pointer press put focus here.
+    #[default]
+    Pointer,
+    /// Tab, or another key stepping focus, put it here.
+    Keyboard,
+}
+
 /// What an element's interaction amounted to this frame.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Response {
@@ -162,6 +177,16 @@ struct Eased {
     seen: u64,
 }
 
+/// How far round its period a looping value has got, and when it was last asked
+/// for.
+#[derive(Debug, Clone, Copy)]
+struct Cycle {
+    /// From zero to one, wrapping.
+    value: f32,
+    /// The frame it was last asked for, so cycles nothing draws are dropped.
+    seen: u64,
+}
+
 /// How close to its target a value has to get before it is called settled.
 ///
 /// Exponential easing approaches its target without ever arriving, so without a
@@ -175,6 +200,8 @@ const SETTLED: f32 = 0.001;
 pub struct Memory {
     active: Option<Id>,
     focus: Option<Id>,
+    /// How focus last moved, which is what decides whether it is ringed.
+    focus_source: FocusSource,
     scroll: HashMap<Id, f32>,
     content_height: HashMap<Id, f32>,
     carets: HashMap<Id, Caret>,
@@ -184,6 +211,8 @@ pub struct Memory {
     pending_focus_step: i32,
     /// Where each animated value has got to.
     eased: HashMap<Id, Eased>,
+    /// How far round its period each looping value has got.
+    cycles: HashMap<Id, Cycle>,
     /// How long the frame being drawn represents, in seconds.
     delta: f32,
     /// Which frame is being drawn, for dropping values nothing draws any more.
@@ -243,7 +272,19 @@ impl Memory {
     /// Notes that an element is being pressed, and gives it the keyboard.
     pub(crate) fn press(&mut self, id: Id) {
         self.active = Some(id);
+        self.focus_source = FocusSource::Pointer;
         self.set_focus(Some(id));
+    }
+
+    /// Whether what holds the keyboard should wear the focus ring.
+    ///
+    /// True only when focus last moved by key. A ring around what was just
+    /// clicked repeats the click back at the person, while keyboard focus is
+    /// invisible without one — so the ring is drawn for the second and not the
+    /// first. A field is the one exception, and the drawing makes it: a caret
+    /// justifies the ring however focus arrived.
+    pub fn focus_visible(&self) -> bool {
+        self.focus_source == FocusSource::Keyboard
     }
 
     /// Enters an element into this frame's tab order.
@@ -431,6 +472,46 @@ impl Memory {
         entry.value
     }
 
+    /// Advances the looping value held under `id`, and answers where it is.
+    ///
+    /// From zero to one and round again every `period` seconds: what a rotating
+    /// sweep, a pulse, or anything else that repeats is driven from. The step is
+    /// the frame's own elapsed time over the period, so a loop takes as long on
+    /// a slow machine as on a quick one, exactly as [`Memory::ease`] does.
+    ///
+    /// # It never settles, so ask for it only while it should be moving
+    ///
+    /// An eased value arrives and the interface goes back to sleep. A cycle has
+    /// nowhere to arrive, so every frame that asks for one asks for another
+    /// frame — which is right when the loop *is* the report (a sweep saying a
+    /// connection is being made, a pulse saying something wants attention) and
+    /// is a window that never idles when it is not. Draw it while the state is
+    /// in flux and stop asking when it is not.
+    ///
+    /// A period of zero or less has no length to divide by and holds at zero,
+    /// without keeping the loop awake.
+    pub fn phase(&mut self, id: Id, period: f32) -> f32 {
+        if period <= 0.0 || !period.is_finite() {
+            return 0.0;
+        }
+        let frame = self.frame;
+        let cycle = self.cycles.entry(id).or_insert(Cycle { value: 0.0, seen: frame });
+        cycle.seen = frame;
+        cycle.value = (cycle.value + self.delta / period).fract();
+        self.animating = true;
+        cycle.value
+    }
+
+    /// Restarts the looping value held under `id` from the top of its turn.
+    ///
+    /// What a caret's blink is reset by on every edit, so the mark holds solid
+    /// while the typing it reports is still happening. Forgetting the entry is
+    /// enough: the next ask starts a fresh turn at zero, exactly as a loop
+    /// being seen for the first time does.
+    pub(crate) fn reset_phase(&mut self, id: Id) {
+        self.cycles.remove(&id);
+    }
+
     /// Settles the frame's interaction state.
     ///
     /// A press is released here rather than where it was drawn, so that letting
@@ -469,6 +550,9 @@ impl Memory {
         // where it was when it left.
         let frame = self.frame;
         self.eased.retain(|_, eased| eased.seen == frame);
+        // And for looping ones, which is what stops a sweep resuming half way
+        // round when whatever it belonged to comes back on screen.
+        self.cycles.retain(|_, cycle| cycle.seen == frame);
 
         // What the pointer was over is now what it *was* over. Anything this
         // frame did not draw is simply not in the new set.
@@ -488,6 +572,7 @@ impl Memory {
     /// and only the finished frame knows the full order.
     pub(crate) fn step_focus(&mut self, step: i32) {
         self.pending_focus_step = step;
+        self.focus_source = FocusSource::Keyboard;
     }
 }
 
@@ -508,6 +593,39 @@ mod tests {
         let parent = Id::new("panel");
         assert_ne!(parent, parent.with("button"));
         assert_ne!(parent, parent.index(0));
+    }
+
+    #[test]
+    fn focus_from_a_press_is_not_ringed_and_focus_from_the_keyboard_is() {
+        // The two routes to the keyboard, told apart: a click already showed
+        // the person where they aimed, and Tab showed them nothing.
+        let mut memory = Memory::new();
+        memory.press(Id::new("button"));
+        assert!(!memory.focus_visible(), "a click is its own confirmation");
+
+        memory.offer_focus(Id::new("button"));
+        memory.step_focus(1);
+        memory.end_frame(&Input::new());
+        assert!(memory.focus_visible(), "keyboard focus is invisible without the ring");
+
+        memory.press(Id::new("button"));
+        assert!(!memory.focus_visible(), "the next click takes the ring back off");
+    }
+
+    #[test]
+    fn a_reset_loop_starts_its_turn_again_from_the_top() {
+        let mut memory = Memory::new();
+        let id = Id::new("caret");
+        for _ in 0..30 {
+            stepped(&mut memory, 1.0 / 60.0);
+            memory.phase(id, 1.0);
+        }
+        assert!(memory.phase(id, 1.0) > 0.3, "the loop has travelled");
+
+        memory.reset_phase(id);
+        stepped(&mut memory, 1.0 / 60.0);
+        let restarted = memory.phase(id, 1.0);
+        assert!(restarted < 0.05, "expected a fresh turn, got {restarted}");
     }
 
     #[test]
@@ -660,6 +778,101 @@ mod tests {
         memory.end_frame(&Input::new());
         assert_eq!(memory.eased.len(), 1);
         assert!(memory.eased.contains_key(&Id::new("row-2")));
+    }
+
+    #[test]
+    fn a_looping_value_advances_by_the_time_the_frame_took() {
+        let mut memory = Memory::new();
+        let id = Id::new("sweep");
+
+        // A tenth of a second of a one-second loop is a tenth of the way round.
+        for _ in 0..6 {
+            stepped(&mut memory, 1.0 / 60.0);
+            memory.phase(id, 1.0);
+        }
+        let after = memory.phase(id, 1.0);
+        assert!((after - 0.1).abs() < 0.02, "expected about a tenth round, got {after}");
+    }
+
+    #[test]
+    fn a_looping_value_wraps_rather_than_running_away() {
+        let mut memory = Memory::new();
+        let id = Id::new("sweep");
+        for _ in 0..300 {
+            stepped(&mut memory, 1.0 / 60.0);
+            let phase = memory.phase(id, 0.5);
+            assert!((0.0..1.0).contains(&phase), "a phase left its own turn: {phase}");
+        }
+    }
+
+    #[test]
+    fn a_loop_takes_as_long_on_a_slow_machine_as_on_a_quick_one() {
+        // The same reasoning easing rests on: a machine drawing half as many
+        // frames must turn the sweep at the same speed, only less smoothly.
+        let travelled = |frames: u32, seconds: f32| {
+            let mut memory = Memory::new();
+            let id = Id::new("sweep");
+            for _ in 0..frames {
+                stepped(&mut memory, seconds);
+                memory.phase(id, 2.0);
+            }
+            memory.phase(id, 2.0)
+        };
+
+        let fast = travelled(40, 1.0 / 120.0);
+        let slow = travelled(20, 1.0 / 60.0);
+        assert!((fast - slow).abs() < 0.01, "{fast} and {slow} should agree after equal time");
+    }
+
+    #[test]
+    fn a_loop_keeps_asking_for_frames_because_it_never_arrives() {
+        // The difference from easing, stated: a cycle has nowhere to settle, so
+        // drawing one is asking for the next frame — which is why it is only
+        // drawn while the loop is what the interface is reporting.
+        let mut memory = Memory::new();
+        stepped(&mut memory, 1.0 / 60.0);
+        memory.phase(Id::new("sweep"), 1.2);
+        assert!(memory.is_animating());
+    }
+
+    #[test]
+    fn a_period_of_nothing_holds_still_and_lets_the_window_sleep() {
+        let mut memory = Memory::new();
+        stepped(&mut memory, 1.0 / 60.0);
+        assert_eq!(memory.phase(Id::new("sweep"), 0.0), 0.0);
+        assert!(!memory.is_animating(), "a loop with no period must not spin the loop");
+    }
+
+    #[test]
+    fn two_loops_run_at_their_own_periods() {
+        let mut memory = Memory::new();
+        let (sweep, pulse) = (Id::new("sweep"), Id::new("pulse"));
+        for _ in 0..20 {
+            stepped(&mut memory, 1.0 / 60.0);
+            memory.phase(sweep, 1.0);
+            memory.phase(pulse, 4.0);
+        }
+        assert!(
+            memory.phase(sweep, 1.0) > memory.phase(pulse, 4.0),
+            "the quicker loop should be further round than the slower one"
+        );
+    }
+
+    #[test]
+    fn loops_nothing_draws_any_more_are_forgotten() {
+        // So a sweep that scrolled away starts at its beginning when it comes
+        // back rather than resuming half way round.
+        let mut memory = Memory::new();
+        stepped(&mut memory, 1.0 / 60.0);
+        memory.phase(Id::new("row-1"), 1.0);
+        memory.end_frame(&Input::new());
+        assert_eq!(memory.cycles.len(), 1);
+
+        stepped(&mut memory, 1.0 / 60.0);
+        memory.phase(Id::new("row-2"), 1.0);
+        memory.end_frame(&Input::new());
+        assert_eq!(memory.cycles.len(), 1);
+        assert!(memory.cycles.contains_key(&Id::new("row-2")));
     }
 
     #[test]

@@ -122,7 +122,13 @@ pub const THEATRE: Palette = Palette {
     // The hairline every panel is outlined in: a neutral grey. Structure is
     // never lit — light is spent on what is chosen, and an edge is not chosen.
     border: Color::rgb(0x24, 0x27, 0x2b),
-    border_focus: Color::rgb(0xf2, 0xf5, 0xf6),
+    // The keyboard's ring, in the deep accent rather than the accent itself:
+    // focus and selection are two facts, and a palette that draws both in one
+    // light cannot say which row is chosen and which merely holds the
+    // keyboard. A step down in value keeps it plainly a ring — still over
+    // three times brighter than the surface it rings — while the full accent
+    // stays what it was: the mark of what is chosen.
+    border_focus: Color::rgb(0xb8, 0xc0, 0xc5),
     text: Color::rgb(0xe9, 0xec, 0xee),
     text_muted: Color::rgb(0x70, 0x78, 0x7e),
     text_on_accent: Color::rgb(0x0a, 0x0b, 0x0d),
@@ -373,6 +379,30 @@ fn sheen<S>() -> El<S> {
         );
     })
     .layer(Anchor::Over)
+}
+
+/// How big a line that leads its row is set; see [`emphatic`].
+const EMPHATIC: f32 = 13.5;
+
+/// How big a state's word is set: the smallest capitals on screen, a step
+/// under the caption — quiet type for a fact the lamp beside it already
+/// carries. See [`state_word`].
+const STATE_WORD: f32 = 10.5;
+
+/// How big a reading's value is set: between the label's micro capitals and
+/// the body, so a figure reads as evidence cited under the sentence rather
+/// than as a headline of its own. See [`reading`].
+const READING_VALUE: f32 = 12.5;
+
+/// A line that leads its row: a half-step above the body, well short of a
+/// heading.
+///
+/// Spent on exactly two lines — a service's name in the rail and the next
+/// move's headline — the two places a row's first words have to be found
+/// before the quieter type around them. One mark, so the two cannot come to
+/// lead at two different sizes.
+pub fn emphatic<S>(label: impl Into<String>) -> El<S> {
+    text(label).text_size(EMPHATIC)
 }
 
 /// The ink a state's own word is set in.
@@ -867,7 +897,7 @@ pub fn section_rule_control<S>(label: &'static str, control: El<S>) -> El<S> {
 /// one word, and on a narrow rail that chrome takes the room the service's own
 /// name needs — and the name is the part that tells one row from another.
 pub fn state_word<S>(status: Status, label: String) -> El<S> {
-    text(label).text_size(10.5).tracking(0.4).color(state_ink(status))
+    text(label).text_size(STATE_WORD).tracking(0.4).color(state_ink(status))
 }
 
 /// One count cited under the condition: what is being counted, and the count.
@@ -893,7 +923,7 @@ pub fn reading<S>(label: &'static str, value: String, alarm: Option<Status>) -> 
         micro(label).tracking(1.2),
         text(value)
             .mono()
-            .text_size(12.5)
+            .text_size(READING_VALUE)
             .color(alarm.map_or(Tone::Text, Tone::ink)),
     ))
     .gap(6.0)
@@ -966,6 +996,39 @@ mod tests {
             accent.r.max(accent.g).max(accent.b) - accent.r.min(accent.g).min(accent.b);
         assert!(spread < 8, "an accent with a hue is a paint, not a light");
         assert!(accent.luminance() > THEATRE.text.luminance(), "lit means brighter than ink");
+    }
+
+    #[test]
+    fn keyboard_focus_and_selection_are_two_facts_with_two_marks() {
+        // A focused row and the chosen row can be different rows, and a
+        // palette whose ring and selection hairline are one colour cannot say
+        // so. The ring is the deep accent — no new colour — and it still has
+        // to read as a boundary against the surface it rings.
+        assert_ne!(THEATRE.border_focus, THEATRE.accent, "focus must not wear selection's light");
+        assert_eq!(THEATRE.border_focus, THEATRE.accent_deep, "the ring is the deep accent");
+        assert!(THEATRE.border_focus.contrast_ratio(THEATRE.surface) >= 3.0);
+    }
+
+    #[test]
+    fn the_palette_holds_the_librarys_own_legibility_law() {
+        // The same battery the library runs over its own palettes, so THEATRE
+        // cannot silently regress a pairing the library already guards.
+        THEATRE.assert_legible("THEATRE");
+    }
+
+    #[test]
+    fn the_type_marks_are_the_sizes_the_window_was_tuned_at() {
+        // The ramp lives here as named marks so a size cannot drift in one
+        // place without the others; these hold the marks where they stand.
+        let lead: El<Nothing> = emphatic("mongod");
+        assert_eq!(lead.style().ink.size, Some(EMPHATIC));
+
+        let word: El<Nothing> = state_word(Status::Ok, "RUNNING".into());
+        assert_eq!(word.style().ink.size, Some(STATE_WORD));
+
+        let cited: El<Nothing> = reading("RUNNING", "2/4".into(), None);
+        let value = cited.child(1).expect("the value beside the label");
+        assert_eq!(value.style().ink.size, Some(READING_VALUE));
     }
 
     #[test]

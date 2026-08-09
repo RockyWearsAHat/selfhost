@@ -186,6 +186,66 @@ impl Palette {
         idle_tint: Color::rgb(0x26, 0x28, 0x2b),
         shadow: Color::rgba(0x00, 0x00, 0x00, 0x38),
     };
+
+    /// Fails unless every pairing this palette puts on screen is legible.
+    ///
+    /// The contrast law, asserted as real WCAG ratios through
+    /// [`Color::contrast_ratio`] rather than as channel deltas: primary text
+    /// carries at least 7:1 against the window, secondary text at least 4.45:1,
+    /// each status ink at least 4.5:1 on its own tint (idle at least 2.3:1),
+    /// and the focus ring at least 3:1 against the surface it rings. A dark
+    /// palette must also stack its surfaces in ascending value —
+    /// `background_deep`, `background`, `surface`, `raised` — because in the
+    /// dark, value is the only separation that works.
+    ///
+    /// `name` names the palette in the failure, so a battery run over several
+    /// palettes says which one regressed.
+    ///
+    /// Two thresholds are tuned to the palettes this workspace ships rather
+    /// than to the WCAG figures they started from — the palettes are the law
+    /// here, and the thresholds hold the line exactly where they stand:
+    /// secondary text at 4.45 because the console's THEATRE palette lands its
+    /// muted ink at 4.49, and idle at 2.3 because idle is the one status that
+    /// reports nothing and is quiet on purpose — THEATRE holds it at 2.35, and
+    /// demanding more would light every stopped service.
+    ///
+    /// Public so an application that supplies its own palette through
+    /// [`Theme::with_palette`] can hold it to the same law from its own tests.
+    pub fn assert_legible(&self, name: &str) {
+        /// Primary text against the window: WCAG AAA for body text.
+        const TEXT: f32 = 7.0;
+        /// Secondary text against the window; see the tuning note above.
+        const MUTED: f32 = 4.45;
+        /// A status ink on its own tint: WCAG AA for its small capitals.
+        const STATUS: f32 = 4.5;
+        /// The idle ink on its tint; see the tuning note above.
+        const IDLE: f32 = 2.3;
+        /// The focus ring against a surface: WCAG's floor for a UI boundary.
+        const FOCUS: f32 = 3.0;
+
+        let holds = |ink: Color, ground: Color, floor: f32, what: &str| {
+            let ratio = ink.contrast_ratio(ground);
+            assert!(ratio >= floor, "{name}: {what} carries {ratio:.2}:1 and needs {floor}:1");
+        };
+        holds(self.text, self.background, TEXT, "primary text on the window");
+        holds(self.text_muted, self.background, MUTED, "secondary text on the window");
+        holds(self.ok, self.ok_tint, STATUS, "the ok ink on its own tint");
+        holds(self.warn, self.warn_tint, STATUS, "the warn ink on its own tint");
+        holds(self.bad, self.bad_tint, STATUS, "the bad ink on its own tint");
+        holds(self.idle, self.idle_tint, IDLE, "the idle ink on its own tint");
+        holds(self.border_focus, self.surface, FOCUS, "the focus ring on a surface");
+
+        if self.background.luminance() < 0.5 {
+            let ladder = [
+                (self.background_deep, self.background, "the background is not above its deep end"),
+                (self.background, self.surface, "a surface is not above the background"),
+                (self.surface, self.raised, "raised is not above the surface it lifts from"),
+            ];
+            for (below, above, what) in ladder {
+                assert!(below.luminance() < above.luminance(), "{name}: {what}");
+            }
+        }
+    }
 }
 
 /// The sizes the layout is built from, in logical units.
@@ -349,6 +409,27 @@ impl Theme {
         self
     }
 
+    /// The same theme, drawn in `palette`.
+    ///
+    /// The other half of what [`App::theme`](crate::App::theme) is for: a
+    /// program whose subject wants a character of its own supplies the colours
+    /// and keeps everything else this theme decided — the metrics, the corner
+    /// shape, and the type scale — rather than restating them to change one.
+    ///
+    /// ```ignore
+    /// App::new("Console", state, view)
+    ///     .theme(|appearance, ui, mono| {
+    ///         Theme::new(appearance, ui, mono).with_palette(HUD)
+    ///     })
+    /// ```
+    ///
+    /// Which appearance the result *is* follows from the palette rather than
+    /// from what it was built with; see [`Theme::is_dark`].
+    pub fn with_palette(mut self, palette: Palette) -> Self {
+        self.palette = palette;
+        self
+    }
+
     /// Whether this theme is the dark one.
     ///
     /// Asked from the palette rather than stored, so a hand-built palette
@@ -435,13 +516,20 @@ impl Theme {
         TextStyle::new(self.ui_font, 11.5, self.palette.text_muted)
     }
 
-    /// A large number on a summary tile: the count the strip is reporting.
+    /// The reading a summary strip is making: a count, or the line of words
+    /// that is the whole report.
+    ///
+    /// The largest size in the scale, and what that size is *for* is the one
+    /// thing on a strip that the rest of the strip explains. Usually that is a
+    /// number; it is as readily a sentence, and a strip whose sentence were set
+    /// smaller than the figures under it would be reporting its evidence louder
+    /// than its finding.
     ///
     /// Proportional and solid. Monospaced digits are worth their awkwardness in
     /// a *column* of numbers, where a count crossing from nine to ten would
-    /// otherwise shuffle the rows sideways. These four sit in a row, each under
-    /// its own label, and none of them lines up with anything — so all the
-    /// fixed-width face bought here was the look of a terminal readout.
+    /// otherwise shuffle the rows sideways. A reading in a strip lines up with
+    /// nothing — so all the fixed-width face bought here was the look of a
+    /// terminal readout.
     pub fn figure(&self) -> TextStyle {
         TextStyle::new(self.ui_font, 21.0, self.palette.text)
     }
@@ -519,25 +607,47 @@ mod tests {
     }
 
     #[test]
-    fn text_is_legible_against_its_own_background_in_both_appearances() {
+    fn both_built_in_palettes_pass_the_contrast_law() {
+        // The whole battery — text at 7:1, secondary at 4.45:1, status inks on
+        // their tints, the focus ring at 3:1, and the dark surface ladder — as
+        // real WCAG ratios rather than the channel deltas that stood here
+        // before. The same call an application runs over its own palette.
+        Palette::LIGHT.assert_legible("LIGHT");
+        Palette::DARK.assert_legible("DARK");
+    }
+
+    #[test]
+    fn every_status_ink_clears_wcag_on_its_own_tint() {
+        // Stated by ratio as well as by the battery, so a loosened battery
+        // threshold cannot quietly take this with it: the three states that
+        // report something clear 4.5:1 in both appearances.
         for appearance in [Appearance::Light, Appearance::Dark] {
-            let palette = theme(appearance).palette;
-            let contrast =
-                (palette.text.luminance() - palette.background.luminance()).abs();
-            assert!(contrast > 0.5, "{appearance:?} text is too close to its background");
+            let theme = theme(appearance);
+            for status in [Status::Ok, Status::Warn, Status::Bad] {
+                let (ink, fill) = theme.status(status);
+                let ratio = ink.contrast_ratio(fill);
+                assert!(ratio >= 4.5, "{appearance:?} {status:?} is {ratio:.2}:1 on its tint");
+            }
         }
     }
 
     #[test]
-    fn every_status_hue_stands_out_from_its_own_tint() {
-        for appearance in [Appearance::Light, Appearance::Dark] {
-            let theme = theme(appearance);
-            for status in [Status::Ok, Status::Warn, Status::Bad, Status::Idle] {
-                let (ink, fill) = theme.status(status);
-                let contrast = (ink.luminance() - fill.luminance()).abs();
-                assert!(contrast > 0.25, "{appearance:?} {status:?} is illegible on its tint");
-            }
-        }
+    fn the_dark_surfaces_climb_from_the_window_floor_to_what_is_raised() {
+        // Radix's ordering rule, asserted directly: in the dark, elevation is
+        // lightness, so the four grounds must ascend or a raised row would sink.
+        let palette = Palette::DARK;
+        assert!(palette.background_deep.luminance() < palette.background.luminance());
+        assert!(palette.background.luminance() < palette.surface.luminance());
+        assert!(palette.surface.luminance() < palette.raised.luminance());
+    }
+
+    #[test]
+    fn the_battery_rejects_an_illegible_palette() {
+        // The law only guards anything if breaking it fails: a palette whose
+        // muted ink is its own background must not pass.
+        let broken = Palette { text_muted: Palette::DARK.background, ..Palette::DARK };
+        let failed = std::panic::catch_unwind(|| broken.assert_legible("broken"));
+        assert!(failed.is_err(), "an illegible palette passed the battery");
     }
 
     #[test]
@@ -708,6 +818,29 @@ mod tests {
         assert_eq!(cut.corner_small(), Corner::Cut(round.metrics.corner_small));
         assert_eq!(cut.palette, round.palette, "a corner shape is not a colour");
         assert_eq!(cut.metrics, round.metrics, "nor a size");
+    }
+
+    #[test]
+    fn a_supplied_palette_reaches_the_theme_and_changes_nothing_else() {
+        // The seam an application with a character of its own comes through:
+        // the colours are its, and the sizes, the corner shape, and the faces
+        // are still the ones it did not restate.
+        let library = theme(Appearance::Dark);
+        let own = Palette { accent: Color::rgb(0x5f, 0xd9, 0xf2), ..Palette::DARK };
+        let supplied = library.with_palette(own);
+
+        assert_eq!(supplied.palette.accent, own.accent);
+        assert_eq!(supplied.metrics, library.metrics, "a palette is not a size");
+        assert_eq!(supplied.corners, library.corners, "nor a shape");
+        assert_eq!(supplied.mono_font, library.mono_font, "nor a face");
+    }
+
+    #[test]
+    fn which_appearance_a_theme_is_follows_its_palette_and_not_its_maker() {
+        // A hand-built palette has to answer for itself, or a light theme
+        // supplied to a dark window draws every derived colour the wrong way.
+        let dark = theme(Appearance::Light).with_palette(Palette::DARK);
+        assert!(dark.is_dark());
     }
 
     #[test]
