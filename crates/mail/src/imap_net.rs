@@ -40,6 +40,7 @@ use crate::imap::{
 use crate::store::{Flags as StoreFlags, Folder, Maildir, StoreError, Uid};
 use crate::submission::Authenticator;
 use std::io;
+use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::SystemTime;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
@@ -73,38 +74,84 @@ pub struct ImapServer {
 pub async fn serve_imap(listener: TcpListener, server: ImapServer) -> io::Result<()> {
     let server = Arc::new(server);
     loop {
-        let (stream, _peer) = listener.accept().await?;
+        let (stream, peer) = listener.accept().await?;
         let server = Arc::clone(&server);
         tokio::spawn(async move {
-            let _ = handle_connection(stream, server).await;
+            let _ = handle_connection(stream, peer, server).await;
         });
     }
+}
+
+/// One `[imap]`-tagged line into the daemon's log stream.
+///
+/// Only connection events, command verbs, and server-authored response lines
+/// are ever logged. Command *arguments* never are — `LOGIN` carries the
+/// password as an argument and a SASL continuation line is nothing but
+/// credentials — which is why client lines pass through [`command_summary`]
+/// first. This exists because a mail client's failure report ("unable to
+/// verify") says nothing about which step died; the log does.
+fn log_imap(peer: SocketAddr, message: impl AsRef<str>) {
+    eprintln!("[imap] {peer} {}", message.as_ref());
+}
+
+/// The loggable form of one client line: its tag and uppercased verb, with the
+/// argument tail dropped (see [`log_imap`] for why the tail must never leak).
+fn command_summary(line: &str) -> String {
+    let mut tokens = line.split_whitespace();
+    let tag = tokens.next().unwrap_or("");
+    let verb = tokens.next().unwrap_or("").to_ascii_uppercase();
+    format!("{tag} {verb}").trim().to_owned()
+}
+
+/// Writes responses to the client, logging the last one — the tagged status
+/// line, which is the part that tells an operator how the command ended.
+async fn send<S>(peer: SocketAddr, stream: &mut S, responses: &[IResponse]) -> io::Result<()>
+where
+    S: AsyncWrite + Unpin,
+{
+    if let Some(last) = responses.last() {
+        let text: String = last.text().trim_end().chars().take(96).collect();
+        log_imap(peer, format!("<< {text}"));
+    }
+    write_responses(stream, responses).await
 }
 
 /// Drives one connection: the implicit-TLS handshake (`:993`) or the
 /// cleartext greeting and optional `STARTTLS` upgrade (`:143`), then commands
 /// until the client logs out or the connection closes.
-async fn handle_connection(stream: TcpStream, server: Arc<ImapServer>) -> io::Result<()> {
+async fn handle_connection(
+    stream: TcpStream,
+    peer: SocketAddr,
+    server: Arc<ImapServer>,
+) -> io::Result<()> {
     let mut session = ISession::new(server.config.clone());
 
     if server.implicit_tls {
         let Some(tls) = server.tls.clone() else { return Ok(()) };
+        log_imap(peer, "connected (implicit TLS)");
         let mut tls_stream = TlsAcceptor::from(tls).accept(stream).await?;
         session.tls_established();
         tls_stream.write_all(session.greeting().to_wire()).await?;
-        let _ = converse(&mut tls_stream, &mut session, &server).await?;
+        let _ = converse(&mut tls_stream, peer, &mut session, &server).await?;
+        log_imap(peer, "closed");
         return Ok(());
     }
 
     let mut stream = stream;
+    log_imap(peer, "connected (cleartext, STARTTLS offered)");
     stream.write_all(session.greeting().to_wire()).await?;
-    match converse(&mut stream, &mut session, &server).await? {
-        Flow::Done => Ok(()),
+    match converse(&mut stream, peer, &mut session, &server).await? {
+        Flow::Done => {
+            log_imap(peer, "closed");
+            Ok(())
+        }
         Flow::StartTls => {
             let Some(tls) = server.tls.clone() else { return Ok(()) };
             let mut tls_stream = TlsAcceptor::from(tls).accept(stream).await?;
             session.tls_established();
-            let _ = converse(&mut tls_stream, &mut session, &server).await?;
+            log_imap(peer, "TLS established via STARTTLS");
+            let _ = converse(&mut tls_stream, peer, &mut session, &server).await?;
+            log_imap(peer, "closed");
             Ok(())
         }
     }
@@ -123,7 +170,12 @@ enum Flow {
 /// Generic over the transport so the identical loop runs on plaintext and TLS
 /// and can be driven by an in-memory duplex in tests, matching
 /// `submission.rs`'s `converse`.
-async fn converse<S>(stream: &mut S, session: &mut ISession, server: &ImapServer) -> io::Result<Flow>
+async fn converse<S>(
+    stream: &mut S,
+    peer: SocketAddr,
+    session: &mut ISession,
+    server: &ImapServer,
+) -> io::Result<Flow>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
@@ -137,52 +189,59 @@ where
             return Ok(Flow::Done);
         }
 
+        if session.awaiting_secret() {
+            log_imap(peer, ">> <sasl credentials line>");
+        } else {
+            log_imap(peer, format!(">> {}", command_summary(&line)));
+        }
+
         match session.command(&line) {
-            IAction::Respond(responses) => write_responses(reader.get_mut(), &responses).await?,
+            IAction::Respond(responses) => send(peer, reader.get_mut(), &responses).await?,
             IAction::StartTls(response) => {
                 // A command already pipelined ahead of the handshake would be
                 // plaintext smuggled under the coming TLS session — the same
                 // STARTTLS injection flaw `submission.rs` guards against.
                 if !reader.buffer().is_empty() {
-                    write_responses(
+                    send(
+                        peer,
                         reader.get_mut(),
                         &[IResponse::untagged("BAD pipelining after STARTTLS is not allowed")],
                     )
                     .await?;
                     return Ok(Flow::Done);
                 }
-                write_responses(reader.get_mut(), &[response]).await?;
+                send(peer, reader.get_mut(), &[response]).await?;
                 return Ok(Flow::StartTls);
             }
             IAction::Login { tag, username, password } => {
                 let authenticated = server.authenticator.verify(&username, &password);
                 let responses = session.login_result(&tag, authenticated);
-                write_responses(reader.get_mut(), &responses).await?;
+                send(peer, reader.get_mut(), &responses).await?;
             }
             IAction::Select { tag, mailbox, read_only } => {
                 let responses = match select_or_status_data(server, session, &mailbox).await {
                     Ok(data) => session.select_result(&tag, &mailbox, read_only, data),
                     Err(reason) => vec![IResponse::tagged(&tag, Status::No, reason)],
                 };
-                write_responses(reader.get_mut(), &responses).await?;
+                send(peer, reader.get_mut(), &responses).await?;
             }
             IAction::Status { tag, mailbox, items } => {
                 let responses = match select_or_status_data(server, session, &mailbox).await {
                     Ok(data) => session.status_result(&tag, &mailbox, &items, &data),
                     Err(reason) => vec![IResponse::tagged(&tag, Status::No, reason)],
                 };
-                write_responses(reader.get_mut(), &responses).await?;
+                send(peer, reader.get_mut(), &responses).await?;
             }
             IAction::Fetch(plan) => {
                 let responses = fetch(server, session, &plan).await;
-                write_responses(reader.get_mut(), &responses).await?;
+                send(peer, reader.get_mut(), &responses).await?;
             }
             IAction::Store(plan) => {
                 let responses = apply_store(server, session, &plan).await;
-                write_responses(reader.get_mut(), &responses).await?;
+                send(peer, reader.get_mut(), &responses).await?;
             }
             IAction::Close(responses) => {
-                write_responses(reader.get_mut(), &responses).await?;
+                send(peer, reader.get_mut(), &responses).await?;
                 return Ok(Flow::Done);
             }
         }
@@ -490,8 +549,9 @@ mod tests {
         server_side.write_all(session.greeting().to_wire()).await.unwrap();
 
         let server = server.clone();
+        let peer: SocketAddr = "127.0.0.1:0".parse().expect("a valid dummy peer");
         let handle = tokio::spawn(async move {
-            let _ = converse(&mut server_side, &mut session, &server).await;
+            let _ = converse(&mut server_side, peer, &mut session, &server).await;
         });
 
         client.write_all(script.as_bytes()).await.unwrap();
