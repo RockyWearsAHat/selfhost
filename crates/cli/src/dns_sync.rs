@@ -328,7 +328,7 @@ fn config_apex_a(config: &Config) -> Option<Ipv4Addr> {
 /// stated and the record omitted — exactly what the engine then publishes,
 /// since a `_domainkey` with no live key behind it invites receivers to
 /// distrust our mail.
-fn dkim_public(config: &Config, project_dir: &Path) -> Option<String> {
+pub(crate) fn dkim_public(config: &Config, project_dir: &Path) -> Option<String> {
     let mail = config.mail.as_ref()?;
     let dkim = mail.dkim.as_ref()?;
     let key_path = project_dir.join(&config.server.data_dir).join(&dkim.private_key);

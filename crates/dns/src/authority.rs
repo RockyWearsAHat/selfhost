@@ -33,7 +33,7 @@
 
 use crate::wire::{self, Query, Record, RecordData, RecordType, ResponseCode, ResponseFlags};
 use crate::zone::Zone;
-use selfhost_config::{Config, RecordConfig, ZoneConfig};
+use selfhost_config::{Config, RecordConfig};
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::{Arc, OnceLock};
@@ -175,6 +175,7 @@ impl Authority {
                             {
                                 zone.push_config_records(records);
                             }
+                            populate_claimed_hosts(&mut zone, config, public_ip);
                         }
                         zone
                     })
@@ -182,6 +183,15 @@ impl Authority {
             })
             .unwrap_or_default();
         Authority(Arc::new(Inner::new(zones, public_ip)))
+    }
+
+    /// Enables the split-horizon LAN view (see the module note).
+    ///
+    /// Decided once at startup, before the first query; the first call wins and
+    /// any later call is a no-op by design — a view that changed mid-flight
+    /// would answer half a client's queries from each horizon.
+    pub fn set_lan(&self, view: LanView) {
+        let _ = self.0.lan.set(view);
     }
 
     /// Serves UDP + TCP on `bind` until a listener fails.
@@ -212,7 +222,7 @@ impl Authority {
             let authority = self.clone();
             let socket = Arc::clone(&socket);
             tokio::spawn(async move {
-                let answer = authority.handle_query(&raw, false).await;
+                let answer = authority.handle_query(&raw, false, from.ip()).await;
                 let _ = socket.send_to(&answer, from).await;
             });
         }
@@ -221,19 +231,19 @@ impl Authority {
     /// The TCP half: accept, then serve length-prefixed messages per connection.
     async fn serve_tcp(&self, listener: TcpListener) -> Result<(), DnsError> {
         loop {
-            let (client, _from) = listener.accept().await?;
+            let (client, from) = listener.accept().await?;
             let authority = self.clone();
             tokio::spawn(async move {
-                let _ = authority.serve_connection(client).await;
+                let _ = authority.serve_connection(client, from.ip()).await;
             });
         }
     }
 
     /// Serves one TCP connection, message by message, until the client hangs up.
-    async fn serve_connection(&self, mut client: TcpStream) -> io::Result<()> {
+    async fn serve_connection(&self, mut client: TcpStream, peer: IpAddr) -> io::Result<()> {
         loop {
             let Some(raw) = read_message(&mut client).await? else { return Ok(()) };
-            let answer = self.handle_query(&raw, true).await;
+            let answer = self.handle_query(&raw, true, peer).await;
             write_message(&mut client, &answer).await?;
         }
     }
@@ -243,7 +253,12 @@ impl Authority {
     /// Never panics on hostile input: an undecodable message becomes a
     /// `FORMERR` reply rather than an error, because a nameserver that dies on a
     /// bad packet is a nameserver one packet can take down.
-    async fn handle_query(&self, raw: &[u8], over_tcp: bool) -> Vec<u8> {
+    ///
+    /// `peer` decides the horizon (see the module note): a private peer with a
+    /// configured [`LanView`] is answered with the LAN address wherever a record
+    /// points at the public one, and its foreign questions are forwarded
+    /// upstream; every other peer gets the pure authoritative behaviour.
+    async fn handle_query(&self, raw: &[u8], over_tcp: bool, peer: IpAddr) -> Vec<u8> {
         let query = match wire::decode_query(raw) {
             Ok(query) => query,
             Err(_) => return format_error(raw),
@@ -254,7 +269,30 @@ impl Authority {
             let zones = self.0.zones.lock().await;
             zones.iter().find(|zone| zone.contains(&query.name)).cloned()
         };
-        respond(&query, zone.as_ref(), over_tcp)
+        let lan = self.0.lan.get().copied().filter(|_| is_lan_peer(peer));
+
+        match (zone, lan) {
+            (Some(zone), Some(view)) => {
+                let public = *self.0.public_ip.lock().await;
+                respond(&query, Some(&lan_horizon(zone, public, view.lan_ip)), over_tcp)
+            }
+            (Some(zone), None) => respond(&query, Some(&zone), over_tcp),
+            // A LAN peer's foreign question is forwarded so the router can hand
+            // this box out as the network's one resolver. SERVFAIL when the
+            // upstream gives nothing usable — honest, and the client retries.
+            (None, Some(view)) => match forward(raw, view.upstream, over_tcp).await {
+                Some(answer) => answer,
+                None => wire::encode_response(
+                    &query,
+                    ResponseCode::ServerFailure,
+                    plain_flags(),
+                    &[],
+                    &[],
+                    &[],
+                ),
+            },
+            (None, None) => respond(&query, None, over_tcp),
+        }
     }
 
     /// Replaces the apex A of `origin` and bumps that zone's SOA serial in place.
@@ -277,7 +315,14 @@ impl Authority {
         // would go *backwards*, and a secondary silently ignores a zone whose
         // serial decreased — the exact failure this whole design guards against.
         zone.soa.serial = zone.soa.serial.saturating_add(1);
-        Some(zone.soa.serial)
+        let serial = zone.soa.serial;
+        drop(zones);
+
+        // The apex A *is* this machine's public address (that is what the
+        // dynamic-IP updater tracks), so split-horizon substitution must follow
+        // it — a stale public_ip here would stop rewriting answers for LAN peers.
+        *self.0.public_ip.lock().await = Some(address);
+        Some(serial)
     }
 
     /// Upserts a record in the zone authoritative for `name`, bumping its serial.
@@ -359,6 +404,111 @@ impl Authority {
     pub async fn origins(&self) -> Vec<String> {
         self.0.zones.lock().await.iter().map(|zone| zone.origin.clone()).collect()
     }
+}
+
+/// Gives every hostname the rest of the config claims under `zone` an address,
+/// and a mail-covered zone its RFC 6186 service locators.
+///
+/// Called only for a **bare** zone (one that listed no records of its own), so
+/// the "explicit records replace defaults" rule holds. Adds, at `public_ip`:
+///
+/// - an `A` for each site domain the zone contains — a provisioned site
+///   resolves without the operator writing a record for it;
+/// - an `A` for the `[mail]` hostname and each client-autoconfig host
+///   (`mail.`/`imap.`/`smtp.` per mail domain) the zone contains;
+/// - when the zone's origin is a mail domain, `_imaps._tcp` → port 993 at
+///   `imap.<origin>` and `_submission._tcp` → port 587 at `smtp.<origin>` —
+///   the same records `registrar::desired_records` derives, so the served zone
+///   and a registrar push can never disagree about client discovery.
+///
+/// With no `public_ip` yet, only the SRVs are added: their targets are names,
+/// not addresses, and the updater fills the missing `A`s on its first tick.
+fn populate_claimed_hosts(zone: &mut Zone, config: &Config, public_ip: Option<Ipv4Addr>) {
+    if let Some(ip) = public_ip {
+        for site in &config.sites {
+            for domain in &site.domains {
+                if zone.contains(domain) {
+                    zone.ensure_address(domain, ip);
+                }
+            }
+        }
+    }
+    let Some(mail) = &config.mail else { return };
+    if let Some(ip) = public_ip {
+        if zone.contains(&mail.hostname) {
+            zone.ensure_address(&mail.hostname, ip);
+        }
+        for host in mail.client_hosts() {
+            if zone.contains(&host) {
+                zone.ensure_address(&host, ip);
+            }
+        }
+    }
+    if mail.domains.iter().any(|domain| domain.eq_ignore_ascii_case(&zone.origin)) {
+        let origin = zone.origin.clone();
+        for (service, port, target) in [
+            ("_imaps._tcp", 993, format!("imap.{origin}")),
+            ("_submission._tcp", 587, format!("smtp.{origin}")),
+        ] {
+            zone.records.push(Record {
+                name: format!("{service}.{origin}"),
+                ttl: DEFAULT_A_TTL,
+                data: RecordData::Srv { priority: 0, weight: 1, port, target },
+            });
+        }
+    }
+}
+
+/// The LAN peer's view of a zone: every address record that points at the
+/// public IP is rewritten to the LAN one, because a NAT that does not hairpin
+/// makes the public address unreachable from inside. With no known public IP
+/// there is nothing to recognise, so the zone passes through unchanged.
+fn lan_horizon(mut zone: Zone, public_ip: Option<Ipv4Addr>, lan_ip: Ipv4Addr) -> Zone {
+    let Some(public) = public_ip else { return zone };
+    for record in &mut zone.records {
+        if record.data == RecordData::A(public) {
+            record.data = RecordData::A(lan_ip);
+        }
+    }
+    zone
+}
+
+/// Whether a peer address belongs to the local network — the split-horizon
+/// gate. Private, loopback, and link-local ranges count for IPv4; loopback,
+/// unique-local, and link-local for IPv6. Everything else is the public face.
+fn is_lan_peer(peer: IpAddr) -> bool {
+    match peer {
+        IpAddr::V4(v4) => v4.is_private() || v4.is_loopback() || v4.is_link_local(),
+        IpAddr::V6(v6) => {
+            v6.is_loopback()
+                || (v6.segments()[0] & 0xfe00) == 0xfc00
+                || (v6.segments()[0] & 0xffc0) == 0xfe80
+        }
+    }
+}
+
+/// Relays one raw query to the upstream resolver and returns its raw answer,
+/// or `None` on timeout or failure. UDP queries forward over UDP and TCP over
+/// TCP, so a truncated upstream answer keeps meaning "retry over TCP" to the
+/// client that receives it. A fresh ephemeral socket per query keeps
+/// concurrent answers from crossing without tracking message ids ourselves.
+async fn forward(raw: &[u8], upstream: SocketAddr, over_tcp: bool) -> Option<Vec<u8>> {
+    let exchange = async {
+        if over_tcp {
+            let mut server = TcpStream::connect(upstream).await.ok()?;
+            write_message(&mut server, raw).await.ok()?;
+            read_message(&mut server).await.ok().flatten()
+        } else {
+            let bind = if upstream.is_ipv4() { "0.0.0.0:0" } else { "[::]:0" };
+            let socket = UdpSocket::bind(bind).await.ok()?;
+            socket.send_to(raw, upstream).await.ok()?;
+            let mut buffer = vec![0_u8; MAX_UDP];
+            let read = socket.recv(&mut buffer).await.ok()?;
+            buffer.truncate(read);
+            Some(buffer)
+        }
+    };
+    tokio::time::timeout(UPSTREAM_TIMEOUT, exchange).await.ok().flatten()
 }
 
 /// Builds the reply for one decoded query against its (maybe-absent) zone.
@@ -496,6 +646,7 @@ fn record_kind(data: &RecordData) -> RecordType {
         RecordData::Mx { .. } => RecordType::Mx,
         RecordData::Txt(_) => RecordType::Txt,
         RecordData::Soa { .. } => RecordType::Soa,
+        RecordData::Srv { .. } => RecordType::Srv,
         RecordData::Unknown { record_type, .. } => *record_type,
     }
 }
@@ -539,6 +690,12 @@ mod tests {
     use std::net::Ipv4Addr;
 
     const PUBLIC: Ipv4Addr = Ipv4Addr::new(203, 0, 113, 10);
+    /// A peer on the public internet: sees exactly the authoritative answers.
+    const WAN_PEER: IpAddr = IpAddr::V4(Ipv4Addr::new(198, 51, 100, 200));
+    /// A peer on the home network: gets the split-horizon view when one is set.
+    const LAN_PEER: IpAddr = IpAddr::V4(Ipv4Addr::new(192, 168, 1, 23));
+    /// The LAN address split-horizon answers substitute for [`PUBLIC`].
+    const LAN_IP: Ipv4Addr = Ipv4Addr::new(192, 168, 1, 8);
 
     /// A small example.com zone: apex A + www A, an MX, and an in-zone ns1.
     fn example_zone() -> Zone {
@@ -704,7 +861,7 @@ mod tests {
         // can take offline. Every hostile shape decodes to FORMERR.
         let authority = Authority(Arc::new(Inner::new(vec![example_zone()], None)));
         for raw in [&[][..], &[0x00][..], &[0x12, 0x34, 0x00][..], &[0xff; 5][..]] {
-            let message = authority.handle_query(raw, false).await;
+            let message = authority.handle_query(raw, false, WAN_PEER).await;
             let response = wire::decode_response(&message).unwrap();
             assert_eq!(response.code, ResponseCode::FormatError, "raw {raw:?}");
         }
@@ -716,7 +873,7 @@ mod tests {
         // arrive as an authoritative answer.
         let authority = Authority(Arc::new(Inner::new(vec![example_zone()], None)));
         let raw = wire::encode_query(0x2222, "example.com", RecordType::A).unwrap();
-        let message = authority.handle_query(&raw, false).await;
+        let message = authority.handle_query(&raw, false, WAN_PEER).await;
         assert_eq!(message[..2], [0x22, 0x22]);
         assert_eq!(wire::decode_response(&message).unwrap().first_a(), Some(PUBLIC));
     }
@@ -731,9 +888,66 @@ mod tests {
         assert_eq!(serial, 2_026_080_701, "the serial only ever increases");
 
         let raw = wire::encode_query(1, "example.com", RecordType::A).unwrap();
-        let message = authority.handle_query(&raw, false).await;
+        let message = authority.handle_query(&raw, false, WAN_PEER).await;
         assert_eq!(wire::decode_response(&message).unwrap().first_a(), Some(moved));
         assert!(authority.set_apex_a("absent.example", moved).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn a_lan_peer_is_answered_with_the_lan_address() {
+        // The split horizon: a record pointing at the public IP answers with
+        // the LAN address for a private peer, because the NAT does not hairpin.
+        let authority = Authority(Arc::new(Inner::new(vec![example_zone()], Some(PUBLIC))));
+        authority.set_lan(LanView { lan_ip: LAN_IP, upstream: "203.0.113.53:53".parse().unwrap() });
+
+        let raw = wire::encode_query(1, "www.example.com", RecordType::A).unwrap();
+        let from_lan = authority.handle_query(&raw, false, LAN_PEER).await;
+        assert_eq!(wire::decode_response(&from_lan).unwrap().first_a(), Some(LAN_IP));
+
+        // The same question from the internet gets the public address.
+        let from_wan = authority.handle_query(&raw, false, WAN_PEER).await;
+        assert_eq!(wire::decode_response(&from_wan).unwrap().first_a(), Some(PUBLIC));
+    }
+
+    #[tokio::test]
+    async fn a_public_peers_foreign_question_stays_refused_with_a_lan_view_set() {
+        // The forwarding path must never open to the internet: even with the
+        // LAN view configured, a public peer asking a foreign name is REFUSED.
+        let authority = Authority(Arc::new(Inner::new(vec![example_zone()], Some(PUBLIC))));
+        authority.set_lan(LanView { lan_ip: LAN_IP, upstream: "203.0.113.53:53".parse().unwrap() });
+
+        let raw = wire::encode_query(2, "elsewhere.net", RecordType::A).unwrap();
+        let message = authority.handle_query(&raw, false, WAN_PEER).await;
+        assert_eq!(wire::decode_response(&message).unwrap().code, ResponseCode::Refused);
+    }
+
+    #[tokio::test]
+    async fn without_a_lan_view_a_private_peer_is_answered_like_the_public() {
+        // Split horizon is opt-in: no configured view, no substitution and no
+        // forwarding — a private peer's foreign question is refused too.
+        let authority = Authority(Arc::new(Inner::new(vec![example_zone()], Some(PUBLIC))));
+
+        let owned = wire::encode_query(3, "www.example.com", RecordType::A).unwrap();
+        let answer = authority.handle_query(&owned, false, LAN_PEER).await;
+        assert_eq!(wire::decode_response(&answer).unwrap().first_a(), Some(PUBLIC));
+
+        let foreign = wire::encode_query(4, "elsewhere.net", RecordType::A).unwrap();
+        let refused = authority.handle_query(&foreign, false, LAN_PEER).await;
+        assert_eq!(wire::decode_response(&refused).unwrap().code, ResponseCode::Refused);
+    }
+
+    #[test]
+    fn lan_and_public_peers_are_told_apart_by_address_range() {
+        assert!(is_lan_peer("192.168.1.23".parse().unwrap()));
+        assert!(is_lan_peer("10.0.0.5".parse().unwrap()));
+        assert!(is_lan_peer("127.0.0.1".parse().unwrap()));
+        assert!(is_lan_peer("169.254.10.10".parse().unwrap()));
+        assert!(is_lan_peer("::1".parse().unwrap()));
+        assert!(is_lan_peer("fe80::1".parse().unwrap()));
+        assert!(is_lan_peer("fd00::1".parse().unwrap()));
+        assert!(!is_lan_peer("172.83.6.109".parse().unwrap()));
+        assert!(!is_lan_peer("8.8.8.8".parse().unwrap()));
+        assert!(!is_lan_peer("2001:db8::1".parse().unwrap()));
     }
 
     #[tokio::test]
@@ -756,7 +970,7 @@ mod tests {
         assert_eq!(serial, 2_026_080_701, "the serial only ever increases");
 
         let raw = wire::encode_query(7, "blog.example.com", RecordType::A).unwrap();
-        let message = authority.handle_query(&raw, false).await;
+        let message = authority.handle_query(&raw, false, WAN_PEER).await;
         assert_eq!(wire::decode_response(&message).unwrap().first_a(), Some(addr));
     }
 
@@ -770,7 +984,7 @@ mod tests {
         authority.upsert_record("www.example.com", RecordData::A(second)).await;
 
         let raw = wire::encode_query(1, "www.example.com", RecordType::A).unwrap();
-        let answers = wire::decode_response(&authority.handle_query(&raw, false).await).unwrap().answers;
+        let answers = wire::decode_response(&authority.handle_query(&raw, false, WAN_PEER).await).unwrap().answers;
         let a_records = answers.iter().filter(|r| matches!(r.data, RecordData::A(_))).count();
         assert_eq!(a_records, 1, "an upsert replaces the RRset, never grows it");
     }
@@ -791,7 +1005,7 @@ mod tests {
 
         assert!(authority.remove_record("blog.example.com", RecordType::A).await.is_some(), "a real removal bumps");
         let raw = wire::encode_query(1, "blog.example.com", RecordType::A).unwrap();
-        assert_eq!(wire::decode_response(&authority.handle_query(&raw, false).await).unwrap().code, ResponseCode::NameError);
+        assert_eq!(wire::decode_response(&authority.handle_query(&raw, false, WAN_PEER).await).unwrap().code, ResponseCode::NameError);
 
         // A second removal changes nothing, so no serial is spent.
         assert!(authority.remove_record("blog.example.com", RecordType::A).await.is_none());
@@ -867,6 +1081,42 @@ domains = ["example.com", "hand.example"]
         assert!(
             !hand.iter().any(|r| matches!(&r.data, RecordData::Mx { .. })),
             "an explicit zone is served exactly as written, mail records excluded"
+        );
+
+        // The bare zone also resolves the client-autoconfig hosts a mail
+        // client's account setup probes, and answers the RFC 6186 SRVs it asks.
+        let served = |name: &str, qtype| {
+            let authority = authority.clone();
+            let raw = wire::encode_query(9, name, qtype).unwrap();
+            async move { authority.handle_query(&raw, false, WAN_PEER).await }
+        };
+        for host in ["mail.example.com", "imap.example.com", "smtp.example.com"] {
+            let message = served(host, RecordType::A).await;
+            assert_eq!(
+                wire::decode_response(&message).unwrap().first_a(),
+                Some(PUBLIC),
+                "{host} must resolve for account autodiscovery"
+            );
+        }
+        let imaps = served("_imaps._tcp.example.com", RecordType::Srv).await;
+        let answers = wire::decode_response(&imaps).unwrap().answers;
+        assert!(
+            answers.iter().any(|r| matches!(&r.data,
+                RecordData::Srv { port: 993, target, .. } if target == "imap.example.com")),
+            "the IMAPS SRV names imap.example.com:993, got {answers:?}"
+        );
+        let submission = served("_submission._tcp.example.com", RecordType::Srv).await;
+        let answers = wire::decode_response(&submission).unwrap().answers;
+        assert!(
+            answers.iter().any(|r| matches!(&r.data,
+                RecordData::Srv { port: 587, target, .. } if target == "smtp.example.com")),
+            "the submission SRV names smtp.example.com:587, got {answers:?}"
+        );
+
+        // The hand zone is a mail domain but wrote its own records: no SRVs.
+        assert!(
+            !hand.iter().any(|r| matches!(&r.data, RecordData::Srv { .. })),
+            "an explicit zone gets no injected SRVs"
         );
     }
 }

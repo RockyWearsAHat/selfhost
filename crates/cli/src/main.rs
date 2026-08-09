@@ -495,7 +495,9 @@ async fn serve_daemon(
     let dns = match config.dns.as_ref() {
         Some(_) => {
             let public_ip = doctor::discover_public_ip().await;
-            Some(Authority::for_config(&config, public_ip))
+            let authority = lan_dns::build_authority(&config, &project_dir, public_ip);
+            enable_lan_view_if_configured(&authority, &config);
+            Some(authority)
         }
         None => None,
     };
@@ -770,7 +772,7 @@ fn dns_sync_command(arguments: &[String]) -> Result<(), String> {
 /// *forwards* queries to diagnose the network, whereas this *answers* them
 /// authoritatively for the configured zones.
 fn serve_dns_command(arguments: &[String]) -> Result<(), String> {
-    let (config, _project_dir) = load()?;
+    let (config, project_dir) = load()?;
     let Some(dns) = config.dns.as_ref() else {
         return Err(
             "no [dns] section in the config, so there is no zone to serve.\n  \
@@ -788,7 +790,7 @@ fn serve_dns_command(arguments: &[String]) -> Result<(), String> {
         .build()
         .map_err(|e| format!("could not start the async runtime: {e}"))?;
 
-    runtime.block_on(serve_dns_foreground(config, bind))
+    runtime.block_on(serve_dns_foreground(config, project_dir, bind))
 }
 
 /// Serves split-horizon DNS for the LAN in the foreground.
@@ -798,7 +800,7 @@ fn serve_dns_command(arguments: &[String]) -> Result<(), String> {
 /// [`lan_dns`] module docs. Renaming any of them silently kills DNS for the
 /// entire LAN on the next deploy.
 fn lan_dns_command(arguments: &[String]) -> Result<(), String> {
-    let (config, _project_dir) = load()?;
+    let (config, project_dir) = load()?;
     let lan_ip: std::net::Ipv4Addr = value_of(arguments, "--lan-ip")
         .ok_or_else(|| {
             format!(
@@ -818,13 +820,40 @@ fn lan_dns_command(arguments: &[String]) -> Result<(), String> {
         .build()
         .map_err(|e| format!("could not start the async runtime: {e}"))?;
 
-    runtime.block_on(lan_dns::lan_dns_command(&config, lan_ip, bind))
+    runtime.block_on(lan_dns::lan_dns_command(&config, &project_dir, lan_ip, bind))
+}
+
+/// Enables the authority's split-horizon LAN view when `[dns].lan_ip` is set.
+///
+/// The upstream for LAN peers' foreign queries is the system resolver, the
+/// same source `lan-dns` uses. A `lan_ip` that does not parse is warned about
+/// and the public view served instead — DNS staying up matters more than the
+/// horizon; `selfhost check` reports the bad value properly.
+fn enable_lan_view_if_configured(authority: &Authority, config: &Config) {
+    let Some(lan_ip) = config.dns.as_ref().and_then(|dns| dns.lan_ip.as_ref()) else {
+        return;
+    };
+    match lan_ip.parse() {
+        Ok(lan_ip) => authority.set_lan(selfhost_dns::authority::LanView {
+            lan_ip,
+            upstream: selfhost_dns::Resolver::system().address(),
+        }),
+        Err(error) => eprintln!(
+            "warning: [dns].lan_ip {lan_ip} is not an IPv4 address ({error}); \
+             serving the public view to every peer"
+        ),
+    }
 }
 
 /// Binds the authority and serves until interrupted.
-async fn serve_dns_foreground(config: Config, bind: SocketAddr) -> Result<(), String> {
+async fn serve_dns_foreground(
+    config: Config,
+    project_dir: std::path::PathBuf,
+    bind: SocketAddr,
+) -> Result<(), String> {
     let public_ip = doctor::discover_public_ip().await;
-    let authority = Authority::for_config(&config, public_ip);
+    let authority = lan_dns::build_authority(&config, &project_dir, public_ip);
+    enable_lan_view_if_configured(&authority, &config);
 
     println!("selfhost authoritative DNS");
     println!("  bind    {bind}");
