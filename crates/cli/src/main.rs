@@ -439,7 +439,7 @@ async fn serve_daemon(
     // `home::record`: the daemon still supervises services, and the listeners are
     // left governed by whatever the host firewall already holds. A known-unset
     // firewall the operator can see beats a daemon that refused to start.
-    let firewall = selfhost_firewall::Manager::for_server(&config.server);
+    let firewall = selfhost_firewall::Manager::for_config(&config);
     match firewall.reconcile().await {
         Ok(state) if state.managed => {
             println!(

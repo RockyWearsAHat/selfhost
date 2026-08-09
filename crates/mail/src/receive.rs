@@ -256,13 +256,19 @@ where
 
     // Deliver only to recipients that are real mailboxes here. Unknown ones were
     // already refused at RCPT; filtering again guarantees no black-hole slips
-    // through even if a client ignored that refusal.
-    let mut delivered = 0u32;
+    // through even if a client ignored that refusal. Recipients are collapsed to
+    // the mailbox they resolve to first, so `RCPT` to both an alias and its
+    // target stores one copy, not two.
+    let mut targets = Vec::new();
     for recipient in &envelope.recipients {
-        if !receiver.store.exists(recipient) {
-            continue;
+        let Some(mailbox) = receiver.store.resolve(recipient).cloned() else { continue };
+        if !targets.contains(&mailbox) {
+            targets.push(mailbox);
         }
-        match receiver.store.deliver(recipient, &message).await {
+    }
+    let mut delivered = 0u32;
+    for mailbox in &targets {
+        match receiver.store.deliver(mailbox, &message).await {
             Ok(_) => delivered += 1,
             Err(_) => return Ok(Reply::line(451, "temporary failure writing to mailbox")),
         }
@@ -442,7 +448,7 @@ mod tests {
 
     fn receiver_with(root: &std::path::Path, mailboxes: &[&str]) -> Receiver {
         let addrs: Vec<Address> = mailboxes.iter().map(|m| Address::parse(m).unwrap()).collect();
-        let store = Maildir::open(root, &addrs).unwrap();
+        let store = Maildir::open(root, &addrs, &[]).unwrap();
         Receiver::new(policy(), store, None)
     }
 
@@ -529,6 +535,31 @@ mod tests {
         .await;
         assert!(out.contains("550"), "unknown local mailbox should be refused:\n{out}");
         assert!(out.to_lowercase().contains("no such mailbox"), "{out}");
+    }
+
+    #[tokio::test]
+    async fn rcpt_to_an_alias_and_its_mailbox_stores_one_copy() {
+        let root = temp_root();
+        let dave = Address::parse("dave@example.com").unwrap();
+        let postmaster = Address::parse("postmaster@example.com").unwrap();
+        let store =
+            Maildir::open(&root, std::slice::from_ref(&dave), &[(postmaster, dave.clone())]).unwrap();
+        let receiver = Receiver::new(policy(), store, None);
+
+        let out = run_conversation(
+            &receiver,
+            "EHLO friend.test\r\n\
+             MAIL FROM:<sender@elsewhere.com>\r\n\
+             RCPT TO:<postmaster@example.com>\r\n\
+             RCPT TO:<dave@example.com>\r\n\
+             DATA\r\nSubject: hi\r\n\r\nonce only\r\n.\r\nQUIT\r\n",
+        )
+        .await;
+        assert!(out.contains("250 message accepted"), "{out}");
+
+        // Both recipients resolve to dave's mailbox, so exactly one copy lands.
+        let new_dir = root.join("mail").join("example.com").join("dave").join("new");
+        assert_eq!(std::fs::read_dir(&new_dir).unwrap().count(), 1);
     }
 
     #[tokio::test]

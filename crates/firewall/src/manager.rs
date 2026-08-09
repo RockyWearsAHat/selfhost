@@ -39,10 +39,12 @@ struct Inner {
 }
 
 impl Manager {
-    /// Detects the backend and derives the desired openings from the config.
-    pub fn for_server(server: &selfhost_config::Server) -> Self {
+    /// Detects the backend and derives the desired openings from the config —
+    /// the web binds, plus the mail binds when `[mail]` is present.
+    pub fn for_config(config: &selfhost_config::Config) -> Self {
+        let server = &config.server;
         let backend = detect();
-        let desired = desired_rules(server);
+        let desired = desired_rules(server, config.mail.as_ref());
         let managed = server.firewall.manage;
         let last = FirewallState {
             backend: backend.kind(),

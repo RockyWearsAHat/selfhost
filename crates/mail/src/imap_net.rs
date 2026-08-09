@@ -462,7 +462,7 @@ mod tests {
     /// this crate does not need to prove `tokio_rustls` a second time.
     fn server_with(root: &std::path::Path) -> ImapServer {
         let dave = addr("dave@example.com");
-        let store = Maildir::open(root, std::slice::from_ref(&dave)).unwrap();
+        let store = Maildir::open(root, std::slice::from_ref(&dave), &[]).unwrap();
         let mailbox = Mailbox {
             address: "dave@example.com".into(),
             password_hash: hash_password("hunter2").unwrap(),
