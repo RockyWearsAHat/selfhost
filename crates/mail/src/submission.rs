@@ -245,7 +245,13 @@ async fn handle_connection(
         }
         Flow::StartTls => {
             let acceptor = TlsAcceptor::from(submission.tls.clone());
-            let mut tls = acceptor.accept(stream).await?;
+            let mut tls = match acceptor.accept(stream).await {
+                Ok(tls) => tls,
+                Err(error) => {
+                    log_submission(peer, format!("STARTTLS handshake failed: {error}"));
+                    return Err(error);
+                }
+            };
             session.tls_established();
             log_submission(peer, "TLS established via STARTTLS");
             let _ = converse(&mut tls, peer, &mut session, &submission).await?;
@@ -284,6 +290,14 @@ where
         let read = read_command_line(&mut reader, &mut line).await?;
         if read == 0 {
             return Ok(Flow::Done);
+        }
+
+        // A bare CRLF between commands is tolerated silently (Postel's law):
+        // Apple Mail sends one right after its STARTTLS upgrade, and an error
+        // reply there makes the client abandon the connection.
+        if line.trim().is_empty() {
+            log_submission(peer, ">> (blank line ignored)");
+            continue;
         }
 
         log_submission(peer, format!(">> {}", verb_summary(&line)));

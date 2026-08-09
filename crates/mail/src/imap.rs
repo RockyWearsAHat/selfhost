@@ -517,7 +517,7 @@ impl ISession {
 
     /// The capabilities advertised in the current state.
     fn capabilities(&self) -> Vec<String> {
-        let mut caps = vec!["IMAP4rev1".to_string()];
+        let mut caps = vec!["IMAP4rev1".to_string(), "ID".to_string()];
         if self.state == IState::NotAuthenticated {
             if self.config.tls_available && !self.tls_active {
                 caps.push("STARTTLS".into());
@@ -569,6 +569,14 @@ impl ISession {
         match verb.to_ascii_uppercase().as_str() {
             "" => respond(IResponse::tagged(tag, Status::Bad, "missing command")),
             "CAPABILITY" => self.capability(tag),
+            // RFC 2971: the client introduces itself (Apple Mail always does,
+            // first thing). `NIL` declines to identify ourselves back — the
+            // point is a polite `OK`, because a `BAD` here reads as a broken
+            // server to exactly the clients that send it.
+            "ID" => respond_all(vec![
+                IResponse::untagged("ID NIL"),
+                IResponse::tagged(tag, Status::Ok, "ID completed"),
+            ]),
             "NOOP" => respond(IResponse::tagged(tag, Status::Ok, "NOOP completed")),
             "LOGOUT" => self.logout(tag),
             "STARTTLS" => self.starttls(tag),
@@ -1733,6 +1741,19 @@ mod tests {
         let responses = s.login_result("a", None);
         assert!(responses[0].text().starts_with("a NO"));
         assert_eq!(s.state(), IState::NotAuthenticated);
+    }
+
+    #[test]
+    fn id_is_answered_politely_with_nil() {
+        // Apple Mail sends ID first thing on every sync connection (RFC 2971);
+        // a BAD here reads as a broken server to it.
+        let mut s = ISession::new(config());
+        s.tls_established();
+        let IAction::Respond(responses) = s.command("x ID (\"name\" \"Mac OS X Mail\")") else {
+            panic!("Respond")
+        };
+        assert_eq!(responses[0].text(), "* ID NIL\r\n");
+        assert!(responses[1].text().starts_with("x OK"), "{}", responses[1].text());
     }
 
     // ---- AUTHENTICATE PLAIN ------------------------------------------------
