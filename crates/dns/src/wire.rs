@@ -40,6 +40,9 @@ pub enum RecordType {
     Mx,
     /// Text, which carries SPF, DKIM, DMARC, and DNSBL explanations.
     Txt,
+    /// Service locator (RFC 2782) — how a mail client discovers the IMAP and
+    /// submission servers for a domain (RFC 6186) without guessing hostnames.
+    Srv,
     /// Certification authority authorisation.
     Caa,
     /// Any other type, kept numerically so unknown records survive a round trip.
@@ -58,6 +61,7 @@ impl RecordType {
             Self::Mx => 15,
             Self::Txt => 16,
             Self::Aaaa => 28,
+            Self::Srv => 33,
             Self::Caa => 257,
             Self::Other(code) => code,
         }
@@ -74,6 +78,7 @@ impl RecordType {
             15 => Self::Mx,
             16 => Self::Txt,
             28 => Self::Aaaa,
+            33 => Self::Srv,
             257 => Self::Caa,
             other => Self::Other(other),
         }
@@ -91,6 +96,7 @@ impl fmt::Display for RecordType {
             Self::Ptr => write!(f, "PTR"),
             Self::Mx => write!(f, "MX"),
             Self::Txt => write!(f, "TXT"),
+            Self::Srv => write!(f, "SRV"),
             Self::Caa => write!(f, "CAA"),
             Self::Other(code) => write!(f, "TYPE{code}"),
         }
@@ -127,6 +133,21 @@ impl ResponseCode {
             4 => Self::NotImplemented,
             5 => Self::Refused,
             other => Self::Other(other),
+        }
+    }
+
+    /// The four-bit RCODE field this code writes into a response header — the
+    /// reverse of [`from_bits`](Self::from_bits), needed by the authoritative
+    /// encoder. An `Other` code is masked to its low four bits.
+    pub fn to_bits(self) -> u8 {
+        match self {
+            Self::NoError => 0,
+            Self::FormatError => 1,
+            Self::ServerFailure => 2,
+            Self::NameError => 3,
+            Self::NotImplemented => 4,
+            Self::Refused => 5,
+            Self::Other(code) => code & 0x0F,
         }
     }
 }
@@ -167,6 +188,12 @@ pub enum RecordData {
     Txt(String),
     /// Start of authority. Names who runs a zone, which is how you find out who
     /// to ask about a reverse-DNS record you cannot change yourself.
+    ///
+    /// The numeric fields matter only when this record is *served* rather than
+    /// merely read for its contact: an authoritative SOA answer, the authority
+    /// section of an NXDOMAIN, and an AXFR all carry the serial and the timers on
+    /// the wire. The stub resolver ignores them, but they must survive a decode so
+    /// the authoritative server can re-emit them and the updater can bump `serial`.
     Soa {
         /// Primary nameserver for the zone.
         primary: String,
@@ -174,6 +201,32 @@ pub enum RecordData {
         /// of an email address, so `ipadmin.example.com` means
         /// `ipadmin@example.com`.
         responsible: String,
+        /// Version number of the zone, bumped on every change so a secondary
+        /// knows to re-transfer. The updater only ever increases it.
+        serial: u32,
+        /// Seconds a secondary waits before checking for a new `serial`.
+        refresh: u32,
+        /// Seconds a secondary waits before retrying a failed refresh.
+        retry: u32,
+        /// Seconds a secondary keeps serving the zone with no successful refresh
+        /// before it stops answering for it.
+        expire: u32,
+        /// Also the negative-caching TTL: how long a resolver may remember that a
+        /// name in this zone does not exist.
+        minimum: u32,
+    },
+    /// A service locator (RFC 2782): which host and port carry a service for
+    /// this name. Served for `_imaps._tcp` and `_submission._tcp` so a mail
+    /// client discovers its servers per RFC 6186 instead of guessing hostnames.
+    Srv {
+        /// Lower values are tried first.
+        priority: u16,
+        /// Relative weight among records of equal priority.
+        weight: u16,
+        /// The port the service listens on.
+        port: u16,
+        /// The host providing the service. Never compressed on the wire (RFC 2782).
+        target: String,
     },
     /// A record type this decoder does not interpret.
     Unknown {
@@ -204,6 +257,10 @@ pub struct Response {
     pub answers: Vec<Record>,
     /// Records delegating or describing authority.
     pub authority: Vec<Record>,
+    /// Additional records — the glue addresses a referral carries for the
+    /// nameservers it names. Read by the delegation checker, which must see the
+    /// parent's glue to verify it points at this machine.
+    pub additional: Vec<Record>,
 }
 
 impl Response {
@@ -309,6 +366,7 @@ fn data_type(data: &RecordData) -> RecordType {
         RecordData::Mx { .. } => RecordType::Mx,
         RecordData::Txt(_) => RecordType::Txt,
         RecordData::Soa { .. } => RecordType::Soa,
+        RecordData::Srv { .. } => RecordType::Srv,
         RecordData::Unknown { record_type, .. } => *record_type,
     }
 }
@@ -468,6 +526,7 @@ pub fn decode_response(buffer: &[u8]) -> Result<Response, WireError> {
     let questions = u16::from_be_bytes([buffer[4], buffer[5]]);
     let answer_count = u16::from_be_bytes([buffer[6], buffer[7]]);
     let authority_count = u16::from_be_bytes([buffer[8], buffer[9]]);
+    let additional_count = u16::from_be_bytes([buffer[10], buffer[11]]);
 
     let mut position = 12;
     for _ in 0..questions {
@@ -492,11 +551,25 @@ pub fn decode_response(buffer: &[u8]) -> Result<Response, WireError> {
             }
             // The authority section is informational here; a malformed one must
             // not discard answers that already decoded cleanly.
+            Err(_) => return Ok(Response { code, answers, authority, additional: Vec::new() }),
+        }
+    }
+
+    // Same posture as authority: additional records (a referral's glue) are
+    // informational, so a malformed tail keeps what decoded cleanly. An OPT
+    // pseudo-record (EDNS0, type 41) lands here too and is simply carried.
+    let mut additional = Vec::with_capacity(additional_count as usize);
+    for _ in 0..additional_count {
+        match read_record(buffer, position) {
+            Ok((record, next)) => {
+                additional.push(record);
+                position = next;
+            }
             Err(_) => break,
         }
     }
 
-    Ok(Response { code, answers, authority })
+    Ok(Response { code, answers, authority, additional })
 }
 
 /// Reads one resource record.
@@ -526,13 +599,33 @@ fn read_record(buffer: &[u8], start: usize) -> Result<(Record, usize), WireError
         }
         RecordType::Soa if length >= 2 => {
             let (primary, next) = read_name(buffer, position)?;
-            let (responsible, _) = read_name(buffer, next)?;
-            RecordData::Soa { primary, responsible }
+            let (responsible, after) = read_name(buffer, next)?;
+            // The two names are followed by five 32-bit fields. A message that
+            // stops short of them is truncated rather than a zero-timer zone.
+            let nums = buffer.get(after..after + 20).ok_or(WireError::Truncated)?;
+            RecordData::Soa {
+                primary,
+                responsible,
+                serial: u32::from_be_bytes([nums[0], nums[1], nums[2], nums[3]]),
+                refresh: u32::from_be_bytes([nums[4], nums[5], nums[6], nums[7]]),
+                retry: u32::from_be_bytes([nums[8], nums[9], nums[10], nums[11]]),
+                expire: u32::from_be_bytes([nums[12], nums[13], nums[14], nums[15]]),
+                minimum: u32::from_be_bytes([nums[16], nums[17], nums[18], nums[19]]),
+            }
         }
         RecordType::Mx if length >= 3 => {
             let preference = u16::from_be_bytes([payload[0], payload[1]]);
             let exchange = read_name(buffer, position + 2)?.0;
             RecordData::Mx { preference, exchange }
+        }
+        RecordType::Srv if length >= 7 => {
+            let target = read_name(buffer, position + 6)?.0;
+            RecordData::Srv {
+                priority: u16::from_be_bytes([payload[0], payload[1]]),
+                weight: u16::from_be_bytes([payload[2], payload[3]]),
+                port: u16::from_be_bytes([payload[4], payload[5]]),
+                target,
+            }
         }
         RecordType::Txt => {
             // TXT arrives as length-prefixed chunks; a long SPF or DKIM value is
@@ -552,6 +645,200 @@ fn read_record(buffer: &[u8], start: usize) -> Result<(Record, usize), WireError
     };
 
     Ok((Record { name, ttl, data }, end))
+}
+
+/// A decoded inbound query: the fields an authoritative server must echo and
+/// honour.
+///
+/// The stub-resolver path decodes *responses* (see [`decode_response`]); an
+/// authoritative server decodes the *question* a client asks and echoes its id,
+/// name, and RD bit back. [`question_of`] drops the id and flags; this keeps
+/// them because a reply that does not echo the id cannot be matched to its query.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Query {
+    /// Message id, echoed verbatim in the response.
+    pub id: u16,
+    /// The single question's owner name (no trailing dot).
+    pub name: String,
+    /// The question's type.
+    pub record_type: RecordType,
+    /// Whether the client set RD. An authoritative-only server does not recurse,
+    /// but it echoes RD per RFC 1035 §4.1.1.
+    pub recursion_desired: bool,
+}
+
+/// Decodes the header and first question of an inbound query.
+///
+/// Rejects a message with no question ([`WireError::Truncated`]) rather than
+/// guessing — an authoritative server answers a question or it answers nothing.
+pub fn decode_query(buffer: &[u8]) -> Result<Query, WireError> {
+    if buffer.len() < 12 {
+        return Err(WireError::Truncated);
+    }
+    if u16::from_be_bytes([buffer[4], buffer[5]]) == 0 {
+        return Err(WireError::Truncated);
+    }
+    let id = u16::from_be_bytes([buffer[0], buffer[1]]);
+    // RD is the low bit of the first flags byte.
+    let recursion_desired = buffer[2] & 0x01 != 0;
+
+    let (name, next) = read_name(buffer, 12)?;
+    let record_type = buffer
+        .get(next..next + 2)
+        .map(|bytes| RecordType::from_code(u16::from_be_bytes([bytes[0], bytes[1]])))
+        .ok_or(WireError::Truncated)?;
+    Ok(Query { id, name, record_type, recursion_desired })
+}
+
+/// How an authoritative response is framed.
+///
+/// Kept as two named intents rather than a raw bitfield so a caller states what
+/// it means (`authoritative`, `truncated`) instead of remembering which header
+/// bit is which.
+#[derive(Debug, Clone, Copy)]
+pub struct ResponseFlags {
+    /// Sets AA. True whenever the answer comes from a zone this server owns.
+    pub authoritative: bool,
+    /// Sets TC. Set when a UDP answer was cut to fit; tells the client to retry
+    /// over TCP.
+    pub truncated: bool,
+}
+
+/// Builds a response message for `query`: echoes the question, sets QR=1, applies
+/// `flags` and `code`, and serialises the record sections.
+///
+/// Names are written uncompressed — RFC 1035 §4.1.4 makes compression optional
+/// on write, so the encoder is a straight walk with no offset bookkeeping, and
+/// [`read_name`] already tolerates both forms on the way back in.
+pub fn encode_response(
+    query: &Query,
+    code: ResponseCode,
+    flags: ResponseFlags,
+    answers: &[Record],
+    authority: &[Record],
+    additional: &[Record],
+) -> Vec<u8> {
+    let mut out = Vec::with_capacity(128);
+    out.extend_from_slice(&query.id.to_be_bytes());
+
+    // Flags byte 1: QR=1, OPCODE=0, then AA, TC, and the echoed RD.
+    let mut flags_high = 0x80;
+    if flags.authoritative {
+        flags_high |= 0x04;
+    }
+    if flags.truncated {
+        flags_high |= 0x02;
+    }
+    if query.recursion_desired {
+        flags_high |= 0x01;
+    }
+    out.push(flags_high);
+    // Flags byte 2: RA=0, Z=0, then RCODE.
+    out.push(code.to_bits() & 0x0F);
+
+    out.extend_from_slice(&1_u16.to_be_bytes()); // the one question, echoed
+    out.extend_from_slice(&(answers.len() as u16).to_be_bytes());
+    out.extend_from_slice(&(authority.len() as u16).to_be_bytes());
+    out.extend_from_slice(&(additional.len() as u16).to_be_bytes());
+
+    // The question, uncompressed: name, QTYPE, QCLASS=IN.
+    let _ = write_name(&mut out, &query.name);
+    out.extend_from_slice(&query.record_type.code().to_be_bytes());
+    out.extend_from_slice(&1_u16.to_be_bytes());
+
+    // A served `RecordData::Name` is either a CNAME or an NS, and the payload
+    // alone cannot say which. The section and the question resolve it: in the
+    // answer section a `Name` is a CNAME (the alias chase) unless the client
+    // asked for NS; in the authority and additional sections a `Name` is always
+    // an NS RRset. Getting this wrong makes a resolver reject the delegation.
+    let answer_name_type =
+        if query.record_type == RecordType::Ns { RecordType::Ns } else { RecordType::Cname };
+    for record in answers {
+        write_record(&mut out, record, answer_name_type);
+    }
+    for record in authority.iter().chain(additional) {
+        write_record(&mut out, record, RecordType::Ns);
+    }
+    out
+}
+
+/// Writes one resource record: owner name, type, class IN, ttl, then the rdata
+/// framed by its two-byte length. `name_type` disambiguates a
+/// [`RecordData::Name`] payload (CNAME vs NS); it is ignored for every other
+/// payload, whose type is unambiguous.
+fn write_record(out: &mut Vec<u8>, record: &Record, name_type: RecordType) {
+    let wire_type = match &record.data {
+        RecordData::Name(_) => name_type,
+        other => record_type_of(other),
+    };
+    let _ = write_name(out, &record.name);
+    out.extend_from_slice(&wire_type.code().to_be_bytes());
+    out.extend_from_slice(&1_u16.to_be_bytes()); // class IN
+    out.extend_from_slice(&record.ttl.to_be_bytes());
+
+    // RDLENGTH is only known after the rdata is written, so reserve it and fill
+    // it in once the payload length is measured.
+    let length_at = out.len();
+    out.extend_from_slice(&[0, 0]);
+    let start = out.len();
+    write_rdata(out, &record.data);
+    let length = (out.len() - start) as u16;
+    out[length_at..length_at + 2].copy_from_slice(&length.to_be_bytes());
+}
+
+/// Writes the rdata payload for one record.
+fn write_rdata(out: &mut Vec<u8>, data: &RecordData) {
+    match data {
+        RecordData::A(address) => out.extend_from_slice(&address.octets()),
+        RecordData::Aaaa(address) => out.extend_from_slice(&address.octets()),
+        RecordData::Name(name) => {
+            let _ = write_name(out, name);
+        }
+        RecordData::Mx { preference, exchange } => {
+            out.extend_from_slice(&preference.to_be_bytes());
+            let _ = write_name(out, exchange);
+        }
+        RecordData::Txt(text) => {
+            // TXT on the wire is a run of length-prefixed chunks, each at most
+            // 255 bytes — the inverse of how `read_record` rejoins them.
+            for chunk in text.as_bytes().chunks(u8::MAX as usize) {
+                out.push(chunk.len() as u8);
+                out.extend_from_slice(chunk);
+            }
+        }
+        RecordData::Soa { primary, responsible, serial, refresh, retry, expire, minimum } => {
+            let _ = write_name(out, primary);
+            let _ = write_name(out, responsible);
+            out.extend_from_slice(&serial.to_be_bytes());
+            out.extend_from_slice(&refresh.to_be_bytes());
+            out.extend_from_slice(&retry.to_be_bytes());
+            out.extend_from_slice(&expire.to_be_bytes());
+            out.extend_from_slice(&minimum.to_be_bytes());
+        }
+        RecordData::Srv { priority, weight, port, target } => {
+            out.extend_from_slice(&priority.to_be_bytes());
+            out.extend_from_slice(&weight.to_be_bytes());
+            out.extend_from_slice(&port.to_be_bytes());
+            let _ = write_name(out, target);
+        }
+        RecordData::Unknown { data, .. } => out.extend_from_slice(data),
+    }
+}
+
+/// The wire type code for an unambiguous payload. A [`RecordData::Name`] is
+/// resolved by the caller (see [`write_record`]) since it may be CNAME or NS;
+/// the arm here is a safe fallback only.
+fn record_type_of(data: &RecordData) -> RecordType {
+    match data {
+        RecordData::A(_) => RecordType::A,
+        RecordData::Aaaa(_) => RecordType::Aaaa,
+        RecordData::Name(_) => RecordType::Cname,
+        RecordData::Mx { .. } => RecordType::Mx,
+        RecordData::Txt(_) => RecordType::Txt,
+        RecordData::Soa { .. } => RecordType::Soa,
+        RecordData::Srv { .. } => RecordType::Srv,
+        RecordData::Unknown { record_type, .. } => *record_type,
+    }
 }
 
 #[cfg(test)]
@@ -704,6 +991,40 @@ mod tests {
     #[test]
     fn refuses_a_truncated_message() {
         assert_eq!(decode_response(&[0, 1, 2]).unwrap_err(), WireError::Truncated);
+    }
+
+    #[test]
+    fn decodes_an_soa_with_its_numeric_fields() {
+        // An authoritative SOA carries the serial and timers on the wire; a
+        // decoder that stopped at the two names would drop exactly the fields a
+        // secondary needs to know whether the zone changed.
+        let mut rdata = Vec::from(b"\x03ns1\x00".as_slice());
+        rdata.extend_from_slice(b"\x0ahostmaster\x00");
+        rdata.extend_from_slice(&2026080700_u32.to_be_bytes()); // serial
+        rdata.extend_from_slice(&7200_u32.to_be_bytes()); // refresh
+        rdata.extend_from_slice(&3600_u32.to_be_bytes()); // retry
+        rdata.extend_from_slice(&1209600_u32.to_be_bytes()); // expire
+        rdata.extend_from_slice(&3600_u32.to_be_bytes()); // minimum
+
+        let mut body = Vec::from(b"\xc0\x0c\x00\x06\x00\x01\x00\x00\x01\x2c".as_slice());
+        body.extend_from_slice(&(rdata.len() as u16).to_be_bytes());
+        body.extend_from_slice(&rdata);
+
+        let response = decode_response(&response_with(1, b"\x07example\x03com\x00", &body)).unwrap();
+        assert_eq!(
+            response.answers[0].data,
+            RecordData::Soa {
+                primary: "ns1".to_owned(),
+                responsible: "hostmaster".to_owned(),
+                serial: 2026080700,
+                refresh: 7200,
+                retry: 3600,
+                expire: 1209600,
+                minimum: 3600,
+            }
+        );
+        // The responsible-party contact still reads the same field.
+        assert_eq!(response.soa_contact().as_deref(), Some("hostmaster"));
     }
 
     #[test]

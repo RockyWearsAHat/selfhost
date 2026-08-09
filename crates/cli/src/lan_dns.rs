@@ -1,14 +1,19 @@
-//! `selfhost lan-dns` — the split-horizon resolver the LAN depends on.
+//! `selfhost lan-dns` — the nameserver the LAN depends on, now the real one.
 //!
 //! The router hands this machine out as the network's DNS server, so every
-//! device on the LAN asks here first. For names this deployment serves —
-//! every configured site domain, plus the `[dns]` zone apexes and their `www` —
-//! the answer is the box's **LAN** address rather than the public one, because
-//! a NAT that does not hairpin makes the public address unreachable from
-//! inside the network. Every other question is forwarded upstream unchanged,
-//! exactly like [`crate::watch`]'s diagnostic forwarder: nothing else is
-//! filtered, rewritten, or blocked, because a resolver that breaks the
-//! household's internet gets unplugged before it helps anyone.
+//! device on the LAN asks here first. This command serves the full
+//! [`Authority`] with its split-horizon LAN view enabled: names in the zones
+//! this deployment owns are answered *authoritatively* — every record type,
+//! `A` through `MX`, `TXT`, and the RFC 6186 `SRV`s a mail client's account
+//! setup asks for — with the box's **LAN** address substituted wherever a
+//! record points at the public one, because a NAT that does not hairpin makes
+//! the public address unreachable from inside. Every other question from a LAN
+//! peer is forwarded upstream unchanged, because a resolver that breaks the
+//! household's internet gets unplugged before it helps anyone. A peer on the
+//! public internet sees exactly the authoritative answers and is never
+//! forwarded for, so the public face cannot be used as an open resolver — and
+//! once the router forwards UDP+TCP 53 here and the registrar delegates a
+//! domain's `NS` to this box, the same process answers the world.
 //!
 //! # Deployment contract — do not rename the flags
 //!
@@ -19,51 +24,119 @@
 //! for the entire LAN, because the router keeps pointing at a resolver that
 //! no longer starts.
 //!
-//! # The IPv6 subtlety
+//! # Zones without `[dns]`
 //!
-//! An overridden name must answer `AAAA` with an **empty `NOERROR`**, not a
-//! forwarded upstream answer. Forwarding would hand back the site's public
-//! `AAAA` (if one exists), and a dual-stack client prefers IPv6 — it would
-//! connect straight past the override to the public address, defeating the
-//! split horizon for exactly the clients modern enough to have v6.
+//! A config that never wrote a `[dns]` section still gets a full zone set:
+//! one bare zone per registrable domain claimed anywhere in the config (site
+//! domains, mail domains, the mail hostname), so the LAN resolves everything
+//! this box hosts with zero DNS configuration. A config that *did* write
+//! `[dns]` zones is served exactly those.
 
-use selfhost_config::Config;
-use selfhost_dns::wire::{self, Record, RecordData, RecordType, ResponseCode, ResponseFlags};
+use crate::dns_sync;
+use selfhost_config::{Config, Dns, RecordConfig, ZoneConfig, psl};
 use selfhost_dns::Resolver;
-use std::collections::BTreeMap;
-use std::io;
+use selfhost_dns::authority::{Authority, LanView};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-use std::sync::Arc;
-use std::time::Duration;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream, UdpSocket};
+use std::path::Path;
 
-/// TTL on synthesised override answers. Short, so a client notices within a
-/// minute when the box's LAN address changes.
-const OVERRIDE_TTL: u32 = 60;
+/// Builds the authority every DNS-serving path shares.
+///
+/// One constructor for the daemon, `selfhost dns serve`, and `lan-dns`, so the
+/// three can never serve different zone content: zones from `[dns]` (bare ones
+/// expanded from `public_ip`), each mail domain's `MX`/SPF/DMARC/DKIM/CAA
+/// records (the DKIM `TXT` only when the key on disk is readable — read-only
+/// here, `selfhost run` is what generates it), and the addresses and `SRV`s of
+/// every host the config claims. The split-horizon LAN view is *not* set here;
+/// each caller decides that from its own configuration.
+pub fn build_authority(
+    config: &Config,
+    project_dir: &Path,
+    public_ip: Option<Ipv4Addr>,
+) -> Authority {
+    let mail_records: Vec<(String, Vec<RecordConfig>)> = match &config.mail {
+        Some(mail) => {
+            let dkim = dns_sync::dkim_public(config, project_dir);
+            mail.domains
+                .iter()
+                .map(|domain| (domain.clone(), mail.dns_records(domain, dkim.as_deref())))
+                .collect()
+        }
+        None => Vec::new(),
+    };
+    Authority::for_config_with_mail(config, public_ip, &mail_records)
+}
 
-/// How long to wait for the upstream resolver before giving up on one query.
-const UPSTREAM_TIMEOUT: Duration = Duration::from_secs(5);
+/// The config as served by `lan-dns`: `[dns]` zones synthesised when absent.
+///
+/// Collects every domain the config claims — site domains, mail domains, the
+/// mail hostname — groups them by registrable domain (`blog.example.com` and
+/// `example.com` are one zone), and writes a bare `[[dns.zone]]` for each.
+/// IP literals and single-label names (`localhost`) have no registrable domain
+/// and are skipped. A config that already lists zones is returned unchanged:
+/// the operator's `[dns]` is authoritative over this convenience.
+fn with_synthesised_zones(config: &Config) -> Config {
+    if config.dns.as_ref().is_some_and(|dns| !dns.zones.is_empty()) {
+        return config.clone();
+    }
 
-/// Largest UDP payload accepted, matching the EDNS0 size clients advertise.
-const MAX_UDP: usize = 4096;
+    let mut origins: Vec<String> = Vec::new();
+    let mut claim = |name: &str| {
+        // An IP literal needs no resolving, and `registrable` would happily
+        // treat its last octet as a public suffix.
+        if name.parse::<IpAddr>().is_ok() {
+            return;
+        }
+        if let Some(origin) = psl::registrable(name) {
+            if !origins.contains(&origin) {
+                origins.push(origin);
+            }
+        }
+    };
+    for site in &config.sites {
+        for domain in &site.domains {
+            claim(domain);
+        }
+    }
+    if let Some(mail) = &config.mail {
+        claim(&mail.hostname);
+        for domain in &mail.domains {
+            claim(domain);
+        }
+    }
 
-/// The override table: canonical name → the LAN address to answer with.
-type Overrides = BTreeMap<String, Ipv4Addr>;
+    let mut augmented = config.clone();
+    let zones = origins
+        .into_iter()
+        .map(|domain| ZoneConfig { domain, soa: None, nameservers: Vec::new(), records: Vec::new() })
+        .collect();
+    match &mut augmented.dns {
+        Some(dns) => dns.zones = zones,
+        None => {
+            augmented.dns = Some(Dns {
+                bind: "0.0.0.0:53".into(),
+                secondaries: Vec::new(),
+                dynamic_ip: false,
+                lan_ip: None,
+                zones,
+            });
+        }
+    }
+    augmented
+}
 
 /// Serves split-horizon DNS for the LAN until interrupted.
 ///
-/// Builds the override table from `config` (see [`overrides`]), discovers the
-/// upstream resolver the same way `watch-dns` does, and serves UDP and TCP on
-/// `bind`. Runs until a listener fails or Ctrl-C; the scheduled task restarts
-/// it on the next trigger. Errors are returned as operator-readable strings in
-/// the CLI's usual style.
+/// Builds the shared [`Authority`] (see [`build_authority`]) over the config's
+/// zones — synthesised from the claimed domains when `[dns]` is absent —
+/// enables the LAN view at `lan_ip` with the system resolver as upstream, and
+/// serves UDP and TCP on `bind`. Runs until a listener fails or Ctrl-C; the
+/// scheduled task restarts it on the next trigger.
 pub async fn lan_dns_command(
     config: &Config,
+    project_dir: &Path,
     lan_ip: Ipv4Addr,
     bind: SocketAddr,
 ) -> Result<(), String> {
-    let table = overrides(config, lan_ip);
     let upstream = Resolver::system().address();
 
     // Forwarding to ourselves would answer every question with the question.
@@ -80,257 +153,81 @@ pub async fn lan_dns_command(
         ));
     }
 
+    // The public address the zones' records point at. Discovery can fail on a
+    // flaky uplink; an explicit apex A in the config is the fallback, and the
+    // LAN address the final one — LAN service (the job that must not die)
+    // still works, since the LAN answer is the LAN address either way.
+    let public_ip = match crate::doctor::discover_public_ip().await {
+        Some(address) => address,
+        None => config_apex_a(config).unwrap_or(lan_ip),
+    };
+
+    let augmented = with_synthesised_zones(config);
+    let authority = build_authority(&augmented, project_dir, Some(public_ip));
+    authority.set_lan(LanView { lan_ip, upstream });
+
     println!("selfhost split-horizon DNS");
     println!("  bind      {bind}");
     println!("  upstream  {upstream}");
-    if table.is_empty() {
-        println!("  overrides none — no site domains configured; every query forwards unchanged");
+    println!("  lan ip    {lan_ip} (answers for LAN peers)");
+    println!("  public ip {public_ip} (answers for everyone else)");
+    let origins = authority.origins().await;
+    if origins.is_empty() {
+        println!("  zones     none — no site or mail domains configured; every query forwards");
     } else {
-        for (name, address) in &table {
-            println!("  override  {name} -> {address}");
+        for origin in &origins {
+            println!("  zone      {origin}");
         }
     }
-    println!("\nEverything not listed forwards upstream unchanged. Ctrl-C to stop.\n");
+    println!("\nLAN peers: zone names answer {lan_ip}; everything else forwards upstream.");
+    println!("Public peers: zone names answer authoritatively; everything else is refused.");
+    println!("Ctrl-C to stop.\n");
 
-    let serving = serve(bind, upstream, Arc::new(table));
     tokio::select! {
-        result = serving => result.map_err(|error| match error.kind() {
-            io::ErrorKind::PermissionDenied => format!(
-                "cannot bind {bind}: port 53 needs privilege.\n  \
-                 Run it with sudo, or on Linux grant the capability once:\n  \
-                 sudo setcap 'cap_net_bind_service=+ep' ./target/release/selfhost"
-            ),
-            io::ErrorKind::AddrInUse => format!(
-                "cannot bind {bind}: something already answers DNS on this machine.\n  \
-                 On macOS that is usually a VPN client or Internet Sharing."
-            ),
-            _ => format!("LAN DNS stopped: {error}"),
-        }),
+        result = authority.serve(bind) => result.map_err(|error| bind_hint(bind, error)),
         _ = tokio::signal::ctrl_c() => Ok(()),
     }
 }
 
-/// Builds the override table: every name this deployment serves → `lan_ip`.
-///
-/// Sources, all lowercased and stripped of any trailing dot:
-/// - every domain of every configured site;
-/// - each `[dns]` zone's apex, plus `www.<apex>`, since a bare zone serves both;
-/// - the `[mail]` hostname and its client-autoconfig hosts (`mail.`, `imap.`,
-///   `smtp.` per mail domain), so a LAN mail client reaches the listeners
-///   directly instead of dying against the non-hairpinning public address.
-///
-/// Entries that are raw IP literals or `localhost` are skipped: an IP needs no
-/// resolving, and hijacking `localhost` would break every device's loopback.
-fn overrides(config: &Config, lan_ip: Ipv4Addr) -> Overrides {
-    let mut table = Overrides::new();
-    let mut claim = |name: &str| {
-        let name = canonical(name);
-        if name.is_empty() || name == "localhost" || name.parse::<IpAddr>().is_ok() {
-            return;
+/// The first explicit apex `A` in any configured `[dns]` zone, if one parses.
+fn config_apex_a(config: &Config) -> Option<Ipv4Addr> {
+    config
+        .dns
+        .as_ref()?
+        .zones
+        .iter()
+        .flat_map(|zone| &zone.records)
+        .find(|record| record.name == "@" && record.record_type.eq_ignore_ascii_case("A"))
+        .and_then(|record| record.value.parse().ok())
+}
+
+/// An operator-readable message for a serve failure, with the two classic
+/// port-53 causes spelled out.
+fn bind_hint(bind: SocketAddr, error: selfhost_dns::authority::DnsError) -> String {
+    use selfhost_dns::authority::DnsError;
+    match &error {
+        DnsError::Bind { source, .. } if source.kind() == std::io::ErrorKind::PermissionDenied => {
+            format!(
+                "cannot bind {bind}: port 53 needs privilege.\n  \
+                 Run it with sudo, or on Linux grant the capability once:\n  \
+                 sudo setcap 'cap_net_bind_service=+ep' ./target/release/selfhost"
+            )
         }
-        table.insert(name, lan_ip);
-    };
-
-    for site in &config.sites {
-        for domain in &site.domains {
-            claim(domain);
+        DnsError::Bind { source, .. } if source.kind() == std::io::ErrorKind::AddrInUse => {
+            format!(
+                "cannot bind {bind}: something already answers DNS on this machine.\n  \
+                 On macOS that is usually a VPN client or Internet Sharing."
+            )
         }
+        _ => format!("LAN DNS stopped: {error}"),
     }
-    if let Some(dns) = &config.dns {
-        for zone in &dns.zones {
-            claim(&zone.domain);
-            claim(&format!("www.{}", zone.domain));
-        }
-    }
-    if let Some(mail) = &config.mail {
-        claim(&mail.hostname);
-        for host in mail.client_hosts() {
-            claim(&host);
-        }
-    }
-    table
-}
-
-/// A query name in the form the override table is keyed by: lowercase, no
-/// trailing dot. DNS names are case-insensitive and a client may or may not
-/// send the root dot, so both differences must be erased before lookup.
-fn canonical(name: &str) -> String {
-    name.trim_end_matches('.').to_ascii_lowercase()
-}
-
-/// Decides one query: `Some(response)` to answer locally, `None` to forward.
-///
-/// Local answers, for a name in `table` only:
-/// - `A` or `ANY` → an authoritative `A` for the LAN address, TTL
-///   [`OVERRIDE_TTL`];
-/// - `AAAA` → an authoritative empty `NOERROR`, so a dual-stack client cannot
-///   slip past the override on IPv6 (see the module docs).
-///
-/// Everything else forwards: names not in the table, other record types (an
-/// overridden domain's `MX` and `TXT` must still resolve publicly), and
-/// messages that do not decode — a resolver in the LAN's critical path passes
-/// on what it cannot parse rather than becoming a fault of its own.
-fn respond(table: &Overrides, query: &[u8]) -> Option<Vec<u8>> {
-    let question = wire::decode_query(query).ok()?;
-    let address = *table.get(&canonical(&question.name))?;
-
-    // 255 is QTYPE `ANY` (RFC 1035 §3.2.3); it has no dedicated variant.
-    let answers: Vec<Record> = match question.record_type {
-        RecordType::A | RecordType::Other(255) => vec![Record {
-            name: question.name.clone(),
-            ttl: OVERRIDE_TTL,
-            data: RecordData::A(address),
-        }],
-        RecordType::Aaaa => Vec::new(),
-        _ => return None,
-    };
-
-    Some(wire::encode_response(
-        &question,
-        ResponseCode::NoError,
-        ResponseFlags { authoritative: true, truncated: false },
-        &answers,
-        &[],
-        &[],
-    ))
-}
-
-/// Serves UDP and TCP on the same port until one listener fails.
-///
-/// Both transports, because a truncated UDP answer sends the client straight
-/// to TCP — a resolver that only speaks UDP breaks large lookups, which is the
-/// household's internet rather than just this feature.
-async fn serve(bind: SocketAddr, upstream: SocketAddr, table: Arc<Overrides>) -> io::Result<()> {
-    let datagram = Arc::new(UdpSocket::bind(bind).await?);
-    let stream = TcpListener::bind(bind).await?;
-
-    tokio::try_join!(
-        serve_udp(Arc::clone(&datagram), upstream, Arc::clone(&table)),
-        serve_tcp(stream, upstream, table),
-    )?;
-    Ok(())
-}
-
-/// The UDP half: one datagram in, one datagram out.
-async fn serve_udp(
-    socket: Arc<UdpSocket>,
-    upstream: SocketAddr,
-    table: Arc<Overrides>,
-) -> io::Result<()> {
-    let mut buffer = vec![0_u8; MAX_UDP];
-    loop {
-        let (read, from) = socket.recv_from(&mut buffer).await?;
-        let query = buffer[..read].to_vec();
-
-        // A synthesised answer needs no network, so it is sent inline; only a
-        // forward waits on the upstream and earns its own task.
-        if let Some(answer) = respond(&table, &query) {
-            let _ = socket.send_to(&answer, from).await;
-            continue;
-        }
-        let socket = Arc::clone(&socket);
-        tokio::spawn(async move {
-            if let Some(answer) = forward_udp(&query, upstream).await {
-                let _ = socket.send_to(&answer, from).await;
-            }
-        });
-    }
-}
-
-/// Sends one query upstream and waits for its answer.
-///
-/// A fresh ephemeral socket per query, so answers cannot be confused between
-/// concurrent lookups without tracking message ids ourselves.
-async fn forward_udp(query: &[u8], upstream: SocketAddr) -> Option<Vec<u8>> {
-    let work = async {
-        let bind = if upstream.is_ipv4() { "0.0.0.0:0" } else { "[::]:0" };
-        let socket = UdpSocket::bind(bind).await.ok()?;
-        socket.send_to(query, upstream).await.ok()?;
-
-        let mut buffer = vec![0_u8; MAX_UDP];
-        let read = socket.recv(&mut buffer).await.ok()?;
-        buffer.truncate(read);
-        Some(buffer)
-    };
-    tokio::time::timeout(UPSTREAM_TIMEOUT, work).await.ok().flatten()
-}
-
-/// The TCP half: length-prefixed messages, as many as the client sends.
-async fn serve_tcp(
-    listener: TcpListener,
-    upstream: SocketAddr,
-    table: Arc<Overrides>,
-) -> io::Result<()> {
-    loop {
-        let (client, _) = listener.accept().await?;
-        let table = Arc::clone(&table);
-        tokio::spawn(async move {
-            let _ = relay_tcp(client, upstream, table).await;
-        });
-    }
-}
-
-/// Relays one client's TCP connection, query by query, answering overridden
-/// names locally and forwarding the rest.
-async fn relay_tcp(
-    mut client: TcpStream,
-    upstream: SocketAddr,
-    table: Arc<Overrides>,
-) -> io::Result<()> {
-    loop {
-        let Some(query) = read_message(&mut client).await? else { return Ok(()) };
-
-        if let Some(answer) = respond(&table, &query) {
-            write_message(&mut client, &answer).await?;
-            continue;
-        }
-
-        let exchange = async {
-            let mut server = TcpStream::connect(upstream).await?;
-            write_message(&mut server, &query).await?;
-            read_message(&mut server).await
-        };
-        let answer = match tokio::time::timeout(UPSTREAM_TIMEOUT, exchange).await {
-            Ok(Ok(Some(answer))) => answer,
-            // Nothing usable came back. Closing is the honest reply: the client
-            // then retries, rather than being handed a forged answer.
-            _ => return Ok(()),
-        };
-        write_message(&mut client, &answer).await?;
-    }
-}
-
-/// Reads one length-prefixed DNS message, or `None` at a clean end of stream.
-async fn read_message(stream: &mut TcpStream) -> io::Result<Option<Vec<u8>>> {
-    let mut length = [0_u8; 2];
-    match stream.read_exact(&mut length).await {
-        Ok(_) => {}
-        Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => return Ok(None),
-        Err(error) => return Err(error),
-    }
-    let mut message = vec![0_u8; u16::from_be_bytes(length) as usize];
-    stream.read_exact(&mut message).await?;
-    Ok(Some(message))
-}
-
-/// Writes one length-prefixed DNS message.
-async fn write_message(stream: &mut TcpStream, message: &[u8]) -> io::Result<()> {
-    let length = u16::try_from(message.len())
-        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "DNS message exceeds 65535 bytes"))?;
-    stream.write_all(&length.to_be_bytes()).await?;
-    stream.write_all(message).await
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use selfhost_config::{
-        AcmeEnvironment, Dns, Firewall, Health, Node, Role, Server, Site, ZoneConfig,
-    };
+    use selfhost_config::{AcmeEnvironment, Firewall, Health, Node, Role, Server, Site};
     use std::path::PathBuf;
-
-    /// The address every override answers with in these tests.
-    const LAN_IP: Ipv4Addr = Ipv4Addr::new(192, 168, 1, 8);
 
     fn site(domains: &[&str]) -> Site {
         Site {
@@ -368,62 +265,32 @@ mod tests {
         }
     }
 
-    fn query_for(name: &str, record_type: RecordType) -> Vec<u8> {
-        wire::encode_query(0xBEEF, name, record_type).expect("a valid query")
+    fn zone_origins(config: &Config) -> Vec<String> {
+        with_synthesised_zones(config)
+            .dns
+            .expect("a dns section exists after synthesis")
+            .zones
+            .into_iter()
+            .map(|zone| zone.domain)
+            .collect()
     }
 
     #[test]
-    fn overrides_cover_every_site_domain_lowercased() {
-        let config =
-            config_with(vec![site(&["Example.COM", "www.example.com", "other.net"])], None);
-        let table = overrides(&config, LAN_IP);
-
-        assert_eq!(
-            table.keys().cloned().collect::<Vec<_>>(),
-            vec!["example.com", "other.net", "www.example.com"]
+    fn zones_are_synthesised_per_registrable_domain() {
+        // Subdomain and apex collapse into one zone; a second domain gets its own.
+        let config = config_with(
+            vec![site(&["blog.example.com", "Example.COM", "other.net"])],
+            None,
         );
-        assert!(table.values().all(|address| *address == LAN_IP));
+        assert_eq!(zone_origins(&config), vec!["example.com", "other.net"]);
     }
 
     #[test]
-    fn ip_literals_and_localhost_are_never_overridden() {
-        // An IP literal needs no resolving, and answering for `localhost` would
-        // hijack every device's loopback — both would be config typos amplified
-        // into a LAN-wide fault.
-        let config = config_with(vec![site(&["192.168.1.8", "localhost", "real.example"])], None);
-        let table = overrides(&config, LAN_IP);
-        assert_eq!(table.keys().cloned().collect::<Vec<_>>(), vec!["real.example"]);
-    }
-
-    #[test]
-    fn dns_zone_apexes_and_their_www_are_included() {
-        let dns = Dns {
-            bind: "0.0.0.0:53".into(),
-            secondaries: vec![],
-            dynamic_ip: true,
-            lan_ip: None,
-            zones: vec![ZoneConfig {
-                domain: "rockywearsahat.com".into(),
-                soa: None,
-                nameservers: vec![],
-                records: vec![],
-            }],
-        };
-        let table = overrides(&config_with(vec![], Some(dns)), LAN_IP);
-        assert_eq!(
-            table.keys().cloned().collect::<Vec<_>>(),
-            vec!["rockywearsahat.com", "www.rockywearsahat.com"]
-        );
-    }
-
-    #[test]
-    fn mail_hostname_and_client_autoconfig_hosts_are_included() {
-        // A LAN mail client resolves `imap.`/`smtp.`/`mail.` — hand those the
-        // LAN address too, or account setup dies against the hairpin NAT.
+    fn mail_domains_and_hostname_are_claimed_too() {
         let mut config = config_with(vec![], None);
         config.mail = Some(selfhost_config::Mail {
-            hostname: "rockywearsahat.com".into(),
-            domains: vec!["rockywearsahat.com".into()],
+            hostname: "mail.example.com".into(),
+            domains: vec!["example.com".into()],
             mailboxes: vec![],
             dkim: None,
             relay: None,
@@ -431,79 +298,33 @@ mod tests {
             max_message_bytes: 1,
             require_tls_for_auth: true,
         });
-
-        let table = overrides(&config, LAN_IP);
-        assert_eq!(
-            table.keys().cloned().collect::<Vec<_>>(),
-            vec![
-                "imap.rockywearsahat.com",
-                "mail.rockywearsahat.com",
-                "rockywearsahat.com",
-                "smtp.rockywearsahat.com",
-            ]
-        );
-        assert!(table.values().all(|address| *address == LAN_IP));
+        assert_eq!(zone_origins(&config), vec!["example.com"]);
     }
 
     #[test]
-    fn qname_matching_ignores_case_and_the_trailing_dot() {
-        assert_eq!(canonical("ExAmPle.COM."), "example.com");
-        assert_eq!(canonical("example.com"), "example.com");
-
-        let table = overrides(&config_with(vec![site(&["example.com"])], None), LAN_IP);
-        let mixed = query_for("ExAmPle.COM.", RecordType::A);
-        assert!(respond(&table, &mixed).is_some(), "case and dot must not defeat the override");
+    fn ip_literals_and_localhost_synthesise_no_zone() {
+        // An IP needs no resolving and `localhost` has no registrable domain;
+        // both would be config typos amplified into a LAN-wide fault.
+        let config = config_with(vec![site(&["192.168.1.8", "localhost", "real.example.com"])], None);
+        assert_eq!(zone_origins(&config), vec!["example.com"]);
     }
 
     #[test]
-    fn an_overridden_a_query_gets_an_authoritative_lan_answer() {
-        // Wire-correctness end to end: the bytes handed back must decode with
-        // the same parser real responses go through.
-        let table = overrides(&config_with(vec![site(&["example.com"])], None), LAN_IP);
-        let answer = respond(&table, &query_for("example.com", RecordType::A))
-            .expect("an overridden A query is answered locally");
-
-        assert_eq!(&answer[0..2], &[0xBE, 0xEF], "the query id is echoed");
-        assert_ne!(answer[2] & 0x04, 0, "the AA bit marks the answer authoritative");
-
-        let decoded = wire::decode_response(&answer).expect("our own output decodes");
-        assert_eq!(decoded.code, ResponseCode::NoError);
-        assert_eq!(decoded.first_a(), Some(LAN_IP));
-        assert_eq!(decoded.answers[0].ttl, OVERRIDE_TTL);
-        assert_eq!(decoded.answers[0].name, "example.com");
-    }
-
-    #[test]
-    fn an_any_query_for_an_overridden_name_is_answered_like_a() {
-        let table = overrides(&config_with(vec![site(&["example.com"])], None), LAN_IP);
-        let answer = respond(&table, &query_for("example.com", RecordType::Other(255)))
-            .expect("ANY is answered locally");
-        assert_eq!(wire::decode_response(&answer).expect("decodes").first_a(), Some(LAN_IP));
-    }
-
-    #[test]
-    fn aaaa_for_an_overridden_name_is_an_empty_noerror() {
-        // Forwarding AAAA would hand back the public v6 address and a
-        // dual-stack client would connect straight past the override.
-        let table = overrides(&config_with(vec![site(&["example.com"])], None), LAN_IP);
-        let answer = respond(&table, &query_for("example.com", RecordType::Aaaa))
-            .expect("AAAA is answered locally, not forwarded");
-
-        let decoded = wire::decode_response(&answer).expect("decodes");
-        assert_eq!(decoded.code, ResponseCode::NoError);
-        assert!(decoded.answers.is_empty(), "no address, and no NXDOMAIN either");
-    }
-
-    #[test]
-    fn everything_else_is_forwarded() {
-        let table = overrides(&config_with(vec![site(&["example.com"])], None), LAN_IP);
-
-        // A name this deployment does not serve.
-        assert!(respond(&table, &query_for("elsewhere.net", RecordType::A)).is_none());
-        // An overridden name's mail and text records still resolve publicly.
-        assert!(respond(&table, &query_for("example.com", RecordType::Mx)).is_none());
-        assert!(respond(&table, &query_for("example.com", RecordType::Txt)).is_none());
-        // A message that does not decode is passed on rather than dropped.
-        assert!(respond(&table, &[0xFF, 0x00, 0x01]).is_none());
+    fn an_operator_written_dns_section_is_served_verbatim() {
+        let dns = Dns {
+            bind: "0.0.0.0:53".into(),
+            secondaries: vec![],
+            dynamic_ip: true,
+            lan_ip: None,
+            zones: vec![ZoneConfig {
+                domain: "chosen.example".into(),
+                soa: None,
+                nameservers: vec![],
+                records: vec![],
+            }],
+        };
+        // The site domain does NOT grow a zone: the operator's [dns] wins.
+        let config = config_with(vec![site(&["other.net"])], Some(dns));
+        assert_eq!(zone_origins(&config), vec!["chosen.example"]);
     }
 }
