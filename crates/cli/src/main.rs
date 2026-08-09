@@ -6,9 +6,11 @@
 mod acme_task;
 mod assess;
 mod dns_status;
+mod dns_sync;
 mod doctor;
 mod identify;
 mod investigate;
+mod lan_dns;
 mod mail_task;
 mod oui;
 mod proxyware;
@@ -63,8 +65,20 @@ Commands
                              asking for a residential proxy service
   dns                        Show the zone this machine serves and whether it
                              is answering on port 53
+  dns sync [--apply]         Reconcile every served domain's records at the
+                             registrar in [registrar]: derive what the config
+                             implies, list what the registrar serves, and print
+                             the plan. Dry-run by default; only --apply writes.
+                             Records point at this machine's discovered public
+                             IP (falling back to the config's [dns] apex A when
+                             discovery fails). provider = \"manual\" prints the
+                             records to add by hand instead
   serve-dns [--bind <addr>]  Serve authoritative DNS for the configured zones in
                              the foreground (the daemon serves them too)
+  lan-dns --lan-ip <ip> [--bind <addr>]
+                             Serve split-horizon DNS for the LAN: configured
+                             site domains answer with this machine's LAN
+                             address, everything else forwards upstream
   run                        Start the proxy in the foreground
   daemon [--bind <addr>]     Run the services and the control API the console
                              connects to
@@ -82,6 +96,9 @@ Commands
                              Add a mailbox; reads the password from stdin if
                              omitted. [mail] must already be configured.
   mail remove <address>      Remove a mailbox
+  console-password [<password>]
+                             Set the web console's login password; reads it
+                             twice from stdin if omitted
   help                       Show this message
 
 Config lives in selfhost.config.toml. Everything else is derived from it.
@@ -98,14 +115,16 @@ fn main() -> ExitCode {
         "site" => find_config().and_then(|path| site::run(&arguments, &path)),
         "doctor" => doctor_command(&arguments),
         "watch-dns" => watch_command(&arguments),
-        "dns" => dns_command(),
+        "dns" => dns_command(&arguments),
         "serve-dns" => serve_dns_command(&arguments),
+        "lan-dns" => lan_dns_command(&arguments),
         "run" => run(),
         "daemon" => daemon_command(&arguments),
         "services" => services_command(),
         "teardown" => teardown_command(&arguments),
         "service" => service_command(&arguments),
         "mail" => mail_command(&arguments),
+        "console-password" => console_password_command(&arguments),
         "help" | "--help" | "-h" => {
             eprint!("{USAGE}");
             Ok(())
@@ -502,8 +521,17 @@ async fn serve_daemon(
         println!("  reachability the router/edge must forward UDP+TCP 53 here (selfhost does not touch it)");
     }
 
-    let api =
-        Api::new(supervisor.clone(), store, token, watches.clone(), firewall.clone());
+    if !config.namecheap_ddns.is_empty() {
+        println!("\nnamecheap dynamic dns");
+        for entry in &config.namecheap_ddns {
+            println!("  {}.{}", entry.host, entry.domain);
+        }
+    }
+
+    // Console auth is read once here: a `selfhost console-password` run takes
+    // effect at the next daemon restart.
+    let api = Api::new(supervisor.clone(), store, token, watches.clone(), firewall.clone())
+        .with_console_auth(&data_dir);
     let outcome = tokio::select! {
         result = selfhost_admin::serve(listener, api) => {
             result.map_err(|e| format!("the control api stopped: {e}"))
@@ -519,6 +547,9 @@ async fn serve_daemon(
         // Tracks the WAN IP and rewrites the apex A when it moves. Pends forever
         // when DNS or dynamic_ip is off, so it occupies an arm without firing.
         _ = track_wan_ip_if_enabled(dns.clone(), &config) => Ok(()),
+        // The same tracking, aimed at Namecheap's Dynamic DNS instead of this
+        // daemon's own authority. Pends forever when `namecheap_ddns` is empty.
+        _ = track_namecheap_ddns_if_configured(&config) => Ok(()),
         _ = shutdown_signal() => Ok(()),
     };
 
@@ -629,6 +660,35 @@ async fn track_wan_ip_if_enabled(dns: Option<Authority>, config: &Config) {
     .await;
 }
 
+/// Tracks the WAN IP and keeps every `[[namecheap_ddns]]` entry pointed at it,
+/// or pends forever.
+///
+/// Independent of `[dns]` entirely — a deployment can use Namecheap's own
+/// Dynamic DNS with no authoritative zone of its own, which is the smaller
+/// commitment [`selfhost_config::NamecheapDdns`]'s own doc comment recommends
+/// starting with. Building [`selfhost_dns::NamecheapClient`] can fail (no TLS
+/// roots, in practice never on a real build); that failure is logged once and
+/// this arm then pends forever rather than taking the whole daemon down for a
+/// feature that is, unlike DNS itself, never the only way a domain resolves.
+async fn track_namecheap_ddns_if_configured(config: &Config) {
+    if config.namecheap_ddns.is_empty() {
+        return std::future::pending().await;
+    }
+    let writer = match selfhost_dns::NamecheapClient::new() {
+        Ok(client) => client,
+        Err(reason) => {
+            eprintln!("namecheap-ddns: could not start ({reason}); this daemon's WAN IP will not be tracked for it");
+            return std::future::pending().await;
+        }
+    };
+    selfhost_dns::track_namecheap_ddns(
+        writer,
+        config.namecheap_ddns.clone(),
+        selfhost_dns::updater::DEFAULT_INTERVAL,
+    )
+    .await;
+}
+
 /// Turns a DNS bind failure into a message that says what to do about it.
 ///
 /// Port 53 is privileged and commonly already held by a stub resolver, so the
@@ -657,12 +717,25 @@ fn dns_bind_error(bind: SocketAddr, error: DnsError) -> String {
     }
 }
 
+/// Dispatches `dns`'s subcommands: bare `dns` shows the served zone,
+/// `dns sync` reconciles the registrar-hosted records.
+fn dns_command(arguments: &[String]) -> Result<(), String> {
+    match arguments.get(1).map(String::as_str) {
+        None => dns_show_command(),
+        Some("sync") => dns_sync_command(arguments),
+        Some(other) => Err(format!(
+            "unknown dns subcommand \"{other}\" — use bare `dns` to show the served zone, \
+             or `dns sync [--apply]` to reconcile the registrar\n\n{USAGE}"
+        )),
+    }
+}
+
 /// Shows the zone this machine serves and whether it is answering on port 53.
 ///
 /// Read-only and needs no running daemon to describe the zone — the preview is
 /// derived from the config the same way the server derives it — but it also
 /// probes the bind so the reader learns whether the server is actually up.
-fn dns_command() -> Result<(), String> {
+fn dns_show_command() -> Result<(), String> {
     let (config, _project_dir) = load()?;
 
     let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -671,6 +744,22 @@ fn dns_command() -> Result<(), String> {
         .map_err(|e| format!("could not start the async runtime: {e}"))?;
 
     runtime.block_on(dns_status::show(&config))
+}
+
+/// Reconciles every served domain's records at the configured registrar.
+///
+/// Dry-run unless `--apply` is passed — see [`dns_sync`] for the whole
+/// contract, including the safety law the engine enforces.
+fn dns_sync_command(arguments: &[String]) -> Result<(), String> {
+    let (config, project_dir) = load()?;
+    let apply = arguments.iter().any(|argument| argument == "--apply");
+
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| format!("could not start the async runtime: {e}"))?;
+
+    runtime.block_on(dns_sync::run(&config, &project_dir, apply))
 }
 
 /// Serves authoritative DNS in the foreground, without the rest of the daemon.
@@ -700,6 +789,36 @@ fn serve_dns_command(arguments: &[String]) -> Result<(), String> {
         .map_err(|e| format!("could not start the async runtime: {e}"))?;
 
     runtime.block_on(serve_dns_foreground(config, bind))
+}
+
+/// Serves split-horizon DNS for the LAN in the foreground.
+///
+/// The box's scheduled task runs `selfhost lan-dns --lan-ip 192.168.1.8`, so
+/// the command name and flag names are a deployment contract — see the
+/// [`lan_dns`] module docs. Renaming any of them silently kills DNS for the
+/// entire LAN on the next deploy.
+fn lan_dns_command(arguments: &[String]) -> Result<(), String> {
+    let (config, _project_dir) = load()?;
+    let lan_ip: std::net::Ipv4Addr = value_of(arguments, "--lan-ip")
+        .ok_or_else(|| {
+            format!(
+                "lan-dns needs --lan-ip <ip> — the LAN address every configured site domain \
+                 should answer with, for example:\n  selfhost lan-dns --lan-ip 192.168.1.8\n\n{USAGE}"
+            )
+        })?
+        .parse()
+        .map_err(|e| format!("--lan-ip: {e}"))?;
+    let bind: SocketAddr = match value_of(arguments, "--bind") {
+        Some(given) => given.parse().map_err(|e| format!("--bind {given}: {e}"))?,
+        None => "0.0.0.0:53".parse().expect("literal bind address"),
+    };
+
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| format!("could not start the async runtime: {e}"))?;
+
+    runtime.block_on(lan_dns::lan_dns_command(&config, lan_ip, bind))
 }
 
 /// Binds the authority and serves until interrupted.
@@ -941,6 +1060,44 @@ fn read_password(argument: Option<&String>) -> Result<String, String> {
             Ok(line.trim_end_matches(['\r', '\n']).to_owned())
         }
     }
+}
+
+/// Sets the console login password, hashing it into `<data_dir>/console.passwd`.
+///
+/// Takes the password as an argument only if given one; otherwise reads it
+/// twice from stdin and refuses a mismatch, so a typo cannot silently lock the
+/// console out. The hash is PBKDF2, matching what the admin API verifies
+/// against; the daemon reads it at startup, so a change takes effect on the
+/// next daemon restart.
+fn console_password_command(arguments: &[String]) -> Result<(), String> {
+    let (config, project_dir) = load()?;
+    let data_dir = teardown::data_dir(&config, &project_dir);
+
+    let password = match arguments.get(1) {
+        Some(password) => password.clone(),
+        None => {
+            eprintln!("New console password (input is echoed):");
+            let first = read_password(None)?;
+            eprintln!("Repeat it:");
+            let second = read_password(None)?;
+            if first != second {
+                return Err("the passwords did not match; nothing was changed".into());
+            }
+            first
+        }
+    };
+    if password.is_empty() {
+        return Err("an empty console password would let anyone in; nothing was changed".into());
+    }
+
+    selfhost_admin::ConsolePassword::write(&data_dir, &password)
+        .map_err(|error| error.to_string())?;
+    println!(
+        "✓ console password set at {}",
+        selfhost_admin::ConsolePassword::path_in(&data_dir).display()
+    );
+    println!("  takes effect on the next daemon restart");
+    Ok(())
 }
 
 /// Hashes a mailbox password for `[[mail.mailboxes]] password_hash`.

@@ -1055,6 +1055,7 @@ mod tests {
             dns: None,
             mail: None,
             namecheap_ddns: vec![],
+            registrar: None,
         }
     }
 

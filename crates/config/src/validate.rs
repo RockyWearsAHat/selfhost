@@ -9,9 +9,10 @@
 //! Validation collects *all* problems rather than stopping at the first, so one
 //! run of `selfhost check` reports everything that needs fixing.
 
-use crate::{Config, Role};
+use crate::{Cidr, Config, Role};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
+use std::net::SocketAddr;
 use std::path::PathBuf;
 
 /// A single validation failure, naming the field responsible.
@@ -80,8 +81,83 @@ impl Config {
         self.check_nodes(&mut problems);
         self.check_sites(&mut problems);
         self.check_port_collisions(&mut problems);
+        self.check_firewall(&mut problems);
+        self.check_dns(&mut problems);
+        self.check_mail(&mut problems);
+        self.check_namecheap_ddns(&mut problems);
+        self.check_registrar(&mut problems);
 
         if problems.is_empty() { Ok(()) } else { Err(ConfigError::Invalid(problems)) }
+    }
+
+    /// When the firewall is managed, the public binds must be real socket addresses.
+    ///
+    /// The daemon derives each inbound allowance by parsing `http_bind` and
+    /// `https_bind` as a [`SocketAddr`]; a bind that does not parse is dropped
+    /// there, silently opening no port for a listener the operator believes is
+    /// exposed. Caught here instead, and named, but only while `manage` is on —
+    /// an unmanaged firewall derives nothing, so an unusual bind string is then
+    /// the proxy's concern alone rather than a firewall error.
+    fn check_firewall(&self, problems: &mut Vec<Problem>) {
+        if !self.server.firewall.manage {
+            return;
+        }
+        for (field, bind) in [
+            ("server.http_bind", &self.server.http_bind),
+            ("server.https_bind", &self.server.https_bind),
+        ] {
+            if bind.parse::<SocketAddr>().is_err() {
+                problems.push(Problem {
+                    field: field.into(),
+                    message: "must be a bindable address like 0.0.0.0:80 when \
+                              server.firewall.manage is set"
+                        .into(),
+                });
+            }
+        }
+    }
+
+    /// Authoritative DNS, when configured, must name valid zones and records.
+    ///
+    /// Delegated to [`crate::dns::Dns::check`] so the schema and its rules live
+    /// together, exactly as a service validates through [`crate::ServiceSpec`].
+    /// Absent `[dns]` validates nothing — DNS is opt-in.
+    fn check_dns(&self, problems: &mut Vec<Problem>) {
+        if let Some(dns) = &self.dns {
+            dns.check("dns", problems);
+        }
+    }
+
+    /// Mail, when configured, must name a valid host, domains, and mailboxes.
+    ///
+    /// Delegated to [`crate::mail::Mail::check`] so the schema and its rules live
+    /// together, exactly as DNS validates through [`crate::dns::Dns::check`].
+    /// Absent `[mail]` validates nothing — mail is opt-in.
+    fn check_mail(&self, problems: &mut Vec<Problem>) {
+        if let Some(mail) = &self.mail {
+            mail.check("mail", problems);
+        }
+    }
+
+    /// Each Namecheap Dynamic DNS entry, when present, must name a domain,
+    /// host, and password. Delegated to
+    /// [`crate::namecheap::NamecheapDdns::check`], exactly as DNS and mail
+    /// validate through their own schema modules. An empty list validates
+    /// nothing — this feature is opt-in, per entry.
+    fn check_namecheap_ddns(&self, problems: &mut Vec<Problem>) {
+        for (i, entry) in self.namecheap_ddns.iter().enumerate() {
+            entry.check(&format!("namecheap_ddns[{i}]"), problems);
+        }
+    }
+
+    /// The registrar section, when present, must carry its provider's
+    /// credentials. Delegated to [`crate::registrar::Registrar::check`],
+    /// exactly as DNS, mail, and Dynamic DNS validate through their own
+    /// schema modules. Absent `[registrar]` validates nothing — sync is opt-in.
+    fn check_registrar(&self, problems: &mut Vec<Problem>) {
+        if let Some(registrar) = &self.registrar {
+            registrar.check("registrar", problems);
+        }
     }
 
     /// Exactly one owner, unique names, and a mesh address for every worker.
@@ -124,9 +200,15 @@ impl Config {
     }
 
     /// Sites must have a hostname, something to serve, and resolvable instances.
+    ///
+    /// Access gating is checked here too: every `allowed_cidrs` entry must
+    /// parse, and a console site must be gated, static, and unique — the
+    /// console fronts the service-control API, so an open or ambiguous one is
+    /// refused at load rather than discovered as an exposure later.
     fn check_sites(&self, problems: &mut Vec<Problem>) {
         let mut seen_names = BTreeSet::new();
         let mut seen_domains: BTreeMap<String, usize> = BTreeMap::new();
+        let mut console_site: Option<usize> = None;
 
         for (i, site) in self.sites.iter().enumerate() {
             if !seen_names.insert(site.name.as_str()) {
@@ -233,6 +315,65 @@ impl Config {
                     Some(_) => {}
                 }
             }
+
+            for (j, entry) in site.allowed_cidrs.iter().enumerate() {
+                if let Err(why) = Cidr::parse(entry) {
+                    problems.push(Problem {
+                        field: format!("sites[{i}].allowed_cidrs[{j}]"),
+                        message: why,
+                    });
+                }
+            }
+
+            if site.console {
+                if let Some(previous) = console_site {
+                    problems.push(Problem {
+                        field: format!("sites[{i}].console"),
+                        message: format!(
+                            "sites[{previous}] is already the console; \
+                             only one site may be the built-in admin console"
+                        ),
+                    });
+                } else {
+                    console_site = Some(i);
+                }
+
+                if site.allowed_cidrs.is_empty() {
+                    problems.push(Problem {
+                        field: format!("sites[{i}].allowed_cidrs"),
+                        message: "a console site must list allowed_cidrs; \
+                                  the admin console is never left open to everyone"
+                            .into(),
+                    });
+                }
+
+                if site.static_root.is_none() {
+                    problems.push(Problem {
+                        field: format!("sites[{i}].static_root"),
+                        message: "a console site needs static_root to serve the console SPA from"
+                            .into(),
+                    });
+                }
+
+                if !site.instances.is_empty() {
+                    problems.push(Problem {
+                        field: format!("sites[{i}].instances"),
+                        message: "a console site declares no instances; \
+                                  its /api traffic is relayed to server.admin_bind, \
+                                  and its routing is built into the proxy"
+                            .into(),
+                    });
+                }
+
+                if !site.app_paths.is_empty() {
+                    problems.push(Problem {
+                        field: format!("sites[{i}].app_paths"),
+                        message: "a console site declares no app_paths; \
+                                  its routing is built into the proxy"
+                            .into(),
+                    });
+                }
+            }
         }
     }
 
@@ -263,7 +404,7 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{AcmeEnvironment, Health, Instance, Node, Server, Site};
+    use crate::{AcmeEnvironment, Firewall, Health, Instance, Node, Scope, Server, Site};
     use std::path::PathBuf;
 
     fn server() -> Server {
@@ -274,6 +415,7 @@ mod tests {
             acme: AcmeEnvironment::SelfSigned,
             data_dir: PathBuf::from("./data"),
             admin_bind: "127.0.0.1:9191".into(),
+            firewall: Firewall::default(),
         }
     }
 
@@ -287,6 +429,8 @@ mod tests {
             instances: vec![],
             health: Health::default(),
             canonical_redirect: true,
+            allowed_cidrs: vec![],
+            console: false,
         }
     }
 
@@ -295,7 +439,16 @@ mod tests {
     }
 
     fn config(nodes: Vec<Node>, sites: Vec<Site>) -> Config {
-        Config { version: 1, server: server(), nodes, sites }
+        Config {
+            version: 1,
+            server: server(),
+            nodes,
+            sites,
+            dns: None,
+            mail: None,
+            namecheap_ddns: vec![],
+            registrar: None,
+        }
     }
 
     fn problems_of(config: &Config) -> Vec<Problem> {
@@ -418,5 +571,105 @@ mod tests {
         let mut future = config(vec![owner_node()], vec![site("a", "a.com")]);
         future.version = 2;
         assert!(problems_of(&future).iter().any(|p| p.field == "version"));
+    }
+
+    #[test]
+    fn a_managed_firewall_refuses_a_bind_that_is_not_a_socket_address() {
+        // The bind is parsed as a SocketAddr to derive the port to open. A bare
+        // "80" or a hostname would parse to nothing, so the port stays shut while
+        // the operator thinks it is open — the exact failure this rule prevents.
+        let mut broken = config(vec![owner_node()], vec![site("a", "a.com")]);
+        broken.server.firewall = Firewall { manage: true, scope: Scope::Internet };
+        broken.server.http_bind = "80".into();
+        broken.server.https_bind = "example.com:443".into();
+
+        let problems = problems_of(&broken);
+        assert!(problems.iter().any(|p| p.field == "server.http_bind"), "{problems:?}");
+        assert!(problems.iter().any(|p| p.field == "server.https_bind"), "{problems:?}");
+    }
+
+    #[test]
+    fn an_unmanaged_firewall_does_not_police_the_binds() {
+        // manage = false derives no rules, so the binds are never parsed as
+        // socket addresses here and an unusual one is the proxy's concern alone.
+        let mut lax = config(vec![owner_node()], vec![site("a", "a.com")]);
+        lax.server.firewall = Firewall { manage: false, scope: Scope::Lan };
+        lax.server.http_bind = "not-an-address".into();
+        assert!(lax.validate().is_ok());
+    }
+
+    #[test]
+    fn a_managed_firewall_with_ordinary_binds_is_valid() {
+        let mut ok = config(vec![owner_node()], vec![site("a", "a.com")]);
+        ok.server.firewall = Firewall { manage: true, scope: Scope::Lan };
+        assert!(ok.validate().is_ok());
+    }
+
+    #[test]
+    fn a_gated_site_with_valid_cidrs_is_valid() {
+        let mut gated = site("a", "a.com");
+        gated.allowed_cidrs = vec!["10.66.0.0/24".into(), "fd00::/8".into(), "127.0.0.1".into()];
+        assert!(config(vec![owner_node()], vec![gated]).validate().is_ok());
+    }
+
+    #[test]
+    fn rejects_a_malformed_cidr_naming_the_exact_entry() {
+        let mut gated = site("a", "a.com");
+        gated.allowed_cidrs = vec!["10.66.0.0/24".into(), "not-a-network".into()];
+        let problems = problems_of(&config(vec![owner_node()], vec![gated]));
+        assert!(
+            problems.iter().any(|p| p.field == "sites[0].allowed_cidrs[1]"),
+            "{problems:?}"
+        );
+    }
+
+    #[test]
+    fn a_console_site_must_be_gated_never_open() {
+        // The console fronts the service-control API; an ungated one would
+        // hand every service on the machine to anyone who resolves the domain.
+        let mut console = site("console", "admin.example.com");
+        console.console = true;
+        let problems = problems_of(&config(vec![owner_node()], vec![console]));
+        assert!(
+            problems.iter().any(|p| p.field == "sites[0].allowed_cidrs"),
+            "{problems:?}"
+        );
+    }
+
+    #[test]
+    fn a_console_site_needs_static_root_and_forbids_instances_and_app_paths() {
+        let mut console = site("console", "admin.example.com");
+        console.console = true;
+        console.allowed_cidrs = vec!["10.66.0.0/24".into()];
+        console.static_root = None;
+        console.instances = vec![Instance { node: "home".into(), port: 5050 }];
+        console.app_paths = vec!["/api/*".into()];
+        let problems = problems_of(&config(vec![owner_node()], vec![console]));
+        for field in ["sites[0].static_root", "sites[0].instances", "sites[0].app_paths"] {
+            assert!(problems.iter().any(|p| p.field == field), "missing {field}: {problems:?}");
+        }
+    }
+
+    #[test]
+    fn rejects_a_second_console_site() {
+        let gate = |mut s: Site| {
+            s.console = true;
+            s.allowed_cidrs = vec!["10.66.0.0/24".into()];
+            s
+        };
+        let doubled = config(
+            vec![owner_node()],
+            vec![gate(site("a", "a.com")), gate(site("b", "b.com"))],
+        );
+        let problems = problems_of(&doubled);
+        assert!(problems.iter().any(|p| p.field == "sites[1].console"), "{problems:?}");
+    }
+
+    #[test]
+    fn a_well_formed_console_site_is_valid() {
+        let mut console = site("console", "admin.example.com");
+        console.console = true;
+        console.allowed_cidrs = vec!["10.66.0.0/24".into()];
+        assert!(config(vec![owner_node()], vec![console]).validate().is_ok());
     }
 }

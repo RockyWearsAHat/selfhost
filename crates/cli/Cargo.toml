@@ -20,6 +20,7 @@ selfhost-firewall = { workspace = true }
 selfhost-git = { workspace = true }
 selfhost-mail = { workspace = true }
 selfhost-proxy = { workspace = true }
+selfhost-registrar = { workspace = true }
 selfhost-http = { workspace = true }
 selfhost-supervisor = { workspace = true }
 tokio = { workspace = true }
