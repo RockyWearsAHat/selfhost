@@ -1,14 +1,23 @@
 [workspace]
 resolver = "3"
 members = [
+    "crates/acme",
     "crates/admin",
+    "crates/app-deploy",
     "crates/config",
     "crates/dns",
+    "crates/igd",
+    "crates/firewall",
+    "crates/git",
     "crates/http",
     "crates/json",
     "crates/mail",
     "crates/proxy",
+    "crates/registrar",
     "crates/supervisor",
+    "crates/rui",
+    "crates/console",
+    "crates/vpn-ui",
     "crates/cli",
 ]
 
@@ -33,21 +42,41 @@ repository = "https://github.com/RockyWearsAHat/selfhost"
 # SMTP, and IMAP. If a protocol is on the wire, we own it.
 [workspace.dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "fs", "time", "signal", "sync", "process"] }
-tokio-rustls = "0.26"
-rustls = "0.23"
+# Both pinned to `ring` rather than to their default provider. rustls defaults
+# to aws-lc-rs and rcgen uses ring, so accepting both defaults compiles *two*
+# independent cryptographic implementations into one binary — two lots of C and
+# assembly, two supply chains, and two sets of advisories to track, to do one
+# job. One provider, chosen deliberately, is the whole point of the policy above.
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12", "logging"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
 rustls-pemfile = "2"
 rcgen = "0.13"
+# P-256 for the ACME account key and JWS signing — the same `ring` the rest of
+# the stack already links, so no second crypto implementation is added.
+ring = "0.17"
+# The trust anchors used to verify the ACME endpoint's own TLS certificate.
+# Bundled Mozilla roots are deterministic across the Win/mac/Linux matrix, where
+# reading the OS store would vary by platform. This is the one dependency the
+# ACME work adds above the socket; verification is never disabled.
+webpki-roots = "1"
 serde = { version = "1", features = ["derive"] }
 toml = "0.8"
 
+selfhost-acme = { path = "crates/acme" }
 selfhost-admin = { path = "crates/admin" }
+selfhost-app-deploy = { path = "crates/app-deploy" }
 selfhost-config = { path = "crates/config" }
 selfhost-dns = { path = "crates/dns" }
+selfhost-igd = { path = "crates/igd" }
+selfhost-firewall = { path = "crates/firewall" }
+selfhost-git = { path = "crates/git" }
 selfhost-http = { path = "crates/http" }
 selfhost-json = { path = "crates/json" }
 selfhost-mail = { path = "crates/mail" }
 selfhost-proxy = { path = "crates/proxy" }
+selfhost-registrar = { path = "crates/registrar" }
 selfhost-supervisor = { path = "crates/supervisor" }
+rui = { path = "crates/rui" }
 
 [profile.release]
 opt-level = 3

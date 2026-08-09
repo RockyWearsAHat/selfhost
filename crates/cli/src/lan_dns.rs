@@ -364,6 +364,7 @@ mod tests {
             dns,
             mail: None,
             namecheap_ddns: vec![],
+            registrar: None,
         }
     }
 

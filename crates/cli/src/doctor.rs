@@ -11,11 +11,12 @@
 //! "tested and fine" are different states, and collapsing them is how a
 //! diagnostic tells somebody their mail works when it has never been tried.
 
-use crate::{assess, investigate};
-use selfhost_config::Config;
-use selfhost_dns::{Resolver, ResolverSource, blocklist_name, is_real_listing};
+use crate::{acme_task, assess, investigate};
+use selfhost_config::{AcmeEnvironment, Config};
+use selfhost_proxy::CertificateStore;
+use selfhost_dns::{RecordType, Resolver, ResolverSource, blocklist_name, is_real_listing};
 use std::fmt;
-use std::net::{IpAddr, Ipv4Addr};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::Path;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -174,6 +175,7 @@ pub async fn run(config: &Config, project_dir: &Path, deep: bool, scan_lan: bool
     check_certificates(&mut report, config, project_dir);
     let public_ip = check_network(&mut report, &resolver).await;
     check_dns(&mut report, config, &resolver, public_ip).await;
+    check_authority(&mut report, config, &resolver, public_ip).await;
     check_mail(&mut report, config, &resolver, public_ip, deep).await;
     if deep || scan_lan {
         investigate_causes(&mut report, &resolver, public_ip, deep, scan_lan).await;
@@ -281,10 +283,11 @@ async fn check_binds(report: &mut Report, config: &Config) {
 /// Certificate presence and what kind they are.
 fn check_certificates(report: &mut Report, config: &Config, project_dir: &Path) {
     let section = report.section("Certificates");
-    let tls_dir = project_dir.join(&config.server.data_dir).join("tls");
+    let data_dir = project_dir.join(&config.server.data_dir);
+    let tls_dir = data_dir.join("tls");
 
     match config.server.acme {
-        selfhost_config::AcmeEnvironment::SelfSigned => section.checks.push(
+        AcmeEnvironment::SelfSigned => section.checks.push(
             Check::new(
                 "certificate source",
                 Verdict::Warn,
@@ -295,39 +298,104 @@ fn check_certificates(report: &mut Report, config: &Config, project_dir: &Path) 
                  here, then \"production\" once staging works.",
             ),
         ),
-        selfhost_config::AcmeEnvironment::Staging => section.checks.push(Check::new(
+        AcmeEnvironment::Staging => section.checks.push(Check::new(
             "certificate source",
             Verdict::Warn,
-            "Let's Encrypt staging — certificates are not browser-trusted",
+            "Let's Encrypt staging — certificates are not browser-trusted (safe default)",
         )),
-        selfhost_config::AcmeEnvironment::Production => section.checks.push(Check::new(
+        AcmeEnvironment::Production => section.checks.push(Check::new(
             "certificate source",
             Verdict::Pass,
             "Let's Encrypt production",
         )),
     }
 
-    let count = std::fs::read_dir(&tls_dir)
-        .map(|entries| {
-            entries
-                .flatten()
-                .filter(|e| e.file_name().to_string_lossy().ends_with(".crt.pem"))
-                .count()
-        })
-        .unwrap_or(0);
+    // The ACME account key is created on the first successful exchange. Its
+    // presence is the difference between "registered with the CA" and "not yet".
+    if !matches!(config.server.acme, AcmeEnvironment::SelfSigned) {
+        let account_key = data_dir.join("acme").join("account.key");
+        if account_key.is_file() {
+            section.checks.push(Check::new(
+                "ACME account",
+                Verdict::Pass,
+                "registered — an account key is present",
+            ));
+        } else {
+            section.checks.push(Check::new(
+                "ACME account",
+                Verdict::Unknown,
+                "no account key yet — one is created on the first issuance",
+            ));
+        }
+    }
 
-    if count == 0 {
+    report_stored_certificates(section, &data_dir, &tls_dir, config.server.acme);
+}
+
+/// Reports each stored certificate: whether it is a real ACME certificate or the
+/// self-signed fallback, and — for real ones — how many days until it expires.
+///
+/// A certificate under 30 days from expiry is a `Warn`: the renewal loop renews
+/// at 30 days remaining, so anything below that has either just been noticed or
+/// is failing to renew and deserves attention.
+fn report_stored_certificates(
+    section: &mut Section,
+    data_dir: &Path,
+    tls_dir: &Path,
+    environment: AcmeEnvironment,
+) {
+    let store = match CertificateStore::open(data_dir) {
+        Ok(store) => store,
+        Err(error) => {
+            section.checks.push(Check::new(
+                "stored certificates",
+                Verdict::Unknown,
+                format!("could not open {}: {error}", tls_dir.display()),
+            ));
+            return;
+        }
+    };
+
+    let hosts = store.hosts();
+    if hosts.is_empty() {
         section.checks.push(Check::new(
             "stored certificates",
             Verdict::Unknown,
             format!("none in {} yet — they are created on first run", tls_dir.display()),
         ));
-    } else {
-        section.checks.push(Check::new(
-            "stored certificates",
-            Verdict::Pass,
-            format!("{count} in {}", tls_dir.display()),
-        ));
+        return;
+    }
+
+    let kind = match environment {
+        AcmeEnvironment::Production => "Let's Encrypt production",
+        AcmeEnvironment::Staging => "Let's Encrypt staging",
+        AcmeEnvironment::SelfSigned => "self-signed",
+    };
+
+    for host in hosts {
+        match acme_task::certificate_days_remaining(&store, &host) {
+            Some(days) if days < 30 => section.checks.push(
+                Check::new(
+                    format!("certificate {host}"),
+                    Verdict::Warn,
+                    format!("{kind}, {days} day(s) until expiry"),
+                )
+                .with_fix(
+                    "The renewal loop renews at 30 days remaining. If this keeps dropping, the \
+                     HTTP-01 challenge on port 80 is probably not reachable — run doctor --deep.",
+                ),
+            ),
+            Some(days) => section.checks.push(Check::new(
+                format!("certificate {host}"),
+                Verdict::Pass,
+                format!("{kind}, {days} day(s) until expiry"),
+            )),
+            None => section.checks.push(Check::new(
+                format!("certificate {host}"),
+                Verdict::Warn,
+                "self-signed fallback — no ACME certificate issued for this host yet",
+            )),
+        }
     }
 }
 
@@ -459,6 +527,241 @@ async fn check_dns(
 
     if config.sites.is_empty() {
         section.checks.push(Check::new("sites", Verdict::Skipped, "none configured"));
+    }
+}
+
+/// The zone this machine serves itself, and whether it is actually serving it.
+///
+/// This is the counterpart to [`check_dns`], which asks the *public* resolver
+/// whether a site's name points here. This asks *this machine's own* server
+/// three questions, each a failure mode that leaves the domain dark:
+///
+/// 1. **Is :53 bound?** The server is queried on loopback for the apex `SOA`. No
+///    answer means nothing is listening — the daemon is not up, or `serve-dns`
+///    was never run. It is queried on loopback deliberately: a failure here is
+///    the local server, cleanly separated from the router forwarding that this
+///    program cannot test and does not touch (see [`crate::serve_daemon`]).
+/// 2. **Does the apex A match the WAN IP?** A served address that is not this
+///    machine's public IP sends every visitor to the wrong place; with
+///    `dynamic_ip` on it usually means the updater has not run yet.
+/// 3. **Is the zone delegated here?** The parent zone must list this machine's
+///    `ns1` or the world never asks it anything, however correct it is.
+///
+/// A single nameserver earns a `Warn`: when this box is down the domain and its
+/// mail vanish, so a secondary (Hurricane Electric offers free secondary DNS) is
+/// strongly wanted even though it is not a hard config error.
+async fn check_authority(
+    report: &mut Report,
+    config: &Config,
+    resolver: &Resolver,
+    public_ip: Option<Ipv4Addr>,
+) {
+    let section = report.section("Authoritative DNS");
+
+    let Some(dns) = &config.dns else {
+        section.checks.push(Check::new(
+            "authoritative DNS",
+            Verdict::Skipped,
+            "no [dns] section — this machine serves no zone of its own",
+        ));
+        return;
+    };
+
+    let bind: SocketAddr = match dns.bind.parse() {
+        Ok(address) => address,
+        Err(error) => {
+            section.checks.push(Check::new(
+                "dns bind address",
+                Verdict::Fail,
+                format!("dns.bind {} does not parse: {error}", dns.bind),
+            ));
+            return;
+        }
+    };
+    // A wildcard bind (0.0.0.0 / ::) cannot itself be queried, so ask the server
+    // where it is reachable from here — loopback on the same port.
+    let query_at = loopback_target(bind);
+    let local = Resolver::at(query_at).with_timeout(Duration::from_secs(2));
+
+    if dns.secondaries.is_empty() {
+        section.checks.push(
+            Check::new(
+                "secondary nameservers",
+                Verdict::Warn,
+                "none configured — this machine is the only nameserver for its zone",
+            )
+            .with_fix(
+                "With one nameserver, the domain and its mail stop resolving whenever this box is \
+                 down or its connection drops. Add a secondary — Hurricane Electric runs free \
+                 secondary DNS at dns.he.net — and list it in [dns].secondaries.",
+            ),
+        );
+    }
+
+    for zone in &dns.zones {
+        let origin = zone.domain.trim().trim_end_matches('.').to_ascii_lowercase();
+
+        // 1. Is anything answering on :53?
+        match local.query(&origin, RecordType::Soa).await {
+            Err(error) => {
+                section.checks.push(
+                    Check::new(
+                        format!("{origin} served on {bind}"),
+                        Verdict::Unknown,
+                        format!("this machine's DNS server is not answering ({error})"),
+                    )
+                    .with_fix(
+                        "Start it with `selfhost daemon` or `selfhost serve-dns`. This query went \
+                         to loopback, so a failure here is the local server — not the router. For \
+                         the internet to reach it, the router/edge must also forward UDP+TCP 53.",
+                    ),
+                );
+                // Nobody answered; the apex-A comparison would only repeat the point.
+                continue;
+            }
+            Ok(response) if response.answers.is_empty() => {
+                section.checks.push(
+                    Check::new(
+                        format!("{origin} SOA"),
+                        Verdict::Fail,
+                        format!("the server answered on {bind} but returned no SOA for {origin}"),
+                    )
+                    .with_fix(
+                        "The server is running but does not consider itself authoritative for this \
+                         zone. Check the domain in [dns] matches the name being queried.",
+                    ),
+                );
+            }
+            Ok(_) => {
+                section.checks.push(Check::new(
+                    format!("{origin} SOA"),
+                    Verdict::Pass,
+                    format!("served on {bind}"),
+                ));
+
+                // 2. Does the served apex A match this machine's public IP?
+                match local.lookup_a(&origin).await {
+                    Ok(addresses) if addresses.is_empty() => section.checks.push(
+                        Check::new(
+                            format!("{origin} apex A"),
+                            Verdict::Fail,
+                            "the zone is served but has no apex A record",
+                        )
+                        .with_fix(
+                            "Add an A record at the apex (name \"@\"), or let a bare [[dns.zone]] \
+                             derive one from the discovered public IP.",
+                        ),
+                    ),
+                    Ok(addresses) => {
+                        let served =
+                            addresses.iter().map(|a| a.to_string()).collect::<Vec<_>>().join(", ");
+                        match public_ip {
+                            Some(ip) if addresses.contains(&ip) => section.checks.push(Check::new(
+                                format!("{origin} apex A == WAN IP"),
+                                Verdict::Pass,
+                                format!("{served} matches this machine's public IP"),
+                            )),
+                            Some(ip) => section.checks.push(
+                                Check::new(
+                                    format!("{origin} apex A == WAN IP"),
+                                    Verdict::Fail,
+                                    format!(
+                                        "the served apex A is {served}, but this machine's public \
+                                         IP is {ip}"
+                                    ),
+                                )
+                                .with_fix(
+                                    "Visitors would be sent to the wrong address. If dynamic_ip is \
+                                     off, correct the apex A in [dns]. If it is on, the updater has \
+                                     not run yet, or the router's GetExternalIPAddress could not be \
+                                     read — check `selfhost doctor` for the edge and re-run.",
+                                ),
+                            ),
+                            None => section.checks.push(Check::new(
+                                format!("{origin} apex A"),
+                                Verdict::Unknown,
+                                format!("served as {served}; cannot compare without our public IP"),
+                            )),
+                        }
+                    }
+                    Err(error) => section.checks.push(Check::new(
+                        format!("{origin} apex A"),
+                        Verdict::Unknown,
+                        format!("lookup against the local server failed: {error}"),
+                    )),
+                }
+            }
+        }
+
+        // 3. Is the zone delegated to this machine at the parent?
+        match resolver.lookup_ns(&origin).await {
+            Ok(nameservers) if nameservers.is_empty() => section.checks.push(
+                Check::new(
+                    format!("{origin} delegation"),
+                    Verdict::Warn,
+                    "the parent zone delegates no nameservers to this domain",
+                )
+                .with_fix(format!(
+                    "Until the registrar publishes NS records for {origin} pointing at this \
+                     machine (ns1.{origin}, plus glue), the internet never asks this server \
+                     anything, however correctly it is configured.",
+                )),
+            ),
+            Ok(nameservers) => {
+                let expected = format!("ns1.{origin}");
+                let listed = nameservers
+                    .iter()
+                    .any(|ns| ns.trim_end_matches('.').eq_ignore_ascii_case(&expected));
+                if listed {
+                    section.checks.push(Check::new(
+                        format!("{origin} delegation"),
+                        Verdict::Pass,
+                        format!("the parent lists {expected}: {}", nameservers.join(", ")),
+                    ));
+                } else {
+                    section.checks.push(
+                        Check::new(
+                            format!("{origin} delegation"),
+                            Verdict::Warn,
+                            format!(
+                                "the parent delegates to {}, which does not include {expected}",
+                                nameservers.join(", ")
+                            ),
+                        )
+                        .with_fix(
+                            "Expected while the domain is still served elsewhere. Point the \
+                             registrar's NS records at this machine when you cut over.",
+                        ),
+                    );
+                }
+            }
+            Err(error) => section.checks.push(Check::new(
+                format!("{origin} delegation"),
+                Verdict::Unknown,
+                format!("could not read the parent's NS records: {error}"),
+            )),
+        }
+    }
+
+    if dns.zones.is_empty() {
+        section.checks.push(Check::new(
+            "zones",
+            Verdict::Skipped,
+            "the [dns] section defines no zones",
+        ));
+    }
+}
+
+/// The address to query a server on, given the address it binds.
+///
+/// A server bound to a wildcard address (`0.0.0.0` or `::`) is listening on every
+/// interface but cannot be *queried* at the wildcard, so this machine reaches it
+/// on loopback. A specific bind is queried as-is.
+fn loopback_target(bind: SocketAddr) -> SocketAddr {
+    if bind.ip().is_unspecified() {
+        SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), bind.port())
+    } else {
+        bind
     }
 }
 
@@ -1150,7 +1453,7 @@ fn report_lan(section: &mut Section, conclusion: &assess::Conclusion) {
 /// So the address is read from a service that reports the address the *TCP
 /// connection* came from, which is the one that actually sends mail and receives
 /// visitors.
-async fn discover_public_ip() -> Option<Ipv4Addr> {
+pub(crate) async fn discover_public_ip() -> Option<Ipv4Addr> {
     // Plain HTTP, and deliberately so: this needs the address a TCP connection
     // appears to come from, and TLS would add a certificate dependency without
     // changing what is learned. Nothing secret is sent.

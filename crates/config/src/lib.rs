@@ -11,14 +11,29 @@
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
+pub mod cidr;
+pub mod dns;
+pub mod edit;
+pub mod git;
+pub mod home;
+pub mod mail;
+pub mod namecheap;
+pub mod registrar;
 pub mod service;
 pub mod validate;
 
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::fmt;
+use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 
+pub use cidr::Cidr;
+pub use dns::{Dns, RecordConfig, SoaConfig, ZoneConfig};
+pub use git::GitWatch;
+pub use mail::{DkimConfig, Mail, MailBind, Mailbox, Relay};
+pub use namecheap::NamecheapDdns;
+pub use registrar::{Registrar, RegistrarProvider};
 pub use service::{RestartPolicy, ServiceCatalog, ServiceSpec, StartMode};
 pub use validate::{ConfigError, Problem};
 
@@ -35,6 +50,22 @@ pub struct Config {
     /// Websites served by the proxy.
     #[serde(default)]
     pub sites: Vec<Site>,
+    /// Authoritative DNS, when this machine serves its own zone. Absent → no DNS.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dns: Option<Dns>,
+    /// Mail, when this machine sends and receives for its domains. Absent → no mail.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mail: Option<Mail>,
+    /// Domains kept pointed at this machine via Namecheap's Dynamic DNS, for
+    /// one whose nameservers stay with Namecheap rather than moving to
+    /// [`Dns`]'s full authority. Empty means none are managed this way.
+    #[serde(default, skip_serializing_if = "Vec::is_empty", rename = "namecheap_ddns")]
+    pub namecheap_ddns: Vec<NamecheapDdns>,
+    /// The registrar hosting the domains' DNS, when `selfhost dns sync` pushes
+    /// records there over its API (or prints them, for `provider = "manual"`).
+    /// Absent → no registrar sync.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub registrar: Option<Registrar>,
 }
 
 /// Host-wide settings.
@@ -62,6 +93,9 @@ pub struct Server {
     /// are OpenSSH's rather than something invented here.
     #[serde(default = "default_admin_bind")]
     pub admin_bind: String,
+    /// Host firewall policy for the public listeners.
+    #[serde(default)]
+    pub firewall: Firewall,
 }
 
 fn default_http_bind() -> String {
@@ -96,6 +130,66 @@ pub enum AcmeEnvironment {
     Production,
     /// A self-signed certificate generated locally. No network, no rate limit.
     SelfSigned,
+}
+
+/// Who, off this machine, may reach the public listeners.
+///
+/// The firewall's whole job is to make this true: a bind on `0.0.0.0` is
+/// reachable by anyone the *network* lets through, and this narrows that to the
+/// operator's intent. Modelled after the SCM/GitWatch enums — a closed set,
+/// lowercase on the wire and in TOML, with a default that cannot publish
+/// anything.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Scope {
+    /// This machine only. No inbound rule is emitted; the default block is the
+    /// whole policy. The safe default, for the reason `init` binds loopback.
+    #[default]
+    Loopback,
+    /// The local network: RFC1918, CGNAT (100.64/10), link-local, and loopback.
+    Lan,
+    /// Anywhere. Required before a site is reachable from outside.
+    Internet,
+}
+
+impl Scope {
+    /// The wire and TOML spelling of this scope.
+    ///
+    /// One word serves both the firewall's hand-written JSON and this crate's
+    /// validation, so the two can never disagree about how a scope is spelled.
+    pub fn tag(&self) -> &'static str {
+        match self {
+            Self::Loopback => "loopback",
+            Self::Lan => "lan",
+            Self::Internet => "internet",
+        }
+    }
+
+    /// Parses a scope from its wire/TOML spelling, or `None` for anything else.
+    pub fn from_tag(tag: &str) -> Option<Self> {
+        match tag {
+            "loopback" => Some(Self::Loopback),
+            "lan" => Some(Self::Lan),
+            "internet" => Some(Self::Internet),
+            _ => None,
+        }
+    }
+}
+
+/// Host firewall management, off by default so a first run changes no rules.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Firewall {
+    /// Whether the daemon reconciles the host firewall at all.
+    ///
+    /// Default `false`: an unmanaged firewall is left exactly as the operator
+    /// set it, no inbound allowance is derived, and reconciliation asserts
+    /// nothing. Turning this on hands the daemon authority to open and close
+    /// inbound ports for the public listeners.
+    #[serde(default)]
+    pub manage: bool,
+    /// Who may reach `http_bind`/`https_bind`. Ignored while `manage` is false.
+    #[serde(default)]
+    pub scope: Scope,
 }
 
 /// The role a node plays.
@@ -148,6 +242,21 @@ pub struct Site {
     /// Redirect every non-canonical domain to the canonical one.
     #[serde(default = "default_true")]
     pub canonical_redirect: bool,
+    /// Client source addresses allowed to reach this site, in CIDR notation
+    /// (IPv4 and IPv6, e.g. `10.66.0.0/24` or a bare address for one host).
+    ///
+    /// Empty — the default, so existing configs keep parsing — leaves the site
+    /// open to everyone. Non-empty turns the proxy's per-site gate on: a
+    /// request whose source address matches no entry is refused, except on the
+    /// always-public paths (ACME challenges and deploy webhooks).
+    #[serde(default)]
+    pub allowed_cidrs: Vec<String>,
+    /// Marks this site as the built-in admin console: the proxy serves its
+    /// hand-rolled SPA from `static_root` and relays `/api/*` to the loopback
+    /// admin API at `server.admin_bind`. At most one site may set this, and it
+    /// must be gated by `allowed_cidrs` — a console is never left open.
+    #[serde(default)]
+    pub console: bool,
 }
 
 fn default_true() -> bool {
@@ -240,6 +349,20 @@ impl Site {
             return true;
         }
         self.app_paths.iter().any(|prefix| path_matches(prefix, path))
+    }
+
+    /// Whether a client at `ip` may reach this site.
+    ///
+    /// An empty `allowed_cidrs` means the site is open to everyone; otherwise
+    /// the address must fall inside at least one listed network. An entry that
+    /// fails to parse permits nothing — validation already rejects such a
+    /// config, but if one is ever reached the gate fails closed, not open.
+    pub fn permits(&self, ip: IpAddr) -> bool {
+        self.allowed_cidrs.is_empty()
+            || self
+                .allowed_cidrs
+                .iter()
+                .any(|entry| Cidr::parse(entry).is_ok_and(|cidr| cidr.contains(ip)))
     }
 }
 
@@ -335,6 +458,7 @@ mod tests {
             acme: AcmeEnvironment::SelfSigned,
             data_dir: default_data_dir(),
             admin_bind: default_admin_bind(),
+            firewall: Firewall::default(),
         }
     }
 
@@ -366,6 +490,8 @@ mod tests {
             instances: vec![],
             health: Health::default(),
             canonical_redirect: true,
+            allowed_cidrs: vec![],
+            console: false,
         };
         assert!(!site.routes_to_app("/api/health"));
     }
@@ -381,6 +507,8 @@ mod tests {
             instances: vec![Instance { node: "home".into(), port: 5050 }],
             health: Health::default(),
             canonical_redirect: true,
+            allowed_cidrs: vec![],
+            console: false,
         };
         assert!(site.routes_to_app("/anything"));
     }
@@ -395,6 +523,10 @@ mod tests {
                 Node { name: "shed".into(), role: Role::Worker, mesh_ip: Some("10.77.0.2".into()) },
             ],
             sites: vec![],
+            dns: None,
+            mail: None,
+            namecheap_ddns: vec![],
+            registrar: None,
         };
 
         assert_eq!(
@@ -425,7 +557,13 @@ mod tests {
                 instances: vec![Instance { node: "home".into(), port: 5050 }],
                 health: Health::default(),
                 canonical_redirect: true,
+                allowed_cidrs: vec![],
+                console: false,
             }],
+            dns: None,
+            mail: None,
+            namecheap_ddns: vec![],
+            registrar: None,
         };
 
         let map = config.host_map();
@@ -468,5 +606,147 @@ path = "/api/health"
         assert_eq!(config.server.acme, AcmeEnvironment::SelfSigned);
         // Unspecified health fields fall back to defaults rather than zero.
         assert_eq!(config.sites[0].health.interval_secs, 10);
+    }
+
+    #[test]
+    fn gating_fields_parse_from_toml_and_default_open() {
+        let text = r#"
+version = 1
+
+[server]
+acme_email = "a@b.com"
+
+[[nodes]]
+name = "home"
+role = "owner"
+
+[[sites]]
+name = "console"
+domains = ["admin.example.com"]
+static_root = "./console"
+console = true
+allowed_cidrs = ["10.66.0.0/24", "fd00::/8"]
+
+[[sites]]
+name = "open"
+domains = ["example.com"]
+static_root = "./public"
+"#;
+        let config = Config::parse(text).unwrap();
+        assert!(config.sites[0].console);
+        assert_eq!(config.sites[0].allowed_cidrs, vec!["10.66.0.0/24", "fd00::/8"]);
+        // Old configs never mention the new fields; they must default open.
+        assert!(!config.sites[1].console);
+        assert!(config.sites[1].allowed_cidrs.is_empty());
+    }
+
+    #[test]
+    fn permits_is_open_when_ungated_and_matches_both_families_when_gated() {
+        let mut site = Site {
+            name: "console".into(),
+            domains: vec!["admin.example.com".into()],
+            static_root: Some("./console".into()),
+            spa: false,
+            app_paths: vec![],
+            instances: vec![],
+            health: Health::default(),
+            canonical_redirect: true,
+            allowed_cidrs: vec![],
+            console: true,
+        };
+        let vpn_client: IpAddr = "10.66.0.2".parse().unwrap();
+        let stranger: IpAddr = "203.0.113.9".parse().unwrap();
+        let v6_client: IpAddr = "fd00::5".parse().unwrap();
+
+        // No gate: everyone is permitted.
+        assert!(site.permits(stranger));
+
+        site.allowed_cidrs = vec!["10.66.0.0/24".into(), "fd00::/8".into()];
+        assert!(site.permits(vpn_client));
+        assert!(site.permits(v6_client));
+        assert!(!site.permits(stranger));
+
+        // A malformed entry permits nothing — the gate fails closed.
+        site.allowed_cidrs = vec!["garbage".into()];
+        assert!(!site.permits(vpn_client));
+    }
+
+    #[test]
+    fn scope_defaults_closed_so_a_first_run_publishes_nothing() {
+        // The whole safety argument rests on this: an omitted scope is loopback,
+        // not "anywhere". If this ever flips, a bind on 0.0.0.0 becomes public
+        // the moment the firewall is managed, which is the opposite of the intent.
+        assert_eq!(Scope::default(), Scope::Loopback);
+        assert!(!Firewall::default().manage);
+        assert_eq!(Firewall::default().scope, Scope::Loopback);
+    }
+
+    #[test]
+    fn a_scope_tag_round_trips_and_matches_its_serde_spelling() {
+        for scope in [Scope::Loopback, Scope::Lan, Scope::Internet] {
+            assert_eq!(Scope::from_tag(scope.tag()), Some(scope));
+            // tag() must equal the serde wire form, or firewall JSON and config
+            // TOML would spell the same scope two different ways.
+            let wire = toml::to_string(&Wrap { scope }).unwrap();
+            assert!(wire.contains(scope.tag()), "{wire}");
+        }
+        assert_eq!(Scope::from_tag("public"), None);
+    }
+
+    #[test]
+    fn the_firewall_sub_table_parses_and_defaults_when_omitted() {
+        let managed = Config::parse(
+            r#"
+version = 1
+
+[server]
+acme_email = "a@b.com"
+acme = "self-signed"
+
+[server.firewall]
+manage = true
+scope = "lan"
+
+[[nodes]]
+name = "home"
+role = "owner"
+
+[[sites]]
+name = "a"
+domains = ["example.com"]
+static_root = "./public"
+"#,
+        )
+        .unwrap();
+        assert!(managed.server.firewall.manage);
+        assert_eq!(managed.server.firewall.scope, Scope::Lan);
+
+        // No [server.firewall] table at all falls back to the closed default
+        // rather than failing to parse.
+        let bare = Config::parse(
+            r#"
+version = 1
+
+[server]
+acme_email = "a@b.com"
+
+[[nodes]]
+name = "home"
+role = "owner"
+
+[[sites]]
+name = "a"
+domains = ["example.com"]
+static_root = "./public"
+"#,
+        )
+        .unwrap();
+        assert!(!bare.server.firewall.manage);
+        assert_eq!(bare.server.firewall.scope, Scope::Loopback);
+    }
+
+    #[derive(Serialize, Deserialize)]
+    struct Wrap {
+        scope: Scope,
     }
 }
