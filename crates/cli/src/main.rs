@@ -1179,7 +1179,7 @@ async fn serve(config: Config, project_dir: PathBuf, config_path: PathBuf) -> Re
     // Mail rides alongside the proxy rather than under `daemon`: it needs the
     // certificate store above, and — like the proxy — is meant to be up for
     // as long as `run` is. A no-op when `config.mail` is absent.
-    mail_task::run(config.clone(), project_dir.clone(), store.clone()).await;
+    mail_task::run(config.clone(), project_dir.clone(), store.clone(), Arc::clone(&resolver)).await;
 
     let tls_config = server_config_with_resolver(resolver).map_err(|e| e.to_string())?;
 

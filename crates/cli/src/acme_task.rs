@@ -19,7 +19,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use selfhost_acme::Acme;
 use selfhost_acme::transport::HttpsClient;
-use selfhost_config::{AcmeEnvironment, Config, Site};
+use selfhost_config::{AcmeEnvironment, Config};
 use selfhost_proxy::{CertificateStore, SniResolver};
 use tokio::time::sleep;
 
@@ -79,13 +79,14 @@ async fn run_sweep(
     account_dir: &Path,
     challenge_dir: &Path,
 ) -> Duration {
-    let due: Vec<&Site> = config.sites.iter().filter(|site| needs_certificate(store, site)).collect();
+    let due: Vec<CertOrder> =
+        certificate_orders(config).into_iter().filter(|order| needs_certificate(store, order)).collect();
     if due.is_empty() {
         return SWEEP_INTERVAL;
     }
 
     let environment = describe_environment(config.server.acme);
-    log(format!("{} site(s) need a certificate — contacting Let's Encrypt {environment}", due.len()));
+    log(format!("{} certificate order(s) due — contacting Let's Encrypt {environment}", due.len()));
 
     let http = match HttpsClient::new() {
         Ok(http) => http,
@@ -103,14 +104,40 @@ async fn run_sweep(
     };
 
     let mut all_ok = true;
-    for site in due {
-        if let Err(error) = issue_for_site(&acme, store, resolver, challenge_dir, site).await {
+    for order in &due {
+        if let Err(error) = issue_order(&acme, store, resolver, challenge_dir, order).await {
             all_ok = false;
-            log(format!("{}: certificate not issued — {error}", site.canonical()));
+            log(format!("{}: certificate not issued — {error}", order.canonical));
         }
     }
 
     if all_ok { SWEEP_INTERVAL } else { RETRY_INTERVAL }
+}
+
+/// One certificate to hold: a canonical host the store's bookkeeping keys on,
+/// and every domain the certificate must cover as a SAN.
+struct CertOrder {
+    canonical: String,
+    domains: Vec<String>,
+}
+
+/// Every certificate this deployment should hold: one order per site, plus —
+/// when `[mail]` is configured — one for the client-autoconfig hosts
+/// ([`selfhost_config::Mail::client_hosts`]), so a mail client that guesses
+/// `imap.<domain>` meets a certificate that actually names it.
+fn certificate_orders(config: &Config) -> Vec<CertOrder> {
+    let mut orders: Vec<CertOrder> = config
+        .sites
+        .iter()
+        .map(|site| CertOrder { canonical: site.canonical().to_owned(), domains: site.domains.clone() })
+        .collect();
+    if let Some(mail) = &config.mail {
+        let domains = mail.client_hosts();
+        if let Some(canonical) = domains.first().cloned() {
+            orders.push(CertOrder { canonical, domains });
+        }
+    }
+    orders
 }
 
 /// Issues one certificate, installs it, and makes it live without a restart.
@@ -118,41 +145,43 @@ async fn run_sweep(
 /// On success the certificate is on disk, stamped with its issue time, and the
 /// running SNI resolver serves it for the site's hostname immediately.
 ///
-/// One certificate covers every domain in `site.domains` as a SAN — that is
+/// One certificate covers every domain in `order.domains` as a SAN — that is
 /// the order ACME issued — but the store and the SNI resolver both key by a
 /// single hostname, so the same chain and key are installed and registered
-/// under *each* of the site's domains, not just the canonical one. Skipping
-/// this would leave a browser connecting by any non-canonical name (a bare
-/// `www.` alongside an apex, say) served the self-signed fallback instead of
-/// the certificate that was just issued to also cover it.
-async fn issue_for_site(
+/// under *each* of the order's domains, not just the canonical one. Skipping
+/// this would leave a client connecting by any non-canonical name (a bare
+/// `www.` alongside an apex, or `imap.` alongside `mail.`) served the
+/// self-signed fallback instead of the certificate that was just issued to
+/// also cover it.
+async fn issue_order(
     acme: &Acme,
     store: &CertificateStore,
     resolver: &Arc<SniResolver>,
     challenge_dir: &Path,
-    site: &Site,
+    order: &CertOrder,
 ) -> Result<(), String> {
-    let host = site.canonical();
+    let host = &order.canonical;
 
-    let issued = acme.issue(&site.domains, challenge_dir).await.map_err(|e| e.to_string())?;
-    for domain in &site.domains {
+    let issued = acme.issue(&order.domains, challenge_dir).await.map_err(|e| e.to_string())?;
+    for domain in &order.domains {
         store.install(domain, &issued.chain_pem, &issued.key_pem).map_err(|e| e.to_string())?;
         resolver.refresh(store, domain).map_err(|e| format!("installed but resolver not refreshed: {e}"))?;
     }
     stamp_issued(store, host).map_err(|e| format!("installed but could not record issue time: {e}"))?;
 
-    log(format!("{host}: certificate installed and live ({} domain(s))", site.domains.len()));
+    log(format!("{host}: certificate installed and live ({} domain(s))", order.domains.len()));
     Ok(())
 }
 
-/// Whether a site should be (re)issued this sweep.
+/// Whether an order should be (re)issued this sweep.
 ///
 /// True when there is no pair at all, when the only pair is the self-signed
 /// fallback (no issue-time marker), or when a real certificate has passed the
-/// renewal threshold. A fresh ACME certificate returns false, which is the
-/// guard that keeps a restart from re-requesting inside the rate limit.
-fn needs_certificate(store: &CertificateStore, site: &Site) -> bool {
-    let host = site.canonical();
+/// renewal threshold — all judged on the order's canonical host, whose stamp
+/// dates the whole SAN set. A fresh ACME certificate returns false, which is
+/// the guard that keeps a restart from re-requesting inside the rate limit.
+fn needs_certificate(store: &CertificateStore, order: &CertOrder) -> bool {
+    let host = &order.canonical;
     if !store.has_pair(host) {
         return true;
     }

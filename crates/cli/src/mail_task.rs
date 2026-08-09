@@ -21,7 +21,7 @@ use selfhost_mail::{
     OutboundQueue, Policy, Receiver, SendContext, SigningIdentity, Submission, serve_imap,
     serve_smtp, serve_submission,
 };
-use selfhost_proxy::CertificateStore;
+use selfhost_proxy::{CertificateStore, SniResolver};
 use tokio::net::TcpListener;
 use tokio_rustls::TlsConnector;
 
@@ -36,7 +36,7 @@ const QUEUE_INTERVAL: Duration = Duration::from_secs(15);
 /// `run`'s `serve`, after the certificate store is open, so a certificate for
 /// `mail.hostname` can be generated the same way the proxy generates one for
 /// a site on first start.
-pub async fn run(config: Config, project_dir: PathBuf, store: CertificateStore) {
+pub async fn run(config: Config, project_dir: PathBuf, store: CertificateStore, resolver: Arc<SniResolver>) {
     let Some(mail) = config.mail.clone() else { return };
 
     let data_dir = project_dir.join(&config.server.data_dir);
@@ -78,7 +78,7 @@ pub async fn run(config: Config, project_dir: PathBuf, store: CertificateStore) 
         }
     };
 
-    let tls_config = match server_tls(&store, &mail.hostname) {
+    let tls_config = match server_tls(&store, &mail.hostname, resolver) {
         Ok(config) => config,
         Err(error) => {
             log(format!("could not prepare TLS for {} ({error}) — mail is not running", mail.hostname));
@@ -245,17 +245,22 @@ async fn run_queue(
     }
 }
 
-/// Builds a plain (non-SNI) TLS server configuration for one hostname,
-/// generating a self-signed pair on first use exactly as the proxy does for a
-/// site with no certificate yet.
-fn server_tls(store: &CertificateStore, hostname: &str) -> Result<Arc<ServerConfig>, String> {
-    let (chain, key) =
-        store.load_or_generate_self_signed(hostname, &[]).map_err(|error| error.to_string())?;
-    ServerConfig::builder()
-        .with_no_client_auth()
-        .with_single_cert(chain, key)
-        .map(Arc::new)
-        .map_err(|error| error.to_string())
+/// Builds the mail listeners' TLS configuration over the daemon's shared SNI
+/// resolver, after making sure `hostname` has at least a self-signed pair —
+/// exactly as the proxy does for a site with no certificate yet.
+///
+/// Sharing the resolver is what lets a client connect by any name the
+/// certificate task provisions — `imap.<domain>`, `smtp.<domain>`, the
+/// hostname itself — and what makes a freshly issued certificate take effect
+/// on the mail ports without a restart. No ALPN is advertised: these are mail
+/// protocols, not HTTP.
+fn server_tls(
+    store: &CertificateStore,
+    hostname: &str,
+    resolver: Arc<SniResolver>,
+) -> Result<Arc<ServerConfig>, String> {
+    store.load_or_generate_self_signed(hostname, &[]).map_err(|error| error.to_string())?;
+    Ok(Arc::new(ServerConfig::builder().with_no_client_auth().with_cert_resolver(resolver)))
 }
 
 /// A TLS client configuration for outbound MX delivery that accepts whatever
