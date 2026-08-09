@@ -30,6 +30,7 @@
 //! exposes no remove. Each such limit is noted where it bites.
 
 use crate::address::Address;
+use crate::submission::decode_plain;
 use std::borrow::Cow;
 use std::fmt;
 
@@ -447,6 +448,9 @@ pub struct ISession {
     tls_active: bool,
     user: Option<Address>,
     mailbox: Option<Mailbox>,
+    /// The tag of an `AUTHENTICATE PLAIN` awaiting its SASL response: the next
+    /// line fed to [`ISession::command`] is that response, not a command.
+    pending_auth: Option<String>,
 }
 
 impl ISession {
@@ -455,7 +459,14 @@ impl ISession {
     /// the first command.
     pub fn new(config: IConfig) -> Self {
         let tls_active = false;
-        Self { config, state: IState::NotAuthenticated, tls_active, user: None, mailbox: None }
+        Self {
+            config,
+            state: IState::NotAuthenticated,
+            tls_active,
+            user: None,
+            mailbox: None,
+            pending_auth: None,
+        }
     }
 
     /// The banner sent as soon as the connection opens.
@@ -507,6 +518,13 @@ impl ISession {
                 // Tells the client not to try LOGIN yet — the password would
                 // travel in the clear.
                 caps.push("LOGINDISABLED".into());
+            } else {
+                // Advertised only once credentials may actually be sent. This
+                // is what Apple Mail and friends key on: a server offering no
+                // AUTH= mechanism reads as "cannot verify", regardless of
+                // whether bare LOGIN would have worked.
+                caps.push("AUTH=PLAIN".into());
+                caps.push("SASL-IR".into());
             }
         }
         caps
@@ -518,6 +536,12 @@ impl ISession {
             // No tag is reliably parseable from an over-long line, so this is an
             // untagged protocol error rather than a tagged failure.
             return respond(IResponse::untagged("BAD command line too long"));
+        }
+
+        // A pending AUTHENTICATE owns the next line outright: it is the SASL
+        // response (or `*` to abort), never a command.
+        if let Some(tag) = self.pending_auth.take() {
+            return self.authenticate_response(&tag, line);
         }
 
         let trimmed = line.trim_end_matches(['\r', '\n']);
@@ -541,11 +565,7 @@ impl ISession {
             "LOGOUT" => self.logout(tag),
             "STARTTLS" => self.starttls(tag),
             "LOGIN" => self.login(tag, args),
-            "AUTHENTICATE" => respond(IResponse::tagged(
-                tag,
-                Status::No,
-                "AUTHENTICATE not supported; use LOGIN over TLS",
-            )),
+            "AUTHENTICATE" => self.authenticate(tag, args),
             "SELECT" => self.select(tag, args, false),
             "EXAMINE" => self.select(tag, args, true),
             "LIST" => self.list(tag, args, false),
@@ -596,6 +616,66 @@ impl ISession {
             return respond(IResponse::tagged(tag, Status::No, "TLS already active"));
         }
         IAction::StartTls(IResponse::tagged(tag, Status::Ok, "begin TLS negotiation now"))
+    }
+
+    /// Handles `AUTHENTICATE <mechanism> [initial-response]` (RFC 3501 §6.2.2,
+    /// initial response per RFC 4959's `SASL-IR`).
+    ///
+    /// `PLAIN` is the one mechanism served — it is what every mainstream client
+    /// sends over TLS, and the TLS gate below is the same one `LOGIN` stands
+    /// behind, so the password crosses only an encrypted link. Without the
+    /// initial response the client is sent a `+` continuation and the next
+    /// line is consumed as the SASL response (see [`ISession::command`]).
+    fn authenticate(&mut self, tag: &str, args: &str) -> IAction {
+        if self.state != IState::NotAuthenticated {
+            return respond(IResponse::tagged(tag, Status::Bad, "already authenticated"));
+        }
+        if self.config.require_tls_for_auth && !self.tls_active {
+            return respond(IResponse::tagged(
+                tag,
+                Status::No,
+                "[PRIVACYREQUIRED] STARTTLS before AUTHENTICATE",
+            ));
+        }
+        let (mechanism, initial) = match args.split_once(' ') {
+            Some((mechanism, rest)) => (mechanism, Some(rest.trim())),
+            None => (args, None),
+        };
+        if !mechanism.eq_ignore_ascii_case("PLAIN") {
+            return respond(IResponse::tagged(
+                tag,
+                Status::No,
+                "unsupported authentication mechanism; use PLAIN",
+            ));
+        }
+        match initial {
+            // RFC 4959: a lone `=` is how a zero-length initial response is spelled.
+            Some(response) => self.plain_credentials(tag, if response == "=" { "" } else { response }),
+            None => {
+                self.pending_auth = Some(tag.to_owned());
+                respond(IResponse::cont(""))
+            }
+        }
+    }
+
+    /// Consumes the line following a continued `AUTHENTICATE PLAIN`: the SASL
+    /// response, or `*`, the client's abort (RFC 3501 §6.2.2).
+    fn authenticate_response(&mut self, tag: &str, line: &str) -> IAction {
+        let response = line.trim();
+        if response == "*" {
+            return respond(IResponse::tagged(tag, Status::Bad, "AUTHENTICATE aborted"));
+        }
+        self.plain_credentials(tag, response)
+    }
+
+    /// Turns a SASL PLAIN response into the driver's credential check, sharing
+    /// [`IAction::Login`] — and therefore the one verification path — with the
+    /// `LOGIN` command.
+    fn plain_credentials(&self, tag: &str, response: &str) -> IAction {
+        match decode_plain(response) {
+            Some((username, password)) => IAction::Login { tag: tag.to_owned(), username, password },
+            None => respond(IResponse::tagged(tag, Status::Bad, "invalid SASL PLAIN response")),
+        }
     }
 
     /// Handles `LOGIN <user> <pass>`.
@@ -1645,6 +1725,98 @@ mod tests {
         let responses = s.login_result("a", None);
         assert!(responses[0].text().starts_with("a NO"));
         assert_eq!(s.state(), IState::NotAuthenticated);
+    }
+
+    // ---- AUTHENTICATE PLAIN ------------------------------------------------
+
+    /// `\0dave@example.com\0secret` base64-encoded — the SASL PLAIN response
+    /// Apple Mail and friends send.
+    const PLAIN_DAVE: &str = "AGRhdmVAZXhhbXBsZS5jb20Ac2VjcmV0";
+
+    #[test]
+    fn capability_over_tls_advertises_auth_plain_with_sasl_ir() {
+        // This advertisement is what mainstream clients key on: without it
+        // they report "unable to verify" instead of falling back to LOGIN.
+        let mut s = ISession::new(config());
+        s.tls_established();
+        let IAction::Respond(responses) = s.command("a CAPABILITY") else { panic!("Respond") };
+        let caps = responses[0].text().into_owned();
+        assert!(caps.contains("AUTH=PLAIN"), "{caps}");
+        assert!(caps.contains("SASL-IR"), "{caps}");
+
+        // Before TLS the mechanism must not be offered — LOGINDISABLED rules.
+        let greeting = ISession::new(config()).greeting().text().into_owned();
+        assert!(!greeting.contains("AUTH=PLAIN"), "{greeting}");
+    }
+
+    #[test]
+    fn authenticate_plain_with_initial_response_verifies_like_login() {
+        let mut s = ISession::new(config());
+        s.tls_established();
+        match s.command(&format!("a AUTHENTICATE PLAIN {PLAIN_DAVE}")) {
+            IAction::Login { tag, username, password } => {
+                assert_eq!(tag, "a");
+                assert_eq!(username, "dave@example.com");
+                assert_eq!(password, "secret");
+            }
+            other => panic!("expected Login, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn authenticate_plain_without_initial_response_continues_then_verifies() {
+        let mut s = ISession::new(config());
+        s.tls_established();
+        let IAction::Respond(responses) = s.command("a AUTHENTICATE PLAIN") else { panic!("Respond") };
+        assert!(responses[0].text().starts_with('+'), "{}", responses[0].text());
+
+        // The next line is the SASL response, not a command.
+        match s.command(&format!("{PLAIN_DAVE}\r\n")) {
+            IAction::Login { tag, username, password } => {
+                assert_eq!(tag, "a");
+                assert_eq!(username, "dave@example.com");
+                assert_eq!(password, "secret");
+            }
+            other => panic!("expected Login, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_continued_authenticate_can_be_aborted_with_a_star() {
+        let mut s = ISession::new(config());
+        s.tls_established();
+        s.command("a AUTHENTICATE PLAIN");
+        let IAction::Respond(responses) = s.command("*\r\n") else { panic!("Respond") };
+        assert!(responses[0].text().starts_with("a BAD"), "{}", responses[0].text());
+        assert_eq!(s.state(), IState::NotAuthenticated);
+
+        // The abort consumed the pending state: the next line is a command again.
+        let IAction::Respond(responses) = s.command("b NOOP") else { panic!("Respond") };
+        assert!(responses[0].text().starts_with("b OK"), "{}", responses[0].text());
+    }
+
+    #[test]
+    fn authenticate_is_gated_and_particular() {
+        // Before TLS: refused for the same reason LOGIN is.
+        let mut s = ISession::new(config());
+        let IAction::Respond(responses) = s.command(&format!("a AUTHENTICATE PLAIN {PLAIN_DAVE}"))
+        else {
+            panic!("Respond")
+        };
+        assert!(responses[0].text().contains("PRIVACYREQUIRED"), "{}", responses[0].text());
+
+        // An unsupported mechanism is named as such.
+        let mut s = ISession::new(config());
+        s.tls_established();
+        let IAction::Respond(responses) = s.command("a AUTHENTICATE CRAM-MD5") else { panic!("Respond") };
+        assert!(responses[0].text().starts_with("a NO"), "{}", responses[0].text());
+
+        // A response that is not base64 SASL PLAIN is a protocol error, not a
+        // failed login.
+        let IAction::Respond(responses) = s.command("b AUTHENTICATE PLAIN not-base64!!") else {
+            panic!("Respond")
+        };
+        assert!(responses[0].text().starts_with("b BAD"), "{}", responses[0].text());
     }
 
     #[test]

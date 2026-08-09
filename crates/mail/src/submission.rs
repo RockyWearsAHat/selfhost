@@ -349,8 +349,9 @@ fn decode_credential(mechanism: &str, initial_response: &str) -> Option<(String,
 /// Decodes a SASL PLAIN token: `authzid \0 authcid \0 password`.
 ///
 /// The authorization identity is ignored; the authentication identity (the
-/// username) and the password are what a login needs.
-fn decode_plain(token: &str) -> Option<(String, String)> {
+/// username) and the password are what a login needs. Shared with the IMAP
+/// session's `AUTHENTICATE PLAIN` — same SASL mechanism, one decoder.
+pub(crate) fn decode_plain(token: &str) -> Option<(String, String)> {
     let bytes = b64_decode(token.trim()).ok()?;
     let mut parts = bytes.split(|b| *b == 0);
     let _authzid = parts.next()?;
