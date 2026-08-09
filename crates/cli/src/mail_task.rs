@@ -121,6 +121,7 @@ pub async fn run(config: Config, project_dir: PathBuf, store: CertificateStore, 
                     Arc::clone(&tls_config),
                     Arc::clone(&authenticator),
                     queue.clone(),
+                    maildir.clone(),
                 );
                 log(format!("submission listening on {address}"));
                 tokio::spawn(async move {

@@ -3,8 +3,9 @@
 //! Submission and reception are the *same* SMTP, driven by the *same*
 //! [`crate::smtp::Session`]; they differ only in policy and in what happens to an
 //! accepted message. The receiver (port 25) stores mail for local mailboxes and
-//! authenticates no one; submission requires a logged-in user and hands what they
-//! send to the outbound queue. Keeping one session type is the whole defence
+//! authenticates no one; submission requires a logged-in user, delivers what they
+//! send to local mailboxes directly, and spools the rest to the outbound queue.
+//! Keeping one session type is the whole defence
 //! against divergence: the open-relay rule lives once, in [`crate::smtp`], and
 //! both ports inherit it.
 //!
@@ -27,7 +28,9 @@
 use crate::address::Address;
 use crate::client::{b64_encode, OutboundQueue};
 use crate::message::Message;
-use crate::smtp::{Action, Policy, Reply, Session};
+use crate::receive::{is_rcpt, rcpt_address};
+use crate::smtp::{Action, Envelope, Policy, Reply, Session};
+use crate::store::Maildir;
 use ring::pbkdf2;
 use ring::rand::{SecureRandom, SystemRandom};
 use selfhost_config::Mailbox;
@@ -162,14 +165,24 @@ pub struct Submission {
     pub tls: Arc<rustls::ServerConfig>,
     /// Verifies SASL credentials.
     pub auth: Arc<dyn Authenticator>,
-    /// Where an accepted message is spooled for the outbound queue runner.
+    /// Where an accepted message bound for a foreign domain is spooled for the
+    /// outbound queue runner.
     pub queue: OutboundQueue,
+    /// The local mail store: recipients in our own domains are delivered here
+    /// directly, never routed out through the queue and back to ourselves.
+    pub store: Maildir,
 }
 
 impl Submission {
     /// Assembles a submission runtime.
-    pub fn new(policy: Policy, tls: Arc<rustls::ServerConfig>, auth: Arc<dyn Authenticator>, queue: OutboundQueue) -> Self {
-        Self { policy, tls, auth, queue }
+    pub fn new(
+        policy: Policy,
+        tls: Arc<rustls::ServerConfig>,
+        auth: Arc<dyn Authenticator>,
+        queue: OutboundQueue,
+        store: Maildir,
+    ) -> Self {
+        Self { policy, tls, auth, queue, store }
     }
 }
 
@@ -311,7 +324,10 @@ where
         }
 
         match session.command(&line) {
-            Action::Reply(reply) => write_reply(reader.get_mut(), &reply).await?,
+            Action::Reply(reply) => {
+                let reply = refine_rcpt(&line, reply, submission);
+                write_reply(reader.get_mut(), &reply).await?
+            }
             Action::ReadData(reply) => {
                 write_reply(reader.get_mut(), &reply).await?;
                 let outcome = read_and_enqueue(&mut reader, session, submission).await?;
@@ -416,11 +432,35 @@ pub(crate) fn decode_plain(token: &str) -> Option<(String, String)> {
     Some((String::from_utf8(authcid.to_vec()).ok()?, String::from_utf8(password.to_vec()).ok()?))
 }
 
-/// Reads the DATA body to the lone-dot terminator and spools it for sending.
+/// Turns an accepted `RCPT` for one of our own domains into `550` when no
+/// mailbox exists for it.
+///
+/// The session's own relay/authentication rules already ran; this only adds the
+/// local-existence check, mirroring the receiver's refinement, so a typo'd local
+/// recipient is refused at `RCPT` time instead of silently vanishing at
+/// delivery. Foreign recipients pass through — relaying them is submission's
+/// entire purpose.
+fn refine_rcpt(line: &str, reply: Reply, submission: &Submission) -> Reply {
+    if reply.code != 250 || !is_rcpt(line) {
+        return reply;
+    }
+    let Some(address) = rcpt_address(line) else {
+        return reply;
+    };
+    if address.is_local_to(&submission.policy.local_domains) && !submission.store.exists(&address) {
+        return Reply::line(550, "no such mailbox at this domain");
+    }
+    reply
+}
+
+/// Reads the DATA body to the lone-dot terminator and routes it: recipients in
+/// our own domains are delivered straight into the local store, everyone else
+/// is spooled to the outbound queue.
 ///
 /// The byte limit is enforced against the actual bytes, not the declared size;
 /// dot-stuffing is reversed at the byte level so an 8-bit body is not corrupted.
-/// On success the message is written to the outbound queue and `250` returned.
+/// `250` is returned only when every recipient was stored or spooled; any
+/// failure answers `451` so the client retries the whole message.
 async fn read_and_enqueue<S>(reader: &mut BufReader<&mut S>, session: &mut Session, submission: &Submission) -> io::Result<Reply>
 where
     S: AsyncRead + AsyncWrite + Unpin,
@@ -465,10 +505,37 @@ where
         Ok(message) => message,
         Err(_) => return Ok(Reply::line(554, "message has no headers")),
     };
-    match submission.queue.enqueue(&envelope, &message) {
-        Ok(_) => Ok(Reply::line(250, "message accepted for delivery")),
-        Err(_) => Ok(Reply::line(451, "could not queue the message; try again")),
+
+    // Split the envelope: our own domains deliver locally, the rest relay out.
+    // Local delivery resolves aliases to their target mailbox and deduplicates,
+    // so alias + target on one message store a single copy — the same rule the
+    // port-25 receiver applies.
+    let (local, remote): (Vec<Address>, Vec<Address>) = envelope
+        .recipients
+        .iter()
+        .cloned()
+        .partition(|recipient| recipient.is_local_to(&submission.policy.local_domains));
+
+    let mut mailboxes: Vec<Address> = Vec::new();
+    for recipient in &local {
+        let Some(mailbox) = submission.store.resolve(recipient).cloned() else { continue };
+        if !mailboxes.contains(&mailbox) {
+            mailboxes.push(mailbox);
+        }
     }
+    for mailbox in &mailboxes {
+        if submission.store.deliver(mailbox, &message).await.is_err() {
+            return Ok(Reply::line(451, "could not store the message; try again"));
+        }
+    }
+
+    if !remote.is_empty() {
+        let outbound = Envelope { sender: envelope.sender.clone(), recipients: remote, helo: envelope.helo.clone() };
+        if submission.queue.enqueue(&outbound, &message).is_err() {
+            return Ok(Reply::line(451, "could not queue the message; try again"));
+        }
+    }
+    Ok(Reply::line(250, "message accepted for delivery"))
 }
 
 /// Reads one command line, capped so an overlong line cannot exhaust memory.
@@ -634,9 +701,20 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("submit-{}-{}", std::process::id(), fastcount()));
         let queue = OutboundQueue::open(&dir).unwrap();
         let auth: Arc<dyn Authenticator> = Arc::new(ConfigAuthenticator::new(mailboxes));
+        // The same mailbox list, as store addresses with their alias routes.
+        let mut addresses = Vec::new();
+        let mut aliases = Vec::new();
+        for mailbox in mailboxes {
+            let target = Address::parse(&mailbox.address).unwrap();
+            for alias in &mailbox.aliases {
+                aliases.push((Address::parse(alias).unwrap(), target.clone()));
+            }
+            addresses.push(target);
+        }
+        let store = Maildir::open(&dir, &addresses, &aliases).unwrap();
         // A throwaway ServerConfig; the duplex test never performs a handshake.
         let tls = dummy_server_config();
-        (Submission::new(policy, tls, auth, queue), dir)
+        (Submission::new(policy, tls, auth, queue, store), dir)
     }
 
     fn fastcount() -> u128 {
@@ -706,6 +784,48 @@ mod tests {
         assert!(out.contains("250 message accepted"), "submission should be accepted:\n{out}");
         // Authenticated submission may relay to a foreign domain — that is the point.
         assert_eq!(submission.queue.list().unwrap().len(), 1, "one message should be spooled");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn a_local_recipient_is_stored_not_queued() {
+        // Mail from dave to dave (his own domain) must land in his mailbox
+        // immediately — spooling it outbound would route it to ourselves over
+        // port 25, or strand it forever when direct sending is blocked.
+        let (submission, dir) = submission_with(&[mailbox("dave@example.com", "hunter2")]);
+        let out = run(
+            &submission,
+            "EHLO me\r\n\
+             AUTH PLAIN AGRhdmUAaHVudGVyMg==\r\n\
+             MAIL FROM:<dave@example.com>\r\n\
+             RCPT TO:<dave@example.com>\r\n\
+             DATA\r\n\
+             Subject: note to self\r\n\r\nbody\r\n.\r\n\
+             QUIT\r\n",
+        )
+        .await;
+        assert!(out.contains("250 message accepted"), "local submission should be accepted:\n{out}");
+        assert!(submission.queue.list().unwrap().is_empty(), "nothing should be spooled outbound");
+        let inbox = dir.join("mail").join("example.com").join("dave").join("new");
+        assert_eq!(std::fs::read_dir(&inbox).unwrap().count(), 1, "one message should be in dave's inbox");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn an_unknown_local_recipient_is_refused_at_rcpt() {
+        // A typo'd address in our own domain fails loudly at RCPT rather than
+        // silently vanishing at delivery time.
+        let (submission, dir) = submission_with(&[mailbox("dave@example.com", "hunter2")]);
+        let out = run(
+            &submission,
+            "EHLO me\r\n\
+             AUTH PLAIN AGRhdmUAaHVudGVyMg==\r\n\
+             MAIL FROM:<dave@example.com>\r\n\
+             RCPT TO:<nobody@example.com>\r\n\
+             QUIT\r\n",
+        )
+        .await;
+        assert!(out.contains("550 no such mailbox"), "an unknown local recipient must be refused:\n{out}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -401,6 +401,7 @@ mod tests {
             bind: "0.0.0.0:53".into(),
             secondaries: vec![],
             dynamic_ip: true,
+            lan_ip: None,
             zones: vec![ZoneConfig {
                 domain: "rockywearsahat.com".into(),
                 soa: None,

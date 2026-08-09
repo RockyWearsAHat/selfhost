@@ -317,13 +317,13 @@ where
 }
 
 /// Whether a command line is a `RCPT` command, case-insensitively.
-fn is_rcpt(line: &str) -> bool {
+pub(crate) fn is_rcpt(line: &str) -> bool {
     line.trim_start().get(..4).is_some_and(|head| head.eq_ignore_ascii_case("RCPT"))
 }
 
 /// Extracts the recipient address from a `RCPT TO:<...>` line, if it parses to a
 /// real mailbox address (not the null path).
-fn rcpt_address(line: &str) -> Option<crate::Address> {
+pub(crate) fn rcpt_address(line: &str) -> Option<crate::Address> {
     let trimmed = line.trim_end_matches(['\r', '\n']);
     let rest = trimmed.split_once(' ')?.1.trim();
     let after = rest.strip_prefix("TO:").or_else(|| {
