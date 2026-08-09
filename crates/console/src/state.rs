@@ -10,6 +10,7 @@
 //! the truth, and the first thing it does is disagree with the first copy.
 
 use selfhost_config::ServiceSpec;
+use selfhost_firewall::FirewallState;
 use selfhost_supervisor::state::ServiceStatus;
 use std::collections::VecDeque;
 
@@ -99,6 +100,12 @@ pub struct Logs {
     pub next_seq: u64,
     /// How many lines the daemon dropped before we asked for them.
     pub missed: u64,
+    /// Whether the daemon has answered for this service at all.
+    ///
+    /// What tells "still fetching" from "printed nothing": a reply with no
+    /// lines and no reply yet both leave [`Logs::lines`] empty, and the pane
+    /// must not claim the first while the truth is the second.
+    pub answered: bool,
 }
 
 impl Logs {
@@ -108,10 +115,12 @@ impl Logs {
         self.lines.clear();
         self.next_seq = 0;
         self.missed = 0;
+        self.answered = false;
     }
 
     /// Appends newly fetched lines, dropping the oldest to stay within bounds.
     pub fn append(&mut self, lines: impl IntoIterator<Item = LogLine>, next_seq: u64, missed: u64) {
+        self.answered = true;
         self.lines.extend(lines);
         while self.lines.len() > MAX_LOG_LINES {
             self.lines.pop_front();
@@ -144,6 +153,20 @@ impl Command {
                 name
             }
             Self::Install(spec) => &spec.name,
+        }
+    }
+
+    /// What to say while it is queued and the poller has not run it yet.
+    ///
+    /// Present tense, trailed off: the press has been received and nothing has
+    /// been confirmed, which is exactly what the words claim and no more.
+    pub fn requested_message(&self) -> &'static str {
+        match self {
+            Self::Start(_) => "start requested…",
+            Self::Stop(_) => "stop requested…",
+            Self::Restart(_) => "restart requested…",
+            Self::Uninstall(_) => "uninstall requested…",
+            Self::Install(_) => "install requested…",
         }
     }
 
@@ -182,6 +205,12 @@ pub struct Snapshot {
     pub logs: Logs,
     /// The result of the last command.
     pub notice: Option<Notice>,
+    /// The host firewall's exposure, or `None` until first fetched.
+    ///
+    /// Held as an option, defaulting to `None`, so the exposure map can tell "not
+    /// polled yet" from "the daemon reports no managed firewall" and draw neither
+    /// as the other.
+    pub firewall: Option<FirewallState>,
     /// Commands the interface has asked for and the poller has not run yet.
     pub commands: VecDeque<Command>,
 }
@@ -225,6 +254,15 @@ impl Snapshot {
     /// Asks for a command to be carried out.
     pub fn enqueue(&mut self, command: Command) {
         self.commands.push_back(command);
+    }
+
+    /// The queued command naming `service`, while the poller has not run it.
+    ///
+    /// The queue is the console's own record of what it has asked for, so this
+    /// is what lets the interface acknowledge a press before the daemon
+    /// answers — and refuse to queue the same press twice.
+    pub fn requested(&self, service: &str) -> Option<&Command> {
+        self.commands.iter().find(|command| command.service() == service)
     }
 
     /// Reports something that worked.
@@ -343,6 +381,29 @@ mod tests {
         logs.append([], 5, 3);
         logs.append([], 9, 4);
         assert_eq!(logs.missed, 7, "a second gap must not erase the first");
+    }
+
+    #[test]
+    fn no_reply_and_an_empty_reply_are_two_different_facts() {
+        // Both leave the lines empty; only one of them has learned anything.
+        let mut logs = Logs::default();
+        logs.follow("one");
+        assert!(!logs.answered, "nothing has come back yet");
+
+        logs.append([], 0, 0);
+        assert!(logs.answered, "an empty reply is still a reply");
+
+        logs.follow("two");
+        assert!(!logs.answered, "a new service starts unlearned again");
+    }
+
+    #[test]
+    fn a_queued_command_is_found_under_the_service_it_names() {
+        let mut snapshot = Snapshot::default();
+        snapshot.enqueue(Command::Stop("mongod".into()));
+        assert_eq!(snapshot.requested("mongod"), Some(&Command::Stop("mongod".into())));
+        assert_eq!(snapshot.requested("other"), None);
+        assert_eq!(Command::Stop("mongod".into()).requested_message(), "stop requested…");
     }
 
     #[test]

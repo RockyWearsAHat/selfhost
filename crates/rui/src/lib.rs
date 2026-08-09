@@ -141,6 +141,7 @@ pub mod memory;
 pub mod paint;
 #[cfg(feature = "reload")]
 pub mod reload;
+pub mod sdf;
 pub mod shell;
 pub mod style;
 pub mod testing;
@@ -156,8 +157,12 @@ pub use element::{Children, El};
 pub use font::{Font, FontError};
 pub use geom::{Insets, Point, Rect, Size};
 pub use input::{Composition, Drag, Event, Input, Key, Modifiers, Phase, PointerButton};
-pub use memory::{Id, Memory, Response};
+pub use memory::{FocusSource, Id, Memory, Response};
 pub use paint::{Painter, Visual};
+pub use sdf::{
+    Paint, Sculpt, Shape, arc, bevel, capsule, circle, linear, ngon, polygon, radial, rect,
+    ring, rounded_rect, solid,
+};
 pub use shell::{Error, LoadedFonts, WindowOptions};
 pub use style::{Align, Anchor, Axis, Face, Ink, Justify, Length, Radius, Style, Tone};
 pub use text::{FontId, Fonts, TextStyle};

@@ -57,6 +57,7 @@ pub fn view(snapshot: &Snapshot) -> El<Console> {
     let label = super::display_name(service);
     let (status, startable, summary) = present(&service.state);
     let state_label = service.state.label().to_uppercase();
+    let requested = snapshot.requested(&name).is_some();
 
     style::plate((
             // A lamp and a word, the same mark the rail makes and the masthead
@@ -64,7 +65,7 @@ pub fn view(snapshot: &Snapshot) -> El<Console> {
             // fact wearing two costumes on one screen.
             title_rule(label, Some(style::state_mark(status, state_label))),
             caption(summary),
-            actions(&name, &service.state, startable),
+            actions(&name, &service.state, startable, requested),
             style::section_rule_control(
                 "DEFINITION",
                 edit_button(spec_of(snapshot, &name).cloned()),
@@ -105,12 +106,19 @@ fn guidance(snapshot: &Snapshot) -> &'static str {
 /// operator last pressed, so a service that died on its own immediately offers
 /// Start again.
 ///
+/// The one exception is `requested`: while a command naming this service is
+/// still queued for the poller, all four are refused. The press has been
+/// received and nothing has answered yet, and a row of live buttons in that
+/// moment is an invitation to queue the same press twice. Pure function of
+/// the snapshot's own queue — the buttons come back the frame the poller
+/// takes the command.
+///
 /// They sit in a well rather than loose on the panel. The row has a deliberate
 /// hole in it — the destructive action is pushed to the far end, away from the
 /// three ordinary ones — and on a wide pane that hole read as a button that had
 /// failed to draw. A track around them says the space between is part of the
 /// control and not a gap in it.
-fn actions(name: &str, state: &ServiceState, startable: bool) -> El<Console> {
+fn actions(name: &str, state: &ServiceState, startable: bool, requested: bool) -> El<Console> {
     let stoppable = state.is_live();
     // The buttons grow from their words toward one shared width, so the four
     // are uniform whenever the pane allows it and share what there is when it
@@ -131,12 +139,12 @@ fn actions(name: &str, state: &ServiceState, startable: bool) -> El<Console> {
             Command::Start(name.to_owned()),
         )
         .primary()
-        .disabled(!startable),
-        action("Stop", Command::Stop(name.to_owned())).disabled(!stoppable),
+        .disabled(!startable || requested),
+        action("Stop", Command::Stop(name.to_owned())).disabled(!stoppable || requested),
         // Restart is offered whatever the state: on a stopped service it means
         // "start", and the supervisor treats it that way. Greying it out would
         // make the operator work out which of two buttons is the live one.
-        action("Restart", Command::Restart(name.to_owned())),
+        action("Restart", Command::Restart(name.to_owned())).disabled(requested),
         // A rule across the space between the two groups, with a tick at the end
         // of it — the same mark every heading in the window is ruled with. On a
         // wide pane that space is most of the row, and empty it read as a button
@@ -150,7 +158,7 @@ fn actions(name: &str, state: &ServiceState, startable: bool) -> El<Console> {
         // hand's width of nothing between it and Uninstall, which is the exact
         // defect the rule was drawn to answer.
         style::rule().pad_x(12.0),
-        action("Uninstall", Command::Uninstall(name.to_owned())).danger(),
+        action("Uninstall", Command::Uninstall(name.to_owned())).danger().disabled(requested),
     ))
     .h(36.0)
     .pad(4.0)
@@ -160,6 +168,13 @@ fn actions(name: &str, state: &ServiceState, startable: bool) -> El<Console> {
     .round(Radius::Control)
 }
 
+/// What the pane says while the daemon has not sent the definition yet.
+///
+/// One sentence, shared between the definition block and the disabled Edit
+/// button, so the reason a control is refused is the same words the block
+/// gives for the rows that are missing.
+const DEFINITION_PENDING: &str = "The definition has not been fetched yet.";
+
 /// The control that opens the definition for editing.
 ///
 /// It sits at the far end of the DEFINITION rule because it is about exactly
@@ -168,18 +183,22 @@ fn actions(name: &str, state: &ServiceState, startable: bool) -> El<Console> {
 /// event. It opens the same form that installs, filled from the definition
 /// the daemon holds, and it is disabled until that definition has been
 /// fetched: a form filled from nothing would submit a service reset to
-/// defaults.
+/// defaults. Disabled, it carries [`DEFINITION_PENDING`] as its name, so what
+/// is announced is why the control is refused rather than a bare word that
+/// will not press.
 fn edit_button(spec: Option<ServiceSpec>) -> El<Console> {
-    button("Edit")
+    let waiting = spec.is_none();
+    let control = button("Edit")
         .ghost()
         .h(20.0)
         .pad_x(10.0)
-        .disabled(spec.is_none())
+        .disabled(waiting)
         .on_click(move |console: &mut Console| {
             if let Some(spec) = &spec {
                 console.form_mut().open_edit(spec);
             }
-        })
+        });
+    if waiting { control.label(format!("Edit — {DEFINITION_PENDING}")) } else { control }
 }
 
 /// What the service is configured to be.
@@ -224,8 +243,13 @@ fn definition(snapshot: &Snapshot, service: &selfhost_supervisor::state::Service
         }
         // Before the definition has been fetched, the live status is all there
         // is. Showing empty rows for the rest would claim the daemon had
-        // answered with nothing rather than not having answered yet.
-        None => rows.push(field_row("START MODE", text(start_mode_label(service.start_mode)))),
+        // answered with nothing rather than not having answered yet — so the
+        // one known fact is stated, and the block says in so many words why
+        // the rest are absent.
+        None => {
+            rows.push(field_row("START MODE", text(start_mode_label(service.start_mode))));
+            rows.push(caption(DEFINITION_PENDING));
+        }
     }
 
     rows.push(field_row(
@@ -262,17 +286,24 @@ fn definition(snapshot: &Snapshot, service: &selfhost_supervisor::state::Service
 /// Pinned to the newest line until the reader scrolls back, and pinned again
 /// once they scroll to the end — see [`rui::El::follow`], which decides that
 /// from where the reader actually is rather than from a flag this has to keep.
+///
+/// Until a reply for the *selected* service has arrived — the selection just
+/// changed and the log still belongs to the last one, or nothing has come
+/// back at all — the pane says it is fetching. "Printed nothing" is a claim
+/// about the service, and it is made only after a reply with no lines in it
+/// actually said so; a fetch still in flight drawn as an empty log is the
+/// console asserting something it has not learned. The same rule keeps a
+/// stale log from being shown under the wrong service's name.
 fn output(snapshot: &Snapshot) -> El<Console> {
-    let lines: Vec<El<Console>> = snapshot.logs.lines.iter().map(log_line).collect();
+    let selected = snapshot.selected.as_deref().unwrap_or_default();
+    let fetching = snapshot.logs.service != selected || !snapshot.logs.answered;
 
-    let body: El<Console> = if lines.is_empty() {
-        col(caption(if snapshot.logs.service.is_empty() {
-            "No service selected."
-        } else {
-            "This service has printed nothing since the daemon started."
-        }))
-        .grow()
+    let body: El<Console> = if fetching {
+        col(caption("Fetching output…")).grow()
+    } else if snapshot.logs.lines.is_empty() {
+        col(caption("This service has printed nothing since the daemon started.")).grow()
     } else {
+        let lines: Vec<El<Console>> = snapshot.logs.lines.iter().map(log_line).collect();
         col(lines).key(&snapshot.logs.service).gap(1.0).follow()
     };
 
@@ -355,8 +386,8 @@ mod tests {
     }
 
     /// Whether each lifecycle button is offered, in the order they are drawn.
-    fn availability(state: &ServiceState, startable: bool) -> Vec<bool> {
-        actions("mongod", state, startable)
+    fn availability(state: &ServiceState, startable: bool, requested: bool) -> Vec<bool> {
+        actions("mongod", state, startable, requested)
             .children()
             .iter()
             .map(|button| !button.is_disabled())
@@ -365,20 +396,30 @@ mod tests {
 
     #[test]
     fn which_lifecycle_buttons_are_live_follows_the_state_and_not_the_last_press() {
-        let stopped = availability(&ServiceState::Stopped, true);
+        let stopped = availability(&ServiceState::Stopped, true, false);
         assert!(stopped[0], "a stopped service can be started");
         assert!(!stopped[1], "and cannot be stopped");
 
-        let running = availability(&ServiceState::Running { pid: 1, uptime_secs: 1 }, false);
+        let running = availability(&ServiceState::Running { pid: 1, uptime_secs: 1 }, false, false);
         assert!(!running[0], "a running service cannot be started again");
         assert!(running[1], "and can be stopped");
         assert!(running[2], "restart is offered whatever the state");
     }
 
     #[test]
+    fn a_queued_command_refuses_the_lifecycle_until_the_poller_takes_it() {
+        // The press has been received and nothing has answered yet; live
+        // buttons in that moment queue the same press twice. Index 3 is the
+        // rule across the well, which has no press to refuse.
+        let queued = availability(&ServiceState::Running { pid: 1, uptime_secs: 1 }, false, true);
+        assert!(!queued[0] && !queued[1] && !queued[2], "the ordinary three are refused");
+        assert!(!queued[4], "and so is Uninstall");
+    }
+
+    #[test]
     fn pressing_start_asks_the_poller_to_start_that_service() {
         let mut console = console(populated());
-        let element = actions("mongod", &ServiceState::Stopped, true);
+        let element = actions("mongod", &ServiceState::Stopped, true, false);
         let start = element.child(0).expect("the first action");
         (start.click_action().expect("Start is clickable"))(&mut console);
 
@@ -408,6 +449,41 @@ mod tests {
         let service = snapshot.selected_service().expect("a selection").clone();
         let block = definition(&snapshot, &service);
         assert!(block.child(0).is_some(), "the block should not be empty");
+        let pending = block.child(1).and_then(rui::El::text_content);
+        assert_eq!(pending, Some(DEFINITION_PENDING), "and it says why the rest are absent");
     }
 
+    /// The words the output pane's empty state carries, if it is empty.
+    fn empty_claim(snapshot: &Snapshot) -> Option<String> {
+        output(snapshot)
+            .child(0)
+            .and_then(|body| body.child(0))
+            .and_then(rui::El::text_content)
+            .map(str::to_owned)
+    }
+
+    #[test]
+    fn output_still_being_fetched_is_never_claimed_to_be_empty() {
+        // `populated` selects a service whose log has not been asked for yet:
+        // the truth is "not looked yet", and the pane must say that rather
+        // than claim the service printed nothing.
+        let snapshot = populated();
+        assert_eq!(empty_claim(&snapshot).as_deref(), Some("Fetching output…"));
+
+        // A reply arrived, for the wrong (previous) service: still fetching,
+        // and the stale lines are not drawn under the new name.
+        let mut stale = populated();
+        stale.logs.follow("mongod");
+        stale.logs.append([LogLine { seq: 0, is_error: false, text: "old".into() }], 1, 0);
+        assert_eq!(empty_claim(&stale).as_deref(), Some("Fetching output…"));
+
+        // Only a real empty reply for the selected service earns the claim.
+        let mut answered = populated();
+        answered.logs.follow("levelup-api");
+        answered.logs.append([], 0, 0);
+        assert_eq!(
+            empty_claim(&answered).as_deref(),
+            Some("This service has printed nothing since the daemon started.")
+        );
+    }
 }

@@ -1,0 +1,19 @@
+[package]
+name = "selfhost-vpn-ui"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "The desktop VPN panel: one window to bring up the Secure-VPN tunnel and reach the admin console."
+
+[[bin]]
+name = "selfhost-vpn-ui"
+path = "src/main.rs"
+
+[dependencies]
+rui = { workspace = true }
+
+[lints.rust]
+unsafe_code = "forbid"
+missing_docs = "warn"

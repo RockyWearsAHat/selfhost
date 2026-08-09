@@ -789,6 +789,112 @@ mod tests {
         assert!(missing.is_err(), "clicking nothing must not quietly pass");
     }
 
+    /// The strip a focus ring would cross, just above an element's own edge.
+    ///
+    /// The ring is stroked two units outside the rect and two thick, so its
+    /// band lies wholly above the top edge; a short strip over the middle of
+    /// that edge — clear of the corners and of the element's own border — is
+    /// marked exactly when the ring is drawn.
+    fn ring_strip(rect: Rect) -> Rect {
+        Rect::new(rect.x + rect.w / 2.0 - 5.0, rect.y - 4.0, 10.0, 2.0)
+    }
+
+    #[test]
+    fn the_focus_ring_marks_keyboard_focus_and_never_a_click() {
+        let mut harness = Harness::new(Counter::default(), |_: &Counter| {
+            crate::col(crate::button("Start").key("go").on_click(|_: &mut Counter| {}))
+                .pad(20.0)
+        });
+        let rect = harness.find_key("go").expect("the button is on screen").rect;
+
+        harness.click(rect.center());
+        assert_eq!(harness.focused(), Some(harness.find_key("go").unwrap().id));
+        assert!(
+            !harness.marked(ring_strip(rect)),
+            "a click already showed the person where they aimed; no ring"
+        );
+
+        harness.tab();
+        assert!(harness.marked(ring_strip(rect)), "keyboard focus is invisible without the ring");
+
+        harness.click(rect.center());
+        assert!(!harness.marked(ring_strip(rect)), "the next click takes the ring back off");
+    }
+
+    #[test]
+    fn a_field_wears_the_ring_however_focus_arrived() {
+        // The one exception to keyboard-only: a caret justifies the ring, so a
+        // clicked field looks held exactly as a tabbed-to one does.
+        let mut harness = Harness::new(Counter::default(), |_: &Counter| {
+            crate::col(crate::field("").key("name")).pad(20.0)
+        });
+        let rect = harness.find_key("name").expect("the field is on screen").rect;
+
+        harness.click(rect.center());
+        assert!(harness.marked(ring_strip(rect)), "a clicked field is still ringed");
+    }
+
+    /// A line being typed into, for the caret tests.
+    #[derive(Default)]
+    struct Typing {
+        text: String,
+    }
+
+    #[test]
+    fn the_caret_blinks_at_rest_and_holds_solid_under_typing() {
+        let mut harness = Harness::new(Typing::default(), |app: &Typing| {
+            crate::col(
+                crate::field(app.text.clone())
+                    .key("name")
+                    .on_input(|app: &mut Typing, text: String| app.text = text),
+            )
+            .pad(20.0)
+        })
+        .frame_time(Duration::from_millis(66));
+        let rect = harness.find_key("name").expect("the field is on screen").rect;
+
+        // A device pixel inside the caret's column: eight units of the field's
+        // own padding in, at its vertical middle. Its resting colour is the
+        // field's well, read before anything has focus.
+        let (x, y) = ((rect.x + 8.0) as u32, rect.center().y as u32);
+        let well = harness.pixel(x, y).expect("the field is on the canvas");
+
+        harness.click(rect.center());
+        let (mut lit, mut dark) = (false, false);
+        for _ in 0..30 {
+            harness.frame();
+            match harness.pixel(x, y) == Some(well) {
+                true => dark = true,
+                false => lit = true,
+            }
+        }
+        assert!(lit && dark, "two seconds of a focused caret must both show and hide it");
+        assert!(harness.is_animating(), "the blink is a live loop while the field is focused");
+
+        // Step to a frame where the caret is dark, then type: the keystroke
+        // resets the blink, so the caret is solid at its new place from the
+        // frame the character lands, not whenever the old blink comes round.
+        for _ in 0..30 {
+            if harness.pixel(x, y) == Some(well) {
+                break;
+            }
+            harness.frame();
+        }
+        harness.type_text("x");
+        // One glyph along: the test face advances half an em of the field's
+        // code size, so the caret's column now starts 5.75 units in and the
+        // device pixel one unit further sits wholly inside it.
+        let after = (rect.x + 8.0 + 6.0) as u32;
+        for _ in 0..4 {
+            assert_ne!(
+                harness.pixel(after, y),
+                Some(well),
+                "typing must hold the caret solid, not mid-blink"
+            );
+            harness.frame();
+        }
+    }
+
     #[test]
     fn the_face_it_draws_with_measures_in_round_numbers() {
         // Aligned to the start, so the run is laid out to the width it asked

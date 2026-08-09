@@ -215,11 +215,18 @@ pub fn view(console: &Console) -> El<Console> {
                 // so changing it on an existing service would be an install of a
                 // different one rather than an edit. The daemon would agree, and
                 // leave two.
+                // Placeholders are examples and say so — "e.g.", in the idle
+                // ink. The code face means "this exact string is what the
+                // machine uses", and a bare `mongod` sitting in the box is
+                // indistinguishable from a value already typed: a blank form
+                // has to be unmistakably blank.
                 match form.editing() {
                     Some(name) => field_row("NAME", code(name.to_owned())),
-                    None => text_row("NAME", &form.name, "mongod", |form, value| form.name = value),
+                    None => {
+                        text_row("NAME", &form.name, "e.g. mongod", |form, value| form.name = value)
+                    }
                 },
-                text_row("PROGRAM", &form.program, "/usr/local/bin/mongod", |form, value| {
+                text_row("PROGRAM", &form.program, "e.g. /usr/local/bin/mongod", |form, value| {
                     form.program = value
                 }),
                 arguments(form),
@@ -286,7 +293,7 @@ fn arguments(form: &InstallForm) -> El<Console> {
                 field(argument)
                     .grow()
                     .max_w(FIELD_MAX)
-                    .placeholder("one argument")
+                    .placeholder("e.g. --config")
                     // Named for what cannot see it: a filled field has no
                     // placeholder left to speak for it, and every unnamed
                     // argument box would otherwise be announced identically.
