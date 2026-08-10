@@ -210,6 +210,22 @@ Step 5 is not a formality. It is the difference between finding a
 misconfiguration on a CA with generous limits and finding it on one that will
 lock you out for a week.
 
+## 8. Let it update itself
+
+Once the deployment directory is a clone of your repository, add:
+
+```toml
+[self_update]
+repository = "https://github.com/you/selfhost.git"
+branch = "main"
+```
+
+The daemon polls the branch (every 60 s by default), and a push fetches,
+rebuilds, and restarts every selfhost process — no SSH needed again. It only
+ever fast-forwards: modified tracked files or local commits in the deployment
+refuse the update rather than being discarded, and a failed build rolls back
+and leaves the old build running.
+
 ## Where things live
 
 ```
