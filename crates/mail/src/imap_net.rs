@@ -249,6 +249,15 @@ where
             }
             IAction::Login { tag, username, password } => {
                 let authenticated = server.authenticator.verify(&username, &password);
+                if authenticated.is_none() {
+                    // Names which half was wrong via the configured address —
+                    // the client's own input never reaches the log (the
+                    // username field may itself hold a mistyped password).
+                    match server.authenticator.resolve(&username) {
+                        Some(address) => log_imap(peer, format!("login failed: password mismatch for {address}")),
+                        None => log_imap(peer, "login failed: unknown login name"),
+                    }
+                }
                 let responses = session.login_result(&tag, authenticated);
                 send(peer, reader.get_mut(), &responses).await?;
             }

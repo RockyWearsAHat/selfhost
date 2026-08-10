@@ -60,6 +60,12 @@ const PBKDF2_KEY_LEN: usize = 32;
 pub trait Authenticator: Send + Sync {
     /// Whether `username`/`password` identify a real mailbox, and which one.
     fn verify(&self, username: &str, password: &str) -> Option<Address>;
+
+    /// The mailbox `username` would address, ignoring the password: `Some` when
+    /// the name is a known login name, `None` otherwise. Lets a failed login be
+    /// logged as "unknown name" vs "wrong password" using only configured
+    /// addresses — the client's own input still never reaches a log.
+    fn resolve(&self, username: &str) -> Option<Address>;
 }
 
 /// Verifies credentials against the configured mailboxes' PBKDF2 hashes.
@@ -95,17 +101,23 @@ impl ConfigAuthenticator {
         }
         Self { entries }
     }
+
+    /// The first entry `username` may log in under, compared case-insensitively.
+    fn find(&self, username: &str) -> Option<&Entry> {
+        let key = username.trim().to_ascii_lowercase();
+        self.entries.iter().find(|entry| entry.login_names.iter().any(|name| name == &key))
+    }
 }
 
 impl Authenticator for ConfigAuthenticator {
     fn verify(&self, username: &str, password: &str) -> Option<Address> {
-        let key = username.trim().to_ascii_lowercase();
-        for entry in &self.entries {
-            if entry.login_names.iter().any(|name| name == &key) && verify_pbkdf2(&entry.password_hash, password) {
-                return Some(entry.address.clone());
-            }
-        }
-        None
+        self.find(username)
+            .filter(|entry| verify_pbkdf2(&entry.password_hash, password))
+            .map(|entry| entry.address.clone())
+    }
+
+    fn resolve(&self, username: &str) -> Option<Address> {
+        self.find(username).map(|entry| entry.address.clone())
     }
 }
 
@@ -351,18 +363,35 @@ where
             }
             Action::VerifyCredentials { mechanism, initial_response } => {
                 let credential = decode_credential(&mechanism, &initial_response);
-                let verdict = credential.and_then(|(user, pass)| submission.auth.verify(&user, &pass));
-                log_submission(peer, if verdict.is_some() { "auth ok" } else { "auth FAILED" });
+                let verdict = credential.as_ref().and_then(|(user, pass)| submission.auth.verify(user, pass));
+                log_submission(peer, auth_outcome(&*submission.auth, credential.as_ref(), verdict.is_some()));
                 finish_auth(reader.get_mut(), session, verdict.is_some()).await?;
             }
             Action::AwaitCredentials { mechanism, reply } => {
                 write_reply(reader.get_mut(), &reply).await?;
                 let credential = read_credentials(&mut reader, &mechanism).await?;
-                let verdict = credential.and_then(|(user, pass)| submission.auth.verify(&user, &pass));
-                log_submission(peer, if verdict.is_some() { "auth ok" } else { "auth FAILED" });
+                let verdict = credential.as_ref().and_then(|(user, pass)| submission.auth.verify(user, pass));
+                log_submission(peer, auth_outcome(&*submission.auth, credential.as_ref(), verdict.is_some()));
                 finish_auth(reader.get_mut(), session, verdict.is_some()).await?;
             }
         }
+    }
+}
+
+/// The log line for one authentication attempt. A failure names which half was
+/// wrong — resolved against the configured mailboxes, so the line carries a
+/// configured address, never the client's own input (which may itself be a
+/// mistyped password).
+fn auth_outcome(auth: &dyn Authenticator, credential: Option<&(String, String)>, ok: bool) -> String {
+    if ok {
+        return "auth ok".to_owned();
+    }
+    match credential {
+        None => "auth FAILED (malformed credential)".to_owned(),
+        Some((username, _)) => match auth.resolve(username) {
+            Some(address) => format!("auth FAILED: password mismatch for {address}"),
+            None => "auth FAILED: unknown login name".to_owned(),
+        },
     }
 }
 
