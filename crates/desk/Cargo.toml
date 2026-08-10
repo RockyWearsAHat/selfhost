@@ -12,7 +12,12 @@ selfhost-json = { workspace = true }
 tokio = { workspace = true }
 
 [dev-dependencies]
-tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time"] }
+# `test-util` is what lets the session driver's tests run a four-hour ceiling and
+# a sixty-second re-validation timer in microseconds of virtual time, on a laptop
+# with no display attached. It is a feature of a dependency the workspace already
+# has, and it is a dev-dependency: nothing it enables is compiled into a release
+# binary.
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time", "test-util"] }
 
 [lints.rust]
 unsafe_code = "forbid"

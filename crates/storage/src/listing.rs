@@ -101,14 +101,32 @@ pub enum Unreachable {
     /// reserved device name, a colon, a trailing dot. It was almost certainly
     /// written by another operating system.
     Refused(path::Refusal),
+    /// The name is spellable and the volume will not hand over what is under
+    /// it: a symlink, a device node, a FIFO, or something that vanished between
+    /// the directory read and the open.
+    ///
+    /// This is the variant a *name* cannot decide, which is why it exists.
+    /// [`Entry::new`] judges the name and nothing else, so a symlink whose name
+    /// is perfectly ordinary looked reachable — and every layer downstream
+    /// believed it: the console offered a link, and
+    /// [`crate::dav::propfind::Resource::from_entry`] minted an `href` for a
+    /// name no `GET` will ever answer. [`Kind`]'s own documentation has always
+    /// said a symlink is reported unreachable; this is what makes that true.
+    Unopenable,
 }
 
 impl Unreachable {
     /// A short reason a person reads, in the console's entry row.
+    ///
+    /// Deliberately vague about *why* the open failed. A row that said "symlink"
+    /// would report the shape of a share's contents to whoever can read a
+    /// listing, and the operator's answer — look at it over SSH — is the same
+    /// for all four causes.
     pub fn reason(self) -> String {
         match self {
             Self::NotUtf8 => "name is not valid UTF-8".to_string(),
             Self::Refused(refusal) => refusal.to_string(),
+            Self::Unopenable => "this share will not serve what is under that name".to_string(),
         }
     }
 }
@@ -157,6 +175,24 @@ impl Entry {
         }
     }
 
+    /// An entry whose name is fine and whose contents this share will not serve.
+    ///
+    /// The counterpart to [`Entry::new`] for the half of reachability a name
+    /// cannot answer: the caller has already tried to open the thing and been
+    /// refused. A name that is *also* unspellable keeps the name's own reason,
+    /// because that is the more specific answer and the one an operator can act
+    /// on.
+    ///
+    /// Kind and size are the caller's best description of something it could
+    /// not describe — a zero-byte file — and they are shown rather than hidden
+    /// for the reason this module's documentation gives: a file that exists and
+    /// cannot be reached is exactly what an operator needs to see.
+    pub fn unopenable(name: &OsStr) -> Self {
+        let mut entry = Self::new(name, Kind::File, 0, None);
+        entry.blocked = entry.blocked.or(Some(Unreachable::Unopenable));
+        entry
+    }
+
     /// Whether a URL exists that fetches this entry.
     pub fn reachable(&self) -> bool {
         self.blocked.is_none()
@@ -171,10 +207,13 @@ impl Entry {
     /// a link would build one by concatenating `name`, which is the bug this
     /// module's documentation describes.
     ///
-    /// An unreachable entry gets no `path`: there is no URL that fetches it, and
-    /// emitting one that resolves to something *else* — which is exactly what a
-    /// name containing a backslash would do — is worse than emitting none. The
-    /// console renders those rows greyed, with `blockedReason` as the tooltip.
+    /// An unreachable entry gets no `path`, and the field is gated on
+    /// [`Entry::reachable`] rather than on whether the encoder happened to
+    /// manage: there is no URL that fetches such an entry, and emitting one that
+    /// resolves to something *else* — which is exactly what a name containing a
+    /// backslash would do — or one that resolves to a `404` — which is what a
+    /// symlink's would do — is worse than emitting none. The console renders
+    /// those rows greyed, with `blockedReason` as the tooltip.
     pub fn to_json(&self, parent: &RelativePath) -> Json {
         let mut fields = vec![
             ("name", Json::string(&self.name)),
@@ -182,7 +221,7 @@ impl Entry {
             ("size", Json::Number(self.size as f64)),
             ("reachable", Json::Bool(self.reachable())),
         ];
-        if let Ok(path) = parent.join(&self.name) {
+        if let Some(path) = self.reachable().then(|| parent.join(&self.name)).and_then(Result::ok) {
             fields.push(("path", Json::string(path.to_url_path())));
         }
         if let Some(seconds) = self.modified.and_then(unix_seconds) {
@@ -336,6 +375,23 @@ mod tests {
             assert!(entry.name.contains("bad"));
         }
         assert_eq!(Unreachable::NotUtf8.reason(), "name is not valid UTF-8");
+    }
+
+    /// The half of reachability a name cannot decide: the volume refused to
+    /// open it.
+    #[test]
+    fn a_name_whose_contents_cannot_be_opened_is_shown_and_not_served() {
+        let entry = Entry::unopenable(OsStr::new("link.txt"));
+        assert_eq!(entry.name, "link.txt");
+        assert!(!entry.reachable(), "a name nothing can be fetched through is not reachable");
+        assert_eq!(entry.blocked, Some(Unreachable::Unopenable));
+        assert_eq!(entry.size, 0);
+        // No link is offered for it, because there is no URL that fetches it.
+        assert!(!entry.to_json(&RelativePath::default()).to_text().contains(r#""path""#));
+
+        // A name that is unspellable *as well* keeps the more specific reason.
+        let refused = Entry::unopenable(OsStr::new("CON.txt"));
+        assert!(matches!(refused.blocked, Some(Unreachable::Refused(_))));
     }
 
     #[test]

@@ -324,6 +324,262 @@
 
   </div>
 
+  <!-- FILES: the shares this caller may open, as a file manager rather than a
+       listing. Hidden until the daemon reports one; a deployment with no
+       [[shares]] and a caller who holds none both get a sentence, never an
+       error — absence is a state of the configuration, not a fault.
+
+       Every name in here is hostile text and every link is built by the
+       encoder; app.js states that rule in full above `urlPath`. -->
+  <section id="storage" class="plate" hidden>
+    <div class="section-rule">
+      <h2>FILES</h2><span class="rule"></span>
+      <span id="fs-count" class="mono micro"></span>
+    </div>
+    <p id="fs-note" class="caption" hidden></p>
+
+    <!-- One plate per share: id, what it is, and a segmented gauge of what it
+         holds. The gauge is the lamp vocabulary widened — lit slots, not a
+         progress bar — so a full share reads the same way a bad lamp does. -->
+    <div id="fs-shares" hidden></div>
+
+    <div id="fs-panes" hidden>
+      <!-- The folder tree. Tick-ruled rather than indented with whitespace, so
+           depth is a measurement like every other structure on this page. -->
+      <nav id="fs-tree" aria-label="Folders"></nav>
+
+      <div id="fs-main">
+        <div id="fs-bar">
+          <nav id="fs-crumbs" aria-label="Breadcrumb"></nav>
+          <span class="rule"></span>
+          <button id="fs-up" class="btn ghost small" type="button" title="Up one folder">UP</button>
+          <button id="fs-mkdir" class="btn ghost small" type="button">NEW FOLDER</button>
+          <button id="fs-upload" class="btn ghost small" type="button">UPLOAD</button>
+          <button id="fs-reload" class="btn ghost small" type="button">REFRESH</button>
+          <input id="fs-file" type="file" multiple hidden>
+        </div>
+
+        <!-- Inline forms rather than dialogs: a modal over an instrument panel
+             hides the readings the operator is acting on. -->
+        <div id="fs-mkdir-row" class="inline-form" hidden>
+          <label class="fieldlabel" for="fs-mkdir-name">NEW FOLDER IN THIS DIRECTORY</label>
+          <input id="fs-mkdir-name" autocomplete="off" spellcheck="false" maxlength="255">
+          <button id="fs-mkdir-go" class="btn primary small" type="button">CREATE</button>
+          <button id="fs-mkdir-cancel" class="btn ghost small" type="button">CANCEL</button>
+        </div>
+
+        <div id="fs-move-row" class="inline-form" hidden>
+          <label class="fieldlabel" for="fs-move-path" id="fs-move-label"></label>
+          <select id="fs-move-share" aria-label="Destination share"></select>
+          <input id="fs-move-path" class="mono" autocomplete="off" spellcheck="false"
+                 placeholder="destination folder, blank for the share root">
+          <button id="fs-move-go" class="btn primary small" type="button">MOVE</button>
+          <button id="fs-move-cancel" class="btn ghost small" type="button">CANCEL</button>
+        </div>
+
+        <!-- Destruction is depth-infinity on a directory, so it takes a typed
+             name exactly as an uninstall does. -->
+        <div id="fs-confirm" class="confirm" hidden>
+          <label class="fieldlabel" for="fs-confirm-input" id="fs-confirm-label"></label>
+          <input id="fs-confirm-input" class="mono" autocomplete="off" spellcheck="false">
+          <button id="fs-confirm-go" class="btn danger small" type="button">DELETE</button>
+          <button id="fs-confirm-cancel" class="btn ghost small" type="button">CANCEL</button>
+        </div>
+
+        <div id="fs-drop">
+          <div id="fs-table-wrap"><table id="fs-table">
+            <thead><tr>
+              <th><button id="fs-sort-name" class="sortbtn" type="button">NAME</button></th>
+              <th class="numeric"><button id="fs-sort-size" class="sortbtn" type="button">SIZE</button></th>
+              <th><button id="fs-sort-modified" class="sortbtn" type="button">MODIFIED</button></th>
+              <th class="actions-head">ACTIONS</th>
+            </tr></thead>
+            <tbody id="fs-rows"></tbody>
+          </table></div>
+          <p id="fs-empty" class="caption centered" hidden></p>
+          <div id="fs-veil" hidden><span>RELEASE TO UPLOAD HERE</span></div>
+        </div>
+
+        <!-- The transfer log. A 5 GB file is never read into this page: the
+             File object is handed to the request as its body and the browser
+             streams it off the disk. -->
+        <div id="fs-transfers" hidden>
+          <div class="section-rule">
+            <h2>TRANSFERS</h2><span class="rule"></span>
+            <span id="fs-transfer-count" class="mono micro"></span>
+            <button id="fs-transfer-clear" class="btn ghost small" type="button">CLEAR FINISHED</button>
+          </div>
+          <ul id="fs-uploads"></ul>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- DESKTOP: the machine's own screen. Hidden when the daemon serves none —
+       [desktop].enabled = false and no [desktop] block are deliberately
+       indistinguishable on the wire, and both mean the plate says so plainly.
+
+       Two stacked canvases, drawn from ArrayBuffers through putImageData. That
+       is a security decision as much as a rendering one: this page's CSP is
+       `default-src 'none'` with no blob: and no data:, which forbids blob URLs,
+       createImageBitmap, Workers and WebCodecs — and that CSP is the strongest
+       single defence the console has, so the viewport is built to need no
+       widening of it.
+
+       WATCHING AND DRIVING ARE TWO DIFFERENT SESSIONS. A stream opened by WATCH
+       carries VIEW and nothing else, and no key, pointer or wheel event is
+       forwarded on it. TAKE CONTROL asks for the passkey at the moment it is
+       clicked — however long the console has been open — and opens a *second*
+       stream with the ticket that authorisation minted: the capability set of a
+       live stream is fixed in its Hello and this page cannot widen one, which is
+       exactly the property that makes an old session not a keyboard. -->
+  <section id="desktop" class="plate" hidden>
+    <div class="section-rule">
+      <h2>DESKTOP</h2><span class="rule"></span>
+      <span id="dv-lamp" class="lamp idle"></span>
+      <span id="dv-word" class="stateword">NOT CONNECTED</span>
+    </div>
+    <p id="dv-note" class="caption"></p>
+    <p id="dv-hint" class="caption dim" hidden></p>
+
+    <!-- The peer picker. A machine that is down is reported with its reason and
+         its age; absence is never the answer. -->
+    <div id="dv-peers" hidden></div>
+
+    <p id="dv-agent" class="caption lampline" hidden>
+      <span id="dv-agent-lamp" class="lamp idle"></span><span id="dv-agent-text"></span>
+    </p>
+
+    <div id="dv-actions" class="actions" hidden>
+      <button id="dv-connect" class="btn primary" type="button">WATCH</button>
+      <button id="dv-disconnect" class="btn" type="button" hidden>DISCONNECT</button>
+      <button id="dv-full" class="btn ghost" type="button" hidden>FULL FRAME</button>
+      <span class="rule"></span>
+      <span id="dv-monitors" class="picker"></span>
+      <button id="dv-control" class="btn ghost" type="button">TAKE CONTROL</button>
+    </div>
+    <p id="dv-control-note" class="caption dim" hidden></p>
+
+    <!-- The fresh-authorisation row. Hidden until a keyboard is asked for and
+         the daemon answers that this login is too old to be one. The password
+         field is the fallback for a deployment with no passkey registered:
+         either credential mints a new session, and a new session is what the
+         daemon's freshness window is measured against. -->
+    <div id="dv-reauth" class="inline-form" hidden>
+      <span class="fieldlabel">AUTHORISE THE KEYBOARD</span>
+      <p id="dv-reauth-note" class="caption"></p>
+      <div id="dv-reauth-row" class="actions">
+        <button id="dv-reauth-go" class="btn primary small" type="button">PROVE IT IS YOU</button>
+        <input id="dv-reauth-pass" type="password" autocomplete="current-password"
+               placeholder="console password" hidden>
+        <button id="dv-reauth-pass-go" class="btn small" type="button" hidden>AUTHORISE</button>
+        <button id="dv-reauth-cancel" class="btn ghost small" type="button">CANCEL</button>
+      </div>
+    </div>
+
+    <!-- The mode banner. The one reading on this plate a person must never have
+         to look twice at: whether what they type is going anywhere. -->
+    <p id="dv-mode" class="caption lampline" hidden>
+      <span id="dv-mode-lamp" class="lamp idle"></span>
+      <span id="dv-mode-word" class="stateword"></span>
+      <span id="dv-mode-text"></span>
+    </p>
+
+    <!-- The viewport: a sunken bezel with the plate's own corner brackets, the
+         screen canvas, and the cursor canvas composited over it from the
+         separate cursor channel.
+
+         While a keyboard is held the frame itself carries the mode: it takes the
+         focus (tabindex), lights its bezel, and wears a badge. A remote desktop
+         whose only sign of being live is a word elsewhere on the page is one
+         people type into by accident. -->
+    <div id="dv-stage" hidden>
+      <div id="dv-frame" tabindex="-1">
+        <canvas id="dv-screen" width="16" height="9" aria-label="The remote screen"></canvas>
+        <canvas id="dv-cursor" width="1" height="1" hidden></canvas>
+        <span id="dv-badge" class="badge" hidden>DRIVING</span>
+        <!-- Shown when the keyboard is held and the frame is not focused: the
+             one state in which keys are silently kept by the browser. -->
+        <div id="dv-focusveil" hidden>
+          <span class="focusmark"></span>
+          <p class="caption centered">CLICK TO TAKE THE KEYBOARD</p>
+        </div>
+        <!-- Refusals, in the agent's own sentence plus what to do about it.
+             Over the picture rather than beside it, because the person reading
+             it is looking at the screen they just failed to type into. -->
+        <div id="dv-refusal" hidden>
+          <p id="dv-refusal-text" class="mono"></p>
+          <p id="dv-refusal-advice" class="caption"></p>
+        </div>
+      </div>
+      <div id="dv-veil" hidden>
+        <div>
+          <div class="reticle"><span class="dot"></span></div>
+          <p id="dv-veil-text" class="caption centered"></p>
+        </div>
+      </div>
+    </div>
+
+    <!-- What is held down on the far machine right now. This exists because the
+         failure a remote keyboard has and a local one does not is a key that
+         goes down here and never comes up there; showing the set makes that
+         visible instead of mysterious, and RELEASE ALL is the one-click cure. -->
+    <div id="dv-held-row" class="heldrow" hidden>
+      <span class="fieldlabel">HELD</span>
+      <span id="dv-held" class="mono"></span>
+      <button id="dv-release" class="btn ghost small" type="button">RELEASE ALL</button>
+    </div>
+
+    <!-- The clipboard bridge: off by default, its own switch, and one direction
+         only — this browser's clipboard typed into the far machine. There is no
+         message on the wire for the other direction, and the note says so. -->
+    <div id="dv-clip-row" class="heldrow" hidden>
+      <label class="switch"><input id="dv-clip" type="checkbox"><span>CLIPBOARD</span></label>
+      <button id="dv-paste" class="btn ghost small" type="button" hidden>PASTE TO MACHINE</button>
+      <span id="dv-clip-note" class="caption"></span>
+    </div>
+
+    <p id="dv-frameline" class="caption lampline" hidden>
+      <span id="dv-frame-lamp" class="lamp idle"></span><span id="dv-frame-text"></span>
+    </p>
+    <p id="dv-stall" class="caption warn-ink" hidden></p>
+    <p id="dv-latency" class="caption" hidden></p>
+
+    <div id="dv-readings" class="readings" hidden>
+      <span class="dial"><span class="fieldlabel">FRAMES</span><span id="dv-r-frames" class="mono"></span></span>
+      <span class="dial"><span class="fieldlabel">FPS</span><span id="dv-r-fps" class="mono"></span></span>
+      <span class="dial"><span class="fieldlabel">RECEIVED</span><span id="dv-r-bytes" class="mono"></span></span>
+      <span class="dial"><span class="fieldlabel">HOP RTT</span><span id="dv-r-hop" class="mono"></span></span>
+      <span class="dial"><span class="fieldlabel">END TO END</span><span id="dv-r-end" class="mono"></span></span>
+      <span class="dial"><span class="fieldlabel">STALLS</span><span id="dv-r-stalls" class="mono"></span></span>
+      <span class="dial"><span class="fieldlabel">GAPS</span><span id="dv-r-gaps" class="mono"></span></span>
+      <span class="dial"><span class="fieldlabel">SENT</span><span id="dv-r-sent" class="mono"></span></span>
+      <span class="dial"><span class="fieldlabel">REFUSED</span><span id="dv-r-refused" class="mono"></span></span>
+      <span class="dial"><span class="fieldlabel">GRANTED</span><span id="dv-r-caps" class="mono"></span></span>
+    </div>
+  </section>
+
+  <!-- AUDIT: the record of what was done to a machine, read where it was done.
+       Owner-only on the daemon, so a caller who has been granted a machine sees
+       no plate at all rather than an empty one — there is no capability that
+       honestly says "may read the record of everybody else".
+
+       Written one line per input message, so the pointer and scroll flood is
+       hidden by default and counted rather than dropped. Every cell is filled
+       through textContent: `detail` is influenced by whoever drove the machine,
+       and an audit trail that rendered its own subject's markup would be an
+       audit trail its subject could forge. -->
+  <section id="audit" class="plate" hidden>
+    <div class="section-rule">
+      <h2>AUDIT</h2><span class="rule"></span>
+      <button id="au-noise" class="btn ghost small" type="button">SHOW POINTER</button>
+      <button id="au-reload" class="btn ghost small" type="button">RELOAD</button>
+    </div>
+    <p id="au-note" class="caption"></p>
+    <ul id="au-list" class="trail"></ul>
+    <button id="au-more" class="btn ghost small" type="button" hidden>READ FURTHER BACK</button>
+  </section>
+
   <!-- PASSKEYS: biometric identities allowed through the login door, one per
        person per device — several people can share a device, and the browser's
        account picker tells them apart at login. Hidden until the daemon says

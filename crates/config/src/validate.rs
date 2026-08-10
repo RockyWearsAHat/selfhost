@@ -87,6 +87,9 @@ impl Config {
         self.check_namecheap_ddns(&mut problems);
         self.check_registrar(&mut problems);
         self.check_self_update(&mut problems);
+        self.check_shares(&mut problems);
+        self.check_desktop(&mut problems);
+        self.check_mesh(&mut problems);
 
         if problems.is_empty() { Ok(()) } else { Err(ConfigError::Invalid(problems)) }
     }
@@ -167,6 +170,69 @@ impl Config {
     fn check_self_update(&self, problems: &mut Vec<Problem>) {
         if let Some(update) = &self.self_update {
             update.check("self_update", problems);
+        }
+    }
+
+    /// The shares, when any are declared, must be individually well-formed and
+    /// must not collide with one another. Delegated to
+    /// [`crate::storage::check_shares`], which owns both the per-block rules and
+    /// the two that only exist between blocks. An empty list validates nothing —
+    /// shares are opt-in.
+    ///
+    /// What is *not* checked here is whether a root is a safe directory to
+    /// serve; `storage::share::Share::new` refuses the filesystem root, a root
+    /// containing `..`, and a root that is, contains, or sits inside `data_dir`,
+    /// the TLS store or this repository. That rule lives with the type whose
+    /// whole purpose is to have been checked, so a share reaching the daemon by
+    /// some route other than TOML cannot skip it.
+    fn check_shares(&self, problems: &mut Vec<Problem>) {
+        crate::storage::check_shares(&self.shares, "shares", problems);
+    }
+
+    /// The desktop section, when present, must be internally honest and within
+    /// the ranges the subsystem can honour. Delegated to
+    /// [`crate::desktop::Desktop::check`]. Absent `[desktop]` validates nothing,
+    /// because absent means the subsystem does not exist.
+    fn check_desktop(&self, problems: &mut Vec<Problem>) {
+        if let Some(desktop) = &self.desktop {
+            desktop.check("desktop", problems);
+        }
+    }
+
+    /// The peer link, when present, must name a declared worker and reach the
+    /// owner over TLS.
+    ///
+    /// The scheme and the token path are [`crate::mesh::Mesh::check`]'s, which
+    /// can judge them alone. The two rules here need the rest of the document:
+    /// the named node must be declared in `[[nodes]]`, exactly as a site
+    /// instance's node must be, and it must not be the owner — the owner is what
+    /// a worker dials, so an owner dialling itself describes nothing that can
+    /// happen.
+    fn check_mesh(&self, problems: &mut Vec<Problem>) {
+        let Some(mesh) = &self.mesh else {
+            return;
+        };
+        mesh.check("mesh", problems);
+
+        match self.node(&mesh.node) {
+            None => problems.push(Problem {
+                field: "mesh.node".into(),
+                message: format!(
+                    "unknown node \"{}\"; mesh.node names this machine's own [[nodes]] entry, \
+                     and the owner looks the link's token up by that name",
+                    mesh.node
+                ),
+            }),
+            Some(node) if node.role == Role::Owner => problems.push(Problem {
+                field: "mesh.node".into(),
+                message: format!(
+                    "\"{}\" is the owner, and the owner is what a worker dials. The owner \
+                     needs nothing beyond its [[nodes]] block: remove the [mesh] section, or \
+                     name the worker this machine actually is",
+                    mesh.node
+                ),
+            }),
+            Some(_) => {}
         }
     }
 
@@ -582,6 +648,9 @@ mod tests {
             namecheap_ddns: vec![],
             registrar: None,
             self_update: None,
+            shares: vec![],
+            desktop: None,
+            mesh: None,
         }
     }
 

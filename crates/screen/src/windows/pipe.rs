@@ -45,7 +45,7 @@ use super::sys::{self, Handle, OwnedHandle};
 use super::{desktop, pipe_descriptor, pipe_name};
 use crate::Fault;
 use std::ffi::c_void;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// The kernel buffer, each way, in bytes.
 ///
@@ -445,4 +445,268 @@ fn parse_descriptor(sddl: &str) -> Result<sys::LocalBuffer, Fault> {
             "succeeded but produced no descriptor",
         )
     })
+}
+
+/// The most the agent will hold of a daemon that is talking faster than it reads.
+///
+/// The link is credit-controlled in the outbound direction; inbound there is only
+/// this, because what arrives here is grants and small control messages and nothing
+/// that should ever approach a megabyte. Exceeding it is a fault rather than a
+/// growing buffer: the far end of this pipe is the process that spawned us, so a
+/// flood is a bug worth seeing rather than a load to absorb.
+const MAX_INBOUND: usize = 1024 * 1024;
+
+/// How much is read from the pipe in one go.
+const READ_CHUNK: usize = 64 * 1024;
+
+/// How long a write to the daemon may take before it is treated as a dead reader.
+///
+/// Generous, because the daemon may be busy; bounded, because an agent blocked
+/// forever on a write is an agent that has stopped capturing and will never say so.
+const WRITE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// The agent's end of the daemon pipe.
+///
+/// The mirror image of [`AgentPipe`], and deliberately a separate type rather than
+/// a mode on that one: the two ends have different jobs, different lifetimes and
+/// different failure meanings. The daemon *creates* the object and is loud when the
+/// name is taken; the agent only ever **opens** an existing one, and an agent that
+/// could create the name would be an agent something could beat to it.
+///
+/// There is no authentication here beyond the pipe's own access-control list, and
+/// none is possible: see [`super::pipe`]'s module documentation for why every
+/// alternative on this platform is worse.
+#[derive(Debug)]
+pub struct DaemonLink {
+    handle: OwnedHandle,
+    /// One manual-reset event, reused: operations on this pipe are strictly
+    /// sequential, and an auto-reset event consumed by a wait whose result check
+    /// then fails would leave the next operation waiting on an event that has
+    /// already fired.
+    event: OwnedHandle,
+    /// Bytes read but not yet parsed into whole frames.
+    inbound: Vec<u8>,
+}
+
+impl DaemonLink {
+    /// Opens the pipe for `session`, waiting up to `deadline` for it to exist.
+    ///
+    /// The agent is normally spawned *by* the daemon and finds the pipe already
+    /// there; the wait covers the case where it wins that race. It is bounded
+    /// because an agent waiting forever for a daemon that has gone away is a
+    /// process nothing will ever clean up.
+    ///
+    /// # Errors
+    ///
+    /// A [`Fault`] naming the call. `ERROR_ACCESS_DENIED` here is worth reading
+    /// closely: it means the pipe exists and this process is **not** the user its
+    /// access-control list names, which is either a session mix-up or something on
+    /// this machine trying to reach a channel it should not have.
+    pub fn connect(session: u32, deadline: Duration) -> Result<Self, Fault> {
+        let name = pipe_name(session);
+        let wide = sys::wide_str(&name)?;
+        let started = Instant::now();
+
+        loop {
+            let raw = unsafe {
+                sys::CreateFileW(
+                    wide.as_ptr(),
+                    sys::GENERIC_READ | sys::GENERIC_WRITE,
+                    0,
+                    std::ptr::null(),
+                    // Never `CREATE_ALWAYS`: the agent opens the daemon's object or
+                    // it fails. Creating one would make it possible for an agent to
+                    // be the thing a squatter connects to.
+                    sys::OPEN_EXISTING,
+                    sys::FILE_FLAG_OVERLAPPED,
+                    std::ptr::null_mut(),
+                )
+            };
+            if let Some(handle) = OwnedHandle::new(raw) {
+                let event = OwnedHandle::new(unsafe {
+                    sys::CreateEventW(std::ptr::null(), 1, 0, std::ptr::null())
+                })
+                .ok_or_else(|| Fault::last_os_error("CreateEventW"))?;
+                return Ok(Self { handle, event, inbound: Vec::new() });
+            }
+
+            let fault = Fault::last_os_error("CreateFileW").noting(name.clone());
+            let waitable = matches!(
+                fault.code(),
+                Some(sys::ERROR_FILE_NOT_FOUND | sys::ERROR_PIPE_BUSY)
+            );
+            if !waitable || started.elapsed() >= deadline {
+                return Err(fault);
+            }
+            // `WaitNamedPipeW` waits for an *instance* rather than for the name to
+            // appear, so it answers immediately when the pipe does not exist yet;
+            // the sleep is what keeps that from being a spin.
+            unsafe { sys::WaitNamedPipeW(wide.as_ptr(), 250) };
+            unsafe { sys::Sleep(50) };
+        }
+    }
+
+    /// Bytes read and not yet consumed.
+    pub fn buffered(&self) -> &[u8] {
+        &self.inbound
+    }
+
+    /// Drops the first `bytes` of the buffer, after they have been parsed.
+    pub fn consume(&mut self, bytes: usize) {
+        if bytes >= self.inbound.len() {
+            self.inbound.clear();
+        } else {
+            self.inbound.drain(..bytes);
+        }
+    }
+
+    /// Reads whatever the daemon has sent, waiting at most `timeout`.
+    ///
+    /// Answers `false` when the daemon has closed its end, which is how the agent
+    /// is asked to stop. That is not a failure and must never be reported as one:
+    /// the daemon closes this pipe on a kill switch, on a session change, and on
+    /// its own shutdown.
+    pub fn poll(&mut self, timeout: Duration) -> Result<bool, Fault> {
+        if self.inbound.len() >= MAX_INBOUND {
+            return Err(Fault::refused(
+                "the daemon link",
+                format!("held {MAX_INBOUND} unparsed bytes; the daemon is sending faster than \
+                         the agent can parse"),
+            ));
+        }
+
+        let start = self.inbound.len();
+        self.inbound.resize(start + READ_CHUNK, 0);
+        let mut overlapped = self.overlapped();
+        let mut immediate: u32 = 0;
+        let ok = unsafe {
+            sys::ReadFile(
+                self.handle.raw(),
+                self.inbound.as_mut_ptr().add(start),
+                u32::try_from(READ_CHUNK).unwrap_or(u32::MAX),
+                &mut immediate,
+                &mut overlapped,
+            )
+        };
+
+        let read = if ok != 0 {
+            immediate
+        } else {
+            let fault = Fault::last_os_error("ReadFile");
+            match fault.code() {
+                Some(sys::ERROR_BROKEN_PIPE) => {
+                    self.inbound.truncate(start);
+                    return Ok(false);
+                }
+                Some(sys::ERROR_IO_PENDING) => {
+                    if self.await_overlapped(&mut overlapped, timeout)? {
+                        self.transferred(&mut overlapped)?
+                    } else {
+                        0
+                    }
+                }
+                _ => {
+                    self.inbound.truncate(start);
+                    return Err(fault);
+                }
+            }
+        };
+
+        self.inbound.truncate(start + read as usize);
+        Ok(true)
+    }
+
+    /// Writes the whole buffer, or fails.
+    ///
+    /// Loops because a pipe write can complete short when the kernel buffer is full
+    /// and the daemon is slow, and a partial write of a framed protocol is a
+    /// desynchronised channel rather than a lost byte.
+    pub fn write_all(&mut self, mut buffer: &[u8]) -> Result<(), Fault> {
+        while !buffer.is_empty() {
+            let wanted = u32::try_from(buffer.len()).unwrap_or(u32::MAX);
+            let mut overlapped = self.overlapped();
+            let mut immediate: u32 = 0;
+            let ok = unsafe {
+                sys::WriteFile(
+                    self.handle.raw(),
+                    buffer.as_ptr(),
+                    wanted,
+                    &mut immediate,
+                    &mut overlapped,
+                )
+            };
+            let written = if ok != 0 {
+                immediate
+            } else {
+                let fault = Fault::last_os_error("WriteFile");
+                if fault.code() != Some(sys::ERROR_IO_PENDING) {
+                    return Err(fault);
+                }
+                if !self.await_overlapped(&mut overlapped, WRITE_TIMEOUT)? {
+                    return Err(Fault::refused("WriteFile", "the daemon stopped reading"));
+                }
+                self.transferred(&mut overlapped)?
+            };
+            if written == 0 {
+                return Err(Fault::refused("WriteFile", "the pipe accepted no bytes"));
+            }
+            buffer = buffer.get(written as usize..).ok_or_else(|| {
+                Fault::refused("WriteFile", "reported writing more bytes than it was given")
+            })?;
+        }
+        Ok(())
+    }
+
+    /// An `OVERLAPPED` pointing at this link's own event.
+    fn overlapped(&self) -> sys::Overlapped {
+        sys::Overlapped {
+            internal: 0,
+            internal_high: 0,
+            offset: 0,
+            offset_high: 0,
+            event: self.event.raw(),
+        }
+    }
+
+    /// Waits for an overlapped operation, cancelling it cleanly on a timeout.
+    ///
+    /// The cancellation is not optional. An `OVERLAPPED` that goes out of scope
+    /// while the kernel still owns it is a write into freed stack, which under
+    /// `panic = "abort"` is not a panic — it is whatever happens to be there.
+    fn await_overlapped(
+        &self,
+        overlapped: &mut sys::Overlapped,
+        timeout: Duration,
+    ) -> Result<bool, Fault> {
+        let milliseconds = u32::try_from(timeout.as_millis()).unwrap_or(u32::MAX);
+        match unsafe { sys::WaitForSingleObject(self.event.raw(), milliseconds) } {
+            sys::WAIT_OBJECT_0 => Ok(true),
+            sys::WAIT_TIMEOUT => {
+                unsafe { sys::CancelIoEx(self.handle.raw(), overlapped) };
+                let mut transferred: u32 = 0;
+                // `wait = TRUE`: returns once the kernel has finished with the
+                // structure, which is the whole point of cancelling.
+                unsafe {
+                    sys::GetOverlappedResult(self.handle.raw(), overlapped, &mut transferred, 1)
+                };
+                Ok(false)
+            }
+            _ => Err(Fault::last_os_error("WaitForSingleObject")),
+        }
+    }
+
+    /// How many bytes a completed overlapped operation moved.
+    fn transferred(&self, overlapped: &mut sys::Overlapped) -> Result<u32, Fault> {
+        let mut transferred: u32 = 0;
+        let ok =
+            unsafe { sys::GetOverlappedResult(self.handle.raw(), overlapped, &mut transferred, 0) };
+        if ok == 0 {
+            let fault = Fault::last_os_error("GetOverlappedResult");
+            if fault.code() == Some(sys::ERROR_BROKEN_PIPE) {
+                return Ok(0);
+            }
+            return Err(fault);
+        }
+        Ok(transferred)
+    }
 }

@@ -49,8 +49,13 @@
 //!   can be in rather than reporting them all as errors.
 //! - [`grant`] — the single-use ticket that authorises an upgrade, and the
 //!   freshness rule that stops a twelve-hour cookie from being a keyboard.
-//! - [`viewer`] — the impure session driver. Deliberately a stub; see its module
-//!   documentation for what it will be and why it is not here yet.
+//! - [`viewer`] — the session driver, and the one impure module here. It owns a
+//!   viewer's stream: the handshake, the frame loop, the credit policy, the
+//!   session's lifetime, and the per-message authorisation of input. It reaches
+//!   the screen, the pointer, the injector and the channel entirely through
+//!   traits, so the whole driver is exercised against an in-memory capture
+//!   source and an in-memory transport — which is what keeps this crate's
+//!   no-platform property true of the impure module as well.
 //!
 //! # What this crate deliberately does not decide
 //!
@@ -58,10 +63,11 @@
 //! Win32 or to CoreGraphics, where a session id came from, or what the operator
 //! put in their config. Those are `selfhost-screen`, `selfhost-admin` and
 //! `selfhost-config`'s business respectively, and each of them passes what it
-//! knows in as an argument. Nothing here reads a clock either: every function
-//! that cares about time takes `now: Instant`, which is what lets a
-//! thirty-second ticket lifetime and a four-hundred-failure backoff both be
-//! tested in microseconds.
+//! knows in as an argument. Only [`viewer`] reads a clock, and only because a
+//! loop that paces frames and enforces a deadline must: every *decision* it
+//! makes is factored out into a function taking `now: Instant`, which is what
+//! lets a thirty-second ticket lifetime, a four-hundred-failure backoff and a
+//! four-hour session ceiling all be tested in microseconds.
 
 pub mod cursor;
 pub mod grant;
@@ -83,6 +89,13 @@ pub use state::{
 pub use tiles::{
     Damage, Decoded, Encoding, Grid, MoveRect, Rect, Surface, TileCoord, TileError, TileSize,
     TileUpdate,
+};
+pub use viewer::{
+    effective, frame_interval, input_refusal, stream_deadline, AtCapacity, CapturedFrame, Ceilings,
+    Condition, Ending, FrameSource, Gate, Inbound, InputSink, NoInput, NoPointer, Outbound, Outcome,
+    PointerShape, PointerSource, Restore, Seat, SessionDirectory, Standing, Stats, StreamError,
+    Task, Viewer, Viewers, Wiring, CLOSE_GRACE, DEFAULT_MAX_FPS, DEFAULT_MAX_SESSION,
+    REVALIDATE_INTERVAL,
 };
 pub use wire::{
     Button, CursorPos, CursorShape, Direction, FrameBegin, Hello, Message, Monitor, Refusal,

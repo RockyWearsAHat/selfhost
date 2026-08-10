@@ -42,6 +42,7 @@
 use std::collections::BTreeMap;
 use std::collections::btree_map::Values;
 use std::fmt;
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::SystemTime;
 
 /// The longest a node name may be, in bytes.
@@ -321,6 +322,28 @@ impl Registry {
         record.links = record.links.saturating_add(1);
     }
 
+    /// Declares a peer and records that its link ended, in one step.
+    ///
+    /// The counterpart to [`Registry::declare_linked`], and it exists for the
+    /// same reason: a dialler supervising its own owner link knows the peer is
+    /// declared because it declared it, and handing that caller a
+    /// [`RegistryError::Undeclared`] it cannot act on is how the *reason a link
+    /// dropped* — the one thing this module exists to preserve — ends up
+    /// discarded on the error path.
+    ///
+    /// `last_seen` follows [`Registry::dropped`]'s rule exactly: it advances
+    /// only if the peer was actually linked, so a failed attempt is never
+    /// reported as a sighting.
+    pub fn declare_dropped(&mut self, name: NodeName, now: SystemTime, reason: DropReason) {
+        self.declare(name.clone());
+        let record = self.peers.get_mut(name.as_str()).expect("just declared");
+        if record.liveness.is_linked() {
+            record.last_seen = Some(now);
+        }
+        record.liveness = Liveness::Down { since: now, reason };
+        record.consecutive_failures = record.consecutive_failures.saturating_add(1);
+    }
+
     /// Removes a peer entirely, because the operator withdrew it from config.
     ///
     /// Returns whether it was there. The caller is responsible for closing any
@@ -413,6 +436,107 @@ impl Registry {
 
     fn record_mut(&mut self, name: &NodeName) -> Result<&mut PeerRecord, RegistryError> {
         self.peers.get_mut(name.as_str()).ok_or_else(|| RegistryError::Undeclared(name.clone()))
+    }
+}
+
+/// A [`Registry`] several tasks share.
+///
+/// The registry itself is pure and holds no lock, which is what makes every rule
+/// in it a unit test. But a live box has a dialler writing link state, a console
+/// reading it, and an accepter admitting peers, all at once — so somewhere there
+/// has to be a lock, and it is better here, once, than at every call site with a
+/// slightly different opinion about what to do with a poisoned one.
+///
+/// The lock is [`std::sync::Mutex`] rather than tokio's, deliberately: every
+/// operation is a map lookup and an assignment, no `await` happens while it is
+/// held, and an async mutex would add a scheduling point to the middle of a
+/// registry update for no benefit at all.
+#[derive(Debug, Clone, Default)]
+pub struct SharedRegistry {
+    inner: Arc<Mutex<Registry>>,
+}
+
+impl SharedRegistry {
+    /// An empty shared registry.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Wraps an existing registry — one the daemon has already filled in from
+    /// config, for instance.
+    pub fn from_registry(registry: Registry) -> Self {
+        Self { inner: Arc::new(Mutex::new(registry)) }
+    }
+
+    /// Declares a peer. See [`Registry::declare`].
+    pub fn declare(&self, name: NodeName) -> bool {
+        self.with(|registry| registry.declare(name))
+    }
+
+    /// Records that a link to `name` is up. See [`Registry::linked`].
+    pub fn linked(&self, name: &NodeName, now: SystemTime) -> Result<(), RegistryError> {
+        self.with(|registry| registry.linked(name, now))
+    }
+
+    /// Records that a link ended, or that an attempt failed, and why.
+    ///
+    /// See [`Registry::dropped`]. This is the call that makes *"it is not
+    /// connected"* into something an operator can act on at two in the morning,
+    /// so it is made on every path that ends a link — including the ones where
+    /// nothing was ever established.
+    pub fn dropped(
+        &self,
+        name: &NodeName,
+        now: SystemTime,
+        reason: DropReason,
+    ) -> Result<(), RegistryError> {
+        self.with(|registry| registry.dropped(name, now, reason))
+    }
+
+    /// Declares a peer and marks it linked. See [`Registry::declare_linked`].
+    pub fn declare_linked(&self, name: &NodeName, now: SystemTime) {
+        self.with(|registry| registry.declare_linked(name.clone(), now));
+    }
+
+    /// Declares a peer and records why its link ended. See
+    /// [`Registry::declare_dropped`].
+    ///
+    /// This is the infallible form the dialler's supervisor uses, so that the
+    /// reason a link dropped is recorded on *every* path — including the ones
+    /// where the link never came up at all.
+    pub fn declare_dropped(&self, name: &NodeName, now: SystemTime, reason: DropReason) {
+        self.with(|registry| registry.declare_dropped(name.clone(), now, reason));
+    }
+
+    /// Whether the operator has declared this peer.
+    pub fn is_declared(&self, name: &NodeName) -> bool {
+        self.with(|registry| registry.is_declared(name))
+    }
+
+    /// A copy of one peer's record, for a reader that must not hold the lock.
+    pub fn get(&self, name: &NodeName) -> Option<PeerRecord> {
+        self.with(|registry| registry.get(name).cloned())
+    }
+
+    /// A copy of every declared peer, in name order.
+    ///
+    /// Cloned rather than borrowed because the console renders this on another
+    /// task, and handing out a borrow would mean holding the lock for as long as
+    /// somebody was drawing.
+    pub fn snapshot(&self) -> Vec<PeerRecord> {
+        self.with(|registry| registry.peers().cloned().collect())
+    }
+
+    /// Runs `action` against the registry under the lock.
+    ///
+    /// Escape hatch for the operations this wrapper does not name — and the one
+    /// place the poisoning decision is made. A panic elsewhere in the process is
+    /// not a reason to stop reporting which machines are reachable; the registry
+    /// is a plain map whose worst partial update is one peer's state, and under
+    /// `panic = "abort"` in release there is no poisoning to observe at all.
+    pub fn with<T>(&self, action: impl FnOnce(&mut Registry) -> T) -> T {
+        let mut registry = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
+        action(&mut registry)
     }
 }
 
@@ -637,6 +761,60 @@ mod tests {
         registry.linked(&name, at(50)).expect("link");
         assert!(!registry.declare(name.clone()));
         assert_eq!(registry.get(&name).expect("record").liveness, Liveness::Linked { since: at(50) });
+    }
+
+    #[test]
+    fn declaring_and_dropping_in_one_step_matches_doing_it_in_two() {
+        // The infallible form must not be a second, subtly different rule: a
+        // failed attempt is still not a sighting, and the reason is still kept.
+        let mut stepwise = Registry::new();
+        stepwise.declare(node("alex-desktop"));
+        stepwise.linked(&node("alex-desktop"), at(100)).expect("link");
+        stepwise.dropped(&node("alex-desktop"), at(200), DropReason::Timeout).expect("drop");
+        stepwise
+            .dropped(&node("alex-desktop"), at(300), DropReason::TransportFailed)
+            .expect("retry failed");
+
+        let mut combined = Registry::new();
+        combined.declare_linked(node("alex-desktop"), at(100));
+        combined.declare_dropped(node("alex-desktop"), at(200), DropReason::Timeout);
+        combined.declare_dropped(node("alex-desktop"), at(300), DropReason::TransportFailed);
+
+        assert_eq!(combined.get(&node("alex-desktop")), stepwise.get(&node("alex-desktop")));
+        let record = combined.get(&node("alex-desktop")).expect("record");
+        assert_eq!(record.last_seen, Some(at(200)));
+        assert_eq!(record.consecutive_failures, 2);
+    }
+
+    #[test]
+    fn a_shared_registry_is_the_same_registry_seen_from_two_places() {
+        let registry = SharedRegistry::new();
+        let observer = registry.clone();
+        let name = node("alex-desktop");
+
+        assert!(registry.declare(name.clone()));
+        assert!(observer.is_declared(&name));
+        registry.linked(&name, at(10)).expect("link");
+        assert!(observer.get(&name).expect("record").is_linked());
+
+        registry
+            .dropped(&name, at(20), DropReason::PeerClosed { code: 1001 })
+            .expect("drop");
+        let seen = observer.snapshot();
+        assert_eq!(seen.len(), 1);
+        assert!(seen[0].describe().contains("1001"), "{}", seen[0].describe());
+    }
+
+    #[test]
+    fn a_shared_registry_reports_an_undeclared_peer_rather_than_inventing_one() {
+        let registry = SharedRegistry::new();
+        let stranger = node("not-mine");
+        assert_eq!(
+            registry.linked(&stranger, at(1)).unwrap_err(),
+            RegistryError::Undeclared(stranger.clone())
+        );
+        assert_eq!(registry.get(&stranger), None);
+        assert!(registry.snapshot().is_empty());
     }
 
     #[test]

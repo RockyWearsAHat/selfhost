@@ -12,15 +12,18 @@
 #![warn(missing_docs)]
 
 pub mod cidr;
+pub mod desktop;
 pub mod dns;
 pub mod edit;
 pub mod git;
 pub mod home;
 pub mod mail;
+pub mod mesh;
 pub mod namecheap;
 pub mod psl;
 pub mod registrar;
 pub mod service;
+pub mod storage;
 pub mod validate;
 
 use serde::{Deserialize, Serialize};
@@ -30,12 +33,15 @@ use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 
 pub use cidr::Cidr;
+pub use desktop::Desktop;
 pub use dns::{Dns, RecordConfig, SoaConfig, ZoneConfig};
 pub use git::{GitWatch, SelfUpdate};
 pub use mail::{DkimConfig, Mail, MailBind, Mailbox, Relay};
+pub use mesh::Mesh;
 pub use namecheap::NamecheapDdns;
 pub use registrar::{Registrar, RegistrarProvider};
 pub use service::{RestartPolicy, ServiceCatalog, ServiceSpec, StartMode};
+pub use storage::{AccessConfig, AccessMode, ShareConfig, SmbConfig};
 pub use validate::{ConfigError, Problem};
 
 /// A complete deployment.
@@ -71,6 +77,68 @@ pub struct Config {
     /// itself — fetch, rebuild, restart. Absent → no self-update.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub self_update: Option<SelfUpdate>,
+    /// Directories this machine serves over the console site, WebDAV and — where
+    /// asked for — SMB. Empty means none: a share is declared, never discovered.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub shares: Vec<ShareConfig>,
+    /// Remote desktop. **Absent means the subsystem does not exist**: no agent is
+    /// spawned and no route is served. This is the default, and it is the
+    /// default because this is the one capability here that drives the machine
+    /// rather than serving data.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub desktop: Option<Desktop>,
+    /// The peer link a worker dials the owner over. Absent on the owner, which
+    /// needs nothing beyond its `[[nodes]]` block; a worker with this section
+    /// still binds nothing at all.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mesh: Option<Mesh>,
+}
+
+/// The smallest valid deployment, used by every module's example test as the
+/// document its own `EXAMPLE` block is appended to.
+///
+/// Kept here rather than copied into three test modules so that a change to what
+/// a minimal deployment requires breaks one line instead of three.
+#[cfg(test)]
+pub(crate) const BASE_DOCUMENT: &str = r#"version = 1
+
+[server]
+acme_email = "a@b.com"
+
+[[nodes]]
+name = "home"
+role = "owner"
+
+[[sites]]
+name = "example"
+domains = ["example.com"]
+static_root = "./public"
+"#;
+
+/// Comments out a documented example block, so it can be shipped in a config
+/// file without arming anything.
+///
+/// Every module that describes an opt-in section carries its example as *live*
+/// TOML — [`desktop::EXAMPLE`], [`mesh::EXAMPLE`], [`storage::EXAMPLE`] — so the
+/// crate's own tests parse and validate the exact text an operator is shown. The
+/// shipped `selfhost.config.toml` and the `selfhost init` template then emit that
+/// same text through this function, which is the only difference between the
+/// documentation and the deployment.
+///
+/// A line that is already a comment is left alone rather than double-hashed, so
+/// the prose reads as prose and the settings read as settings — the style the
+/// console-site block in `selfhost.config.toml` established. The function is
+/// therefore idempotent: commenting an already-commented block changes nothing.
+pub fn commented(block: &str) -> String {
+    let mut out = String::with_capacity(block.len() + block.lines().count());
+    for line in block.lines() {
+        if !(line.is_empty() || line.starts_with('#')) {
+            out.push('#');
+        }
+        out.push_str(line);
+        out.push('\n');
+    }
+    out
 }
 
 /// Host-wide settings.
@@ -533,6 +601,9 @@ mod tests {
             namecheap_ddns: vec![],
             registrar: None,
             self_update: None,
+            shares: vec![],
+            desktop: None,
+            mesh: None,
         };
 
         assert_eq!(
@@ -571,6 +642,9 @@ mod tests {
             namecheap_ddns: vec![],
             registrar: None,
             self_update: None,
+            shares: vec![],
+            desktop: None,
+            mesh: None,
         };
 
         let map = config.host_map();
@@ -676,6 +750,35 @@ static_root = "./public"
         // A malformed entry permits nothing — the gate fails closed.
         site.allowed_cidrs = vec!["garbage".into()];
         assert!(!site.permits(vpn_client));
+    }
+
+    #[test]
+    fn the_deployments_own_config_file_still_loads_and_arms_nothing_new() {
+        // `selfhost.config.toml` is gitignored — it carries this box's hostnames
+        // and mailbox addresses — so it is read at run time rather than compiled
+        // in, and a checkout that does not have one simply has nothing to check.
+        // Where it *is* present, the documented example blocks appended to it
+        // must leave it loading exactly as before: commented out is the whole
+        // point, and a stray uncommented line would arm a subsystem by accident.
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../selfhost.config.toml");
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            return;
+        };
+        let config = Config::parse(&text)
+            .unwrap_or_else(|why| panic!("{} no longer loads: {why}", path.display()));
+        assert!(config.shares.is_empty(), "the shares example must stay commented out");
+        assert!(config.desktop.is_none(), "the desktop example must stay commented out");
+        assert!(config.mesh.is_none(), "the mesh example must stay commented out");
+    }
+
+    #[test]
+    fn commenting_a_block_hashes_settings_leaves_prose_and_is_idempotent() {
+        let block = "# why this exists\n\nenabled = false\n  [sub.table]\n";
+        let once = commented(block);
+        assert_eq!(once, "# why this exists\n\n#enabled = false\n#  [sub.table]\n");
+        // Idempotent, because `selfhost init` and the shipped file may both pass
+        // text through this and neither should produce `##`.
+        assert_eq!(commented(&once), once);
     }
 
     #[test]

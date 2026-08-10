@@ -68,7 +68,7 @@
 //! which is helping them pass it.
 
 use crate::token::{constant_time_eq, hex, random_bytes};
-use selfhost_identity::{Caller, Capability, Identity, Policy};
+use selfhost_identity::{Caller, Capability, Identity, NodeName, Policy};
 use selfhost_ws::handshake::{self, Refusal, Upgrade};
 use std::io;
 use std::sync::{Arc, Mutex};
@@ -148,23 +148,115 @@ const TICKET_PREFIX: &str = "tkt.";
 /// strings meant. Adding a variant is therefore a decision somebody makes on
 /// purpose, in the phase that builds the route it names.
 ///
-/// One variant today. The desktop's `View` and `Control` land with the capture
-/// pipeline, and `Control` brings a rule this phase has no place to put: a
-/// ticket carrying it may be minted only when the session authenticated by
-/// password or passkey within the configured re-authentication window, so that a
-/// twelve-hour cookie in a browser left open on an unlocked laptop is not a
-/// keyboard.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Four variants, and the three desktop ones **carry the machine they name**.
+/// That is not decoration: [`Capability::DesktopView`],
+/// [`Capability::DesktopControl`] and [`Capability::ClipboardRead`] are per-node
+/// capabilities, so an ability that
+/// did not carry its target could only be checked against *some* node, and a
+/// ticket minted for the machine in the study would open a stream to the one in
+/// the office. Carrying the name makes `abilities.contains(&route)` in
+/// [`decide`] simultaneously the ticket check and the target check, which is one
+/// comparison that cannot be half-written.
+///
+/// Two of them bring a rule the others do not — see
+/// [`Ability::needs_a_fresh_credential`]: a ticket carrying them is
+/// minted only when the caller's session was opened by password or passkey
+/// within `[desktop].reauth_window`, so that a twelve-hour cookie in a browser
+/// left open on an unlocked laptop is not a keyboard. That check lives in
+/// [`Api::mint_ticket`](crate::Api) beside the policy decision, because it needs
+/// a clock and a configuration and this type needs neither.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Ability {
     /// Receive the console's live snapshot: `GET /api/events`.
     Events,
+    /// Watch one machine's screen: `GET /api/desktop/session?peer=<node>`.
+    DesktopView(NodeName),
+    /// Drive one machine's pointer and keyboard, on the same stream.
+    ///
+    /// Never granted alone: a mint that is asked for control also grants view,
+    /// because a session that may type but not see is a session typing blind
+    /// into whatever window happens to have focus.
+    DesktopControl(NodeName),
+    /// Read what the person at that machine last copied, on the same stream.
+    ///
+    /// A separate ability rather than a bit of control, because it is a
+    /// separate power with a separate blast radius: a clipboard channel
+    /// exfiltrates whatever was last copied on the far machine — routinely a
+    /// password, a recovery code or a token — and it does so leaving none of the
+    /// visible evidence that moving a pointer leaves. It is off unless
+    /// `[desktop].allow_clipboard` is true, and it is held to the same freshness
+    /// standard as control, because the thing it can take is the same thing a
+    /// keyboard can take.
+    ///
+    /// Never granted alone, for the reason
+    /// [`Capabilities::from_bits`](selfhost_desk::grant::Capabilities::from_bits)
+    /// also refuses it: the clipboard travels on the desktop stream, and a
+    /// stream that may read a clipboard but not see a screen is a stream nobody
+    /// asked for.
+    ///
+    /// **No clipboard message exists on the wire yet**, so a ticket carrying
+    /// this authorises a channel that currently transfers nothing. That is
+    /// deliberate and it is the same argument the capability model makes
+    /// everywhere else: the authorisation path is built, exercised and covered
+    /// from the first release, so that switching the feature on later is a
+    /// configuration change rather than a new way into the machine that nobody
+    /// has tested.
+    ClipboardRead(NodeName),
 }
 
 impl Ability {
     /// The word this ability is named by on the wire.
-    pub fn as_str(self) -> &'static str {
+    pub fn as_str(&self) -> &'static str {
         match self {
             Self::Events => "events",
+            Self::DesktopView(_) => "desktop.view",
+            Self::DesktopControl(_) => "desktop.control",
+            Self::ClipboardRead(_) => "desktop.clipboard",
+        }
+    }
+
+    /// The machine this ability names, for the ones that name a machine.
+    pub fn node(&self) -> Option<&NodeName> {
+        match self {
+            Self::Events => None,
+            Self::DesktopView(node) | Self::DesktopControl(node) | Self::ClipboardRead(node) => {
+                Some(node)
+            }
+        }
+    }
+
+    /// The ability this one cannot be granted without, if there is one.
+    ///
+    /// Control and the clipboard both ride on a desktop stream and both are
+    /// refused by `Capabilities::from_bits` without
+    /// [`VIEW`](selfhost_desk::grant::Capabilities::VIEW), so a mint that
+    /// produced either alone would hand back a ticket the handshake turns into
+    /// an empty capability set for no stated reason. Written as a `match` on the
+    /// vocabulary rather than as a rule at the mint, so a variant added later
+    /// has to answer the question.
+    pub fn implies(&self) -> Option<Self> {
+        match self {
+            Self::Events | Self::DesktopView(_) => None,
+            Self::DesktopControl(node) | Self::ClipboardRead(node) => {
+                Some(Self::DesktopView(node.clone()))
+            }
+        }
+    }
+
+    /// Whether a ticket carrying this ability may be minted only for a login
+    /// that happened within `[desktop].reauth_window`.
+    ///
+    /// True for exactly the two abilities that reach past the screen: driving
+    /// the machine, and reading what was last copied on it. The rule is written
+    /// here, on the vocabulary, rather than at the one call site that applies
+    /// it, because *which powers need a fresh person behind them* is a property
+    /// of the power and not of the route — and because a variant added later
+    /// must be answered for in a `match` the compiler checks rather than
+    /// silently inherit the lenient side of an `if`.
+    pub fn needs_a_fresh_credential(&self) -> bool {
+        match self {
+            Self::Events | Self::DesktopView(_) => false,
+            Self::DesktopControl(_) | Self::ClipboardRead(_) => true,
         }
     }
 
@@ -176,32 +268,59 @@ impl Ability {
     /// and is answered with no subprotocol at all, which it can notice, rather
     /// than being connected to a peer that means something else by the same
     /// bytes.
-    pub fn protocol(self) -> &'static str {
+    ///
+    /// All three desktop abilities share one token, because they are one
+    /// protocol on one stream: what a viewer may *do* on it is the capability
+    /// set in the `Hello`, re-decided per input message, not a different message
+    /// grammar.
+    pub fn protocol(&self) -> &'static str {
         match self {
             Self::Events => "selfhost.events.1",
+            Self::DesktopView(_) | Self::DesktopControl(_) | Self::ClipboardRead(_) => {
+                "selfhost.desktop.1"
+            }
         }
     }
 
-    /// The ability named by `word`, or `None` for anything else.
+    /// The ability named by `word` against `node`, or `None` for anything else.
     ///
     /// Unknown words are refused rather than ignored. A mint that quietly
     /// dropped a word it did not recognise would hand back a ticket that
     /// authorises less than the caller asked for, and the failure would appear
     /// later as a stream that closes for no stated reason.
-    pub fn parse(word: &str) -> Option<Self> {
+    ///
+    /// A desktop word without a node is refused for the same reason: a target
+    /// this API guessed at is a target the caller did not choose, and the guess
+    /// would be authorised as though they had.
+    pub fn parse(word: &str, node: Option<&NodeName>) -> Option<Self> {
         match word {
             "events" => Some(Self::Events),
+            "desktop.view" => Some(Self::DesktopView(node?.clone())),
+            "desktop.control" => Some(Self::DesktopControl(node?.clone())),
+            "desktop.clipboard" => Some(Self::ClipboardRead(node?.clone())),
             _ => None,
         }
     }
 
-    /// The stream route reached at `path`, if any.
+    /// The stream route reached at `target`, if any.
     ///
     /// The one place a URL becomes an ability, so the socket layer never has to
     /// hold a second opinion about which paths are streams.
-    pub fn for_path(path: &str) -> Option<Self> {
+    ///
+    /// Takes the whole request target rather than the path because the desktop
+    /// route names its machine in the query string, and the **minimum** ability
+    /// is what it yields: a handshake asks for `DesktopView`, and whether the
+    /// stream may also drive the machine is decided by what the redeemed ticket
+    /// carries, never by the URL. A URL that could ask for a keyboard would be a
+    /// keyboard request a page can make with no header at all.
+    pub fn for_target(target: &str) -> Option<Self> {
+        let (path, query) = crate::split_target(target);
         match path {
             "/api/events" => Some(Self::Events),
+            "/api/desktop/session" => {
+                let asked = crate::query_value(query, "peer").unwrap_or(crate::desk_api::LOCAL_NODE);
+                Some(Self::DesktopView(NodeName::parse(asked).ok()?))
+            }
             _ => None,
         }
     }
@@ -218,9 +337,12 @@ impl Ability {
     /// bodies `GET /api/services` and `GET /api/firewall` answer with. A push
     /// and a poll of the same data must not be two different permissions, or the
     /// console would have a way to read what the REST routes refuse it.
-    pub fn capability(self) -> Capability {
+    pub fn capability(&self) -> Capability {
         match self {
             Self::Events => Capability::ConsoleRead,
+            Self::DesktopView(node) => Capability::DesktopView(node.clone()),
+            Self::DesktopControl(node) => Capability::DesktopControl(node.clone()),
+            Self::ClipboardRead(node) => Capability::ClipboardRead(node.clone()),
         }
     }
 }
@@ -700,6 +822,19 @@ pub struct Doorway<'a> {
 /// Then the ticket, which is consumed. Then the ability, checked **after** the
 /// ticket is consumed, so presenting a ticket for the wrong route costs it
 /// rather than leaving it available for a second attempt against the right one.
+///
+/// # The ticket's other abilities are re-decided, and losing one is a downgrade
+///
+/// A desktop ticket carries more than the route: `desktop.control` and
+/// `desktop.clipboard` ride on the same stream as `desktop.view`. Each of them
+/// is decided again here, against the caller as they stand *now*, and one that
+/// no longer passes is **dropped from the admission** rather than refusing the
+/// handshake. That asymmetry is deliberate. Refusing would answer a revoked
+/// keyboard with the uniform 401, sending an operator who can still legitimately
+/// watch the machine to a login page; dropping opens the stream they may have,
+/// with the capability set they actually hold, which the `Hello` then states.
+/// The route's own capability is not in this filter because it was decided
+/// above, where failing it is a refusal and not a downgrade.
 pub fn decide(
     request: &selfhost_http::Request,
     credential: Option<(Holder, Caller)>,
@@ -724,15 +859,40 @@ pub fn decide(
     if !abilities.contains(&route) {
         return Err(Denial::AbilityNotGranted(route));
     }
+    let abilities = still_permitted(doorway.policy, &caller, &route, abilities);
 
     Ok(Admission {
-        subprotocol: echoed_subprotocol(&handshake.subprotocols, route),
+        subprotocol: echoed_subprotocol(&handshake.subprotocols, &route),
         accept: handshake.accept,
         holder,
         caller,
         abilities,
         slot,
     })
+}
+
+/// The abilities on a ticket that the caller may still exercise.
+///
+/// Pure, so the downgrade rule is a table test rather than a socket. `route` is
+/// kept unconditionally: it was decided by [`decide`] before the ticket was
+/// spent, and a second decision here could only disagree with the first by being
+/// asked a different question.
+///
+/// The order of the surviving abilities is the order they were minted in, so a
+/// stream's log line and the `Hello` it sends read the same way whether or not
+/// anything was dropped.
+pub fn still_permitted(
+    policy: &Policy,
+    caller: &Caller,
+    route: &Ability,
+    abilities: Vec<Ability>,
+) -> Vec<Ability> {
+    abilities
+        .into_iter()
+        .filter(|ability| {
+            ability == route || policy.decide(caller, &ability.capability()).is_allowed()
+        })
+        .collect()
 }
 
 /// Whether an `Origin` is acceptable.
@@ -798,7 +958,7 @@ pub fn ticket_offered(subprotocols: &[String]) -> Result<&str, Denial> {
 /// only a fixed, server-known string also means the value written into the `101`
 /// is never client-derived, which is one fewer way to attempt a response split
 /// even with the header layer's injection check standing behind it.
-pub fn echoed_subprotocol(subprotocols: &[String], ability: Ability) -> Option<String> {
+pub fn echoed_subprotocol(subprotocols: &[String], ability: &Ability) -> Option<String> {
     subprotocols
         .iter()
         .any(|token| token == ability.protocol())
@@ -1089,29 +1249,56 @@ mod tests {
     fn only_the_routes_own_protocol_is_echoed_and_never_the_ticket() {
         let offered = offer(&["selfhost.events.1", "tkt.secret"]);
         assert_eq!(
-            echoed_subprotocol(&offered, Ability::Events),
+            echoed_subprotocol(&offered, &Ability::Events),
             Some("selfhost.events.1".to_owned())
         );
         // A ticket alone is not a protocol offer, and the credential must never
         // appear in the answer.
         let ticket_only = offer(&["tkt.secret"]);
-        assert_eq!(echoed_subprotocol(&ticket_only, Ability::Events), None);
+        assert_eq!(echoed_subprotocol(&ticket_only, &Ability::Events), None);
         // A neighbouring version is not this one.
         let other = offer(&["selfhost.events.2"]);
-        assert_eq!(echoed_subprotocol(&other, Ability::Events), None);
+        assert_eq!(echoed_subprotocol(&other, &Ability::Events), None);
+    }
+
+    /// The node every desktop test below names.
+    fn node() -> NodeName {
+        NodeName::parse("alex-desktop").expect("a legal node name")
     }
 
     #[test]
     fn the_ability_vocabulary_round_trips_and_refuses_everything_else() {
-        // One variant today; the array is the shape this becomes when `View` and
-        // `Control` arrive, so adding one costs nothing here.
-        for ability in [Ability::Events, Ability::Events] {
-            assert_eq!(Ability::parse(ability.as_str()), Some(ability));
-            assert_eq!(Ability::parse(ability.protocol()), None, "a protocol is not an ability");
+        let target = node();
+        for ability in [
+            Ability::Events,
+            Ability::DesktopView(target.clone()),
+            Ability::DesktopControl(target.clone()),
+            Ability::ClipboardRead(target.clone()),
+        ] {
+            assert_eq!(Ability::parse(ability.as_str(), Some(&target)), Some(ability.clone()));
+            assert_eq!(
+                Ability::parse(ability.protocol(), Some(&target)),
+                None,
+                "a protocol is not an ability"
+            );
         }
-        for word in ["", "Events", "events ", "desktop.view", "*", "admin"] {
-            assert_eq!(Ability::parse(word), None, "{word} was accepted as an ability");
+        for word in ["", "Events", "events ", "desktop", "*", "admin"] {
+            assert_eq!(
+                Ability::parse(word, Some(&target)),
+                None,
+                "{word} was accepted as an ability"
+            );
         }
+    }
+
+    #[test]
+    fn a_desktop_ability_without_a_machine_is_refused_rather_than_guessed_at() {
+        // A target this API invented is a target the caller did not choose, and
+        // it would be authorised as though they had.
+        assert_eq!(Ability::parse("desktop.view", None), None);
+        assert_eq!(Ability::parse("desktop.control", None), None);
+        assert_eq!(Ability::parse("desktop.clipboard", None), None);
+        assert_eq!(Ability::parse("events", None), Some(Ability::Events));
     }
 
     #[test]
@@ -1121,14 +1308,109 @@ mod tests {
         // `GET /api/services` and `GET /api/firewall` answer with, so it needs
         // exactly what they need.
         assert_eq!(Ability::Events.capability(), Capability::ConsoleRead);
+        assert_eq!(
+            Ability::DesktopView(node()).capability(),
+            Capability::DesktopView(node())
+        );
+        assert_eq!(
+            Ability::DesktopControl(node()).capability(),
+            Capability::DesktopControl(node())
+        );
+        assert_eq!(
+            Ability::ClipboardRead(node()).capability(),
+            Capability::ClipboardRead(node())
+        );
+    }
+
+    #[test]
+    fn exactly_the_abilities_that_reach_past_the_screen_need_a_fresh_person() {
+        assert!(!Ability::Events.needs_a_fresh_credential());
+        assert!(!Ability::DesktopView(node()).needs_a_fresh_credential());
+        assert!(Ability::DesktopControl(node()).needs_a_fresh_credential());
+        assert!(Ability::ClipboardRead(node()).needs_a_fresh_credential());
+    }
+
+    #[test]
+    fn exactly_the_abilities_that_ride_a_desktop_stream_imply_watching_it() {
+        assert_eq!(Ability::Events.implies(), None);
+        assert_eq!(Ability::DesktopView(node()).implies(), None);
+        assert_eq!(
+            Ability::DesktopControl(node()).implies(),
+            Some(Ability::DesktopView(node()))
+        );
+        assert_eq!(
+            Ability::ClipboardRead(node()).implies(),
+            Some(Ability::DesktopView(node()))
+        );
+    }
+
+    #[test]
+    fn a_grant_revoked_between_the_mint_and_the_handshake_downgrades_the_stream() {
+        // The person may still watch the machine and may no longer drive it.
+        // The stream opens, without the keyboard — refusing it outright would
+        // answer a revoked keyboard with a login page.
+        let name = selfhost_identity::PersonName::parse("Mary-Anne").expect("a valid name");
+        let caller = Caller::session(
+            selfhost_identity::Identity::Person(name),
+            selfhost_identity::Session::new(
+                selfhost_identity::Opening::Passkey,
+                std::time::Instant::now(),
+            ),
+            selfhost_identity::Grants::new([Capability::DesktopView(node())]).expect("few grants"),
+        );
+        let minted = vec![
+            Ability::DesktopControl(node()),
+            Ability::DesktopView(node()),
+            Ability::ClipboardRead(node()),
+        ];
+        let route = Ability::DesktopView(node());
+        assert_eq!(
+            still_permitted(&Policy::locked_down(), &caller, &route, minted),
+            vec![Ability::DesktopView(node())]
+        );
+    }
+
+    #[test]
+    fn the_route_itself_survives_the_filter_because_it_was_already_decided() {
+        // `decide` refuses a caller who may not have the route at all, before
+        // the ticket is spent. Re-deciding it here could only disagree with that
+        // by asking a different question, so the route is kept unconditionally.
+        let caller = Caller::bearer();
+        let route = Ability::DesktopControl(node());
+        assert_eq!(
+            still_permitted(&Policy::locked_down(), &caller, &route, vec![route.clone()]),
+            vec![route]
+        );
     }
 
     #[test]
     fn only_the_stream_paths_are_streams() {
-        assert_eq!(Ability::for_path("/api/events"), Some(Ability::Events));
+        assert_eq!(Ability::for_target("/api/events"), Some(Ability::Events));
         for path in ["/api/events/", "/api/eventsource", "/api", "/api/services", "/", "/events"] {
-            assert_eq!(Ability::for_path(path), None, "{path} was taken for a stream");
+            assert_eq!(Ability::for_target(path), None, "{path} was taken for a stream");
         }
+    }
+
+    #[test]
+    fn a_desktop_handshake_asks_for_a_view_of_the_machine_it_names() {
+        assert_eq!(
+            Ability::for_target("/api/desktop/session?peer=alex-desktop"),
+            Some(Ability::DesktopView(node()))
+        );
+        // No `peer` means this machine, which is the same code path as any
+        // other and not a special case.
+        assert_eq!(
+            Ability::for_target("/api/desktop/session"),
+            Some(Ability::DesktopView(NodeName::parse("self").expect("a legal name")))
+        );
+        // A URL can never ask for a keyboard: whether the stream may drive the
+        // machine is what the redeemed ticket carries, and a page can set a
+        // query string with no header at all.
+        assert!(matches!(
+            Ability::for_target("/api/desktop/session?peer=alex-desktop&control=1"),
+            Some(Ability::DesktopView(_))
+        ));
+        assert_eq!(Ability::for_target("/api/desktop/session?peer=Not A Node"), None);
     }
 
     /// The origin every test below treats as the console's own.

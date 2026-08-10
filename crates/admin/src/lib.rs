@@ -30,8 +30,11 @@
 
 #![warn(missing_docs)]
 
+pub mod audit_api;
+pub mod desk_api;
 pub mod passwd;
 pub mod session;
+pub mod storage_api;
 pub mod store;
 pub mod stream;
 pub mod token;
@@ -41,7 +44,7 @@ pub mod webauthn;
 use selfhost_firewall::Manager;
 use selfhost_git::Watches;
 use selfhost_http::{Body, Method, Request, Response, Status};
-use selfhost_identity::{Caller, Capability, Credential, Identity, Opening, People, Policy};
+use selfhost_identity::{Caller, Capability, Opening, People, Policy};
 use selfhost_json::Json;
 use selfhost_supervisor::Supervisor;
 use selfhost_supervisor::state::{spec_from_json, spec_to_json};
@@ -53,6 +56,8 @@ use tokio::net::{TcpListener, TcpStream};
 
 pub use passwd::ConsolePassword;
 pub use session::{Authenticated, FailureGate, Sessions};
+pub use desk_api::{AgentReport, Fleet, Handover, NodeReport, Standings};
+pub use storage_api::Volumes;
 pub use store::Store;
 pub use token::Token;
 pub use upgrade::{Ability, Admission, Denial, Doorway, Holder, MintError, Streams, Tickets};
@@ -102,6 +107,34 @@ pub struct Api {
     /// from this registry, and a person with no registry to be found in holds
     /// exactly what a person with an empty entry holds, which is nothing.
     people: Option<People>,
+    /// The shares this daemon serves, opened once at startup.
+    ///
+    /// `None` when no `[[shares]]` block was declared, and `None` is not a
+    /// special case anywhere below: with no shares every storage route answers
+    /// the same uninformative 401 an unauthenticated caller gets, which is
+    /// exactly what a deployment that serves no files should look like from the
+    /// outside.
+    storage: Option<Volumes>,
+    /// The remote-desktop subsystem, if the daemon wired one.
+    ///
+    /// `None`, or present with `[desktop].enabled = false`, both mean the same
+    /// thing on the wire: there is no desktop here. The dangerous half of this
+    /// repository is off unless somebody turned it on in a file and restarted
+    /// the daemon, which is the only place it can be turned on.
+    desktop: Option<desk_api::Wiring>,
+    /// The append-only record of every control action, for reading back.
+    ///
+    /// `None` until a data directory has been named, and `None` answers the
+    /// audit route with an empty trail rather than an error: a deployment with
+    /// no data directory has never written a line, and the honest report of
+    /// nothing recorded is nothing, not a fault.
+    ///
+    /// This crate only ever **reads** it. The writers are the subsystems that
+    /// perform the actions — `crates/cli`'s input sink writes one line per
+    /// message, and it is the daemon rather than the CLI that records the kill
+    /// switch, so that a switch created by `touch`, by Finder or over SMB is
+    /// recorded identically and never twice.
+    audit: Option<selfhost_identity::AuditLog>,
 }
 
 /// Cookie-session authentication, present once [`Api::with_console_auth`] has
@@ -153,6 +186,15 @@ enum Demand {
     /// confer it. Until there is a capability that honestly describes it, these
     /// routes ask for the identity that cannot be granted to anybody.
     OwnerOnly,
+    /// Nobody, ever.
+    ///
+    /// The demand of a route whose target could not name anything this
+    /// deployment serves — a share id that is not a legal share id, a node name
+    /// that is not a legal node name. It refuses with the API's ordinary 401
+    /// rather than a `404`, which is the point: a refusal that distinguished
+    /// *no such share* from *not yours* would be a way to enumerate what sits
+    /// behind the wall, one guess at a time.
+    Unsatisfiable,
 }
 
 /// One matched route behind the authorisation wall, and the whole of this API's
@@ -180,6 +222,26 @@ enum Route<'a> {
     Act(&'a str, &'a str),
     /// `POST /api/desktop/ticket`
     MintTicket,
+    /// `GET /api/desktop`
+    DesktopSettings,
+    /// `GET /api/desktop/nodes`
+    DesktopNodes,
+    /// `GET /api/desktop/agent?peer=<node>`
+    DesktopAgent,
+    /// `GET /api/audit?limit=<n>`
+    AuditTrail,
+    /// `GET /api/storage/shares`
+    Shares,
+    /// `GET /api/storage/shares/<id>/list?path=…`
+    ShareList(&'a str),
+    /// `GET /api/storage/shares/<id>/stat?path=…`
+    ShareStat(&'a str),
+    /// `POST /api/storage/shares/<id>/mkdir`
+    ShareMkdir(&'a str),
+    /// `POST /api/storage/shares/<id>/rename`
+    ShareRename(&'a str),
+    /// `DELETE /api/storage/shares/<id>/entry?path=…`
+    ShareDelete(&'a str),
     /// `GET /api/firewall`
     FirewallState,
     /// `POST /api/firewall/reconcile`
@@ -215,6 +277,22 @@ impl<'a> Route<'a> {
             // the moment that *can* be protected is moved here and the handshake
             // is made to carry proof that it happened. See [`crate::upgrade`].
             (Method::Post, ["api", "desktop", "ticket"]) => Some(Self::MintTicket),
+            (Method::Get, ["api", "desktop"]) => Some(Self::DesktopSettings),
+            (Method::Get, ["api", "desktop", "nodes"]) => Some(Self::DesktopNodes),
+            (Method::Get, ["api", "desktop", "agent"]) => Some(Self::DesktopAgent),
+            // The trail of what the dangerous capabilities did. A `GET`, and
+            // owner-only: see `Route::demand`.
+            (Method::Get, ["api", "audit"]) => Some(Self::AuditTrail),
+            (Method::Get, ["api", "storage", "shares"]) => Some(Self::Shares),
+            (Method::Get, ["api", "storage", "shares", id, "list"]) => Some(Self::ShareList(id)),
+            (Method::Get, ["api", "storage", "shares", id, "stat"]) => Some(Self::ShareStat(id)),
+            (Method::Post, ["api", "storage", "shares", id, "mkdir"]) => Some(Self::ShareMkdir(id)),
+            (Method::Post, ["api", "storage", "shares", id, "rename"]) => {
+                Some(Self::ShareRename(id))
+            }
+            (Method::Delete, ["api", "storage", "shares", id, "entry"]) => {
+                Some(Self::ShareDelete(id))
+            }
             // Authenticated, not on `/api/health`: the open ports it reveals are
             // as sensitive as the service list, so it sits inside the wall.
             (Method::Get, ["api", "firewall"]) => Some(Self::FirewallState),
@@ -261,13 +339,34 @@ impl<'a> Route<'a> {
             | Self::Describe(_)
             | Self::Logs(_)
             | Self::FirewallState
-            | Self::MintTicket => Demand::Held(Capability::ConsoleRead),
+            | Self::MintTicket
+            | Self::DesktopSettings
+            | Self::DesktopNodes
+            | Self::Shares => Demand::Held(Capability::ConsoleRead),
+            // Per-node and per-share, so the target has to be a name the
+            // vocabulary can hold. One that is not names nothing this
+            // deployment serves, and refusing it as though it were somebody
+            // else's is what keeps the two indistinguishable.
+            Self::DesktopAgent => Demand::Held(Capability::ConsoleRead),
+            Self::ShareList(id) | Self::ShareStat(id) => {
+                storage_api::demand(id, storage_api::Wants::Read)
+            }
+            Self::ShareMkdir(id) | Self::ShareRename(id) | Self::ShareDelete(id) => {
+                storage_api::demand(id, storage_api::Wants::Write)
+            }
             Self::Install(_)
             | Self::Uninstall(_)
             | Self::DeployNow(_)
             | Self::Act(_, _)
             | Self::FirewallReconcile => Demand::Held(Capability::ServiceControl),
-            Self::RegisterChallenge
+            // Owner-only, with the passkey routes and for a related reason.
+            // The trail names every person who has driven a machine and what
+            // they did with it; reading it is not one of the powers a grant
+            // confers, and there is no capability that honestly describes
+            // "may read the record of everyone else". A person who could be
+            // granted it could watch the record of their own supervision.
+            Self::AuditTrail
+            | Self::RegisterChallenge
             | Self::Register
             | Self::ListPasskeys
             | Self::RemovePasskey(_) => Demand::OwnerOnly,
@@ -330,16 +429,49 @@ impl Api {
             streams: Streams::new(),
             policy: Policy::locked_down(),
             people: None,
+            storage: None,
+            desktop: None,
+            audit: None,
         }
     }
 
-    /// Enables cookie-session login, loading the password hash and the people
-    /// registry from `dir`.
+    /// Records the shares this daemon serves.
+    ///
+    /// Opened by the caller ([`Volumes::open`]) rather than here, because a
+    /// share whose root is missing or is rooted somewhere the deployment
+    /// protects must stop the daemon with a message at startup rather than
+    /// produce an `Api` that answers 500 to one route.
+    pub fn with_storage(mut self, volumes: Volumes) -> Self {
+        self.storage = Some(volumes);
+        self
+    }
+
+    /// Records the remote-desktop subsystem and the hardware behind it.
+    ///
+    /// `config` is `[desktop]` verbatim and `fleet` is the daemon's own screens,
+    /// pointers and peer links. The two arrive together because neither is any
+    /// use alone: settings with nothing to drive answer questions about a
+    /// machine that cannot be reached, and hardware with no settings would be
+    /// hardware nobody armed.
+    pub fn with_desktop(mut self, config: selfhost_config::Desktop, fleet: Arc<dyn Fleet>) -> Self {
+        self.desktop = Some(desk_api::Wiring::new(config, fleet));
+        self
+    }
+
+    /// Enables cookie-session login, loading the password hash, the people
+    /// registry and the audit log from `dir`.
     ///
     /// The wiring seam for the daemon: called once, right after [`Api::new`],
     /// with the daemon's data directory. A missing password file still enables
     /// the session routes — they just refuse every login until
     /// `selfhost console-password` writes one.
+    ///
+    /// The audit log is wired here rather than through its own call because it
+    /// is the third thing that lives in the data directory and there is nothing
+    /// to decide about it: `<data_dir>/audit.log` is where
+    /// [`AuditLog::in_dir`](selfhost_identity::AuditLog::in_dir) puts it, the
+    /// daemon writes it there, and a console that could not read it back would
+    /// leave the operator grepping the box for the record of a keyboard.
     ///
     /// The registry is persisted through this crate's own
     /// [`token::write_private`], which is the one implementation in this
@@ -350,6 +482,17 @@ impl Api {
     pub fn with_console_auth(self, dir: &Path) -> Self {
         self.with_console_auth_parts(ConsolePassword::load(dir), Sessions::new())
             .with_people(People::with_writer(dir, token::write_private))
+            .with_audit(selfhost_identity::AuditLog::in_dir(dir))
+    }
+
+    /// Records the audit log this API reads the trail back out of.
+    ///
+    /// Separate from [`Api::with_console_auth`] so a test can point the route at
+    /// a log it wrote itself, and so a deployment with no console password can
+    /// still have its actions readable.
+    pub fn with_audit(mut self, log: selfhost_identity::AuditLog) -> Self {
+        self.audit = Some(log);
+        self
     }
 
     /// Records the people registry the policy reads grants from.
@@ -532,6 +675,16 @@ impl Api {
             Route::DeployNow(name) => self.deploy_now(name).await,
             Route::Act(name, action) => self.act(name, action).await,
             Route::MintTicket => self.mint_ticket(request, &caller, body),
+            Route::DesktopSettings => self.desktop_settings(),
+            Route::DesktopNodes => self.desktop_nodes(&caller),
+            Route::DesktopAgent => self.desktop_agent(&caller, query),
+            Route::AuditTrail => self.audit_trail(query),
+            Route::Shares => self.shares(&caller).await,
+            Route::ShareList(id) => self.share_list(id, &caller, query).await,
+            Route::ShareStat(id) => self.share_stat(id, &caller, query).await,
+            Route::ShareMkdir(id) => self.share_mkdir(id, &caller, body).await,
+            Route::ShareRename(id) => self.share_rename(id, &caller, body).await,
+            Route::ShareDelete(id) => self.share_delete(id, &caller, query).await,
             Route::FirewallState => self.firewall_state().await,
             Route::FirewallReconcile => self.firewall_reconcile().await,
             Route::RegisterChallenge => self.webauthn_register_challenge(),
@@ -617,17 +770,10 @@ impl Api {
             return None;
         }
         let (_, held) = self.live_session(console, request)?;
-        let identity = Identity::parse(&held.user).ok()?;
-        let credential = Credential::Session(selfhost_identity::Session::new(
-            held.opened_by,
-            held.opened_at,
-        ));
-        Some(match &self.people {
-            Some(people) => people.caller(identity, credential),
-            // No registry wired: the owner's authority does not come from one,
-            // and a person's comes from nowhere else, so a person holds nothing.
-            None => Caller::new(identity, credential, selfhost_identity::Grants::none()),
-        })
+        // Shared with `Standings`, deliberately: a request and a running
+        // desktop stream must never form different opinions about the same
+        // stored session.
+        held.caller(self.people.as_ref())
     }
 
     /// The first candidate cookie that names a live session, and who holds it.
@@ -653,6 +799,7 @@ impl Api {
         match demand {
             Demand::Held(capability) => self.policy.decide(caller, capability).is_allowed(),
             Demand::OwnerOnly => caller.identity().is_owner(),
+            Demand::Unsatisfiable => false,
         }
     }
 
@@ -934,12 +1081,28 @@ impl Api {
             return problem(Status(401), "authorisation required");
         };
         let Some(abilities) = requested_abilities(body) else {
-            return problem(Status(400), "body must be JSON with a \"want\" array of known abilities");
+            return problem(
+                Status(400),
+                "body must be JSON with a \"want\" array of known abilities and, for a desktop, a \"peer\"",
+            );
         };
+        // A desktop ability on a deployment with no desktop is not a 404 here:
+        // the mint is the one route that would otherwise answer *whether this
+        // box has a screen* to anybody who can reach the console gate, which on
+        // this deployment is every process on the machine.
+        if abilities.iter().any(|ability| ability.node().is_some()) && self.desktop().is_none() {
+            return problem(Status(401), "authorisation required");
+        }
         for ability in &abilities {
             if !self.policy.decide(caller, &ability.capability()).is_allowed() {
                 return problem(Status(401), "authorisation required");
             }
+        }
+        if let Some(refusal) = self.switched_off(&abilities) {
+            return refusal;
+        }
+        if let Some(refusal) = self.stale_for_control(caller, &abilities) {
+            return refusal;
         }
         match self.tickets.mint(holder, abilities) {
             Ok(ticket) => json(
@@ -955,6 +1118,138 @@ impl Api {
             Err(error @ MintError::TooManyOutstanding) => problem(Status(429), &error.to_string()),
             Err(error) => problem(Status(500), &format!("could not mint a ticket: {error}")),
         }
+    }
+
+    /// Refuses an ability the operator has switched off in `[desktop]`, or
+    /// `None` when nothing asked for one.
+    ///
+    /// Two switches, and they are the outermost of the three gates on the
+    /// dangerous half of this subsystem: `allow_input` and `allow_clipboard`
+    /// both default to false, and neither is reachable from the console — only
+    /// from a file on the box and a restart. A caller who passes
+    /// [`Policy::decide`] for [`Capability::DesktopControl`] and is refused here
+    /// is being told about the *deployment's* configuration, not about their own
+    /// permissions.
+    ///
+    /// Legible for the reason [`Api::stale_for_control`] is: every value it
+    /// discloses is one `GET /api/desktop` already returns to the same caller,
+    /// and a console that could not distinguish "you may not" from "this box
+    /// does not" would offer a keyboard that silently refuses every key.
+    fn switched_off(&self, abilities: &[Ability]) -> Option<Response> {
+        let wiring = self.desktop()?;
+        let config = wiring.config();
+        let refused = abilities.iter().find_map(|ability| match ability {
+            Ability::DesktopControl(_) if !config.allow_input => {
+                Some(("[desktop].allow_input", "this deployment does not allow input"))
+            }
+            Ability::ClipboardRead(_) if !config.allow_clipboard => Some((
+                "[desktop].allow_clipboard",
+                "this deployment does not share the clipboard",
+            )),
+            _ => None,
+        })?;
+        Some(json(
+            Status(403),
+            Json::object([
+                ("error", Json::string(refused.1)),
+                ("setting", Json::string(refused.0)),
+            ]),
+        ))
+    }
+
+    /// Refuses a control or clipboard ticket to a caller whose login is too old,
+    /// or `None` when there is nothing to refuse.
+    ///
+    /// Both abilities are held to one standard because the thing they can take
+    /// is the same thing: a keyboard types a password out of the operator, and a
+    /// clipboard reads one the operator already copied. See
+    /// [`Ability::needs_a_fresh_credential`].
+    ///
+    /// # Why this refusal is allowed to be legible
+    ///
+    /// Every other refusal in this file is the same uninformative 401, because
+    /// telling a stranger *which* check they failed helps them pass it. This one
+    /// is a `403` naming re-authentication, and that is deliberate: it is
+    /// reachable only by a caller who has **already** satisfied
+    /// [`Policy::decide`] for [`Capability::DesktopControl`] on that machine, so
+    /// the only thing it discloses is a fact that caller already holds. The
+    /// console needs it — the whole design is that clicking CONNECT prompts for
+    /// the passkey — and a uniform 401 there would send the operator to a login
+    /// page they are already past.
+    fn stale_for_control(&self, caller: &Caller, abilities: &[Ability]) -> Option<Response> {
+        if !abilities.iter().any(Ability::needs_a_fresh_credential) {
+            return None;
+        }
+        let wiring = self.desktop()?;
+        let fresh = desk_api::fresh_enough(
+            caller,
+            wiring.config().reauth_window(),
+            std::time::Instant::now(),
+        );
+        (!fresh).then(|| {
+            json(
+                Status(403),
+                Json::object([
+                    ("error", Json::string("this login is too old to drive a machine")),
+                    ("reauthenticate", Json::Bool(true)),
+                    (
+                        "withinSecs",
+                        Json::Number(wiring.config().reauth_window_secs as f64),
+                    ),
+                ]),
+            )
+        })
+    }
+
+    /// Whether this request may move bytes to or from a share, and everything
+    /// the transfer needs if it may.
+    ///
+    /// Pure, and for exactly the reason [`Api::upgrade_for`] is: it reads a
+    /// request head, asks the capability model, and resolves the path with
+    /// `selfhost_storage`'s own pure resolver. No descriptor is opened and no
+    /// socket is touched, so every way of getting a bulk transfer's
+    /// authorisation wrong is a unit test over a `Request`.
+    ///
+    /// The `PUT` path inherits the CSRF-header-before-store ordering for free,
+    /// because it builds its caller with [`Api::caller`], which refuses a
+    /// non-`GET` without [`CONSOLE_HEADER`] before the session store is
+    /// consulted. A cross-site upload therefore cannot even refresh the
+    /// operator's idle timer, let alone write a file.
+    pub fn bulk_for(&self, request: &Request) -> Result<storage_api::Bulk, storage_api::Denied> {
+        use storage_api::{Denied, Transfer};
+
+        let (path, query) = split_target(&request.target);
+        let (id, remainder) = storage_api::split_blob(path).ok_or(Denied::NoPath)?;
+
+        let transfer = match request.method {
+            Method::Get | Method::Head => {
+                Transfer::Download(storage_api::requested_disposition(query))
+            }
+            Method::Put => Transfer::Upload {
+                declared: storage_api::declared_length(request)?,
+                existing: storage_api::requested_existing(query),
+            },
+            _ => return Err(Denied::WrongMethod),
+        };
+
+        let share = selfhost_identity::ShareId::parse(id).map_err(|_| Denied::Unauthorised)?;
+        let want = match transfer {
+            Transfer::Download(_) => Capability::FilesRead(share),
+            Transfer::Upload { .. } => Capability::FilesWrite(share),
+        };
+        let caller = self.caller(request).ok_or(Denied::Unauthorised)?;
+        if !self.policy.decide(&caller, &want).is_allowed() {
+            return Err(Denied::Unauthorised);
+        }
+
+        let volume = self.volume(id).ok_or(Denied::NoShare)?;
+        let at = volume.resolve(remainder).map_err(Denied::Refused)?;
+        Ok(storage_api::Bulk {
+            volume: Arc::clone(volume),
+            at,
+            who: caller.identity().clone(),
+            transfer,
+        })
     }
 
     /// Whether this handshake may become a stream on `route`, and everything the
@@ -984,6 +1279,224 @@ impl Api {
             },
             route,
         )
+    }
+
+    /// A closure asking the authorisation model one question about this caller.
+    ///
+    /// The routes that report a *set* — the shares a caller may open, the nodes
+    /// they may watch — need to decide each item separately rather than refuse
+    /// the whole route, in exactly the way [`Api::mint_ticket`] decides each
+    /// requested ability. Handing them a closure rather than the `Policy` and
+    /// the `Caller` keeps the decision in one place and keeps the storage and
+    /// desktop modules from having to know what a `Policy` is.
+    fn may<'a>(&'a self, caller: &'a Caller) -> impl Fn(&Capability) -> bool + Sync + 'a {
+        move |capability| self.policy.decide(caller, capability).is_allowed()
+    }
+
+    /// The shares this daemon serves, if any were declared.
+    pub fn storage(&self) -> Option<&Volumes> {
+        self.storage.as_ref()
+    }
+
+    /// The desktop subsystem, but only while it is switched on.
+    ///
+    /// One accessor for both halves of "is there a desktop here", so a route
+    /// cannot check the wiring and forget the switch. `[desktop].enabled =
+    /// false` and no wiring at all are the same answer, which is what makes the
+    /// two indistinguishable from outside.
+    fn desktop(&self) -> Option<&desk_api::Wiring> {
+        self.desktop.as_ref().filter(|wiring| wiring.enabled())
+    }
+
+    /// The volume named by a URL segment, for a caller who has already been
+    /// decided against its capability.
+    ///
+    /// `None` here is a genuine 404 rather than a 401, and that is safe
+    /// precisely because [`Route::demand`] ran first: a caller who does not hold
+    /// `FilesRead` on this id never reaches this function, so the only people
+    /// who can tell an unknown share from a known one are the ones who could
+    /// list them anyway.
+    fn volume(&self, id: &str) -> Option<&Arc<selfhost_storage::api::Volume>> {
+        self.storage.as_ref()?.find(id)
+    }
+
+    /// Answers `GET /api/storage/shares`.
+    async fn shares(&self, caller: &Caller) -> Response {
+        let Some(volumes) = &self.storage else {
+            return problem(Status(401), "authorisation required");
+        };
+        storage_api::shares(volumes, caller.identity(), &self.may(caller)).await
+    }
+
+    /// Answers `GET /api/storage/shares/<id>/list?path=…`.
+    async fn share_list(&self, id: &str, caller: &Caller, query: &str) -> Response {
+        let Some(volume) = self.volume(id) else {
+            return problem(Status(404), "no such share");
+        };
+        storage_api::list(volume, caller.identity(), query_value(query, "path").unwrap_or("")).await
+    }
+
+    /// Answers `GET /api/storage/shares/<id>/stat?path=…`.
+    async fn share_stat(&self, id: &str, caller: &Caller, query: &str) -> Response {
+        let Some(volume) = self.volume(id) else {
+            return problem(Status(404), "no such share");
+        };
+        storage_api::stat(volume, caller.identity(), query_value(query, "path").unwrap_or("")).await
+    }
+
+    /// Answers `POST /api/storage/shares/<id>/mkdir`.
+    async fn share_mkdir(&self, id: &str, caller: &Caller, body: &[u8]) -> Response {
+        let Some(volume) = self.volume(id) else {
+            return problem(Status(404), "no such share");
+        };
+        storage_api::mkdir(volume, caller.identity(), body).await
+    }
+
+    /// Answers `POST /api/storage/shares/<id>/rename`.
+    ///
+    /// The destination may name a different share, which is why the whole
+    /// [`Volumes`] set and a capability closure both travel in: the destination
+    /// share's read-only flag, its grants and the caller's capability *for it*
+    /// are all the destination's to enforce, and a function given only a path
+    /// would have checked the source's.
+    async fn share_rename(&self, id: &str, caller: &Caller, body: &[u8]) -> Response {
+        let (Some(volumes), Some(volume)) = (self.storage.as_ref(), self.volume(id)) else {
+            return problem(Status(404), "no such share");
+        };
+        storage_api::rename(volumes, volume, caller.identity(), body, &self.may(caller)).await
+    }
+
+    /// Answers `DELETE /api/storage/shares/<id>/entry?path=…`.
+    async fn share_delete(&self, id: &str, caller: &Caller, query: &str) -> Response {
+        let Some(volume) = self.volume(id) else {
+            return problem(Status(404), "no such share");
+        };
+        storage_api::delete(volume, caller.identity(), query_value(query, "path").unwrap_or(""))
+            .await
+    }
+
+    /// Answers `GET /api/desktop`: the operator's own switches.
+    fn desktop_settings(&self) -> Response {
+        match self.desktop() {
+            Some(wiring) => json(Status(200), desk_api::settings(wiring)),
+            None => problem(Status(404), "this deployment serves no desktop"),
+        }
+    }
+
+    /// Answers `GET /api/desktop/nodes`: the machines this caller may watch.
+    ///
+    /// Filtered per node against [`Capability::DesktopView`], the same way the
+    /// share list is filtered: the route's own demand is a floor, and a caller
+    /// who may watch nothing gets an empty list rather than a refusal. Absence
+    /// is never the answer for a node that is *down* — that one is reported with
+    /// its reason — but a node the caller may not watch is absent, because
+    /// listing it would be an enumeration of the fleet.
+    fn desktop_nodes(&self, caller: &Caller) -> Response {
+        let Some(wiring) = self.desktop() else {
+            return problem(Status(404), "this deployment serves no desktop");
+        };
+        let may = self.may(caller);
+        let visible: Vec<Json> = wiring
+            .nodes()
+            .into_iter()
+            .filter(|report| match selfhost_identity::NodeName::parse(&report.node) {
+                Ok(node) => may(&Capability::DesktopView(node)),
+                // A node whose declared name is not a legal node name cannot be
+                // the target of a capability, so nobody can hold one for it.
+                Err(_) => false,
+            })
+            .map(|report| report.to_json())
+            .collect();
+        json(Status(200), Json::object([("nodes", Json::array(visible))]))
+    }
+
+    /// Answers `GET /api/desktop/agent?peer=<node>`: what the capture agent on
+    /// one machine is doing.
+    ///
+    /// Decided against [`Capability::DesktopView`] for *that* machine, and a
+    /// caller without it gets the ordinary 401 — the same one an unparseable
+    /// node name gets, so the route cannot be used to discover which machines
+    /// exist.
+    fn desktop_agent(&self, caller: &Caller, query: &str) -> Response {
+        let Some(wiring) = self.desktop() else {
+            return problem(Status(404), "this deployment serves no desktop");
+        };
+        let asked = query_value(query, "peer").unwrap_or(desk_api::LOCAL_NODE);
+        let Ok(node) = selfhost_identity::NodeName::parse(asked) else {
+            return problem(Status(401), "authorisation required");
+        };
+        if !self.may(caller)(&Capability::DesktopView(node.clone())) {
+            return problem(Status(401), "authorisation required");
+        }
+        json(Status(200), wiring.agent(node.as_str()).to_json())
+    }
+
+    /// Answers `GET /api/audit?limit=<n>`: the tail of the control-action
+    /// record, newest first.
+    ///
+    /// The reason this route exists is that an audit trail an operator cannot
+    /// read is an audit trail nobody checks. `data/audit.log` is written for the
+    /// capability that can type on the machine, and the person who needs it most
+    /// is the one who has just seen their own pointer move — in a browser, not
+    /// in a shell on the box.
+    ///
+    /// The read is bounded twice, at [`audit_api::MAX_TAIL_BYTES`] and
+    /// [`audit_api::MAX_LIMIT`], because nothing in this repository rotates that
+    /// file and a route that loaded it would be a way for a legitimate caller to
+    /// make the daemon allocate however large it has grown. An unreadable file
+    /// is a `500` naming nothing but the failure: the trail's *contents* are
+    /// exactly what this route is for, and its path is not a secret to somebody
+    /// who has already proved they are the owner, but an `io::Error`'s text can
+    /// carry a path from a locale-dependent message and there is nothing to gain
+    /// by relaying it.
+    fn audit_trail(&self, query: &str) -> Response {
+        let Some(log) = &self.audit else {
+            // Never wired: no data directory was named, so nothing was ever
+            // written. Reported as an empty trail rather than a 404, because the
+            // console asks this question on every refresh and "there is no
+            // audit here" is a different — and wrong — thing to display.
+            return json(Status(200), audit_api::Tail::default().to_json());
+        };
+        let limit = query_value(query, "limit")
+            .and_then(|asked| asked.parse::<usize>().ok())
+            .unwrap_or(audit_api::DEFAULT_LIMIT);
+        match audit_api::tail(log, limit) {
+            Ok(found) => json(Status(200), found.to_json()),
+            Err(error) => {
+                eprintln!("admin: the audit log could not be read: {error}");
+                problem(Status(500), "the audit log could not be read")
+            }
+        }
+    }
+
+    /// The live session store, as a running desktop stream must read it.
+    ///
+    /// # Why this is a public accessor and not something the API does itself
+    ///
+    /// A desktop stream's per-message authorisation is performed by
+    /// `selfhost_desk`'s session driver, which runs in the **daemon** — this
+    /// crate hands over the socket at the `101` and speaks none of the protocol
+    /// that follows. The driver asks a
+    /// [`SessionDirectory`](selfhost_desk::viewer::SessionDirectory) on every
+    /// input message; this is the real one, over the store the login route
+    /// writes and the registry the people route edits, so revoking a grant or
+    /// signing out stops the keyboard on the next keystroke rather than at the
+    /// next reconnect.
+    ///
+    /// `None` when there is no console password wired — there is then no session
+    /// store to read, and the only credential that can open a stream is the
+    /// bearer token, whose standing needs no store.
+    ///
+    /// See [`Standings`] for the three rules it is written around.
+    pub fn standings(&self) -> Option<Standings> {
+        let console = self.console.as_ref()?;
+        let switches = self
+            .desktop
+            .as_ref()
+            .map_or(desk_api::Switches { allow_input: false, allow_clipboard: false }, |wiring| {
+                desk_api::Switches::of(wiring.config())
+            });
+        Some(Standings::new(console.sessions.clone(), self.people.clone(), self.policy, switches))
     }
 
     async fn list_services(&self) -> Response {
@@ -1177,19 +1690,39 @@ fn login_password(body: &[u8]) -> Option<String> {
     parse_json_body(body)?.get("password").and_then(Json::as_str).map(str::to_owned)
 }
 
-/// Reads the abilities a ticket is being minted for.
+/// Reads the abilities a ticket is being minted for, and the machine they name.
 ///
-/// An empty body means the one ability this deployment has a route for, so the
-/// console can ask for a stream without composing a document. Anything else must
-/// be `{"want": [...]}` carrying known words: an unknown word is refused rather
-/// than skipped, because a ticket that quietly authorises less than was asked
-/// for turns into a stream that closes for no stated reason, minutes later and
-/// somewhere else.
+/// An empty body means the one ability every deployment has a route for, so the
+/// console can ask for the events stream without composing a document. Anything
+/// else must be `{"want": [...], "peer": "..."}` carrying known words: an
+/// unknown word is refused rather than skipped, because a ticket that quietly
+/// authorises less than was asked for turns into a stream that closes for no
+/// stated reason, minutes later and somewhere else.
+///
+/// `peer` names the machine and defaults to [`desk_api::LOCAL_NODE`] — this box
+/// — so that controlling the machine you are logged into and controlling
+/// another one are one request shape, one authorisation check and one set of
+/// tests. A `peer` that is not a legal node name is refused rather than
+/// defaulted, because a target this API chose is not the target the caller
+/// asked for.
+///
+/// **Control and the clipboard both imply view, and it is added here rather
+/// than trusted from the body.** A ticket carrying control without view would
+/// authorise a session that may type but not see, which is a session typing
+/// blind into whatever window happens to have focus; one carrying the clipboard
+/// without view would authorise a stream whose only purpose is to take what was
+/// last copied. `Capabilities::from_bits` refuses both on the wire, so a mint
+/// that produced either would be a ticket the handshake then turned into an
+/// empty capability set with no stated reason.
 fn requested_abilities(body: &[u8]) -> Option<Vec<Ability>> {
     if body.iter().all(u8::is_ascii_whitespace) {
         return Some(vec![Ability::Events]);
     }
     let value = parse_json_body(body)?;
+    let node = match value.get("peer").and_then(Json::as_str) {
+        Some(named) => Some(selfhost_identity::NodeName::parse(named).ok()?),
+        None => selfhost_identity::NodeName::parse(desk_api::LOCAL_NODE).ok(),
+    };
     let Some(want) = value.get("want") else {
         return Some(vec![Ability::Events]);
     };
@@ -1197,7 +1730,17 @@ fn requested_abilities(body: &[u8]) -> Option<Vec<Ability>> {
     if words.is_empty() {
         return None;
     }
-    words.iter().map(|word| Ability::parse(word.as_str()?)).collect()
+    let mut abilities: Vec<Ability> = words
+        .iter()
+        .map(|word| Ability::parse(word.as_str()?, node.as_ref()))
+        .collect::<Option<_>>()?;
+    let implied: Vec<Ability> = abilities.iter().filter_map(Ability::implies).collect();
+    for view in implied {
+        if !abilities.contains(&view) {
+            abilities.push(view);
+        }
+    }
+    Some(abilities)
 }
 
 /// Parses a request body as JSON, or `None` for anything that is not.
@@ -1383,13 +1926,23 @@ async fn handle_connection(
     // /api/events` falls through and gets the same "no such endpoint" 404 as any
     // other unmatched route, which is what it should look like to anyone who is
     // not opening a stream.
-    let stream_route = Ability::for_path(request.path())
+    let stream_route = Ability::for_target(&request.target)
         .filter(|_| selfhost_ws::handshake::looks_like_upgrade(&request));
     if let Some(route) = stream_route {
         // Everything past the head belongs to the new protocol, not to a body.
         // See `stream::Prefixed` for what happens if it is dropped here.
         let leftover = buffer.split_off(consumed);
         return serve_stream(stream, leftover, api, request, route).await;
+    }
+
+    // The other branch that does not go through `Api::handle`: a bulk transfer
+    // is gigabytes in one direction or the other, and the whole point of
+    // `read_body` below is that it refuses to be. Matched on the path alone, so
+    // an unauthorised caller reaches the same refusal here that they would
+    // anywhere else rather than a 404 that says the prefix is not served.
+    if storage_api::is_bulk(request.path()) {
+        let leftover = buffer.split_off(consumed);
+        return serve_bulk(stream, leftover, api, request).await;
     }
 
     let body = match read_body(&mut stream, &request, &mut buffer, consumed).await {
@@ -1421,7 +1974,7 @@ async fn serve_stream(
     request: Request,
     route: Ability,
 ) -> std::io::Result<()> {
-    let admission = match api.upgrade_for(&request, route) {
+    let admission = match api.upgrade_for(&request, route.clone()) {
         Ok(admission) => admission,
         Err(denial) => {
             eprintln!("admin: refused a stream on {}: {denial}", request.path());
@@ -1437,7 +1990,7 @@ async fn serve_stream(
         who = Api::stream_identity(&admission),
     );
 
-    let outcome = match route {
+    let outcome = match &route {
         Ability::Events => {
             stream::events(
                 stream::Prefixed::new(leftover, stream),
@@ -1446,6 +1999,16 @@ async fn serve_stream(
                 stream::Watch::default(),
             )
             .await
+        }
+        // A desktop stream is not this crate's protocol to speak. Everything
+        // past the `101` is `selfhost-desk`, driven over screens and peer links
+        // that live in the daemon, so the socket, the redeemed grant and the
+        // seat go there and this function's job is finished. What it keeps is
+        // the part that is its own: deciding who was allowed in.
+        Ability::DesktopView(node)
+        | Ability::DesktopControl(node)
+        | Ability::ClipboardRead(node) => {
+            return serve_desktop(stream, leftover, api, node.clone(), admission).await;
         }
     };
     match outcome {
@@ -1459,6 +2022,106 @@ async fn serve_stream(
             println!("admin: stream on {} ended: {error}", request.path());
         }
         Err(error) => eprintln!("admin: stream on {} failed: {error}", request.path()),
+    }
+    Ok(())
+}
+
+/// Hands an admitted desktop handshake to the daemon's own hardware.
+///
+/// Everything authorisation-shaped has already happened: the ticket was
+/// redeemed, the node it names matched the one in the URL, the capability was
+/// decided twice, the freshness rule was applied at the mint, and a place in the
+/// deployment-wide stream ceiling is held by the [`Admission`]. What is decided
+/// *here* is the one ceiling that is per machine rather than per credential —
+/// `[desktop].max_viewers` — because it belongs to the thing being watched, and
+/// three browsers pointed at one screen is a different question from one browser
+/// holding three streams.
+///
+/// The seat is taken **after** the `101` is written, which is deliberate: a
+/// refusal at capacity should close a stream the client has already established
+/// rather than answer the handshake with the uniform 401, because "the machine
+/// already has two viewers" is not an authorisation failure and telling a
+/// legitimate operator it is would send them to a login page.
+async fn serve_desktop(
+    mut stream: TcpStream,
+    leftover: Vec<u8>,
+    api: Api,
+    node: selfhost_identity::NodeName,
+    admission: Admission,
+) -> std::io::Result<()> {
+    let Some(wiring) = api.desktop() else {
+        // Reached only if the subsystem was switched off between the handshake's
+        // capability check and this line. Nothing is owed to the caller beyond
+        // the connection closing.
+        eprintln!("admin: a desktop stream was admitted with no desktop wired");
+        return Ok(());
+    };
+    stream::answer(&mut stream, &admission).await?;
+
+    let Some(seat) = wiring.admit(node.as_str()) else {
+        println!(
+            "admin: refused a desktop stream on {node}: already at {limit} viewers",
+            limit = wiring.config().max_viewers
+        );
+        return Ok(());
+    };
+
+    // The abilities the admission carries have already been narrowed twice: at
+    // the mint, by `Policy::decide` per ability, and at the handshake, by
+    // `upgrade::still_permitted`. They are narrowed a third time on every input
+    // message, by the driver in the daemon, against `Api::standings`. This line
+    // only translates what survived into the wire's vocabulary.
+    let capabilities = desk_api::capabilities_for(
+        admission.abilities.iter().any(|a| matches!(a, Ability::DesktopView(_))),
+        admission.abilities.iter().any(|a| matches!(a, Ability::DesktopControl(_))),
+        admission.abilities.iter().any(|a| matches!(a, Ability::ClipboardRead(_))),
+    );
+    let session = match &admission.holder {
+        Holder::Session(id) => Some(id.clone()),
+        Holder::Bearer => None,
+    };
+    println!(
+        "admin: desktop stream open on {node} for {who} ({bits:#05b})",
+        who = admission.identity(),
+        bits = capabilities.bits(),
+    );
+
+    let ended = wiring
+        .serve(desk_api::Handover {
+            io: Box::new(stream::Prefixed::new(leftover, stream)),
+            redemption: desk_api::redemption(session.as_deref(), &node, capabilities),
+            ceilings: wiring.ceilings(),
+            seat,
+            identity: admission.identity().clone(),
+        })
+        .await;
+    println!("admin: desktop stream on {node} ended: {ended}");
+    Ok(())
+}
+
+/// Answers a bulk storage transfer, or refuses it.
+///
+/// The refusal is logged **without the path**, and so is the success: on a NAS
+/// the file names are the sensitive thing, and a log with no stated ACL is a
+/// directory listing waiting to be reconstructed. The share id is fine — it is a
+/// configured name, and the caller had to hold a capability naming it to get
+/// this far.
+async fn serve_bulk(
+    mut stream: TcpStream,
+    prefix: Vec<u8>,
+    api: Api,
+    request: Request,
+) -> std::io::Result<()> {
+    let plan = match api.bulk_for(&request) {
+        Ok(plan) => plan,
+        Err(denied) => {
+            eprintln!("admin: refused a storage transfer: {denied}");
+            return write_response(&mut stream, &denied.response()).await;
+        }
+    };
+    match storage_api::serve(&mut stream, prefix, &request, plan).await {
+        Ok(report) => println!("admin: {report}"),
+        Err(error) => eprintln!("admin: a storage transfer ended badly: {error}"),
     }
     Ok(())
 }

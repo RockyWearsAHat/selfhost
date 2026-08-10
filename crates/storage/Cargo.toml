@@ -26,12 +26,17 @@ tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time"] }
 # has no safe standard-library route on either platform. `std` opens by whole
 # path, and a whole path is exactly what an attacker gets to redirect.
 #
-# The exemption is confined to `src/fs/unix.rs` (`openat` and `unlinkat`, one
-# declaration each) and `src/fs/windows.rs` (`NtCreateFile` relative to a parent
-# handle, plus `SetFileInformationByHandle` to delete through one), and it is
-# granted with an explicit `#[allow(unsafe_code)]` per declaration and per call
-# site rather than crate-wide. No other module in the crate contains `unsafe`:
-# the whole security core — `path`, `share`, `listing`, `respond`, `quota`, and
-# the WebDAV bodies — is pure safe Rust and is meant to stay that way.
+# The exemption is confined to `src/fs/unix.rs` (`openat`, `unlinkat`,
+# `mkdirat`, `renameat` and `fstatfs`, one declaration each) and
+# `src/fs/windows.rs` (`NtCreateFile` relative to a parent handle,
+# `SetFileInformationByHandle` to delete and to rename through one,
+# `GetFileInformationByHandle` for volume identity, and `GetDiskFreeSpaceExW`
+# for the free-space floor). Every one of them is either a relative operation
+# with no whole-path spelling — which is the confinement — or a number the write
+# path is gated on that `std` does not expose. It is granted with an explicit
+# `#[allow(unsafe_code)]` per declaration and per call site rather than
+# crate-wide. No other module in the crate contains `unsafe`: the whole security
+# core — `path`, `share`, `listing`, `respond`, `quota`, `auth`, `api` and the
+# WebDAV bodies — is pure safe Rust and is meant to stay that way.
 unsafe_code = "deny"
 missing_docs = "warn"

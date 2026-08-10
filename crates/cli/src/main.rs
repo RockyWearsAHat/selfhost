@@ -5,23 +5,31 @@
 
 mod acme_task;
 mod assess;
+mod audit;
 mod data_dir;
+mod desk_agent;
+mod desk_local;
+mod desk_task;
 mod dns_status;
 mod dns_sync;
 mod doctor;
 mod identify;
+mod kill_switch;
 mod investigate;
 mod lan_dns;
 mod mail_task;
+mod mesh_task;
+mod node_command;
 mod oui;
 mod proxyware;
 mod self_update;
 mod service_install;
+mod share_command;
 mod site;
 mod teardown;
 mod watch;
 
-use selfhost_admin::{Api, Store, Token};
+use selfhost_admin::{Api, Fleet, Store, Token};
 use selfhost_config::{AcmeEnvironment, Config};
 use selfhost_dns::Resolver;
 use selfhost_dns::authority::{Authority, DnsError};
@@ -85,6 +93,24 @@ Commands
   daemon [--bind <addr>]     Run the services and the control API the console
                              connects to
   services                   List the installed services and what they are doing
+  share <list|usage|ls>      The shares this box serves, what each one holds,
+                             and what is inside one
+  sync push <local-path> <share>:<path> [--apply]
+  sync pull <share>:<path> <local-path> [--apply]
+                             Copy files into or out of a share, through the same
+                             rules the console and WebDAV write under. Dry-run by
+                             default; only --apply writes.
+  node <list|invite|join>    The machines this deployment can reach.
+                             `invite <name>` mints a worker's enrolment token on
+                             the owner and prints it once; `join` stores it on
+                             the worker, reading it from stdin — never from an
+                             argument, which would land in shell history and ps
+  desktop <status|disable|enable>
+                             Whether remote desktop is on and what it can see.
+                             `disable` writes <data_dir>/desktop.disabled, which
+                             closes every stream and refuses new ones within
+                             seconds — the switch to reach for when something is
+                             wrong and the console cannot be trusted.
   teardown [--everything] [--yes]
                              Stop, uninstall, and remove what the daemon created
   service <install|uninstall|status> [--system] [--yes]
@@ -123,6 +149,17 @@ fn main() -> ExitCode {
         "run" => run(),
         "daemon" => daemon_command(&arguments),
         "services" => services_command(),
+        "share" => load().and_then(|(config, dir)| share_command::share(&arguments, &config, &dir)),
+        "sync" => load().and_then(|(config, dir)| share_command::sync(&arguments, &config, &dir)),
+        "node" => load().and_then(|(config, project_dir)| {
+            let data_dir = teardown::data_dir(&config, &project_dir);
+            node_command::run(&arguments, &config, &data_dir)
+        }),
+        "desktop" => desktop_command(&arguments),
+        // Deliberately absent from USAGE: the daemon spawns this into the
+        // console session, and there is nothing an operator can do with it.
+        // See [`desk_agent`] for what stops it working when run by hand.
+        "desk-agent" => desk_agent::run(&arguments),
         "teardown" => teardown_command(&arguments),
         "service" => service_command(&arguments),
         "mail" => mail_command(&arguments),
@@ -182,6 +219,23 @@ fn init(arguments: &[String]) -> Result<(), String> {
         return Err(format!("{CONFIG_FILENAME} already exists here"));
     }
 
+    // The two opt-in subsystems are emitted commented out, from the config
+    // crate's own live examples rather than a copy: `commented` prefixes every
+    // line, so the block a reader uncomments is byte-for-byte the block that
+    // crate's tests parse. A copy here would be a second version of the truth,
+    // and it would rot the first time a key was renamed.
+    //
+    // The kill switch is named in the desktop block deliberately. An operator
+    // learns about `data/desktop.disabled` at the moment they decide to turn
+    // remote desktop on — not while looking for it in an emergency.
+    let desktop = format!(
+        "{}#\n# The switch that turns this off without the console, and without a restart:\n\
+         #   touch <data_dir>/desktop.disabled     (or: selfhost desktop disable)\n\
+         # Its presence closes every stream within seconds and refuses new ones.\n",
+        selfhost_config::commented(selfhost_config::desktop::EXAMPLE)
+    );
+    let shares = selfhost_config::commented(selfhost_config::storage::EXAMPLE);
+
     // Defaults are chosen so a first run cannot publish anything or burn a
     // certificate rate limit: loopback binds, self-signed certificates.
     let starter = format!(
@@ -218,7 +272,9 @@ spa = false
 # [self_update]
 # repository = "https://github.com/you/selfhost.git"
 # branch = "main"
-"#
+
+{desktop}
+{shares}"#
     );
 
     std::fs::write(&path, starter).map_err(|e| e.to_string())?;
@@ -571,6 +627,59 @@ async fn serve_daemon(
         api = api.with_console_webauthn(host, &data_dir);
         println!("\nconsole passkeys enabled for https://{host} (stored in console.passkeys)");
     }
+
+    // Network storage. Absent `[[shares]]` means no `Volumes` at all, so every
+    // storage route answers with the same uninformative 401 an unauthenticated
+    // caller gets and nothing is opened, measured or advertised.
+    //
+    // A share that cannot be served stops the daemon here, deliberately: a root
+    // that does not exist, or one nested inside `data_dir`, the TLS store or
+    // this checkout, is an operator mistake with a security consequence, and the
+    // moment to say so is before the API is answering rather than on the first
+    // request that happens to touch it.
+    if !config.shares.is_empty() {
+        let volumes = open_shares(&config, &project_dir, &data_dir)?;
+        println!("\n{} share(s):", volumes.len());
+        for volume in volumes.all() {
+            let share = volume.share();
+            println!(
+                "  {:<20} {} ({})",
+                share.id().as_str(),
+                share.root().display(),
+                if share.read_only() { "read-only" } else { "writable" },
+            );
+        }
+        api = api.with_storage(volumes);
+    }
+
+    // The peer link. Started before the desktop because the desktop's node
+    // picker reports what the link knows, and a picker built against a registry
+    // that does not exist yet would report "no mesh" on a box that has one.
+    //
+    // A worker binds nothing to do this: it dials the owner's console site on
+    // the 443 that site already serves, over the tunnel it is already reached
+    // through. Nothing in this arm opens a port, and if it ever appears to need
+    // one the change has taken a wrong turn.
+    let mesh = mesh_task::start(&config, &data_dir);
+    if let Some(line) = mesh.banner() {
+        println!("\n{line}");
+    }
+
+    // Remote desktop. `None` unless `[desktop]` is present and `enabled = true`,
+    // and `None` means the subsystem does not exist: no `Fleet` on the API, no
+    // kill-switch poll, no agent, and every desktop route indistinguishable from
+    // one this deployment does not serve.
+    //
+    // Built once, here. A `[desktop]` edit takes effect at the next daemon
+    // restart, exactly like `[mail]` and `[dns]` — the config watch in `run`
+    // reloads the proxy's routing table and nothing else, so there is no path
+    // by which a second copy of this subsystem could come into being.
+    let desk = desk_task::start(&config, &data_dir, mesh.peers().cloned()).map(Arc::new);
+    if let Some(desk) = desk.as_ref() {
+        println!("\n{}", desk.summary());
+        api = api.with_desktop(*desk.config(), Arc::clone(desk) as Arc<dyn Fleet>);
+    }
+
     let mut updated_to: Option<String> = None;
     let outcome = tokio::select! {
         result = selfhost_admin::serve(listener, api) => {
@@ -590,6 +699,15 @@ async fn serve_daemon(
         // The same tracking, aimed at Namecheap's Dynamic DNS instead of this
         // daemon's own authority. Pends forever when `namecheap_ddns` is empty.
         _ = track_namecheap_ddns_if_configured(&config) => Ok(()),
+        // Watches for the operator's `desktop.disabled` marker so an engaged
+        // kill switch reaches every running stream without anything else having
+        // to be working. Pends forever when there is no desktop subsystem, so
+        // the arm exists without ever firing.
+        _ = watch_kill_switch(desk.as_deref()) => Ok(()),
+        // Keeps this worker's link to its owner up. Dials out and binds nothing;
+        // pends forever when there is no `[mesh]` section, when it is parked, or
+        // when it cannot be used, so the arm exists without ever firing.
+        _ = maintain_mesh(mesh.peers()) => Ok(()),
         // Watches this daemon's own repository; resolving means a new build is
         // fetched, compiled, and installed, and this process's job is to get
         // out of its way. Pends forever when `[self_update]` is absent or off.
@@ -632,6 +750,64 @@ async fn serve_daemon(
         std::process::exit(self_update::RESTART_EXIT);
     }
     outcome
+}
+
+/// Opens every declared share, or refuses to start with the reason.
+///
+/// Both paths handed to [`Reserved`] are made absolute first: `data_dir` is
+/// relative in the default config, and a path that cannot be compared soundly is
+/// one `Reserved` refuses rather than accepts quietly — which would turn "this
+/// share overlaps the deployment's secrets" into a check that silently passed.
+fn open_shares(
+    config: &Config,
+    project_dir: &Path,
+    data_dir: &Path,
+) -> Result<selfhost_admin::Volumes, String> {
+    let absolute = |path: &Path| {
+        std::path::absolute(path)
+            .map_err(|error| format!("cannot resolve {} to an absolute path: {error}", path.display()))
+    };
+    let reserved = selfhost_storage::share::Reserved::new(
+        &absolute(data_dir)?,
+        Some(&absolute(project_dir)?),
+    )
+    .map_err(|error| format!("cannot state what this deployment protects: {error}"))?;
+    selfhost_admin::Volumes::open(&config.shares, &reserved).map_err(|error| {
+        format!(
+            "{error}\n  A share is declared in {CONFIG_FILENAME} and must name an existing \
+             directory outside data_dir, the TLS store and this checkout."
+        )
+    })
+}
+
+/// Watches the desktop kill switch, or pends forever when there is no desktop.
+///
+/// One arm of the daemon's `select!`, the same pend-forever shape the DNS and
+/// self-update arms use. It never resolves: an engaged switch stops streams, it
+/// does not stop the daemon — the box is still serving websites, mail and files,
+/// and taking those down because somebody revoked a screen would be a worse
+/// outage than the one they were preventing.
+async fn watch_kill_switch(desk: Option<&desk_task::Desk>) {
+    let Some(desk) = desk else {
+        return std::future::pending().await;
+    };
+    desk.watch().await;
+}
+
+/// Keeps the peer link up, or pends forever when this machine has none.
+///
+/// The same pend-forever shape as the DNS and kill-switch arms. It never
+/// resolves: a link that drops is re-established, and a link that cannot be
+/// established is retried — neither is a reason to stop serving websites, mail
+/// and files, which is what returning from this arm would do.
+async fn maintain_mesh(peers: Option<&std::sync::Arc<mesh_task::Peers>>) {
+    let Some(peers) = peers else {
+        return std::future::pending().await;
+    };
+    peers.run().await;
+    // `run` only returns when the dialler gave up for a reason that will not
+    // change; the daemon still has every other job to do.
+    std::future::pending().await
 }
 
 /// Watches the host firewall for out-of-band changes and re-asserts the policy.
@@ -1069,6 +1245,120 @@ fn service_command(arguments: &[String]) -> Result<(), String> {
             "service needs a subcommand: install, uninstall, or status\n\n{USAGE}"
         )),
     }
+}
+
+/// Reports on remote desktop, and works the kill switch.
+///
+/// The three subcommands are deliberately unequal in weight. `status` reads and
+/// changes nothing. `disable` and `enable` create and remove one file, and that
+/// file — not this command — is the mechanism: `touch` and `rm` do exactly the
+/// same thing, which is the whole point of a switch an operator must be able to
+/// reach when the console is the thing they do not trust. See
+/// [`kill_switch`] for why it fails closed.
+fn desktop_command(arguments: &[String]) -> Result<(), String> {
+    let (config, project_dir) = load()?;
+    let data_dir = teardown::data_dir(&config, &project_dir);
+    match arguments.get(1).map(String::as_str) {
+        None | Some("status") => desktop_status(&config, &data_dir),
+        Some("disable") => {
+            // Created if it is not there. This is the command an operator runs
+            // when something is wrong, possibly before the daemon has ever
+            // started, and "no such directory" would be a refusal to stop.
+            crate::data_dir::create_if_absent(&data_dir)
+                .map_err(|error| format!("cannot create {}: {error}", data_dir.display()))?;
+            kill_switch::engage(&data_dir).map_err(|error| {
+                format!("cannot write {}: {error}", kill_switch::path_in(&data_dir).display())
+            })?;
+            // No audit line is written here, deliberately: the running daemon
+            // records what it observes, whatever put the file there. See
+            // [`desk_task::Desk::watch`] for why the observer and not the
+            // commander is the one writer.
+            println!("✓ remote desktop disabled — {}", kill_switch::path_in(&data_dir).display());
+            println!(
+                "  a running daemon closes every stream within {} second(s); no restart is needed",
+                kill_switch::POLL_INTERVAL.as_secs()
+            );
+            Ok(())
+        }
+        Some("enable") => {
+            let removed = kill_switch::release(&data_dir).map_err(|error| {
+                format!("cannot remove {}: {error}", kill_switch::path_in(&data_dir).display())
+            })?;
+            if removed {
+                println!("✓ kill switch removed — {}", kill_switch::path_in(&data_dir).display());
+            } else {
+                println!("the kill switch was not in place; nothing changed");
+            }
+            // Said every time, because removing the switch is not the same as
+            // switching the feature on and an operator expecting a screen
+            // deserves to learn that here rather than from a blank viewport.
+            match config.desktop.as_ref() {
+                Some(desktop) if desktop.enabled => {}
+                _ => println!(
+                    "  note: [desktop] is absent or enabled = false, so there is still no remote \
+                     desktop. That is a config edit and a daemon restart, never a UI toggle."
+                ),
+            }
+            Ok(())
+        }
+        Some(other) => Err(format!(
+            "unknown desktop subcommand \"{other}\" — expected status, disable, or enable\n\n{USAGE}"
+        )),
+    }
+}
+
+/// Prints what remote desktop is configured to do and what it can actually see.
+fn desktop_status(config: &Config, data_dir: &Path) -> Result<(), String> {
+    let switch = kill_switch::path_in(data_dir);
+    let engaged = kill_switch::present(data_dir);
+
+    match config.desktop.as_ref() {
+        None => println!("remote desktop: not configured — no [desktop] block in {CONFIG_FILENAME}"),
+        Some(desktop) if !desktop.enabled => {
+            println!("remote desktop: off — [desktop] enabled = false");
+        }
+        Some(desktop) => {
+            println!("remote desktop: on");
+            println!("  viewers      {} at once, per machine", desktop.max_viewers);
+            println!("  frames       up to {} per second, {}px tiles", desktop.max_fps, desktop.tile);
+            println!(
+                "  input        {}",
+                if desktop.allow_input {
+                    "allowed — a viewer with the capability can type and click"
+                } else {
+                    "refused — view only"
+                }
+            );
+            println!(
+                "  clipboard    {}",
+                if desktop.allow_clipboard { "allowed" } else { "refused" }
+            );
+            println!(
+                "  freshness    a control ticket needs a login within {}s; a session ends after {}s",
+                desktop.reauth_window_secs, desktop.max_session_secs
+            );
+        }
+    }
+
+    // The capture backend is only worth naming when something might use it. On
+    // a deployment with no [desktop] block it would read as a promise.
+    if config.desktop.as_ref().is_some_and(|desktop| desktop.enabled) {
+        // The sentence is printed whether or not there is a screen behind it.
+        // "CGDisplayStream" on its own is the shape of answer this seam exists
+        // to prevent: it names a mechanism and says nothing about whether this
+        // machine, right now, can produce a pixel through it.
+        let backend = desk_task::Backend::here();
+        println!("  capture      {}", backend.name);
+        println!("               {}", backend.why);
+    }
+
+    if engaged {
+        println!("  kill switch  ENGAGED — {}", switch.display());
+        println!("               no stream will run until that file is removed");
+    } else {
+        println!("  kill switch  clear — create {} to stop everything", switch.display());
+    }
+    Ok(())
 }
 
 /// Dispatches `mail`'s subcommands.

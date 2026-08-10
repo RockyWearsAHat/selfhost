@@ -15,10 +15,16 @@ path = "src/main.rs"
 selfhost-acme = { workspace = true }
 selfhost-admin = { workspace = true }
 selfhost-config = { workspace = true }
+selfhost-desk = { workspace = true }
 selfhost-dns = { workspace = true }
+selfhost-identity = { workspace = true }
+selfhost-screen = { workspace = true }
+selfhost-storage = { workspace = true }
+selfhost-ws = { workspace = true }
 selfhost-firewall = { workspace = true }
 selfhost-git = { workspace = true }
 selfhost-mail = { workspace = true }
+selfhost-mesh = { workspace = true }
 selfhost-proxy = { workspace = true }
 selfhost-registrar = { workspace = true }
 selfhost-http = { workspace = true }
@@ -26,6 +32,21 @@ selfhost-supervisor = { workspace = true }
 tokio = { workspace = true }
 rustls = { workspace = true }
 tokio-rustls = { workspace = true }
+# The trust anchors the mesh dialler verifies the owner's certificate against.
+# The same bundle `selfhost-acme` already links, chosen for the same reason: it
+# is deterministic across the Win/mac/Linux matrix where reading the OS store
+# would vary by platform. Nothing new enters the workspace by naming it here.
+webpki-roots = { workspace = true }
+
+[dev-dependencies]
+# `test-util` only, and only for tests: the kill switch's requirement is that an
+# engaged switch reaches a running stream inside one poll, and asserting that
+# against the wall clock would mean a test that sleeps for twenty seconds — which
+# is a test nobody runs. Pausing the runtime's clock asserts the same property in
+# microseconds. No package enters the tree; this is a feature of the async
+# runtime the workspace already depends on, and it is not compiled into a release
+# build.
+tokio = { workspace = true, features = ["test-util"] }
 
 [lints.rust]
 unsafe_code = "forbid"

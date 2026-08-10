@@ -12,7 +12,7 @@
 //! must count against the same gate the others consult.
 
 use crate::token::{constant_time_eq, hex, random_bytes};
-use selfhost_identity::Opening;
+use selfhost_identity::{Caller, Credential, Grants, Identity, Opening, People, Session};
 use std::io;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -79,6 +79,31 @@ pub struct Authenticated {
     pub opened_at: Instant,
 }
 
+impl Authenticated {
+    /// Who this session is, and what they hold.
+    ///
+    /// The one place a stored session becomes a [`Caller`], so the request path
+    /// ([`Api::caller`](crate::Api::caller)) and a running desktop stream
+    /// ([`Standings`](crate::desk_api::Standings)) cannot form different
+    /// opinions about the same entry — which would mean a stream authorising
+    /// what a request would refuse, or the reverse.
+    ///
+    /// `None` when the stored name is not one [`Identity::parse`] accepts. That
+    /// is a corrupted or hand-edited store, and the safe reading of an identity
+    /// nobody can name is nobody.
+    ///
+    /// `people` absent grants nothing: an owner's authority never comes from
+    /// the registry, and a person's comes from nowhere else.
+    pub fn caller(&self, people: Option<&People>) -> Option<Caller> {
+        let identity = Identity::parse(&self.user).ok()?;
+        let credential = Credential::Session(Session::new(self.opened_by, self.opened_at));
+        Some(match people {
+            Some(registry) => registry.caller(identity, credential),
+            None => Caller::new(identity, credential, Grants::none()),
+        })
+    }
+}
+
 /// The shared in-memory session store.
 ///
 /// Cloning shares the store: every clone of the [`crate::Api`] sees the same
@@ -104,6 +129,17 @@ impl Sessions {
     /// session that is expired the moment it is created.
     pub fn with_expiry(absolute: Duration, idle: Duration) -> Self {
         Self { entries: Arc::new(Mutex::new(Vec::new())), absolute, idle }
+    }
+
+    /// How long a session may live in total, however active.
+    ///
+    /// Exposed because a running desktop stream needs the wall its session
+    /// cannot move past, and computing it as `opened_at + <constant>` at the
+    /// reader would be a second copy of a limit that must not drift from the one
+    /// [`Sessions::expired`] enforces. See
+    /// [`Standings`](crate::desk_api::Standings).
+    pub fn absolute_lifetime(&self) -> Duration {
+        self.absolute
     }
 
     /// Creates a session for `user`, opened by `opened_by`, and returns its id,

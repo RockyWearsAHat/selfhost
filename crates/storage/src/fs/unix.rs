@@ -38,7 +38,7 @@
 //! condition on opening it — and it takes one arch-varying constant out of the
 //! security path entirely.
 
-use super::OpenError;
+use super::{Existing, OpenError};
 use std::ffi::{c_char, c_int, c_uint, CString};
 use std::fs::{File, OpenOptions};
 use std::io;
@@ -145,15 +145,64 @@ compile_error!(
 /// crate inventing a second policy that would surprise whoever set it.
 const CREATE_MODE: c_uint = 0o666;
 
-// The two syscalls. `openat` is genuinely variadic in C — the mode argument is
+/// The mode a created directory asks for, before the process umask narrows it.
+///
+/// `0o777` for the reason [`CREATE_MODE`] is `0o666`: it is what
+/// `std::fs::create_dir` passes, so a directory made through the console is
+/// exactly as private as one the operator made by hand, and the umask remains
+/// the single place that decides.
+const CREATE_DIR_MODE: ModeT = 0o777;
+
+/// `mode_t`, which is **not** the same width on every unix.
+///
+/// Darwin spells it `unsigned short`; Linux spells it `unsigned int`. It is
+/// written out per platform rather than approximated with `c_uint` because
+/// `mkdirat` takes it as an ordinary (non-variadic) parameter, where no default
+/// argument promotion applies and the declared width is the ABI.
+#[cfg(target_vendor = "apple")]
+type ModeT = u16;
+
+/// See the Apple arm above.
+#[cfg(not(target_vendor = "apple"))]
+type ModeT = u32;
+
+/// The flag that turns `unlinkat` into `rmdir` rather than `unlink`.
+///
+/// `AT_REMOVEDIR` is `0x80` on Darwin and `0x200` on Linux — an
+/// operating-system constant, not an architecture one, so a two-arm `cfg` is
+/// the whole of it. Getting it wrong is not a security failure but a functional
+/// one: `unlinkat` without it refuses a directory outright (`EPERM`/`EISDIR`),
+/// which is a visible error rather than a silent removal of the wrong thing.
+#[cfg(target_vendor = "apple")]
+const AT_REMOVEDIR: c_int = 0x80;
+
+/// See the Apple arm above.
+#[cfg(not(target_vendor = "apple"))]
+const AT_REMOVEDIR: c_int = 0x200;
+
+// The syscalls. `openat` is genuinely variadic in C — the mode argument is
 // read only when `O_CREAT` is set — and it is declared variadic here so the
 // calls that pass a mode and the calls that do not are both built with the ABI
 // the platform actually uses for it, which differs from the fixed-argument ABI
 // on aarch64 Apple targets.
+//
+// `mkdirat` and `renameat` are the write path's two remaining relative
+// operations, and they are declared for exactly the reason `openat` is: the
+// whole-path spellings (`mkdir`, `rename`) resolve every component themselves,
+// so a link planted anywhere above the name would redirect the operation after
+// the walk had finished proving there was none.
 #[allow(unsafe_code)]
 unsafe extern "C" {
     fn openat(directory: c_int, path: *const c_char, flags: c_int, ...) -> c_int;
     fn unlinkat(directory: c_int, path: *const c_char, flags: c_int) -> c_int;
+    fn mkdirat(directory: c_int, path: *const c_char, mode: ModeT) -> c_int;
+    fn renameat(
+        from_directory: c_int,
+        from: *const c_char,
+        to_directory: c_int,
+        to: *const c_char,
+    ) -> c_int;
+    fn fstatfs(descriptor: c_int, out: *mut StatFs) -> c_int;
 }
 
 /// Opens a directory by path. Used for the share root and for the identity
@@ -239,6 +288,207 @@ pub(super) fn same_object(a: &File, b: &File) -> bool {
         (Ok(a), Ok(b)) => a.dev() == b.dev() && a.ino() == b.ino(),
         _ => false,
     }
+}
+
+/// Creates one child directory relative to an open directory.
+///
+/// `mkdirat` fails with `EEXIST` when the name is taken — including when it is
+/// taken by a symlink, dangling or not — which makes it the same collision
+/// oracle [`create_child`] is, asked of the volume rather than guessed at.
+pub(super) fn create_child_dir(parent: &File, name: &str) -> Result<(), OpenError> {
+    let name = c_name(name)?;
+    // Safety: `parent` owns a live descriptor for the duration of the call and
+    // `name` is a NUL-terminated C string that outlives it. Nothing is returned
+    // but a status.
+    #[allow(unsafe_code)]
+    let status = unsafe { mkdirat(parent.as_raw_fd(), name.as_ptr(), CREATE_DIR_MODE) };
+    if status < 0 {
+        return Err(classify(io::Error::last_os_error()));
+    }
+    Ok(())
+}
+
+/// Removes one child directory of an open directory, which must be empty.
+///
+/// The emptiness is the kernel's rule, not ours (`ENOTEMPTY`), and relying on
+/// it is deliberate: a recursive delete that raced a concurrent upload would
+/// otherwise remove a directory whose last file arrived a microsecond ago. The
+/// recursive form in [`super::Dir::remove_tree`] descends first and then calls
+/// this, so the kernel gets the final say every time.
+pub(super) fn remove_child_dir(parent: &File, name: &str) -> io::Result<()> {
+    let name = CString::new(name).map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
+    // Safety: as `remove_child`; both arguments are borrowed for the call.
+    #[allow(unsafe_code)]
+    let status = unsafe { unlinkat(parent.as_raw_fd(), name.as_ptr(), AT_REMOVEDIR) };
+    if status < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// Renames one child of an open directory to a name in another open directory.
+///
+/// Both ends are descriptors, so neither the source nor the destination path
+/// can be redirected between the walk that proved them link-free and the
+/// operation itself. This is what closes the window
+/// [`super::Upload::commit`]'s by-path publish still has, and it is why every
+/// caller of a rename in this crate that has two `Dir`s in hand uses this one.
+///
+/// **`renameat` replaces its destination silently**, exactly as `rename(2)`
+/// does, and `existing` is therefore *not* enforced here — a portable "fail if
+/// the destination exists" needs `renameatx_np` on Darwin and `renameat2` on
+/// Linux, two different symbols with two different flag words. The occupancy
+/// decision is made one layer up in [`super::Dir::rename_into`], where WebDAV's
+/// `Overwrite` header lives and where the answer has to be a `412` rather than
+/// a failed syscall. The argument is still taken, because the Windows half has
+/// a flag for it and a signature that differed by platform would put the
+/// difference somewhere a caller has to remember it.
+pub(super) fn rename_child(
+    parent: &File,
+    name: &str,
+    destination: &File,
+    destination_name: &str,
+    _existing: Existing,
+) -> Result<(), OpenError> {
+    let from = c_name(name)?;
+    let to = c_name(destination_name)?;
+    // Safety: both descriptors are owned by live `File`s and both C strings
+    // outlive the call; `renameat` returns ownership of nothing.
+    #[allow(unsafe_code)]
+    let status =
+        unsafe { renameat(parent.as_raw_fd(), from.as_ptr(), destination.as_raw_fd(), to.as_ptr()) };
+    if status < 0 {
+        return Err(classify(io::Error::last_os_error()));
+    }
+    Ok(())
+}
+
+/// Bytes an unprivileged writer may still put on the volume this directory
+/// lives on.
+///
+/// Read from the **descriptor**, so the answer describes the volume the walk
+/// reached rather than whatever the path names now. The Windows half cannot do
+/// this — `GetDiskFreeSpaceExW` takes a path — and that asymmetry is recorded
+/// in [`super::free_space`].
+///
+/// `f_bavail` rather than `f_bfree`: the difference is the reserve a filesystem
+/// keeps for the superuser, and the daemon is not the superuser. Counting a
+/// reserve we cannot spend would let the free-space floor pass while the write
+/// fails with `ENOSPC`, which is the one outcome the floor exists to prevent.
+/// The `path` argument is unused here and present so that both platforms
+/// declare the same function: the Windows half has no handle-taking form of
+/// this question, and a signature that differed by platform would push a `cfg`
+/// into [`super::Dir`], where the security rules are deliberately
+/// unconditional.
+pub(super) fn free_space(directory: &File, _path: &Path) -> io::Result<u64> {
+    let mut out = StatFs::default();
+    // Safety: `directory` owns a live descriptor for the duration of the call,
+    // and `out` is a local at least as large as the structure the kernel writes
+    // — see `StatFs`'s own documentation for why the tail is oversized.
+    #[allow(unsafe_code)]
+    let status = unsafe { fstatfs(directory.as_raw_fd(), &raw mut out) };
+    if status < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(available_bytes(&out))
+}
+
+/// The head of `struct statfs`, plus a tail large enough that the kernel cannot
+/// write past it.
+///
+/// Only three fields are read, and only the *offsets* of those three have to be
+/// right. Everything after them is a byte array rather than a transcription of
+/// the rest of the structure, which is the point: `f_mntonname` alone is 1024
+/// bytes on Darwin and the tail differs between kernels and kernel versions, so
+/// transcribing it would be a large surface with no benefit and a real chance
+/// of being wrong. An oversized opaque tail is right as long as it is *at
+/// least* as long as the real one, and 4 KiB is comfortably more than the
+/// ~2.2 KiB Darwin writes and the 120 bytes Linux writes.
+///
+/// The structure is written out twice rather than once with conditional fields,
+/// because the two kernels genuinely disagree about it: Darwin opens with a
+/// 32-bit `f_bsize` and puts `f_iosize` before the counts, which are 64-bit on
+/// every architecture; Linux opens with `f_type` and makes every field a
+/// machine word. Two honest declarations are shorter than one parameterised by
+/// three type aliases, and each can be read against its own header.
+///
+/// `fs::tests::the_volume_reports_a_plausible_free_space_and_the_tree_reports_its_size`
+/// is what keeps the offsets honest: fields read at the wrong offset produce an
+/// absurd figure on a real volume, which that test asserts against.
+#[cfg(target_vendor = "apple")]
+#[repr(C)]
+struct StatFs {
+    /// `f_bsize`: the fundamental block size, in bytes.
+    block_size: u32,
+    /// `f_iosize`, never read; present so the counts are at their offsets.
+    _io_size: i32,
+    /// `f_blocks`, never read.
+    _blocks: u64,
+    /// `f_bfree` — free blocks *including* the superuser's reserve, never read.
+    _blocks_free: u64,
+    /// `f_bavail`: free blocks an ordinary writer may actually use.
+    blocks_available: u64,
+    /// Everything after, deliberately opaque and deliberately oversized.
+    _tail: [u8; 4096],
+}
+
+/// See the Apple declaration above.
+#[cfg(not(target_vendor = "apple"))]
+#[repr(C)]
+struct StatFs {
+    /// `f_type`, never read.
+    _kind: isize,
+    /// `f_bsize`: the fundamental block size, in bytes. A signed word, so a
+    /// negative value is a kernel that has gone wrong rather than a huge block.
+    block_size: isize,
+    /// `f_blocks`, never read.
+    _blocks: usize,
+    /// `f_bfree`, never read.
+    _blocks_free: usize,
+    /// `f_bavail`: free blocks an ordinary writer may actually use.
+    blocks_available: usize,
+    /// Everything after, deliberately opaque and deliberately oversized.
+    _tail: [u8; 4096],
+}
+
+impl Default for StatFs {
+    /// Zeroed, because the kernel overwrites everything it uses and a partial
+    /// write must not leave a stale number that reads as free space.
+    fn default() -> Self {
+        Self {
+            block_size: 0,
+            #[cfg(target_vendor = "apple")]
+            _io_size: 0,
+            #[cfg(not(target_vendor = "apple"))]
+            _kind: 0,
+            _blocks: 0,
+            _blocks_free: 0,
+            blocks_available: 0,
+            _tail: [0; 4096],
+        }
+    }
+}
+
+/// The bytes an ordinary writer may still use, from a filled-in structure.
+///
+/// Split out so that the one `unsafe` call has one body while the arithmetic —
+/// which is where the platforms differ, in the width and signedness of two
+/// fields — stays a small function per platform that can be read against its
+/// own header.
+#[cfg(target_vendor = "apple")]
+fn available_bytes(out: &StatFs) -> u64 {
+    out.blocks_available.saturating_mul(u64::from(out.block_size))
+}
+
+/// See the Apple arm above. A negative block size or a count that will not fit
+/// a `u64` are both a kernel that has gone wrong, and both answer *no space
+/// measured* rather than an enormous amount of it — the safe direction, since
+/// this number's only use is to refuse writes.
+#[cfg(not(target_vendor = "apple"))]
+fn available_bytes(out: &StatFs) -> u64 {
+    let block = u64::try_from(out.block_size).unwrap_or(0);
+    let blocks = u64::try_from(out.blocks_available).unwrap_or(0);
+    blocks.saturating_mul(block)
 }
 
 /// The shared body of the two read opens.

@@ -26,7 +26,7 @@
 //! underneath it — a junction, a directory symlink, a file symlink and a mount
 //! point are all reparse points and all refused alike.
 
-use super::OpenError;
+use super::{Existing, OpenError};
 use std::ffi::{c_void, OsStr};
 use std::fs::{File, OpenOptions};
 use std::io;
@@ -94,6 +94,21 @@ const STATUS_IO_REPARSE_TAG_NOT_HANDLED: i32 = 0xC000_0279_u32 as i32;
 
 /// `FileDispositionInfo`, the class that marks a handle's file for deletion.
 const FILE_DISPOSITION_INFO: u32 = 4;
+
+/// `FileRenameInfo`, the class that moves a handle's object to a new name
+/// relative to another open directory.
+const FILE_RENAME_INFO: u32 = 3;
+
+/// The fixed part of `FILE_RENAME_INFO`, in bytes, before the name.
+///
+/// `BOOLEAN ReplaceIfExists` at 0, seven bytes of padding, `HANDLE
+/// RootDirectory` at 8, `DWORD FileNameLength` at 16, and `WCHAR FileName[]`
+/// from 20. Written as a number rather than as a `struct` because the name is a
+/// flexible array member: the structure's *declared* size includes trailing
+/// padding that must not be counted, and the length passed to
+/// `SetFileInformationByHandle` is the header plus the real name, not
+/// `size_of`.
+const FILE_RENAME_INFO_HEADER_BYTES: usize = 20;
 
 /// A counted, **not** NUL-terminated string, which is how the native API names
 /// objects.
@@ -197,6 +212,12 @@ unsafe extern "system" {
     fn GetFileInformationByHandle(
         file: *mut c_void,
         information: *mut ByHandleFileInformation,
+    ) -> i32;
+    fn GetDiskFreeSpaceExW(
+        directory: *const u16,
+        free_bytes_available_to_caller: *mut u64,
+        total_bytes: *mut u64,
+        total_free_bytes: *mut u64,
     ) -> i32;
 }
 
@@ -316,7 +337,175 @@ pub(super) fn remove_child(parent: &File, name: &str, handle: Option<File>) -> i
         )
         .map_err(io::Error::other)?,
     };
+    mark_for_deletion(handle)
+}
 
+/// Creates one child directory relative to an open directory.
+///
+/// `FILE_CREATE` with `FILE_DIRECTORY_FILE` is the same collision oracle
+/// [`create_child`] uses, asked about a directory: it fails with
+/// `STATUS_OBJECT_NAME_COLLISION` exactly when NTFS considers the name taken.
+/// The handle is opened and dropped rather than returned, because the caller
+/// re-walks to the new directory through [`open_child_dir`] — which is what
+/// applies the reparse-point refusal to it like any other component.
+pub(super) fn create_child_dir(parent: &File, name: &str) -> Result<(), OpenError> {
+    let handle = native_open(
+        parent,
+        name,
+        FILE_LIST_DIRECTORY | FILE_READ_ATTRIBUTES | SYNCHRONIZE,
+        FILE_ATTRIBUTE_NORMAL,
+        FILE_CREATE,
+        FILE_DIRECTORY_FILE | FILE_SYNCHRONOUS_IO_NONALERT,
+    )?;
+    drop(handle);
+    Ok(())
+}
+
+/// Removes one child directory of an open directory, which must be empty.
+///
+/// The same delete-through-a-handle discipline [`remove_child`] uses, with
+/// `FILE_DIRECTORY_FILE` so that a file of the same name cannot be removed by
+/// mistake and `FILE_OPEN_REPARSE_POINT` so that a junction is removed as
+/// itself rather than walked through. Windows enforces the emptiness
+/// (`STATUS_DIRECTORY_NOT_EMPTY`), which is the rule this crate relies on.
+pub(super) fn remove_child_dir(parent: &File, name: &str) -> io::Result<()> {
+    let handle = native_open(
+        parent,
+        name,
+        DELETE | FILE_READ_ATTRIBUTES | SYNCHRONIZE,
+        0,
+        FILE_OPEN,
+        FILE_DIRECTORY_FILE | FILE_SYNCHRONOUS_IO_NONALERT | FILE_OPEN_REPARSE_POINT,
+    )
+    .map_err(io::Error::other)?;
+    mark_for_deletion(handle)
+}
+
+/// Renames one child of an open directory to a name in another open directory.
+///
+/// `FILE_RENAME_INFO` carries a `RootDirectory` handle for exactly the reason
+/// `renameat` takes a descriptor: the destination is named *relative to an open
+/// directory*, so no component of either side can be redirected between the
+/// walk and the rename.
+///
+/// `ReplaceIfExists` follows `existing`, and only [`Existing::Replace`] sets
+/// it. That is the one place the two platforms genuinely differ: `renameat`
+/// always replaces, so unix cannot honour [`Existing::Refuse`] at the syscall
+/// and the occupancy decision is made one layer up in
+/// [`super::Dir::rename_into`] for both. Setting the flag here anyway keeps the
+/// staged-publish path — the one caller that *means* to replace — working on a
+/// platform whose default is to refuse.
+///
+/// The structure ends in a variable-length name, which is why it is assembled
+/// as bytes rather than declared as a `struct` with a one-element array: the
+/// only way to declare the real thing in Rust is to write the header and append
+/// the name, and doing that with `to_ne_bytes` keeps the assembly itself in
+/// safe code.
+pub(super) fn rename_child(
+    parent: &File,
+    name: &str,
+    destination: &File,
+    destination_name: &str,
+    existing: Existing,
+) -> Result<(), OpenError> {
+    let handle = native_open(
+        parent,
+        name,
+        DELETE | FILE_READ_ATTRIBUTES | SYNCHRONIZE,
+        0,
+        FILE_OPEN,
+        FILE_SYNCHRONOUS_IO_NONALERT | FILE_OPEN_REPARSE_POINT,
+    )?;
+    let handle = refuse_reparse_point(handle)?;
+
+    let wide: Vec<u16> = OsStr::new(destination_name).encode_wide().collect();
+    let Ok(name_bytes) = u32::try_from(wide.len().saturating_mul(2)) else {
+        // Unreachable through `validate_segment`, which caps a segment at 255
+        // bytes; mapped rather than unwrapped for the reason `native_open`
+        // gives for the same shape.
+        return Err(OpenError::Refused(crate::path::Refusal::SegmentTooLong));
+    };
+
+    let mut info = vec![0u8; FILE_RENAME_INFO_HEADER_BYTES];
+    // `ReplaceIfExists` is byte 0; bytes 1..8 are padding and stay zero.
+    info[0] = u8::from(existing == Existing::Replace);
+    let root = destination.as_raw_handle() as usize;
+    info[8..16].copy_from_slice(&root.to_ne_bytes());
+    info[16..20].copy_from_slice(&name_bytes.to_ne_bytes());
+    for unit in &wide {
+        info.extend_from_slice(&unit.to_ne_bytes());
+    }
+    let Ok(size) = u32::try_from(info.len()) else {
+        return Err(OpenError::Refused(crate::path::Refusal::SegmentTooLong));
+    };
+
+    // Safety: the handle is live for the duration of the call and was opened
+    // with `DELETE`, which is what a rename requires; `info` is a live buffer
+    // whose length is passed alongside its pointer, and the destination handle
+    // stored in it is owned by a `File` that outlives the call.
+    #[allow(unsafe_code)]
+    let ok = unsafe {
+        SetFileInformationByHandle(
+            handle.as_raw_handle(),
+            FILE_RENAME_INFO,
+            info.as_ptr().cast(),
+            size,
+        )
+    };
+    drop(handle);
+    if ok == 0 {
+        return Err(classify_io(io::Error::last_os_error()));
+    }
+    Ok(())
+}
+
+/// Bytes an unprivileged writer may still put on the volume this directory
+/// lives on.
+///
+/// **By path, unlike the unix half**, because `GetDiskFreeSpaceExW` has no
+/// handle-taking form and the native alternative
+/// (`NtQueryVolumeInformationFile`) is a second `ntdll` symbol with a second
+/// structure to get right for a number that is advisory by the time it is read.
+/// The exposure is bounded and worth stating: a junction swapped in under the
+/// path between the walk and this call makes us measure a *different volume's*
+/// free space. Nothing is opened, read or written through the result — it feeds
+/// [`crate::quota::admit`], which only ever refuses more or less often — so the
+/// worst case is a floor enforced against the wrong disk, never a byte moved
+/// outside the share.
+///
+/// The first output is the caller's own quota-aware free space rather than the
+/// volume's, which is the right one: an NTFS disk quota on the account the
+/// daemon runs as makes the volume's total free space a number the daemon
+/// cannot spend.
+/// The `directory` argument is unused here and present so that both platforms
+/// declare the same function; the unix half reads the answer from it.
+pub(super) fn free_space(_directory: &File, path: &Path) -> io::Result<u64> {
+    let mut wide: Vec<u16> = path.as_os_str().encode_wide().collect();
+    wide.push(0);
+    let mut available: u64 = 0;
+    // Safety: `wide` is a NUL-terminated buffer that outlives the call, and the
+    // three out-parameters are locals; the two this code does not want are
+    // passed as null, which the API documents as permitted.
+    #[allow(unsafe_code)]
+    let ok = unsafe {
+        GetDiskFreeSpaceExW(
+            wide.as_ptr(),
+            &raw mut available,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+        )
+    };
+    if ok == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(available)
+}
+
+/// Marks an open handle's object for deletion and closes it.
+///
+/// Shared by the file and directory removals so that the one call whose
+/// argument sizes must agree with a structure is written once.
+fn mark_for_deletion(handle: File) -> io::Result<()> {
     let disposition = FileDispositionInfo { delete_file: 1 };
     // Safety: the handle is live for the duration of the call and was opened
     // with `DELETE`; the pointer is to a local whose size is passed alongside
