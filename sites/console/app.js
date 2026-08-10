@@ -197,6 +197,68 @@ function guidance(link, serviceCount) {
   return "Choose a service on the left, or add one.";
 }
 
+/** Bytes → unpadded base64url, the alphabet WebAuthn speaks on the wire. */
+function bufToB64url(bytes) {
+  const B64 = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+  let out = "";
+  for (let i = 0; i < bytes.length; i += 3) {
+    const bits = (bytes[i] << 16) | ((bytes[i + 1] || 0) << 8) | (bytes[i + 2] || 0);
+    out += B64[(bits >> 18) & 63] + B64[(bits >> 12) & 63];
+    if (i + 1 < bytes.length) out += B64[(bits >> 6) & 63];
+    if (i + 2 < bytes.length) out += B64[bits & 63];
+  }
+  return out;
+}
+
+/** Unpadded base64url → bytes, or null for any other alphabet — a value that
+ *  fails here did not come from this console's own encoder or the daemon. */
+function b64urlToBuf(text) {
+  const B64 = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+  const symbols = [];
+  for (const char of String(text)) {
+    if (char === "=") continue;
+    const value = B64.indexOf(char);
+    if (value < 0) return null;
+    symbols.push(value);
+  }
+  if (symbols.length % 4 === 1) return null;
+  const out = [];
+  for (let i = 0; i < symbols.length; i += 4) {
+    const group = symbols.slice(i, i + 4);
+    const bits = group.reduce((acc, s, at) => acc | (s << (18 - 6 * at)), 0);
+    out.push((bits >> 16) & 255);
+    if (group.length > 2) out.push((bits >> 8) & 255);
+    if (group.length > 3) out.push(bits & 255);
+  }
+  return new Uint8Array(out);
+}
+
+/** Whether a credential id may appear in a request path: base64url text of a
+ *  sane length, validated (never escaped) exactly as service names are. */
+function usableCredentialId(id) {
+  return typeof id === "string" && id.length > 0 && id.length <= 1400
+    && /^[A-Za-z0-9_-]+$/.test(id);
+}
+
+/** The default label for a passkey being registered, from the user agent —
+ *  the operator sees "Mac" or "iPhone" in the list, not a credential id. */
+function deviceLabel(ua) {
+  const text = String(ua);
+  if (/iPhone/.test(text)) return "iPhone";
+  if (/iPad/.test(text)) return "iPad";
+  if (/Macintosh/.test(text)) return "Mac";
+  if (/Windows/.test(text)) return "Windows";
+  if (/Android/.test(text)) return "Android";
+  return "this device";
+}
+
+/** A passkey's registration instant as its calendar day, or an honest dash. */
+function passkeyDay(unix) {
+  const n = Number(unix);
+  if (!Number.isFinite(n) || n <= 0) return "—";
+  return new Date(n * 1000).toISOString().slice(0, 10);
+}
+
 /* ── 2. Self-tests: `node app.js` ───────────────────────────────────── */
 
 if (typeof document === "undefined") {
@@ -259,6 +321,26 @@ if (typeof document === "undefined") {
   check("sieve is case-insensitive", sift("WARN slow query", "warn"), true);
   check("sieve refuses a miss", sift("GET /api 200", "error"), false);
 
+  const bytes = new Uint8Array([0, 1, 250, 255]);
+  check("b64url round trip", Array.from(b64urlToBuf(bufToB64url(bytes))), Array.from(bytes));
+  check("b64url empty", bufToB64url(new Uint8Array(0)), "");
+  check("b64url uses the url alphabet unpadded", bufToB64url(new Uint8Array([251, 255])), "-_8");
+  check("the standard alphabet is refused", b64urlToBuf("a+b/"), null);
+  check("a lone symbol is refused", b64urlToBuf("a"), null);
+
+  check("credential ids pass", usableCredentialId("pQEC_Aw-"), true);
+  for (const bad of ["", "a b", "a/b", "a+b", "x".repeat(1401), 7]) {
+    check(`credential id refused: ${String(bad).slice(0, 12)}`, usableCredentialId(bad), false);
+  }
+
+  check("a Mac names itself", deviceLabel("Mozilla/5.0 (Macintosh; Intel Mac OS X)"), "Mac");
+  check("an iPhone names itself", deviceLabel("Mozilla/5.0 (iPhone; CPU iPhone OS 17_0)"), "iPhone");
+  check("an unknown agent stays generic", deviceLabel("curl/8.0"), "this device");
+
+  check("a passkey day reads as a date", passkeyDay(86400), "1970-01-02");
+  check("a missing day is a dash", passkeyDay(0), "—");
+  check("a garbage day is a dash", passkeyDay("soon"), "—");
+
   check("link word while connecting", linkWord("connecting", 0), "CONNECTING");
   check("link word connected", linkWord("connected", 500), "CONNECTED");
   check("a fresh loss has no age", linkWord("lost", 1), "UNREACHABLE");
@@ -293,6 +375,7 @@ function boot() {
     logs: { service: "", nextSeq: 0, missed: 0, count: 0 },
     notice: null,               // { kind: "done"|"problem", text }
     formOpen: false,
+    passkeys: null,             // registered passkeys, or null → panel hidden
   };
 
   const $ = (id) => document.getElementById(id);
@@ -374,6 +457,7 @@ function boot() {
     state.firewall = null;
     state.notice = null;
     state.formOpen = false;
+    state.passkeys = null;
     resetLogs("");
     firewallDrawn = "";
     for (const row of railRows.values()) row.remove();
@@ -388,6 +472,9 @@ function boot() {
     $("view-console").hidden = false;
     render();
     poll();
+    // Outside the poll on purpose: passkeys change only through this page's
+    // own register and remove buttons, which refresh the list themselves.
+    refreshPasskeys();
   }
 
   async function submitLogin(event) {
@@ -418,6 +505,200 @@ function boot() {
     try { await api("/api/session", { method: "DELETE" }); }
     catch { /* the session is being abandoned either way */ }
     toLogin();
+  }
+
+  /* ── passkeys (biometric login) ───────────────────────────────────── */
+
+  /** Unhides the login page's passkey button where a biometric (platform)
+   *  authenticator actually exists — everywhere else the password stands alone. */
+  function offerPasskeyLogin() {
+    if (!window.PublicKeyCredential
+      || typeof PublicKeyCredential.isUserVerifyingPlatformAuthenticatorAvailable !== "function") {
+      return;
+    }
+    PublicKeyCredential.isUserVerifyingPlatformAuthenticatorAvailable()
+      .then((available) => { $("login-passkey").hidden = !available; })
+      .catch(() => { /* no authenticator, no button */ });
+  }
+
+  /** The biometric login: challenge → authenticator → assertion → session.
+   *  A cancelled prompt says nothing; a refusal wears the password form's own
+   *  quiet words, because the daemon's refusals are deliberately uniform. */
+  async function passkeyLogin() {
+    const note = $("login-note");
+    note.hidden = true;
+    $("login-passkey").disabled = true;
+    try {
+      const issued = await api("/api/webauthn/login/challenge", { method: "POST" });
+      const challenge = issued.status === 200 && issued.body
+        ? b64urlToBuf(issued.body.challenge) : null;
+      if (!challenge) {
+        note.hidden = false;
+        note.textContent = issued.status === 429 ? "too many attempts, wait a minute" : "not accepted";
+        return;
+      }
+      let credential;
+      try {
+        credential = await navigator.credentials.get({
+          publicKey: {
+            challenge,
+            rpId: issued.body.rpId,
+            // The point of the feature: the authenticator must verify the
+            // person (biometric or PIN), not merely observe a touch.
+            userVerification: "required",
+            timeout: 60000,
+          },
+        });
+      } catch { return; /* cancelled or refused at the authenticator */ }
+      if (!credential) return;
+      const answer = credential.response;
+      const reply = await api("/api/webauthn/login", {
+        method: "POST",
+        body: {
+          id: credential.id,
+          clientDataJSON: bufToB64url(new Uint8Array(answer.clientDataJSON)),
+          authenticatorData: bufToB64url(new Uint8Array(answer.authenticatorData)),
+          signature: bufToB64url(new Uint8Array(answer.signature)),
+        },
+      });
+      if (reply.status >= 200 && reply.status < 300) { enterConsole(); return; }
+      note.hidden = false;
+      note.textContent = reply.status === 429 ? "too many attempts, wait a minute" : "not accepted";
+    } catch {
+      note.hidden = false;
+      note.textContent = "cannot reach the server";
+    } finally {
+      $("login-passkey").disabled = false;
+    }
+  }
+
+  /** Fetches the registered passkeys. A 404 — a daemon without the feature —
+   *  hides the panel silently, exactly as the firewall panel handles it. */
+  async function refreshPasskeys() {
+    try {
+      const reply = await api("/api/webauthn/credentials");
+      if (reply.status === 401) { toLogin(); return; }
+      state.passkeys = reply.status === 200 && reply.body && Array.isArray(reply.body.passkeys)
+        ? reply.body.passkeys : null;
+    } catch {
+      state.passkeys = null;
+    }
+    renderPasskeys();
+  }
+
+  /** Registers this device's platform authenticator as a passkey: an
+   *  authenticated-session-only act, so the password remains the root key. */
+  async function registerPasskey() {
+    $("pk-register").disabled = true;
+    try {
+      const issued = await api("/api/webauthn/register/challenge", { method: "POST" });
+      if (issued.status === 401) { toLogin(); return; }
+      const challenge = issued.status === 200 && issued.body
+        ? b64urlToBuf(issued.body.challenge) : null;
+      if (!challenge) {
+        notify("problem", (issued.body && issued.body.error) || `could not start registration (${issued.status})`);
+        return;
+      }
+      let credential;
+      try {
+        credential = await navigator.credentials.create({
+          publicKey: {
+            challenge,
+            rp: { id: issued.body.rpId, name: "selfhost" },
+            // One operator, one fixed handle: re-registering a device replaces
+            // its previous passkey instead of piling up copies.
+            user: {
+              id: new TextEncoder().encode("selfhost-operator"),
+              name: "operator",
+              displayName: "Operator",
+            },
+            pubKeyCredParams: [{ type: "public-key", alg: -7 }],
+            authenticatorSelection: {
+              authenticatorAttachment: "platform",
+              // Discoverable, so the login ceremony can name no credential
+              // ids and the login door leaks nothing about what exists.
+              residentKey: "required",
+              userVerification: "required",
+            },
+            attestation: "none",
+            timeout: 60000,
+          },
+        });
+      } catch { return; /* cancelled at the authenticator */ }
+      if (!credential) return;
+      const made = credential.response;
+      if (typeof made.getPublicKey !== "function" || typeof made.getAuthenticatorData !== "function") {
+        notify("problem", "this browser cannot export the passkey's public key");
+        return;
+      }
+      const reply = await api("/api/webauthn/register", {
+        method: "POST",
+        body: {
+          id: credential.id,
+          algorithm: made.getPublicKeyAlgorithm(),
+          publicKey: bufToB64url(new Uint8Array(made.getPublicKey())),
+          clientDataJSON: bufToB64url(new Uint8Array(made.clientDataJSON)),
+          authenticatorData: bufToB64url(new Uint8Array(made.getAuthenticatorData())),
+          label: deviceLabel(navigator.userAgent),
+        },
+      });
+      if (reply.status === 401) { toLogin(); return; }
+      if (reply.status >= 400) {
+        notify("problem", (reply.body && reply.body.error) || `registration refused (${reply.status})`);
+        return;
+      }
+      notify("done", "Passkey registered — this device's biometric now logs in");
+    } catch {
+      notify("problem", "cannot reach the server");
+    } finally {
+      $("pk-register").disabled = false;
+      refreshPasskeys();
+    }
+  }
+
+  /** Revokes one passkey. One click, no typed confirm: unlike an uninstall,
+   *  a removed passkey is recoverable by registering the device again. */
+  async function removePasskey(id) {
+    if (!usableCredentialId(id)) return;
+    await command("Passkey removed", "DELETE", `/api/webauthn/credentials/${id}`);
+    refreshPasskeys();
+  }
+
+  /** The PASSKEYS panel: hidden while the daemon lacks the feature, a listed
+   *  device per row, and the register button only where registering can work. */
+  function renderPasskeys() {
+    const panel = $("passkeys");
+    panel.hidden = state.passkeys === null;
+    if (state.passkeys === null) return;
+    const passkeys = state.passkeys;
+    $("pk-count").textContent = String(passkeys.length);
+    $("pk-register").hidden = !window.PublicKeyCredential;
+    const note = $("pk-note");
+    note.hidden = passkeys.length > 0;
+    note.textContent = window.PublicKeyCredential
+      ? "No passkeys yet. Register this device to log in with its biometric."
+      : "No passkeys yet. Open the console on a device with a biometric authenticator to register one.";
+    const rows = $("pk-list");
+    rows.textContent = "";
+    for (const entry of passkeys) {
+      if (!usableCredentialId(entry.id)) continue;
+      const row = document.createElement("li");
+      const label = document.createElement("span");
+      label.className = "pk-label";
+      label.textContent = String(entry.label || "passkey");
+      const added = document.createElement("span");
+      added.className = "mono micro";
+      added.textContent = passkeyDay(entry.createdUnix);
+      const rule = document.createElement("span");
+      rule.className = "rule";
+      const remove = document.createElement("button");
+      remove.type = "button";
+      remove.className = "btn danger small";
+      remove.textContent = "REMOVE";
+      remove.addEventListener("click", () => removePasskey(entry.id));
+      row.append(label, added, rule, remove);
+      rows.append(row);
+    }
   }
 
   /* ── polling ──────────────────────────────────────────────────────── */
@@ -1250,7 +1531,10 @@ function boot() {
   /* ── wiring ───────────────────────────────────────────────────────── */
 
   $("login-form").addEventListener("submit", submitLogin);
+  $("login-passkey").addEventListener("click", passkeyLogin);
+  $("pk-register").addEventListener("click", registerPasskey);
   $("logout").addEventListener("click", logout);
+  offerPasskeyLogin();
   $("notice-dismiss").addEventListener("click", () => { state.notice = null; renderNotice(); });
 
   $("add-service").addEventListener("click", openBlank);

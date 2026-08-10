@@ -549,8 +549,18 @@ async fn serve_daemon(
 
     // Console auth is read once here: a `selfhost console-password` run takes
     // effect at the next daemon restart.
-    let api = Api::new(supervisor.clone(), store, token, watches.clone(), firewall.clone())
+    let mut api = Api::new(supervisor.clone(), store, token, watches.clone(), firewall.clone())
         .with_console_auth(&data_dir);
+    // Passkey (biometric) login is scoped to the console site's canonical
+    // hostname — the WebAuthn relying-party id. Config is the only honest
+    // source for it: the proxy's console relay forwards no Host header, and an
+    // identity the client could pick would undo the origin binding. No console
+    // site, no passkeys; the password and bearer paths are unchanged.
+    if let Some(host) = config.sites.iter().find(|site| site.console).and_then(|site| site.domains.first())
+    {
+        api = api.with_console_webauthn(host, &data_dir);
+        println!("\nconsole passkeys enabled for https://{host} (stored in console.passkeys)");
+    }
     let mut updated_to: Option<String> = None;
     let outcome = tokio::select! {
         result = selfhost_admin::serve(listener, api) => {

@@ -30,6 +30,10 @@
         <span id="login-sweep" class="sweep" hidden></span>
       </div>
     </form>
+    <!-- Biometric login: shown only where a platform authenticator exists.
+         The password stays the root credential; a passkey is registered from
+         inside a logged-in session. -->
+    <button id="login-passkey" class="btn wide" type="button" hidden>TOUCH&nbsp;ID&nbsp;/&nbsp;PASSKEY</button>
     <p id="login-caps" class="caption warn-ink" hidden>Caps Lock is on.</p>
     <p id="login-note" class="caption bad-ink" hidden></p>
     <p class="caption">Reachable over the WireGuard tunnel only.</p>
@@ -290,6 +294,19 @@
     </section>
 
   </div>
+
+  <!-- PASSKEYS: biometric identities allowed through the login door. Hidden
+       until the daemon says the feature is configured; removal is one click
+       because a passkey, unlike a service, is recoverable by re-registering. -->
+  <section id="passkeys" class="plate" hidden>
+    <div class="section-rule">
+      <h2>PASSKEYS</h2><span class="rule"></span>
+      <span id="pk-count" class="mono micro"></span>
+      <button id="pk-register" class="btn ghost small" type="button" hidden>REGISTER THIS DEVICE</button>
+    </div>
+    <p id="pk-note" class="caption" hidden></p>
+    <ul id="pk-list"></ul>
+  </section>
 </section>
 
 <script src="/app.js"></script>
