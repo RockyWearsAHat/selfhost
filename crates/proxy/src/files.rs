@@ -24,6 +24,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 pub enum Resolution {
     /// A file to serve.
     File(PathBuf),
+    /// The path named a directory but arrived without its trailing slash. The
+    /// caller redirects to the same target with one appended.
+    TrailingSlash,
     /// The path escaped the root, or was otherwise refused.
     Rejected,
     /// Nothing matched, and the site does not fall back to an app shell.
@@ -66,8 +69,17 @@ fn percent_decode(input: &str) -> Option<String> {
 
 /// Maps a request path to a file beneath `root`.
 ///
-/// `spa` makes an unmatched path fall back to `index.html`, which is what lets
-/// a client-side route survive a page reload.
+/// Resolution is ordered exactly-named file, then directory index, then the
+/// clean-URL form (`/about` → `about.html`), then — when `spa` is set — the app
+/// shell, which is what lets a client-side route survive a page reload. The
+/// clean-URL step is what every static-site generator and every host this
+/// platform replaces already assumes: without it a link written `/about` finds
+/// `about.html` nowhere and the page 404s.
+///
+/// A directory reached without its trailing slash resolves to
+/// [`Resolution::TrailingSlash`] rather than straight to its index, because
+/// serving `/docs/index.html` at the URL `/docs` makes every relative link on
+/// that page resolve against the parent directory instead of the page's own.
 pub fn resolve(root: &Path, request_path: &str, spa: bool) -> Resolution {
     let Some(decoded) = percent_decode(request_path) else {
         return Resolution::Rejected;
@@ -104,26 +116,58 @@ pub fn resolve(root: &Path, request_path: &str, spa: bool) -> Resolution {
     }
 
     let candidate = root.join(&safe);
-    let candidate = if candidate.is_dir() { candidate.join("index.html") } else { candidate };
 
     if candidate.is_file() {
-        return match confine(root, &candidate) {
-            Some(path) => Resolution::File(path),
-            None => Resolution::Rejected,
-        };
+        return serve(root, &candidate);
+    }
+
+    if candidate.is_dir() {
+        let index = candidate.join("index.html");
+        if index.is_file() {
+            // The root itself is always "/", so only a nested directory can be
+            // missing its slash.
+            if !normalised.ends_with('/') {
+                return Resolution::TrailingSlash;
+            }
+            return serve(root, &index);
+        }
+    }
+
+    // The clean URL: `/about` is the link every generator writes, and
+    // `about.html` is the file it emits next to it. An empty `safe` means the
+    // request was for the root, which the directory branch above already
+    // covered — appending an extension there would name a sibling of the root.
+    if !safe.as_os_str().is_empty() {
+        let page = candidate.with_file_name(match candidate.file_name() {
+            Some(name) => {
+                let mut name = name.to_owned();
+                name.push(".html");
+                name
+            }
+            None => return Resolution::NotFound,
+        });
+        if page.is_file() {
+            return serve(root, &page);
+        }
     }
 
     if spa {
         let shell = root.join("index.html");
         if shell.is_file() {
-            return match confine(root, &shell) {
-                Some(path) => Resolution::File(path),
-                None => Resolution::Rejected,
-            };
+            return serve(root, &shell);
         }
     }
 
     Resolution::NotFound
+}
+
+/// Turns a matched file into a resolution, refusing anything that leaves the
+/// root once symlinks are followed.
+fn serve(root: &Path, candidate: &Path) -> Resolution {
+    match confine(root, candidate) {
+        Some(path) => Resolution::File(path),
+        None => Resolution::Rejected,
+    }
 }
 
 /// Confirms a resolved path really sits inside the root once symlinks are
@@ -258,8 +302,11 @@ mod tests {
         let root = std::env::temp_dir().join(format!("selfhost-files-{label}-{}", std::process::id()));
         let _ = fs::remove_dir_all(&root);
         fs::create_dir_all(root.join("assets")).unwrap();
+        fs::create_dir_all(root.join("docs")).unwrap();
         fs::write(root.join("index.html"), b"<h1>home</h1>").unwrap();
+        fs::write(root.join("about.html"), b"<h1>about</h1>").unwrap();
         fs::write(root.join("assets/app.js"), b"console.log(1)").unwrap();
+        fs::write(root.join("docs/index.html"), b"<h1>docs</h1>").unwrap();
         root
     }
 
@@ -276,6 +323,55 @@ mod tests {
             panic!("expected the directory index");
         };
         assert!(path.ends_with("index.html"));
+    }
+
+    #[test]
+    fn a_clean_url_finds_the_page_beside_it() {
+        let root = temp_root("clean");
+        // The bug this guards: `/about` is the link generators write, and
+        // answering it 404 while `about.html` sits right there makes every
+        // internal link on the site dead.
+        let Resolution::File(path) = resolve(&root, "/about", false) else {
+            panic!("expected about.html");
+        };
+        assert!(path.ends_with("about.html"));
+    }
+
+    #[test]
+    fn a_clean_url_does_not_invent_a_page() {
+        let root = temp_root("clean-miss");
+        assert_eq!(resolve(&root, "/missing", false), Resolution::NotFound);
+        // The root must never reach for a sibling of itself named `.html`.
+        assert!(matches!(resolve(&root, "/", false), Resolution::File(_)));
+    }
+
+    #[test]
+    fn an_exact_file_outranks_the_clean_url_form() {
+        let root = temp_root("exact");
+        let Resolution::File(path) = resolve(&root, "/about.html", false) else {
+            panic!("expected the file asked for");
+        };
+        assert!(path.ends_with("about.html"));
+    }
+
+    #[test]
+    fn a_directory_without_its_slash_redirects() {
+        let root = temp_root("slash");
+        // Serving docs/index.html at "/docs" would point every relative link on
+        // the page at the root instead of at the directory.
+        assert_eq!(resolve(&root, "/docs", false), Resolution::TrailingSlash);
+        let Resolution::File(path) = resolve(&root, "/docs/", false) else {
+            panic!("expected the directory index");
+        };
+        assert!(path.ends_with("index.html"));
+    }
+
+    #[test]
+    fn a_directory_with_no_index_falls_through_rather_than_redirecting() {
+        let root = temp_root("no-index");
+        // `assets` has no index.html, so a redirect would only bounce the
+        // caller to a second 404.
+        assert_eq!(resolve(&root, "/assets", false), Resolution::NotFound);
     }
 
     #[test]
