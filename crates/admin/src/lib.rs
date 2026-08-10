@@ -99,6 +99,17 @@ struct ConsoleAuth {
 /// The name of the session cookie the console browser holds.
 const SESSION_COOKIE: &str = "selfhost_session";
 
+/// The identity behind the root credentials: the console password and the
+/// bearer token. Passkey sessions carry the holder's own name instead.
+const OWNER: &str = "owner";
+
+/// The body of every "you are in" reply — login, passkey login, and the
+/// session probe — naming who the session belongs to, in one shape so the
+/// SPA reads them with one hand.
+fn session_granted(user: &str) -> Json {
+    Json::object([("ok", Json::Bool(true)), ("user", Json::string(user))])
+}
+
 /// The header a cookie-authenticated non-GET request must carry.
 ///
 /// The CSRF defence: a cross-site form or fetch can make the browser attach
@@ -327,9 +338,11 @@ impl Api {
             return problem(Status(401), "authorisation required");
         }
         console.gate.reset();
-        match console.sessions.create() {
+        // The password is the root credential; the session it mints is the
+        // deployment's owner, whatever device typed it.
+        match console.sessions.create(OWNER) {
             Ok(id) => with_session_cookie(
-                json(Status(200), Json::object([("ok", Json::Bool(true))])),
+                json(Status(200), session_granted(OWNER)),
                 &id,
                 session::SESSION_LIFETIME_SECS,
             ),
@@ -381,14 +394,16 @@ impl Api {
         let Some(assertion) = parse_json_body(body) else {
             return problem(Status(400), "body must be a JSON assertion");
         };
-        if webauthn.verify_login(&assertion).is_err() {
+        let Ok(passkey) = webauthn.verify_login(&assertion) else {
             console.gate.record_failure();
             return problem(Status(401), "authorisation required");
-        }
+        };
         console.gate.reset();
-        match console.sessions.create() {
+        // The assertion proved which person's credential signed it; the
+        // session belongs to that person by cryptographic fact, not claim.
+        match console.sessions.create(&passkey.user) {
             Ok(id) => with_session_cookie(
-                json(Status(200), Json::object([("ok", Json::Bool(true))])),
+                json(Status(200), session_granted(&passkey.user)),
                 &id,
                 session::SESSION_LIFETIME_SECS,
             ),
@@ -421,7 +436,10 @@ impl Api {
         match webauthn.register(&registration) {
             Ok(passkey) => json(
                 Status(200),
-                Json::object([("registered", Json::string(passkey.label))]),
+                Json::object([
+                    ("registered", Json::string(passkey.label)),
+                    ("user", Json::string(passkey.user)),
+                ]),
             ),
             Err(_) => problem(Status(400), "the registration could not be verified"),
         }
@@ -465,13 +483,19 @@ impl Api {
     ///
     /// A 200 for any authenticated caller — cookie or bearer — and the usual
     /// uninformative 401 otherwise, so the SPA can decide between its login
-    /// form and its dashboard with one request.
+    /// form and its dashboard with one request. The 200 names the session's
+    /// holder; a bearer token is the owner's own credential.
     fn session_probe(&self, request: &Request) -> Response {
-        if self.authorised(request) {
-            json(Status(200), Json::object([("ok", Json::Bool(true))]))
-        } else {
-            problem(Status(401), "authorisation required")
+        if !self.authorised(request) {
+            return problem(Status(401), "authorisation required");
         }
+        let user = self
+            .console
+            .as_ref()
+            .zip(session_cookie(request))
+            .and_then(|(console, id)| console.sessions.identity(&id))
+            .unwrap_or_else(|| OWNER.to_owned());
+        json(Status(200), session_granted(&user))
     }
 
     async fn list_services(&self) -> Response {

@@ -8,6 +8,14 @@
 //! credential — a passkey can never grant more than the password that
 //! registered it, and deleting `console.passkeys` revokes them all.
 //!
+//! Passkeys are *named*: each belongs to a person, several people can share
+//! one device (each name is its own resident credential, distinguished by the
+//! browser's account picker at login), and a verified assertion answers who
+//! signed it, so the session it mints knows its holder. The biometric proves
+//! a person the device trusts is present; *which* person is proved by the
+//! credential's signature, which is what makes the identity cryptographic
+//! rather than declared.
+//!
 //! Only ES256 (ECDSA P-256 over SHA-256) is accepted. Every platform
 //! authenticator offers it, and holding to one algorithm keeps verification a
 //! single code path through `ring` — the same provider the rest of the
@@ -45,9 +53,17 @@ const CHALLENGE_LIFETIME: Duration = Duration::from_secs(120);
 /// couple in flight; a challenge-request loop evicts its own oldest.
 const MAX_CHALLENGES: usize = 32;
 
-/// The most passkeys the store will hold. One operator with a handful of
-/// devices never approaches this; a registration loop is refused, not stored.
-const MAX_PASSKEYS: usize = 16;
+/// The most passkeys the store will hold. Several people, each with a few
+/// devices, never approach this; a registration loop is refused, not stored.
+const MAX_PASSKEYS: usize = 32;
+
+/// The longest person's name a passkey may carry. Bounded like every stored
+/// string: it renders in the console and names sessions, but it is input.
+const MAX_USER_CHARS: usize = 32;
+
+/// The identity a passkey wears when the registering caller names nobody —
+/// the same identity a password login mints its session under.
+const DEFAULT_USER: &str = "owner";
 
 /// The longest credential id accepted, from the WebAuthn specification.
 const MAX_CREDENTIAL_ID_BYTES: usize = 1023;
@@ -175,7 +191,12 @@ pub struct Passkey {
     pub id: String,
     /// The uncompressed P-256 point assertions are verified against.
     public_key: Vec<u8>,
-    /// The operator's own name for the device ("MacBook", "phone").
+    /// The person this passkey belongs to ("Alex", "Mom") — the identity a
+    /// verified assertion mints its session under. Several people can share
+    /// one device: each name is its own resident credential in the
+    /// authenticator, and the browser's account picker chooses between them.
+    pub user: String,
+    /// The person's own name for the device ("MacBook", "phone").
     pub label: String,
     /// When the passkey was registered, as seconds since the Unix epoch —
     /// wall-clock rather than `Instant` because it survives restarts on disk.
@@ -237,18 +258,24 @@ impl Passkeys {
         self.lock().clone()
     }
 
-    /// The public key registered under a credential id, if any.
-    fn key_for(&self, id: &str) -> Option<Vec<u8>> {
-        self.lock().iter().find(|entry| entry.id == id).map(|entry| entry.public_key.clone())
+    /// The passkey registered under a credential id, if any.
+    fn find(&self, id: &str) -> Option<Passkey> {
+        self.lock().iter().find(|entry| entry.id == id).cloned()
     }
 
-    /// Adds (or, for a re-registered id, replaces) a passkey and persists.
+    /// Adds a passkey and persists, superseding what it replaces: the same
+    /// credential id, or the same person's earlier passkey on the same
+    /// device — an authenticator keeps one resident credential per person
+    /// and site, so re-registering destroyed that credential authenticator-side
+    /// and its stored entry is dead weight.
     ///
     /// Refuses beyond [`MAX_PASSKEYS`]: a registration loop must hit a wall,
     /// not grow a credential file without bound.
     fn add(&self, passkey: Passkey) -> io::Result<()> {
         let mut entries = self.lock();
-        entries.retain(|entry| entry.id != passkey.id);
+        entries.retain(|entry| {
+            entry.id != passkey.id && !(entry.user == passkey.user && entry.label == passkey.label)
+        });
         if entries.len() >= MAX_PASSKEYS {
             return Err(io::Error::other(format!("at most {MAX_PASSKEYS} passkeys may be registered")));
         }
@@ -292,7 +319,8 @@ impl std::fmt::Debug for Passkeys {
     }
 }
 
-/// The stored file's JSON shape: `{"passkeys": [{id, publicKey, label, createdUnix}]}`.
+/// The stored file's JSON shape:
+/// `{"passkeys": [{id, publicKey, user, label, createdUnix}]}`.
 fn passkeys_to_json(entries: &[Passkey]) -> Json {
     Json::object([(
         "passkeys",
@@ -300,6 +328,7 @@ fn passkeys_to_json(entries: &[Passkey]) -> Json {
             Json::object([
                 ("id", Json::string(&entry.id)),
                 ("publicKey", Json::string(b64url_encode(&entry.public_key))),
+                ("user", Json::string(&entry.user)),
                 ("label", Json::string(&entry.label)),
                 ("createdUnix", Json::Number(entry.created_unix as f64)),
             ])
@@ -308,7 +337,9 @@ fn passkeys_to_json(entries: &[Passkey]) -> Json {
 }
 
 /// Parses the stored file. `None` for anything malformed — including an entry
-/// whose key is not a P-256 point, which could never verify anyway.
+/// whose key is not a P-256 point, which could never verify anyway. A missing
+/// `user` is not malformed: files written before passkeys were named belong to
+/// the sole operator they served, [`DEFAULT_USER`].
 fn parse_passkeys(text: &str) -> Option<Vec<Passkey>> {
     let value = selfhost_json::parse(text).ok()?;
     let mut entries = Vec::new();
@@ -321,6 +352,7 @@ fn parse_passkeys(text: &str) -> Option<Vec<Passkey>> {
         entries.push(Passkey {
             id,
             public_key,
+            user: item.get("user").and_then(Json::as_str).unwrap_or(DEFAULT_USER).to_owned(),
             label: item.get("label")?.as_str()?.to_owned(),
             created_unix: item.get("createdUnix")?.as_u64()?,
         });
@@ -383,7 +415,8 @@ impl Webauthn {
     /// The body carries what `navigator.credentials.create()` returned:
     /// `id` (base64url credential id), `publicKey` (base64url SPKI from
     /// `getPublicKey()`), `algorithm` (COSE, must be ES256), `clientDataJSON`
-    /// and `authenticatorData` (base64url), and an optional `label`. Every
+    /// and `authenticatorData` (base64url), plus an optional `user` (whose
+    /// passkey this is; [`DEFAULT_USER`] when unnamed) and `label`. Every
     /// failure is one uninformative error: the caller is already
     /// authenticated, but a registration body is still attacker-shaped input.
     pub fn register(&self, body: &Json) -> Result<Passkey, RefusedCeremony> {
@@ -401,18 +434,13 @@ impl Webauthn {
         let spki = decoded_field(body, "publicKey")?;
         let public_key = p256_point_from_spki(&spki).ok_or(RefusedCeremony)?;
 
-        let label = body
-            .get("label")
-            .and_then(Json::as_str)
-            .map(str::trim)
-            .filter(|label| !label.is_empty())
-            .unwrap_or("passkey");
         let passkey = Passkey {
             id,
             public_key,
-            // Bounded like every stored string: the label renders in the
-            // console and lives in an owner-only file, but it is still input.
-            label: label.chars().take(64).collect(),
+            user: named_field(body, "user", DEFAULT_USER, MAX_USER_CHARS),
+            // Bounded like every stored string: both names render in the
+            // console and live in an owner-only file, but they are still input.
+            label: named_field(body, "label", "passkey", 64),
             created_unix: SystemTime::now()
                 .duration_since(SystemTime::UNIX_EPOCH)
                 .map(|since| since.as_secs())
@@ -422,16 +450,17 @@ impl Webauthn {
         Ok(passkey)
     }
 
-    /// Verifies a browser's login assertion; `Ok` means "mint a session".
+    /// Verifies a browser's login assertion; `Ok` carries the passkey that
+    /// signed it — whose `user` the caller mints the session under.
     ///
     /// The body carries what `navigator.credentials.get()` returned: `id`,
     /// `clientDataJSON`, `authenticatorData`, and `signature`, all base64url.
     /// Every way of failing — unknown credential, stale challenge, wrong
     /// origin, missing user-verification flag, bad signature — is the same
     /// uninformative refusal, so probing the login door teaches nothing.
-    pub fn verify_login(&self, body: &Json) -> Result<(), RefusedCeremony> {
+    pub fn verify_login(&self, body: &Json) -> Result<Passkey, RefusedCeremony> {
         let id = credential_id(body)?;
-        let public_key = self.passkeys.key_for(&id).ok_or(RefusedCeremony)?;
+        let passkey = self.passkeys.find(&id).ok_or(RefusedCeremony)?;
 
         let client_data = decoded_field(body, "clientDataJSON")?;
         self.check_client_data(&client_data, "webauthn.get", Purpose::Login)?;
@@ -444,12 +473,14 @@ impl Webauthn {
         // the client data's digest appended.
         let mut message = auth_data;
         message.extend_from_slice(digest::digest(&digest::SHA256, &client_data).as_ref());
-        UnparsedPublicKey::new(&ECDSA_P256_SHA256_ASN1, &public_key)
+        UnparsedPublicKey::new(&ECDSA_P256_SHA256_ASN1, &passkey.public_key)
             .verify(&message, &signature)
-            .map_err(|_| RefusedCeremony)
+            .map_err(|_| RefusedCeremony)?;
+        Ok(passkey)
     }
 
-    /// The registered passkeys as `{"passkeys": [{id, label, createdUnix}]}`.
+    /// The registered passkeys as
+    /// `{"passkeys": [{id, user, label, createdUnix}]}`.
     ///
     /// Public keys stay out on purpose: the console has no use for them, and
     /// what is not sent cannot end up pasted somewhere.
@@ -459,6 +490,7 @@ impl Webauthn {
             Json::array(self.passkeys.list().into_iter().map(|entry| {
                 Json::object([
                     ("id", Json::string(entry.id)),
+                    ("user", Json::string(entry.user)),
                     ("label", Json::string(entry.label)),
                     ("createdUnix", Json::Number(entry.created_unix as f64)),
                 ])
@@ -534,6 +566,19 @@ fn credential_id(body: &Json) -> Result<String, RefusedCeremony> {
 /// Reads a base64url string field out of a ceremony body, decoded.
 fn decoded_field(body: &Json, field: &str) -> Result<Vec<u8>, RefusedCeremony> {
     body.get(field).and_then(Json::as_str).and_then(b64url_decode).ok_or(RefusedCeremony)
+}
+
+/// Reads a display-name field out of a registration body: trimmed, bounded to
+/// `limit` characters, and `fallback` where absent or blank.
+fn named_field(body: &Json, field: &str, fallback: &str, limit: usize) -> String {
+    body.get(field)
+        .and_then(Json::as_str)
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .unwrap_or(fallback)
+        .chars()
+        .take(limit)
+        .collect()
 }
 
 /// Cuts the uncompressed point out of a P-256 SubjectPublicKeyInfo.
@@ -662,8 +707,9 @@ mod tests {
             .into_bytes()
         }
 
-        /// A complete registration body for a freshly issued challenge.
-        fn register_body(&self, webauthn: &Webauthn, label: &str) -> Json {
+        /// A complete registration body for a freshly issued challenge,
+        /// registering `user`'s passkey on the device called `label`.
+        fn register_body(&self, webauthn: &Webauthn, user: &str, label: &str) -> Json {
             let challenge = challenge_of(webauthn.challenge(Purpose::Register).unwrap());
             let client = Self::client_data("webauthn.create", &challenge, &format!("https://{RP}"));
             let flags = FLAG_USER_PRESENT | FLAG_USER_VERIFIED | FLAG_ATTESTED_CREDENTIAL;
@@ -673,6 +719,7 @@ mod tests {
                 ("publicKey", Json::string(b64url_encode(&self.spki()))),
                 ("clientDataJSON", Json::string(b64url_encode(&client))),
                 ("authenticatorData", Json::string(b64url_encode(&Self::auth_data(flags)))),
+                ("user", Json::string(user)),
                 ("label", Json::string(label)),
             ])
         }
@@ -744,11 +791,55 @@ mod tests {
         let webauthn = webauthn(&dir);
         let device = Authenticator::new("credential-1");
 
-        let stored = webauthn.register(&device.register_body(&webauthn, "MacBook")).expect("registers");
+        let stored = webauthn.register(&device.register_body(&webauthn, "Alex", "MacBook")).expect("registers");
+        assert_eq!(stored.user, "Alex");
         assert_eq!(stored.label, "MacBook");
         assert!(!webauthn.is_empty());
 
-        webauthn.verify_login(&device.login_body(&webauthn)).expect("a real assertion verifies");
+        let signer = webauthn.verify_login(&device.login_body(&webauthn)).expect("a real assertion verifies");
+        assert_eq!(signer.user, "Alex", "the assertion answers who signed it");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn two_people_on_one_device_stay_distinct() {
+        let dir = scratch("two-people");
+        let webauthn = webauthn(&dir);
+        // Same machine, two resident credentials — one per person.
+        let alexs = Authenticator::new("credential-alex");
+        let moms = Authenticator::new("credential-mom");
+        webauthn.register(&alexs.register_body(&webauthn, "Alex", "MacBook")).expect("registers");
+        webauthn.register(&moms.register_body(&webauthn, "Mom", "MacBook")).expect("registers");
+
+        assert_eq!(webauthn.verify_login(&alexs.login_body(&webauthn)).unwrap().user, "Alex");
+        assert_eq!(webauthn.verify_login(&moms.login_body(&webauthn)).unwrap().user, "Mom");
+
+        // The same person re-registering the same device supersedes their own
+        // passkey — and only theirs.
+        let replacement = Authenticator::new("credential-alex-2");
+        webauthn.register(&replacement.register_body(&webauthn, "Alex", "MacBook")).expect("registers");
+        assert!(webauthn.verify_login(&alexs.login_body(&webauthn)).is_err(), "superseded");
+        assert_eq!(webauthn.verify_login(&replacement.login_body(&webauthn)).unwrap().user, "Alex");
+        assert_eq!(webauthn.verify_login(&moms.login_body(&webauthn)).unwrap().user, "Mom");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_file_from_before_names_belongs_to_the_owner() {
+        let dir = scratch("unnamed-file");
+        // Write through the store, then strip the user fields the way a
+        // pre-naming daemon would have written the file.
+        let first = webauthn(&dir);
+        let device = Authenticator::new("credential-1");
+        first.register(&device.register_body(&first, "ignored", "MacBook")).expect("registers");
+        let path = Passkeys::path_in(&dir);
+        let text = std::fs::read_to_string(&path).unwrap().replace(",\"user\":\"ignored\"", "");
+        assert!(!text.contains("\"user\""), "the rewritten file is nameless");
+        std::fs::write(&path, text).unwrap();
+
+        let reloaded = webauthn(&dir);
+        let signer = reloaded.verify_login(&device.login_body(&reloaded)).expect("still verifies");
+        assert_eq!(signer.user, DEFAULT_USER, "an unnamed passkey is the owner's");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -757,7 +848,7 @@ mod tests {
         let dir = scratch("reload");
         let first = webauthn(&dir);
         let device = Authenticator::new("credential-1");
-        first.register(&device.register_body(&first, "phone")).expect("registers");
+        first.register(&device.register_body(&first, "Alex", "phone")).expect("registers");
 
         // A fresh load — the daemon restarting — still verifies the device.
         let reloaded = webauthn(&dir);
@@ -770,7 +861,7 @@ mod tests {
         let dir = scratch("refusals");
         let webauthn = webauthn(&dir);
         let device = Authenticator::new("credential-1");
-        webauthn.register(&device.register_body(&webauthn, "MacBook")).expect("registers");
+        webauthn.register(&device.register_body(&webauthn, "Alex", "MacBook")).expect("registers");
 
         // Presence without verification: the biometric check did not happen.
         let unverified = device.login_body_with(&webauthn, FLAG_USER_PRESENT, None);
@@ -801,13 +892,13 @@ mod tests {
         let webauthn = webauthn(&dir);
         let device = Authenticator::new("credential-1");
 
-        let mut wrong_alg = device.register_body(&webauthn, "x");
+        let mut wrong_alg = device.register_body(&webauthn, "Alex", "x");
         if let Json::Object(entries) = &mut wrong_alg {
             entries.insert("algorithm".into(), Json::Number(-257.0)); // RS256
         }
         assert!(webauthn.register(&wrong_alg).is_err(), "only ES256 is accepted");
 
-        let mut wrong_key = device.register_body(&webauthn, "x");
+        let mut wrong_key = device.register_body(&webauthn, "Alex", "x");
         if let Json::Object(entries) = &mut wrong_key {
             entries.insert("publicKey".into(), Json::string(b64url_encode(&[0x30, 0x59, 0x01])));
         }
@@ -822,7 +913,7 @@ mod tests {
         let dir = scratch("remove");
         let webauthn = webauthn(&dir);
         let device = Authenticator::new("credential-1");
-        webauthn.register(&device.register_body(&webauthn, "MacBook")).expect("registers");
+        webauthn.register(&device.register_body(&webauthn, "Alex", "MacBook")).expect("registers");
 
         assert!(webauthn.remove(&device.id).expect("removes"));
         assert!(!webauthn.remove(&device.id).expect("second remove is a no-op"));
@@ -836,7 +927,7 @@ mod tests {
         let dir = scratch("list");
         let webauthn = webauthn(&dir);
         let device = Authenticator::new("credential-1");
-        webauthn.register(&device.register_body(&webauthn, "MacBook")).expect("registers");
+        webauthn.register(&device.register_body(&webauthn, "Alex", "MacBook")).expect("registers");
         let text = webauthn.list().to_text();
         assert!(text.contains("MacBook"));
         assert!(!text.contains(&b64url_encode(&device.spki())), "keys stay out of the list");
@@ -859,7 +950,7 @@ mod tests {
         let dir = scratch("perms");
         let webauthn = webauthn(&dir);
         let device = Authenticator::new("credential-1");
-        webauthn.register(&device.register_body(&webauthn, "x")).expect("registers");
+        webauthn.register(&device.register_body(&webauthn, "Alex", "x")).expect("registers");
         let mode = std::fs::metadata(Passkeys::path_in(&dir)).unwrap().permissions().mode();
         assert_eq!(mode & 0o077, 0, "no group or world access: mode {mode:o}");
         let _ = std::fs::remove_dir_all(&dir);
