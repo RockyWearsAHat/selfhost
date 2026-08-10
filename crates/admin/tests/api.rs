@@ -694,6 +694,266 @@ async fn an_invented_cookie_does_not_authorise_anything() {
 }
 
 /// A scratch directory that removes itself when dropped.
+// ---- passkey (WebAuthn) login -----------------------------------------------
+//
+// The ceremony crypto — signatures, origins, flags, challenges — is unit-tested
+// inside `webauthn.rs`; these tests cover the route glue: which door needs what
+// credential, the uniform refusals, and that a verified assertion mints the
+// same session cookie a password login would.
+
+/// The relying party every passkey test speaks for, and the origin the test
+/// authenticator therefore claims.
+const RP: &str = "console.example.com";
+
+/// The console API with passkey login enabled for [`RP`].
+fn passkey_api(name: &str) -> (Api, ScratchDir) {
+    let (api, dir) = console_api(name, Sessions::new());
+    let api = api.with_console_webauthn(RP, dir.path());
+    (api, dir)
+}
+
+/// Unpadded base64url, for building ceremony bodies by hand.
+fn b64url(data: &[u8]) -> String {
+    const B64: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+    let mut out = String::new();
+    for chunk in data.chunks(3) {
+        let bits = (chunk[0] as u32) << 16
+            | (*chunk.get(1).unwrap_or(&0) as u32) << 8
+            | *chunk.get(2).unwrap_or(&0) as u32;
+        out.push(B64[(bits >> 18 & 0x3f) as usize] as char);
+        out.push(B64[(bits >> 12 & 0x3f) as usize] as char);
+        if chunk.len() > 1 {
+            out.push(B64[(bits >> 6 & 0x3f) as usize] as char);
+        }
+        if chunk.len() > 2 {
+            out.push(B64[(bits & 0x3f) as usize] as char);
+        }
+    }
+    out
+}
+
+/// A stand-in platform authenticator: a real P-256 keypair that answers
+/// ceremonies for [`RP`] the way a browser's `PublicKeyCredential` would.
+struct Authenticator {
+    keys: ring::signature::EcdsaKeyPair,
+    id: String,
+}
+
+impl Authenticator {
+    fn new() -> Self {
+        use ring::signature::{ECDSA_P256_SHA256_ASN1_SIGNING, EcdsaKeyPair};
+        let rng = ring::rand::SystemRandom::new();
+        let pkcs8 =
+            EcdsaKeyPair::generate_pkcs8(&ECDSA_P256_SHA256_ASN1_SIGNING, &rng).expect("keypair");
+        let keys = EcdsaKeyPair::from_pkcs8(&ECDSA_P256_SHA256_ASN1_SIGNING, pkcs8.as_ref(), &rng)
+            .expect("keypair parses");
+        Self { keys, id: b64url(b"test-credential") }
+    }
+
+    /// Authenticator data for [`RP`]: rpIdHash, `flags`, and a counter.
+    fn auth_data(flags: u8) -> Vec<u8> {
+        let mut out =
+            ring::digest::digest(&ring::digest::SHA256, RP.as_bytes()).as_ref().to_vec();
+        out.push(flags);
+        out.extend_from_slice(&[0, 0, 0, 1]);
+        out
+    }
+
+    fn client_data(ceremony: &str, challenge: &str) -> Vec<u8> {
+        Json::object([
+            ("type", Json::string(ceremony)),
+            ("challenge", Json::string(challenge)),
+            ("origin", Json::string(format!("https://{RP}"))),
+        ])
+        .to_text()
+        .into_bytes()
+    }
+
+    /// The registration body for a challenge, as the SPA would send it.
+    fn register_body(&self, challenge: &str, label: &str) -> String {
+        use ring::signature::KeyPair;
+        // getPublicKey()'s SPKI: the fixed P-256 prefix plus the raw point.
+        let mut spki = vec![
+            0x30, 0x59, 0x30, 0x13, 0x06, 0x07, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x02, 0x01, 0x06,
+            0x08, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x03, 0x01, 0x07, 0x03, 0x42, 0x00,
+        ];
+        spki.extend_from_slice(self.keys.public_key().as_ref());
+        Json::object([
+            ("id", Json::string(&self.id)),
+            ("algorithm", Json::Number(-7.0)),
+            ("publicKey", Json::string(b64url(&spki))),
+            ("clientDataJSON", Json::string(b64url(&Self::client_data("webauthn.create", challenge)))),
+            ("authenticatorData", Json::string(b64url(&Self::auth_data(0x45)))), // UP|UV|AT
+            ("label", Json::string(label)),
+        ])
+        .to_text()
+    }
+
+    /// A signed login assertion for a challenge, as the SPA would send it.
+    fn login_body(&self, challenge: &str) -> String {
+        let client = Self::client_data("webauthn.get", challenge);
+        let auth = Self::auth_data(0x05); // UP|UV
+        let mut message = auth.clone();
+        message
+            .extend_from_slice(ring::digest::digest(&ring::digest::SHA256, &client).as_ref());
+        let signature = self
+            .keys
+            .sign(&ring::rand::SystemRandom::new(), &message)
+            .expect("signing with the test key");
+        Json::object([
+            ("id", Json::string(&self.id)),
+            ("clientDataJSON", Json::string(b64url(&client))),
+            ("authenticatorData", Json::string(b64url(&auth))),
+            ("signature", Json::string(b64url(signature.as_ref()))),
+        ])
+        .to_text()
+    }
+}
+
+/// Registers `device` through the routes, driven by an authenticated cookie.
+async fn register_passkey(api: &Api, cookie: &str, device: &Authenticator, label: &str) {
+    let challenge = call_with(
+        api,
+        "POST",
+        "/api/webauthn/register/challenge",
+        &[("Cookie", cookie), ("X-Selfhost-Console", "1")],
+        "",
+    )
+    .await;
+    assert_eq!(challenge.status.code(), 200, "an authenticated caller gets a challenge");
+    let reply = body_json(&challenge);
+    assert_eq!(reply.get("rpId").and_then(Json::as_str), Some(RP));
+    let challenge = reply.get("challenge").and_then(Json::as_str).expect("a challenge").to_owned();
+
+    let registered = call_with(
+        api,
+        "POST",
+        "/api/webauthn/register",
+        &[("Cookie", cookie), ("X-Selfhost-Console", "1")],
+        &device.register_body(&challenge, label),
+    )
+    .await;
+    assert_eq!(registered.status.code(), 200, "{:?}", body_json(&registered));
+}
+
+/// Fetches a login challenge through the unauthenticated route.
+async fn login_challenge(api: &Api) -> Response {
+    call_with(api, "POST", "/api/webauthn/login/challenge", &[("X-Selfhost-Console", "1")], "")
+        .await
+}
+
+#[tokio::test]
+async fn a_registered_passkey_logs_in_and_the_session_it_mints_opens_the_api() {
+    let (api, _dir) = passkey_api("passkey-roundtrip");
+    let device = Authenticator::new();
+    register_passkey(&api, &login(&api).await, &device, "MacBook").await;
+
+    let challenge = login_challenge(&api).await;
+    assert_eq!(challenge.status.code(), 200, "a challenge once a passkey exists");
+    let challenge =
+        body_json(&challenge).get("challenge").and_then(Json::as_str).unwrap().to_owned();
+
+    let reply = call_with(
+        &api,
+        "POST",
+        "/api/webauthn/login",
+        &[("X-Selfhost-Console", "1")],
+        &device.login_body(&challenge),
+    )
+    .await;
+    assert_eq!(reply.status.code(), 200, "{:?}", body_json(&reply));
+    let cookie = session_cookie_pair(&reply);
+    let listed = call_with(&api, "GET", "/api/services", &[("Cookie", &cookie)], "").await;
+    assert_eq!(listed.status.code(), 200, "the passkey session opens the API");
+}
+
+#[tokio::test]
+async fn passkey_routes_refuse_uniformly_when_absent_or_unearned() {
+    // Console auth without passkeys configured: the login pair answers the
+    // API's uniform 401, and management routes are an honest 404 behind auth.
+    let (api, _dir) = console_api("passkey-absent", Sessions::new());
+    assert_eq!(login_challenge(&api).await.status.code(), 401);
+    let (status, _) = call(&api, "GET", "/api/webauthn/credentials", Some(TOKEN), "").await;
+    assert_eq!(status, 404, "an authenticated caller may learn the feature is off");
+
+    // Configured but with nothing registered: the same 401, so an
+    // unauthenticated probe cannot tell these deployments apart.
+    let (api, _dir) = passkey_api("passkey-empty");
+    assert_eq!(login_challenge(&api).await.status.code(), 401);
+
+    // The login pair is CSRF-guarded like the password login.
+    let bare = call_with(&api, "POST", "/api/webauthn/login/challenge", &[], "").await;
+    assert_eq!(bare.status.code(), 401, "no console header, no challenge");
+
+    // Registration is behind the wall entirely.
+    let anonymous =
+        call_with(&api, "POST", "/api/webauthn/register/challenge", &[("X-Selfhost-Console", "1")], "")
+            .await;
+    assert_eq!(anonymous.status.code(), 401, "registering needs a session or token");
+}
+
+#[tokio::test]
+async fn a_forged_assertion_is_refused_and_counts_toward_the_shared_gate() {
+    let (api, _dir) = passkey_api("passkey-forged");
+    let device = Authenticator::new();
+    register_passkey(&api, &login(&api).await, &device, "MacBook").await;
+
+    // A different key signing under the same credential id: refused, and each
+    // attempt feeds the same gate the password door uses.
+    let stranger = Authenticator::new();
+    for _ in 0..5 {
+        let challenge = login_challenge(&api).await;
+        assert_eq!(challenge.status.code(), 200);
+        let challenge =
+            body_json(&challenge).get("challenge").and_then(Json::as_str).unwrap().to_owned();
+        let refused = call_with(
+            &api,
+            "POST",
+            "/api/webauthn/login",
+            &[("X-Selfhost-Console", "1")],
+            &stranger.login_body(&challenge),
+        )
+        .await;
+        assert_eq!(refused.status.code(), 401);
+        assert!(refused.headers.get_str("set-cookie").is_none(), "no cookie on refusal");
+    }
+    assert_eq!(login_challenge(&api).await.status.code(), 429, "the gate has locked");
+    let password = call_with(
+        &api,
+        "POST",
+        "/api/session",
+        &[("X-Selfhost-Console", "1")],
+        &format!(r#"{{"password":"{PASSWORD}"}}"#),
+    )
+    .await;
+    assert_eq!(password.status.code(), 429, "one gate over both login doors");
+}
+
+#[tokio::test]
+async fn a_passkey_can_be_listed_and_revoked() {
+    let (api, _dir) = passkey_api("passkey-revoke");
+    let device = Authenticator::new();
+    let cookie = login(&api).await;
+    register_passkey(&api, &cookie, &device, "MacBook").await;
+
+    let (status, listed) = call(&api, "GET", "/api/webauthn/credentials", Some(TOKEN), "").await;
+    assert_eq!(status, 200);
+    let passkeys = listed.get("passkeys").and_then(Json::as_array).expect("a list");
+    assert_eq!(passkeys.len(), 1);
+    assert_eq!(passkeys[0].get("label").and_then(Json::as_str), Some("MacBook"));
+    let id = passkeys[0].get("id").and_then(Json::as_str).expect("an id").to_owned();
+
+    let (status, _) =
+        call(&api, "DELETE", &format!("/api/webauthn/credentials/{id}"), Some(TOKEN), "").await;
+    assert_eq!(status, 200);
+    let (status, _) =
+        call(&api, "DELETE", &format!("/api/webauthn/credentials/{id}"), Some(TOKEN), "").await;
+    assert_eq!(status, 404, "revoking twice names the absence");
+
+    // With the store empty again, the login door returns to its uniform 401.
+    assert_eq!(login_challenge(&api).await.status.code(), 401);
+}
+
 struct ScratchDir(std::path::PathBuf);
 
 impl ScratchDir {

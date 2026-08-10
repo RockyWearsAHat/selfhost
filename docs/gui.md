@@ -62,6 +62,14 @@ remote daemon by tunnelling over SSH — see
 Authentication is a bearer token in `data/admin.token`, mode `0600`, generated
 from the operating system's entropy and compared in constant time.
 
+The web console (the `console = true` site the proxy relays to this port) adds
+two browser credentials, both implemented in `crates/admin`: a cookie session
+against the `console.passwd` PBKDF2 hash (`POST /api/session`), and passkeys —
+WebAuthn with Touch ID / Face ID / Windows Hello — under `/api/webauthn/*`,
+stored in `data/console.passkeys`. Registering a passkey always requires an
+already-authenticated caller, so the password remains the root credential, and
+both login doors share one rate-limit gate.
+
 ```
 GET    /api/health                       no auth; is a daemon listening?
 GET    /api/services                     every service and what it is doing

@@ -34,6 +34,7 @@ pub mod passwd;
 pub mod session;
 pub mod store;
 pub mod token;
+pub mod webauthn;
 
 use selfhost_firewall::Manager;
 use selfhost_git::Watches;
@@ -51,6 +52,7 @@ pub use passwd::ConsolePassword;
 pub use session::{FailureGate, Sessions};
 pub use store::Store;
 pub use token::Token;
+pub use webauthn::Webauthn;
 
 /// The largest request body accepted.
 ///
@@ -85,8 +87,13 @@ struct ConsoleAuth {
     password: Arc<ConsolePassword>,
     /// The shared session store; one store across every clone of the `Api`.
     sessions: Sessions,
-    /// The shared login rate limiter.
+    /// The shared login rate limiter — one gate over both login doors, so a
+    /// guesser cannot double the budget by alternating password and passkey.
     gate: FailureGate,
+    /// Passkey (biometric) login, present once [`Api::with_console_webauthn`]
+    /// has been called. Absent when no console site is configured: without a
+    /// hostname there is no relying-party identity to verify against.
+    webauthn: Option<Webauthn>,
 }
 
 /// The name of the session cookie the console browser holds.
@@ -141,8 +148,35 @@ impl Api {
     /// a test passes a [`Sessions`] built with `Sessions::with_expiry` to get
     /// sessions that expire without waiting hours.
     pub fn with_console_auth_parts(mut self, password: ConsolePassword, sessions: Sessions) -> Self {
-        self.console =
-            Some(ConsoleAuth { password: Arc::new(password), sessions, gate: FailureGate::new() });
+        self.console = Some(ConsoleAuth {
+            password: Arc::new(password),
+            sessions,
+            gate: FailureGate::new(),
+            webauthn: None,
+        });
+        self
+    }
+
+    /// Enables passkey (biometric) login for the console site at `rp_id`.
+    ///
+    /// Called after [`Api::with_console_auth`] with the console site's
+    /// canonical hostname — the WebAuthn relying-party id every credential is
+    /// scoped to. The hostname must come from configuration, never a request:
+    /// the proxy relay forwards no `Host`, and an attacker-chosen identity
+    /// would defeat the origin binding that makes passkeys unphishable.
+    /// Without console auth there is no session to mint, so this is a no-op.
+    pub fn with_console_webauthn(mut self, rp_id: &str, dir: &Path) -> Self {
+        if let Some(console) = &mut self.console {
+            console.webauthn = Some(Webauthn::load(rp_id, dir));
+        }
+        self
+    }
+
+    /// The same, from an already-built verifier — the tests' seam.
+    pub fn with_console_webauthn_parts(mut self, webauthn: Webauthn) -> Self {
+        if let Some(console) = &mut self.console {
+            console.webauthn = Some(webauthn);
+        }
         self
     }
 
@@ -185,6 +219,24 @@ impl Api {
             };
         }
 
+        // The passkey login pair sits ahead of the wall for the same reason
+        // `POST /api/session` does: it is how a browser *gets* authorised.
+        // Both are POSTs that carry the CSRF header — the challenge route
+        // feeds the failure gate's door and must not be drivable cross-site.
+        if path == "/api/webauthn/login/challenge" || path == "/api/webauthn/login" {
+            if request.method != Method::Post {
+                return problem(Status(404), "no such endpoint");
+            }
+            if !has_console_header(request) {
+                return problem(Status(401), "authorisation required");
+            }
+            return if path == "/api/webauthn/login" {
+                self.webauthn_login(body)
+            } else {
+                self.webauthn_login_challenge()
+            };
+        }
+
         if !self.authorised(request) {
             // No detail about why. "Wrong token" and "no token" are the same
             // answer to anyone who should not be here.
@@ -206,6 +258,14 @@ impl Api {
             // as sensitive as the service list, so it sits inside the token wall.
             (Method::Get, ["api", "firewall"]) => self.firewall_state().await,
             (Method::Post, ["api", "firewall", "reconcile"]) => self.firewall_reconcile().await,
+            // Passkey management: registering needs an already-authenticated
+            // caller, so the console password stays the root credential.
+            (Method::Post, ["api", "webauthn", "register", "challenge"]) => {
+                self.webauthn_register_challenge()
+            }
+            (Method::Post, ["api", "webauthn", "register"]) => self.webauthn_register(body),
+            (Method::Get, ["api", "webauthn", "credentials"]) => self.webauthn_list(),
+            (Method::Delete, ["api", "webauthn", "credentials", id]) => self.webauthn_remove(id),
             _ => problem(Status(404), "no such endpoint"),
         }
     }
@@ -274,6 +334,116 @@ impl Api {
                 session::SESSION_LIFETIME_SECS,
             ),
             Err(error) => problem(Status(500), &format!("could not create a session: {error}")),
+        }
+    }
+
+    /// The passkey verifier, when the whole chain to it is enabled.
+    fn webauthn(&self) -> Option<(&ConsoleAuth, &Webauthn)> {
+        let console = self.console.as_ref()?;
+        Some((console, console.webauthn.as_ref()?))
+    }
+
+    /// Answers `POST /api/webauthn/login/challenge`: a challenge the login
+    /// page can hand to `navigator.credentials.get()`.
+    ///
+    /// The uniform 401 covers "feature off" and "no passkey registered"
+    /// alike, so this unauthenticated route reveals nothing about the
+    /// deployment; it names no credential ids for the same reason. Refused
+    /// while the gate is locked — a challenge is the first half of a guess.
+    fn webauthn_login_challenge(&self) -> Response {
+        let Some((console, webauthn)) = self.webauthn() else {
+            return problem(Status(401), "authorisation required");
+        };
+        if webauthn.is_empty() {
+            return problem(Status(401), "authorisation required");
+        }
+        if console.gate.locked() {
+            return problem(Status(429), "too many attempts");
+        }
+        match webauthn.challenge(webauthn::Purpose::Login) {
+            Ok(challenge) => json(Status(200), challenge),
+            Err(error) => problem(Status(500), &format!("could not issue a challenge: {error}")),
+        }
+    }
+
+    /// Answers `POST /api/webauthn/login`: verifies an assertion and mints
+    /// the same session cookie a password login would.
+    ///
+    /// Failures count into the shared [`FailureGate`], and every one of them
+    /// is the API's uniform 401 — the reasons live in the verifier.
+    fn webauthn_login(&self, body: &[u8]) -> Response {
+        let Some((console, webauthn)) = self.webauthn() else {
+            return problem(Status(401), "authorisation required");
+        };
+        if console.gate.locked() {
+            return problem(Status(429), "too many attempts");
+        }
+        let Some(assertion) = parse_json_body(body) else {
+            return problem(Status(400), "body must be a JSON assertion");
+        };
+        if webauthn.verify_login(&assertion).is_err() {
+            console.gate.record_failure();
+            return problem(Status(401), "authorisation required");
+        }
+        console.gate.reset();
+        match console.sessions.create() {
+            Ok(id) => with_session_cookie(
+                json(Status(200), Json::object([("ok", Json::Bool(true))])),
+                &id,
+                session::SESSION_LIFETIME_SECS,
+            ),
+            Err(error) => problem(Status(500), &format!("could not create a session: {error}")),
+        }
+    }
+
+    /// Answers `POST /api/webauthn/register/challenge` for an authenticated
+    /// caller about to run `navigator.credentials.create()`.
+    fn webauthn_register_challenge(&self) -> Response {
+        let Some((_, webauthn)) = self.webauthn() else {
+            return problem(Status(404), "passkey login is not configured on this deployment");
+        };
+        match webauthn.challenge(webauthn::Purpose::Register) {
+            Ok(challenge) => json(Status(200), challenge),
+            Err(error) => problem(Status(500), &format!("could not issue a challenge: {error}")),
+        }
+    }
+
+    /// Answers `POST /api/webauthn/register`: verifies and stores a new
+    /// passkey. Behind the wall, but a 401-shaped refusal would mislead an
+    /// authenticated caller — a rejected ceremony is this route's 400.
+    fn webauthn_register(&self, body: &[u8]) -> Response {
+        let Some((_, webauthn)) = self.webauthn() else {
+            return problem(Status(404), "passkey login is not configured on this deployment");
+        };
+        let Some(registration) = parse_json_body(body) else {
+            return problem(Status(400), "body must be a JSON registration");
+        };
+        match webauthn.register(&registration) {
+            Ok(passkey) => json(
+                Status(200),
+                Json::object([("registered", Json::string(passkey.label))]),
+            ),
+            Err(_) => problem(Status(400), "the registration could not be verified"),
+        }
+    }
+
+    /// Answers `GET /api/webauthn/credentials`: the registered passkeys.
+    fn webauthn_list(&self) -> Response {
+        match self.webauthn() {
+            Some((_, webauthn)) => json(Status(200), webauthn.list()),
+            None => problem(Status(404), "passkey login is not configured on this deployment"),
+        }
+    }
+
+    /// Answers `DELETE /api/webauthn/credentials/<id>`: revokes one passkey.
+    fn webauthn_remove(&self, id: &str) -> Response {
+        let Some((_, webauthn)) = self.webauthn() else {
+            return problem(Status(404), "passkey login is not configured on this deployment");
+        };
+        match webauthn.remove(id) {
+            Ok(true) => json(Status(200), Json::object([("removed", Json::string(id))])),
+            Ok(false) => problem(Status(404), "no such passkey"),
+            Err(error) => problem(Status(500), &format!("could not save the passkeys: {error}")),
         }
     }
 
@@ -492,9 +662,12 @@ impl Api {
 /// `None` for anything that is not JSON carrying a `password` string — the
 /// caller answers 400 rather than treating a malformed body as a failed guess.
 fn login_password(body: &[u8]) -> Option<String> {
-    let text = std::str::from_utf8(body).ok()?;
-    let value = selfhost_json::parse(text).ok()?;
-    value.get("password").and_then(Json::as_str).map(str::to_owned)
+    parse_json_body(body)?.get("password").and_then(Json::as_str).map(str::to_owned)
+}
+
+/// Parses a request body as JSON, or `None` for anything that is not.
+fn parse_json_body(body: &[u8]) -> Option<Json> {
+    selfhost_json::parse(std::str::from_utf8(body).ok()?).ok()
 }
 
 /// Extracts the session id from a request's `Cookie` header, if present.
