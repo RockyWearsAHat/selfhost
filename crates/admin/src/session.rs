@@ -42,6 +42,11 @@ const MAX_SESSIONS: usize = 32;
 struct Entry {
     /// The 64-hex-character id the cookie carries.
     id: String,
+    /// Who logged in: `"owner"` for the password (and the bearer token's
+    /// implicit identity), or the passkey holder's own name. Identity, not
+    /// authority — every session opens the same console today, and this field
+    /// is where per-user permissions will attach when they arrive.
+    user: String,
     /// When the session was created; drives the absolute expiry.
     created: Instant,
     /// When the session last authenticated a request; drives the idle expiry.
@@ -75,11 +80,12 @@ impl Sessions {
         Self { entries: Arc::new(Mutex::new(Vec::new())), absolute, idle }
     }
 
-    /// Creates a session and returns its id, evicting the oldest if at capacity.
+    /// Creates a session for `user` and returns its id, evicting the oldest
+    /// if at capacity.
     ///
     /// The id comes from the operating system's entropy — the same source as
     /// the bearer token — and an entropy failure is an error, never a weaker id.
-    pub fn create(&self) -> io::Result<String> {
+    pub fn create(&self, user: &str) -> io::Result<String> {
         let id = hex(&random_bytes(SESSION_ID_BYTES)?);
         let now = Instant::now();
         let mut entries = self.lock();
@@ -88,8 +94,26 @@ impl Sessions {
         while entries.len() >= MAX_SESSIONS {
             entries.remove(0);
         }
-        entries.push(Entry { id: id.clone(), created: now, last_seen: now });
+        entries.push(Entry { id: id.clone(), user: user.to_owned(), created: now, last_seen: now });
         Ok(id)
+    }
+
+    /// Who holds the live session named by `presented`, if anyone.
+    ///
+    /// Answers identity only — [`Sessions::validate`] remains the door check
+    /// and the idle-timer refresh; this walk touches nothing. Compared in
+    /// constant time and never returning early, like every credential here.
+    pub fn identity(&self, presented: &str) -> Option<String> {
+        let now = Instant::now();
+        let mut entries = self.lock();
+        entries.retain(|entry| !self.expired(entry, now));
+        let mut found = None;
+        for entry in entries.iter() {
+            if constant_time_eq(entry.id.as_bytes(), presented.as_bytes()) {
+                found = Some(entry.user.clone());
+            }
+        }
+        found
     }
 
     /// Whether `presented` names a live session, refreshing its idle timer.
@@ -207,7 +231,7 @@ mod tests {
     #[test]
     fn a_created_session_validates_and_an_invented_one_does_not() {
         let sessions = Sessions::new();
-        let id = sessions.create().expect("system entropy");
+        let id = sessions.create("owner").expect("system entropy");
         assert_eq!(id.len(), SESSION_ID_BYTES * 2, "64 hex characters");
         assert!(sessions.validate(&id));
         assert!(!sessions.validate("0".repeat(64).as_str()));
@@ -220,7 +244,7 @@ mod tests {
         // Api is Clone; a login accepted by one clone must hold on another.
         let sessions = Sessions::new();
         let clone = sessions.clone();
-        let id = sessions.create().unwrap();
+        let id = sessions.create("owner").unwrap();
         assert!(clone.validate(&id));
         clone.revoke(&id);
         assert!(!sessions.validate(&id));
@@ -229,7 +253,7 @@ mod tests {
     #[test]
     fn a_revoked_session_stops_validating() {
         let sessions = Sessions::new();
-        let id = sessions.create().unwrap();
+        let id = sessions.create("owner").unwrap();
         sessions.revoke(&id);
         assert!(!sessions.validate(&id));
         sessions.revoke(&id); // revoking again is a no-op, not a panic
@@ -238,23 +262,23 @@ mod tests {
     #[test]
     fn an_expired_session_is_rejected_and_purged() {
         let sessions = Sessions::with_expiry(Duration::ZERO, Duration::ZERO);
-        let id = sessions.create().unwrap();
+        let id = sessions.create("owner").unwrap();
         assert!(!sessions.validate(&id), "zero lifetime expires immediately");
     }
 
     #[test]
     fn an_idle_session_expires_even_inside_its_absolute_lifetime() {
         let sessions = Sessions::with_expiry(Duration::from_secs(3600), Duration::ZERO);
-        let id = sessions.create().unwrap();
+        let id = sessions.create("owner").unwrap();
         assert!(!sessions.validate(&id), "the idle limit binds on its own");
     }
 
     #[test]
     fn the_store_is_capped_by_evicting_the_oldest() {
         let sessions = Sessions::new();
-        let first = sessions.create().unwrap();
+        let first = sessions.create("owner").unwrap();
         for _ in 0..MAX_SESSIONS {
-            sessions.create().unwrap();
+            sessions.create("owner").unwrap();
         }
         assert!(!sessions.validate(&first), "the oldest session is evicted at capacity");
         let held = sessions.lock().len();

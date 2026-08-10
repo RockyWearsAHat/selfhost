@@ -46,6 +46,7 @@
   <header id="masthead">
     <span class="wordmark">SELFHOST</span>
     <span class="designation">ADMIN CONSOLE</span>
+    <span id="who" class="designation" hidden></span>
     <span class="rule"></span>
     <span id="link-sweep" class="sweep" hidden></span>
     <span id="link-lamp" class="lamp warn"></span>
@@ -295,16 +296,22 @@
 
   </div>
 
-  <!-- PASSKEYS: biometric identities allowed through the login door. Hidden
-       until the daemon says the feature is configured; removal is one click
-       because a passkey, unlike a service, is recoverable by re-registering. -->
+  <!-- PASSKEYS: biometric identities allowed through the login door, one per
+       person per device — several people can share a device, and the browser's
+       account picker tells them apart at login. Hidden until the daemon says
+       the feature is configured; removal is one click because a passkey,
+       unlike a service, is recoverable by re-registering. -->
   <section id="passkeys" class="plate" hidden>
     <div class="section-rule">
       <h2>PASSKEYS</h2><span class="rule"></span>
       <span id="pk-count" class="mono micro"></span>
-      <button id="pk-register" class="btn ghost small" type="button" hidden>REGISTER THIS DEVICE</button>
     </div>
     <p id="pk-note" class="caption" hidden></p>
+    <div id="pk-register-row" hidden>
+      <input id="pk-user" type="text" maxlength="32" placeholder="whose passkey (e.g. Alex)"
+             autocomplete="off" spellcheck="false">
+      <button id="pk-register" class="btn ghost small" type="button">REGISTER ON THIS DEVICE</button>
+    </div>
     <ul id="pk-list"></ul>
   </section>
 </section>

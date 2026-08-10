@@ -66,9 +66,14 @@ The web console (the `console = true` site the proxy relays to this port) adds
 two browser credentials, both implemented in `crates/admin`: a cookie session
 against the `console.passwd` PBKDF2 hash (`POST /api/session`), and passkeys —
 WebAuthn with Touch ID / Face ID / Windows Hello — under `/api/webauthn/*`,
-stored in `data/console.passkeys`. Registering a passkey always requires an
-already-authenticated caller, so the password remains the root credential, and
-both login doors share one rate-limit gate.
+stored in `data/console.passkeys`. Passkeys are named per person: several
+people can register on one device (the browser's account picker tells them
+apart at login), a verified assertion proves *whose* credential signed it, and
+the session it mints carries that name — `GET /api/session` answers it, and it
+is the hook per-user permissions will attach to. Registering a passkey always
+requires an already-authenticated caller, so the password remains the root
+credential (its sessions, and the bearer token's, are `owner`), and both login
+doors share one rate-limit gate.
 
 ```
 GET    /api/health                       no auth; is a daemon listening?

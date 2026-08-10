@@ -376,6 +376,7 @@ function boot() {
     notice: null,               // { kind: "done"|"problem", text }
     formOpen: false,
     passkeys: null,             // registered passkeys, or null → panel hidden
+    user: null,                 // who this session belongs to, from the daemon
   };
 
   const $ = (id) => document.getElementById(id);
@@ -430,10 +431,17 @@ function boot() {
   async function checkSession() {
     try {
       const reply = await api("/api/session");
-      if (reply.status === 200) enterConsole(); else showLogin("", { keep: true });
+      if (reply.status === 200) { rememberUser(reply); enterConsole(); }
+      else showLogin("", { keep: true });
     } catch {
       showLogin("cannot reach the server", { keep: true });
     }
+  }
+
+  /** Keeps who the daemon says this session belongs to — every granted-session
+   *  reply carries a `user` — for the masthead's account of itself. */
+  function rememberUser(reply) {
+    state.user = reply.body && typeof reply.body.user === "string" ? reply.body.user : null;
   }
 
   function showLogin(note, options = {}) {
@@ -458,6 +466,7 @@ function boot() {
     state.notice = null;
     state.formOpen = false;
     state.passkeys = null;
+    state.user = null;
     resetLogs("");
     firewallDrawn = "";
     for (const row of railRows.values()) row.remove();
@@ -470,6 +479,9 @@ function boot() {
     state.link = "connecting";
     $("view-login").hidden = true;
     $("view-console").hidden = false;
+    const who = $("who");
+    who.hidden = !state.user;
+    who.textContent = state.user ? `— ${state.user}` : "";
     render();
     poll();
     // Outside the poll on purpose: passkeys change only through this page's
@@ -485,7 +497,7 @@ function boot() {
     $("login-sweep").hidden = false;
     try {
       const reply = await api("/api/session", { method: "POST", body: { password: $("login-password").value } });
-      if (reply.status >= 200 && reply.status < 300) { enterConsole(); return; }
+      if (reply.status >= 200 && reply.status < 300) { rememberUser(reply); enterConsole(); return; }
       note.hidden = false;
       if (reply.status === 401) note.textContent = "not accepted";
       else if (reply.status === 429) note.textContent = "too many attempts, wait a minute";
@@ -534,7 +546,13 @@ function boot() {
         ? b64urlToBuf(issued.body.challenge) : null;
       if (!challenge) {
         note.hidden = false;
-        note.textContent = issued.status === 429 ? "too many attempts, wait a minute" : "not accepted";
+        // A 401 before any biometric prompt means the daemon has nothing to
+        // verify against — the one failure worth explaining, because the fix
+        // is a registration, not a retry.
+        note.textContent = issued.status === 429 ? "too many attempts, wait a minute"
+          : issued.status === 401
+            ? "no passkey registered yet — enter the password once, then register under PASSKEYS"
+            : "not accepted";
         return;
       }
       let credential;
@@ -561,7 +579,7 @@ function boot() {
           signature: bufToB64url(new Uint8Array(answer.signature)),
         },
       });
-      if (reply.status >= 200 && reply.status < 300) { enterConsole(); return; }
+      if (reply.status >= 200 && reply.status < 300) { rememberUser(reply); enterConsole(); return; }
       note.hidden = false;
       note.textContent = reply.status === 429 ? "too many attempts, wait a minute" : "not accepted";
     } catch {
@@ -586,9 +604,11 @@ function boot() {
     renderPasskeys();
   }
 
-  /** Registers this device's platform authenticator as a passkey: an
+  /** Registers a passkey on this device's platform authenticator for the
+   *  person named in the field (the session's own user when left blank): an
    *  authenticated-session-only act, so the password remains the root key. */
   async function registerPasskey() {
+    const who = ($("pk-user").value || "").trim().slice(0, 32) || state.user || "owner";
     $("pk-register").disabled = true;
     try {
       const issued = await api("/api/webauthn/register/challenge", { method: "POST" });
@@ -605,12 +625,14 @@ function boot() {
           publicKey: {
             challenge,
             rp: { id: issued.body.rpId, name: "selfhost" },
-            // One operator, one fixed handle: re-registering a device replaces
-            // its previous passkey instead of piling up copies.
+            // One handle per person: the same name re-registered on the same
+            // device replaces that person's passkey instead of piling up
+            // copies, while different names stay separate resident
+            // credentials — the browser's account picker at login.
             user: {
-              id: new TextEncoder().encode("selfhost-operator"),
-              name: "operator",
-              displayName: "Operator",
+              id: new TextEncoder().encode(`selfhost-user:${who.toLowerCase()}`),
+              name: who,
+              displayName: who,
             },
             pubKeyCredParams: [{ type: "public-key", alg: -7 }],
             authenticatorSelection: {
@@ -639,6 +661,7 @@ function boot() {
           publicKey: bufToB64url(new Uint8Array(made.getPublicKey())),
           clientDataJSON: bufToB64url(new Uint8Array(made.clientDataJSON)),
           authenticatorData: bufToB64url(new Uint8Array(made.getAuthenticatorData())),
+          user: who,
           label: deviceLabel(navigator.userAgent),
         },
       });
@@ -647,7 +670,8 @@ function boot() {
         notify("problem", (reply.body && reply.body.error) || `registration refused (${reply.status})`);
         return;
       }
-      notify("done", "Passkey registered — this device's biometric now logs in");
+      $("pk-user").value = "";
+      notify("done", `Passkey registered — ${who} can now log in with this device's biometric`);
     } catch {
       notify("problem", "cannot reach the server");
     } finally {
@@ -664,27 +688,30 @@ function boot() {
     refreshPasskeys();
   }
 
-  /** The PASSKEYS panel: hidden while the daemon lacks the feature, a listed
-   *  device per row, and the register button only where registering can work. */
+  /** The PASSKEYS panel: hidden while the daemon lacks the feature, one row
+   *  per person-and-device, and the register row only where it can work. */
   function renderPasskeys() {
     const panel = $("passkeys");
     panel.hidden = state.passkeys === null;
     if (state.passkeys === null) return;
     const passkeys = state.passkeys;
     $("pk-count").textContent = String(passkeys.length);
-    $("pk-register").hidden = !window.PublicKeyCredential;
+    $("pk-register-row").hidden = !window.PublicKeyCredential;
     const note = $("pk-note");
     note.hidden = passkeys.length > 0;
     note.textContent = window.PublicKeyCredential
-      ? "No passkeys yet. Register this device to log in with its biometric."
+      ? "No passkeys yet. Name whose it is and register — each person on each device gets their own."
       : "No passkeys yet. Open the console on a device with a biometric authenticator to register one.";
     const rows = $("pk-list");
     rows.textContent = "";
     for (const entry of passkeys) {
       if (!usableCredentialId(entry.id)) continue;
       const row = document.createElement("li");
+      const person = document.createElement("span");
+      person.className = "pk-label";
+      person.textContent = String(entry.user || "owner");
       const label = document.createElement("span");
-      label.className = "pk-label";
+      label.className = "mono micro";
       label.textContent = String(entry.label || "passkey");
       const added = document.createElement("span");
       added.className = "mono micro";
@@ -696,7 +723,7 @@ function boot() {
       remove.className = "btn danger small";
       remove.textContent = "REMOVE";
       remove.addEventListener("click", () => removePasskey(entry.id));
-      row.append(label, added, rule, remove);
+      row.append(person, label, added, rule, remove);
       rows.append(row);
     }
   }
