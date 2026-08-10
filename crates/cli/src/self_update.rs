@@ -309,7 +309,12 @@ fn sweep_aside() {
     if aside.exists()
         && let Err(error) = std::fs::remove_file(&aside)
     {
-        eprintln!("self-update: could not delete the previous binary {}: {error}", aside.display());
+        eprintln!(
+            "self-update: could not delete the previous binary {} ({error}) — harmless while \
+             another selfhost process still runs the previous build; the next restart's sweep \
+             gets it",
+            aside.display()
+        );
     }
 }
 
