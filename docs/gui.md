@@ -66,9 +66,14 @@ The web console (the `console = true` site the proxy relays to this port) adds
 two browser credentials, both implemented in `crates/admin`: a cookie session
 against the `console.passwd` PBKDF2 hash (`POST /api/session`), and passkeys —
 WebAuthn with Touch ID / Face ID / Windows Hello — under `/api/webauthn/*`,
-stored in `data/console.passkeys`. Passkeys are named per person: several
-people can register on one device (the browser's account picker tells them
-apart at login), a verified assertion proves *whose* credential signed it, and
+stored in `data/console.passkeys`. Passkeys are named per person, and a person's
+passkey can live on any authenticator — this device's biometric, their own
+phone (offered by QR in the browser's dialog), or a security key. Their own
+hardware is the honest choice on a shared machine: one shared authenticator
+accepts any finger the OS has enrolled and WebAuthn reports only that
+verification happened, never which finger, so on-device the account picker is
+a choice, while a passkey on the person's own phone or key answers to their
+biometric alone. A verified assertion proves *whose* credential signed it, and
 the session it mints carries that name — `GET /api/session` answers it, and it
 is the hook per-user permissions will attach to. Registering a passkey always
 requires an already-authenticated caller, so the password remains the root

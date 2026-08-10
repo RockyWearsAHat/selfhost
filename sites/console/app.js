@@ -521,16 +521,12 @@ function boot() {
 
   /* ── passkeys (biometric login) ───────────────────────────────────── */
 
-  /** Unhides the login page's passkey button where a biometric (platform)
-   *  authenticator actually exists — everywhere else the password stands alone. */
+  /** Unhides the login page's passkey button wherever the browser speaks
+   *  WebAuthn at all: even without a built-in biometric, it can reach a
+   *  phone by QR or a plugged-in security key — someone else's authenticator,
+   *  which is the whole point of passkeys being per-person. */
   function offerPasskeyLogin() {
-    if (!window.PublicKeyCredential
-      || typeof PublicKeyCredential.isUserVerifyingPlatformAuthenticatorAvailable !== "function") {
-      return;
-    }
-    PublicKeyCredential.isUserVerifyingPlatformAuthenticatorAvailable()
-      .then((available) => { $("login-passkey").hidden = !available; })
-      .catch(() => { /* no authenticator, no button */ });
+    $("login-passkey").hidden = !window.PublicKeyCredential;
   }
 
   /** The biometric login: challenge → authenticator → assertion → session.
@@ -635,8 +631,14 @@ function boot() {
               displayName: who,
             },
             pubKeyCredParams: [{ type: "public-key", alg: -7 }],
+            // No attachment restriction: the browser's own dialog offers this
+            // device's biometric, another person's phone (by QR), or a
+            // security key. One shared authenticator cannot tell people's
+            // fingers apart — the OS accepts any enrolled finger and WebAuthn
+            // reports only that verification happened — so a second person's
+            // passkey belonging on *their* device is what makes "whose
+            // biometric" a cryptographic fact instead of a picker choice.
             authenticatorSelection: {
-              authenticatorAttachment: "platform",
               // Discoverable, so the login ceremony can name no credential
               // ids and the login door leaks nothing about what exists.
               residentKey: "required",
@@ -700,8 +702,10 @@ function boot() {
     const note = $("pk-note");
     note.hidden = passkeys.length > 0;
     note.textContent = window.PublicKeyCredential
-      ? "No passkeys yet. Name whose it is and register — each person on each device gets their own."
-      : "No passkeys yet. Open the console on a device with a biometric authenticator to register one.";
+      ? "No passkeys yet. Name whose it is and register — the browser offers this device's "
+        + "biometric, their phone by QR, or a security key, and each person's passkey answers "
+        + "only to their own hardware."
+      : "No passkeys yet. Open the console in a browser that supports passkeys to register one.";
     const rows = $("pk-list");
     rows.textContent = "";
     for (const entry of passkeys) {
