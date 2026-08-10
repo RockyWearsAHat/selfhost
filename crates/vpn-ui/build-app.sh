@@ -17,6 +17,9 @@ echo "assembling $app"
 rm -rf "$app"
 mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"
 cp "$root/target/release/$bin" "$app/Contents/MacOS/$bin"
+# The console gate rides in the bundle so the app's one-time privileged setup
+# can install it as the com.selfhost.console-gate LaunchDaemon (docs/VPN.md).
+cp "$root/target/release/selfhost-console-gate" "$app/Contents/MacOS/selfhost-console-gate"
 
 cat > "$app/Contents/Info.plist" <<'PLIST'
 <?xml version="1.0" encoding="UTF-8"?>

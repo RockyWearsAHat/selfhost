@@ -1,0 +1,21 @@
+[package]
+name = "selfhost-app-deploy"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Composes a Git-backed application into a supervised backend and a proxy upstream, and deploys it without taking the previous version down on a failed build."
+
+[dependencies]
+selfhost-config = { workspace = true }
+selfhost-supervisor = { workspace = true }
+selfhost-git = { workspace = true }
+tokio = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time"] }
+
+[lints.rust]
+unsafe_code = "forbid"
+missing_docs = "warn"

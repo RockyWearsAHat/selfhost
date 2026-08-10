@@ -91,7 +91,7 @@ pub async fn serve_imap(listener: TcpListener, server: ImapServer) -> io::Result
 /// first. This exists because a mail client's failure report ("unable to
 /// verify") says nothing about which step died; the log does.
 fn log_imap(peer: SocketAddr, message: impl AsRef<str>) {
-    eprintln!("[imap] {peer} {}", message.as_ref());
+    eprintln!("{} [imap] {peer} {}", crate::time::stamp(), message.as_ref());
 }
 
 /// The loggable form of one client line: its tag and uppercased verb, with the
@@ -140,6 +140,11 @@ async fn handle_connection(
             }
         };
         session.tls_established();
+        // The SNI name is the one hard fact about what a failing client asked
+        // for — an auto-setup validator probes several hostname guesses, and
+        // only this line says which guess a given connection was.
+        let sni = tls_stream.get_ref().1.server_name().unwrap_or("<none>").to_owned();
+        log_imap(peer, format!("TLS established (sni={sni})"));
         tls_stream.write_all(session.greeting().to_wire()).await?;
         let _ = converse(&mut tls_stream, peer, &mut session, &server).await?;
         log_imap(peer, "closed");
@@ -164,7 +169,8 @@ async fn handle_connection(
                 }
             };
             session.tls_established();
-            log_imap(peer, "TLS established via STARTTLS");
+            let sni = tls_stream.get_ref().1.server_name().unwrap_or("<none>").to_owned();
+            log_imap(peer, format!("TLS established via STARTTLS (sni={sni})"));
             let _ = converse(&mut tls_stream, peer, &mut session, &server).await?;
             log_imap(peer, "closed");
             Ok(())

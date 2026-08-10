@@ -11,8 +11,16 @@ description = "The desktop VPN panel: one window to bring up the Secure-VPN tunn
 name = "selfhost-vpn-ui"
 path = "src/main.rs"
 
+# The console gate: the loopback 443 → 8443 bridge the app installs once as a
+# LaunchDaemon so the admin console opens at its portless URL. See the bin's
+# module doc and docs/SECURITY.md (VPN-04).
+[[bin]]
+name = "selfhost-console-gate"
+path = "src/bin/console-gate.rs"
+
 [dependencies]
 rui = { workspace = true }
+selfhost-dns = { workspace = true }
 
 [lints.rust]
 unsafe_code = "forbid"

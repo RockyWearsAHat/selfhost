@@ -5,7 +5,8 @@
 //! not possible to declare one length and write another — the mismatch that
 //! desynchronises a connection and enables response smuggling.
 
-use crate::headers::{HeaderError, Headers};
+use crate::headers::{HeaderError, Headers, MAX_HEAD_BYTES, MAX_HEADER_COUNT};
+use crate::request::ParseError;
 use std::fmt;
 
 /// A response status code and its reason phrase.
@@ -201,6 +202,287 @@ impl Response {
         headers.write_to(out);
         out.extend_from_slice(b"\r\n");
         Ok(())
+    }
+}
+
+/// How an incoming response's body is delimited.
+///
+/// A response has one framing a request does not: it may simply run until the
+/// connection closes. That is legal, and it is why this is a separate decision
+/// from [`crate::BodyLength`] rather than the same one reused.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResponseFraming {
+    /// There is no body, and none is permitted.
+    None,
+    /// Exactly this many bytes follow.
+    Fixed(u64),
+    /// Chunked transfer coding.
+    Chunked,
+    /// Everything until the peer closes the connection.
+    UntilClose,
+}
+
+/// A response head read off the wire.
+///
+/// Distinct from [`Response`], which is a response being *built*: that one owns
+/// a [`Body`] and derives its framing when written, and this one has a body it
+/// has not read yet and a framing it was told.
+#[derive(Debug, Clone)]
+pub struct IncomingResponse {
+    /// The status.
+    pub status: Status,
+    /// The minor version: 0 for `HTTP/1.0`, 1 for `HTTP/1.1`.
+    pub minor_version: u8,
+    /// The header fields, in the order they arrived.
+    pub headers: Headers,
+    /// How to find the end of the body.
+    pub framing: ResponseFraming,
+}
+
+/// A parsed response head, and how many bytes of input it took.
+#[derive(Debug, Clone)]
+pub struct ParsedResponse {
+    /// The head.
+    pub response: IncomingResponse,
+    /// Where the body begins in the input.
+    pub consumed: usize,
+}
+
+impl IncomingResponse {
+    /// Parses a response head from the front of `input`.
+    ///
+    /// Answers [`ParseError::Incomplete`] until the blank line has arrived, so a
+    /// caller reads more and retries.
+    ///
+    /// The framing rules are the request parser's, kept deliberately strict for
+    /// the same reason: a client that resolves an ambiguous length by guessing
+    /// can be made to read the *next* response as part of this one.
+    pub fn parse(input: &[u8]) -> Result<ParsedResponse, ParseError> {
+        let head_end = crate::request::find_head_end(input).ok_or({
+            if input.len() > MAX_HEAD_BYTES { ParseError::HeadTooLarge } else { ParseError::Incomplete }
+        })?;
+        if head_end > MAX_HEAD_BYTES {
+            return Err(ParseError::HeadTooLarge);
+        }
+
+        let mut lines = crate::request::split_crlf(&input[..head_end]);
+        let (status, minor_version) =
+            parse_status_line(lines.next().ok_or(ParseError::BadRequestLine)?)?;
+
+        let mut headers = Headers::new();
+        for line in lines {
+            if line[0] == b' ' || line[0] == b'\t' {
+                return Err(ParseError::AmbiguousFraming("obsolete header line folding"));
+            }
+            if headers.len() >= MAX_HEADER_COUNT {
+                return Err(ParseError::BadHeader(HeaderError::TooMany));
+            }
+            headers
+                .append(crate::request::parse_header_line(line)?)
+                .map_err(ParseError::BadHeader)?;
+        }
+
+        let framing = framing_of(status, &headers)?;
+        Ok(ParsedResponse {
+            response: IncomingResponse { status, minor_version, headers, framing },
+            consumed: head_end,
+        })
+    }
+}
+
+/// Parses `HTTP/1.x SP code SP reason`.
+///
+/// The reason phrase is discarded. It is free text that no two servers agree on
+/// and that nothing should ever branch on; the code is the answer.
+fn parse_status_line(line: &[u8]) -> Result<(Status, u8), ParseError> {
+    let text = std::str::from_utf8(line).map_err(|_| ParseError::BadRequestLine)?;
+    let (version, rest) = text.split_once(' ').ok_or(ParseError::BadRequestLine)?;
+
+    let minor_version = match version {
+        "HTTP/1.1" => 1,
+        "HTTP/1.0" => 0,
+        other if other.starts_with("HTTP/") => return Err(ParseError::UnsupportedVersion),
+        _ => return Err(ParseError::BadRequestLine),
+    };
+
+    let code = rest.split(' ').next().unwrap_or_default();
+    if code.len() != 3 || !code.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err(ParseError::BadRequestLine);
+    }
+    let code: u16 = code.parse().map_err(|_| ParseError::BadRequestLine)?;
+    Ok((Status(code), minor_version))
+}
+
+/// Decides how a response body ends.
+fn framing_of(status: Status, headers: &Headers) -> Result<ResponseFraming, ParseError> {
+    // Some statuses cannot carry a body whatever the headers claim. Believing a
+    // `Content-Length` on a 204 is how a client ends up waiting forever for
+    // bytes that were never going to come.
+    if status.forbids_body() {
+        return Ok(ResponseFraming::None);
+    }
+
+    let chunked = headers.contains("transfer-encoding");
+    let lengths = headers.count("content-length");
+    if chunked && lengths > 0 {
+        return Err(ParseError::AmbiguousFraming(
+            "both Transfer-Encoding and Content-Length present",
+        ));
+    }
+
+    if chunked {
+        if headers.count("transfer-encoding") > 1 {
+            return Err(ParseError::AmbiguousFraming("repeated Transfer-Encoding"));
+        }
+        let value = headers
+            .get_str("transfer-encoding")
+            .ok_or(ParseError::AmbiguousFraming("non-UTF-8 Transfer-Encoding"))?;
+        let final_coding =
+            value.rsplit(',').next().map(str::trim).unwrap_or_default().to_ascii_lowercase();
+        if final_coding != "chunked" {
+            return Err(ParseError::AmbiguousFraming("Transfer-Encoding does not end with chunked"));
+        }
+        return Ok(ResponseFraming::Chunked);
+    }
+
+    if lengths == 0 {
+        return Ok(ResponseFraming::UntilClose);
+    }
+
+    let mut agreed: Option<u64> = None;
+    for field in headers.iter() {
+        if !field.name().eq_ignore_ascii_case("content-length") {
+            continue;
+        }
+        let text = field
+            .value_str()
+            .ok_or(ParseError::AmbiguousFraming("non-UTF-8 Content-Length"))?
+            .trim();
+        if text.is_empty() || !text.bytes().all(|byte| byte.is_ascii_digit()) {
+            return Err(ParseError::AmbiguousFraming("Content-Length is not a bare integer"));
+        }
+        let parsed: u64 = text
+            .parse()
+            .map_err(|_| ParseError::AmbiguousFraming("Content-Length out of range"))?;
+        match agreed {
+            None => agreed = Some(parsed),
+            Some(existing) if existing == parsed => {}
+            Some(_) => {
+                return Err(ParseError::AmbiguousFraming("conflicting Content-Length values"));
+            }
+        }
+    }
+    Ok(ResponseFraming::Fixed(agreed.unwrap_or(0)))
+}
+
+#[cfg(test)]
+mod incoming_tests {
+    use super::*;
+
+    fn parse(raw: &str) -> Result<ParsedResponse, ParseError> {
+        IncomingResponse::parse(raw.as_bytes())
+    }
+
+    #[test]
+    fn parses_a_status_line_and_headers() {
+        let parsed = parse("HTTP/1.1 200 OK\r\nContent-Length: 3\r\n\r\nabc").expect("parse");
+        assert_eq!(parsed.response.status, Status(200));
+        assert_eq!(parsed.response.minor_version, 1);
+        assert_eq!(parsed.response.framing, ResponseFraming::Fixed(3));
+        assert_eq!(&"HTTP/1.1 200 OK\r\nContent-Length: 3\r\n\r\nabc"[parsed.consumed..], "abc");
+    }
+
+    #[test]
+    fn an_unfinished_head_asks_for_more() {
+        assert!(matches!(parse("HTTP/1.1 200 OK\r\n"), Err(ParseError::Incomplete)));
+    }
+
+    #[test]
+    fn a_missing_reason_phrase_is_still_a_valid_status_line() {
+        let parsed = parse("HTTP/1.1 204 \r\n\r\n").expect("parse");
+        assert_eq!(parsed.response.status, Status(204));
+    }
+
+    #[test]
+    fn a_status_that_forbids_a_body_has_none_whatever_it_claims() {
+        // A 204 with a Content-Length is a server bug; believing it would leave
+        // the client waiting for bytes that are never sent.
+        let parsed = parse("HTTP/1.1 204 No Content\r\nContent-Length: 10\r\n\r\n").expect("parse");
+        assert_eq!(parsed.response.framing, ResponseFraming::None);
+    }
+
+    #[test]
+    fn no_length_and_no_coding_means_until_the_connection_closes() {
+        let parsed = parse("HTTP/1.1 200 OK\r\n\r\n").expect("parse");
+        assert_eq!(parsed.response.framing, ResponseFraming::UntilClose);
+    }
+
+    #[test]
+    fn chunked_is_recognised() {
+        let parsed =
+            parse("HTTP/1.1 200 OK\r\nTransfer-Encoding: gzip, chunked\r\n\r\n").expect("parse");
+        assert_eq!(parsed.response.framing, ResponseFraming::Chunked);
+    }
+
+    #[test]
+    fn a_coding_that_does_not_end_in_chunked_is_refused() {
+        assert!(matches!(
+            parse("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked, gzip\r\n\r\n"),
+            Err(ParseError::AmbiguousFraming(_))
+        ));
+    }
+
+    #[test]
+    fn a_length_alongside_a_coding_is_refused() {
+        assert!(matches!(
+            parse("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nContent-Length: 4\r\n\r\n"),
+            Err(ParseError::AmbiguousFraming(_))
+        ));
+    }
+
+    #[test]
+    fn conflicting_lengths_are_refused_and_identical_ones_are_not() {
+        assert!(matches!(
+            parse("HTTP/1.1 200 OK\r\nContent-Length: 4\r\nContent-Length: 5\r\n\r\n"),
+            Err(ParseError::AmbiguousFraming(_))
+        ));
+        let parsed =
+            parse("HTTP/1.1 200 OK\r\nContent-Length: 4\r\nContent-Length: 4\r\n\r\n").expect("parse");
+        assert_eq!(parsed.response.framing, ResponseFraming::Fixed(4));
+    }
+
+    #[test]
+    fn a_padded_or_signed_length_is_refused() {
+        for length in ["+4", "4 4", "0x4", ""] {
+            let raw = format!("HTTP/1.1 200 OK\r\nContent-Length: {length}\r\n\r\n");
+            assert!(
+                matches!(parse(&raw), Err(ParseError::AmbiguousFraming(_))),
+                "accepted Content-Length {length:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn obsolete_line_folding_is_refused() {
+        assert!(matches!(
+            parse("HTTP/1.1 200 OK\r\nX-Thing: a\r\n  b\r\n\r\n"),
+            Err(ParseError::AmbiguousFraming(_))
+        ));
+    }
+
+    #[test]
+    fn a_malformed_status_line_is_refused() {
+        for line in ["HTTP/1.1 20 OK", "HTTP/1.1 abc OK", "HTTP/2 200 OK", "200 OK", "HTTP/1.1"] {
+            let raw = format!("{line}\r\n\r\n");
+            assert!(parse(&raw).is_err(), "accepted status line {line:?}");
+        }
+    }
+
+    #[test]
+    fn a_head_that_is_too_large_is_refused_rather_than_buffered() {
+        let raw =
+            format!("HTTP/1.1 200 OK\r\nX-Pad: {}\r\n\r\n", "a".repeat(MAX_HEAD_BYTES));
+        assert!(matches!(parse(&raw), Err(ParseError::HeadTooLarge)));
     }
 }
 

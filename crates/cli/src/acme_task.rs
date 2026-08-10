@@ -268,7 +268,7 @@ fn describe_environment(environment: AcmeEnvironment) -> &'static str {
 /// The task runs in the background with no console of its own; a consistent
 /// `acme:` prefix lets its output be told apart in the daemon's log stream.
 fn log(message: impl AsRef<str>) {
-    eprintln!("acme: {}", message.as_ref());
+    eprintln!("{} acme: {}", selfhost_mail::stamp(), message.as_ref());
 }
 
 #[cfg(test)]

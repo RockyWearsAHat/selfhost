@@ -266,7 +266,60 @@ pub fn spec_to_json(spec: &selfhost_config::ServiceSpec) -> Json {
             .map(|c| Json::array(c.iter().map(Json::string)))
             .unwrap_or(Json::Null),
     ));
+    fields.push(("git", spec.git.as_ref().map(watch_to_json).unwrap_or(Json::Null)));
     Json::object(fields)
+}
+
+/// Writes a Git watch for the wire.
+fn watch_to_json(watch: &selfhost_config::GitWatch) -> Json {
+    Json::object([
+        ("repository", Json::string(&watch.repository)),
+        ("branch", Json::string(&watch.branch)),
+        ("path", Json::string(watch.path.display().to_string())),
+        ("intervalSecs", Json::Number(watch.interval_secs as f64)),
+        ("enabled", Json::Bool(watch.enabled)),
+        ("autoUpdate", Json::Bool(watch.auto_update)),
+        (
+            "postPull",
+            watch
+                .post_pull
+                .as_ref()
+                .map(|c| Json::array(c.iter().map(Json::string)))
+                .unwrap_or(Json::Null),
+        ),
+    ])
+}
+
+/// Reads a Git watch from the wire.
+///
+/// A watch needs a repository and a working copy; everything else takes the
+/// default the config crate gives it, so a console can install one by naming two
+/// things. `None` for anything that is not an object with both — including the
+/// `null` a service without a watch sends.
+fn watch_from_json(value: &Json) -> Option<selfhost_config::GitWatch> {
+    let repository = value.get("repository")?.as_str()?;
+    let path = value.get("path")?.as_str()?;
+    let mut watch = selfhost_config::GitWatch::new(repository, path);
+
+    if let Some(branch) = value.get("branch").and_then(Json::as_str)
+        && !branch.is_empty()
+    {
+        watch.branch = branch.to_owned();
+    }
+    if let Some(interval) = value.get("intervalSecs").and_then(Json::as_u64) {
+        watch.interval_secs = interval;
+    }
+    if let Some(Json::Bool(enabled)) = value.get("enabled") {
+        watch.enabled = *enabled;
+    }
+    if let Some(Json::Bool(auto)) = value.get("autoUpdate") {
+        watch.auto_update = *auto;
+    }
+    if let Some(command) = value.get("postPull").and_then(Json::as_array) {
+        watch.post_pull =
+            Some(command.iter().filter_map(Json::as_str).map(str::to_owned).collect());
+    }
+    Some(watch)
 }
 
 /// Reads a service definition from the wire.
@@ -321,6 +374,9 @@ pub fn spec_from_json(value: &Json) -> Option<selfhost_config::ServiceSpec> {
     if let Some(command) = value.get("stopCommand").and_then(Json::as_array) {
         spec.stop_command =
             Some(command.iter().filter_map(Json::as_str).map(str::to_owned).collect());
+    }
+    if let Some(watch) = value.get("git").and_then(watch_from_json) {
+        spec.git = Some(watch);
     }
     Some(spec)
 }
@@ -464,6 +520,53 @@ mod tests {
 
         let parsed = selfhost_json::parse(&status.to_json().to_text()).unwrap();
         assert_eq!(ServiceStatus::from_json(&parsed), Some(status));
+    }
+
+    #[test]
+    fn a_git_watch_round_trips_through_the_wire_with_its_service() {
+        let mut spec = selfhost_config::ServiceSpec::new("site", "/usr/bin/node");
+        let mut watch = selfhost_config::GitWatch::new("git@github.com:owner/repo.git", "checkouts/site");
+        watch.branch = "release".into();
+        watch.interval_secs = 120;
+        watch.auto_update = false;
+        watch.post_pull = Some(vec!["npm".into(), "ci".into()]);
+        spec.git = Some(watch);
+
+        let parsed = selfhost_json::parse(&spec_to_json(&spec).to_text()).unwrap();
+        assert_eq!(spec_from_json(&parsed), Some(spec));
+    }
+
+    #[test]
+    fn a_service_without_a_watch_sends_null_and_reads_back_as_none() {
+        let spec = selfhost_config::ServiceSpec::new("api", "/bin/api");
+        let text = spec_to_json(&spec).to_text();
+        assert!(text.contains(r#""git":null"#), "{text}");
+
+        let parsed = selfhost_json::parse(&text).unwrap();
+        assert_eq!(spec_from_json(&parsed).and_then(|s| s.git), None);
+    }
+
+    #[test]
+    fn a_watch_needs_only_a_repository_and_a_path_and_defaults_the_rest() {
+        let value = selfhost_json::parse(
+            r#"{"name":"site","program":"/bin/node","git":{"repository":"https://example.com/r.git","path":"site"}}"#,
+        )
+        .unwrap();
+        let watch = spec_from_json(&value).and_then(|s| s.git).expect("a watch");
+        assert_eq!(watch.branch, "main");
+        assert_eq!(watch.interval_secs, 60);
+        assert!(watch.enabled && watch.auto_update);
+    }
+
+    #[test]
+    fn a_watch_missing_what_it_needs_is_dropped_rather_than_half_built() {
+        // Half a watch would poll a repository nobody named, or check one out
+        // somewhere nobody chose.
+        for partial in [r#"{"repository":"https://example.com/r.git"}"#, r#"{"path":"site"}"#, "null"] {
+            let text = format!(r#"{{"name":"s","program":"/bin/s","git":{partial}}}"#);
+            let value = selfhost_json::parse(&text).unwrap();
+            assert_eq!(spec_from_json(&value).and_then(|s| s.git), None, "accepted {partial}");
+        }
     }
 
     #[test]

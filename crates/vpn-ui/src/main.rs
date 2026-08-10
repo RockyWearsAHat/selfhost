@@ -11,6 +11,7 @@
 
 mod actions;
 mod app;
+mod dns;
 mod hero;
 mod hud;
 mod keys;
@@ -59,7 +60,8 @@ fn run(args: Vec<String>) -> Result<(), String> {
     }
 }
 
-/// Opens the window, keeps the key rotating, and runs until it is closed.
+/// Opens the window, keeps the key rotating and the console's name answered,
+/// and runs until it is closed.
 fn open() -> Result<(), String> {
     let running = Arc::new(AtomicBool::new(true));
     let panel = Panel::new(Endpoint::default(), Arc::clone(&running));
@@ -71,10 +73,14 @@ fn open() -> Result<(), String> {
         Arc::clone(&running),
     );
 
+    // The split-DNS responder backs the /etc/resolver file for the console host.
+    let responder = dns::spawn(Arc::clone(&running), panel.activity_handle());
+
     let outcome = panel.run("SelfHost VPN".into()).map_err(|error| error.to_string());
 
     running.store(false, Ordering::Relaxed);
     let _ = rotor.join();
+    let _ = responder.join();
     outcome
 }
 

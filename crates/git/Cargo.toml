@@ -1,0 +1,20 @@
+[package]
+name = "selfhost-git"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Watches a Git branch and redeploys the service built from it."
+
+[dependencies]
+selfhost-config = { workspace = true }
+selfhost-supervisor = { workspace = true }
+tokio = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time"] }
+
+[lints.rust]
+unsafe_code = "forbid"
+missing_docs = "warn"

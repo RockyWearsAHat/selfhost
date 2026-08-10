@@ -10,11 +10,19 @@ description = "TLS termination, static serving with byte ranges, reverse proxy, 
 [dependencies]
 selfhost-http = { workspace = true }
 selfhost-config = { workspace = true }
+# The webhook route reads the daemon's service catalogue (to find a watch's
+# secret) and calls its loopback control API (to trigger a deploy) — both
+# already-built, already-tested pieces of `selfhost-admin` rather than a
+# second copy of either.
+selfhost-admin = { workspace = true }
 tokio = { workspace = true }
 tokio-rustls = { workspace = true }
 rustls = { workspace = true }
 rustls-pemfile = { workspace = true }
 rcgen = { workspace = true }
+# HMAC-SHA256 for verifying a webhook's signature. Not a second crypto
+# provider: `ring` is the one this workspace already links, for TLS.
+ring = { workspace = true }
 
 [lints.rust]
 unsafe_code = "forbid"

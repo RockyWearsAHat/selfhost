@@ -9,6 +9,13 @@ description = "DNS wire format and a stub resolver, written from RFC 1035. Share
 
 [dependencies]
 tokio = { workspace = true }
+selfhost-config = { workspace = true }
+selfhost-igd = { workspace = true }
+# The Namecheap Dynamic DNS updater speaks HTTPS to Namecheap's own DDNS
+# endpoint. `selfhost-acme` already owns exactly that kind of outbound HTTPS
+# client (`transport::HttpsClient`), built for talking to Let's Encrypt — reused
+# here rather than writing a second one.
+selfhost-acme = { workspace = true }
 
 [lints.rust]
 unsafe_code = "forbid"

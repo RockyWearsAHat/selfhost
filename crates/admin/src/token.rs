@@ -56,17 +56,25 @@ impl Token {
     /// leading characters were right, which turns guessing the token from
     /// infeasible into a few thousand requests against a local port.
     pub fn matches(&self, presented: &str) -> bool {
-        let expected = self.0.as_bytes();
-        let actual = presented.as_bytes();
-        if expected.len() != actual.len() {
-            return false;
-        }
-        let mut difference = 0u8;
-        for (a, b) in expected.iter().zip(actual) {
-            difference |= a ^ b;
-        }
-        difference == 0
+        constant_time_eq(self.0.as_bytes(), presented.as_bytes())
     }
+}
+
+/// Whether two byte strings are equal, in constant time for equal lengths.
+///
+/// Shared by every credential comparison in this crate — the bearer token and
+/// the session ids — so the no-short-circuit property lives in one place. A
+/// length mismatch returns early, which is fine: the length of our secrets is
+/// public (64 hex characters).
+pub(crate) fn constant_time_eq(expected: &[u8], actual: &[u8]) -> bool {
+    if expected.len() != actual.len() {
+        return false;
+    }
+    let mut difference = 0u8;
+    for (a, b) in expected.iter().zip(actual) {
+        difference |= a ^ b;
+    }
+    difference == 0
 }
 
 // Deliberately not `Display` or a revealing `Debug`: a token that formats itself
@@ -78,8 +86,11 @@ impl std::fmt::Debug for Token {
 }
 
 /// Writes a secret so only its owner can read it.
+///
+/// Shared with [`crate::passwd`], which stores the console password hash under
+/// the same trust model as the token: the file permissions are the boundary.
 #[cfg(unix)]
-fn write_private(path: &Path, contents: &str) -> io::Result<()> {
+pub(crate) fn write_private(path: &Path, contents: &str) -> io::Result<()> {
     use std::io::Write;
     use std::os::unix::fs::OpenOptionsExt;
 
@@ -102,12 +113,12 @@ fn write_private(path: &Path, contents: &str) -> io::Result<()> {
 /// `SetNamedSecurityInfo`, and is worth doing once there is a Windows machine to
 /// verify it on.
 #[cfg(not(unix))]
-fn write_private(path: &Path, contents: &str) -> io::Result<()> {
+pub(crate) fn write_private(path: &Path, contents: &str) -> io::Result<()> {
     std::fs::write(path, contents)
 }
 
 /// Renders bytes as lowercase hex.
-fn hex(bytes: &[u8]) -> String {
+pub(crate) fn hex(bytes: &[u8]) -> String {
     use std::fmt::Write as _;
     bytes.iter().fold(String::with_capacity(bytes.len() * 2), |mut out, byte| {
         let _ = write!(out, "{byte:02x}");
@@ -116,8 +127,11 @@ fn hex(bytes: &[u8]) -> String {
 }
 
 /// Fills a buffer with entropy from the operating system.
+///
+/// Shared with [`crate::session`], whose session ids need the same
+/// unguessability as the token itself.
 #[cfg(unix)]
-fn random_bytes(count: usize) -> io::Result<Vec<u8>> {
+pub(crate) fn random_bytes(count: usize) -> io::Result<Vec<u8>> {
     use std::io::Read;
     let mut buffer = vec![0u8; count];
     std::fs::File::open("/dev/urandom")?.read_exact(&mut buffer)?;
@@ -129,7 +143,7 @@ fn random_bytes(count: usize) -> io::Result<Vec<u8>> {
 /// `RtlGenRandom` is the long-standing entry point for this and needs no
 /// initialisation, which keeps the declaration to a single symbol.
 #[cfg(windows)]
-fn random_bytes(count: usize) -> io::Result<Vec<u8>> {
+pub(crate) fn random_bytes(count: usize) -> io::Result<Vec<u8>> {
     #[allow(unsafe_code)]
     #[link(name = "advapi32")]
     unsafe extern "system" {

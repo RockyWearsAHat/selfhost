@@ -22,10 +22,18 @@
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
+pub mod authority;
+pub mod namecheap;
 pub mod resolver;
+pub mod updater;
 pub mod wire;
+pub mod zone;
 
+pub use authority::{Authority, DnsError};
+pub use namecheap::{DdnsWriter, NamecheapClient, track_namecheap_ddns};
 pub use resolver::{
     ResolveError, Resolver, ResolverSource, blocklist_name, is_real_listing, reverse_name,
 };
+pub use updater::{ApexWriter, DEFAULT_INTERVAL, Movement, assess, next_serial, track_wan_ip};
 pub use wire::{Record, RecordData, RecordType, Response, ResponseCode, WireError};
+pub use zone::{Soa, Zone, default_zone};

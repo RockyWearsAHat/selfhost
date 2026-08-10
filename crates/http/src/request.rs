@@ -321,14 +321,14 @@ impl Request {
 }
 
 /// Locates the end of the head, returning the offset just past the blank line.
-fn find_head_end(input: &[u8]) -> Option<usize> {
+pub(crate) fn find_head_end(input: &[u8]) -> Option<usize> {
     let limit = input.len().min(MAX_HEAD_BYTES + 4);
     let window = &input[..limit];
     window.windows(4).position(|w| w == b"\r\n\r\n").map(|i| i + 4)
 }
 
 /// Splits a head into lines on CRLF, dropping the trailing blank line.
-fn split_crlf(head: &[u8]) -> impl Iterator<Item = &[u8]> {
+pub(crate) fn split_crlf(head: &[u8]) -> impl Iterator<Item = &[u8]> {
     head.split(|&b| b == b'\n')
         .map(|line| line.strip_suffix(b"\r").unwrap_or(line))
         .filter(|line| !line.is_empty())
@@ -361,7 +361,7 @@ fn parse_request_line(line: &[u8]) -> Result<(Method, String, u8), ParseError> {
 }
 
 /// Parses `Name: value`, trimming optional whitespace around the value.
-fn parse_header_line(line: &[u8]) -> Result<Header, ParseError> {
+pub(crate) fn parse_header_line(line: &[u8]) -> Result<Header, ParseError> {
     let colon = line.iter().position(|&b| b == b':').ok_or(ParseError::BadHeader(HeaderError::InvalidName))?;
     let name = std::str::from_utf8(&line[..colon]).map_err(|_| ParseError::BadHeader(HeaderError::InvalidName))?;
 
@@ -376,7 +376,7 @@ fn parse_header_line(line: &[u8]) -> Result<Header, ParseError> {
 }
 
 /// Trims leading and trailing spaces and horizontal tabs.
-fn trim_ows(bytes: &[u8]) -> &[u8] {
+pub(crate) fn trim_ows(bytes: &[u8]) -> &[u8] {
     let start = bytes.iter().position(|&b| b != b' ' && b != b'\t').unwrap_or(bytes.len());
     let end = bytes.iter().rposition(|&b| b != b' ' && b != b'\t').map_or(start, |i| i + 1);
     &bytes[start..end]

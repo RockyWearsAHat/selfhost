@@ -24,6 +24,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
+use crate::git::GitWatch;
 use crate::validate::Problem;
 
 /// When a service starts.
@@ -133,6 +134,16 @@ pub struct ServiceSpec {
     /// rather than only on Unix.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stop_command: Option<Vec<String>>,
+
+    /// A Git branch whose movement redeploys this service, if it has one.
+    ///
+    /// Optional because most services are a program already on the machine. A
+    /// service that *is* a deployment — a site's backend built from a repository —
+    /// carries the watch here rather than in a second catalogue, so that the thing
+    /// which stops the service and the thing which updates its code are the same
+    /// object and cannot disagree about which service they mean.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub git: Option<GitWatch>,
 }
 
 fn default_restart_delay() -> u64 {
@@ -165,7 +176,17 @@ impl ServiceSpec {
             max_restarts: default_max_restarts(),
             stop_timeout_secs: default_stop_timeout(),
             stop_command: None,
+            git: None,
         }
+    }
+
+    /// The Git watch that should be polled for this service, if there is one.
+    ///
+    /// Answers `None` for a watch that is switched off, so no caller has to
+    /// remember to check `enabled` — forgetting it would poll a repository the
+    /// operator deliberately stopped watching.
+    pub fn active_watch(&self) -> Option<&GitWatch> {
+        self.git.as_ref().filter(|watch| watch.is_active())
     }
 
     /// The name to show in the console.
@@ -184,9 +205,8 @@ impl ServiceSpec {
     /// at the offending field. `known_nodes` comes from the deployment config;
     /// pass an empty slice to skip the node check.
     pub fn check(&self, at: &str, known_nodes: &[&str], problems: &mut Vec<Problem>) {
-        match name_problem(&self.name) {
-            Some(message) => problems.push(Problem { field: format!("{at}.name"), message }),
-            None => {}
+        if let Some(message) = name_problem(&self.name) {
+            problems.push(Problem { field: format!("{at}.name"), message });
         }
 
         if self.program.as_os_str().is_empty() {
@@ -232,6 +252,10 @@ impl ServiceSpec {
                           ordinary way"
                     .into(),
             });
+        }
+
+        if let Some(watch) = &self.git {
+            watch.check(&format!("{at}.git"), problems);
         }
 
         for key in self.env.keys() {
@@ -552,6 +576,54 @@ program = "/bin/api"
         catalog.upsert(ServiceSpec::new("api", "/bin/api"));
         let written = catalog.to_toml();
         assert!(ServiceCatalog::parse(&written, &[]).is_ok(), "{written}");
+    }
+
+    #[test]
+    fn a_services_git_watch_is_validated_with_it_and_reported_under_its_own_path() {
+        let mut spec = ServiceSpec::new("site", "/usr/bin/node");
+        let mut watch = crate::GitWatch::new("https://example.com/r.git", "site");
+        watch.interval_secs = 0;
+        spec.git = Some(watch);
+
+        let problems = problems_of(&catalog(vec![spec]), &[]);
+        assert!(
+            problems.iter().any(|p| p.field == "service[0].git.interval_secs"),
+            "{problems:?}"
+        );
+    }
+
+    #[test]
+    fn a_watch_round_trips_through_toml_with_the_service_that_owns_it() {
+        let mut spec = ServiceSpec::new("site", "/usr/bin/node");
+        let mut watch = crate::GitWatch::new("git@github.com:owner/repo.git", "checkouts/site");
+        watch.branch = "release".into();
+        watch.post_pull = Some(vec!["npm".into(), "ci".into()]);
+        watch.auto_update = false;
+        spec.git = Some(watch);
+
+        let written = catalog(vec![spec.clone()]).to_toml();
+        let read = ServiceCatalog::parse(&written, &[]).expect("round trip");
+        assert_eq!(read.services[0], spec);
+    }
+
+    #[test]
+    fn a_service_without_a_watch_writes_no_git_section_at_all() {
+        // The catalogue is a file a person reads. An empty [service.git] table
+        // would read as "this is watched, badly configured" rather than "not
+        // watched", which is the wrong thing to make somebody debug.
+        let written = catalog(vec![ServiceSpec::new("api", "/bin/api")]).to_toml();
+        assert!(!written.contains("git"), "{written}");
+    }
+
+    #[test]
+    fn a_switched_off_watch_is_kept_but_not_offered_for_polling() {
+        let mut spec = ServiceSpec::new("site", "/usr/bin/node");
+        let mut watch = crate::GitWatch::new("https://example.com/r.git", "site");
+        watch.enabled = false;
+        spec.git = Some(watch);
+
+        assert!(spec.active_watch().is_none(), "a disabled watch must not be polled");
+        assert!(spec.git.is_some(), "but its definition must survive");
     }
 
     #[test]

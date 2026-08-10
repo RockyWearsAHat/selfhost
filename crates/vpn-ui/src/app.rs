@@ -16,8 +16,11 @@ use rui::{
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
-/// The console URL the tunnel exposes, opened by the console button.
-pub const CONSOLE_URL: &str = "https://admin.rockywearsahat.com:8443/";
+/// The console URL, reached portless through the loopback 443 gate.
+pub const CONSOLE_URL: &str = "https://admin.rockywearsahat.com/";
+
+/// The console host: answered by the split-DNS responder, mapped to loopback.
+pub const CONSOLE_HOST: &str = "admin.rockywearsahat.com";
 
 /// What a slow, off-thread action is doing and what it last said.
 #[derive(Default)]
