@@ -6,6 +6,13 @@
 `/tmp/lvlup-self-hosting-handoff.md` — hosting websites from a spare PC, free,
 unrestricted, load balanced.
 
+> **State check 2026-08-10:** production moved to ALEX-DESKTOP (Windows,
+> `192.168.1.8`), which is a clone of this repo and self-updates from pushes to
+> `main` (`[self_update]`, 60 s poll → fetch, rebuild, restart). The admin
+> console SPA (`sites/console`) is live at `admin.rockywearsahat.com`,
+> VPN-gated to loopback. §3 below predates that move — `index.dx` is the
+> current map; this file remains the July orientation snapshot.
+
 ---
 
 ## 1. Who you're working with
