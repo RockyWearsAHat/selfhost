@@ -32,6 +32,15 @@
 //!   `SYSTEM` account (`S-1-5-18`) at the highest run level, restarted three
 //!   times a minute apart if it dies and with no execution-time limit — the same
 //!   policy `scripts/install-service.ps1` sets, expressed as task XML.
+//!
+//!   One caveat, learned live: Task Scheduler's `RestartOnFailure` covers a
+//!   task that *fails to run* — it does **not** re-run a program that started
+//!   and then exited, whatever its exit code. A daemon that exits on purpose
+//!   (a self-update's restart, exit 75) therefore stays down under the XML
+//!   below. A deployment using `[self_update]` on Windows should point the
+//!   task at a keep-alive wrapper instead — a two-line batch loop that reruns
+//!   the program after a 5-second pause — which is what launchd's `KeepAlive`
+//!   and systemd's `Restart=` provide natively.
 //! - **Linux** — a systemd unit, a `--user` unit by default and a system unit
 //!   under `/etc/systemd/system` with `--system`.
 
