@@ -14,6 +14,14 @@ use std::fmt;
 pub struct Status(pub u16);
 
 impl Status {
+    /// The connection is leaving HTTP for the protocol named in `Upgrade`.
+    ///
+    /// The only status in this codebase whose head is not followed by a body
+    /// this crate knows how to frame: after the blank line the bytes belong to
+    /// whatever protocol was negotiated, and HTTP has stopped. [`Response::write_head`]
+    /// therefore gives it `Connection: Upgrade` and no `Content-Length` — see
+    /// the note there for why either of the ordinary answers would be wrong.
+    pub const SWITCHING_PROTOCOLS: Self = Self(101);
     /// Success.
     pub const OK: Self = Self(200);
     /// Partial content, sent in answer to a satisfiable `Range`.
@@ -66,6 +74,7 @@ impl Status {
     /// The canonical reason phrase.
     pub fn reason(self) -> &'static str {
         match self.0 {
+            101 => "Switching Protocols",
             200 => "OK",
             206 => "Partial Content",
             301 => "Moved Permanently",
@@ -181,6 +190,26 @@ impl Response {
     ///
     /// `head_only` reflects a `HEAD` request: the `Content-Length` still
     /// describes what a `GET` would return, but no bytes follow.
+    ///
+    /// # The one exception, and why it lives here rather than in the caller
+    ///
+    /// A `101 Switching Protocols` is the single response this crate writes
+    /// whose framing is not a statement about a body: after the blank line the
+    /// connection stops speaking HTTP altogether, and the bytes that follow
+    /// belong to whatever protocol the `Upgrade` field named. Both of the
+    /// ordinary answers are therefore wrong on it. `Content-Length: 0` claims a
+    /// zero-length body where in truth there is no body at all and the peer must
+    /// keep reading; `Connection: close` and `Connection: keep-alive` both
+    /// describe an HTTP connection's reuse, and a browser that reads either one
+    /// on a handshake abandons the upgrade — RFC 6455 §4.2.2 requires
+    /// `Connection: Upgrade` exactly.
+    ///
+    /// It is enforced here rather than left to each caller for the same reason
+    /// every other framing decision is made in this function: a rule that lives
+    /// in one place cannot be got right in one caller and wrong in the next. The
+    /// `Content-Length` half already falls out of [`Status::forbids_body`],
+    /// which covers the whole `1xx` range; only the `Connection` field needs
+    /// saying.
     pub fn write_head(&self, out: &mut Vec<u8>, keep_alive: bool) -> Result<(), HeaderError> {
         out.extend_from_slice(b"HTTP/1.1 ");
         out.extend_from_slice(self.status.code().to_string().as_bytes());
@@ -198,7 +227,11 @@ impl Response {
             headers.set("Content-Length", self.body.len().to_string())?;
         }
 
-        headers.set("Connection", if keep_alive { "keep-alive" } else { "close" })?;
+        if self.status == Status::SWITCHING_PROTOCOLS {
+            headers.set("Connection", "Upgrade")?;
+        } else {
+            headers.set("Connection", if keep_alive { "keep-alive" } else { "close" })?;
+        }
         headers.write_to(out);
         out.extend_from_slice(b"\r\n");
         Ok(())
@@ -529,6 +562,43 @@ mod tests {
         let response = Response::empty(Status::OK);
         assert!(head_of(&response, true).contains("Connection: keep-alive\r\n"));
         assert!(head_of(&response, false).contains("Connection: close\r\n"));
+    }
+
+    #[test]
+    fn a_switching_protocols_head_says_upgrade_and_frames_nothing() {
+        // Both halves of the rule at once, and both matter: a browser drops the
+        // handshake on the wrong Connection value, and a peer that believes a
+        // Content-Length of 0 stops reading exactly where the new protocol
+        // begins.
+        for keep_alive in [true, false] {
+            let head = head_of(&Response::empty(Status::SWITCHING_PROTOCOLS), keep_alive);
+            assert!(head.starts_with("HTTP/1.1 101 Switching Protocols\r\n"), "{head}");
+            assert!(head.contains("Connection: Upgrade\r\n"), "{head}");
+            assert!(!head.contains("Content-Length"), "{head}");
+            assert!(!head.to_ascii_lowercase().contains("keep-alive"), "{head}");
+            assert!(!head.to_ascii_lowercase().contains("connection: close"), "{head}");
+        }
+    }
+
+    #[test]
+    fn only_a_101_gets_the_upgrade_connection_value() {
+        // The rule is keyed on the status and nothing else, so a 200 that
+        // happens to carry an Upgrade field is still an ordinary response.
+        let mut response = Response::empty(Status::OK);
+        response.headers.push("Upgrade", "websocket").unwrap();
+        let head = head_of(&response, true);
+        assert!(head.contains("Connection: keep-alive\r\n"), "{head}");
+        assert!(head.contains("Content-Length: 0\r\n"), "{head}");
+    }
+
+    #[test]
+    fn a_101_names_itself_in_the_status_line() {
+        assert_eq!(Status::SWITCHING_PROTOCOLS.code(), 101);
+        assert_eq!(Status::SWITCHING_PROTOCOLS.reason(), "Switching Protocols");
+        // Inherited from the 1xx range rather than added for this status: the
+        // Content-Length half of the rule is already true for every informational
+        // response, and stating it twice is how the two drift apart.
+        assert!(Status::SWITCHING_PROTOCOLS.forbids_body());
     }
 
     #[test]

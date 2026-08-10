@@ -15,7 +15,11 @@
 //!   repeated `Content-Length`, a transfer coding that does not end in
 //!   `chunked`, obsolete line folding, and whitespace before a header colon.
 //! - **Response framing.** Length is derived from the body when the head is
-//!   written, so a declared length can never disagree with the bytes sent.
+//!   written, so a declared length can never disagree with the bytes sent. The
+//!   one status where framing is not a statement about a body —
+//!   [`Status::SWITCHING_PROTOCOLS`], after which the connection stops speaking
+//!   HTTP — is handled by the same function rather than by its callers, so a
+//!   handshake cannot be answered correctly in one place and wrongly in another.
 //! - **Byte ranges.** Required for the adaptive video ladder this platform
 //!   serves; see [`range`].
 

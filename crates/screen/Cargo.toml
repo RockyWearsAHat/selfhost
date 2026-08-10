@@ -1,0 +1,23 @@
+[package]
+name = "selfhost-screen"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "This machine's pixels and this machine's input devices, behind three traits under which every unsafe block lives."
+
+[dependencies]
+selfhost-desk = { workspace = true }
+selfhost-json = { workspace = true }
+tokio = { workspace = true }
+
+[dev-dependencies]
+
+[lints.rust]
+# The only new crate with FFI. Capture and input injection are operating-system
+# calls; there is no safe path to a screen's pixels. Every `unsafe` block lives
+# behind the three traits in `lib.rs`, so the streaming logic above them is
+# ordinary safe Rust and is tested without a screen.
+unsafe_code = "allow"
+missing_docs = "warn"

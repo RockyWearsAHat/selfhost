@@ -258,6 +258,11 @@ textarea { resize: vertical; }
   display: flex; gap: 10px; align-items: center; min-height: 30px; flex-wrap: wrap;
   padding-bottom: 6px; border-bottom: 1px solid var(--border);
 }
+/* The LIVE lamp sits just left of the link's own, close enough to read as one
+   pair of instruments and separated enough that neither borrows the other's
+   colour. It carries no gap of its own from the flex row's 10px; the word
+   after it does, so the two lamps do not crowd. */
+#live-word { margin-right: 6px; }
 
 .alert {
   display: flex; gap: 9px; align-items: center;
@@ -296,6 +301,18 @@ textarea { resize: vertical; }
 .chip.idle .fill { background: none; border: 1px solid var(--idle); }
 .chip:hover { border-color: var(--muted); }
 .chip[aria-current="true"] { border-color: var(--accent); }
+
+/* ── diagnostics ──────────────────────────────────────────────────── */
+
+/* The stream's own instruments, laid out in the same machined bar the detail
+   pane's dials use — deliberately, so a reading is a reading wherever it
+   appears and the eye does not have to learn a second grammar. */
+#diagnostics { display: flex; flex-direction: column; gap: 6px; }
+#dg-word { margin-left: 2px; }
+/* The dials here are numbers rather than words, so they need less room than
+   the detail pane's; without this the row breaks onto two lines on a laptop
+   for no reason. */
+#diagnostics .readings .dial { min-width: 78px; }
 
 /* ── firewall ─────────────────────────────────────────────────────── */
 

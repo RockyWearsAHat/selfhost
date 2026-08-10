@@ -268,8 +268,10 @@ dependencies = [
  "selfhost-firewall",
  "selfhost-git",
  "selfhost-http",
+ "selfhost-identity",
  "selfhost-json",
  "selfhost-supervisor",
+ "selfhost-ws",
  "tokio",
 ]
 
@@ -324,6 +326,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "selfhost-desk"
+version = "0.1.0"
+dependencies = [
+ "selfhost-json",
+ "tokio",
+]
+
+[[package]]
 name = "selfhost-dns"
 version = "0.1.0"
 dependencies = [
@@ -356,6 +366,14 @@ name = "selfhost-http"
 version = "0.1.0"
 
 [[package]]
+name = "selfhost-identity"
+version = "0.1.0"
+dependencies = [
+ "ring",
+ "selfhost-json",
+]
+
+[[package]]
 name = "selfhost-igd"
 version = "0.1.0"
 dependencies = [
@@ -379,6 +397,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "selfhost-mesh"
+version = "0.1.0"
+dependencies = [
+ "ring",
+ "selfhost-identity",
+ "selfhost-json",
+ "selfhost-ws",
+ "tokio",
+]
+
+[[package]]
 name = "selfhost-proxy"
 version = "0.1.0"
 dependencies = [
@@ -389,6 +418,7 @@ dependencies = [
  "selfhost-admin",
  "selfhost-config",
  "selfhost-http",
+ "selfhost-ws",
  "tokio",
  "tokio-rustls",
 ]
@@ -399,6 +429,27 @@ version = "0.1.0"
 dependencies = [
  "selfhost-config",
  "selfhost-json",
+]
+
+[[package]]
+name = "selfhost-screen"
+version = "0.1.0"
+dependencies = [
+ "selfhost-desk",
+ "selfhost-json",
+ "tokio",
+]
+
+[[package]]
+name = "selfhost-storage"
+version = "0.1.0"
+dependencies = [
+ "ring",
+ "selfhost-config",
+ "selfhost-http",
+ "selfhost-identity",
+ "selfhost-json",
+ "tokio",
 ]
 
 [[package]]
@@ -416,6 +467,15 @@ version = "0.1.0"
 dependencies = [
  "rui",
  "selfhost-dns",
+]
+
+[[package]]
+name = "selfhost-ws"
+version = "0.1.0"
+dependencies = [
+ "ring",
+ "selfhost-http",
+ "tokio",
 ]
 
 [[package]]

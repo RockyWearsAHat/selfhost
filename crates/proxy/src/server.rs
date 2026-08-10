@@ -14,6 +14,7 @@
 
 use crate::files::{self, Resolution};
 use crate::health;
+use crate::upgrade;
 use crate::upstream::Pool;
 use selfhost_config::{Config, Site};
 use selfhost_http::{Body, Method, ParseError, Request, Response, Status};
@@ -21,6 +22,7 @@ use std::collections::BTreeMap;
 use std::io;
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -74,6 +76,17 @@ const MAX_FORWARD_BODY_BYTES: u64 = 25 * 1024 * 1024;
 /// here — before the loopback connection even opens — rather than relayed
 /// only for the admin API to refuse it anyway.
 const CONSOLE_API_MAX_BODY: u64 = 64 * 1024;
+
+/// Numbers the upgraded streams this process has carried, so the line logged
+/// when a stream opens and the line logged when it closes can be tied together.
+///
+/// A stream lives for minutes or hours, and the per-request access log prints
+/// once, after dispatch returns. Without an identifier the two lines about the
+/// same connection are an hour apart with any number of ordinary requests in
+/// between, which is the same as having no record at all. Monotonic and process-
+/// local; it names a stream in this log and nothing else, so wrapping after
+/// 2^64 streams would be harmless even if it were reachable.
+static NEXT_STREAM_ID: AtomicU64 = AtomicU64::new(1);
 
 /// Everything the proxy needs to serve one site.
 #[derive(Debug)]
@@ -303,13 +316,26 @@ where
 
         // One line per request. Without this there is no way to answer "is
         // anyone actually reaching the site" except by guessing.
-        eprintln!(
-            "[access] {peer} {scheme} {host} {method} {target} {ms}ms",
-            scheme = if is_tls { "https" } else { "http" },
-            ms = started.elapsed().as_millis(),
-        );
+        //
+        // The target is logged through `upgrade::loggable_target`, which
+        // withholds the remainder of a share path or a stream path. On a NAS the
+        // file name is more sensitive than the fact of the transfer, and an
+        // operator reading a log should not incidentally learn the name of every
+        // document in the household.
+        let ms = started.elapsed().as_millis();
+        let scheme = if is_tls { "https" } else { "http" };
+        let logged = upgrade::loggable_target(&target);
+        match outcome {
+            // A stream already announced itself when it opened; this line closes
+            // the record and the elapsed time is the stream's whole life, not a
+            // request's latency, so it is not written as one.
+            Outcome::Upgraded(id) => {
+                eprintln!("[stream] {id} {peer} {host} closed after {ms}ms");
+            }
+            _ => eprintln!("[access] {peer} {scheme} {host} {method} {logged} {ms}ms"),
+        }
 
-        if !keep_alive || outcome == Outcome::MustClose {
+        if !keep_alive || outcome != Outcome::Reusable {
             return Ok(());
         }
     }
@@ -322,6 +348,15 @@ enum Outcome {
     Reusable,
     /// The connection must be closed.
     MustClose,
+    /// The connection stopped speaking HTTP and carried an upgraded stream,
+    /// which has now ended. Its identifier ties the closing log line to the one
+    /// written when it opened.
+    ///
+    /// Distinct from [`Outcome::MustClose`] rather than folded into it because
+    /// the two mean different things to a reader of the log: a `MustClose` is a
+    /// request that was answered and whose connection cannot be reused, and this
+    /// is a connection that stopped being HTTP altogether. Both end the loop.
+    Upgraded(u64),
 }
 
 /// Reads one request head, returning `None` on a clean close.
@@ -761,6 +796,23 @@ fn is_console_api(path: &str) -> bool {
 /// response — status, headers including any `Set-Cookie`, and body — is
 /// copied back byte for byte, the same verbatim-relay rule [`forward`]
 /// follows, and the connection closes afterwards for the same reason.
+///
+/// # The upgrade path
+///
+/// A request that [`upgrade::looks_like_upgrade`] recognises takes a second
+/// route through the same function: no body is read, four extra fields are
+/// relayed for that one request, and the answer's head is *parsed* rather than
+/// copied blind, because the proxy has to know whether the daemon agreed to
+/// leave HTTP. If it did not — a `401` for a missing ticket, a `404` for a path
+/// that is not a stream — the fallback is byte-for-byte what this function did
+/// before upgrades existed, including the bytes already read while looking for
+/// the head. If it did, the proxy stops framing anything and moves opaque bytes
+/// in both directions until one side finishes.
+///
+/// Everything about this path is *below* `Site::permits(peer.ip())` in
+/// [`dispatch`], which is where it must stay: the source-address gate runs on
+/// the TCP peer before the console branch is reached at all, and no upgrade
+/// widens it, exempts anything from it, or is reachable without passing it.
 async fn relay_console_api<S>(
     server: &Server,
     request: &Request,
@@ -771,12 +823,26 @@ async fn relay_console_api<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
+    let is_upgrade = upgrade::looks_like_upgrade(request);
+
     // Framing is settled before anything else. The admin API rejects chunked
     // bodies, and buffering an unbounded chunked stream here just to measure
     // it would defeat the cap — so only a fixed length (or no body) proceeds,
     // and an oversized one is refused before the loopback connection opens.
+    //
+    // A handshake carries no body, and one that declares a non-empty body is
+    // refused outright rather than relayed with its length forced to zero. The
+    // bytes of such a body would otherwise sit unread until after the `101` and
+    // then be handed to the daemon's frame parser as if the peer had sent them
+    // as frames — a message whose meaning depends on which layer counted it,
+    // which is the family of ambiguity this codebase refuses on principle.
     let length = match request.body_length() {
         Ok(selfhost_http::BodyLength::None) => 0,
+        Ok(selfhost_http::BodyLength::Fixed(0)) => 0,
+        Ok(selfhost_http::BodyLength::Fixed(_)) if is_upgrade => {
+            write_response(stream, Response::error_page(Status::BAD_REQUEST), false).await?;
+            return Ok(Outcome::MustClose);
+        }
         Ok(selfhost_http::BodyLength::Fixed(length)) if length <= CONSOLE_API_MAX_BODY => length,
         Ok(selfhost_http::BodyLength::Fixed(_)) => {
             write_response(stream, Response::error_page(Status::CONTENT_TOO_LARGE), false).await?;
@@ -788,7 +854,10 @@ where
         }
     };
 
-    let body = take_body(leftover, stream, length).await?;
+    // On the upgrade path nothing is taken out of `leftover`: whatever the
+    // client sent after its head is the first bytes of the new protocol, and it
+    // belongs to the upstream once the switch is agreed.
+    let body = if is_upgrade { Vec::new() } else { take_body(leftover, stream, length).await? };
 
     let Some(admin_bind) = server.admin_bind else {
         eprintln!("[proxy] console relay: admin_bind is not configured or does not parse");
@@ -810,13 +879,15 @@ where
     head.extend_from_slice(request.target.as_bytes());
     head.extend_from_slice(b" HTTP/1.1\r\nHost: 127.0.0.1\r\n");
 
-    // Only what the admin API acts on is passed along: the body's type and
-    // the caller's credentials. Everything else — including any framing or
-    // hop-by-hop field the client sent — is dropped and re-derived below.
-    const RELAYED: [&str; 4] = ["content-type", "cookie", "authorization", "x-selfhost-console"];
+    // Only what the admin API acts on is passed along: the body's type and the
+    // caller's credentials, widened for this one request by the handshake's own
+    // fields when it is a handshake. Everything else — including any framing or
+    // hop-by-hop field the client sent — is dropped and re-derived below. See
+    // `upgrade::RELAYED_FOR_UPGRADE` for what the widening does and does not
+    // include, and why.
     for field in request.headers.iter() {
         let name = field.name();
-        if RELAYED.iter().any(|allowed| name.eq_ignore_ascii_case(allowed)) {
+        if upgrade::is_relayed(name, is_upgrade) {
             head.extend_from_slice(name.as_bytes());
             head.extend_from_slice(b": ");
             head.extend_from_slice(field.value());
@@ -825,18 +896,165 @@ where
     }
 
     head.extend_from_slice(format!("X-Forwarded-For: {}\r\n", peer.ip()).as_bytes());
-    head.extend_from_slice(format!("Content-Length: {}\r\n", body.len()).as_bytes());
-    head.extend_from_slice(b"Connection: close\r\n\r\n");
+    if is_upgrade {
+        // No `Content-Length`: there is no body, and the two hop-by-hop lines
+        // are the proxy's own statement about this hop rather than an echo of
+        // the client's.
+        head.extend_from_slice(upgrade::UPGRADE_REQUEST_LINES);
+        head.extend_from_slice(b"\r\n");
+    } else {
+        head.extend_from_slice(format!("Content-Length: {}\r\n", body.len()).as_bytes());
+        head.extend_from_slice(b"Connection: close\r\n\r\n");
+    }
 
     upstream.write_all(&head).await?;
     upstream.write_all(&body).await?;
     upstream.flush().await?;
+
+    if is_upgrade {
+        return splice_upgrade(&mut upstream, leftover, stream, peer, request).await;
+    }
 
     // The admin API's response is relayed byte for byte, so its own framing
     // reaches the client untouched and the two cannot disagree.
     tokio::io::copy(&mut upstream, stream).await?;
     stream.flush().await?;
     Ok(Outcome::MustClose)
+}
+
+/// Reads the admin API's answer to a handshake and either hands the connection
+/// over or falls back to relaying an ordinary response.
+///
+/// # The stranding trap, in the other direction
+///
+/// [`dispatch`]'s doc explains why a handler must consult `leftover` before
+/// reading a body: bytes that arrived in the same TCP segment as the head are
+/// already in this process, and the socket has nothing more to give until the
+/// peer sends again — which a peer waiting for an answer never does. An upgrade
+/// puts the same trap on both sides of the splice at once, and both are fatal
+/// rather than slow, because after this point nobody is waiting on a timeout.
+///
+/// - Whatever the *client* already sent past its head is the first bytes of the
+///   new protocol. It is pushed to the upstream before the copy begins;
+///   otherwise the daemon waits forever for a message the browser has already
+///   delivered.
+/// - Whatever the *upstream* sent past its own head — the daemon writes its
+///   first frame immediately, and it very often lands in the same read as the
+///   `101` — is written to the client with the head. It is inside `buffered`,
+///   so writing that buffer whole is what handles it; slicing it to `consumed`
+///   would drop the daemon's first message on the floor.
+///
+/// Neither hazard is hypothetical and neither shows up under a hand test on an
+/// idle link, which is exactly why both are written down here.
+async fn splice_upgrade<S>(
+    upstream: &mut TcpStream,
+    leftover: &mut Vec<u8>,
+    stream: &mut S,
+    peer: SocketAddr,
+    request: &Request,
+) -> io::Result<Outcome>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let mut buffered = Vec::with_capacity(1024);
+    let parsed = match read_response_head(upstream, &mut buffered).await {
+        Ok(parsed) => parsed,
+        Err(error) => {
+            eprintln!("[proxy] console relay: the admin API's answer was unreadable: {error}");
+            write_response(stream, Response::error_page(Status::BAD_GATEWAY), false).await?;
+            return Ok(Outcome::MustClose);
+        }
+    };
+
+    if !upgrade::is_switching_protocols(&parsed.response) {
+        // The daemon refused, or the path is not a stream at all. From here on
+        // this is an ordinary relayed response: the bytes already read go out
+        // first, then the rest of the connection, which together are exactly the
+        // byte sequence the unmodified `tokio::io::copy` would have produced.
+        stream.write_all(&buffered).await?;
+        tokio::io::copy(upstream, stream).await?;
+        stream.flush().await?;
+        return Ok(Outcome::MustClose);
+    }
+
+    // The head goes out exactly as the daemon wrote it. Not through
+    // `write_response`: that path derives framing from a body this response does
+    // not have, and `apply_security_headers` would splice `X-Frame-Options` and
+    // friends into a `101` — fields that mean nothing to a protocol that is no
+    // longer HTTP, in a message a browser checks strictly before it hands the
+    // socket to the page.
+    stream.write_all(&buffered).await?;
+    stream.flush().await?;
+
+    if !leftover.is_empty() {
+        upstream.write_all(leftover).await?;
+        upstream.flush().await?;
+        leftover.clear();
+    }
+
+    let id = NEXT_STREAM_ID.fetch_add(1, Ordering::Relaxed);
+    // Logged here rather than only at close: the access line for this request is
+    // printed once, after this function returns, which for a stream is hours
+    // later. Without this line an open stream is invisible in the log.
+    eprintln!("[stream] {id} {peer} open {target}", target = upgrade::loggable_target(&request.target));
+
+    // From here the proxy interprets nothing. Every ceiling and every deadline
+    // that applies to these bytes belongs to `crates/ws` in the daemon; this
+    // process is a pipe, which is the whole point of putting the frame parser
+    // anywhere but here. `crates/ws` is linked — the upgrade predicate comes
+    // from it — so its frame codec is one `use` away, and reaching for it to
+    // count messages or enforce a cap on this line would move a parser over
+    // stranger-chosen bytes into the process that owns 80, 443, mail and the
+    // certificate store, under `panic = "abort"`. See `crate::upgrade`.
+    let moved = tokio::io::copy_bidirectional(stream, upstream).await;
+    if let Err(error) = moved {
+        // Ordinary at the end of a stream — a browser tab closing produces a
+        // reset as often as a clean shutdown — so it is reported at the same
+        // weight as the close itself rather than as a fault.
+        eprintln!("[stream] {id} ended: {error}");
+    }
+    Ok(Outcome::Upgraded(id))
+}
+
+/// Reads exactly as much of the upstream's answer as its head, keeping every
+/// byte read in `buffered` so the caller can forward them.
+///
+/// Bounded by [`HEAD_TIMEOUT`] for the same reason the request head is: until
+/// the head has been read the proxy is holding a client connection open on the
+/// promise of an answer, and a daemon that has stopped answering must not be
+/// able to accumulate those. Once the head is read the deadline stops, exactly
+/// as it does for a request — after that, liveness is the stream layer's job and
+/// is enforced by pings the proxy never sees.
+async fn read_response_head(
+    upstream: &mut TcpStream,
+    buffered: &mut Vec<u8>,
+) -> io::Result<selfhost_http::ParsedResponse> {
+    let mut chunk = [0u8; 1024];
+    loop {
+        match selfhost_http::IncomingResponse::parse(buffered) {
+            Ok(parsed) => return Ok(parsed),
+            Err(ParseError::Incomplete) => {}
+            Err(error) => {
+                return Err(io::Error::new(io::ErrorKind::InvalidData, error.to_string()));
+            }
+        }
+        let read = match tokio::time::timeout(HEAD_TIMEOUT, upstream.read(&mut chunk)).await {
+            Ok(result) => result?,
+            Err(_) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "the admin API did not answer the handshake in time",
+                ));
+            }
+        };
+        if read == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "the admin API closed the connection before a response head arrived",
+            ));
+        }
+        buffered.extend_from_slice(&chunk[..read]);
+    }
 }
 
 /// The same request target with a slash appended to its path.
@@ -1864,5 +2082,291 @@ mod tests {
         let response = dispatch_bytes(&server, &head, "10.66.0.2:5000", true, b"").await;
         let text = String::from_utf8_lossy(&response);
         assert!(text.starts_with("HTTP/1.1 413"), "{text}");
+    }
+
+    // The upgrade relay, and the four ways it is known to be got wrong. Each of
+    // these traps is silent under a hand test on an idle link — the connection
+    // simply sits there, or the browser simply refuses without saying why — so
+    // each one has a test that fails loudly instead.
+
+    /// The head a browser sends to open a desktop stream: RFC 6455's four
+    /// fields, the ticket the console carries in `Sec-WebSocket-Protocol`
+    /// because it is the only header a page may set on a handshake, the `Origin`
+    /// a browser always volunteers, and a couple of fields the admin API has no
+    /// business seeing.
+    fn handshake_head(target: &str) -> String {
+        format!(
+            "GET {target} HTTP/1.1\r\nHost: console.example.com\r\n\
+             Upgrade: websocket\r\nConnection: keep-alive, Upgrade\r\n\
+             Sec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\
+             Sec-WebSocket-Protocol: selfhost.desktop.1, tkt.abc123\r\n\
+             Origin: https://console.example.com\r\nCookie: selfhost_session=abc\r\n\
+             User-Agent: probe\r\nAccept-Language: en\r\n\r\n"
+        )
+    }
+
+    /// What the stand-in admin API saw on a relayed handshake.
+    struct RelayedHandshake {
+        /// The request head, through its terminating blank line.
+        head: String,
+        /// Every byte that arrived after that head. On an agreed upgrade these
+        /// are the client's own first bytes of the new protocol, which is the
+        /// whole point of [`the_bytes_the_client_already_sent_are_pushed_to_the_daemon`].
+        after_head: Vec<u8>,
+    }
+
+    /// The offset just past a head's terminating blank line, if it has arrived.
+    fn head_end(bytes: &[u8]) -> Option<usize> {
+        bytes.windows(4).position(|window| window == b"\r\n\r\n").map(|at| at + 4)
+    }
+
+    /// Runs a stand-in admin API that answers one relayed request with `answer`
+    /// and then reads until the proxy hangs up.
+    ///
+    /// `answer` is written in a single `write_all`, so on loopback the proxy's
+    /// head reader sees the response head *and* whatever the daemon wrote after
+    /// it in one read — the arrangement that makes the "forward `buffered`
+    /// whole" rule observable. The write half is closed straight afterwards
+    /// because the fallback path relays until the upstream's EOF: a daemon that
+    /// held the connection open while waiting for the proxy to close would
+    /// deadlock against a proxy waiting for the daemon to.
+    async fn fake_daemon(
+        answer: &'static [u8],
+    ) -> (SocketAddr, tokio::task::JoinHandle<RelayedHandshake>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind a fake admin port");
+        let admin_bind = listener.local_addr().expect("a bound address");
+        let task = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("one connection");
+            let mut head = Vec::new();
+            let mut chunk = [0u8; 512];
+            while head_end(&head).is_none() {
+                let read = stream.read(&mut chunk).await.expect("read the relayed head");
+                assert!(read > 0, "the relay closed before it finished its head");
+                head.extend_from_slice(&chunk[..read]);
+            }
+            let end = head_end(&head).expect("the loop only exits with a complete head");
+            let mut after_head = head.split_off(end);
+            stream.write_all(answer).await.expect("answer the relayed request");
+            stream.flush().await.expect("flush the answer");
+            stream.shutdown().await.expect("close the answering half");
+            stream.read_to_end(&mut after_head).await.expect("read to the proxy's close");
+            RelayedHandshake { head: String::from_utf8_lossy(&head).into_owned(), after_head }
+        });
+        (admin_bind, task)
+    }
+
+    /// A `101` exactly as the daemon's handshake writer emits it.
+    ///
+    /// It ends at the blank line, which is the shape that makes the
+    /// security-header trap observable: `apply_security_headers` splices its
+    /// fields in front of a trailing `\r\n\r\n` and does nothing to a buffer
+    /// that has bytes after it. A test whose fixture carried a frame would pass
+    /// even against a relay that called it.
+    const DAEMON_101: &[u8] = b"HTTP/1.1 101 Switching Protocols\r\n\
+        Upgrade: websocket\r\nConnection: Upgrade\r\n\
+        Sec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\n\
+        Sec-WebSocket-Protocol: selfhost.desktop.1\r\n\r\n";
+
+    /// The same `101` with the daemon's first frame in the same write — the
+    /// ordinary case, since a stream that has something to say says it at once.
+    const DAEMON_101_AND_FRAME: &[u8] = b"HTTP/1.1 101 Switching Protocols\r\n\
+        Upgrade: websocket\r\nConnection: Upgrade\r\n\
+        Sec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\n\
+        Sec-WebSocket-Protocol: selfhost.desktop.1\r\n\r\n\x81\x04helo";
+
+    #[tokio::test]
+    async fn a_101_reaches_the_browser_exactly_as_the_daemon_wrote_it() {
+        let dir = ScratchDataDir::new("upgrade-101");
+        write_spa(&dir.0);
+        let (admin_bind, daemon) = fake_daemon(DAEMON_101).await;
+        let mut config = config_with(vec![console_site()]);
+        config.server.admin_bind = admin_bind.to_string();
+        let server = Server::build(&config, &dir.0);
+
+        let head = handshake_head("/api/desktop/stream");
+        let response = dispatch_bytes(&server, &head, "10.66.0.2:40000", true, b"").await;
+
+        // Byte-for-byte. The head must not go out through `write_response`,
+        // which would derive a `Content-Length` and a `Connection` from a body
+        // this response does not have, and whose `apply_security_headers` would
+        // splice `X-Frame-Options` and friends into a message that is no longer
+        // HTTP — and that a browser checks strictly before it hands the socket
+        // to the page.
+        assert_eq!(response, DAEMON_101, "{}", String::from_utf8_lossy(&response));
+        let text = String::from_utf8_lossy(&response);
+        for spliced in ["X-Frame-Options", "Content-Security-Policy", "Content-Length"] {
+            assert!(!text.contains(spliced), "{spliced} was spliced into a 101: {text}");
+        }
+
+        // And the head the daemon received: the handshake's own fields relayed,
+        // the hop-by-hop pair written by the proxy exactly once, no body framing
+        // at all, and nothing a browser volunteers that the API does not act on.
+        let relayed = daemon.await.expect("the fake daemon did not panic");
+        assert!(relayed.head.starts_with("GET /api/desktop/stream HTTP/1.1"), "{}", relayed.head);
+        for expected in [
+            "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n",
+            "Sec-WebSocket-Version: 13\r\n",
+            "Sec-WebSocket-Protocol: selfhost.desktop.1, tkt.abc123\r\n",
+            "Origin: https://console.example.com\r\n",
+            "Cookie: selfhost_session=abc\r\n",
+            "X-Forwarded-For: 10.66.0.2\r\n",
+            "Upgrade: websocket\r\n",
+            "Connection: Upgrade\r\n",
+        ] {
+            assert!(relayed.head.contains(expected), "{expected:?} was not relayed: {}", relayed.head);
+        }
+        for refused in ["User-Agent", "Accept-Language", "Content-Length", "keep-alive"] {
+            assert!(!relayed.head.contains(refused), "{refused} reached the daemon: {}", relayed.head);
+        }
+        assert_eq!(relayed.head.matches("Connection:").count(), 1, "{}", relayed.head);
+        assert!(relayed.after_head.is_empty(), "this client sent nothing past its head");
+    }
+
+    #[tokio::test]
+    async fn the_daemons_first_frame_is_not_left_behind_in_the_head_buffer() {
+        let dir = ScratchDataDir::new("upgrade-first-frame");
+        write_spa(&dir.0);
+        let (admin_bind, daemon) = fake_daemon(DAEMON_101_AND_FRAME).await;
+        let mut config = config_with(vec![console_site()]);
+        config.server.admin_bind = admin_bind.to_string();
+        let server = Server::build(&config, &dir.0);
+
+        // The stranding trap seen from the upstream's side. `read_response_head`
+        // stops parsing at the blank line but has already read whatever came
+        // with it into `buffered`; forwarding only as far as the head parser
+        // consumed would drop the daemon's first message on the floor, and no
+        // retransmission would ever bring it back — those bytes are in this
+        // process, not on the wire.
+        let head = handshake_head("/api/desktop/stream");
+        let response = dispatch_bytes(&server, &head, "10.66.0.2:40000", true, b"").await;
+        assert_eq!(response, DAEMON_101_AND_FRAME, "{}", String::from_utf8_lossy(&response));
+        daemon.await.expect("the fake daemon did not panic");
+    }
+
+    #[tokio::test]
+    async fn the_bytes_the_client_already_sent_are_pushed_to_the_daemon() {
+        let dir = ScratchDataDir::new("upgrade-leftover");
+        write_spa(&dir.0);
+        let (admin_bind, daemon) = fake_daemon(DAEMON_101).await;
+        let mut config = config_with(vec![console_site()]);
+        config.server.admin_bind = admin_bind.to_string();
+        let server = Server::build(&config, &dir.0);
+
+        // A masked client frame that arrived in the same TCP segment as the
+        // handshake — which is what a page opening a socket and writing to it
+        // immediately produces. `read_head` has already taken these bytes off
+        // the socket, so nothing but the relay can deliver them: forget the push
+        // and the daemon waits forever for a message that is sitting in this
+        // process, with no timeout left anywhere to break the wait.
+        const FIRST_FRAME: &[u8] = b"\x81\x83\x01\x02\x03\x04abc";
+        let head = handshake_head("/api/desktop/stream");
+        let response = dispatch_bytes(&server, &head, "10.66.0.2:40000", true, FIRST_FRAME).await;
+        assert_eq!(response, DAEMON_101, "{}", String::from_utf8_lossy(&response));
+
+        let relayed = daemon.await.expect("the fake daemon did not panic");
+        assert_eq!(
+            relayed.after_head, FIRST_FRAME,
+            "the bytes read past the head were stranded in the proxy"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_refused_handshake_falls_back_to_an_ordinary_verbatim_relay() {
+        let dir = ScratchDataDir::new("upgrade-refused");
+        write_spa(&dir.0);
+        // The uniform 401 the admin API answers a handshake with no valid
+        // ticket. Nothing about it is special to the proxy: it must come back
+        // exactly as the daemon wrote it, which is what this relay did for every
+        // response before upgrades existed.
+        const REFUSAL: &[u8] =
+            b"HTTP/1.1 401 Unauthorized\r\nContent-Type: application/json\r\n\
+              Content-Length: 16\r\n\r\n{\"error\":\"auth\"}";
+        let (admin_bind, daemon) = fake_daemon(REFUSAL).await;
+        let mut config = config_with(vec![console_site()]);
+        config.server.admin_bind = admin_bind.to_string();
+        let server = Server::build(&config, &dir.0);
+
+        let head = handshake_head("/api/desktop/stream");
+        let response = dispatch_bytes(&server, &head, "10.66.0.2:40000", true, b"\x81\x03abc").await;
+        assert_eq!(response, REFUSAL, "{}", String::from_utf8_lossy(&response));
+
+        // And the client's would-be first frame is not pushed to an upstream
+        // that refused the switch: those bytes are only the new protocol's if
+        // there is a new protocol.
+        let relayed = daemon.await.expect("the fake daemon did not panic");
+        assert!(
+            relayed.after_head.is_empty(),
+            "bytes were pushed to a daemon that never agreed to upgrade"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_source_address_gate_runs_above_the_upgrade_path() {
+        let dir = ScratchDataDir::new("upgrade-gate");
+        write_spa(&dir.0);
+        let mut config = config_with(vec![console_site()]);
+        // Nothing listens here. A handshake that reached the relay at all would
+        // answer 502; the 404 is the proof that the gate refused it first.
+        config.server.admin_bind = "127.0.0.1:1".into();
+        let server = Server::build(&config, &dir.0);
+
+        let head = handshake_head("/api/desktop/stream");
+        let denied = dispatch_bytes(&server, &head, "203.0.113.9:5000", true, b"").await;
+        let unknown = dispatch_bytes(
+            &server,
+            "GET / HTTP/1.1\r\nHost: not-hosted.example.com\r\n\r\n",
+            "203.0.113.9:5000",
+            true,
+            b"",
+        )
+        .await;
+        assert!(denied.starts_with(b"HTTP/1.1 404"), "{}", String::from_utf8_lossy(&denied));
+        assert_eq!(
+            denied, unknown,
+            "a refused handshake must be indistinguishable from a hostname that is not hosted"
+        );
+
+        // The peer inside the gate reaches the relay, and fails only because
+        // nothing is listening on the admin port — which is what makes the 404
+        // above a statement about the gate rather than about the route.
+        let permitted = dispatch_bytes(&server, &head, "10.66.0.2:40000", true, b"").await;
+        assert!(permitted.starts_with(b"HTTP/1.1 502"), "{}", String::from_utf8_lossy(&permitted));
+    }
+
+    #[tokio::test]
+    async fn an_upgrade_cannot_borrow_the_exemptions_that_sit_above_the_gate() {
+        let dir = ScratchDataDir::new("upgrade-exemptions");
+        write_spa(&dir.0);
+        let mut config = config_with(vec![console_site()]);
+        // Again a dead admin port: every answer below must be a refusal written
+        // by the proxy itself, never a 502 from a relay that was attempted.
+        config.server.admin_bind = "127.0.0.1:1".into();
+        let server = Server::build(&config, &dir.0);
+        let denied = "203.0.113.9:5000";
+
+        // Exactly two things are answered above `Site::permits`: an ACME
+        // challenge on cleartext, and a deploy webhook. Both must stay reachable
+        // — a certificate authority and a hosting provider have no VPN — and
+        // neither may become a way in for a stream. A handshake shaped at each
+        // of them is answered by that route's own handler, which for a `GET`
+        // webhook and an unknown challenge token is a 404, and never spliced.
+        for exempt in [
+            format!("{WEBHOOK_PREFIX}levelup"),
+            format!("{ACME_CHALLENGE_PREFIX}t0ken"),
+        ] {
+            let response = dispatch_bytes(&server, &handshake_head(&exempt), denied, true, b"").await;
+            assert!(
+                response.starts_with(b"HTTP/1.1 404"),
+                "{exempt} answered a handshake with {}",
+                String::from_utf8_lossy(&response)
+            );
+        }
+
+        // And nothing on the cleartext listener upgrades anything but the
+        // scheme, even for a peer the gate permits: the console API — and
+        // therefore the whole upgrade path — is below the HTTPS branch.
+        let cleartext = handshake_head("/api/desktop/stream");
+        let response = dispatch_bytes(&server, &cleartext, "10.66.0.2:40000", false, b"").await;
+        assert!(response.starts_with(b"HTTP/1.1 308"), "{}", String::from_utf8_lossy(&response));
     }
 }

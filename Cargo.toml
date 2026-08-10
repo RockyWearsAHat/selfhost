@@ -5,14 +5,20 @@ members = [
     "crates/admin",
     "crates/app-deploy",
     "crates/config",
+    "crates/desk",
     "crates/dns",
+    "crates/identity",
     "crates/igd",
     "crates/firewall",
     "crates/git",
     "crates/http",
     "crates/json",
     "crates/mail",
+    "crates/mesh",
     "crates/proxy",
+    "crates/screen",
+    "crates/storage",
+    "crates/ws",
     "crates/registrar",
     "crates/supervisor",
     "crates/rui",
@@ -66,16 +72,22 @@ selfhost-acme = { path = "crates/acme" }
 selfhost-admin = { path = "crates/admin" }
 selfhost-app-deploy = { path = "crates/app-deploy" }
 selfhost-config = { path = "crates/config" }
+selfhost-desk = { path = "crates/desk" }
 selfhost-dns = { path = "crates/dns" }
+selfhost-identity = { path = "crates/identity" }
 selfhost-igd = { path = "crates/igd" }
 selfhost-firewall = { path = "crates/firewall" }
 selfhost-git = { path = "crates/git" }
 selfhost-http = { path = "crates/http" }
 selfhost-json = { path = "crates/json" }
 selfhost-mail = { path = "crates/mail" }
+selfhost-mesh = { path = "crates/mesh" }
 selfhost-proxy = { path = "crates/proxy" }
 selfhost-registrar = { path = "crates/registrar" }
+selfhost-screen = { path = "crates/screen" }
+selfhost-storage = { path = "crates/storage" }
 selfhost-supervisor = { path = "crates/supervisor" }
+selfhost-ws = { path = "crates/ws" }
 rui = { path = "crates/rui" }
 
 # The release profile is what the self-updater rebuilds on every push, so its

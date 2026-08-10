@@ -33,12 +33,15 @@
 pub mod passwd;
 pub mod session;
 pub mod store;
+pub mod stream;
 pub mod token;
+pub mod upgrade;
 pub mod webauthn;
 
 use selfhost_firewall::Manager;
 use selfhost_git::Watches;
 use selfhost_http::{Body, Method, Request, Response, Status};
+use selfhost_identity::{Caller, Capability, Credential, Identity, Opening, People, Policy};
 use selfhost_json::Json;
 use selfhost_supervisor::Supervisor;
 use selfhost_supervisor::state::{spec_from_json, spec_to_json};
@@ -49,9 +52,10 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
 pub use passwd::ConsolePassword;
-pub use session::{FailureGate, Sessions};
+pub use session::{Authenticated, FailureGate, Sessions};
 pub use store::Store;
 pub use token::Token;
+pub use upgrade::{Ability, Admission, Denial, Doorway, Holder, MintError, Streams, Tickets};
 pub use webauthn::Webauthn;
 
 /// The largest request body accepted.
@@ -73,6 +77,31 @@ pub struct Api {
     watches: Watches,
     firewall: Manager,
     console: Option<ConsoleAuth>,
+    /// Single-use tickets that authorise an upgrade.
+    ///
+    /// Held on the `Api` rather than inside [`ConsoleAuth`] because the bearer
+    /// token opens a stream too — the native console over its SSH tunnel — and a
+    /// deployment with no console password would otherwise have a credential
+    /// that can reach every route except the streaming ones.
+    tickets: Tickets,
+    /// How many streams are open, and for whom. Held here for the same reason
+    /// the tickets are: a bearer stream counts against the same ceiling a
+    /// browser's does.
+    streams: Streams,
+    /// The authorisation model every route is decided by.
+    ///
+    /// Locked down by default, so a deployment that has not wired
+    /// `[desktop].bearer_may_control` refuses an unattended credential the
+    /// capabilities that drive a machine — the safe direction for a switch
+    /// nobody has set yet.
+    policy: Policy,
+    /// The people this deployment knows and what each of them holds.
+    ///
+    /// `None` until a data directory has been named ([`Api::with_console_auth`]
+    /// wires it), and `None` grants nothing: an owner's authority never comes
+    /// from this registry, and a person with no registry to be found in holds
+    /// exactly what a person with an empty entry holds, which is nothing.
+    people: Option<People>,
 }
 
 /// Cookie-session authentication, present once [`Api::with_console_auth`] has
@@ -94,6 +123,156 @@ struct ConsoleAuth {
     /// has been called. Absent when no console site is configured: without a
     /// hostname there is no relying-party identity to verify against.
     webauthn: Option<Webauthn>,
+    /// The console site's canonical origin — `https://<hostname>` — computed
+    /// from configuration and never from a request.
+    ///
+    /// The value an upgrade's `Origin` must equal. It is the same string, from
+    /// the same source and for the same reason, as the WebAuthn relying-party
+    /// origin: the proxy's relay forwards no `Host`, and an identity the client
+    /// could choose would defeat the comparison entirely. Absent means no
+    /// console site is configured, and a browser is then refused a stream rather
+    /// than admitted unchecked — see [`upgrade::origin_permitted`].
+    origin: Option<String>,
+}
+
+/// What a route demands of the caller who reached it.
+///
+/// Two shapes, because the capability vocabulary is closed and deliberately
+/// small, and one part of this API is not in it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Demand {
+    /// A capability from [`selfhost_identity`]'s closed vocabulary, decided by
+    /// [`Policy::decide`].
+    Held(Capability),
+    /// The owner's own identity, and nothing less.
+    ///
+    /// The passkey routes. Registering a credential is not *using* a power, it
+    /// is *minting* one: a passkey registered under a name is a way to
+    /// authenticate as that name for ever after, and the capability vocabulary
+    /// has no word for "may create authority" because no grant should ever
+    /// confer it. Until there is a capability that honestly describes it, these
+    /// routes ask for the identity that cannot be granted to anybody.
+    OwnerOnly,
+}
+
+/// One matched route behind the authorisation wall, and the whole of this API's
+/// surface there.
+///
+/// Split out of [`Api::handle`] so that "which route is this" and "what does it
+/// demand" are separate, pure, and testable without a supervisor. The dispatch
+/// below matches this enum exhaustively, so a route added here and forgotten in
+/// [`Route::demand`] is a build error rather than a route with no permission.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Route<'a> {
+    /// `GET /api/services`
+    ListServices,
+    /// `GET /api/services/<name>`
+    Describe(&'a str),
+    /// `PUT /api/services/<name>`
+    Install(&'a str),
+    /// `DELETE /api/services/<name>`
+    Uninstall(&'a str),
+    /// `GET /api/services/<name>/logs`
+    Logs(&'a str),
+    /// `POST /api/services/<name>/deploy`
+    DeployNow(&'a str),
+    /// `POST /api/services/<name>/<action>`
+    Act(&'a str, &'a str),
+    /// `POST /api/desktop/ticket`
+    MintTicket,
+    /// `GET /api/firewall`
+    FirewallState,
+    /// `POST /api/firewall/reconcile`
+    FirewallReconcile,
+    /// `POST /api/webauthn/register/challenge`
+    RegisterChallenge,
+    /// `POST /api/webauthn/register`
+    Register,
+    /// `GET /api/webauthn/credentials`
+    ListPasskeys,
+    /// `DELETE /api/webauthn/credentials/<id>`
+    RemovePasskey(&'a str),
+}
+
+impl<'a> Route<'a> {
+    /// The route named by a method and a split path, or `None` for anything
+    /// this API does not serve.
+    fn of(method: &Method, segments: &[&'a str]) -> Option<Self> {
+        match (method, segments) {
+            (Method::Get, ["api", "services"]) => Some(Self::ListServices),
+            (Method::Get, ["api", "services", name]) => Some(Self::Describe(name)),
+            (Method::Put, ["api", "services", name]) => Some(Self::Install(name)),
+            (Method::Delete, ["api", "services", name]) => Some(Self::Uninstall(name)),
+            (Method::Get, ["api", "services", name, "logs"]) => Some(Self::Logs(name)),
+            // Matched ahead of the generic action route below: "deploy" is not a
+            // supervisor action like start/stop/restart, it drives a git watch.
+            (Method::Post, ["api", "services", name, "deploy"]) => Some(Self::DeployNow(name)),
+            (Method::Post, ["api", "services", name, action]) => Some(Self::Act(name, action)),
+            // The stream mint. A non-`GET`, so the CSRF header was already
+            // demanded of a cookie caller by `authorised()` — by code that
+            // predates streams and is not changed by them. That is the whole
+            // trick: a handshake is a `GET` and cannot carry a custom header, so
+            // the moment that *can* be protected is moved here and the handshake
+            // is made to carry proof that it happened. See [`crate::upgrade`].
+            (Method::Post, ["api", "desktop", "ticket"]) => Some(Self::MintTicket),
+            // Authenticated, not on `/api/health`: the open ports it reveals are
+            // as sensitive as the service list, so it sits inside the wall.
+            (Method::Get, ["api", "firewall"]) => Some(Self::FirewallState),
+            (Method::Post, ["api", "firewall", "reconcile"]) => Some(Self::FirewallReconcile),
+            (Method::Post, ["api", "webauthn", "register", "challenge"]) => {
+                Some(Self::RegisterChallenge)
+            }
+            (Method::Post, ["api", "webauthn", "register"]) => Some(Self::Register),
+            (Method::Get, ["api", "webauthn", "credentials"]) => Some(Self::ListPasskeys),
+            (Method::Delete, ["api", "webauthn", "credentials", id]) => {
+                Some(Self::RemovePasskey(id))
+            }
+            _ => None,
+        }
+    }
+
+    /// What this route demands of its caller.
+    ///
+    /// The whole of the mapping from this API's surface onto the capability
+    /// model, in one match a reviewer can read in a sitting. Two capabilities
+    /// cover everything that existed before this model did, which is what makes
+    /// the change byte-for-byte equivalent for an owner: the boolean these
+    /// replace answered yes to all of it, and [`Policy::decide`] answers
+    /// [`Decision::Allow`](selfhost_identity::Decision::Allow) to all of it for
+    /// [`Identity::Owner`].
+    ///
+    /// The split between the two is *shows* against *does*.
+    /// [`Capability::ConsoleRead`] is everything the console renders — the
+    /// service list, one service's state, its logs, the firewall's state, and
+    /// the events stream that pushes exactly those. [`Capability::ServiceControl`]
+    /// is everything that changes the machine: installing, uninstalling,
+    /// starting, stopping, restarting, deploying, and re-asserting the firewall.
+    /// Reconciling the firewall is deliberately on the second side even though
+    /// reading it is on the first, because it rewrites the host's rules.
+    ///
+    /// [`Route::MintTicket`] is the exception that proves the mapping is real:
+    /// its demand is not fixed here, because a ticket carries whatever abilities
+    /// were asked for, and each of those is decided separately against its own
+    /// capability in [`Api::mint_ticket`]. What is checked here is only that the
+    /// caller may read the console at all — a floor, not the decision.
+    fn demand(&self) -> Demand {
+        match self {
+            Self::ListServices
+            | Self::Describe(_)
+            | Self::Logs(_)
+            | Self::FirewallState
+            | Self::MintTicket => Demand::Held(Capability::ConsoleRead),
+            Self::Install(_)
+            | Self::Uninstall(_)
+            | Self::DeployNow(_)
+            | Self::Act(_, _)
+            | Self::FirewallReconcile => Demand::Held(Capability::ServiceControl),
+            Self::RegisterChallenge
+            | Self::Register
+            | Self::ListPasskeys
+            | Self::RemovePasskey(_) => Demand::OwnerOnly,
+        }
+    }
 }
 
 /// The name of the session cookie the console browser holds.
@@ -140,17 +319,60 @@ impl Api {
         watches: Watches,
         firewall: Manager,
     ) -> Self {
-        Self { supervisor, store: Arc::new(store), token, watches, firewall, console: None }
+        Self {
+            supervisor,
+            store: Arc::new(store),
+            token,
+            watches,
+            firewall,
+            console: None,
+            tickets: Tickets::new(),
+            streams: Streams::new(),
+            policy: Policy::locked_down(),
+            people: None,
+        }
     }
 
-    /// Enables cookie-session login, loading the password hash from `dir`.
+    /// Enables cookie-session login, loading the password hash and the people
+    /// registry from `dir`.
     ///
     /// The wiring seam for the daemon: called once, right after [`Api::new`],
     /// with the daemon's data directory. A missing password file still enables
     /// the session routes — they just refuse every login until
     /// `selfhost console-password` writes one.
+    ///
+    /// The registry is persisted through this crate's own
+    /// [`token::write_private`], which is the one implementation in this
+    /// workspace that builds an explicit owner-only DACL on Windows rather than
+    /// inheriting the parent directory's. `selfhost-identity` cannot do that for
+    /// itself — it forbids `unsafe` and sits below this crate — so the writer is
+    /// injected here, at the one place that already owns it.
     pub fn with_console_auth(self, dir: &Path) -> Self {
         self.with_console_auth_parts(ConsolePassword::load(dir), Sessions::new())
+            .with_people(People::with_writer(dir, token::write_private))
+    }
+
+    /// Records the people registry the policy reads grants from.
+    ///
+    /// Separate from [`Api::with_console_auth`] so a test can hand in a registry
+    /// it built, and so a deployment without a console password can still have
+    /// one. Absent, every person holds nothing; the owner is unaffected either
+    /// way, because [`Policy::decide`] never consults an owner's grants.
+    pub fn with_people(mut self, people: People) -> Self {
+        self.people = Some(people);
+        self
+    }
+
+    /// Records the authorisation policy, which is one switch today:
+    /// `[desktop].bearer_may_control`.
+    ///
+    /// Not read from configuration here, because this crate must keep working
+    /// for a daemon that has not been taught the key yet — and the default it
+    /// keeps in that case is the locked-down one, which refuses rather than
+    /// permits.
+    pub fn with_policy(mut self, policy: Policy) -> Self {
+        self.policy = policy;
+        self
     }
 
     /// Enables cookie-session login from already-built parts.
@@ -164,7 +386,24 @@ impl Api {
             sessions,
             gate: FailureGate::new(),
             webauthn: None,
+            origin: None,
         });
+        self
+    }
+
+    /// Records the console site's canonical hostname, which fixes the origin an
+    /// upgrade's `Origin` header must equal.
+    ///
+    /// Separate from [`Api::with_console_webauthn`] so a deployment can have a
+    /// console site without passkeys and still get the origin check — but
+    /// `with_console_webauthn` calls this itself, because it already receives
+    /// the same hostname for the same reason and a second wiring point is a
+    /// second thing to forget. Forgetting it fails closed: with no origin
+    /// recorded, a browser cannot open a stream at all.
+    pub fn with_console_origin(mut self, host: &str) -> Self {
+        if let Some(console) = &mut self.console {
+            console.origin = Some(format!("https://{host}"));
+        }
         self
     }
 
@@ -176,14 +415,24 @@ impl Api {
     /// the proxy relay forwards no `Host`, and an attacker-chosen identity
     /// would defeat the origin binding that makes passkeys unphishable.
     /// Without console auth there is no session to mint, so this is a no-op.
+    ///
+    /// Also records the stream origin ([`Api::with_console_origin`]): the two
+    /// are the same hostname, wanted for the same reason, and the daemon
+    /// already calls this with it.
     pub fn with_console_webauthn(mut self, rp_id: &str, dir: &Path) -> Self {
         if let Some(console) = &mut self.console {
             console.webauthn = Some(Webauthn::load(rp_id, dir));
         }
-        self
+        self.with_console_origin(rp_id)
     }
 
     /// The same, from an already-built verifier — the tests' seam.
+    ///
+    /// Deliberately does **not** set the stream origin: a built verifier does not
+    /// hand back the hostname it was built for, and inferring one would mean
+    /// guessing at the value a security check compares against. A test that wants
+    /// both calls [`Api::with_console_origin`] as well, which is one line and is
+    /// honest about what it is asserting.
     pub fn with_console_webauthn_parts(mut self, webauthn: Webauthn) -> Self {
         if let Some(console) = &mut self.console {
             console.webauthn = Some(webauthn);
@@ -222,7 +471,7 @@ impl Api {
                 // a forged cross-site fetch cannot without a preflight the API
                 // never grants. A missing header answers the same uninformative
                 // 401 as every other refusal.
-                Method::Post if has_console_header(request) => self.login(body),
+                Method::Post if has_console_header(request) => self.login(body).await,
                 Method::Post => problem(Status(401), "authorisation required"),
                 Method::Delete => self.logout(request),
                 Method::Get => self.session_probe(request),
@@ -242,7 +491,7 @@ impl Api {
                 return problem(Status(401), "authorisation required");
             }
             return if path == "/api/webauthn/login" {
-                self.webauthn_login(body)
+                self.webauthn_login(body).await
             } else {
                 self.webauthn_login_challenge()
             };
@@ -255,29 +504,40 @@ impl Api {
         }
 
         let segments: Vec<&str> = path.trim_matches('/').split('/').collect();
-        match (&request.method, segments.as_slice()) {
-            (Method::Get, ["api", "services"]) => self.list_services().await,
-            (Method::Get, ["api", "services", name]) => self.describe(name).await,
-            (Method::Put, ["api", "services", name]) => self.install(name, body).await,
-            (Method::Delete, ["api", "services", name]) => self.uninstall(name).await,
-            (Method::Get, ["api", "services", name, "logs"]) => self.logs(name, query).await,
-            // Matched ahead of the generic action route below: "deploy" is not a
-            // supervisor action like start/stop/restart, it drives a git watch.
-            (Method::Post, ["api", "services", name, "deploy"]) => self.deploy_now(name).await,
-            (Method::Post, ["api", "services", name, action]) => self.act(name, action).await,
-            // Authenticated, not on `/api/health`: the open ports it reveals are
-            // as sensitive as the service list, so it sits inside the token wall.
-            (Method::Get, ["api", "firewall"]) => self.firewall_state().await,
-            (Method::Post, ["api", "firewall", "reconcile"]) => self.firewall_reconcile().await,
-            // Passkey management: registering needs an already-authenticated
-            // caller, so the console password stays the root credential.
-            (Method::Post, ["api", "webauthn", "register", "challenge"]) => {
-                self.webauthn_register_challenge()
-            }
-            (Method::Post, ["api", "webauthn", "register"]) => self.webauthn_register(body),
-            (Method::Get, ["api", "webauthn", "credentials"]) => self.webauthn_list(),
-            (Method::Delete, ["api", "webauthn", "credentials", id]) => self.webauthn_remove(id),
-            _ => problem(Status(404), "no such endpoint"),
+        let Some(route) = Route::of(&request.method, &segments) else {
+            return problem(Status(404), "no such endpoint");
+        };
+
+        // The wall above answers *whether* this request is authenticated; this
+        // answers *who*, and what they may do with it. Both are needed and
+        // neither replaces the other: the wall is what refreshes an idle timer
+        // and what enforces the CSRF header, and this is what decides the route.
+        let Some(caller) = self.caller(request) else {
+            return problem(Status(401), "authorisation required");
+        };
+        if !self.permits(&caller, &route.demand()) {
+            // The same uninformative 401 an anonymous caller gets. A person who
+            // is known to the deployment and holds nothing must not be able to
+            // tell that apart from being unknown, or the console becomes a way
+            // to enumerate what exists behind it.
+            return problem(Status(401), "authorisation required");
+        }
+
+        match route {
+            Route::ListServices => self.list_services().await,
+            Route::Describe(name) => self.describe(name).await,
+            Route::Install(name) => self.install(name, body).await,
+            Route::Uninstall(name) => self.uninstall(name).await,
+            Route::Logs(name) => self.logs(name, query).await,
+            Route::DeployNow(name) => self.deploy_now(name).await,
+            Route::Act(name, action) => self.act(name, action).await,
+            Route::MintTicket => self.mint_ticket(request, &caller, body),
+            Route::FirewallState => self.firewall_state().await,
+            Route::FirewallReconcile => self.firewall_reconcile().await,
+            Route::RegisterChallenge => self.webauthn_register_challenge(),
+            Route::Register => self.webauthn_register(body),
+            Route::ListPasskeys => self.webauthn_list(),
+            Route::RemovePasskey(id) => self.webauthn_remove(id),
         }
     }
 
@@ -307,6 +567,11 @@ impl Api {
     /// whether the stolen ride would otherwise have worked. The header is
     /// checked *before* the store so a forged request cannot even refresh the
     /// session's idle timer.
+    ///
+    /// Every candidate cookie is tried, not the first (see [`session_cookies`]).
+    /// `validate` refreshes the idle timer of whatever it matches, and a planted
+    /// value matches nothing, so at most the caller's own real session is
+    /// refreshed.
     fn cookie_authorised(&self, request: &Request) -> bool {
         let Some(console) = &self.console else {
             return false;
@@ -314,7 +579,81 @@ impl Api {
         if request.method != Method::Get && !has_console_header(request) {
             return false;
         }
-        session_cookie(request).is_some_and(|id| console.sessions.validate(&id))
+        session_cookies(request).iter().any(|id| console.sessions.validate(id))
+    }
+
+    /// Who is behind this request, and what they hold.
+    ///
+    /// The seam `selfhost-identity` was written to end at, and the counterpart
+    /// to [`Api::authorised`]: the same two doors, in the same order, answering
+    /// *who* rather than *whether*.
+    ///
+    /// Two properties matter and both are load-bearing:
+    ///
+    /// - **It preserves the CSRF-header-before-store ordering.** A non-`GET`
+    ///   without [`CONSOLE_HEADER`] is refused here before the session store is
+    ///   consulted, exactly as in [`Api::cookie_authorised`], so building a
+    ///   `Caller` never becomes a second path into the store that skips the
+    ///   check.
+    /// - **It does not refresh the idle timer.** It reads with
+    ///   [`Sessions::authenticated`] rather than `Sessions::validate`, because
+    ///   the callers here are a capability check, a ticket mint and a handshake,
+    ///   and none of those should be able to keep a session alive on its own.
+    ///   For an ordinary request the timer was already refreshed by
+    ///   `authorised()`, for a caller who deserved it.
+    ///
+    /// `None` means no credential this deployment recognises — which is also
+    /// what a session naming something [`Identity::parse`] refuses produces. A
+    /// stored name that is not a valid identity is a corrupted or hand-edited
+    /// store, and the safe reading of an identity nobody can name is nobody.
+    pub fn caller(&self, request: &Request) -> Option<Caller> {
+        if self.bearer_authorised(request) {
+            // The bearer token is the deployment's root credential; whatever
+            // holds it is the owner, exactly as it is everywhere else here.
+            return Some(Caller::bearer());
+        }
+        let console = self.console.as_ref()?;
+        if request.method != Method::Get && !has_console_header(request) {
+            return None;
+        }
+        let (_, held) = self.live_session(console, request)?;
+        let identity = Identity::parse(&held.user).ok()?;
+        let credential = Credential::Session(selfhost_identity::Session::new(
+            held.opened_by,
+            held.opened_at,
+        ));
+        Some(match &self.people {
+            Some(people) => people.caller(identity, credential),
+            // No registry wired: the owner's authority does not come from one,
+            // and a person's comes from nowhere else, so a person holds nothing.
+            None => Caller::new(identity, credential, selfhost_identity::Grants::none()),
+        })
+    }
+
+    /// The first candidate cookie that names a live session, and who holds it.
+    ///
+    /// Reads without refreshing; see [`Api::caller`].
+    fn live_session(
+        &self,
+        console: &ConsoleAuth,
+        request: &Request,
+    ) -> Option<(String, Authenticated)> {
+        session_cookies(request)
+            .into_iter()
+            .find_map(|id| console.sessions.authenticated(&id).map(|held| (id, held)))
+    }
+
+    /// Whether `caller` satisfies what a route demands.
+    ///
+    /// The one place this crate asks the authorisation model a question about an
+    /// ordinary route. Every refusal becomes the same uninformative 401 at the
+    /// caller; the distinction between the two demands lives here and nowhere
+    /// on the wire.
+    fn permits(&self, caller: &Caller, demand: &Demand) -> bool {
+        match demand {
+            Demand::Held(capability) => self.policy.decide(caller, capability).is_allowed(),
+            Demand::OwnerOnly => caller.identity().is_owner(),
+        }
     }
 
     /// Answers `POST /api/session`: verifies the password and mints a session.
@@ -323,24 +662,28 @@ impl Api {
     /// is the identical 401 the rest of the API sends, so probing this route
     /// reveals nothing about the deployment's configuration. A malformed body
     /// is a 400, which reveals only that the caller cannot form JSON.
-    fn login(&self, body: &[u8]) -> Response {
+    ///
+    /// The password is checked **before** the rate limiter is consulted, and the
+    /// limiter only ever refuses a credential that turned out to be wrong. See
+    /// [`FailureGate`] for the reasoning; the short version is that this API is
+    /// reachable by anything already running on this box, a lockout would
+    /// otherwise be a remotely-triggered denial of the operator's own console,
+    /// and the desktop's re-authentication rule routes them back through this
+    /// exact door.
+    async fn login(&self, body: &[u8]) -> Response {
         let Some(console) = &self.console else {
             return problem(Status(401), "authorisation required");
         };
-        if console.gate.locked() {
-            return problem(Status(429), "too many attempts");
-        }
         let Some(password) = login_password(body) else {
             return problem(Status(400), "body must be JSON with a \"password\" string");
         };
         if !console.password.verify(&password) {
-            console.gate.record_failure();
-            return problem(Status(401), "authorisation required");
+            return self.refuse_login(console).await;
         }
         console.gate.reset();
         // The password is the root credential; the session it mints is the
         // deployment's owner, whatever device typed it.
-        match console.sessions.create(OWNER) {
+        match console.sessions.create(OWNER, Opening::Password) {
             Ok(id) => with_session_cookie(
                 json(Status(200), session_granted(OWNER)),
                 &id,
@@ -348,6 +691,31 @@ impl Api {
             ),
             Err(error) => problem(Status(500), &format!("could not create a session: {error}")),
         }
+    }
+
+    /// Counts one failed login and answers it.
+    ///
+    /// One place for both login doors, so the password and the passkey cannot
+    /// drift into charging different prices for the same mistake.
+    ///
+    /// The gate is read *before* this failure is counted, which keeps the
+    /// thresholds exactly where they were when the gate stood in front of
+    /// verification: the attempt that reaches [`FailureGate`]'s limit is still
+    /// an ordinary 401, and only the ones after it are refused as a lockout.
+    ///
+    /// A locked gate waits out [`FailureGate::penalise`] before answering. That
+    /// delay is the whole of what a lockout costs a guesser now that it costs a
+    /// correct credential nothing, and the 429 rather than a 401 is so an
+    /// operator who really did mistype is told the difference between "wrong"
+    /// and "the door is busy".
+    async fn refuse_login(&self, console: &ConsoleAuth) -> Response {
+        let locked = console.gate.locked();
+        console.gate.record_failure();
+        if locked {
+            console.gate.penalise().await;
+            return problem(Status(429), "too many attempts");
+        }
+        problem(Status(401), "authorisation required")
     }
 
     /// The passkey verifier, when the whole chain to it is enabled.
@@ -361,17 +729,22 @@ impl Api {
     ///
     /// The uniform 401 covers "feature off" and "no passkey registered"
     /// alike, so this unauthenticated route reveals nothing about the
-    /// deployment; it names no credential ids for the same reason. Refused
-    /// while the gate is locked — a challenge is the first half of a guess.
+    /// deployment; it names no credential ids for the same reason.
+    ///
+    /// Issued **even while the gate is locked**, which reverses an earlier rule.
+    /// A challenge is a random number that grants nothing: it cannot be turned
+    /// into a session without a signature from hardware the guesser does not
+    /// have, and the challenge store is bounded and single-use. Refusing it
+    /// while locked was therefore not a defence against guessing — it was the
+    /// second half of the lockout this deployment cannot afford, shutting the
+    /// operator's biometric door because somebody else got a password wrong five
+    /// times. See [`FailureGate`].
     fn webauthn_login_challenge(&self) -> Response {
-        let Some((console, webauthn)) = self.webauthn() else {
+        let Some((_, webauthn)) = self.webauthn() else {
             return problem(Status(401), "authorisation required");
         };
         if webauthn.is_empty() {
             return problem(Status(401), "authorisation required");
-        }
-        if console.gate.locked() {
-            return problem(Status(429), "too many attempts");
         }
         match webauthn.challenge(webauthn::Purpose::Login) {
             Ok(challenge) => json(Status(200), challenge),
@@ -384,24 +757,26 @@ impl Api {
     ///
     /// Failures count into the shared [`FailureGate`], and every one of them
     /// is the API's uniform 401 — the reasons live in the verifier.
-    fn webauthn_login(&self, body: &[u8]) -> Response {
+    ///
+    /// The assertion is verified before the gate is consulted, for the reason
+    /// [`Api::login`] gives: a lockout may refuse a wrong credential and may
+    /// never refuse a right one. A passkey assertion is the credential this rule
+    /// matters most for, because it is the one that proves a person is at the
+    /// machine right now.
+    async fn webauthn_login(&self, body: &[u8]) -> Response {
         let Some((console, webauthn)) = self.webauthn() else {
             return problem(Status(401), "authorisation required");
         };
-        if console.gate.locked() {
-            return problem(Status(429), "too many attempts");
-        }
         let Some(assertion) = parse_json_body(body) else {
             return problem(Status(400), "body must be a JSON assertion");
         };
         let Ok(passkey) = webauthn.verify_login(&assertion) else {
-            console.gate.record_failure();
-            return problem(Status(401), "authorisation required");
+            return self.refuse_login(console).await;
         };
         console.gate.reset();
         // The assertion proved which person's credential signed it; the
         // session belongs to that person by cryptographic fact, not claim.
-        match console.sessions.create(&passkey.user) {
+        match console.sessions.create(&passkey.user, Opening::Passkey) {
             Ok(id) => with_session_cookie(
                 json(Status(200), session_granted(&passkey.user)),
                 &id,
@@ -471,9 +846,14 @@ impl Api {
     /// out an expired or unknown cookie must still clear it from the browser,
     /// and the worst a forged logout can do is inconvenience the operator into
     /// logging in again.
+    /// Every candidate cookie is revoked, not the first: a browser carrying a
+    /// planted `selfhost_session` alongside the real one must still be able to
+    /// log out of the real one.
     fn logout(&self, request: &Request) -> Response {
-        if let (Some(console), Some(id)) = (&self.console, session_cookie(request)) {
-            console.sessions.revoke(&id);
+        if let Some(console) = &self.console {
+            for id in session_cookies(request) {
+                console.sessions.revoke(&id);
+            }
         }
         // Max-Age=0 makes the browser discard the cookie immediately.
         with_session_cookie(json(Status(200), Json::object([("ok", Json::Bool(true))])), "", 0)
@@ -492,10 +872,118 @@ impl Api {
         let user = self
             .console
             .as_ref()
-            .zip(session_cookie(request))
-            .and_then(|(console, id)| console.sessions.identity(&id))
+            .and_then(|console| self.live_session(console, request))
+            .map(|(_, held)| held.user)
             .unwrap_or_else(|| OWNER.to_owned());
         json(Status(200), session_granted(&user))
+    }
+
+    /// The console site's canonical origin, when one is configured.
+    fn console_origin(&self) -> Option<&str> {
+        self.console.as_ref()?.origin.as_deref()
+    }
+
+    /// Which credential this request presents, and who and what it is.
+    ///
+    /// The same two doors [`Api::authorised`] opens, in the same order, but
+    /// answering *which one* rather than merely *whether*: a ticket is bound to
+    /// the credential that minted it, so the streaming paths need the credential
+    /// instance as well as the authority behind it.
+    ///
+    /// Reads the session store without refreshing the idle timer, for the reason
+    /// [`Api::caller`] gives.
+    fn holder_of(&self, request: &Request) -> Option<(Holder, Caller)> {
+        Some((self.holder(request)?, self.caller(request)?))
+    }
+
+    /// Which credential *instance* this request presents.
+    ///
+    /// Separate from [`Api::caller`] because the two answer different questions
+    /// and only one of them is a secret: a [`Caller`] is an identity and a grant
+    /// set, while a [`Holder`] is the session id itself, which is what a ticket
+    /// is bound to so that one browser's ticket cannot be redeemed by another.
+    fn holder(&self, request: &Request) -> Option<Holder> {
+        if self.bearer_authorised(request) {
+            return Some(Holder::Bearer);
+        }
+        let console = self.console.as_ref()?;
+        let (id, _) = self.live_session(console, request)?;
+        Some(Holder::Session(id))
+    }
+
+    /// Answers `POST /api/desktop/ticket`: mints the single-use credential a
+    /// handshake must present.
+    ///
+    /// Behind the authorisation wall, so this route is reachable only by a
+    /// caller who could already drive the console — a ticket grants nothing new,
+    /// it moves an existing authorisation across a boundary a custom header
+    /// cannot cross. The body is optional; `{"want": ["events"]}` names the
+    /// abilities, and an unrecognised word is a `400` rather than a ticket that
+    /// silently authorises less than was asked for.
+    ///
+    /// **Every requested ability is decided separately**, against the capability
+    /// [`Ability::capability`] names for it, through [`Policy::decide`]. That is
+    /// the whole difference between this route and the one the review found:
+    /// reading the ability words out of the body and handing them back is not a
+    /// mint, it is a caller granting themselves whatever they asked for. A
+    /// refusal is the same uninformative 401 as everywhere else, because the
+    /// alternative tells a caller which powers exist and which of them they
+    /// nearly had.
+    fn mint_ticket(&self, request: &Request, caller: &Caller, body: &[u8]) -> Response {
+        let Some(holder) = self.holder(request) else {
+            return problem(Status(401), "authorisation required");
+        };
+        let Some(abilities) = requested_abilities(body) else {
+            return problem(Status(400), "body must be JSON with a \"want\" array of known abilities");
+        };
+        for ability in &abilities {
+            if !self.policy.decide(caller, &ability.capability()).is_allowed() {
+                return problem(Status(401), "authorisation required");
+            }
+        }
+        match self.tickets.mint(holder, abilities) {
+            Ok(ticket) => json(
+                Status(200),
+                Json::object([
+                    ("ticket", Json::string(ticket)),
+                    ("expiresIn", Json::Number(upgrade::TICKET_LIFETIME.as_secs() as f64)),
+                ]),
+            ),
+            // A client that has asked for more unredeemed tickets than it can
+            // hold is looping; that is its own doing and its own to slow down,
+            // so it is a 429 rather than a fault reported as a 500.
+            Err(error @ MintError::TooManyOutstanding) => problem(Status(429), &error.to_string()),
+            Err(error) => problem(Status(500), &format!("could not mint a ticket: {error}")),
+        }
+    }
+
+    /// Whether this handshake may become a stream on `route`, and everything the
+    /// stream needs if it may.
+    ///
+    /// Pure: it reads a request head and the in-memory ticket store, and touches
+    /// no socket. That is what lets every refusal be tested by building a
+    /// `Request`, and it is the same property [`Api::handle`] has and must keep.
+    /// The socket hand-over is [`crate::stream`]'s.
+    ///
+    /// The decision itself is [`upgrade::decide`], which owns the ordering of
+    /// the checks and the reasoning for it; this supplies the things only an
+    /// `Api` can know — which credential was presented and what it may do, what
+    /// the console site's origin is, and where the tickets and the concurrency
+    /// ceiling live. Every [`Denial`] becomes one uniform 401 at the caller; the
+    /// variants exist so the daemon's own log can say which check failed, where
+    /// an operator can read it and a stranger cannot.
+    pub fn upgrade_for(&self, request: &Request, route: Ability) -> Result<Admission, Denial> {
+        upgrade::decide(
+            request,
+            self.holder_of(request),
+            &Doorway {
+                policy: &self.policy,
+                expected_origin: self.console_origin(),
+                tickets: &self.tickets,
+                streams: &self.streams,
+            },
+            route,
+        )
     }
 
     async fn list_services(&self) -> Response {
@@ -689,21 +1177,81 @@ fn login_password(body: &[u8]) -> Option<String> {
     parse_json_body(body)?.get("password").and_then(Json::as_str).map(str::to_owned)
 }
 
+/// Reads the abilities a ticket is being minted for.
+///
+/// An empty body means the one ability this deployment has a route for, so the
+/// console can ask for a stream without composing a document. Anything else must
+/// be `{"want": [...]}` carrying known words: an unknown word is refused rather
+/// than skipped, because a ticket that quietly authorises less than was asked
+/// for turns into a stream that closes for no stated reason, minutes later and
+/// somewhere else.
+fn requested_abilities(body: &[u8]) -> Option<Vec<Ability>> {
+    if body.iter().all(u8::is_ascii_whitespace) {
+        return Some(vec![Ability::Events]);
+    }
+    let value = parse_json_body(body)?;
+    let Some(want) = value.get("want") else {
+        return Some(vec![Ability::Events]);
+    };
+    let words = want.as_array()?;
+    if words.is_empty() {
+        return None;
+    }
+    words.iter().map(|word| Ability::parse(word.as_str()?)).collect()
+}
+
 /// Parses a request body as JSON, or `None` for anything that is not.
 fn parse_json_body(body: &[u8]) -> Option<Json> {
     selfhost_json::parse(std::str::from_utf8(body).ok()?).ok()
 }
 
-/// Extracts the session id from a request's `Cookie` header, if present.
+/// The most `selfhost_session` pairs read out of one `Cookie` header.
 ///
-/// A browser sends every cookie for the site in one header, `name=value` pairs
-/// separated by semicolons; only [`SESSION_COOKIE`] is ours.
-fn session_cookie(request: &Request) -> Option<String> {
-    let header = request.headers.get_str("cookie")?;
-    header.split(';').find_map(|pair| {
-        let (name, value) = pair.trim().split_once('=')?;
-        (name.trim() == SESSION_COOKIE).then(|| value.trim().to_owned())
-    })
+/// A browser sends one cookie per (name, domain, path), so a console request
+/// legitimately carries one — two at the very most, while a `Domain`-scoped
+/// cookie is being replaced. Beyond a handful, the header is somebody's
+/// experiment rather than a browser's, and each extra candidate is another walk
+/// of the session store. Candidates past this many are ignored rather than the
+/// request refused, so a neighbour cannot lock the console out by planting nine
+/// of them.
+const MAX_SESSION_COOKIES: usize = 8;
+
+/// Extracts every session-id candidate from a request's `Cookie` header.
+///
+/// # Why every pair, and not the first
+///
+/// A browser sends every cookie for the host in one header, `name=value` pairs
+/// separated by semicolons, and **cookie scope is not origin scope**. This box's
+/// whole purpose is hosting several sites through one proxy, so any site under
+/// the same registrable domain can set `selfhost_session=…; Domain=<parent>`,
+/// which the browser will then also send to the console host — in whatever order
+/// it likes. Taking the first pair meant a neighbouring site could plant a value
+/// that sorted first and silently hide the operator's real session: not an
+/// authentication bypass, because the planted value names nothing, but a
+/// persistent, remotely-triggered lockout of the console.
+///
+/// The alternative considered was refusing a request that carries more than one
+/// such pair outright. That is simpler and it is the wrong choice here, because
+/// it leaves the neighbour holding exactly the same lockout: the planted cookie
+/// is sent on every request, so every request would be refused. Trying each
+/// candidate costs a walk of a store that holds at most 32 entries, compares in
+/// constant time either way, and turns the attack into nothing at all — a value
+/// that names no session simply names no session.
+///
+/// The list is bounded by [`MAX_SESSION_COOKIES`] so that the cost stays a
+/// handful of walks rather than one per cookie an attacker can fit in a header.
+fn session_cookies(request: &Request) -> Vec<String> {
+    let Some(header) = request.headers.get_str("cookie") else {
+        return Vec::new();
+    };
+    header
+        .split(';')
+        .filter_map(|pair| {
+            let (name, value) = pair.trim().split_once('=')?;
+            (name.trim() == SESSION_COOKIE).then(|| value.trim().to_owned())
+        })
+        .take(MAX_SESSION_COOKIES)
+        .collect()
 }
 
 /// Whether the request carries the CSRF header (see [`CONSOLE_HEADER`]).
@@ -830,6 +1378,20 @@ async fn handle_connection(
         }
     };
 
+    // The one branch that does not end in a response. Taken only when the path
+    // names a stream *and* the head is shaped like a handshake: a plain `GET
+    // /api/events` falls through and gets the same "no such endpoint" 404 as any
+    // other unmatched route, which is what it should look like to anyone who is
+    // not opening a stream.
+    let stream_route = Ability::for_path(request.path())
+        .filter(|_| selfhost_ws::handshake::looks_like_upgrade(&request));
+    if let Some(route) = stream_route {
+        // Everything past the head belongs to the new protocol, not to a body.
+        // See `stream::Prefixed` for what happens if it is dropped here.
+        let leftover = buffer.split_off(consumed);
+        return serve_stream(stream, leftover, api, request, route).await;
+    }
+
     let body = match read_body(&mut stream, &request, &mut buffer, consumed).await {
         Ok(body) => body,
         Err(response) => return write_response(&mut stream, &response).await,
@@ -837,6 +1399,82 @@ async fn handle_connection(
 
     let response = api.handle(&request, &body).await;
     write_response(&mut stream, &response).await
+}
+
+/// Decides an upgrade, answers it, and hands the connection to the stream that
+/// asked for it.
+///
+/// The whole of the socket layer's part in a stream. The decision is
+/// [`Api::upgrade_for`], which is pure and tested without a port; the hand-over
+/// is [`stream::Prefixed`], which carries the bytes that arrived alongside the
+/// head so the first message is not eaten; and the loop is [`stream::events`].
+///
+/// A refusal is the same uninformative 401 every other unauthorised request
+/// gets, byte for byte. The reason is written to the daemon's log, where an
+/// operator debugging a console that will not connect can read it and a stranger
+/// cannot — and it is written for a refusal only, never for a success, so the
+/// log does not fill with a line per reconnect.
+async fn serve_stream(
+    mut stream: TcpStream,
+    leftover: Vec<u8>,
+    api: Api,
+    request: Request,
+    route: Ability,
+) -> std::io::Result<()> {
+    let admission = match api.upgrade_for(&request, route) {
+        Ok(admission) => admission,
+        Err(denial) => {
+            eprintln!("admin: refused a stream on {}: {denial}", request.path());
+            return write_response(&mut stream, &problem(Status(401), "authorisation required"))
+                .await;
+        }
+    };
+
+    stream::answer(&mut stream, &admission).await?;
+    println!(
+        "admin: stream open on {path} for {who}",
+        path = request.path(),
+        who = Api::stream_identity(&admission),
+    );
+
+    let outcome = match route {
+        Ability::Events => {
+            stream::events(
+                stream::Prefixed::new(leftover, stream),
+                api,
+                admission,
+                stream::Watch::default(),
+            )
+            .await
+        }
+    };
+    match outcome {
+        Ok(reason) => println!("admin: stream on {} ended: {reason}", request.path()),
+        // A transport that simply went away is a fact about a console on a
+        // laptop, not a fault: a closing tab drops its socket often enough that
+        // the answering close frame finds nothing to write to. Reporting that at
+        // the same weight as a protocol violation is how a log stops being read,
+        // so only the genuine failures reach stderr.
+        Err(error) if is_departure(&error) => {
+            println!("admin: stream on {} ended: {error}", request.path());
+        }
+        Err(error) => eprintln!("admin: stream on {} failed: {error}", request.path()),
+    }
+    Ok(())
+}
+
+/// Whether a stream's error is simply the peer having gone.
+fn is_departure(error: &selfhost_ws::StreamError) -> bool {
+    match error {
+        selfhost_ws::StreamError::Io(io) => matches!(
+            io.kind(),
+            std::io::ErrorKind::BrokenPipe
+                | std::io::ErrorKind::ConnectionReset
+                | std::io::ErrorKind::ConnectionAborted
+                | std::io::ErrorKind::UnexpectedEof
+        ),
+        selfhost_ws::StreamError::Protocol(_) => false,
+    }
 }
 
 /// Reads exactly the declared body, refusing anything oversized or unframed.

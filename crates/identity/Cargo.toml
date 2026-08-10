@@ -1,0 +1,22 @@
+[package]
+name = "selfhost-identity"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Who the caller is and what they may do: identities, credentials, capabilities, and the pure policy that decides."
+
+[dependencies]
+# The entropy behind an audit record's id, from the same provider the rest of
+# the workspace links. Nothing here is a secret to be compared, so no
+# constant-time primitive is used: this crate decides authority, it never
+# verifies a credential — that stays in `crates/admin`, beside the credentials.
+ring = { workspace = true }
+selfhost-json = { workspace = true }
+
+[dev-dependencies]
+
+[lints.rust]
+unsafe_code = "forbid"
+missing_docs = "warn"

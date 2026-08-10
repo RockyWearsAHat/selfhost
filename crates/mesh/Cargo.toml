@@ -1,0 +1,23 @@
+[package]
+name = "selfhost-mesh"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "One link, many channels: the mux header, credit flow control, peer enrolment, and the outbound dialler. A worker dials out; nothing listens."
+
+[dependencies]
+# HMAC for the enrolment proof's channel binding.
+ring = { workspace = true }
+selfhost-identity = { workspace = true }
+selfhost-json = { workspace = true }
+selfhost-ws = { workspace = true }
+tokio = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time", "io-util"] }
+
+[lints.rust]
+unsafe_code = "forbid"
+missing_docs = "warn"

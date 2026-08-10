@@ -16,6 +16,7 @@ pub mod mime;
 pub mod server;
 pub mod sni;
 pub mod tls;
+pub mod upgrade;
 pub mod upstream;
 
 pub use files::{Resolution, build_response, resolve};

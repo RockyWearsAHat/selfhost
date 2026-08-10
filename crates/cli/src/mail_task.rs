@@ -40,9 +40,19 @@ pub async fn run(config: Config, project_dir: PathBuf, store: CertificateStore, 
     let Some(mail) = config.mail.clone() else { return };
 
     let data_dir = project_dir.join(&config.server.data_dir);
-    if let Err(error) = std::fs::create_dir_all(&data_dir) {
-        log(format!("cannot create {}: {error} — mail is not running", data_dir.display()));
-        return;
+    // Mail's own reason for wanting this directory private: the maildir under
+    // it is every message this deployment has received, and the DKIM signing
+    // key beside it is what lets anything claim to be this domain.
+    match crate::data_dir::prepare(&data_dir) {
+        Ok(prepared) => {
+            for note in prepared.notes(&data_dir) {
+                log(note);
+            }
+        }
+        Err(error) => {
+            log(format!("cannot create {}: {error} — mail is not running", data_dir.display()));
+            return;
+        }
     }
 
     // One pass over the config mailboxes yields both the store's mailbox list
