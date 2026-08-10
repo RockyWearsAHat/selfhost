@@ -18,8 +18,23 @@ secrets/
 # The live config carries hostnames and mailbox addresses.
 selfhost.config.toml
 
-# Site content served by the proxy — the user's websites, not this project's source.
-sites/
+# Site content served by the proxy — the user's websites, not this project's
+# source. The one exception: sites/console is the web admin console's own SPA,
+# shipped with the project, so it stays tracked.
+sites/*
+!sites/console/
 
 # OS noise
 .DS_Store
+
+# Scratch directory for the service-manager demo (see .demo/svc)
+.demo/
+
+# local agent/security notes — never commit
+CLAUDE.md
+
+# local security tooling & docs — do not commit
+scripts/verify-hardening.zsh
+scripts/lockdown.sh
+scripts/verify-security.sh
+docs/SECURITY.md
