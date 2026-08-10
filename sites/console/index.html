@@ -1,0 +1,297 @@
+<!doctype html>
+<!-- The web admin console: the native console's instrument panel, served over
+     the WireGuard tunnel only. Static skeleton; app.js fills every reading.
+     No build step, no framework, no external request of any kind — the CSP
+     below refuses them outright. -->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta http-equiv="Content-Security-Policy"
+      content="default-src 'none'; connect-src 'self'; style-src 'self'; script-src 'self'; img-src 'self'">
+<title>SELFHOST — Admin Console</title>
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+
+<!-- LOGIN: one password field. Quiet refusals; the daemon says nothing more. -->
+<section id="view-login" hidden>
+  <div class="plate login-plate">
+    <header class="login-mast">
+      <span class="wordmark">SELFHOST</span>
+      <span class="designation">ADMIN CONSOLE</span>
+    </header>
+    <form id="login-form">
+      <label class="fieldlabel" for="login-password">PASSWORD</label>
+      <input id="login-password" type="password" autocomplete="current-password" required>
+      <div class="login-submit-row">
+        <button type="submit" class="btn primary" id="login-submit">ENTER</button>
+        <span id="login-sweep" class="sweep" hidden></span>
+      </div>
+    </form>
+    <p id="login-caps" class="caption warn-ink" hidden>Caps Lock is on.</p>
+    <p id="login-note" class="caption bad-ink" hidden></p>
+    <p class="caption">Reachable over the WireGuard tunnel only.</p>
+  </div>
+</section>
+
+<!-- CONSOLE -->
+<section id="view-console" hidden>
+
+  <header id="masthead">
+    <span class="wordmark">SELFHOST</span>
+    <span class="designation">ADMIN CONSOLE</span>
+    <span class="rule"></span>
+    <span id="link-sweep" class="sweep" hidden></span>
+    <span id="link-lamp" class="lamp warn"></span>
+    <span id="link-word" class="stateword warn">CONNECTING</span>
+    <button id="logout" class="btn ghost small" type="button">LOG OUT</button>
+  </header>
+
+  <div id="notice" class="alert" hidden>
+    <span class="flagbar"></span>
+    <span id="notice-text"></span>
+    <button id="notice-dismiss" class="btn ghost small" type="button" aria-label="Dismiss">&#215;</button>
+  </div>
+
+  <!-- The readout bank: the machine's own account of itself, and the fleet
+       strip — one lamp slot per service, the whole machine at a glance. -->
+  <section id="bank" class="plate">
+    <div class="bank-main">
+      <p id="condition"></p>
+      <p id="evidence" class="evidence" hidden>
+        <span class="reading"><span class="fieldlabel">RUNNING</span> <span id="ev-running" class="mono"></span></span>
+        <span class="reading"><span class="fieldlabel">RESTARTS</span> <span id="ev-restarts" class="mono"></span></span>
+        <span class="reading"><span class="fieldlabel">ATTENTION</span> <span id="ev-attention" class="mono"></span></span>
+      </p>
+    </div>
+    <div id="strip" hidden></div>
+  </section>
+
+  <!-- FIREWALL: hidden until the daemon reports one; hidden silently on 404. -->
+  <section id="firewall" class="plate" hidden>
+    <div class="section-rule">
+      <h2>FIREWALL</h2><span class="rule"></span>
+      <span id="fw-backend" class="mono micro"></span>
+      <span id="fw-managed" class="stateword"></span>
+      <button id="fw-reconcile" class="btn ghost small" type="button">RECONCILE</button>
+    </div>
+    <p id="fw-inbound" class="caption lampline" hidden>
+      <span id="fw-inbound-lamp" class="lamp"></span><span id="fw-inbound-text"></span>
+    </p>
+    <p id="fw-note" class="caption" hidden></p>
+    <div id="fw-table-wrap" hidden><table id="fw-table">
+      <thead><tr>
+        <th>SERVICE</th><th>BIND</th><th>FIREWALL</th><th>ROUTER</th><th>REACHABILITY</th>
+      </tr></thead>
+      <tbody id="fw-rows"></tbody>
+    </table></div>
+  </section>
+
+  <div id="panes">
+
+    <!-- SERVICE RAIL -->
+    <section id="rail" class="plate">
+      <div class="section-rule">
+        <h2>SERVICES</h2><span class="rule"></span><span id="service-count" class="mono micro"></span>
+      </div>
+      <ul id="service-list" role="listbox" aria-label="Services"></ul>
+      <p id="rail-empty" class="caption centered" hidden></p>
+      <button id="add-service" class="btn wide" type="button">+&nbsp;&nbsp;ADD SERVICE</button>
+    </section>
+
+    <!-- DETAIL -->
+    <section id="detail" class="plate">
+      <div id="detail-empty" class="empty" hidden>
+        <div>
+          <div class="reticle"><span class="dot"></span></div>
+          <p class="caption" id="detail-guidance"></p>
+        </div>
+      </div>
+      <div id="detail-body" hidden>
+        <div class="title-rule">
+          <h2 id="d-name" class="title"></h2><span class="rule"></span>
+          <span id="d-lamp" class="lamp"></span><span id="d-stateword" class="stateword"></span>
+        </div>
+        <p id="d-summary" class="caption"></p>
+
+        <!-- The service's dials: its vital numbers in one machined bar. -->
+        <div id="d-readings" class="readings" hidden>
+          <span class="dial"><span class="fieldlabel">PID</span><span id="d-r-pid" class="mono"></span></span>
+          <span class="dial"><span class="fieldlabel">UPTIME</span><span id="d-r-uptime" class="mono"></span></span>
+          <span class="dial"><span class="fieldlabel">RESTARTS</span><span id="d-r-restarts" class="mono"></span></span>
+          <span class="dial"><span class="fieldlabel">START MODE</span><span id="d-r-mode" class="mono"></span></span>
+        </div>
+
+        <div class="actions">
+          <button id="d-start" class="btn primary" type="button">Start</button>
+          <button id="d-stop" class="btn" type="button">Stop</button>
+          <button id="d-restart" class="btn" type="button">Restart</button>
+          <span class="rule"></span>
+          <button id="d-deploy" class="btn ghost" type="button" hidden>Deploy</button>
+          <button id="d-uninstall" class="btn danger" type="button">Uninstall</button>
+        </div>
+
+        <!-- Destruction takes a typed name, not a click. -->
+        <div id="d-confirm" class="confirm" hidden>
+          <label class="fieldlabel" for="d-confirm-input" id="d-confirm-label"></label>
+          <input id="d-confirm-input" class="mono" autocomplete="off" spellcheck="false">
+          <button id="d-confirm-go" class="btn danger" type="button" disabled>Uninstall</button>
+          <button id="d-confirm-cancel" class="btn ghost" type="button">Cancel</button>
+        </div>
+
+        <div class="section-rule">
+          <h2>DEFINITION</h2><span class="rule"></span>
+          <button id="d-edit" class="btn ghost small" type="button" disabled>Edit</button>
+        </div>
+        <dl id="d-def"></dl>
+
+        <div class="section-rule output-rule">
+          <h2>OUTPUT</h2><span class="rule"></span>
+          <span id="d-output-note" class="mono micro"></span>
+          <input id="log-filter" type="search" placeholder="filter" autocomplete="off" spellcheck="false" aria-label="Filter log lines">
+          <button id="log-stderr" class="btn ghost small" type="button" aria-pressed="false">STDERR</button>
+        </div>
+        <div id="log-wrap">
+          <div id="log-scroll"><p id="log-empty" class="caption"></p></div>
+          <button id="log-jump" class="btn small" type="button" hidden></button>
+        </div>
+      </div>
+    </section>
+
+    <!-- INSTALL / EDIT: fields mirror the ServiceSpec wire format exactly. -->
+    <section id="form-pane" class="plate" hidden>
+      <div class="title-rule"><h2 id="f-title" class="title">ADD SERVICE</h2><span class="rule"></span></div>
+      <ul id="form-problems" class="problems" hidden></ul>
+      <form id="service-form">
+        <div class="grid">
+          <div class="field" data-problem="f-name">
+            <label class="fieldlabel" for="f-name">NAME</label>
+            <input id="f-name" class="mono" autocomplete="off" spellcheck="false">
+            <p class="problem" hidden></p>
+          </div>
+          <div class="field" data-problem="f-display">
+            <label class="fieldlabel" for="f-display">DISPLAY NAME</label>
+            <input id="f-display" autocomplete="off">
+            <p class="problem" hidden></p>
+          </div>
+          <div class="field span" data-problem="f-desc">
+            <label class="fieldlabel" for="f-desc">DESCRIPTION</label>
+            <input id="f-desc" autocomplete="off">
+            <p class="problem" hidden></p>
+          </div>
+          <div class="field span" data-problem="f-program">
+            <label class="fieldlabel" for="f-program">PROGRAM</label>
+            <input id="f-program" class="mono" autocomplete="off" spellcheck="false">
+            <p class="problem" hidden></p>
+          </div>
+          <div class="field" data-problem="f-args">
+            <label class="fieldlabel" for="f-args">ARGUMENTS — one per line</label>
+            <textarea id="f-args" class="mono" rows="3" spellcheck="false"></textarea>
+            <p class="problem" hidden></p>
+          </div>
+          <div class="field" data-problem="f-env">
+            <label class="fieldlabel" for="f-env">ENVIRONMENT — NAME=value per line</label>
+            <textarea id="f-env" class="mono" rows="3" spellcheck="false"></textarea>
+            <p class="problem" hidden></p>
+          </div>
+          <div class="field" data-problem="f-cwd">
+            <label class="fieldlabel" for="f-cwd">RUNS IN</label>
+            <input id="f-cwd" class="mono" autocomplete="off" spellcheck="false">
+            <p class="problem" hidden></p>
+          </div>
+          <div class="field" data-problem="f-node">
+            <label class="fieldlabel" for="f-node">NODE</label>
+            <input id="f-node" class="mono" autocomplete="off" spellcheck="false">
+            <p class="problem" hidden></p>
+          </div>
+          <div class="field" data-problem="f-startmode">
+            <label class="fieldlabel" for="f-startmode">START MODE</label>
+            <select id="f-startmode">
+              <option value="automatic">automatic</option>
+              <option value="manual">manual</option>
+              <option value="disabled">disabled</option>
+            </select>
+            <p class="problem" hidden></p>
+          </div>
+          <div class="field" data-problem="f-restart">
+            <label class="fieldlabel" for="f-restart">RESTART</label>
+            <select id="f-restart">
+              <option value="never">never</option>
+              <option value="on-failure">on failure</option>
+              <option value="always">always</option>
+            </select>
+            <p class="problem" hidden></p>
+          </div>
+          <div class="field" data-problem="f-delay">
+            <label class="fieldlabel" for="f-delay">RESTART DELAY (S)</label>
+            <input id="f-delay" class="mono" inputmode="numeric" autocomplete="off">
+            <p class="problem" hidden></p>
+          </div>
+          <div class="field" data-problem="f-maxrestarts">
+            <label class="fieldlabel" for="f-maxrestarts">MAX RESTARTS</label>
+            <input id="f-maxrestarts" class="mono" inputmode="numeric" autocomplete="off">
+            <p class="problem" hidden></p>
+          </div>
+          <div class="field" data-problem="f-stoptimeout">
+            <label class="fieldlabel" for="f-stoptimeout">STOP TIMEOUT (S)</label>
+            <input id="f-stoptimeout" class="mono" inputmode="numeric" autocomplete="off">
+            <p class="problem" hidden></p>
+          </div>
+          <div class="field span" data-problem="f-stopcmd">
+            <label class="fieldlabel" for="f-stopcmd">STOP COMMAND — one argument per line, blank for none</label>
+            <textarea id="f-stopcmd" class="mono" rows="2" spellcheck="false"></textarea>
+            <p class="problem" hidden></p>
+          </div>
+        </div>
+
+        <div class="section-rule"><h2>GIT WATCH</h2><span class="rule"></span></div>
+        <p class="caption">Leave the repository and path blank for a service that is not deployed from Git.</p>
+        <div class="grid">
+          <div class="field span" data-problem="f-git-repo">
+            <label class="fieldlabel" for="f-git-repo">REPOSITORY</label>
+            <input id="f-git-repo" class="mono" autocomplete="off" spellcheck="false">
+            <p class="problem" hidden></p>
+          </div>
+          <div class="field" data-problem="f-git-branch">
+            <label class="fieldlabel" for="f-git-branch">BRANCH</label>
+            <input id="f-git-branch" class="mono" autocomplete="off" spellcheck="false" placeholder="main">
+            <p class="problem" hidden></p>
+          </div>
+          <div class="field" data-problem="f-git-path">
+            <label class="fieldlabel" for="f-git-path">WORKING COPY PATH</label>
+            <input id="f-git-path" class="mono" autocomplete="off" spellcheck="false">
+            <p class="problem" hidden></p>
+          </div>
+          <div class="field" data-problem="f-git-interval">
+            <label class="fieldlabel" for="f-git-interval">POLL INTERVAL (S)</label>
+            <input id="f-git-interval" class="mono" inputmode="numeric" autocomplete="off" placeholder="60">
+            <p class="problem" hidden></p>
+          </div>
+          <div class="field check">
+            <label class="fieldlabel" for="f-git-enabled"><input id="f-git-enabled" type="checkbox" checked> ENABLED</label>
+          </div>
+          <div class="field check">
+            <label class="fieldlabel" for="f-git-auto"><input id="f-git-auto" type="checkbox" checked> AUTO-UPDATE</label>
+          </div>
+          <div class="field span" data-problem="f-git-postpull">
+            <label class="fieldlabel" for="f-git-postpull">POST-PULL COMMAND — one argument per line</label>
+            <textarea id="f-git-postpull" class="mono" rows="2" spellcheck="false"></textarea>
+            <p class="problem" hidden></p>
+          </div>
+        </div>
+
+        <div class="form-actions">
+          <button id="f-save" class="btn primary" type="submit">Save</button>
+          <button id="f-cancel" class="btn ghost" type="button">Cancel</button>
+        </div>
+      </form>
+    </section>
+
+  </div>
+</section>
+
+<script src="/app.js"></script>
+</body>
+</html>
