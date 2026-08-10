@@ -78,9 +78,16 @@ selfhost-registrar = { path = "crates/registrar" }
 selfhost-supervisor = { path = "crates/supervisor" }
 rui = { path = "crates/rui" }
 
+# The release profile is what the self-updater rebuilds on every push, so its
+# job is to be *fast to rebuild*, not to squeeze the last percent of runtime
+# out of an I/O-bound server. LTO with one codegen unit re-links the whole
+# binary from scratch on any change and was the bulk of each deploy's build
+# time; parallel codegen plus incremental reuse turns a push into a rebuild of
+# only what changed.
 [profile.release]
 opt-level = 3
-lto = "thin"
-codegen-units = 1
+lto = false
+codegen-units = 16
+incremental = true
 panic = "abort"
 strip = true
