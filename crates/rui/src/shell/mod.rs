@@ -46,6 +46,23 @@
 //! costs what it always did. Nothing here knows what is animating or why: the
 //! interface answers [`Memory::is_animating`] and the loop believes it.
 //!
+//! # And news from a thread that is not this one
+//!
+//! An animation is the interface's own doing, and an event is the person's, but
+//! a picture arriving on a socket is neither, and a loop that only knew about
+//! those two would show it at the idle timeout — four times a second. So a thread
+//! holding a [`Redraw`](crate::app::Redraw) can shorten the wait and ask for a
+//! frame, and the loop honours both: it sleeps for no longer than the bound it
+//! was given, and draws when something asked it to.
+//!
+//! Which is why waking and drawing are two decisions here rather than one. A
+//! wait shortened to a stream's pace happens whether or not a frame arrived, and
+//! drawing on every one of those wakes would re-rasterise the whole interface
+//! sixty times a second in order to present nothing. So a turn of the loop draws
+//! when an event arrived, an animation is running, a frame was asked for, or the
+//! idle timeout has come round anyway — and otherwise goes back to waiting,
+//! which is what it would have been doing.
+//!
 //! # When the platform takes the loop away
 //!
 //! A window system may run a loop of its own that does not return until a
@@ -338,6 +355,37 @@ impl Surface {
     }
 }
 
+/// What one turn of the loop found waiting for it.
+///
+/// A named value rather than four arguments to an `if`, because it is the one
+/// piece of the loop that can be got wrong without a window being open to
+/// notice: too eager and a live stream re-rasterises the whole interface for
+/// nothing, too shy and news sits unshown. Split out so it can be asserted
+/// without a display, which nothing else in this module can be.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Turn {
+    /// Another thread asked for a frame.
+    requested: bool,
+    /// The window system had something to tell us.
+    had_events: bool,
+    /// Something on screen is mid-animation.
+    animating: bool,
+    /// The application's idle timeout has come round.
+    idle_elapsed: bool,
+}
+
+impl Turn {
+    /// Whether this turn should draw a frame.
+    ///
+    /// Any of the four is enough, and none of them is optional: an event is the
+    /// person, an animation is the interface, a request is another thread, and
+    /// the timeout is the promise that the screen is never more than that stale
+    /// however quiet everything else has been.
+    fn is_due(self) -> bool {
+        self.requested || self.had_events || self.animating || self.idle_elapsed
+    }
+}
+
 /// Opens a window and runs `app` in it until it is closed.
 pub(crate) fn run<S>(
     options: WindowOptions,
@@ -363,10 +411,15 @@ pub(crate) fn run<S>(
         composition_area: None,
     };
     let mut events = Vec::new();
+    // When a frame is owed however little else has happened. Drawing on every
+    // wake would be right but wasteful once another thread has shortened the
+    // wait to a stream's pace: an unrequested wake would then re-rasterise the
+    // whole interface sixty times a second to present nothing.
+    let mut idle_due = Instant::now();
 
     while window.is_open() && app.is_running() {
         events.clear();
-        let wait = if surface.memory.is_animating() { FRAME } else { app.idle() };
+        let wait = if surface.memory.is_animating() { FRAME } else { app.wait() };
 
         {
             // What the backend calls when the platform has taken the loop away.
@@ -384,10 +437,62 @@ pub(crate) fn run<S>(
             return Err(error);
         }
 
-        surface.draw(&window, &mut fonts, &mut app, &mut events)?;
+        // The request is taken unconditionally rather than as one term of the
+        // decision, so that a request arriving in the same wait as an event is
+        // cleared by the frame that answers both instead of provoking a second.
+        let now = Instant::now();
+        let turn = Turn {
+            requested: app.take_redraw_request(),
+            had_events: !events.is_empty(),
+            animating: surface.memory.is_animating(),
+            idle_elapsed: now >= idle_due,
+        };
+        if turn.is_due() {
+            surface.draw(&window, &mut fonts, &mut app, &mut events)?;
+            idle_due = now + app.idle();
+        }
         if surface.input.close_requested() {
             break;
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A turn on which nothing at all happened.
+    const QUIET: Turn =
+        Turn { requested: false, had_events: false, animating: false, idle_elapsed: false };
+
+    #[test]
+    fn a_wake_that_nothing_asked_for_draws_nothing() {
+        // What makes a shortened wait affordable: a stream's pace is how often
+        // the loop *may* draw, not how often it does. Without this a live
+        // session would rasterise the whole interface sixty times a second in
+        // order to present the same picture.
+        assert!(!QUIET.is_due());
+    }
+
+    #[test]
+    fn any_one_of_the_four_reasons_is_enough_on_its_own() {
+        for turn in [
+            Turn { requested: true, ..QUIET },
+            Turn { had_events: true, ..QUIET },
+            Turn { animating: true, ..QUIET },
+            Turn { idle_elapsed: true, ..QUIET },
+        ] {
+            assert!(turn.is_due(), "{turn:?} should have drawn");
+        }
+    }
+
+    #[test]
+    fn the_idle_timeout_still_draws_a_window_nobody_is_touching() {
+        // The behaviour every window had before there was anything else to
+        // consider, and the promise an application makes with
+        // `App::idle_timeout`: a machine that changed on its own is on screen
+        // within that long, whether or not anything thought to ask.
+        assert!(Turn { idle_elapsed: true, ..QUIET }.is_due());
+    }
 }

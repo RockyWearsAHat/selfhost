@@ -29,6 +29,13 @@
 //! input the daemon forwards, through [`crate::Injector`], releasing whatever is
 //! left held the moment the link closes.
 //!
+//! **How it was asked to run** ([`AgentOptions`], [`InputPolicy`],
+//! [`agent_arguments`]). The agent is a separate process and cannot read the
+//! daemon's config, so `[desktop].allow_input` travels to it on its command line
+//! and is honoured at the layer that would otherwise create the injector. That is
+//! the whole of the mechanism, and [`InputPolicy`] says why it is the command line
+//! and not the pipe.
+//!
 //! # Credit, and why a remote desktop drops frames rather than queueing them
 //!
 //! The link underneath is credit-controlled end to end — the browser grants the
@@ -1108,15 +1115,163 @@ pub fn decode_link(buffer: &[u8]) -> Result<Option<(LinkFrame, usize)>, Fault> {
     }
 }
 
+// ══ The deployment-wide input switch, and how it reaches a separate process ══
+
+/// The subcommand the daemon starts the agent with.
+///
+/// Spelled here rather than in the command-line crate because the daemon builds
+/// the whole argument vector with [`agent_arguments`], and the two halves of that
+/// contract — what is written and what is read — belong in one file or they drift.
+pub const AGENT_SUBCOMMAND: &str = "desk-agent";
+
+/// The flag naming the session the daemon aimed the agent at.
+pub const SESSION_FLAG: &str = "--session";
+
+/// The flag that grants the agent an injector, and the whole of the mechanism.
+///
+/// Exact and valueless: `--allow-input` grants, and **every other spelling
+/// refuses**, including `--allow-input=true`, `--allow-inputs` and a bare `true`
+/// following it. A switch whose off position is "anything I did not recognise" is
+/// the only shape of switch that stays off when a caller is upgraded, truncated
+/// or wrong.
+pub const ALLOW_INPUT_FLAG: &str = "--allow-input";
+
+/// Whether this deployment permits the machine to be driven, carried from the
+/// daemon's `[desktop].allow_input` into the agent process.
+///
+/// # Why a whole type for one bit
+///
+/// Because the bit crosses a process boundary and has to survive the crossing
+/// with its meaning intact. `selfhost_desk`'s `Policy` already refuses to mint a
+/// control ticket when the switch is off, and `selfhost_desk::viewer` already
+/// refuses each input message on the daemon's side — but the agent is a *separate
+/// process* that cannot read the daemon's config, and until this type existed the
+/// agent built an injector unconditionally and relied entirely on the daemon
+/// never forwarding it anything. That is a gate made of wiring: correct only for
+/// as long as every caller upstream stays correct. With this, a deployment that
+/// says `allow_input = false` has **no injector anywhere in the console session**,
+/// which is a property of the process rather than of the code that talks to it.
+///
+/// # How it reaches the agent, and why not over the pipe
+///
+/// On the agent's **command line**, fixed by `CreateProcessAsUserW` at the moment
+/// the daemon spawns it, read once by [`InputPolicy::from_arguments`] before the
+/// link is opened, and never re-read. Deliberately *not* a message on the pipe:
+/// the pipe's DACL admits `SYSTEM` and the console user's own SID (Windows cannot
+/// distinguish two processes of one user on a named object), so a switch that
+/// arrived as a frame would be a switch anything that can talk to the pipe could
+/// assert. Nothing that can talk to the pipe can alter the argv of a process that
+/// has already parsed it.
+///
+/// It is not a secret and does not need to be — a command line is readable by
+/// every process on the machine, which is exactly why the *pipe's ACL* and not a
+/// token is what authenticates the link. This value is a capability the parent
+/// grants, and the two gates are independent: the daemon forwards no input when
+/// its config says no, and the agent holds no injector when its argv says no.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InputPolicy {
+    /// The agent streams pixels and builds no injector at all.
+    ViewOnly,
+    /// The agent may build an injector and perform the input the daemon forwards.
+    AllowInput,
+}
+
+impl InputPolicy {
+    /// The policy `[desktop].allow_input` describes.
+    pub const fn from_config(allow_input: bool) -> Self {
+        if allow_input {
+            Self::AllowInput
+        } else {
+            Self::ViewOnly
+        }
+    }
+
+    /// Whether an injector may exist.
+    pub const fn allows(self) -> bool {
+        matches!(self, Self::AllowInput)
+    }
+
+    /// The policy an agent started with `arguments` runs under.
+    ///
+    /// **Fail-closed by construction**: this looks for one exact word and answers
+    /// [`InputPolicy::ViewOnly`] for its absence, for a misspelling, for an empty
+    /// vector, and for arguments this build has never heard of. There is no
+    /// parse error to mishandle, because the only two outcomes are "the daemon
+    /// asked for input" and "nothing here asked for input".
+    ///
+    /// `arguments` is the whole argv tail as the command-line crate hands it
+    /// around, `arguments[0]` being [`AGENT_SUBCOMMAND`].
+    pub fn from_arguments(arguments: &[String]) -> Self {
+        if arguments.iter().any(|argument| argument == ALLOW_INPUT_FLAG) {
+            Self::AllowInput
+        } else {
+            Self::ViewOnly
+        }
+    }
+}
+
+/// The argument vector the daemon spawns the agent with.
+///
+/// The inverse of [`InputPolicy::from_arguments`] and of the command-line crate's
+/// `--session` parsing, and the only supported way to build one: an argv assembled
+/// by hand somewhere else is an argv that will still be granting input a year after
+/// the flag's spelling changed.
+///
+/// The result is the tail **excluding the program name**, which is the shape
+/// `crate::windows::spawn::AgentCommand` takes — Windows is handed the executable
+/// separately as `lpApplicationName`, and `crate::windows::command_line` repeats it
+/// as `argv[0]`.
+pub fn agent_arguments(session: u32, input: InputPolicy) -> Vec<String> {
+    let mut arguments =
+        vec![AGENT_SUBCOMMAND.to_owned(), SESSION_FLAG.to_owned(), session.to_string()];
+    if input.allows() {
+        arguments.push(ALLOW_INPUT_FLAG.to_owned());
+    }
+    arguments
+}
+
+/// How the agent was asked to run.
+///
+/// Built on every platform, though only Windows has a `run` to hand it to, so
+/// that the argv contract above is exercised by the tests in this file on a
+/// developer's Mac rather than only on the machine it ships to.
+#[derive(Debug, Clone)]
+pub struct AgentOptions {
+    /// The session whose pipe to connect to. Checked against the agent's own
+    /// session, because a mismatch means the daemon aimed at a session that has
+    /// since been replaced and the agent must not answer for it.
+    pub session: u32,
+    /// What to stream under.
+    pub config: StreamConfig,
+    /// Whether an injector may be built at all. See [`InputPolicy`].
+    pub input: InputPolicy,
+}
+
+impl AgentOptions {
+    /// The options an agent invoked with `arguments` runs under.
+    ///
+    /// `session` is passed separately because the command-line crate has already
+    /// parsed and cross-checked it — an agent must prove it is *in* the session it
+    /// was aimed at before it captures anything, and that check needs the number
+    /// long before this is called.
+    pub fn from_arguments(session: u32, arguments: &[String]) -> Self {
+        Self {
+            session,
+            config: StreamConfig::default(),
+            input: InputPolicy::from_arguments(arguments),
+        }
+    }
+}
+
 #[cfg(windows)]
-pub use self::windows_body::{run, AgentOptions};
+pub use self::windows_body::run;
 
 /// The Windows process body: everything that only the machine itself can do.
 #[cfg(windows)]
 mod windows_body {
     use super::{
-        decode_link, encode_link, AgentReport, CreditWindow, Delivery, FrameSink, LinkFrame,
-        SendError, StreamConfig, Streamer,
+        decode_link, encode_link, AgentOptions, AgentReport, CreditWindow, Delivery, FrameSink,
+        InputPolicy, LinkFrame, SendError, Streamer,
     };
     use crate::windows::{
         cursor::GdiCursor, gdi::GdiCapture, identity, inject::WinInjector, pipe::DaemonLink,
@@ -1144,17 +1299,6 @@ mod windows_body {
     /// Short on purpose: what arrives here is credit, and a loop that waits a long
     /// time for a grant is a loop that is not capturing while it waits.
     const READ_TIMEOUT: Duration = Duration::from_millis(1);
-
-    /// How the agent was asked to run.
-    #[derive(Debug, Clone)]
-    pub struct AgentOptions {
-        /// The session whose pipe to connect to. Checked against the agent's own
-        /// session, because a mismatch means the daemon aimed at a session that has
-        /// since been replaced and the agent must not answer for it.
-        pub session: u32,
-        /// What to stream under.
-        pub config: StreamConfig,
-    }
 
     /// The agent's whole life.
     ///
@@ -1200,6 +1344,14 @@ mod windows_body {
         send_or_exit(&mut sink, &hello)?;
 
         let mut detail = report.sentence();
+        if !options.input.allows() {
+            // Said in the opening line for the same reason the desktop is: an
+            // operator whose keystrokes do nothing needs the reason at the moment
+            // they look, and "the config says view-only" is a thirty-second fix
+            // where "nothing happens when I type" is an afternoon.
+            detail.push_str(" — view-only: [desktop].allow_input is false, so this agent \
+                             holds no injector at all");
+        }
         if !identity::landed_interactively(&report.window_station, &report.desktop) {
             // The two failures that produce a process which runs perfectly and shows
             // nothing. Said in the opening line, because by the time anybody looks at
@@ -1216,10 +1368,14 @@ mod windows_body {
             },
         )?;
 
-        // Built after the link is up, so that a machine which cannot inject at all
-        // still streams its screen: viewing and driving are separate capabilities
-        // everywhere else in this subsystem and they are separate here too.
-        let mut hands = Hands::open();
+        // The deployment's own switch, consulted **here**, where the injector is
+        // created, rather than only at the layers that forward input to it: a
+        // view-only deployment must have no injector in the console session, not
+        // an injector nobody currently sends anything to. Built after the link is
+        // up so that a machine which cannot inject at all still streams its screen
+        // — viewing and driving are separate capabilities everywhere else in this
+        // subsystem and they are separate here too.
+        let mut hands = Hands::open(options.input);
 
         loop {
             match sink.pump_incoming(&mut streamer, &mut hands)? {
@@ -1267,6 +1423,21 @@ mod windows_body {
 
     /// The agent's keyboard and pointer.
     ///
+    /// # The deployment's switch is enforced here, not upstream of here
+    ///
+    /// [`InputPolicy::ViewOnly`] means [`Hands::open`] never calls
+    /// `WinInjector::new` at all, so a view-only deployment has no injector
+    /// anywhere in the console session — no display enumeration for pointer
+    /// normalisation, no held-key record that could be posted, nothing. Every
+    /// input message is answered with [`Refusal::InputDisabled`], which is the
+    /// same word `selfhost_desk`'s policy uses when it refuses to mint the ticket,
+    /// so the console's sentence is identical whichever gate the operator ran into.
+    ///
+    /// This is deliberately redundant with the daemon, which already refuses to
+    /// forward input under the same config. Redundant is the point: the daemon's
+    /// refusal is a property of the code that talks to this process, and this one
+    /// is a property of the process.
+    ///
     /// # Why the injector is optional
     ///
     /// For exactly the same reason [`Screen`] is: a session with no displays cannot
@@ -1292,21 +1463,40 @@ mod windows_body {
     /// dropping mid-drag, where the client that would have sent `RELEASE_ALL` is the
     /// thing that vanished.
     struct Hands {
-        /// The injector, absent when the session could not produce one.
+        /// The injector, absent when the deployment forbids one or the session
+        /// could not produce one.
         injector: Option<WinInjector>,
         /// What the client believes is held.
         held: HeldKeys,
         /// Why there is no injector, for the refusal that goes back.
         absent: Option<InjectError>,
+        /// Whether this deployment permits an injector at all. Kept so that
+        /// [`Hands::rebuild`] cannot quietly grant one that start-up refused.
+        policy: InputPolicy,
     }
 
     impl Hands {
-        /// Builds an injector, or remembers why it could not.
-        fn open() -> Self {
+        /// Builds an injector if the deployment allows one, or remembers why there
+        /// is none.
+        ///
+        /// A refused deployment is answered before `WinInjector::new` is reached,
+        /// so the view-only case is not "an injector that is never used" but no
+        /// injector at all.
+        fn open(policy: InputPolicy) -> Self {
+            if !policy.allows() {
+                return Self {
+                    injector: None,
+                    held: HeldKeys::new(),
+                    absent: Some(InjectError::Refused(Refusal::InputDisabled)),
+                    policy,
+                };
+            }
             match WinInjector::new() {
-                Ok(injector) => Self { injector: Some(injector), held: HeldKeys::new(), absent: None },
+                Ok(injector) => {
+                    Self { injector: Some(injector), held: HeldKeys::new(), absent: None, policy }
+                }
                 Err(reason) => {
-                    Self { injector: None, held: HeldKeys::new(), absent: Some(reason) }
+                    Self { injector: None, held: HeldKeys::new(), absent: Some(reason), policy }
                 }
             }
         }
@@ -1332,8 +1522,13 @@ mod windows_body {
         /// by a fresh injector whose own state carries no modifier mask — so `Ctrl+C`
         /// would arrive on the far machine as a bare `C`, silently, because a monitor
         /// was unplugged mid-chord.
+        ///
+        /// The policy *is* carried across, because it is not session state: a
+        /// display being plugged in is not a change of what the deployment
+        /// permits, and a rebuild that re-derived the answer from anywhere else
+        /// would be a second route to an injector.
         fn rebuild(&mut self) {
-            *self = Self::open();
+            *self = Self::open(self.policy);
         }
 
         /// Performs one message, or answers why it will not be.
@@ -1346,8 +1541,14 @@ mod windows_body {
                 return None;
             }
             let Some(injector) = self.injector.as_mut() else {
-                // No injector at all. `NotLive` is the truthful word: this session
-                // has no displays to point at.
+                // No injector at all, for one of two reasons that must not be
+                // confused: the deployment forbids one, which is
+                // `Refusal::InputDisabled` and is permanent until an operator
+                // changes the config; or the session has no displays to point at,
+                // which is `NotLive` and comes back by itself. Both are already
+                // recorded in `absent`, and the fallback is the second because an
+                // injector that vanished without a recorded reason is a session
+                // that is not live.
                 return Some(
                     self.absent
                         .as_ref()
@@ -2359,5 +2560,69 @@ mod tests {
         // the client's business and a capture state is the console's.
         assert_eq!(Refusal::NotPermitted.code(), Refusal::NotPermitted.code());
         assert!(!CaptureError::SecureDesktop.is_fatal());
+    }
+
+    #[test]
+    fn the_switch_survives_the_process_boundary_in_both_positions() {
+        // The whole contract in one test: what the daemon writes is what the
+        // agent reads, for both answers, so neither half can be changed alone.
+        for (configured, expected) in
+            [(false, InputPolicy::ViewOnly), (true, InputPolicy::AllowInput)]
+        {
+            let policy = InputPolicy::from_config(configured);
+            let argv = agent_arguments(7, policy);
+            assert_eq!(argv.first().map(String::as_str), Some(AGENT_SUBCOMMAND));
+            assert!(argv.contains(&"7".to_owned()), "the session travels too: {argv:?}");
+            assert_eq!(InputPolicy::from_arguments(&argv), expected, "{argv:?}");
+            assert_eq!(AgentOptions::from_arguments(7, &argv).input, expected);
+        }
+    }
+
+    #[test]
+    fn a_view_only_deployment_puts_no_grant_anywhere_in_the_argv() {
+        // Not merely "the parser answers ViewOnly": the word must not be on the
+        // command line at all, because the command line is what a later reader —
+        // a log, an operator, a different parser — will believe.
+        let argv = agent_arguments(3, InputPolicy::ViewOnly);
+        assert!(
+            !argv.iter().any(|argument| argument.contains("allow-input")),
+            "a view-only spawn must not mention input at all: {argv:?}"
+        );
+    }
+
+    #[test]
+    fn anything_that_is_not_the_exact_flag_leaves_input_off() {
+        // The fail-closed property, stated as the cases that have actually gone
+        // wrong elsewhere: a value-taking spelling, a plural, a stray `true`, a
+        // flag for something else, and nothing at all.
+        let refused = [
+            vec![],
+            vec!["desk-agent".to_owned()],
+            vec!["--allow-input=true".to_owned()],
+            vec!["--allow-inputs".to_owned()],
+            vec!["--allow".to_owned(), "input".to_owned()],
+            vec!["--session".to_owned(), "true".to_owned()],
+            vec!["allow-input".to_owned()],
+            vec![" --allow-input".to_owned()],
+        ];
+        for argv in refused {
+            assert_eq!(
+                InputPolicy::from_arguments(&argv),
+                InputPolicy::ViewOnly,
+                "{argv:?} must not grant an injector"
+            );
+        }
+    }
+
+    #[test]
+    fn only_the_configured_switch_can_open_the_door() {
+        // `from_config` is the single place the daemon's boolean becomes a policy,
+        // and `allows` is the single question the agent asks before it builds an
+        // injector. Both directions are pinned so a later refactor cannot invert
+        // one of them silently.
+        assert!(!InputPolicy::from_config(false).allows());
+        assert!(InputPolicy::from_config(true).allows());
+        assert!(!InputPolicy::ViewOnly.allows());
+        assert!(InputPolicy::AllowInput.allows());
     }
 }

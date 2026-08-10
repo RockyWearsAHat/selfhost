@@ -60,15 +60,49 @@
 //!
 //! # Credit
 //!
-//! At zero credit the driver **drops the frame and keeps the previous surface**,
-//! so the damage merges into the next one it can afford. A remote desktop must
-//! show the present, not a backlog, and merging is free: the next
-//! [`crate::tiles::diff`] is taken against the last surface the client actually
-//! received, so it necessarily contains everything that has changed since. Each
-//! drop is counted in [`Stats::credit_stalls`] so an operator can see a starved
-//! link rather than guess at one.
+//! Three facts decide the whole of this, and the first release got the
+//! relationship between them wrong:
+//!
+//! 1. A **frame** is a set of tiles, and tiles are independently decodable —
+//!    each one carries its own coordinates and its own encoding.
+//! 2. The **window** bounds the bytes that may be in flight at one instant. It
+//!    is a property of the link, not of the picture.
+//! 3. At zero credit the driver must **drop and merge damage rather than
+//!    queue**, because a remote desktop shows the present and not a backlog.
+//!
+//! Rule 3 is about a backlog of *stale frames*. It was never a reason to make a
+//! single frame that is larger than the window undeliverable — and yet comparing
+//! a whole frame's byte total against the window did exactly that: the first
+//! frame of a session is always a keyframe, a keyframe for a 3024×1964 display
+//! is about 1457 tiles, and 1457 tiles do not fit in 256 KiB. Every frame was
+//! declined, forever, and the stream delivered a `Hello` and then nothing.
+//!
+//! So admission is decided **per message, not per frame**:
+//!
+//! - Zero credit when a frame is offered means the link is saturated: the whole
+//!   frame is declined, [`Viewer::previous`] stays where it is, and the damage
+//!   merges into the next frame the link can afford. That is rule 3, intact.
+//! - With any credit at all the frame is *begun*, and its tiles are written
+//!   while the window allows. The window is re-read between tiles, because the
+//!   transport returns it as bytes leave — so a link that can carry the frame
+//!   carries all of it in one pass, and the 256 KiB figure never has to be
+//!   larger than the bytes genuinely outstanding.
+//! - Tiles the window would not admit are **owed**, not lost. Their coordinates
+//!   are remembered, and they are re-encoded **from the newest pixels** — either
+//!   folded into the next frame's diff, or, on a desktop that has stopped
+//!   changing, flushed on their own by [`Viewer::flush_owed`]. Nothing stale is
+//!   ever put on the wire and nothing damaged is ever forgotten.
+//!
+//! [`Stats::credit_stalls`] counts declined frames and [`Stats::tiles_deferred`]
+//! counts owed tiles, so a starved link is visible in the diagnostics plate
+//! rather than guessed at.
+//!
+//! The window itself has two sources. The transport always has one — its own
+//! socket, which is the only backpressure a browser gives us. A client may also
+//! declare one by sending [`Message::Credit`], after which the driver honours the
+//! smaller of the two; see that message for why it is opt-in.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::fmt;
 use std::future::Future;
 use std::pin::Pin;
@@ -81,7 +115,7 @@ use crate::cursor::{CursorPolicy, Pointer, ShapeId, DEFAULT_CAPACITY};
 use crate::grant::{Capabilities, Redemption, SessionId};
 use crate::keys::{HeldKeys, Usage};
 use crate::state::{Action, Limits, Observation, Phase, Session, Surrender, Suspension};
-use crate::tiles::{diff, Surface, TileSize};
+use crate::tiles::{diff, encode_tile, Grid, Surface, TileCoord, TileError, TileSize, TileUpdate};
 use crate::wire::{
     Button, CursorPos, CursorShape, Direction, FrameBegin, Hello, Message, Monitor, Refusal,
     TileMessage, WireError, MAX_CURSOR_EDGE, MAX_MONITORS, PROTOCOL_VERSION,
@@ -108,6 +142,19 @@ pub const DEFAULT_MAX_FPS: u8 = 30;
 
 /// The default hard stream ceiling, matching `[desktop].max_session`.
 pub const DEFAULT_MAX_SESSION: Duration = Duration::from_secs(4 * 60 * 60);
+
+/// The initial send window: how many payload bytes may be in flight towards one
+/// viewer before the driver stops producing.
+///
+/// The mux's own initial window, in the same currency, because the two are the
+/// same quantity measured on two hops and an operator reading `credit_stalls`
+/// should not have to know which one they are looking at.
+///
+/// It is emphatically **not** a ceiling on the size of a frame. A keyframe for a
+/// 3024×1964 display is roughly 1457 tiles and megabytes of payload; it is
+/// delivered by spending this window, having it returned as the bytes leave, and
+/// spending it again. See this module's *Credit* section.
+pub const DEFAULT_SEND_WINDOW: u32 = 256 * 1024;
 
 /// The shortest the driver will ever wait before looking for another frame.
 ///
@@ -160,12 +207,23 @@ pub trait Outbound: Send {
     /// Writes one complete protocol message.
     fn send<'a>(&'a mut self, frame: &'a [u8]) -> Task<'a, Result<(), StreamError>>;
 
-    /// How many payload bytes the peer has authorised and this end has not yet
-    /// spent.
+    /// How many payload bytes may be written **right now** without the bytes in
+    /// flight exceeding the link's window.
     ///
-    /// Read before a frame is offered, never after: the driver's whole flow
-    /// policy is to decline to produce what it cannot afford, rather than to
-    /// queue it and let the buffer grow.
+    /// This is a measure of the link's instantaneous headroom, not a budget for
+    /// a picture. Two consequences, and both are contract:
+    ///
+    /// 1. **It is re-read between messages, not once per frame.** An
+    ///    implementation must therefore return credit as bytes leave, or a frame
+    ///    larger than the window can never be delivered at all.
+    /// 2. **It must never be a switch dressed as a byte count.** Answering
+    ///    "the whole window" while the transport is in fact backed up teaches the
+    ///    driver nothing, and answering zero for anything other than a full
+    ///    window stops the picture.
+    ///
+    /// Zero is a real answer and means the link is saturated this instant: the
+    /// driver declines the frame and merges its damage forward rather than
+    /// queueing it.
     fn credit(&self) -> u32;
 
     /// Closes the channel, carrying the reason for the peer's log.
@@ -664,9 +722,20 @@ pub struct Stats {
     pub tiles_sent: u64,
     /// Payload bytes written.
     pub bytes_sent: u64,
-    /// Frames dropped because the peer had granted no credit for them. Damage
-    /// merged into the next frame; this counts how often that happened.
+    /// Frames declined whole because the link had no headroom at all when they
+    /// were offered. Damage merged into the next frame the link could afford;
+    /// this counts how often that happened.
     pub credit_stalls: u64,
+    /// Tiles held back from a frame that had started, because the window ran out
+    /// part-way through it.
+    ///
+    /// Separate from [`Stats::credit_stalls`] because the two mean different
+    /// things to an operator: stalls say the link cannot start a frame, deferrals
+    /// say it cannot finish one in a single pass. A large first frame on a
+    /// healthy link produces neither — the window is returned as fast as it is
+    /// spent — so a non-zero count here is a genuinely narrow link and not the
+    /// ordinary cost of a keyframe.
+    pub tiles_deferred: u64,
     /// Cursor updates dropped for want of credit.
     pub cursor_stalls: u64,
     /// Cursor bitmaps the platform reported in a shape the protocol cannot
@@ -746,6 +815,34 @@ pub fn input_refusal(live: Capabilities, allow_input: bool, phase: Phase) -> Opt
 /// and a stream must lose the capability the moment *either* does.
 pub fn effective(granted: Capabilities, standing: Capabilities) -> Capabilities {
     Capabilities::from_bits(granted.bits() & standing.bits()).unwrap_or_else(Capabilities::none)
+}
+
+/// Encodes named tiles of a surface, in the order they were asked for.
+///
+/// The one place owed tiles turn back into payloads. Free rather than a method
+/// because it is a pure function of a surface, a grid size and a set of
+/// coordinates — nothing about a session decides what a tile's bytes are — and a
+/// pure function is what lets "the client is sent the newest pixels for a region,
+/// however long ago it became damaged" be tested directly.
+///
+/// A coordinate outside the surface's grid is a [`TileError`] rather than a
+/// silent skip: it can only mean the owed set and the surface have come from
+/// different frames, and the caller's correct response is to forget both and send
+/// a keyframe.
+fn encode_tiles(
+    surface: &Surface,
+    size: TileSize,
+    coords: &[TileCoord],
+) -> Result<Vec<TileUpdate>, TileError> {
+    let grid = Grid::new(size, surface.width(), surface.height())?;
+    let mut updates = Vec::with_capacity(coords.len());
+    for &coord in coords {
+        let bounds = grid.bounds(coord)?;
+        let pixels = surface.tile(bounds)?;
+        let (encoding, payload) = encode_tile(&pixels)?;
+        updates.push(TileUpdate { coord, encoding, payload });
+    }
+    Ok(updates)
 }
 
 /// Turns a platform cursor bitmap into a wire message, or refuses it.
@@ -866,6 +963,23 @@ pub struct Viewer<'a> {
     buttons: HeldButtons,
     previous: Option<Surface>,
     previous_monitor: Option<u8>,
+    /// Tiles of [`Viewer::previous`] the client has **not** been given, because
+    /// the window ran out part-way through the frame that would have carried
+    /// them.
+    ///
+    /// Coordinates rather than payloads, which is the whole point: what the
+    /// client is owed is a *region*, and the pixels for it are taken from the
+    /// newest surface at the moment it is finally sent. A queue of encoded
+    /// payloads would be a backlog of stale pixels, which is exactly what this
+    /// driver refuses to keep.
+    owed: BTreeSet<TileCoord>,
+    /// The window this client declared for itself with [`Message::Credit`], or
+    /// `None` for a client that has never sent one.
+    ///
+    /// `None` and `Some(0)` are deliberately different: a client that has said
+    /// nothing is bounded by the transport alone, and a client that has spent the
+    /// window it declared is bounded until it grants more.
+    peer_window: Option<u32>,
     sequence: u64,
     pending_restore: Option<Restore>,
     stats: Stats,
@@ -908,6 +1022,8 @@ impl<'a> Viewer<'a> {
             buttons: HeldButtons::default(),
             previous: None,
             previous_monitor: None,
+            owed: BTreeSet::new(),
+            peer_window: None,
             sequence: 0,
             pending_restore: None,
             stats: Stats::default(),
@@ -1094,8 +1210,7 @@ impl<'a> Viewer<'a> {
                     // next frame must be a keyframe and the pointer must be
                     // re-sent, because what the client is holding was produced
                     // by an object that no longer exists.
-                    self.previous = None;
-                    self.previous_monitor = None;
+                    self.forget_client_state();
                     self.cursor.forget();
                     Observation::Retry
                 }
@@ -1122,10 +1237,17 @@ impl<'a> Viewer<'a> {
             self.emit(&Message::Status { notice, detail }, deadline).await?;
         }
 
-        if let Some(frame) = captured {
-            if self.machine.phase() == Phase::Live && live.contains(Capabilities::VIEW) {
-                self.send_frame(frame, deadline).await?;
-                self.send_pointer(deadline).await?;
+        if self.machine.phase() == Phase::Live && live.contains(Capabilities::VIEW) {
+            match captured {
+                Some(frame) => {
+                    self.send_frame(frame, deadline).await?;
+                    self.send_pointer(deadline).await?;
+                }
+                // No new pixels, but possibly an unfinished frame. A desktop that
+                // goes still right after a truncated keyframe would otherwise
+                // hold its missing tiles forever: the merge path needs a next
+                // frame to merge into, and there is not going to be one.
+                None => self.flush_owed(deadline).await?,
             }
         }
 
@@ -1152,13 +1274,47 @@ impl<'a> Viewer<'a> {
         })
     }
 
-    /// Diffs one frame against what the client is holding and sends the result,
-    /// or drops it for want of credit.
+    /// How many payload bytes may go on the wire this instant.
     ///
-    /// Dropping keeps [`Viewer::previous`] exactly where it was, which is what
-    /// makes the damage merge: the next diff is taken against the last surface
-    /// the client actually received, so it contains everything that changed
-    /// while the link was starved.
+    /// The smaller of the link's own headroom and — for a client that has opted
+    /// into explicit flow control by sending [`Message::Credit`] — the window it
+    /// declared. A client that has never granted anything is bounded by the
+    /// transport alone, which is what makes the explicit half opt-in rather than
+    /// a gate a silent browser could close.
+    fn affordable(&self) -> u32 {
+        let link = self.wiring.outbound.credit();
+        match self.peer_window {
+            Some(granted) => link.min(granted),
+            None => link,
+        }
+    }
+
+    /// Records that `spent` bytes went out, against the client's declared window.
+    ///
+    /// The link's own window is the transport's to account for; this end only
+    /// tracks the half the client asked to own.
+    fn spend(&mut self, spent: usize) {
+        let Some(window) = self.peer_window else { return };
+        let spent = u32::try_from(spent).unwrap_or(u32::MAX);
+        self.peer_window = Some(window.saturating_sub(spent));
+    }
+
+    /// Diffs one frame against what the client is holding and sends as much of
+    /// the result as the window allows.
+    ///
+    /// Two different things happen at zero credit, and the distinction is the
+    /// whole of this driver's flow control:
+    ///
+    /// - **Before the frame begins**, zero credit declines it whole and records
+    ///   nothing about it: the client is still described by whatever it was
+    ///   described by a moment ago, so the next diff necessarily contains
+    ///   everything that changed while the link was starved. That is the "show
+    ///   the present, not a backlog" rule.
+    /// - **Part-way through**, the tiles that did not fit are *owed*: their
+    ///   coordinates are kept and their pixels are re-taken from a newer surface
+    ///   later. A frame is a set of independently decodable tiles, so a
+    ///   truncated one is a correct partial update rather than a corrupt frame,
+    ///   and nothing stale is ever queued to send it.
     async fn send_frame(
         &mut self,
         frame: CapturedFrame,
@@ -1175,58 +1331,173 @@ impl<'a> Viewer<'a> {
         }
 
         let keyframe = self.previous.is_none();
-        let updates = match diff(self.previous.as_ref(), &frame.surface, self.ceilings.tile) {
-            Ok(updates) => updates,
-            Err(_) => {
-                // A surface the grid cannot describe is not a reason to end a
-                // session: drop the frame, forget the history, and let the next
-                // capture try as a keyframe.
-                self.previous = None;
-                self.previous_monitor = None;
-                return Ok(());
-            }
-        };
+        if keyframe {
+            // A keyframe carries every tile of the new geometry, so whatever was
+            // owed against the old one is both satisfied and, if the shape
+            // changed, out of range.
+            self.owed.clear();
+        }
+        let updates =
+            match self.frame_updates(self.previous.as_ref(), &frame.surface, keyframe) {
+                Ok(updates) => updates,
+                Err(_) => {
+                    // A surface the grid cannot describe is not a reason to end a
+                    // session: drop the frame, forget the history, and let the next
+                    // capture try as a keyframe.
+                    self.forget_client_state();
+                    return Ok(());
+                }
+            };
         if updates.is_empty() && !keyframe {
             // A still desktop costs nothing at all — not even a frame marker.
             return Ok(());
         }
 
-        let sequence = self.sequence.wrapping_add(1);
-        let tiles = updates.len();
-        let mut encoded = Vec::with_capacity(tiles.saturating_add(2));
-        encoded.push(encode(&Message::FrameBegin(FrameBegin {
-            monitor: frame.monitor,
-            sequence,
-            width: frame.surface.width(),
-            height: frame.surface.height(),
-            keyframe,
-        }))?);
-        for update in updates {
-            encoded.push(encode(&Message::Tile(TileMessage {
-                monitor: frame.monitor,
-                col: update.coord.col,
-                row: update.coord.row,
-                encoding: update.encoding,
-                payload: update.payload,
-            }))?);
-        }
-        encoded.push(encode(&Message::FrameEnd { sequence })?);
-
-        let total: u64 = encoded.iter().map(|frame| frame.len() as u64).sum();
-        if u64::from(self.wiring.outbound.credit()) < total {
+        if self.affordable() == 0 {
+            // Declined whole, and nothing is remembered about it: `previous`
+            // stays where it was, so the next diff is taken against the surface
+            // the client actually holds and rediscovers all of this damage by
+            // itself. Merging by *not* recording anything is what keeps a starved
+            // link from accumulating a backlog.
             self.stats.credit_stalls = self.stats.credit_stalls.saturating_add(1);
             return Ok(());
         }
 
-        for bytes in &encoded {
-            self.write(bytes, deadline).await?;
-        }
-        self.sequence = sequence;
+        // Committed before a byte is written, and deliberately: from here on the
+        // client is described by *this* surface minus whatever tiles of it end up
+        // owed, and that pair is what the next diff must be taken against.
+        let (width, height) = (frame.surface.width(), frame.surface.height());
         self.previous = Some(frame.surface);
         self.previous_monitor = Some(frame.monitor);
+        self.deliver_frame(frame.monitor, width, height, updates, keyframe, deadline).await
+    }
+
+    /// The tiles this frame must carry: what changed, plus what is still owed.
+    ///
+    /// The owed tiles are re-encoded from `current` rather than from whatever
+    /// surface first damaged them, which is what makes deferral a merge instead
+    /// of a backlog — the client is always sent the newest pixels for a region,
+    /// however long ago the region became damaged.
+    fn frame_updates(
+        &self,
+        previous: Option<&Surface>,
+        current: &Surface,
+        keyframe: bool,
+    ) -> Result<Vec<TileUpdate>, TileError> {
+        let mut updates = diff(previous, current, self.ceilings.tile)?;
+        if keyframe || self.owed.is_empty() {
+            return Ok(updates);
+        }
+        let fresh: BTreeSet<TileCoord> = updates.iter().map(|update| update.coord).collect();
+        let carry: Vec<TileCoord> =
+            self.owed.iter().copied().filter(|coord| !fresh.contains(coord)).collect();
+        updates.extend(encode_tiles(current, self.ceilings.tile, &carry)?);
+        // In grid order, so a truncated frame fills the picture top-to-bottom
+        // rather than in whatever order the two sources happened to produce.
+        updates.sort_by_key(|update| (update.coord.row, update.coord.col));
+        Ok(updates)
+    }
+
+    /// Writes one frame's messages, stopping at the window and owing the rest.
+    ///
+    /// Called only with headroom to begin: the "no credit at all" decision
+    /// belongs to the caller, which still holds the choice of forgetting the
+    /// frame entirely. `FrameBegin` and `FrameEnd` are then written
+    /// unconditionally — they are a couple of dozen bytes between them, and a
+    /// frame whose end never arrives is a frame the client will not present.
+    async fn deliver_frame(
+        &mut self,
+        monitor: u8,
+        width: u32,
+        height: u32,
+        updates: Vec<TileUpdate>,
+        keyframe: bool,
+        deadline: tokio::time::Instant,
+    ) -> Result<(), Ending> {
+        let sequence = self.sequence.wrapping_add(1);
+        let begin = encode(&Message::FrameBegin(FrameBegin {
+            monitor,
+            sequence,
+            width,
+            height,
+            keyframe,
+        }))?;
+        self.write(&begin, deadline).await?;
+
+        let mut sent = 0u64;
+        let mut deferred = BTreeSet::new();
+        for update in updates {
+            // Re-read per tile, never once per frame: the transport returns the
+            // window as bytes leave, so a link that can carry this frame carries
+            // all of it here rather than over the next several seconds.
+            if self.affordable() == 0 {
+                deferred.insert(update.coord);
+                continue;
+            }
+            let bytes = encode(&Message::Tile(TileMessage {
+                monitor,
+                col: update.coord.col,
+                row: update.coord.row,
+                encoding: update.encoding,
+                payload: update.payload,
+            }))?;
+            self.write(&bytes, deadline).await?;
+            self.spend(bytes.len());
+            sent = sent.saturating_add(1);
+        }
+        let end = encode(&Message::FrameEnd { sequence })?;
+        self.write(&end, deadline).await?;
+
+        self.sequence = sequence;
         self.stats.frames_sent = self.stats.frames_sent.saturating_add(1);
-        self.stats.tiles_sent = self.stats.tiles_sent.saturating_add(tiles as u64);
+        self.stats.tiles_sent = self.stats.tiles_sent.saturating_add(sent);
+        self.stats.tiles_deferred =
+            self.stats.tiles_deferred.saturating_add(deferred.len() as u64);
+        self.owed = deferred;
         Ok(())
+    }
+
+    /// Sends tiles owed from an earlier frame when no new pixels arrived.
+    ///
+    /// Without this a truncated frame on a desktop that then stops changing would
+    /// never complete: the merge path only runs when there is a next frame to
+    /// merge into, and a still screen produces none. The pixels come from
+    /// [`Viewer::previous`], which is the newest surface this end has.
+    async fn flush_owed(&mut self, deadline: tokio::time::Instant) -> Result<(), Ending> {
+        if self.owed.is_empty() || self.affordable() == 0 {
+            return Ok(());
+        }
+        let (Some(surface), Some(monitor)) = (self.previous.as_ref(), self.previous_monitor)
+        else {
+            // Nothing describes what is owed any more; the next frame is a
+            // keyframe and covers it.
+            self.owed.clear();
+            return Ok(());
+        };
+        let carry: Vec<TileCoord> = self.owed.iter().copied().collect();
+        let (width, height) = (surface.width(), surface.height());
+        let carried = encode_tiles(surface, self.ceilings.tile, &carry);
+        let updates = match carried {
+            Ok(updates) => updates,
+            Err(_) => {
+                self.forget_client_state();
+                return Ok(());
+            }
+        };
+        self.deliver_frame(monitor, width, height, updates, false, deadline).await
+    }
+
+    /// Forgets everything believed about the client's picture, so the next frame
+    /// is a keyframe.
+    ///
+    /// One function rather than three assignments at five call sites, because the
+    /// three pieces of state are only correct together: a `previous` surface
+    /// without its monitor, or an `owed` set naming tiles of a surface that no
+    /// longer exists, is a picture made of two frames.
+    fn forget_client_state(&mut self) {
+        self.previous = None;
+        self.previous_monitor = None;
+        self.owed.clear();
     }
 
     /// Sends whatever the pointer policy says the client is missing.
@@ -1272,12 +1543,13 @@ impl<'a> Viewer<'a> {
             }));
         }
 
-        let mut encoded = Vec::with_capacity(messages.len());
-        for message in &messages {
-            encoded.push(encode(message)?);
-        }
-        let total: u64 = encoded.iter().map(|frame| frame.len() as u64).sum();
-        if u64::from(self.wiring.outbound.credit()) < total {
+        // All or nothing, and on headroom rather than on size — the two cursor
+        // messages are a pair (a shape carries no position) and a half-sent
+        // pointer is worse than a stale one. Compared against the window's
+        // *emptiness*, never against the pair's byte total: a shape bitmap larger
+        // than the window would otherwise be permanently undeliverable, which is
+        // the same mistake that made frames undeliverable.
+        if self.affordable() == 0 {
             // Unlike a frame, a skipped cursor update does not merge on its own:
             // the policy has already recorded the shape as sent. Forgetting puts
             // both back on the wire the next time there is credit for them.
@@ -1285,8 +1557,10 @@ impl<'a> Viewer<'a> {
             self.stats.cursor_stalls = self.stats.cursor_stalls.saturating_add(1);
             return Ok(());
         }
-        for bytes in &encoded {
-            self.write(bytes, deadline).await?;
+        for message in &messages {
+            let bytes = encode(message)?;
+            self.write(&bytes, deadline).await?;
+            self.spend(bytes.len());
         }
         Ok(())
     }
@@ -1312,9 +1586,18 @@ impl<'a> Viewer<'a> {
             Message::ReleaseAll => self.release_everything(deadline).await,
 
             Message::RequestFullFrame { .. } => {
-                self.previous = None;
-                self.previous_monitor = None;
+                self.forget_client_state();
                 self.cursor.forget();
+                Ok(())
+            }
+
+            // Flow control, not input: never authorised, never audited, and
+            // never refused. A grant only ever *permits* bytes, so the worst a
+            // hostile grant can do is let this end write faster than the client
+            // wanted — which the transport's own window still bounds.
+            Message::Credit { bytes } => {
+                self.peer_window =
+                    Some(self.peer_window.unwrap_or(0).saturating_add(*bytes));
                 Ok(())
             }
 
@@ -1549,6 +1832,48 @@ mod tests {
         Surface::new(128, 64, pixels).expect("a tight buffer")
     }
 
+    /// A surface of any extent, painted in sixteen-pixel bands.
+    ///
+    /// Not a flat colour, and not noise. A flat expanse encodes as one
+    /// [`crate::tiles::Encoding::Solid`] tile of four bytes, which would make a
+    /// whole-screen keyframe *smaller* than the send window and quietly stop the
+    /// tests below from being about anything. Noise would encode as raw and make
+    /// them cost tens of megabytes. Bands are a real desktop's shape: they
+    /// compress, and a full screen of them is still several times the window.
+    fn banded_surface(width: u32, height: u32) -> Surface {
+        let (width_px, height_px) = (width as usize, height as usize);
+        let mut pixels = vec![0u8; width_px * height_px * 4];
+        for row in 0..height_px {
+            for col in 0..width_px {
+                let value = ((col / 16 + row) % 251) as u8;
+                let at = (row * width_px + col) * 4;
+                pixels[at] = value;
+                pixels[at + 1] = value.wrapping_mul(3);
+                pixels[at + 2] = value.wrapping_add(0x40);
+                pixels[at + 3] = 0xFF;
+            }
+        }
+        Surface::new(width, height, pixels).expect("a tight buffer")
+    }
+
+    /// A display of any extent, at Retina scale.
+    fn display(width: u32, height: u32) -> Monitor {
+        Monitor {
+            id: 0,
+            origin_x: 0,
+            origin_y: 0,
+            width,
+            height,
+            scale_permille: 2000,
+            primary: true,
+        }
+    }
+
+    /// Every tile coordinate of a grid over the given extent.
+    fn grid_tiles(width: u32, height: u32) -> usize {
+        Grid::new(TileSize::DEFAULT, width, height).expect("a legal grid").len()
+    }
+
     /// One step of a scripted capture source.
     enum Beat {
         /// Hand out these pixels.
@@ -1572,8 +1897,15 @@ mod tests {
 
     impl ScriptedFrames {
         fn new(script: Vec<Beat>, credit: Arc<AtomicU32>) -> Self {
+            Self::on(monitor(0), script, credit)
+        }
+
+        /// The same, for a display that is not the 128×64 default — so a test
+        /// about a large panel advertises the panel it is about rather than
+        /// describing one screen in `Hello` and sending the pixels of another.
+        fn on(display: Monitor, script: Vec<Beat>, credit: Arc<AtomicU32>) -> Self {
             Self {
-                monitors: vec![monitor(0)],
+                monitors: vec![display],
                 script: script.into(),
                 credit,
                 restores: Vec::new(),
@@ -1610,16 +1942,59 @@ mod tests {
     }
 
     /// A writing half that records everything, with a settable credit window.
+    ///
+    /// # Why this models a window and a drain rather than a counter
+    ///
+    /// The first version of this double answered [`Outbound::credit`] from a
+    /// number the test had set, so no test ever exercised the real 256 KiB
+    /// ceiling and the driver shipped unable to deliver a single frame on a
+    /// Retina display. A double whose ceiling is whatever the test wants is a
+    /// double that agrees with any implementation.
+    ///
+    /// So this one is shaped like the transport it stands for: a fixed
+    /// **window** of bytes that may be in flight, spent as messages are written
+    /// and returned as the peer consumes them. `drain` is how many bytes the peer
+    /// consumes between one look at the window and the next — `u32::MAX` for a
+    /// peer that keeps up (a loopback socket, the ordinary case), a small number
+    /// for a narrow link, and zero for a peer that has stopped reading
+    /// altogether.
     struct Recorder {
         sent: Vec<Message>,
+        /// The ceiling on bytes in flight. Shared so a scripted [`Beat::Grant`]
+        /// can widen it mid-session.
         credit: Arc<AtomicU32>,
+        /// Bytes written and not yet consumed by the peer.
+        outstanding: AtomicU32,
+        /// Bytes the peer consumes between two looks at the window.
+        drain: u32,
         closed: Option<Ending>,
         broken: bool,
     }
 
     impl Recorder {
+        /// A peer that keeps up: the window is returned as fast as it is spent,
+        /// which is what a loopback socket does and what every test that is not
+        /// about flow control wants.
         fn new(credit: Arc<AtomicU32>) -> Self {
-            Self { sent: Vec::new(), credit, closed: None, broken: false }
+            Self::draining(credit, u32::MAX)
+        }
+
+        /// A peer that consumes `drain` bytes between one look at the window and
+        /// the next.
+        fn draining(credit: Arc<AtomicU32>, drain: u32) -> Self {
+            Self {
+                sent: Vec::new(),
+                credit,
+                outstanding: AtomicU32::new(0),
+                drain,
+                closed: None,
+                broken: false,
+            }
+        }
+
+        /// Every message of a kind, in order.
+        fn count(&self, wanted: fn(&Message) -> bool) -> usize {
+            self.sent.iter().filter(|message| wanted(message)).count()
         }
 
         /// Every tile message, in order.
@@ -1654,16 +2029,25 @@ mod tests {
                 // message the driver cannot round-trip fails the test rather
                 // than being asserted on in a shape the peer never sees.
                 let message = Message::decode(frame).expect("the driver encodes decodable messages");
-                let spent = frame.len() as u32;
-                let held = self.credit.load(Ordering::SeqCst);
-                self.credit.store(held.saturating_sub(spent), Ordering::SeqCst);
+                let spent = u32::try_from(frame.len()).unwrap_or(u32::MAX);
+                let held = self.outstanding.load(Ordering::SeqCst);
+                self.outstanding.store(held.saturating_add(spent), Ordering::SeqCst);
                 self.sent.push(message);
                 Ok(())
             })
         }
 
         fn credit(&self) -> u32 {
-            self.credit.load(Ordering::SeqCst)
+            // The peer consumed some of what it was sent since the last look.
+            // Draining here rather than on a timer is what makes the double
+            // faithful to the contract: the driver re-reads the window between
+            // messages precisely because a live transport returns it as bytes
+            // leave, and a double that only ever counted down would make a frame
+            // larger than the window undeliverable — which is the bug.
+            let outstanding =
+                self.outstanding.load(Ordering::SeqCst).saturating_sub(self.drain);
+            self.outstanding.store(outstanding, Ordering::SeqCst);
+            self.credit.load(Ordering::SeqCst).saturating_sub(outstanding)
         }
 
         fn close<'a>(&'a mut self, ending: &'a Ending) -> Task<'a, Result<(), StreamError>> {
@@ -2042,6 +2426,223 @@ mod tests {
             .filter(|message| matches!(message, Message::FrameBegin(_)))
             .count();
         assert_eq!(begins, 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_large_first_frame_on_a_large_display_arrives() {
+        // The regression this whole redesign exists for, in the shape it was
+        // observed in: this machine's own 3024×1964 panel, a first frame that is
+        // therefore a keyframe of about fifteen hundred tiles, and the ordinary
+        // 256 KiB send window. The driver used to sum the whole frame's bytes,
+        // compare that against the window, and drop it — and since every frame
+        // after a dropped one is still a keyframe, it dropped all of them. Live,
+        // that read as `0 frame(s), 32 byte(s), 6 credit stall(s)`.
+        let credit = Arc::new(AtomicU32::new(DEFAULT_SEND_WINDOW));
+        let mut frames = ScriptedFrames::on(
+            display(3024, 1964),
+            vec![
+                Beat::Frame(banded_surface(3024, 1964)),
+                Beat::Condition(Condition::Fatal),
+            ],
+            Arc::clone(&credit),
+        );
+        let mut out = Recorder::new(Arc::clone(&credit));
+        let mut pointer = FixedPointer::none();
+        let mut input = NoInput;
+        let store = Store::holding(Capabilities::VIEW, Duration::from_secs(600));
+
+        let viewer = Viewer::new(
+            Wiring {
+                outbound: &mut out,
+                frames: &mut frames,
+                pointer: &mut pointer,
+                input: &mut input,
+            },
+            &store,
+            seat(),
+            &redemption(Capabilities::VIEW),
+            quick(),
+        );
+        let outcome = viewer.run(&mut Silent).await;
+
+        let tiles = grid_tiles(3024, 1964);
+        assert_eq!(outcome.stats.frames_sent, 1, "the first frame must arrive");
+        assert_eq!(outcome.stats.tiles_sent, tiles as u64, "all of it, not part of it");
+        assert_eq!(outcome.stats.credit_stalls, 0);
+        assert_eq!(outcome.stats.tiles_deferred, 0, "a peer that keeps up defers nothing");
+
+        // The assertion that keeps this test honest: the frame really is far
+        // larger than the window it is being delivered through, so it is
+        // exercising the case rather than sneaking under the old comparison.
+        assert!(
+            outcome.stats.bytes_sent > u64::from(DEFAULT_SEND_WINDOW),
+            "a keyframe of {tiles} tiles came to only {} bytes — the fixture stopped \
+             being bigger than the window and this test stopped testing anything",
+            outcome.stats.bytes_sent
+        );
+
+        // One frame, correctly framed: a client presents on `FrameEnd`, and the
+        // keyframe flag is what tells it the tiles describe the whole screen.
+        assert_eq!(out.count(|message| matches!(message, Message::FrameBegin(_))), 1);
+        assert_eq!(out.count(|message| matches!(message, Message::FrameEnd { .. })), 1);
+        let begin = out
+            .sent
+            .iter()
+            .find_map(|message| match message {
+                Message::FrameBegin(begin) => Some(*begin),
+                _ => None,
+            })
+            .expect("a frame was begun");
+        assert!(begin.keyframe);
+        assert_eq!((begin.width, begin.height), (3024, 1964));
+
+        // Every tile of the grid exactly once: a keyframe with a hole in it is
+        // a picture with a hole in it, and nothing later would repair it.
+        let mut covered: BTreeSet<TileCoord> = BTreeSet::new();
+        for tile in out.tiles() {
+            assert!(covered.insert(tile.coord()), "tile {:?} sent twice", tile.coord());
+        }
+        assert_eq!(covered.len(), tiles);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_frame_wider_than_the_window_is_finished_across_turns() {
+        // A link too narrow to carry one frame in a single pass, and a desktop
+        // that goes still immediately afterwards — the case where the merge path
+        // has no next frame to merge into. The tiles that did not fit are owed
+        // rather than lost, and the picture the client ends up holding is the one
+        // that was captured.
+        let credit = Arc::new(AtomicU32::new(4096));
+        let mut frames = ScriptedFrames::on(
+            display(320, 256),
+            vec![Beat::Frame(banded_surface(320, 256))],
+            Arc::clone(&credit),
+        );
+        // A peer that consumes a kilobyte between one look at the window and the
+        // next: enough to keep going, nowhere near enough to swallow the frame.
+        let mut out = Recorder::draining(Arc::clone(&credit), 1024);
+        let mut pointer = FixedPointer::none();
+        let mut input = NoInput;
+        let store = Store::holding(Capabilities::VIEW, Duration::from_secs(600));
+
+        let mut ceilings = quick();
+        ceilings.max_session = Duration::from_millis(400);
+
+        let viewer = Viewer::new(
+            Wiring {
+                outbound: &mut out,
+                frames: &mut frames,
+                pointer: &mut pointer,
+                input: &mut input,
+            },
+            &store,
+            seat(),
+            &redemption(Capabilities::VIEW),
+            ceilings,
+        );
+        let outcome = viewer.run(&mut Silent).await;
+
+        assert_eq!(outcome.ending, Ending::Deadline);
+        assert!(
+            outcome.stats.tiles_deferred > 0,
+            "the fixture must actually overflow the window, or this proves nothing"
+        );
+        assert!(
+            outcome.stats.frames_sent > 1,
+            "a truncated frame is finished by a later one, not abandoned"
+        );
+
+        // The whole point: what the client is holding equals what was captured.
+        let mut client = Surface::blank(320, 256).expect("a blank client surface");
+        for tile in out.tiles() {
+            apply(
+                &mut client,
+                TileSize::DEFAULT,
+                &crate::tiles::TileUpdate {
+                    coord: tile.coord(),
+                    encoding: tile.encoding,
+                    payload: tile.payload.clone(),
+                },
+            )
+            .expect("every tile the driver sent applies");
+        }
+        assert_eq!(
+            client.pixels(),
+            banded_surface(320, 256).pixels(),
+            "the deferred tiles arrived, and they arrived correct"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_client_that_grants_no_credit_of_its_own_stops_its_own_picture() {
+        // The explicit half of flow control, and the two properties that make it
+        // safe to have built: a client that says nothing is bounded by the
+        // transport alone and sees its screen, and a client that declares a
+        // window of zero has closed its own shutter — over the identical
+        // transport, with the identical script.
+        async fn run_with(grant: Option<u32>) -> Stats {
+            let credit = Arc::new(AtomicU32::new(1 << 20));
+            let mut frames = ScriptedFrames::new(
+                (1..=20u8).map(|step| Beat::Frame(surface(step, step * 2))).collect(),
+                Arc::clone(&credit),
+            );
+            let mut out = Recorder::new(Arc::clone(&credit));
+            let mut pointer = FixedPointer::none();
+            let mut input = NoInput;
+            let store = Store::holding(Capabilities::VIEW, Duration::from_secs(600));
+            let (sender, receiver) = mpsc::unbounded_channel();
+            let mut inbound = Channel(receiver);
+
+            let mut ceilings = quick();
+            ceilings.max_session = Duration::from_millis(200);
+
+            if let Some(bytes) = grant {
+                sender
+                    .send(Message::Credit { bytes }.encode().expect("a grant encodes"))
+                    .expect("the driver has not started reading yet");
+            }
+            // Held open so the stream ends on its own wall rather than on the
+            // peer hanging up, which would end it before the second frame.
+            let feeder = tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(400)).await;
+                drop(sender);
+            });
+
+            let viewer = Viewer::new(
+                Wiring {
+                    outbound: &mut out,
+                    frames: &mut frames,
+                    pointer: &mut pointer,
+                    input: &mut input,
+                },
+                &store,
+                seat(),
+                &redemption(Capabilities::VIEW),
+                ceilings,
+            );
+            let outcome = viewer.run(&mut inbound).await;
+            feeder.await.expect("the feeder finishes");
+            outcome.stats
+        }
+
+        let silent = run_with(None).await;
+        assert!(silent.frames_sent > 2, "a client that grants nothing is not gated");
+
+        // A grant cannot arrive before the stream starts, so the frame already
+        // in flight when it lands still goes. Everything after it does not.
+        let shut = run_with(Some(0)).await;
+        assert!(
+            shut.frames_sent <= 1,
+            "a declared window of zero closed the client's own shutter, but {} frames went",
+            shut.frames_sent
+        );
+        assert!(shut.credit_stalls > 0, "and the diagnostics say why");
+
+        let opened = run_with(Some(1 << 20)).await;
+        assert_eq!(
+            opened.frames_sent, silent.frames_sent,
+            "a window it can afford costs it nothing"
+        );
     }
 
     #[tokio::test(start_paused = true)]

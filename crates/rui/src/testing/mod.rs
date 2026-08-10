@@ -63,7 +63,7 @@ use crate::canvas::Canvas;
 use crate::color::Color;
 use crate::element::El;
 use crate::geom::{Point, Rect};
-use crate::input::{Event, Input, Key, Modifiers, PointerButton};
+use crate::input::{Event, Input, Key, KeyCode, Modifiers, PointerButton};
 use crate::accessibility::Role;
 use crate::memory::{Id, Memory};
 use crate::shell::LoadedFonts;
@@ -319,13 +319,46 @@ impl<S: 'static> Harness<S> {
     }
 
     /// Presses a key, with nothing held with it.
+    ///
+    /// The press only. A test of anything that *holds* something while a key is
+    /// down should use [`Harness::key_stroke`], which lets go again — as a
+    /// keyboard does.
     pub fn key(&mut self, key: Key) -> &mut Self {
         self.key_with(key, Modifiers::NONE)
     }
 
     /// Presses a key with modifiers held.
     pub fn key_with(&mut self, key: Key, modifiers: Modifiers) -> &mut Self {
-        self.event(Event::KeyDown { key, modifiers }).frame()
+        self.event(Event::KeyDown { key: Some(key), code: None, modifiers }).frame()
+    }
+
+    /// Releases a key, with nothing held with it.
+    pub fn key_up(&mut self, key: Key) -> &mut Self {
+        self.event(Event::KeyUp { key: Some(key), code: None, modifiers: Modifiers::NONE }).frame()
+    }
+
+    /// A whole keystroke: down on one frame, up on the next.
+    ///
+    /// Two frames, because that is what it is — a press and a release cannot
+    /// arrive in one, and anything that holds state between them is only
+    /// exercised by a test that separates them.
+    pub fn key_stroke(&mut self, key: Key) -> &mut Self {
+        self.key(key).key_up(key)
+    }
+
+    /// Presses a physical key, whether or not this library names it.
+    ///
+    /// What a test of a viewport forwarding the keyboard needs and
+    /// [`Harness::key`] cannot give it: keystrokes carrying a
+    /// [`KeyCode`] are the only ones anything forwards, because
+    /// a key with no position is not a key another machine can be told about.
+    pub fn raw_key(&mut self, code: KeyCode, key: Option<Key>) -> &mut Self {
+        self.event(Event::KeyDown { key, code: Some(code), modifiers: Modifiers::NONE }).frame()
+    }
+
+    /// Releases a physical key.
+    pub fn raw_key_up(&mut self, code: KeyCode, key: Option<Key>) -> &mut Self {
+        self.event(Event::KeyUp { key, code: Some(code), modifiers: Modifiers::NONE }).frame()
     }
 
     /// Moves the keyboard on to the next thing that can take it.
@@ -573,6 +606,22 @@ impl<S: 'static> Harness<S> {
     /// The application's own state.
     pub fn state(&self) -> &S {
         self.app.state()
+    }
+
+    /// The same, to be changed from outside the interface.
+    ///
+    /// Not a way around the handlers: a test of what a *person* does should
+    /// drive the pointer and the keyboard, because that is the path the program
+    /// takes and the one that can be wrong.
+    ///
+    /// This is for the other half — news the interface did not cause. A frame
+    /// arriving on a socket, a job finishing, a log line read on a worker
+    /// thread: in a window those reach the state from another thread and ask
+    /// for a frame with [`Redraw`](crate::Redraw), and in a test this is the
+    /// thread. Nothing else can play that part, because a view is a function of
+    /// the state and there is no other way to put something in it.
+    pub fn state_mut(&mut self) -> &mut S {
+        self.app.state_mut()
     }
 
     /// The pixels of the last frame.

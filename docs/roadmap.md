@@ -21,6 +21,12 @@ exercised against a running instance; anything else has not been written.
 | Host firewall reconciliation | `crates/firewall` | — | macOS pf, Linux nftables, Windows netsh backends behind one `Manager`; default-inbound-block plus named openings, drift re-asserted on a timer |
 | A declarative interface library, `rui` | `crates/rui` | 263 | layout, hit testing, focus, scrolling, dragging, easing, and a whole frame — all with no display attached |
 | The console itself | `crates/console` | 91 | frames rendered headless at the smallest window; a tunnel that dies takes its `ssh` with it |
+| WebSockets (RFC 6455) | `crates/ws` | 99 | binary frames only, no extension negotiated, minimal length encodings, bounded fragments; the proxy never parses one |
+| Identity, capabilities, audit | `crates/identity` | 56 | `Policy::decide` table-tested over every (identity, credential, capability) triple; an unattended token is refused a keyboard |
+| Remote-desktop protocol | `crates/desk` | 153 | total parsers on every attacker-influenced field; the session state machine driven through the secure desktop, a crash loop and a user logging out, with no display attached |
+| Screen capture and input injection | `crates/screen` | 189 | pure coordinate mapping, key tables and synthetic-event plans; macOS verified, **every Windows arm type-checked and unrun** |
+| Network storage | `crates/storage` | 321 | traversal, ADS, reserved names, 8.3 aliases and case collisions refused; a full SMB reconcile leaves this Mac's `sharing -l -f json` byte-identical |
+| Peer mesh transport | `crates/mesh` | 177 | fixed eight-byte header, credit that drops and merges, an HMAC proof bound to one handshake; **the owner has no route to accept a dial yet** |
 
 Verified live: HTTPS 200 on a real trusted Let's Encrypt production certificate
 for the deployed domain and its `www`, HTTP→HTTPS 308, `206` + `Content-Range`
@@ -58,22 +64,40 @@ for exactly the deployments where direct delivery is blocked upstream.
 
 ## Next, in the order I would do it
 
-### 1. Node join and the private mesh
+### 1. Finish the two subsystems that just landed
 
-`Config::instance_address` already refuses to address a worker that has no
-`mesh_ip`, so the config layer is ready. What is missing is the mesh itself and
-a one-command join.
+Three specific gaps, all small, all named at the code:
 
-The rule to preserve: **workers are reached over the mesh, never a public
-address**, so an application port is never exposed to the internet even on a
-remote machine.
+- **Route `/api/mesh/link` on the owner.** `crates/mesh/src/accept.rs` is
+  written and tested; there is no route, so a worker's dial lands on a 404 and
+  the registry records the reason. Until then a second machine cannot join, and
+  the rule to preserve is the one that made the design safe: **the worker dials
+  the owner**, over the console site, so the link passes the same source-address
+  gate as every other console request and nothing binds.
+- **Wire `Api::standings` into `crates/cli/src/desk_task.rs`.** The per-input
+  re-check is real but the daemon feeds it the standing the *ticket* established,
+  so a revocation mid-stream ends the session at its ceiling rather than at the
+  next keystroke. Three lines, no interface change — and until it is done,
+  `docs/SECURITY.md` §3.7 SCR-01 says plainly not to read that check as live
+  revocation.
+- **The splice.** The Windows agent's frames do not reach a viewer, because the
+  daemon's session driver takes an owned frame per call and the agent produces a
+  message stream. Forward the payloads without interpreting them, rewrite the
+  channel id, carry credit end to end. Do **not** reconstruct a surface in the
+  daemon: that puts attacker-influenced pixel parsing back in the process that
+  serves 80/443 under `panic = "abort"`.
 
-### 2. Backups
+### 2. Run it on Windows
+
+Nine thousand lines have never executed. `HANDOFF.md` §5 is the order, and the
+first two steps decide whether the session-0 design works at all.
+
+### 3. Backups
 
 Nightly dump plus an off-site copy. **Untested backups are not backups** —
 restore has to be exercised, not assumed.
 
-### 3. The console
+### 4. The console
 
 **The daemon half is done and verified.** `selfhost daemon` supervises arbitrary
 services — MongoDB, a NAS daemon, a site's backend — and serves a loopback
@@ -87,10 +111,15 @@ does nothing but open a window, deliver input, and copy a buffer to the screen.
 See [`gui.md`](gui.md) for the split and for what the font engine deliberately
 does not do.
 
-What is left is the **sites and certificates** views, which wait on an API that
-reports them, and **running the Windows and X11 backends** — both type-check for
-their targets but have never been run, because everything so far has been built
-on a Mac.
+It now carries four screens — services, files, desktops and people — and so does
+the browser console; `gui.md`'s *two new plate families* section is the argument
+for both. What is left is the **sites and certificates** views, which wait on an
+API that reports them; **running the Windows and X11 backends**, which type-check
+for their targets and have never been opened; a **pointer-move handler in `rui`**
+(`on_hover` is a boolean and `on_drag` fires only while a button is held, so the
+native viewport cannot track a hand moving over the picture — the largest
+remaining parity gap between the two consoles); and an **operator-start route**,
+because the console's start-the-agent button has nothing to call.
 
 **The SSH transport is done.** `selfhost-console --ssh you@server` runs `ssh` as
 a managed child, forwards the control port to loopback here, and reads the
@@ -124,6 +153,19 @@ Written down so they are decisions rather than surprises.
   but nothing calls it. Low priority for a video-heavy site, where most bytes are
   already compressed.
 - **No rate limiting.** The biggest remaining gap before public exposure.
+- **A relayed WebDAV `PUT` has no deadline after its head.** It streams
+  uncapped by design — quotas and the in-flight ceiling are storage's job — so a
+  client that declares an enormous length and then stalls holds one client and
+  one loopback connection. That is the slow-loris shape left behind until the
+  in-flight ceiling is enforced.
+- **`/dav` has no configuration switch.** It is live wherever a console password
+  and a `[[shares]]` block coexist. Authenticated, and behind the console site's
+  source gate — but it is the only surface these two subsystems add that is not
+  off until a file says otherwise.
+- **Nothing publishes the DNS-SD records** a browsable share derives, and Windows
+  has no mDNS responder to publish them with even when something does.
+- **`selfhost desktop status` answers from the config alone** and cannot see a
+  running daemon; `doctor` is the command that asks one.
 
 ## Things not to do
 

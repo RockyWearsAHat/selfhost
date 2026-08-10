@@ -32,6 +32,14 @@
 //!    cannot be inherited across sessions — which is *why* the IPC has to be a
 //!    named object rather than an inherited pipe.
 //!
+//! The command line that call is given is built by
+//! [`crate::agent::agent_arguments`] and carries two things: the session the
+//! supervisor aimed at, and whether this deployment permits input at all. The
+//! second is the *only* route by which `[desktop].allow_input` reaches the agent,
+//! which is a separate process that cannot read the daemon's config — see
+//! [`crate::agent::InputPolicy`] for why it travels here rather than as a message
+//! on the pipe.
+//!
 //! # Why the pure half lives up here
 //!
 //! Three of the decisions in that sequence are strings, and all three are

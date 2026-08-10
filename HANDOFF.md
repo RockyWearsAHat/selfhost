@@ -1,17 +1,27 @@
 # Handoff — selfhost
 
-**Written:** 2026-07-26 · **Repo:** <https://github.com/RockyWearsAHat/selfhost> ·
-**Branch:** `main`
+**Started:** 2026-07-26 · **§3 and §5 rewritten:** 2026-08-10 ·
+**Repo:** <https://github.com/RockyWearsAHat/selfhost> · **Branch:**
+`service-manager` (production tracks `main`)
 **Prior session:** the question that started this is in
 `/tmp/lvlup-self-hosting-handoff.md` — hosting websites from a spare PC, free,
 unrestricted, load balanced.
 
-> **State check 2026-08-10:** production moved to ALEX-DESKTOP (Windows,
-> `192.168.1.8`), which is a clone of this repo and self-updates from pushes to
-> `main` (`[self_update]`, 60 s poll → fetch, rebuild, restart). The admin
-> console SPA (`sites/console`) is live at `admin.rockywearsahat.com`,
-> VPN-gated to loopback. §3 below predates that move — `index.dx` is the
-> current map; this file remains the July orientation snapshot.
+> **Read this first.** Production is ALEX-DESKTOP (Windows, `192.168.1.8`), a
+> clone of this repo that self-updates from pushes to `main` (`[self_update]`,
+> 60 s poll → fetch, rebuild, restart). The admin console SPA (`sites/console`)
+> is live at `admin.rockywearsahat.com`, VPN-gated to loopback. Two large
+> subsystems — **remote desktop** and **network storage** — landed on this
+> branch on 2026-08-10 and have never run on that box. §3 is the current state
+> and §5 is what has to be confirmed there, in order. **Do not soften §3: about
+> nine thousand lines of this workspace have never executed anywhere.**
+>
+> The maps are elsewhere and are kept true: `index.dx` (the file tree),
+> `selfhost.dx` (the platform in one page), `desktop-lab.dx` and `nas-lab.dx`
+> (the two new subsystems, with runnable checks), `console-lab.dx` and
+> `web-console-lab.dx` (the two consoles), `docs/SECURITY.md` (the guidebook
+> you must read before writing anything networked). This file is orientation
+> and judgement; it does not repeat them.
 
 ---
 
@@ -52,12 +62,23 @@ Permitted dependencies, and nothing else:
 - **`rustls`** for TLS primitives and **`tokio`** for async I/O — foundations at
   the same level as the standard library. Hand-writing cryptography would make
   this less safe, not more independent.
+- **`ring`** — the one cryptographic implementation, and `rustls`/`rcgen` are
+  both pinned to it. Accepting each crate's default provider compiles *two*
+  independent crypto stacks into one binary, which is two supply chains and two
+  advisory feeds to do one job.
 - **`serde` + `toml`** for the config format.
-- **`rcgen`** for self-signed certificate generation.
+- **`rcgen`** for self-signed certificate generation, and **`webpki-roots`** for
+  the trust anchors ACME and the mesh dialler verify against.
+
+Nothing else, and the six crates added in 2026-08 kept to it: `ws`, `identity`,
+`desk`, `mesh`, `screen` and `storage` add **no** crates.io package between them.
+Platform integration is raw `extern "C"`/`extern "system"` FFI, and the operating
+system's own SMB server is driven as a program the way `git` and `ssh` are.
 
 Everything above the socket is written here: HTTP parsing, the reverse proxy,
-load balancing, health checking, byte ranges, SMTP, and — planned — ACME, DNS,
-and IMAP.
+load balancing, health checking, byte ranges, ACME, the DNS wire format, SMTP,
+IMAP, RFC 6455 WebSockets, WebDAV, and this project's own remote-desktop
+protocol. If a protocol is on the wire, we own it.
 
 **Do not reintroduce a container runtime or an external server binary.** The
 reason is concrete, not aesthetic: on Windows and macOS a container runtime
@@ -65,194 +86,140 @@ requires a logged-in desktop session. The target is a Windows PC that must stay
 up unattended. We hit this live during the session — the stack needed
 `open -a Docker`, a GUI launch, to come up.
 
-## 3. State — done vs not
+## 3. State — what is verified, and where
 
-**816 tests pass.** `cargo test --workspace`; the table below sums to the same,
-doc-tests included.
+**3,117 tests pass** (`cargo test --workspace`), `cargo clippy --workspace
+--all-targets` is silent, `cargo build --workspace` warns about nothing, and the
+whole workspace also type-checks for `x86_64-pc-windows-gnu`. That last figure is
+the one that matters most and is the one most easily misread — see *§3.3 What has
+never executed*.
 
-| crate | what | tests |
-|---|---|---|
-| `crates/http` | HTTP/1.1 messages + dates, pure, no I/O | 70 |
-| `crates/config` | Config model + validation, the Git watch, the daemon note | 57 |
-| `crates/json` | JSON, for the control API | 13 |
-| `crates/proxy` | TLS, static+Range, caching, routing, LB, health | 60 |
-| `crates/mail` | Addresses + SMTP session state machine | 48 |
-| `crates/dns` | DNS wire format + resolver | 22 |
-| `crates/supervisor` | Runs services and keeps them running | 50 |
-| `crates/admin` | The loopback control API | 29 |
-| `crates/git` | Watches a branch; stops, updates, builds, starts | 37 |
-| `crates/rui` | **`rui`**: the interface library — elements, style, layout, rasteriser, TrueType engine, animation, PNG, windows, headless test harness | 263 |
-| `crates/console` | The `selfhost-console` desktop binary + SSH tunnel | 80 |
-| `crates/cli` | The `selfhost` binary, `doctor`, LAN assessment, `watch-dns`, `teardown` | 87 |
+The per-crate table that used to live here is gone rather than updated: it went
+stale between sessions and it duplicated `docs/roadmap.md`, which is the
+authoritative list and is kept current crate by crate. `index.dx` is the file-tree
+map. What follows is only what those two cannot say.
 
-**Verified against a running instance,** not only in unit tests: HTTPS 200,
-HTTP→HTTPS 308 preserving path and query, `206` + `Content-Range` on a seek,
-`416` on an impossible range, `.m3u8`/`.ts` content types, path traversal → 404,
-smuggling → 400, and a **full failover cycle** with two live backends — 5/5
-split, one killed → 10/10 to the survivor with no failed requests, restarted →
-back to 5/5 unaided, both down → 502.
+### 3.1 Verified against a running instance
 
-**The console is built and runs.** `selfhost-console` is a native window drawn
-by an interface library written here, over a per-platform layer that only opens a
-window, delivers input, and copies a buffer to the screen. Verified against a
-live daemon: services listed and selected, definitions shown, output tailed, and
-start/stop/restart/install/uninstall driven from it. See
-[`docs/gui.md`](docs/gui.md).
+Everything in this list was done by running it, not by testing it:
 
-**The toolkit is now a library in its own right: `rui`.** It was
-`selfhost-ui` + `selfhost-window` — an immediate-mode toolkit whose call sites
-did their own rectangle arithmetic (`split_left`, `control_rect`, `allocate`).
-It is now one dependency-free crate with a **declarative** interface: a view is
-`Fn(&State) -> El<State>`, structure and style and behaviour are one chained
-expression, and a handler is an ordinary `Fn(&mut State)` — so the description
-borrows nothing mutably and there is no `Rc`, `RefCell`, or interior mutability
-anywhere in it. Layout is the useful half of flexbox (`grow`, `Fraction`,
-`min/max`, shrink-what-is-sized-to-content), colours are *roles* resolved against
-the theme, and text properties inherit. The console was rewritten onto it: its
-views are ~40% shorter and contain no rectangle arithmetic at all. `rui` knows
-nothing about selfhost and is documented on its own terms in
-[`crates/rui/README.md`](crates/rui/README.md);
-`cargo run -p rui --example counter` is a whole program in thirty lines.
+- **The public web path.** HTTPS 200 on a real trusted Let's Encrypt production
+  certificate for the deployed domain and its `www`, HTTP→HTTPS 308 preserving
+  path and query, `206` + `Content-Range` on a seek, `416` on an impossible
+  range, `304` with zero bytes on both cache validators, `.m3u8`/`.ts` content
+  types, traversal → 404, smuggling → 400, an ACME challenge served over
+  cleartext while ordinary paths still redirect, and a full failover cycle across
+  two live backends (5/5 → one killed → 10/10 to the survivor with no failed
+  request → restarted → back to 5/5 → both down → 502).
+- **Mail.** A real message accepted over port 25 from an external network and
+  read back out of the Maildir; STARTTLS on 25 presenting the same trusted
+  certificate the site serves; Apple Mail set up against IMAP end to end (which
+  needed command-literal parsing — `LOGIN` credentials arrive only that way).
+- **DNS.** Real clients resolved through `watch-dns` over UDP and TCP, and a
+  lookup of a known proxy domain named the address that made it.
+- **Deployment.** A service installed through the control API cloned a GitHub
+  branch, ran its build step, and started; a second commit stopped it, updated
+  the working copy, and started it on the new commit.
+- **The route to the console.** `admin.rockywearsahat.com` answers 200 with TLS
+  through the Secure-VPN tunnel, verified end to end on 2026-08-09.
+- **The native console against a live daemon.** Services listed, definitions
+  shown, output tailed, and start/stop/restart/install/uninstall driven from it,
+  including over a managed `ssh -L` tunnel whose refused key was reported as
+  *tunnel down · the server refused the key · `ssh-add`* rather than as a missing
+  daemon.
 
-**`rui` now has its own repository, and a foundation you can build controls
-on:** <https://github.com/RockyWearsAHat/rui>, public, MIT, with CI on macOS,
-Windows, and Linux. This workspace still builds it from `crates/rui` by path, so
-the two are copies — changes made here have to be pushed there.
+### 3.2 The two new subsystems, and exactly how far they got
 
-It could draw a button and it could not draw a slider, because `draw` was handed
-a rectangle and nothing about its own state, and there was no access to the
-pointer beyond a click. So: `Painter::visual` tells an application's own drawing
-what a button knows (hovered, held, focused, disabled, and how far its hover has
-eased); `on_drag` reports where the pointer is *within* an element every frame it
-is held; `on_key`, `on_scroll`, and `on_hover` hand over the keyboard, the wheel,
-and the pointer arriving; `.layer(Anchor)` hangs an element off its parent's
-edge, held inside the window and drawn above what it covers, which is what a
-menu, a tooltip, and a dialog are; and `.flow()` runs children onto further
-lines. What the pointer is over is now decided once per frame rather than by each
-element for itself, so two overlapping things can no longer both think they are
-hovered. **No checkbox, toggle, or slider was added** — `examples/controls.rs`
-builds all of them from those primitives in a few lines each, and
-`tests/recipes.rs` tests them.
+Both are **off unless a file says otherwise** and **neither binds a socket** —
+checked rather than asserted: there are zero occurrences of `TcpListener`,
+`UdpSocket` or `::bind(` in `crates/{desk,screen,ws,mesh,identity,storage}`. The
+admin API is still `127.0.0.1:9191` and the only public surface is still the
+proxy on 80/443.
 
-**And it is testable without a window.** `rui::testing::Harness` drives the real
-frame — describe, lay out, draw, apply — into a buffer, aiming at what a person
-would aim at (`click_text`, `hover_text`, `drag`, `type_text`), and answering
-where things came out, what the interface says, and what was drawn.
-`rui::testing::font` **builds** a TrueType face a table at a time, read back by
-the same parser that reads one off the disk, at half an em to a glyph and an em
-to a line — so a width in a test is arithmetic rather than whatever face the
-machine happened to have. Writing those tests turned up two layout defects, both
-now fixed: a box that stated its own width measured its children against the room
-it was *offered*, so a paragraph in a narrow column came out one line tall and
-three lines long; and a child sized to its content could be laid out wider than
-the box that owned it.
+**Remote desktop** (`desktop-lab.dx` is the document; `docs/SECURITY.md` §3.7
+SCR-01…03 is the specification). The protocol, the capture and injection layers,
+the ticket mint, the freshness rule, the per-message capability re-check, the
+audit trail, the kill switch and both consoles' plates are written and tested. On
+this Mac the whole recovery path is exercised without a display by feeding
+observations to a state machine. **What is not done:** the agent's frames do not
+reach a viewer on a session-0 Windows service — the *splice* between the agent's
+message stream and the daemon's `FrameSource` seam is unwritten, and until it
+exists a session-0 daemon supervises a live agent and tells the console it cannot
+reach the desktop, with the reason. A Windows daemon started from a signed-in
+session captures directly and that path is served in full. **And one thing that
+reads stronger than it is:** the daemon drives sessions with `TicketStanding`
+(`crates/cli/src/desk_task.rs`), which reports the standing the *ticket*
+established, so a mid-stream revocation ends the stream at its ceiling rather
+than at the next keystroke. The real directory (`Api::standings`) exists and is
+not wired. Three lines in `crates/cli`, no interface change.
 
-**The console has been laid out again, and every part of it went into the
-toolkit rather than being drawn into the views.** The interface is *ruled rather
-than boxed*: two framed surfaces in the whole window, and inside them
-small-capital section labels with a hairline running to the far edge
-(`section`). Small capitals needed real letter-spacing, so
-`TextStyle` grew a `tracking` field applied in the single advance that
-measuring, fitting, wrapping, and drawing all share.
+**Network storage** (`nas-lab.dx`; `docs/SECURITY.md` §3.7 NAS-01…03). Shares,
+the confining resolver, the descriptor walk, quotas, the JSON API and its bulk
+byte plane, WebDAV at `/dav` (relayed by the proxy, answered by the admin API
+behind its own Basic-over-TLS door), the SMB reconciler for all three platforms,
+DNS-SD derivation, `selfhost share|sync|storage` and the doctor checks are
+written and tested. The acceptance test that mattered passes on this Mac: a full
+`sync()` leaves `sharing -l -f json` **byte-identical**, so the pre-existing
+guest share point survives untouched. **What is not done:** no real client has
+ever mounted a share — no Finder, no Explorer, no `cadaver`; nothing publishes
+the DNS-SD records; `storage smb apply` has deliberately never been run; and
+`/dav` has **no configuration switch**, so it is live wherever a console password
+and a `[[shares]]` block coexist.
 
-**The look it was given on top of that was wrong, was redone, and is now an
-instrument on purpose.** The first version cut corners on everything, put a cyan
-accent on a blue-black ground, ruled a grid across the window, haloed panels,
-buttons, tabs and status dots alike, bracketed the log, drew a segmented gauge,
-and set the title, tabs, headings and figures monospaced and tracked open. Every
-one had its own argument; together they read as a film prop. The correction made
-`rui` itself rounded, near-neutral and blue-accented — which is what the library
-still is and what its defaults still produce.
+**The peer mesh** is dialled but not answered: `crates/mesh/src/accept.rs` exists
+and the owner has **no `/api/mesh/link` route**, so a worker's dial lands on a
+404 and the registry records the reason. The dialler also verifies the owner's
+certificate against the bundled Mozilla roots with no accept-any path, so an
+owner on `acme = "self-signed"` cannot be dialled at all.
 
-The console then took the seams the library offers (`App::theme`,
-`Theme::with_palette`, `Theme::with_corners`, `App::ground`) and spent them on
-a face of its own: a HUD one step off black with one electric cyan, chamfered
-plates with corner brackets, every control milled to the same cut as the plate
-it sits in, a viewport frame scribed at the window's own edge, a ring gauge
-with a lit core, a lamp that pulses when it wants attention, and a sweep of two
-counter-rotating arcs drawn only while a link is being made. What keeps that
-from being the costume again is stated as three rules — the shape is the only
-word the console respells, glow is a fact and not a filter, two hues at rest —
-in *And then it was made an instrument on purpose* in
-[`docs/gui.md`](docs/gui.md), which keeps the reasoning so it is not repeated.
-The fixed-width face is reserved for text the machine produced, and
-`cargo run -p rui --example gallery -- .` — and the console's own
-`SELFHOST_FRAME_DIR=<dir> cargo test -p selfhost-console reference_frames` — is
-how an appearance change is judged before it is committed to.
+### 3.3 What has never executed, anywhere
 
-Two sizing rules replaced numbers somebody had picked: the rail is a share of
-the window instead of a fixed 292 units, and the log is promised its height
-(`min_h`) while the definition is what shrinks and scrolls. Both are now stated
-in the description rather than computed — the layout takes room back off
-whatever is sized to its content, so nothing has to work out what fits.
+Be exact about this, because everything above is macOS.
 
-A whole frame at 980 by 680 Retina costs **1.9 ms** measured, against the 8 ms
-an animating frame has; it rose about a fifth because there is more interface in
-the same window, not because a mark got dearer. The animation clock is *given*
-to `rui`, never read by it, which is what keeps easing assertable with no
-display. Frames are checked two ways with no window: font-less, so every box
-comes out at its minimum and a layout that only fitted because a label was short
-fails; and with the real faces via `reference_frames`, which writes every screen
-the console can be on out as PNGs and prints that timing table. See
-[`docs/gui.md`](docs/gui.md).
+- **7,292 lines live in Windows-only files** — `crates/screen/src/windows/*`
+  (5,131), `crates/rui/src/shell/platform/windows.rs` (980),
+  `crates/storage/src/fs/windows.rs` (634), `crates/storage/src/smb/windows.rs`
+  (547) — and with the `cfg(windows)` arms in `crates/cli`
+  (`desk_local`, `desk_supervisor`, `service_install`), `crates/admin/src/token.rs`,
+  `crates/rui/src/shell/fonts.rs` and `crates/firewall/src/backend/netsh.rs`, it
+  is **roughly nine thousand lines**. None of it has ever run. Not once, not
+  anywhere.
+- **What the Windows check does and does not prove.** `cargo check --workspace
+  --all-targets --target x86_64-pc-windows-gnu` passes cleanly — test targets
+  included, no diagnostics — and that is worth having: the
+  struct layouts, the `extern "system"` signatures and the whole call graph
+  compile against real Windows headers, so a wrong argument type or a missing
+  field is a build error here rather than a crash there. It proves **nothing**
+  about linking and **nothing whatever** about behaviour. Note the invocation —
+  the `cargo` and `rustc` on `PATH` are Homebrew's and have no Windows std, so
+  the rustup shims must come first on `PATH`, not merely be named by absolute
+  path. Getting that wrong reports `can't find crate for core` on every crate,
+  which reads like a broken tree and is a broken command.
+- **The X11 backend** type-checks and has never run either. X11 keycodes are not
+  mapped at all, so desktop keystroke forwarding from a Linux console does
+  nothing — an X11 keycode is an index into a per-server keymap with no fixed
+  meaning.
+- **No desktop stream has ever crossed a real socket** to a real agent, in either
+  console.
+- **The SMB backends for Windows and Linux** — the `SmbShare` cmdlets, the
+  `icacls` forms, `testparm -s`, `smbcontrol all reload-config` — are written
+  from documentation and have met no host. macOS is the opposite: flags read off
+  this machine's own `sharing` usage text, parser tested against its real JSON,
+  and the `sharing: must be run as root` denial observed by running the command
+  unprivileged.
+- **Windows discovery is absent, not partial.** Windows has no general mDNS
+  responder; Explorer's Network node is WSD and segment name resolution is
+  LLMNR. A Mac will not see a Windows box's WebDAV share in Finder however many
+  records this code derives. WSD is not implemented.
 
-**Only ever run on macOS.** The Windows and X11 backends type-check for their
-targets and have never been executed. That is the first thing to try when the
-Windows machine arrives, and the most likely place for a surprise.
+### 3.4 Two rules that keep catching people
 
-**The console installs as a real macOS application.** `scripts/macos-app.sh
-install` builds it, draws the icon, bundles it, installs it to `/Applications`,
-pins it to the Dock, and reopens a console that was running so the window on
-screen is the build that was just made; `uninstall` reverses all of that. **It
-is also the only way a code change reaches that window — see §7.** The icon is
-*drawn*
-by the library at every size macOS asks for (`crates/rui/examples/icon.rs`, via
-the PNG writer in `crates/rui/src/image.rs`) rather than stored as a binary
-nobody can review. Verified: the bundle opens from the Dock, and a console
-opened before its daemon says so in the header and connects by itself once the
-daemon starts.
-
-**Resizing the window used to smear, and no longer does.** macOS tracks a live
-resize in a nested run loop that does not return until the drag ends, so the
-console drew nothing for the whole gesture and the compositor stretched the last
-frame to each new size. A run-loop observer registered for the common modes now
-draws from inside AppKit's own loop; three separate ten-megabyte-per-frame costs
-were removed alongside it. The full reasoning is in
-[`docs/gui.md`](docs/gui.md). **The mechanism is unit-tested but the *feel* of a
-drag needs a hand on a mouse — that is the one thing still worth checking by
-hand.**
-
-**One crypto stack, not two.** `rustls` defaulted to `aws-lc-rs` while `rcgen`
-used `ring`, so every binary carried two independent cryptographic
-implementations — two lots of C and assembly, two supply chains, two sets of
-advisories. Both are now pinned to `ring`; the lock file went from 87 packages
-to 78, and a TLS 1.3 handshake was verified live afterwards rather than
-assumed.
-
-**The console reaches a remote daemon, and a push redeploys a service.** Both
-are done and verified live, and both are documented in
-[`docs/gui.md`](docs/gui.md):
-
-- `selfhost-console --ssh you@server` runs `ssh` as a managed child, forwards the
-  control port to loopback here, and reads the daemon's token over the same
-  connection. It answers no prompts — `BatchMode=yes` turns each question `ssh`
-  would have asked into a failure, and the console turns that failure into the
-  command that fixes it, in a banner across the window. Verified against a real
-  `sshd` that refused the key: the console said *tunnel down · the server refused
-  the key · `ssh-add`*, not *no daemon*, and retried with a growing backoff.
-- A service can carry `[service.git]`, and when the branch moves the daemon
-  **stops** it, updates the working copy, runs `post_pull`, and starts it again —
-  never `restart`, which would race the supervisor's own restart policy. Verified
-  live: a service installed over the control API cloned a GitHub branch, ran its
-  build step, started, and printed the checked-out file; a second commit stopped
-  it, reset the working copy, and started it on the new commit.
-
-**Not built:** ACME (so nothing can be published to a real browser yet), DNS,
-the mail connection layer, IMAP, MIME, service install as a system service, node
-join, backups, the console's sites-and-certificates views, a webhook receiver to
-make a poll happen sooner, and an OAuth device flow for repositories the daemon's
-own SSH key does not reach. Full detail and ordering in
-[`docs/roadmap.md`](docs/roadmap.md).
+- **A drawing change is not on screen until `scripts/macos-app.sh install` has
+  run.** The bundle in `/Applications` holds a *copy* of the binary. See §7.
+- **`rui` has its own repository** (<https://github.com/RockyWearsAHat/rui>,
+  public, MIT, CI on macOS/Windows/Linux). This workspace builds it from
+  `crates/rui` by path, so the two are copies and changes made here have to be
+  pushed there. Its own practices document is `crates/rui/rui.dx`.
 
 ## 4. Measured facts — do not re-derive
 
@@ -299,21 +266,70 @@ Consequence, already reflected in the design: outbound supports **both** `direct
 and `relay` as first-class modes, and `selfhost mail doctor` should *measure*
 which is usable rather than anyone guessing.
 
-## 5. What I'd do next
+## 5. What must be confirmed on ALEX-DESKTOP, in this order
 
-In order, with the reasoning in `docs/roadmap.md`:
+Everything above is macOS. This is the priority list for the first session on the
+Windows box, ordered so that a failure at step *n* makes steps after it
+meaningless. **Do not skip ahead to the interesting part**: steps 1 and 2 decide
+whether the remote-desktop design works at all on a service deployment, and every
+later step assumes them.
 
-1. **ACME client (RFC 8555).** Unblocks everything public. HTTP-01, since we
-   already own port 80 — do not couple it to the DNS server that does not exist
-   yet. The redirect exemption and token serving are **already done**: write
-   tokens into `data/acme-challenges/<token>` and the proxy serves them over
-   cleartext without redirecting.
-2. **SNI certificate selection** — today one certificate carries every hostname.
-3. **Mail connection layer** → Maildir store → MIME → IMAP.
-4. **DNS**, with a free secondary (Hurricane Electric). A single authoritative
-   home box means the domain stops resolving when it is down, which takes mail
-   with it.
-5. **Service install** — Windows SCM first; it is why Docker went.
+1. **Is the daemon actually LocalSystem?** `WTSQueryUserToken` returning
+   `ERROR_ACCESS_DENIED` means it is not, and the entire session-0 plan is
+   inoperative. The fault names the call. Say so once, loudly, and stop retrying
+   in a tight loop.
+2. **Does the agent spawn, connect, and stay up?** Watch for three specific
+   things: `CreateNamedPipeW` + `ERROR_PIPE_BUSY`/`ERROR_ACCESS_DENIED` (a
+   previous agent has not exited, or something local is squatting the name —
+   `FILE_FLAG_FIRST_PIPE_INSTANCE` is what makes that detectable rather than
+   silent); the agent's `Hello` arriving inside the **20 s start deadline**
+   (without `connected` the supervisor kills it as `NeverConnected` and charges
+   it a failure, which is a crash loop caused by a missing call rather than a
+   broken agent); and the per-hour respawn cap being spent, which surrenders out
+   loud and stays surrendered until the operator presses start.
+3. **Check the pipe's ACL before trusting anything else.**
+   `(Get-Acl \\.\pipe\selfhost-desk-1).Access` must name only
+   `NT AUTHORITY\SYSTEM` and the console user. **The DACL is the
+   authentication** — there is no agent secret to leak, so a wrong DACL is the
+   whole security model gone, not a degraded one.
+4. **Confirm UIPI is intact.** With an elevated window focused, keys, text,
+   buttons and wheel must be refused with `input-refused (elevated window)` while
+   pointer movement still works. Success is never inferred from `SendInput`'s
+   return count — UIPI discards silently and `GetLastError` says nothing. **If a
+   keystroke reaches an elevated window, stop everything**: that is remote
+   privilege escalation, not a feature. The agent is never SYSTEM and never gets
+   `uiAccess`; both refusals are permanent.
+5. **Confirm the secure desktop is never captured.** A UAC consent dialog or the
+   login window must produce a *named state* in the console, not pixels.
+6. **Only then, the picture.** A Windows daemon started from a signed-in session
+   is the path that is served in full — try that before the service, because it
+   isolates a capture problem from the session-0 splice that is still unwritten.
+7. **The audit trail.** `wc -l data/audit.log` grows by exactly one line per
+   control action; typed text is a unit count and is never quoted. Nothing
+   rotates this file — a long drive session is one line per keystroke.
+8. **Then storage.** `selfhost storage smb plan`, read it, then `apply`, then
+   confirm every pre-existing Windows share point is still there. `New-SmbShare`
+   with no access parameter grants `Everyone: Read`, so check that the created
+   share names `BUILTIN\Administrators` by SID and that guest exposure reads
+   false. Remember 445 is LAN-only, forever, never forwarded, and that
+   `selfhost_firewall::desired_rules` does not open it — on a managed firewall an
+   export is created, advertised, and unreachable, which is the safe failure.
+9. **Then a real client.** Mount a share in Explorer over WebDAV and watch what
+   it does with the PROPPATCH `403` it sends after each `PUT` — predicted as
+   *"some attributes could not be copied"* with the file itself intact. **The
+   Windows mount will not work behind a self-signed certificate**, so this needs
+   a real certificate first. Then Finder from the Mac, which is where SMB
+   discovery either appears or does not.
+10. **`cargo run -p rui --example counter`** on Windows and on Linux. The window
+    backends have never been opened. This is cheap, it is the most likely place
+    for a surprise, and everything visual depends on it.
+
+**What to do first back on the Mac, independent of the Windows box:** wire
+`Api::standings` into `crates/cli/src/desk_task.rs` so a revocation ends a stream
+at the next keystroke rather than at its ceiling (§3.2), add
+`fn operator_start(&self)` to `selfhost_admin::Fleet` plus a route so the
+console's start button has something to call, and decide whether `/dav` should
+have a config switch. All three are small and all three are named in the labs.
 
 ## 6. Open questions for him
 
@@ -332,15 +348,26 @@ In order, with the reasoning in `docs/roadmap.md`:
    The call itself is scripted in [`docs/isp-script.md`](docs/isp-script.md) —
    its first question, whether `172.83.7.210` is dedicated or shared, decides
    whether the infected device is even on this network.
-2. **Is the Windows PC available yet, and what are its specs?** Everything has
-   been built and tested on the Mac. Nothing is Mac-specific, and the
-   cross-compile targets are installed, but it has never been run on Windows.
-3. **Which domain goes first?** `leveluplongboarding.surf` is on Namecheap DNS
+2. **Which domain goes first?** `leveluplongboarding.surf` is on Namecheap DNS
    (not Netlify, contrary to the prior handoff) pointing at Netlify. Recommend
    proving the chain on a throwaway subdomain before cutting the live site over.
-4. **Has he verified inbound 80/443 actually reach the machine?** Untestable
+3. **Has he verified inbound 80/443 actually reach the machine?** Untestable
    until something listens and the router forwards, and it must be tested from
    *outside* the network. Many ISPs filter them.
+4. **Does he want remote desktop turned on at all, and with a keyboard?** It is
+   the highest-privilege capability in this repository and it is off by default
+   for reasons written out in `docs/SECURITY.md` §3.7 SCR-01. Viewing and driving
+   are separate decisions and the second one should be his, explicitly, rather
+   than something a session enables to demonstrate it works.
+5. **Where should a share be rooted on ALEX-DESKTOP, and does anyone need an OS
+   account for SMB?** A root may not sit inside `data_dir`, the TLS store or the
+   repository. SMB authenticates against OS accounts, so a person who is to reach
+   a share over SMB needs an account on that box — the console password cannot do
+   it, on any platform.
+6. **Should `/dav` have an off switch?** It is live wherever a console password
+   and a `[[shares]]` block coexist, with no `[storage]` setting to disable it.
+   Defensible — it is authenticated, and the site it rides is source-gated — but
+   it is the one place in these two subsystems where something is on by default.
 
 ## 7. Traps
 
@@ -394,6 +421,47 @@ In order, with the reasoning in `docs/roadmap.md`:
   the daemon never touches it — serialising it back would destroy every comment
   in it, including the ACME rate-limit warning. The daemon owns
   `data/services.toml`. Do not give either file a second writer.
+- **Do not "fix" the two injection refusals.** On Windows the injector refuses
+  keys while an elevated window has focus, and on macOS it refuses keyboard and
+  text while `IsSecureEventInputEnabled` is true. Both look like bugs and both
+  are the feature: a channel that can drive a UAC consent dialog or a login
+  window is remote privilege escalation. Pointer movement is still injected in
+  both cases so the session does not look dead. The agent is never SYSTEM and
+  never gets `uiAccess`, forever.
+- **A WebDAV `401` must never feed the console's global failure gate.** Every
+  WebDAV client's first request is unauthenticated by protocol design, so
+  mounting one share would otherwise lock the operator out of the console they
+  would use to unmount it. The counter is per credential, deliberately.
+- **A refusal after authentication on `/dav` is never a second `401`.** macOS and
+  Windows discard the keychain item and prompt for ever when they see one. This
+  is the opposite of the uniform-401 rule everywhere else in this codebase, and
+  it is safe only because the sole credential that opens `/dav` holds every
+  share. If a per-person WebDAV credential is ever added, that reasoning has to
+  be revisited in the same edit.
+- **Do not pop `..` in a share path, and do not match it before trimming trailing
+  dots and spaces.** Windows strips those before the filesystem sees a component,
+  so `".. "` passes an exact-equality refusal and normalises back to `..`. That
+  is a directory traversal, not a naming nicety, and it is the single most likely
+  way a NAS gets rooted. The rule is on every platform and never behind a `cfg`.
+- **`crates/proxy/src/files.rs` is not reusable for the share write path** and
+  was deliberately not reused: `confine()` canonicalises, which returns ENOENT
+  for every path being created, and `resolve` invents paths, which on a file
+  share means serving a different file than was asked for.
+- **`storage smb apply` can remove an export.** Which is why `apply` is a spelled
+  word rather than a flag, dry-run is the default, and the reconciler never
+  touches a share point selfhost did not create. The ownership ledger
+  (`storage.smb-owned`) is what makes "did not create" a fact rather than a
+  guess — do not bypass it to make a cleanup easier.
+- **Do not put the desktop input switch on the wire.** It travels on the agent's
+  command line, fixed by `CreateProcessAsUserW` at spawn and read once before the
+  link is opened. The pipe's DACL admits SYSTEM and the console user's own SID —
+  Windows cannot tell two same-user processes apart on a named object — so a
+  switch that arrived as a frame would be assertable by anything that can talk to
+  the pipe.
+- **The console gate is a source address, not an identity.** The tunnel exits on
+  loopback, so `allowed_cidrs = ["127.0.0.1/32"]` admits every co-hosted web app
+  on this box. Never justify a control by the gate. Every one of them has to
+  stand as a credential check, a capability check, a freshness check or a file.
 
 ## 8. Suggested skills
 

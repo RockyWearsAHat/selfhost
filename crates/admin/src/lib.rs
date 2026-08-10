@@ -26,12 +26,26 @@
 //!
 //! [`Api::handle`] turns a request into a response and touches no sockets, so
 //! every route — including every way of getting the authorisation wrong — is
-//! tested directly. [`serve`] is the thin part that owns the listener.
+//! tested directly. [`serve`] is the thin part that owns the listener, and the
+//! handful of routes that stop being HTTP go through [`stream::Upgraded`], which
+//! is the only thing in this crate that writes a `101`.
+//!
+//! One of those routes is unlike every other in this file and is worth knowing
+//! about before reading it. `GET /api/mesh/link` is answered **before** its
+//! caller has proved anything: a worker dialling its owner presents no cookie
+//! and no ticket, because what it can prove is an HMAC over the very handshake
+//! being answered, and that does not exist until the handshake does. The `101`
+//! there is the start of the conversation in which the caller proves who they
+//! are, the next frame decides it, and what an unproved caller can cost this
+//! daemon is bounded by [`mesh_api::MAX_PENDING_LINKS`] and a greeting timeout.
+//! See [`mesh_api`].
 
 #![warn(missing_docs)]
 
 pub mod audit_api;
+pub mod dav_api;
 pub mod desk_api;
+pub mod mesh_api;
 pub mod passwd;
 pub mod session;
 pub mod storage_api;
@@ -56,7 +70,9 @@ use tokio::net::{TcpListener, TcpStream};
 
 pub use passwd::ConsolePassword;
 pub use session::{Authenticated, FailureGate, Sessions};
+pub use dav_api::Webdav;
 pub use desk_api::{AgentReport, Fleet, Handover, NodeReport, Standings};
+pub use mesh_api::Peerage;
 pub use storage_api::Volumes;
 pub use store::Store;
 pub use token::Token;
@@ -122,6 +138,21 @@ pub struct Api {
     /// repository is off unless somebody turned it on in a file and restarted
     /// the daemon, which is the only place it can be turned on.
     desktop: Option<desk_api::Wiring>,
+    /// The WebDAV credential cache and lock table, shared by every clone.
+    ///
+    /// `None` only if the system random source refused to seed the cache key at
+    /// start-up, and `None` closes `/dav` entirely rather than opening it
+    /// without a cache. That is the safe direction twice over: a cache keyed on
+    /// a constant would be a fingerprint table an attacker could build offline,
+    /// and a `/dav` endpoint with no cache at all would spend 70 ms of PBKDF2 on
+    /// every one of Finder's five hundred requests — thirty-five seconds of a
+    /// core, on the first mount, before anybody has copied anything.
+    ///
+    /// Wired in [`Api::new`] rather than by a builder call, because WebDAV is
+    /// not a subsystem an operator switches on: it is a second protocol onto the
+    /// shares that are already declared, and a deployment with no `[[shares]]`
+    /// and no console password serves nothing over it either way.
+    webdav: Option<Arc<Webdav>>,
     /// The append-only record of every control action, for reading back.
     ///
     /// `None` until a data directory has been named, and `None` answers the
@@ -135,6 +166,14 @@ pub struct Api {
     /// switch, so that a switch created by `touch`, by Finder or over SMB is
     /// recorded identically and never twice.
     audit: Option<selfhost_identity::AuditLog>,
+    /// The machines this owner has invited, and the links they are holding.
+    ///
+    /// `None` when the daemon wired no peerage, and `None` makes
+    /// `GET /api/mesh/link` answer exactly what a path this deployment does not
+    /// serve answers — which is what a box with no workers should look like from
+    /// outside. A worker's dial is otherwise the one upgrade on this API whose
+    /// credential arrives *after* the `101`; see [`mesh_api`].
+    peers: Option<Peerage>,
 }
 
 /// Cookie-session authentication, present once [`Api::with_console_auth`] has
@@ -374,6 +413,46 @@ impl<'a> Route<'a> {
     }
 }
 
+/// The paths that stop being HTTP, and what each of them becomes.
+///
+/// [`Route`] covers everything [`Api::handle`] answers with a response;
+/// this covers the handful that answer with a `101` and then a connection. One
+/// vocabulary rather than a check per route, so that "which paths are streams"
+/// is asked once, in one place, and a path that is not in this list cannot
+/// accidentally be upgraded by a route that forgot to ask.
+///
+/// The split inside it is the one that matters. A console stream is authorised
+/// **before** the handshake is answered, by a single-use ticket minted at a
+/// CSRF-protected `POST` — that is [`Ability`], and it is a closed vocabulary
+/// precisely so a ticket cannot authorise a string a later version invents. A
+/// peer link cannot be: a worker is a daemon with no session and no ticket, and
+/// what it can prove is an HMAC **over this very handshake**, which does not
+/// exist until the handshake does. Modelling the second as an `Ability` would
+/// have meant either a ticket nobody can mint or an ability nobody checks; it is
+/// its own variant instead, and [`mesh_api`] owns the credential that follows.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum StreamRoute {
+    /// A console stream, carrying the minimum ability its URL asks for.
+    Console(Ability),
+    /// `GET /api/mesh/link` — a worker dialling its owner.
+    PeerLink,
+}
+
+impl StreamRoute {
+    /// The stream route reached at `target`, if any.
+    ///
+    /// The peer link is matched first and on the path alone. It takes no query
+    /// string, carries no ticket, and names no node in its URL — the node is
+    /// named in the greeting and *proved* there, which is the only place a name
+    /// on this route means anything.
+    fn for_target(target: &str) -> Option<Self> {
+        if split_target(target).0 == mesh_api::LINK_PATH {
+            return Some(Self::PeerLink);
+        }
+        Ability::for_target(target).map(Self::Console)
+    }
+}
+
 /// The name of the session cookie the console browser holds.
 const SESSION_COOKIE: &str = "selfhost_session";
 
@@ -431,8 +510,35 @@ impl Api {
             people: None,
             storage: None,
             desktop: None,
+            webdav: Webdav::new().ok().map(Arc::new),
             audit: None,
+            peers: None,
         }
+    }
+
+    /// Records the machines this owner has invited, and opens the link route.
+    ///
+    /// Built by the caller ([`Peerage::for_owner`]) rather than here, for the
+    /// reason [`Api::with_storage`] is: the registry it carries is the *same*
+    /// value the daemon's node picker and `doctor` read, and an `Api` that built
+    /// its own would be a second belief about which machines are up.
+    ///
+    /// Without this call `GET /api/mesh/link` is indistinguishable from a path
+    /// this deployment does not serve, which is the honest report for a box that
+    /// has no workers.
+    pub fn with_peers(mut self, peers: Peerage) -> Self {
+        self.peers = Some(peers);
+        self
+    }
+
+    /// The machines this owner has invited, if the daemon wired any.
+    ///
+    /// The daemon reaches through this to splice a desktop session onto a peer's
+    /// link ([`Peerage::link`]) and to draw the node picker
+    /// ([`Peerage::registry`]), so the route that admits a link and the panel
+    /// that reports it cannot disagree.
+    pub fn peers(&self) -> Option<&Peerage> {
+        self.peers.as_ref()
     }
 
     /// Records the shares this daemon serves.
@@ -638,6 +744,18 @@ impl Api {
             } else {
                 self.webauthn_login_challenge()
             };
+        }
+
+        // WebDAV sits ahead of the wall because it has a door of its own, and it
+        // has to: a Finder or a Windows mount speaks HTTP authentication or
+        // nothing — no login form, no cookie, no bearer header it could be
+        // taught. So `/dav` authenticates with Basic over TLS against the same
+        // console password, through the verified-credential cache that is the
+        // difference between a mount and thirty-five seconds of PBKDF2. See
+        // [`dav_api`] for why the cookie and the token are deliberately refused
+        // there, and for why a refusal *after* authentication is never a 401.
+        if dav_api::is_dav_path(path) {
+            return self.dav(request, body).await;
         }
 
         if !self.authorised(request) {
@@ -1028,6 +1146,48 @@ impl Api {
     /// The console site's canonical origin, when one is configured.
     fn console_origin(&self) -> Option<&str> {
         self.console.as_ref()?.origin.as_deref()
+    }
+
+    /// The console site's configured hostname, without the scheme.
+    ///
+    /// The value a WebDAV `Destination` header's authority is compared against.
+    /// It comes from configuration and never from a request, for the same reason
+    /// the passkey relying-party id does: the proxy's relay forwards no `Host`,
+    /// so a host taken from the request would be the client's own claim, and a
+    /// check against a value the attacker chose is not a check.
+    fn console_host(&self) -> Option<&str> {
+        self.console_origin()?.strip_prefix("https://")
+    }
+
+    /// Everything a WebDAV request is decided against, or `None` when nothing
+    /// could ever open one.
+    ///
+    /// Three things must all be present: a console password to verify against, a
+    /// credential cache to verify through, and shares to serve. Any one missing
+    /// makes every `/dav` request the same `401` with a challenge — not a `404`
+    /// — because a mount point that answered `404` on a box with no password and
+    /// `401` on a box with one would be a way to read the deployment's
+    /// configuration from outside it.
+    pub fn dav_wiring(&self) -> Option<dav_api::Wiring<'_>> {
+        Some(dav_api::Wiring {
+            password: Arc::clone(&self.console.as_ref()?.password),
+            webdav: Arc::clone(self.webdav.as_ref()?),
+            volumes: self.storage.as_ref()?,
+            policy: &self.policy,
+            host: self.console_host(),
+        })
+    }
+
+    /// Answers a WebDAV request on the document plane.
+    ///
+    /// The byte plane — `GET`, `HEAD` and `PUT` — is [`serve_dav`], which owns a
+    /// connection; its *decision* still runs here, so every refusal it can make
+    /// is reachable from this function and therefore from a test with no socket.
+    async fn dav(&self, request: &Request, body: &[u8]) -> Response {
+        match self.dav_wiring() {
+            Some(wiring) => dav_api::answer(&wiring, request, body).await,
+            None => dav_api::unauthenticated(),
+        }
     }
 
     /// Which credential this request presents, and who and what it is.
@@ -1926,13 +2086,18 @@ async fn handle_connection(
     // /api/events` falls through and gets the same "no such endpoint" 404 as any
     // other unmatched route, which is what it should look like to anyone who is
     // not opening a stream.
-    let stream_route = Ability::for_target(&request.target)
+    let stream_route = StreamRoute::for_target(&request.target)
         .filter(|_| selfhost_ws::handshake::looks_like_upgrade(&request));
     if let Some(route) = stream_route {
         // Everything past the head belongs to the new protocol, not to a body.
         // See `stream::Prefixed` for what happens if it is dropped here.
         let leftover = buffer.split_off(consumed);
-        return serve_stream(stream, leftover, api, request, route).await;
+        return match route {
+            StreamRoute::Console(ability) => {
+                serve_stream(stream, leftover, api, request, ability).await
+            }
+            StreamRoute::PeerLink => serve_link(stream, leftover, api, &request).await,
+        };
     }
 
     // The other branch that does not go through `Api::handle`: a bulk transfer
@@ -1943,6 +2108,17 @@ async fn handle_connection(
     if storage_api::is_bulk(request.path()) {
         let leftover = buffer.split_off(consumed);
         return serve_bulk(stream, leftover, api, request).await;
+    }
+
+    // And the third, for the same reason: a WebDAV `GET`, `HEAD` or `PUT` is a
+    // whole file in one direction or the other. Every other WebDAV verb carries
+    // a small document and goes through `Api::handle` with the rest of the API.
+    // Matched on the path and the method alone, so a caller with no credential
+    // meets the same challenge here as on any other `/dav` request rather than a
+    // 404 that says which prefixes are served.
+    if dav_api::is_dav_path(request.path()) && dav_api::is_byte_verb(&request.method) {
+        let leftover = buffer.split_off(consumed);
+        return serve_dav(stream, leftover, api, request).await;
     }
 
     let body = match read_body(&mut stream, &request, &mut buffer, consumed).await {
@@ -1957,10 +2133,11 @@ async fn handle_connection(
 /// Decides an upgrade, answers it, and hands the connection to the stream that
 /// asked for it.
 ///
-/// The whole of the socket layer's part in a stream. The decision is
+/// The whole of the socket layer's part in a console stream. The decision is
 /// [`Api::upgrade_for`], which is pure and tested without a port; the hand-over
-/// is [`stream::Prefixed`], which carries the bytes that arrived alongside the
-/// head so the first message is not eaten; and the loop is [`stream::events`].
+/// is [`stream::Upgraded`], which writes the `101` — the **only** place in this
+/// crate that does — and carries the bytes that arrived alongside the head so
+/// the first message is not eaten; and the loop is [`stream::events`].
 ///
 /// A refusal is the same uninformative 401 every other unauthorised request
 /// gets, byte for byte. The reason is written to the daemon's log, where an
@@ -1983,23 +2160,15 @@ async fn serve_stream(
         }
     };
 
-    stream::answer(&mut stream, &admission).await?;
+    let upgraded = stream::Upgraded::answer(stream, leftover, admission).await?;
     println!(
         "admin: stream open on {path} for {who}",
         path = request.path(),
-        who = Api::stream_identity(&admission),
+        who = Api::stream_identity(upgraded.whom()),
     );
 
     let outcome = match &route {
-        Ability::Events => {
-            stream::events(
-                stream::Prefixed::new(leftover, stream),
-                api,
-                admission,
-                stream::Watch::default(),
-            )
-            .await
-        }
+        Ability::Events => stream::events(upgraded, api, stream::Watch::default()).await,
         // A desktop stream is not this crate's protocol to speak. Everything
         // past the `101` is `selfhost-desk`, driven over screens and peer links
         // that live in the daemon, so the socket, the redeemed grant and the
@@ -2008,7 +2177,7 @@ async fn serve_stream(
         Ability::DesktopView(node)
         | Ability::DesktopControl(node)
         | Ability::ClipboardRead(node) => {
-            return serve_desktop(stream, leftover, api, node.clone(), admission).await;
+            return serve_desktop(upgraded, api, node.clone()).await;
         }
     };
     match outcome {
@@ -2042,12 +2211,18 @@ async fn serve_stream(
 /// rather than answer the handshake with the uniform 401, because "the machine
 /// already has two viewers" is not an authorisation failure and telling a
 /// legitimate operator it is would send them to a login page.
+///
+/// It takes an [`Upgraded`](stream::Upgraded) rather than a socket and an
+/// [`Admission`], and that is load-bearing rather than cosmetic: this function
+/// used to answer the handshake *again*, so the desktop route put two complete
+/// `101` heads on the wire and every client read the second as a malformed
+/// frame. It can no longer do so, because the connection it is handed has
+/// already been answered and it never holds the raw stream a second answer would
+/// be written to.
 async fn serve_desktop(
-    mut stream: TcpStream,
-    leftover: Vec<u8>,
+    upgraded: stream::Upgraded<TcpStream, Admission>,
     api: Api,
     node: selfhost_identity::NodeName,
-    admission: Admission,
 ) -> std::io::Result<()> {
     let Some(wiring) = api.desktop() else {
         // Reached only if the subsystem was switched off between the handshake's
@@ -2056,7 +2231,6 @@ async fn serve_desktop(
         eprintln!("admin: a desktop stream was admitted with no desktop wired");
         return Ok(());
     };
-    stream::answer(&mut stream, &admission).await?;
 
     let Some(seat) = wiring.admit(node.as_str()) else {
         println!(
@@ -2065,6 +2239,8 @@ async fn serve_desktop(
         );
         return Ok(());
     };
+
+    let (io, admission) = upgraded.into_parts();
 
     // The abilities the admission carries have already been narrowed twice: at
     // the mint, by `Policy::decide` per ability, and at the handshake, by
@@ -2088,7 +2264,7 @@ async fn serve_desktop(
 
     let ended = wiring
         .serve(desk_api::Handover {
-            io: Box::new(stream::Prefixed::new(leftover, stream)),
+            io: Box::new(io),
             redemption: desk_api::redemption(session.as_deref(), &node, capabilities),
             ceilings: wiring.ceilings(),
             seat,
@@ -2096,6 +2272,59 @@ async fn serve_desktop(
         })
         .await;
     println!("admin: desktop stream on {node} ended: {ended}");
+    Ok(())
+}
+
+/// Admits a worker's dial, or refuses it before anything is upgraded.
+///
+/// The owner's half of the peer link, and the reason `crates/mesh` is reachable
+/// at all. Three refusals happen **before** the `101`, in this order, and each
+/// is answered as an ordinary HTTP response because there is no stream yet to
+/// close:
+///
+/// 1. **No peerage wired.** The same `404` a path this deployment does not serve
+///    answers with, because that is exactly what a box with no invited workers
+///    is. It is not a `401`: there is no credential to have got wrong yet, and a
+///    dialler that is told *authorisation required* would report a stale token
+///    to its operator when the truth is that the far end has no mesh at all.
+/// 2. **Not a valid handshake.** A `400` with a fixed sentence; the syntax
+///    verdict goes to this daemon's log rather than to the caller.
+/// 3. **At the admission ceiling** ([`mesh_api::MAX_PENDING_LINKS`]). A `503`,
+///    which is honest and says nothing about which nodes exist. Refusing here
+///    rather than after the upgrade is the point of the ceiling: a caller who
+///    will not be admitted should never be handed an upgraded connection.
+///
+/// Everything after the `101` — the greeting, the proof, the replay ledger, the
+/// registry and the link itself — is [`mesh_api::serve`], and every refusal
+/// there is one bare close code with no prose, so the operator's list of their
+/// own machines cannot be enumerated one guess at a time.
+async fn serve_link(
+    mut stream: TcpStream,
+    leftover: Vec<u8>,
+    api: Api,
+    request: &Request,
+) -> std::io::Result<()> {
+    let Some(peers) = api.peers().cloned() else {
+        return write_response(&mut stream, &problem(Status(404), "no such endpoint")).await;
+    };
+    let key = match selfhost_ws::handshake::validate(request) {
+        Ok(handshake) => handshake.key,
+        Err(refusal) => {
+            eprintln!("admin: refused a peer link: not a handshake: {refusal}");
+            return write_response(&mut stream, &problem(Status(400), "not a websocket handshake"))
+                .await;
+        }
+    };
+    let Some(pending) = mesh_api::admission_slot(&peers) else {
+        eprintln!(
+            "admin: refused a peer link: {} admissions are already in flight",
+            mesh_api::MAX_PENDING_LINKS
+        );
+        return write_response(&mut stream, &problem(Status(503), "try again shortly")).await;
+    };
+
+    let upgraded = stream::Upgraded::answer(stream, leftover, stream::PeerKey::new(&key)).await?;
+    println!("admin: {}", mesh_api::serve(upgraded, peers, pending).await);
     Ok(())
 }
 
@@ -2122,6 +2351,36 @@ async fn serve_bulk(
     match storage_api::serve(&mut stream, prefix, &request, plan).await {
         Ok(report) => println!("admin: {report}"),
         Err(error) => eprintln!("admin: a storage transfer ended badly: {error}"),
+    }
+    Ok(())
+}
+
+/// Serves a WebDAV file transfer, or refuses it.
+///
+/// The refusal is logged **without the path**, and so is the success: on a NAS
+/// the file names are the sensitive thing, and a log with no stated ACL is a
+/// directory listing waiting to be reconstructed. The share id is fine — it is a
+/// configured name, and the caller had to prove they hold the deployment's own
+/// password to get this far.
+async fn serve_dav(
+    mut stream: TcpStream,
+    prefix: Vec<u8>,
+    api: Api,
+    request: Request,
+) -> std::io::Result<()> {
+    let Some(wiring) = api.dav_wiring() else {
+        return write_response(&mut stream, &dav_api::unauthenticated()).await;
+    };
+    let passage = match dav_api::admit(&wiring, &request).await {
+        Ok(passage) => passage,
+        Err(refused) => {
+            eprintln!("admin: refused a WebDAV transfer: {refused}");
+            return write_response(&mut stream, &refused.response()).await;
+        }
+    };
+    match dav_api::serve(&mut stream, prefix, &request, passage).await {
+        Ok(report) => println!("admin: {report}"),
+        Err(error) => eprintln!("admin: a WebDAV transfer ended badly: {error}"),
     }
     Ok(())
 }
@@ -2186,4 +2445,66 @@ async fn write_response(stream: &mut TcpStream, response: &Response) -> std::io:
     }
     stream.write_all(&out).await?;
     stream.flush().await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The whole upgrade routing table, which is the thing that was wrong.
+    ///
+    /// `/api/mesh/link` had no variant anywhere, so a worker's dial fell through
+    /// to the ordinary router and met a `404` — and `crates/mesh`, every line of
+    /// it, was unreachable. A table test here is what makes that a build-time
+    /// question rather than something discovered on a second machine.
+    #[test]
+    fn the_upgrade_routing_table_in_full() {
+        let node = |name: &str| selfhost_identity::NodeName::parse(name).expect("a legal name");
+
+        assert_eq!(StreamRoute::for_target("/api/mesh/link"), Some(StreamRoute::PeerLink));
+        assert_eq!(
+            StreamRoute::for_target("/api/events"),
+            Some(StreamRoute::Console(Ability::Events))
+        );
+        // A desktop URL yields the *minimum* ability: whether the stream may also
+        // drive the machine is decided by the redeemed ticket, never by a URL a
+        // page can compose with no header at all.
+        assert_eq!(
+            StreamRoute::for_target("/api/desktop/session?peer=alex-desktop"),
+            Some(StreamRoute::Console(Ability::DesktopView(node("alex-desktop"))))
+        );
+        assert_eq!(
+            StreamRoute::for_target("/api/desktop/session"),
+            Some(StreamRoute::Console(Ability::DesktopView(node(desk_api::LOCAL_NODE)))),
+            "an unnamed peer is this machine, which is the same code path as any other"
+        );
+
+        // The link route names no machine and takes no parameters, so nothing in
+        // a query string may change what it is.
+        assert_eq!(
+            StreamRoute::for_target("/api/mesh/link?peer=alex-desktop"),
+            Some(StreamRoute::PeerLink)
+        );
+
+        // Every near miss. None of these is a stream, and each one would be a
+        // route reachable without a ticket if the match were a prefix or a
+        // contains.
+        for target in [
+            "/api/mesh",
+            "/api/mesh/link/",
+            "/api/mesh/links",
+            "/api/mesh/link/extra",
+            "/API/MESH/LINK",
+            "/api/services",
+            "/api/desktop/ticket",
+            "/",
+            "",
+        ] {
+            assert_eq!(StreamRoute::for_target(target), None, "{target} was routed as a stream");
+        }
+
+        // A peer that is not a legal node name names nothing this deployment
+        // serves, and is refused rather than defaulted to this machine.
+        assert_eq!(StreamRoute::for_target("/api/desktop/session?peer=Not%20A%20Node"), None);
+    }
 }

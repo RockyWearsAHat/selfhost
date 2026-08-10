@@ -10,6 +10,7 @@
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
+pub mod dav;
 pub mod files;
 pub mod health;
 pub mod mime;

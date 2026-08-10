@@ -11,6 +11,12 @@ description = "Network attached storage: shares, the safe path resolver, streame
 # PBKDF2 verification for share credentials reuses the console password hash.
 ring = { workspace = true }
 selfhost-config = { workspace = true }
+# The DNS-SD records `discover` derives are expressed in the project's own wire
+# vocabulary (`selfhost_dns::wire::{Record, RecordData}`) rather than in a model
+# invented here, so the records this crate hands to a platform advertiser and the
+# records `crates/dns` would serve are the same types. Nothing in this crate
+# encodes or transmits one — publication is delegated; see `discover`.
+selfhost-dns = { workspace = true }
 selfhost-http = { workspace = true }
 selfhost-identity = { workspace = true }
 selfhost-json = { workspace = true }

@@ -21,10 +21,11 @@
 
 use super::sys::{self, Handle, OwnedHandle};
 use super::{command_line, desktop, INTERACTIVE_DESKTOP};
+use crate::agent::{agent_arguments, InputPolicy};
 use crate::supervisor::{AgentHost, AgentProcess, ConsoleSession};
 use crate::Fault;
 use std::ffi::c_void;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// What to start, and with what arguments.
 ///
@@ -89,18 +90,57 @@ impl AgentProcess for SpawnedAgent {
 
 /// The daemon's Windows implementation of [`AgentHost`].
 ///
-/// Holds only the command, because everything else it needs — which session, who
-/// is signed in — is asked freshly every time. Caching a session id here would
-/// mean an agent started into a session that has since gone away.
+/// Holds the executable and the deployment's input policy, and **nothing about a
+/// session**: which session and who is signed into it are asked freshly on every
+/// spawn, because a cached session id is an agent started into a session that has
+/// since gone away.
+///
+/// The arguments are built here rather than accepted from the caller, by
+/// [`agent_arguments`], so that the session the supervisor decided on and the
+/// switch the operator configured are the two things that reach the agent — and
+/// so that no caller can assemble an argv that grants input by accident.
 #[derive(Debug, Clone)]
 pub struct WindowsHost {
-    command: AgentCommand,
+    executable: PathBuf,
+    input: InputPolicy,
 }
 
 impl WindowsHost {
-    /// A host that starts this command.
-    pub fn new(command: AgentCommand) -> Self {
-        Self { command }
+    /// A host that starts `executable` under `input`.
+    ///
+    /// `executable` must be the absolute path of the selfhost binary — the same
+    /// one this daemon is running from, in production, since the agent is a
+    /// subcommand of it. It is passed as `lpApplicationName` and never searched
+    /// for; see [`spawn_into_session`].
+    ///
+    /// `input` is [`InputPolicy::from_config`] of `[desktop].allow_input`, read at
+    /// the moment the host is built. An operator who changes that switch gets the
+    /// new answer when the daemon re-reads its config and rebuilds the host, which
+    /// is the same rule every other config value in this deployment follows.
+    pub fn new(executable: PathBuf, input: InputPolicy) -> Self {
+        Self { executable, input }
+    }
+
+    /// The command this host would spawn into `session`.
+    ///
+    /// Exposed for the daemon's own diagnostics — a console plate that shows what
+    /// is about to be started — and used by [`AgentHost::spawn`] itself, so the
+    /// line an operator reads is the line that runs.
+    pub fn command_for(&self, session: u32) -> AgentCommand {
+        AgentCommand {
+            executable: self.executable.clone(),
+            arguments: agent_arguments(session, self.input),
+        }
+    }
+
+    /// The executable this host starts.
+    pub fn executable(&self) -> &Path {
+        &self.executable
+    }
+
+    /// Whether agents started by this host may build an injector.
+    pub fn input_policy(&self) -> InputPolicy {
+        self.input
     }
 }
 
@@ -110,7 +150,7 @@ impl AgentHost for WindowsHost {
     }
 
     fn spawn(&mut self, session: u32) -> Result<Box<dyn AgentProcess>, Fault> {
-        Ok(Box::new(spawn_into_session(&self.command, session)?))
+        Ok(Box::new(spawn_into_session(&self.command_for(session), session)?))
     }
 }
 

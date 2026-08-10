@@ -55,23 +55,55 @@
 //! caches what the daemon said, so a service that has just died cannot still be
 //! drawn as running by a widget that was not told.
 
+mod desktop;
 mod detail;
 mod exposure;
+pub(crate) mod files;
 mod install;
+mod people;
 mod style;
 
-use crate::state::{Command, Link, NoticeKind, Snapshot, Tunnel};
+use crate::channel::{Live, Session};
+use crate::client::Client;
+use crate::nas;
+use crate::remote::{self, ControlRefusal};
+use crate::state::{Command, FileAction, Link, NoticeKind, Screen, Snapshot, Tunnel};
+use files::FilesForm;
 use install::InstallForm;
 use rui::style::Justify;
 use rui::{
-    Align, App, El, Key, Role, Status, Tone, button, caption, col, figure, heading, micro,
-    paragraph, row, spacer, text, title,
+    Align, App, Drag, El, Key, KeyStroke, Modifiers, Phase, Redraw, Role, Status, Tone, button,
+    caption, col, figure, heading, micro, paragraph, row, spacer, tabs, text, title,
 };
+use selfhost_desk::wire::{Button, Message};
 use selfhost_supervisor::state::{ServiceState, ServiceStatus};
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
+
+/// How a console reaches its daemon, when it has been given one.
+///
+/// A function and not a [`Client`], for the reason [`crate::poller::Connect`] is
+/// one: the token the daemon wrote may not exist when the window opens, and a
+/// console launched from the Dock before its daemon has started must still show
+/// a window. Shared with the poller rather than duplicated, so there is one
+/// place a credential is read from disk.
+pub type Connector = Arc<dyn Fn() -> Result<Client, String> + Send + Sync>;
+
+/// The margin the whole window is inset by.
+///
+/// Named because it is also an assertion: nothing the console draws may reach
+/// into it, and a test says so — see
+/// `nothing_on_a_new_screen_is_drawn_outside_the_page`.
+const PAGE_PAD: f32 = 16.0;
+
+/// How far one notch of a wheel turns the far machine's.
+///
+/// The desktop wire counts in 1/120ths of a notch, which is what Windows'
+/// `WHEEL_DELTA` counts in and what every platform's high-resolution scrolling
+/// is reported against. `rui` reports whole lines, so one line is one notch.
+const NOTCH: f32 = 120.0;
 
 /// What share of the window's width the rail of services takes.
 ///
@@ -186,6 +218,37 @@ pub struct Console {
     /// servers would otherwise both read `127.0.0.1:9191`.
     via: Option<String>,
     form: InstallForm,
+    /// The one text field the FILES plate uses, and what it is for.
+    files_form: FilesForm,
+    /// How to build a client, for the one thing that opens its own socket.
+    ///
+    /// `None` in a test, and in a console that has not been given one, so every
+    /// frame test in this file draws without a daemon — which is what makes the
+    /// reference frames producible on a machine with nothing running.
+    connect: Option<Connector>,
+    /// The handle that lets a stream ask for a frame.
+    ///
+    /// Set after the [`App`] is built, because the handle comes from it. A
+    /// console with none can still draw everything; it simply cannot open a
+    /// desktop session, which is exactly the state a frame test is in.
+    redraw: Option<Redraw>,
+    /// The desktop session, when one is open.
+    session: Option<Session>,
+    /// Why the last attempt to open one was refused, in its structured form.
+    control_trouble: Option<ControlRefusal>,
+    /// Whether the keyboard is aimed at the viewport.
+    ///
+    /// Held here rather than read from `rui`'s own focus, because what this
+    /// decides is whether keys leave this machine — and that must be a fact the
+    /// console owns, set by a press on the picture and cleared by the pointer
+    /// leaving it, rather than something inferred from a focus ring.
+    viewport_focus: bool,
+    /// The modifier state last sent to the far machine.
+    ///
+    /// Diffed against every arriving keystroke, because neither platform
+    /// delivers a modifier as an ordinary key event — see
+    /// [`crate::remote::modifier_changes`], which is where the argument is.
+    held: Modifiers,
 }
 
 impl Console {
@@ -196,18 +259,45 @@ impl Console {
         address: SocketAddr,
         via: Option<String>,
     ) -> Self {
-        Self { shared, running, address, via, form: InstallForm::default() }
+        Self {
+            shared,
+            running,
+            address,
+            via,
+            form: InstallForm::default(),
+            files_form: FilesForm::default(),
+            connect: None,
+            redraw: None,
+            session: None,
+            control_trouble: None,
+            viewport_focus: false,
+            held: Modifiers::default(),
+        }
+    }
+
+    /// Gives this console the means to open a desktop session.
+    ///
+    /// Separate from [`Console::new`] so that everything else — every plate,
+    /// every reference frame, every layout test — is built without one and
+    /// cannot accidentally reach a daemon while a frame is being drawn.
+    pub fn reaching(mut self, connect: Connector) -> Self {
+        self.connect = Some(connect);
+        self
     }
 
     /// Opens the window and runs until it is closed.
     pub fn run(self, title: String) -> Result<(), rui::Error> {
         let running = Arc::clone(&self.running);
-        application(title, self)
+        let mut app = application(title, self)
             .size(980.0, 680.0)
             .min_size(560.0, 420.0)
             .idle_timeout(IDLE_REDRAW)
-            .while_running(move |_| running.load(Ordering::Relaxed))
-            .run()
+            .while_running(move |_| running.load(Ordering::Relaxed));
+        // The handle exists only once there is a loop to ask for a frame, so it
+        // is handed to the console here rather than at construction.
+        let redraw = app.redraw();
+        app.state_mut().redraw = Some(redraw);
+        app.run()
     }
 
     /// What the daemon last said.
@@ -257,6 +347,320 @@ impl Console {
         };
         self.form.submit(&mut snapshot);
     }
+
+    /// Opens a different screen, and tells the poller which one.
+    ///
+    /// The snapshot carries it as well as the console because that is what
+    /// decides which routes are asked for — see [`Screen`]. Written in both
+    /// places by this one method, so they cannot disagree.
+    pub(crate) fn show(&mut self, screen: Screen) {
+        // Leaving the desktop takes the keyboard with it. A window whose FILES
+        // plate is open must not still be typing on somebody's machine.
+        if screen != Screen::Desktop {
+            self.release_far_keys();
+        }
+        self.with_snapshot(|snapshot| snapshot.screen = screen);
+    }
+
+    /// The FILES plate's field, for the pane that draws it.
+    pub(crate) fn files_form(&self) -> &FilesForm {
+        &self.files_form
+    }
+
+    /// The same field, to be edited by whatever was just typed or pressed.
+    pub(crate) fn files_form_mut(&mut self) -> &mut FilesForm {
+        &mut self.files_form
+    }
+
+    /// Validates the FILES field and asks for what it describes.
+    ///
+    /// The refusal stays on the form rather than becoming a notice, because it
+    /// is about the thing still being typed: a notice would appear at the top of
+    /// the window while the operator is looking at the bottom of it.
+    pub(crate) fn submit_files_form(&mut self) {
+        let (share, directory, selected) = {
+            let snapshot = self.snapshot();
+            (
+                snapshot.files.share.clone(),
+                snapshot.files.path.clone(),
+                snapshot.files.selected.clone(),
+            )
+        };
+        let Some(share) = share else {
+            self.files_form.trouble = Some("Choose a share first.".into());
+            return;
+        };
+        match self.files_form.submit(&share, &directory, selected.as_deref()) {
+            Ok(command) => {
+                self.files_form.close();
+                self.request(command);
+            }
+            Err(reason) => self.files_form.trouble = Some(reason),
+        }
+    }
+
+    /// Asks for one file to be copied out of the share.
+    ///
+    /// The destination is not asked for: this window has no file picker to open
+    /// — the platform dialogue is one unsafe call per backend and `rui` has none
+    /// — so a download lands beside the operator, in their downloads folder if
+    /// there is one and their home if there is not, and the notice says exactly
+    /// where. Silently choosing a path and *not* saying which would be the worse
+    /// half of the same trade.
+    pub(crate) fn download(&mut self, path: &str) {
+        let (share, size) = {
+            let snapshot = self.snapshot();
+            let Some(share) = snapshot.files.share.clone() else {
+                return;
+            };
+            let size = snapshot
+                .files
+                .listing()
+                .and_then(|listing| {
+                    listing.entries.iter().find(|entry| entry.path.as_deref() == Some(path))
+                })
+                .map_or(0, |entry| entry.size);
+            (share, size)
+        };
+        // Refused before it is asked for, not while it is arriving. This client
+        // holds a body whole, so a hundred-gigabyte film is an allocation that
+        // fails — and under `panic = "abort"` a failed allocation is the console
+        // going away rather than an error a person can read.
+        if size > nas::MAX_TRANSFER {
+            self.with_snapshot(|snapshot| {
+                snapshot.report_problem(format!(
+                    "This console downloads files up to {} at a time; that one is {}.                      Reach the share over SMB or WebDAV for anything larger.",
+                    nas::size_text(nas::MAX_TRANSFER),
+                    nas::size_text(size)
+                ));
+            });
+            return;
+        }
+        let Some(name) = nas::path_segments(path).last().map(|name| name.to_string()) else {
+            return;
+        };
+        let to = downloads_directory().join(name);
+        self.request(Command::Files {
+            share,
+            action: FileAction::Download { path: path.to_owned(), to },
+        });
+    }
+
+    /// Asks for one name to be removed.
+    pub(crate) fn delete_entry(&mut self, path: &str) {
+        let Some(share) = self.snapshot().files.share.clone() else {
+            return;
+        };
+        self.request(Command::Files {
+            share,
+            action: FileAction::Delete { path: path.to_owned() },
+        });
+    }
+
+    /// What the desktop session is doing, or `None` when there is none.
+    pub(crate) fn session_live(&self) -> Option<Live> {
+        self.session.as_ref().map(Session::live)
+    }
+
+    /// Whether the open session asked the daemon for a keyboard.
+    ///
+    /// The difference between this and [`Live::may_control`] is the sentence
+    /// worth showing: a ticket can be minted for control and then *downgraded*
+    /// between the mint and the handshake, and the agent's `Hello` is what says
+    /// so. A console that only read what was granted would draw that as an
+    /// ordinary watching session and leave the operator wondering why their
+    /// keys do nothing.
+    pub(crate) fn session_asked_for_control(&self) -> bool {
+        self.session.as_ref().is_some_and(Session::asked_for_control)
+    }
+
+    /// Why the last attempt at a keyboard was refused.
+    ///
+    /// Read from the session first, because the daemon's refusal arrives on the
+    /// stream thread after the press that asked for it has already returned.
+    pub(crate) fn control_trouble(&self) -> Option<ControlRefusal> {
+        self.session
+            .as_ref()
+            .and_then(|session| session.live().control_refusal)
+            .or_else(|| self.control_trouble.clone())
+    }
+
+    /// The picture and the size cell the viewport draws through.
+    pub(crate) fn viewport_handles(&self) -> Option<desktop::ViewportHandles> {
+        let session = self.session.as_ref()?;
+        Some((session.picture_handle(), session.fit_handle()))
+    }
+
+    /// Whether the keyboard is aimed at the viewport.
+    pub(crate) fn viewport_has_keys(&self) -> bool {
+        self.viewport_focus
+    }
+
+    /// Points the keyboard at the viewport.
+    pub(crate) fn aim_at_viewport(&mut self) {
+        self.viewport_focus = true;
+    }
+
+    /// Watches a different machine, closing whatever session is open.
+    ///
+    /// A session belongs to the machine it was minted for — the ticket names it
+    /// — so changing the machine cannot carry one over. Closing rather than
+    /// re-opening is deliberate: the new machine may be one this credential may
+    /// watch and not drive, and silently opening a session with whatever the
+    /// last one asked for would be this console choosing an authorisation.
+    pub(crate) fn watch_machine(&mut self, node: &str) {
+        if self.snapshot().desk.peer.as_deref() == Some(node) {
+            return;
+        }
+        self.close_session();
+        let node = node.to_owned();
+        self.with_snapshot(|snapshot| {
+            snapshot.desk.peer = Some(node);
+            snapshot.desk.agent = None;
+        });
+    }
+
+    /// Opens a session on the chosen machine, asking for a keyboard or not.
+    ///
+    /// **The keyboard is a separate mint and this is the only way to it.** A
+    /// session opened without `control` is a session that cannot be upgraded:
+    /// asking for one closes this and opens another, which the daemon decides
+    /// against its own freshness rule. That is the browser's behaviour, and it
+    /// is not relaxed here.
+    pub(crate) fn open_session(&mut self, control: bool) {
+        self.close_session();
+        self.control_trouble = None;
+        let Some(peer) = self.snapshot().desk.peer.clone() else {
+            self.with_snapshot(|snapshot| snapshot.report_problem("Choose a machine first."));
+            return;
+        };
+        let (Some(connect), Some(redraw)) = (self.connect.clone(), self.redraw.clone()) else {
+            self.with_snapshot(|snapshot| {
+                snapshot.report_problem("This console was opened without a way to reach a daemon.");
+            });
+            return;
+        };
+        match connect() {
+            Ok(client) => self.session = Some(Session::open(client, &peer, control, redraw)),
+            Err(reason) => self.with_snapshot(|snapshot| snapshot.report_problem(reason)),
+        }
+    }
+
+    /// Closes whatever session is open, releasing the far machine's keys.
+    pub(crate) fn close_session(&mut self) {
+        self.release_far_keys();
+        // Dropping is what stops the thread: the flag is cleared and the read
+        // deadline expires, so the daemon does not keep a place in its ceiling
+        // for a viewer that has gone.
+        self.session = None;
+    }
+
+    /// Asks the far machine for a whole frame rather than a difference.
+    pub(crate) fn request_full_frame(&self) {
+        if let Some(session) = &self.session {
+            session.request_full_frame();
+        }
+    }
+
+    /// Watches a different display of the same machine.
+    pub(crate) fn watch_monitor(&self, monitor: u8) {
+        if let Some(session) = &self.session {
+            session.watch(monitor);
+        }
+    }
+
+    /// Lets go of every key and modifier the far machine is holding for us.
+    pub(crate) fn release_far_keys(&mut self) {
+        self.viewport_focus = false;
+        self.held = Modifiers::default();
+        if let Some(session) = &self.session {
+            session.release_all();
+        }
+    }
+
+    /// Sends one pointer press, drag or release to the far machine.
+    ///
+    /// # What this can and cannot carry
+    ///
+    /// A press, the movement while it is held, and the release. **A pointer
+    /// moving with no button down is not forwarded**, because `rui` reports
+    /// hover as a boolean and a position only during a drag — so the far
+    /// pointer follows a click and a drag exactly, and does not track a hand
+    /// moving over the picture. That is a real difference from the browser and
+    /// it is recorded as OPEN in `console-lab.dx` rather than papered over.
+    pub(crate) fn forward_pointer(&mut self, drag: Drag) {
+        let Some(session) = &self.session else {
+            return;
+        };
+        let live = session.live();
+        if !desktop::forwards_keys(&live, self.viewport_focus) {
+            return;
+        }
+        let fraction = drag.fraction();
+        let Some((x, y)) = session.picture().remote_point(fraction.x, fraction.y) else {
+            return;
+        };
+        session.send(Message::PointerMove { monitor: live.monitor, x, y });
+        match drag.phase {
+            Phase::Began => session.send(Message::Button { button: Button::Left, down: true }),
+            Phase::Moved => {}
+            Phase::Ended => session.send(Message::Button { button: Button::Left, down: false }),
+        }
+    }
+
+    /// Sends one physical key movement, and whatever modifiers changed with it.
+    ///
+    /// The modifiers go first on a press and last on a release, which is the
+    /// order a keyboard produces them in and the order the far machine has to
+    /// see them in for `Shift+A` to be a capital rather than an `a` and a
+    /// shift. A key with no position is dropped: `Usage` is a *physical*
+    /// vocabulary, and a synthesized keystroke with no code names no key another
+    /// machine could be told about.
+    pub(crate) fn forward_key(&mut self, stroke: KeyStroke) {
+        let Some(session) = &self.session else {
+            return;
+        };
+        if !desktop::forwards_keys(&session.live(), self.viewport_focus) {
+            return;
+        }
+        for (usage, down) in remote::keystroke_messages(self.held, stroke) {
+            session.send(Message::Key { usage, down });
+        }
+        self.held = stroke.modifiers;
+    }
+
+    /// Sends one turn of the wheel.
+    pub(crate) fn forward_scroll(&mut self, across: f32, down: f32) {
+        let Some(session) = &self.session else {
+            return;
+        };
+        if !desktop::forwards_keys(&session.live(), self.viewport_focus) {
+            return;
+        }
+        let notches = |lines: f32| (lines * NOTCH).round().clamp(-120_000.0, 120_000.0) as i32;
+        let (dx, dy) = (notches(across), notches(down));
+        if dx != 0 || dy != 0 {
+            session.send(Message::Scroll { dx, dy });
+        }
+    }
+}
+
+/// Where a download lands.
+///
+/// `~/Downloads` when there is one, the home directory when there is not, and
+/// the working directory when even that cannot be found. Every step is a
+/// directory that already exists rather than one this program creates: a console
+/// that made a folder as a side effect of a download would be a console that
+/// litters.
+fn downloads_directory() -> std::path::PathBuf {
+    let home = std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(std::path::PathBuf::from);
+    let Some(home) = home else {
+        return std::path::PathBuf::from(".");
+    };
+    let downloads = home.join("Downloads");
+    if downloads.is_dir() { downloads } else { home }
 }
 
 /// The console as an application, drawn in the console's own theme.
@@ -271,24 +675,83 @@ pub(crate) fn application(title: impl Into<String>, console: Console) -> App<Con
 }
 
 /// The whole console, as one description.
+///
+/// # Four screens under one masthead
+///
+/// The masthead, the tunnel's complaint and the last command's notice are about
+/// the *link* and are drawn on every screen, because a broken tunnel makes every
+/// plate below it stale and a console that said so on only one of them would be
+/// a console that lies on three.
+///
+/// Everything below the tabs belongs to one screen. The readout bank and the
+/// exposure map stay on SERVICES, where they were: both are readings about the
+/// supervised services, and carrying them onto a file browser would spend the
+/// top fifth of that plate restating a fact about something else — the same
+/// argument the bank itself makes about four cards for three numbers.
 pub fn view(console: &Console) -> El<Console> {
     let snapshot = console.snapshot();
+    let screen = snapshot.screen;
 
     col((
         header(console, &snapshot),
+        screens(screen),
         tunnel_banner(&snapshot).map(banner),
         snapshot.notice.clone().map(notice),
-        bank(&snapshot),
+        match screen {
+            Screen::Services => services(console, &snapshot),
+            // The three new screens are drawn from the console rather than from
+            // this borrow of the snapshot, so each takes its own: a plate that
+            // needs the session as well as the snapshot cannot be handed a
+            // guard this function is still holding.
+            Screen::Files => {
+                drop(snapshot);
+                files::view(console)
+            }
+            Screen::Desktop => {
+                drop(snapshot);
+                desktop::view(console)
+            }
+            Screen::People => {
+                drop(snapshot);
+                people::view(console)
+            }
+        },
+    ))
+    .pad(PAGE_PAD)
+    .gap(8.0)
+}
+
+/// The row of tabs naming the four screens.
+///
+/// Under the masthead and above everything else, which is where a person looks
+/// for them and the one place they are not competing with a reading. The chosen
+/// one is marked by a bar on a rule that runs the full width — the rule
+/// separates the row from the page, not the tabs from each other.
+fn screens(screen: Screen) -> El<Console> {
+    let labels: Vec<&str> = Screen::ALL.iter().map(|screen| screen.label()).collect();
+    let chosen = Screen::ALL.iter().position(|candidate| *candidate == screen).unwrap_or(0);
+    tabs(&labels, chosen, |console: &mut Console, index| {
+        // A tab index that names no screen changes nothing, rather than falling
+        // back to the first: an out-of-range index is a defect in this row, and
+        // silently opening SERVICES would hide it.
+        if let Some(screen) = Screen::ALL.get(index).copied() {
+            console.show(screen);
+        }
+    })
+}
+
+/// The SERVICES screen: the bank, the exposure map, the rail and the pane.
+fn services(console: &Console, snapshot: &Snapshot) -> El<Console> {
+    col((
+        bank(snapshot),
         // The exposure map is a full-width strip between the bank and the panes,
         // and only when the firewall is managed — it returns `None` otherwise, so
         // on the common unmanaged deployment it costs the log below it nothing.
         exposure::view(snapshot.firewall.as_ref()),
-        row((rail(&snapshot), pane(console, &snapshot)))
-            .gap(8.0)
-            .grow(),
+        row((rail(snapshot), pane(console, snapshot))).gap(8.0).grow(),
     ))
-    .pad(16.0)
     .gap(8.0)
+    .grow()
 }
 
 /// The masthead: what this is, whether it is connected, and to what.
@@ -1136,6 +1599,38 @@ mod tests {
         )
     }
 
+    /// Re-fits the still-life session's picture to the pane it was last drawn
+    /// into. See [`crate::channel::Session::settle`].
+    pub(crate) fn settle_viewport(
+        console: &Console,
+        surface: &selfhost_desk::tiles::Surface,
+    ) {
+        if let Some(session) = &console.session {
+            session.settle(surface);
+        }
+    }
+
+    /// A copy of the still-life session's fitted picture, for the one
+    /// measurement that times the blit apart from the frame it sits in.
+    pub(crate) fn session_picture(console: &Console) -> Option<(Vec<u8>, u32, u32)> {
+        let session = console.session.as_ref()?;
+        let picture = session.picture();
+        let (bytes, width, height) = picture.bgra()?;
+        Some((bytes.to_vec(), width, height))
+    }
+
+    /// A console holding a session that never opened a socket.
+    ///
+    /// What makes the viewport photographable. Everything else on the DESKTOP
+    /// plate is drawn from the snapshot and needs no daemon; the picture is the
+    /// one thing that would otherwise only ever exist on somebody's screen.
+    pub(crate) fn watching(snapshot: Snapshot, session: crate::channel::Session) -> Console {
+        let mut console = console(snapshot);
+        console.session = Some(session);
+        console.viewport_focus = true;
+        console
+    }
+
     /// Draws one whole frame at a given size, with no window and no faces.
     ///
     /// No faces is the point: text measures to nothing, so every rectangle comes
@@ -1454,7 +1949,221 @@ mod tests {
             ("the install form", form_open, (980.0, 680.0)),
             ("the form editing a service", form_editing, (980.0, 680.0)),
             ("the smallest window the backend allows", console(busy()), (560.0, 420.0)),
+            // The three screens the native console gained to reach parity with
+            // the browser. Each is audited at both extremes, because a plate
+            // with five fractional columns is wrong at 560 units long before it
+            // is wrong at 980.
+            ("the files plate", console(browsing()), (980.0, 680.0)),
+            ("the files plate, narrow", console(browsing()), (560.0, 420.0)),
+            ("the desktop plate with no session", console(fleet()), (980.0, 680.0)),
+            ("the desktop plate driving a machine", watching(fleet(), still_session(true)), (980.0, 680.0)),
+            ("the desktop plate, narrow", watching(fleet(), still_session(true)), (560.0, 420.0)),
+            ("the people plate", console(roster()), (980.0, 680.0)),
+            ("the people plate, narrow", console(roster()), (560.0, 420.0)),
         ]
+    }
+
+    #[test]
+    fn every_new_screen_survives_the_smallest_window_with_no_face_loaded() {
+        // The same argument the existing frame tests make: with no faces every
+        // rectangle comes out at its minimum, so anything that only fits
+        // because a label happened to be short is caught here rather than on
+        // somebody's screen.
+        for (name, snapshot) in
+            [("files", browsing()), ("desktop", fleet()), ("people", roster())]
+        {
+            println!("drawing {name} at the smallest window");
+            draw_frame(560, 420, console(snapshot));
+        }
+        draw_frame(560, 420, watching(fleet(), still_session(true)));
+    }
+
+    #[test]
+    fn a_tab_opens_its_screen_and_tells_the_poller_which_one() {
+        // The snapshot carries the screen because that is what decides which
+        // routes are asked for; a tab that changed only the drawing would leave
+        // the poller fetching the wrong plate's data for ever.
+        let mut harness =
+            Harness::with_app(application("selfhost", console(busy()))).size(980.0, 680.0);
+        harness.frame();
+        harness.click_text("FILES");
+        assert_eq!(harness.state().snapshot().screen, Screen::Files);
+        harness.click_text("PEOPLE");
+        assert_eq!(harness.state().snapshot().screen, Screen::People);
+    }
+
+    #[test]
+    fn leaving_the_desktop_screen_takes_the_keyboard_with_it() {
+        // A window whose FILES plate is open must not still be typing on
+        // somebody's machine, and the release is what tells the far end to let
+        // go of whatever is held.
+        let mut console = watching(fleet(), still_session(true));
+        assert!(console.viewport_has_keys());
+        console.show(Screen::Files);
+        assert!(!console.viewport_has_keys());
+        assert_eq!(console.snapshot().screen, Screen::Files);
+    }
+
+    #[test]
+    fn the_files_plate_keeps_its_columns_at_the_narrowest_window() {
+        let mut harness =
+            Harness::with_app(application("selfhost", console(browsing()))).size(560.0, 420.0);
+        harness.frame();
+        // The chosen column wears its direction, so the heading it is looked
+        // up by is the whole word the plate actually draws.
+        for column in ["NAME \u{25b2}", "SIZE", "MODIFIED"] {
+            assert!(
+                harness.rect_of(column).is_some(),
+                "the {column} heading is drawn at 560 units"
+            );
+        }
+        assert!(harness.rect_of("VAULT").is_some(), "the breadcrumb still names the share");
+    }
+
+    #[test]
+    fn nothing_on_a_new_screen_is_drawn_outside_the_page() {
+        // The defect this exists for: the FILES listing's four columns are
+        // fractions that sum to one, and a gap *between* them is width the row
+        // does not have — the row overflowed and the cell at the end, carrying
+        // that row's own download and delete, was pushed off the plate. It
+        // looked like a missing feature and it was a layout arithmetic error,
+        // which is exactly the class of defect a reference frame catches and a
+        // unit test should stop coming back.
+        for (name, snapshot) in
+            [("files", browsing()), ("desktop", fleet()), ("people", roster())]
+        {
+            for (width, height) in [(560.0, 420.0), (980.0, 680.0)] {
+                let mut harness =
+                    Harness::with_app(application("selfhost", console(snapshot_of(&snapshot))))
+                        .size(width, height);
+                harness.frame();
+                let edge = width - PAGE_PAD;
+                for probe in harness.probes() {
+                    // The root fills the window; the margin is inside it, and
+                    // the rule is about what the page draws in that margin.
+                    if probe.rect.w >= width {
+                        continue;
+                    }
+                    assert!(
+                        probe.rect.x + probe.rect.w <= edge + 0.5,
+                        "{name} at {width}×{height} draws {:?} into the page margin: {:?}",
+                        probe.text,
+                        probe.rect
+                    );
+                }
+            }
+        }
+    }
+
+    /// A fresh copy of a fixture, so one can be drawn at several sizes.
+    ///
+    /// [`Snapshot`] holds a queue and a listing and is deliberately not `Clone`
+    /// — the console has exactly one of it — so a test that needs two rebuilds
+    /// the parts it asserts on rather than teaching the type to copy itself.
+    fn snapshot_of(source: &Snapshot) -> Snapshot {
+        Snapshot {
+            link: source.link.clone(),
+            services: source.services.clone(),
+            selected: source.selected.clone(),
+            screen: source.screen,
+            files: crate::state::Files {
+                shares: source.files.shares.clone(),
+                share: source.files.share.clone(),
+                path: source.files.path.clone(),
+                listing: source.files.listing.clone(),
+                trouble: source.files.trouble.clone(),
+                column: source.files.column,
+                ascending: source.files.ascending,
+                selected: source.files.selected.clone(),
+            },
+            desk: crate::state::Desk {
+                settings: source.desk.settings,
+                nodes: source.desk.nodes.clone(),
+                peer: source.desk.peer.clone(),
+                agent: source.desk.agent.clone(),
+            },
+            people: crate::state::People {
+                holders: source.people.holders.clone(),
+                trouble: source.people.trouble.clone(),
+                trail: source.people.trail.clone(),
+                hide_pointer_noise: source.people.hide_pointer_noise,
+            },
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn a_download_larger_than_this_console_can_hold_is_refused_before_it_is_asked_for() {
+        // This client buffers a body whole, so the alternative is an allocation
+        // that fails — and under `panic = "abort"` that is the window going away
+        // rather than a sentence a person can act on.
+        let mut console = console(browsing());
+        console.download("photos/2024/raw negatives.tar");
+        let snapshot = console.snapshot();
+        assert!(snapshot.commands.is_empty(), "nothing was asked of the daemon");
+        let notice = snapshot.notice.as_ref().expect("a refusal");
+        assert_eq!(notice.kind, NoticeKind::Problem);
+        assert!(notice.text.contains("512 MB"), "it names the limit: {}", notice.text);
+        assert!(notice.text.contains("SMB"), "and what to use instead: {}", notice.text);
+    }
+
+    #[test]
+    fn an_ordinary_download_is_queued_with_a_destination_that_names_the_file() {
+        let mut console = console(browsing());
+        console.download("photos/2024/contact sheet.pdf");
+        let snapshot = console.snapshot();
+        let Some(Command::Files { share, action: FileAction::Download { path, to } }) =
+            snapshot.commands.front()
+        else {
+            panic!("a download was not queued: {:?}", snapshot.commands);
+        };
+        assert_eq!(share, "vault");
+        assert_eq!(path, "photos/2024/contact sheet.pdf");
+        assert!(to.ends_with("contact sheet.pdf"), "it lands under its own name: {to:?}");
+    }
+
+    #[test]
+    fn a_name_the_daemon_cannot_address_says_why_rather_than_offering_a_link() {
+        let mut harness =
+            Harness::with_app(application("selfhost", console(browsing()))).size(980.0, 680.0);
+        harness.frame();
+        assert!(
+            harness.rect_of("the name contains a path separator").is_some(),
+            "an unreachable row carries its reason"
+        );
+    }
+
+    #[test]
+    fn the_desktop_plate_says_what_the_far_machine_says_about_itself() {
+        // The words are `selfhost-desk`'s, so a change of wording there is a
+        // change of wording here — which is the whole point of the two consoles
+        // sharing the vocabulary and nothing else.
+        let mut harness =
+            Harness::with_app(application("selfhost", watching(fleet(), still_session(true))))
+                .size(980.0, 680.0);
+        harness.frame();
+        assert!(harness.rect_of("live").is_some(), "the session's own notice is drawn");
+        assert!(harness.rect_of("DRIVING").is_some(), "and where the keyboard is pointed");
+    }
+
+    #[test]
+    fn a_watching_session_never_draws_the_word_driving() {
+        let mut harness =
+            Harness::with_app(application("selfhost", watching(fleet(), still_session(false))))
+                .size(980.0, 680.0);
+        harness.frame();
+        assert!(harness.rect_of("WATCHING").is_some());
+        assert!(harness.rect_of("DRIVING").is_none(), "a view is never drawn as control");
+    }
+
+    #[test]
+    fn the_people_plate_shows_the_roster_beside_the_trail() {
+        let mut harness =
+            Harness::with_app(application("selfhost", console(roster()))).size(980.0, 680.0);
+        harness.frame();
+        assert!(harness.rect_of("alex").is_some(), "a holder by name");
+        assert!(harness.rect_of("YubiKey 5C").is_some(), "and the device under it");
+        assert!(harness.rect_of("AUDIT").is_some(), "with the trail beside it");
     }
 
     #[test]
@@ -1519,6 +2228,242 @@ mod tests {
             .collect();
         assert!(named.contains(&"Dismiss"), "the notice's cross is named: {named:?}");
         assert!(named.iter().all(|name| !name.trim().is_empty()));
+    }
+
+    /// A console browsing a share.
+    ///
+    /// Everything the FILES plate has to lay out at once: a share near its
+    /// ceiling and one whose usage could not be read, a directory two levels
+    /// down so the trail has crumbs in it, a name long enough to compete for the
+    /// row, and a name the daemon says cannot be addressed at all.
+    pub(crate) fn browsing() -> Snapshot {
+        use crate::nas::{Entry, Kind, Listing, Share};
+        let share = |id: &str, used: Option<u64>, quota: Option<u64>, writable: bool| Share {
+            id: id.into(),
+            read_only: !writable,
+            browsable: true,
+            writable,
+            quota_bytes: quota,
+            available_bytes: Some(48_000_000_000),
+            used_bytes: used,
+            smb: (id == "vault").then(|| "Vault".to_owned()),
+        };
+        let entry = |name: &str, kind: Kind, size: u64, modified: Option<u64>| Entry {
+            name: name.into(),
+            kind,
+            size,
+            modified,
+            path: crate::nas::join_path("photos/2024", name),
+            blocked: None,
+        };
+
+        let mut snapshot = populated();
+        snapshot.screen = Screen::Files;
+        snapshot.files.shares = Some(vec![
+            share("vault", Some(478_000_000_000), Some(500_000_000_000), true),
+            share("photos", Some(12_400_000_000), None, true),
+            share("archive", None, Some(2_000_000_000_000), false),
+        ]);
+        snapshot.files.share = Some("vault".into());
+        snapshot.files.path = "photos/2024".into();
+        snapshot.files.selected = Some("beach at golden hour.jpg".into());
+        snapshot.files.listing = Some(Listing {
+            share: "vault".into(),
+            path: "photos/2024".into(),
+            entries: vec![
+                entry("summer", Kind::Directory, 0, Some(1_712_000_000)),
+                entry("winter", Kind::Directory, 0, Some(1_704_100_000)),
+                entry("beach at golden hour.jpg", Kind::File, 8_412_672, Some(1_719_000_000)),
+                entry("contact sheet.pdf", Kind::File, 1_204_000, Some(1_718_000_000)),
+                entry("raw negatives.tar", Kind::File, 41_203_400_000, Some(1_700_000_000)),
+                Entry {
+                    name: "scan\\001.tif".into(),
+                    kind: Kind::File,
+                    size: 92_000,
+                    modified: Some(1_690_000_000),
+                    path: None,
+                    blocked: Some("the name contains a path separator".into()),
+                },
+            ],
+        });
+        snapshot
+    }
+
+    /// A console looking at the fleet, with no session open.
+    ///
+    /// The picker's three cases at once: the machine the daemon runs on, one
+    /// that is up, and one that is down with a reason and a last-seen time.
+    pub(crate) fn fleet() -> Snapshot {
+        use crate::remote::{Agent, Node, Settings};
+        let mut snapshot = populated();
+        snapshot.screen = Screen::Desktop;
+        snapshot.desk.settings = Some(Settings {
+            enabled: true,
+            allow_input: true,
+            allow_clipboard: false,
+            bearer_may_control: true,
+            max_viewers: 2,
+            max_fps: 30,
+            tile: 64,
+            reauth_window_secs: 120,
+            max_session_secs: 14_400,
+        });
+        snapshot.desk.nodes = Some(vec![
+            Node { node: "self".into(), live: true, last_seen_secs: Some(0), reason: None },
+            Node {
+                node: "alex-desktop".into(),
+                live: true,
+                last_seen_secs: Some(2),
+                reason: None,
+            },
+            Node {
+                node: "studio-mac".into(),
+                live: false,
+                last_seen_secs: Some(5_400),
+                reason: Some("the link was closed by the peer".into()),
+            },
+        ]);
+        snapshot.desk.peer = Some("alex-desktop".into());
+        snapshot.desk.agent = Some(Agent {
+            node: "alex-desktop".into(),
+            live: true,
+            sentence: "agent live in session 1 as ALEX · WinSta0\\Default · 2 monitors · \
+                       per-monitor DPI · medium integrity"
+                .into(),
+            monitors: 2,
+            respawns: 1,
+        });
+        snapshot
+    }
+
+    /// A synthetic far screen: a graded ground with a window on it.
+    ///
+    /// Graded deliberately. A flat picture would look the same fitted, sheared,
+    /// or upside down; a vertical grade with one bright rectangle in it makes
+    /// every one of those obvious in the reference frame.
+    pub(crate) fn synthetic_screen() -> selfhost_desk::tiles::Surface {
+        use selfhost_desk::tiles::Surface;
+        const WIDTH: u32 = 1920;
+        const HEIGHT: u32 = 1080;
+        let mut pixels = vec![0u8; WIDTH as usize * HEIGHT as usize * 4];
+        for y in 0..HEIGHT as usize {
+            for x in 0..WIDTH as usize {
+                let at = (y * WIDTH as usize + x) * 4;
+                let in_window = (200..1500).contains(&x) && (140..820).contains(&y);
+                let shade = if in_window {
+                    [0x2a, 0x24, 0x1e, 0xff]
+                } else {
+                    // A vertical grade, so a picture that is fitted upside down
+                    // or sheared is obvious in the reference frame rather than
+                    // plausible.
+                    let value = 0x10 + (y * 0x50 / HEIGHT as usize) as u8;
+                    [value, value.saturating_sub(4), value.saturating_sub(8), 0xff]
+                };
+                if let Some(cell) = pixels.get_mut(at..at + 4) {
+                    cell.copy_from_slice(&shade);
+                }
+            }
+        }
+        Surface::new(WIDTH, HEIGHT, pixels).expect("a surface")
+    }
+
+    /// A session holding one picture, without ever opening a socket.
+    ///
+    /// The picture goes through the real fitting path, so what a frame
+    /// photographs is the blit a stream would have produced and not a
+    /// hand-built buffer.
+    pub(crate) fn still_session(control: bool) -> crate::channel::Session {
+        use crate::channel::{LinkState, Live, Picture, Session};
+        use selfhost_desk::grant::Capabilities;
+        use selfhost_desk::state::Notice;
+        use selfhost_desk::wire::Monitor;
+
+        let surface = synthetic_screen();
+        let mut live = Live::opening();
+        live.state = LinkState::Open;
+        live.notice = Some(Notice::Live);
+        live.capabilities = if control {
+            Capabilities::VIEW.with(Capabilities::CONTROL)
+        } else {
+            Capabilities::VIEW
+        };
+        live.monitors = vec![
+            Monitor {
+                id: 0,
+                origin_x: 0,
+                origin_y: 0,
+                width: surface.width(),
+                height: surface.height(),
+                scale_permille: 1000,
+                primary: true,
+            },
+            Monitor {
+                id: 1,
+                origin_x: 1920,
+                origin_y: 0,
+                width: 2560,
+                height: 1440,
+                scale_permille: 1500,
+                primary: false,
+            },
+        ];
+        live.frames = 1_284;
+        live.bytes = 41_200_512;
+
+        Session::still_life("alex-desktop", control, live, Picture::fitted(&surface, 1_400, 900))
+    }
+
+    /// A console reading the registry and the trail.
+    pub(crate) fn roster() -> Snapshot {
+        use crate::registry::{Person, Record, Trail};
+        let mut snapshot = populated();
+        snapshot.screen = Screen::People;
+        snapshot.people.holders = Some(vec![
+            Person {
+                id: "q0Zm-x_9AAbb".into(),
+                user: "alex".into(),
+                label: "MacBook Pro · Touch ID".into(),
+                created_unix: 1_712_000_000,
+            },
+            Person {
+                id: "K3lp_zzQ11".into(),
+                user: "alex".into(),
+                label: "iPhone · Face ID".into(),
+                created_unix: 1_716_400_000,
+            },
+            Person {
+                id: "b9-Ww_04zz".into(),
+                user: "rocky".into(),
+                label: "YubiKey 5C".into(),
+                created_unix: 1_700_000_000,
+            },
+        ]);
+        let record = |id: &str, at: u64, who: &str, capability: &str, target: &str, outcome: &str,
+                      reason: &str, detail: &str| Record {
+            id: id.into(),
+            at_unix: at,
+            identity: "owner".into(),
+            who: who.into(),
+            capability: capability.into(),
+            target: target.into(),
+            outcome: outcome.into(),
+            reason: reason.into(),
+            detail: detail.into(),
+        };
+        snapshot.people.trail = Some(Trail {
+            records: vec![
+                record("r7", 1_723_000_400, "alex", "desktop.control", "alex-desktop", "allow", "", "key 0x04 down"),
+                record("r6", 1_723_000_380, "alex", "desktop.control", "alex-desktop", "allow", "", "pointer 1204,880"),
+                record("r5", 1_723_000_360, "rocky", "desktop.control", "alex-desktop", "deny", "stale-login", "ticket refused"),
+                record("r4", 1_723_000_100, "alex", "desktop.view", "alex-desktop", "allow", "", "stream opened"),
+                record("r3", 1_722_900_000, "alex", "files.write", "vault", "allow", "", "vault · rename"),
+                record("r2", 1_722_800_000, "rocky", "files.read", "archive", "deny", "no-grant", "archive · list"),
+                record("r1", 1_722_700_000, "alex", "console.read", "", "allow", "", "session opened"),
+            ],
+            scanned: 412,
+            unreadable: 0,
+        });
+        snapshot
     }
 
     /// A console that has been connected for a while.
@@ -1673,6 +2618,50 @@ mod tests {
         written("console-alarmed", alarmed, |_| {}, (1000, 660));
         written("console-reaching", reaching(), |_| {}, (1000, 660));
 
+        // The three screens that bring the native console to parity with the
+        // browser, each at both sizes — because a plate with five fractional
+        // columns and a viewport is wrong at 560 units long before it is wrong
+        // at 1000, and a screen nobody has looked at is a screen nobody has
+        // reviewed.
+        for (name, size) in [("files", (1000, 660)), ("files-narrow", (560, 420))] {
+            written(name, browsing(), |_| {}, size);
+        }
+        written("desktop", fleet(), |_| {}, (1000, 660));
+        for (name, size) in [("people", (1000, 660)), ("people-narrow", (560, 420))] {
+            written(name, roster(), |_| {}, size);
+        }
+
+        // The viewport, which is the one screen whose drawing cannot be
+        // photographed from a snapshot: it needs a session holding pixels. The
+        // picture goes through the real fitting path and the real
+        // `Canvas::blit_bgra`, so what is in the image is what a live stream
+        // would put there.
+        let screen = synthetic_screen();
+        let mut viewport = |name: &str, size: (u32, u32)| {
+            let console = watching(fleet(), still_session(true));
+            let mut app = application("selfhost", console);
+            for (scale, path) in
+                [(2.0, format!("{directory}/{name}.png")), (1.0, format!("{directory}/web/{name}.png"))]
+            {
+                // The first frame states the pane's device size into the
+                // session's fit cell; the picture is then fitted to it and the
+                // second frame draws it. That is exactly the settling a resized
+                // window does, and doing it by hand here is what makes the
+                // image a photograph of the real path rather than of a
+                // hand-sized buffer.
+                app.render(size.0, size.1, scale, Appearance::Dark, &mut fonts);
+                settle_viewport(app.state(), &screen);
+                let canvas = app.render(size.0, size.1, scale, Appearance::Dark, &mut fonts);
+                let pixels = rui::image::rgba(&canvas);
+                let png = rui::image::png(canvas.width(), canvas.height(), &pixels)
+                    .expect("a frame should encode");
+                std::fs::write(&path, png).expect("the directory should be writable");
+                println!("wrote {path}");
+            }
+        };
+        viewport("desktop-live", (1000, 660));
+        viewport("desktop-narrow", (560, 420));
+
         // What a frame costs, at the sizes the window is actually used at. The
         // glyph cache is warmed first: the first frame at a new size rasterises
         // every glyph in it, and that is a start-up cost rather than a frame's.
@@ -1707,6 +2696,55 @@ mod tests {
                 "| {width} × {height} | {pixels:.1} M | **{:.1} ms** | {:.0} µs |",
                 each.as_secs_f32() * 1000.0,
                 describe.as_secs_f32() * 1_000_000.0
+            );
+        }
+
+        // What a live viewport adds, measured beside the figures above rather
+        // than asserted. Three numbers, because the cost of a remote desktop in
+        // this window is three separate things and only one of them is in the
+        // frame loop: fitting an arriving frame to the pane (on the stream's own
+        // thread, once per *frame received*), blitting the result (in the frame
+        // loop, once per *frame drawn*), and drawing the rest of the interface
+        // around it.
+        let mut app = application("selfhost", watching(fleet(), still_session(true)));
+        let screen = synthetic_screen();
+        println!("\n| viewport at | fit a 1920×1080 frame | blit it | whole interface with it |");
+        println!("|---|---|---|---|");
+        for (width, height) in FRAME_SIZES {
+            let mut canvas = rui::Canvas::new(width * 2, height * 2, 2.0);
+            let mut memory = rui::Memory::new();
+            app.draw_into(&mut canvas, &mut fonts, Appearance::Dark, &mut memory);
+            settle_viewport(app.state(), &screen);
+            app.draw_into(&mut canvas, &mut fonts, Appearance::Dark, &mut memory);
+
+            let fitting = std::time::Instant::now();
+            for _ in 0..RUNS {
+                settle_viewport(app.state(), &screen);
+            }
+            let fit = fitting.elapsed() / RUNS;
+
+            let drawing = std::time::Instant::now();
+            for _ in 0..RUNS {
+                app.draw_into(&mut canvas, &mut fonts, Appearance::Dark, &mut memory);
+            }
+            let whole = drawing.elapsed() / RUNS;
+
+            // The blit alone, against the same canvas the loop draws into.
+            let (bytes, source_width, source_height) =
+                session_picture(app.state()).expect("a fitted picture");
+            let blitting = std::time::Instant::now();
+            for _ in 0..RUNS {
+                if let Some(bgra) = rui::Bgra::packed(source_width, source_height, &bytes) {
+                    canvas.blit_bgra(rui::Rect::new(0.0, 0.0, width as f32, height as f32), &bgra);
+                }
+            }
+            let blit = blitting.elapsed() / RUNS;
+
+            println!(
+                "| {width} × {height} | {:.2} ms | {:.2} ms | **{:.1} ms** |",
+                fit.as_secs_f32() * 1000.0,
+                blit.as_secs_f32() * 1000.0,
+                whole.as_secs_f32() * 1000.0
             );
         }
     }

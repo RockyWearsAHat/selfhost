@@ -374,7 +374,14 @@ async fn a_close_the_server_decided_on_ends_a_peer_that_keeps_talking() {
         credential_recheck: Duration::from_millis(20),
         close_grace: Duration::from_millis(200),
     };
-    let serving = tokio::spawn(stream::events(server, api, admission, watch));
+    // Answered first, because that is now the only way to obtain the value
+    // `events` takes: a loop cannot be started on a connection whose handshake
+    // was never written. The peer below never reads, so the head simply sits in
+    // the pipe — which is what a client that stops reading looks like anyway.
+    let upgraded = stream::Upgraded::answer(server, Vec::new(), admission)
+        .await
+        .expect("the handshake is answered");
+    let serving = tokio::spawn(stream::events(upgraded, api, watch));
 
     // The session ends underneath the open stream — a logout, an idle expiry, or
     // an operator revoking a device.

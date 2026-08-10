@@ -8,12 +8,19 @@
 //! # What this module does and does not own
 //!
 //! It owns **authorisation and hand-off**. It does not own a pixel. The screen,
-//! the pointer, the keyboard and the mux channel to another machine all live in
-//! `selfhost-screen` and `selfhost-mesh`, which this crate deliberately does not
-//! depend on: the admin API is the process that decides *who may*, and the
-//! daemon is the process that owns the hardware. So the last act of a successful
-//! handshake is [`Fleet::serve`] — the socket, the redeemed grant and the seat,
-//! handed to whoever the daemon wired in, which returns when the session ends.
+//! the pointer, and the session driver that turns a mux channel into a desktop
+//! all live in `selfhost-screen` and `selfhost-desk`, driven by the daemon: the
+//! admin API is the process that decides *who may*, and the daemon is the
+//! process that owns the hardware. So the last act of a successful handshake is
+//! [`Fleet::serve`] — the socket, the redeemed grant and the seat, handed to
+//! whoever the daemon wired in, which returns when the session ends.
+//!
+//! This crate does link `selfhost-mesh`, but for the *other* half of the mesh:
+//! [`crate::mesh_api`] answers `GET /api/mesh/link`, because a worker's
+//! credential is a proof over the handshake and can only be checked by the
+//! process that answered it. Nothing about a desktop session's pixels or
+//! keystrokes comes through here, and this module still knows nothing about a
+//! link.
 //!
 //! That seam is why `crates/admin` can be tested for every refusal without a
 //! display, and why a machine with no capture backend at all still exercises the
@@ -59,12 +66,16 @@ use tokio::io::{AsyncRead, AsyncWrite};
 
 /// The pseudo-peer naming this machine.
 ///
-/// Mirrors `selfhost_mesh::LOCAL_NAME` rather than importing it, the same way
-/// `crates/config`'s mail module mirrors constants rather than depending on the
-/// subsystem that owns them. Controlling the box you are logged into and
-/// controlling another one are one code path, one authorisation check and one
-/// set of tests, and this is the name that makes them so.
-pub const LOCAL_NODE: &str = "self";
+/// **The mesh's own constant**, not a copy of it. This was a mirrored literal
+/// while `crates/admin` did not link `selfhost-mesh`; it does now, for
+/// [`crate::mesh_api`], so the two spellings are collapsed into the one
+/// definition — a name that means "this machine" in one crate and something else
+/// in the other would route a desktop session to the wrong box, silently.
+///
+/// Controlling the box you are logged into and controlling another one are one
+/// code path, one authorisation check and one set of tests, and this is the name
+/// that makes them so.
+pub const LOCAL_NODE: &str = selfhost_mesh::LOCAL_NAME;
 
 /// A boxed future, in the shape `selfhost-desk` and `selfhost-acme` already use
 /// for a trait a caller implements.
@@ -207,9 +218,10 @@ impl fmt::Debug for Handover {
 
 /// The machines this daemon can reach, and what it can do with them.
 ///
-/// Implemented by the daemon, which owns `selfhost-screen` and
-/// `selfhost-mesh`; held here as a trait object so `crates/admin` depends on
-/// neither. Three methods, and the third is the whole subsystem:
+/// Implemented by the daemon, which owns `selfhost-screen` and the session
+/// driver; held here as a trait object so that `crates/admin` can decide who may
+/// watch a screen without linking anything that touches one. Three methods, and
+/// the third is the whole subsystem:
 ///
 /// - [`Fleet::nodes`] and [`Fleet::agent`] answer the console's panels and must
 ///   be cheap — they are polled.

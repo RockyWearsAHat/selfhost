@@ -522,14 +522,56 @@ fn f7_a_symlink_is_listed_as_a_name_that_cannot_be_reached() {
     assert_eq!(std::fs::read_to_string(outside.path().join("secret")).expect("read"), "secret");
 }
 
+/// Says, on the platforms where [`f7_a_symlink_is_listed_as_a_name_that_cannot_be_reached`]
+/// is compiled out, that it was compiled out.
+///
+/// F7 must stay `#[cfg(unix)]`: its fixture is a symlink, and creating one on
+/// Windows needs either Developer Mode or an administrator, neither of which a
+/// test suite may assume. But a `cfg` that removes a test removes it from the
+/// list as well, so a Windows run shows sixteen green ticks where a Mac shows
+/// seventeen and nothing anywhere says which one is missing or why. This test is
+/// that sentence. It asserts nothing, deliberately — its entire job is to be the
+/// line of output that stops the shorter list from reading as the same coverage.
+///
+/// Written straight to the stream because `libtest` captures the printing macros
+/// and shows their output only for a test that fails, which is exactly backwards
+/// for a notice attached to a passing run.
+#[cfg(not(unix))]
+#[test]
+fn f7_is_compiled_out_on_this_platform_and_says_so() {
+    let banner = format!(
+        "SKIPPED: f7 (a symlink is listed as a name that cannot be reached) is not compiled \
+         on {}, because creating the symlink its fixture needs requires privilege a test \
+         suite must not assume. The property is untested here.\n",
+        std::env::consts::OS
+    );
+    let mut stderr = std::io::stderr();
+    let _ = std::io::Write::write_all(&mut stderr, banner.as_bytes());
+    let _ = std::io::Write::flush(&mut stderr);
+}
+
 // ---------------------------------------------------------------------------
 // Controls: the properties the review could not break, kept so that a fix
 // somewhere else cannot quietly take them away.
 // ---------------------------------------------------------------------------
 
+/// Every hostile `Destination:` header is either refused or confined, and at
+/// least one of them gets far enough for "confined" to mean something.
+///
+/// The counter is not decoration. Two of the three outcomes below are `continue`
+/// — a header the parser rejects, and a path the resolver rejects — and both are
+/// correct answers, so a change that made `destination` refuse *everything*
+/// would leave this loop running to completion having asserted nothing at all,
+/// still green, and no longer guarding the containment it was written for. That
+/// is the same shape of failure as a test that skips on the wrong volume: a
+/// regression guard that quietly does not run. So the test states the second
+/// half of its property out loud — the hostile inputs that survive parsing and
+/// resolution must be a non-empty set, because the confinement claim is about
+/// them.
 #[test]
 fn c1_destination_header_cannot_be_talked_out_of_the_mount() {
     use selfhost_storage::dav::method::destination;
+    let mut confined = 0_usize;
     for hostile in [
         "https://admin.example@evil.example/dav/vault/a",
         "https://admin.example:443@evil.example/dav/vault/a",
@@ -542,18 +584,29 @@ fn c1_destination_header_cannot_be_talked_out_of_the_mount() {
         "HTTPS://admin.example/dav/vault/a",
         "/dav/vault/a\\..\\..\\etc",
     ] {
+        // Refused at the header: a correct outcome, and one that asserts
+        // nothing about confinement.
         let Ok(parsed) = destination(Some(hostile), Some("admin.example")) else {
             continue;
         };
         let root = Path::new("/srv/vault");
-        if let Ok(resolved) = selfhost_storage::path::resolve(root, &parsed.path) {
-            assert!(
-                resolved.textual_path().starts_with(root),
-                "{hostile} escaped as {:?}",
-                resolved.textual_path()
-            );
-        }
+        // Refused at the resolver: likewise correct, likewise silent.
+        let Ok(resolved) = selfhost_storage::path::resolve(root, &parsed.path) else {
+            continue;
+        };
+        assert!(
+            resolved.textual_path().starts_with(root),
+            "{hostile} escaped as {:?}",
+            resolved.textual_path()
+        );
+        confined += 1;
     }
+    assert!(
+        confined > 0,
+        "every hostile Destination was refused before it could be resolved, so this test \
+         proved nothing about confinement — the property it guards now needs an input that \
+         reaches the resolver"
+    );
 }
 
 #[test]

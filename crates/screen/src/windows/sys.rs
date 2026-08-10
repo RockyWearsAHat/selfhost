@@ -491,16 +491,15 @@ impl OwnedHandle {
 
     /// The raw handle, for passing back into Win32. Borrowed, never consumed, so
     /// the value cannot outlive the close.
+    ///
+    /// There is deliberately **no `into_raw`**. Every handle in this crate is held
+    /// by exactly one owner for its whole life — the process handle a
+    /// `SpawnedAgent` keeps, the token a spawn drops the moment the child exists,
+    /// the pipe and its event — and none is ever handed to another structure to
+    /// close. An escape hatch that gives up ownership without closing would be a
+    /// leak waiting for its first caller, in a daemon that runs for months.
     pub(crate) fn raw(&self) -> Handle {
         self.0
-    }
-
-    /// Gives up ownership without closing, for a handle another structure is
-    /// taking over.
-    pub(crate) fn into_raw(self) -> Handle {
-        let raw = self.0;
-        std::mem::forget(self);
-        raw
     }
 }
 

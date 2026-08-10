@@ -180,9 +180,10 @@ pub async fn run(config: &Config, project_dir: &Path, deep: bool, scan_lan: bool
     check_dns(&mut report, config, &resolver, public_ip).await;
     check_authority(&mut report, config, &resolver, public_ip).await;
     check_mail(&mut report, config, &resolver, public_ip, deep).await;
-    check_desktop(&mut report, config, project_dir);
+    check_desktop(&mut report, config, project_dir).await;
     check_mesh(&mut report, config, project_dir);
     check_storage(&mut report, config, project_dir, deep);
+    check_exports(&mut report, config, project_dir).await;
     if deep || scan_lan {
         investigate_causes(&mut report, &resolver, public_ip, deep, scan_lan).await;
     }
@@ -198,7 +199,7 @@ pub async fn run(config: &Config, project_dir: &Path, deep: bool, scan_lan: bool
 /// process this command did not start and cannot see: reporting it as `Pass`
 /// because the config looks right is precisely the failure this whole file
 /// exists to avoid.
-fn check_desktop(report: &mut Report, config: &Config, project_dir: &Path) {
+async fn check_desktop(report: &mut Report, config: &Config, project_dir: &Path) {
     let data_dir = crate::teardown::data_dir(config, project_dir);
     let switch = crate::kill_switch::path_in(&data_dir);
     let engaged = crate::kill_switch::present(&data_dir);
@@ -287,19 +288,10 @@ fn check_desktop(report: &mut Report, config: &Config, project_dir: &Path) {
     // (below). This is the middle one.
     section.checks.push(input_permission_check(desktop.allow_input));
 
-    // The one question this command genuinely cannot answer.
-    section.checks.push(
-        Check::new(
-            "capture agent",
-            Verdict::Unknown,
-            "whether a stream is running is a fact about the daemon's own process, which this \
-             command did not start and cannot inspect",
-        )
-        .with_fix(
-            "Ask the daemon: the console's DESKTOP plate reports the machine's own sentence, and \
-             it is the daemon's process that holds the operating system's grants.",
-        ),
-    );
+    // The one question this command cannot answer by itself — so it asks the
+    // process that can. See [`agent_check`] for why this is a loopback request
+    // rather than an inference.
+    section.checks.push(agent_check(config, &data_dir).await);
 
     section.checks.push(if engaged {
         Check::new(
@@ -486,6 +478,366 @@ fn input_permission_check(allowed_by_config: bool) -> Check {
              keystroke will be refused",
         )
     }
+}
+
+/// Whether a capture agent is live, and in which session.
+///
+/// # Why this asks the daemon instead of concluding something
+///
+/// Whether an agent is running is a fact about a *different process*: the daemon
+/// spawned it, holds its process handle and holds the pipe it answers on, and
+/// none of that is visible from here. Every earlier version of this check said
+/// `Unknown` for exactly that reason, which was honest and unhelpful — the
+/// operator's next move was always "go and look at the console", so this makes
+/// that move for them.
+///
+/// It is a **client** request to `server.admin_bind`, which is loopback and
+/// refuses to be anything else. Nothing is bound; the token is the same bearer
+/// credential the console client presents, read from the file whose permissions
+/// this same report checks a section earlier. A daemon that is not running, a
+/// token that cannot be read and a deployment whose desktop is switched off are
+/// three different answers and each says which it is, because "could not ask" and
+/// "asked and there is no agent" are the two states this whole file exists to
+/// keep apart.
+async fn agent_check(config: &Config, data_dir: &Path) -> Check {
+    let unknown = |detail: String| {
+        Check::new("capture agent", Verdict::Unknown, detail).with_fix(
+            "Start the daemon (`selfhost daemon`) and run this again, or read the console's \
+             DESKTOP plate — it prints the same sentence this would have.",
+        )
+    };
+
+    let report = match ask_daemon(config, data_dir, "/api/desktop/agent?peer=self").await {
+        Ok(report) => report,
+        Err(reason) => return unknown(reason),
+    };
+    let sentence = report.get("sentence").and_then(selfhost_json::Json::as_str).unwrap_or_default();
+    if sentence.is_empty() {
+        return unknown("the daemon answered without saying anything about its agent".to_owned());
+    }
+    let live = report.get("live").and_then(selfhost_json::Json::as_bool).unwrap_or(false);
+    let monitors = report.get("monitors").and_then(selfhost_json::Json::as_u64).unwrap_or(0);
+    let respawns = report.get("respawns").and_then(selfhost_json::Json::as_u64).unwrap_or(0);
+
+    if live {
+        let mut check = Check::new(
+            "capture agent",
+            Verdict::Pass,
+            format!("live · {monitors} display(s) · {sentence}"),
+        );
+        // A crash loop that is currently up still looks fine in one glance, and
+        // it is the state most likely to be dismissed. Say the number.
+        if respawns > 0 {
+            check = check.with_fix(format!(
+                "It has been started {respawns} time(s) in the last hour. A number that keeps \
+                 climbing is a crash loop, and the daemon stops trying at \
+                 [desktop].agent_respawn_cap."
+            ));
+        }
+        return check;
+    }
+
+    // Not live is not automatically wrong: a machine at its login screen has no
+    // agent and is working correctly. The daemon's own sentence is what
+    // distinguishes the two, so it is printed rather than summarised.
+    Check::new("capture agent", Verdict::Warn, format!("no agent is answering · {sentence}"))
+        .with_fix(
+            "The sentence above is the daemon's own. Nobody signed in, a session mid-switch and \
+             the kill switch are ordinary states; a spawn that keeps failing is not, and it names \
+             the Windows call that refused.",
+        )
+}
+
+/// Asks the running daemon one loopback question and hands back the JSON.
+///
+/// # Errors
+///
+/// A sentence naming which step could not be taken, because each one means a
+/// different thing to the reader: no token file means this deployment has never
+/// started, a refused connection means the daemon is not running, and a 404 means
+/// it is running with the subsystem switched off.
+///
+/// Deliberately not a general-purpose client. It sends one `GET`, closes, and
+/// reads to end of stream, which is the shape every route this file asks about
+/// answers in — and keeping it that shape is what keeps `doctor` from growing an
+/// HTTP client nobody maintains.
+async fn ask_daemon(
+    config: &Config,
+    data_dir: &Path,
+    target: &str,
+) -> Result<selfhost_json::Json, String> {
+    /// Long enough for a loopback answer, short enough that a wedged daemon does
+    /// not hold up a diagnostic somebody is watching.
+    const DEADLINE: Duration = Duration::from_secs(3);
+    /// The most body this reads. Every answer here is a short JSON object; a
+    /// bigger one is a route that changed shape, not an answer.
+    const MAX_BODY: usize = 64 * 1024;
+
+    let token = std::fs::read_to_string(Token::path_in(data_dir)).map_err(|error| {
+        format!(
+            "the admin token at {} could not be read ({error}), so the daemon cannot be asked",
+            Token::path_in(data_dir).display()
+        )
+    })?;
+    let token = token.trim().to_owned();
+    if token.is_empty() {
+        return Err("the admin token file is empty, so the daemon cannot be asked".to_owned());
+    }
+    let bind = &config.server.admin_bind;
+    let address: SocketAddr = bind
+        .parse()
+        .map_err(|error| format!("admin_bind {bind} is not an address: {error}"))?;
+
+    let exchange = async {
+        let mut stream = TcpStream::connect(address)
+            .await
+            .map_err(|error| format!("nothing is answering on {address}: {error}"))?;
+        let request = format!(
+            "GET {target} HTTP/1.1\r\nHost: {address}\r\nAuthorization: Bearer {token}\r\n\
+             Connection: close\r\n\r\n"
+        );
+        stream
+            .write_all(request.as_bytes())
+            .await
+            .map_err(|error| format!("the daemon closed the connection: {error}"))?;
+        let mut raw = Vec::new();
+        let mut buffer = [0u8; 4096];
+        loop {
+            let read = stream
+                .read(&mut buffer)
+                .await
+                .map_err(|error| format!("the daemon's answer stopped: {error}"))?;
+            if read == 0 {
+                break;
+            }
+            let arrived = buffer.get(..read).unwrap_or_default();
+            raw.extend_from_slice(arrived);
+            if raw.len() > MAX_BODY {
+                return Err("the daemon's answer is larger than this check will read".to_owned());
+            }
+        }
+        Ok(raw)
+    };
+
+    let raw = tokio::time::timeout(DEADLINE, exchange)
+        .await
+        .map_err(|_| format!("{address} did not answer within {}s", DEADLINE.as_secs()))??;
+
+    read_answer(&raw)
+}
+
+/// Reads one loopback answer, or says which kind of "no" it was.
+///
+/// Pure, and separate from the socket, because the *statuses* are the part with
+/// meaning: a 401 and a 404 from this route are two entirely different pieces of
+/// advice — the wrong token against a running daemon, and a running daemon with
+/// the subsystem switched off — and collapsing them would send an operator to
+/// rotate a credential that was never the problem.
+fn read_answer(raw: &[u8]) -> Result<selfhost_json::Json, String> {
+    let text = String::from_utf8_lossy(raw);
+    let (head, body) = text
+        .split_once("\r\n\r\n")
+        .ok_or_else(|| "the daemon's answer had no complete head".to_owned())?;
+    let status = head.split_whitespace().nth(1).unwrap_or_default();
+    match status {
+        "200" => selfhost_json::parse(body.trim())
+            .map_err(|error| format!("the daemon's answer is not JSON this build reads: {error}")),
+        "401" => Err(
+            "the daemon refused the token in the data directory — it is not the one that daemon \
+             is running with"
+                .to_owned(),
+        ),
+        "404" => Err(
+            "the daemon is running with this subsystem switched off, so it has nothing to report"
+                .to_owned(),
+        ),
+        other => Err(format!("the daemon answered {other}")),
+    }
+}
+
+/// The operating system's half of the NAS: is anything exported, is anything
+/// advertised, and what privilege is missing.
+///
+/// Separate from [`check_storage`], which asks whether the *directories* are
+/// usable. These two fail independently and for unrelated reasons: a share whose
+/// root is perfect and writable is still invisible to a laptop if `sharing`
+/// refused for want of root, and an export that exists is still undiscoverable on
+/// a platform where nothing publishes DNS-SD.
+///
+/// The reconcile is run as a **dry run**, always. `doctor` reports; it does not
+/// change the machine, and a diagnostic that created share points as a side
+/// effect of being run would be the last one anybody trusted.
+async fn check_exports(report: &mut Report, config: &Config, project_dir: &Path) {
+    use selfhost_storage::discover;
+    use selfhost_storage::smb::{self, Apply, OwnershipLedger, SmbError};
+
+    if config.shares.is_empty() {
+        return;
+    }
+    let shares = match crate::storage_command::declared_shares(config, project_dir) {
+        Ok(shares) => shares,
+        // `check_storage` has already reported this properly, with the sentence
+        // that would stop the daemon. Saying it twice would teach a reader that
+        // this report repeats itself.
+        Err(_) => return,
+    };
+    let section = report.section("Network storage — exports and discovery");
+
+    let backend = smb::detect();
+    let exports = smb::plan::desired_exports(&shares).unwrap_or_default();
+    if exports.is_empty() {
+        section.checks.push(Check::new(
+            "SMB exports",
+            Verdict::Skipped,
+            "no share declares a [shares.smb] block, so this box never speaks to its SMB server",
+        ));
+    } else if backend.kind() == smb::BackendKind::Unsupported {
+        section.checks.push(
+            Check::new(
+                "SMB backend",
+                Verdict::Fail,
+                format!(
+                    "{} share(s) ask to be exported and there is no SMB driver for {}",
+                    exports.len(),
+                    std::env::consts::OS
+                ),
+            )
+            .with_fix(
+                "Remove the [shares.smb] blocks on this host, or export the directory with the \
+                 platform's own tools. WebDAV and the console still serve these shares.",
+            ),
+        );
+    } else {
+        let data_dir = crate::teardown::data_dir(config, project_dir);
+        let ledger = OwnershipLedger::under(&data_dir);
+        section.checks.push(
+            match smb::sync(&backend, &ledger, &shares, Apply::DryRun).await {
+                Ok(run) => export_check(&run, backend.kind()),
+                // The privilege case is the whole reason this check exists: the
+                // daemon runs as a service account, and none of the three
+                // platforms grants that account the right to create a share
+                // point by default.
+                Err(SmbError::Denied { program, privilege }) => Check::new(
+                    "SMB backend",
+                    Verdict::Fail,
+                    format!("{program} needs {privilege}, which this account does not have"),
+                )
+                .with_fix(
+                    "Nothing was changed. Grant that privilege to the account the daemon runs \
+                     as, or run `selfhost storage smb apply` from a shell that holds it.",
+                ),
+                Err(other) => Check::new(
+                    "SMB backend",
+                    Verdict::Unknown,
+                    format!("{} could not be read: {other}", backend.kind().label()),
+                ),
+            },
+        );
+    }
+
+    // Advertisement is a separate question with a separate answer, and on one of
+    // the three platforms the answer is "nothing will publish this".
+    let label = crate::storage_command::advertised_label(config)
+        .unwrap_or_else(|| crate::storage_command::FALLBACK_HOSTNAME.to_owned());
+    let dav = crate::storage_command::dav_endpoint(config).ok().flatten();
+    let publication = discover::publication(std::env::consts::OS);
+    let advertised = discover::HostIdentity::new(&label, crate::storage_command::DEFAULT_MODEL, Vec::new())
+        .map(|host| discover::advertisements(&shares, &host, dav.as_ref()).len())
+        .unwrap_or(0);
+    let browsable = shares.all().iter().filter(|share| share.browsable()).count();
+
+    section.checks.push(if browsable == 0 {
+        Check::new(
+            "share discovery",
+            Verdict::Skipped,
+            "no share sets `browsable = true`, so nothing is advertised on the LAN",
+        )
+    } else if advertised == 0 {
+        Check::new(
+            "share discovery",
+            Verdict::Warn,
+            format!("{browsable} share(s) are browsable and none produced a registration"),
+        )
+        .with_fix(
+            "A browsable share is advertised over SMB only when it also declares [shares.smb], \
+             and over WebDAV only when a site sets `console = true`.",
+        )
+    } else if publication.publishes_dns_sd() {
+        Check::new(
+            "share discovery",
+            Verdict::Pass,
+            format!(
+                "{advertised} registration(s), published by {} — `selfhost storage discover` \
+                 prints them",
+                publication.tag()
+            ),
+        )
+    } else {
+        Check::new(
+            "share discovery",
+            Verdict::Warn,
+            format!("{advertised} registration(s) are derived and nothing on this platform will publish them"),
+        )
+        .with_fix(publication.explanation())
+    });
+}
+
+/// Turns a dry-run reconcile into one line about the host's exports.
+///
+/// Pure given the report, so the rule that decides Pass from Warn is testable
+/// without a machine that has an SMB server. The rule: a plan that would change
+/// the host means the exports are **not** what the config declares, whatever else
+/// is true, and a name already taken by somebody else's share point is worse than
+/// a missing one because it will never resolve on its own.
+fn export_check(
+    run: &selfhost_storage::smb::SyncReport,
+    kind: selfhost_storage::smb::BackendKind,
+) -> Check {
+    let plan = &run.plan;
+    let ours = run.state.shares.iter().filter(|share| share.managed).count();
+    if !plan.conflicts.is_empty() {
+        let names: Vec<&str> = plan.conflicts.iter().map(|c| c.name.as_str()).collect();
+        return Check::new(
+            "SMB exports",
+            Verdict::Fail,
+            format!(
+                "{} configured name(s) are already taken by share points this deployment did not \
+                 create: {}",
+                names.len(),
+                names.join(", ")
+            ),
+        )
+        .with_fix(
+            "Neither adopted nor deleted, deliberately. Rename the export in the config, or \
+             remove the existing share point with the platform's own tools.",
+        );
+    }
+    if plan.changes_the_host() {
+        return Check::new(
+            "SMB exports",
+            Verdict::Warn,
+            format!(
+                "{} to create, {} to correct, {} to remove — the host is not exporting what the \
+                 config declares",
+                plan.create.len(),
+                plan.update.len(),
+                plan.remove.len(),
+            ),
+        )
+        .with_fix("`selfhost storage smb apply` performs the plan; `plan` prints it first.");
+    }
+    let running = match run.state.service_running {
+        Some(true) => "the service is running",
+        Some(false) => "the service is NOT running, so nothing can mount them",
+        None => "this platform will not say whether the service is running",
+    };
+    let verdict =
+        if run.state.service_running == Some(false) { Verdict::Warn } else { Verdict::Pass };
+    Check::new(
+        "SMB exports",
+        verdict,
+        format!("{ours} export(s) through {}; {running}", kind.label()),
+    )
 }
 
 /// Network storage: how many shares, whether their roots are there, whether the
@@ -2465,5 +2817,81 @@ allowed_cidrs = [{gate}]
         assert!(rendered.contains("LISTED"));
         assert!(rendered.contains("delist it"));
         assert!(rendered.contains("1 failed"));
+    }
+
+    /// The daemon's three answers are three different pieces of advice, and the
+    /// one that reads as success has to be the only one that does.
+    #[test]
+    fn each_kind_of_daemon_answer_is_told_apart() {
+        let ok = read_answer(
+            b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n{\"live\":true,\"sentence\":\"agent live in session 1\"}",
+        )
+        .expect("a 200 is read");
+        assert_eq!(ok.get("live").and_then(selfhost_json::Json::as_bool), Some(true));
+
+        let refused = read_answer(b"HTTP/1.1 401 Unauthorized\r\n\r\n{}").expect_err("a 401");
+        assert!(refused.contains("token"), "{refused}");
+
+        let absent = read_answer(b"HTTP/1.1 404 Not Found\r\n\r\n{}").expect_err("a 404");
+        assert!(absent.contains("switched off"), "{absent}");
+
+        // A half-arrived answer is never mistaken for an empty one.
+        assert!(read_answer(b"HTTP/1.1 200 OK\r\nContent-Type: app").is_err());
+        // A 200 whose body is not JSON is a route that changed shape, and it
+        // says so rather than reporting a machine with no agent.
+        assert!(read_answer(b"HTTP/1.1 200 OK\r\n\r\nnot json").is_err());
+    }
+
+    /// A plan that would change the host means the host is not exporting what
+    /// the config says, whatever else is true — and a name somebody else already
+    /// owns is worse than a missing one, because it never resolves by itself.
+    #[test]
+    fn the_export_verdict_follows_the_plan_and_not_the_count() {
+        use selfhost_storage::share::SmbName;
+        use selfhost_storage::smb::{
+            BackendKind, Conflict, Owned, Reconciliation, ShareState, SmbState, SyncReport,
+        };
+
+        let state = |running: Option<bool>, shares: Vec<ShareState>| SmbState {
+            backend: BackendKind::Sharing,
+            service_running: running,
+            shares,
+        };
+        let ours = ShareState {
+            name: "Vault".to_owned(),
+            path: "/Volumes/Vault".to_owned(),
+            managed: true,
+            guest_access: false,
+            read_only: false,
+            encrypted: true,
+        };
+
+        let settled = SyncReport {
+            plan: Reconciliation::default(),
+            performed: Vec::new(),
+            state: state(Some(true), vec![ours.clone()]),
+            owned: Owned::empty(),
+        };
+        assert_eq!(export_check(&settled, BackendKind::Sharing).verdict, Verdict::Pass);
+
+        // Exported, but nothing can mount them: a pass here would be the exact
+        // reassurance this file exists to refuse.
+        let stopped = SyncReport { state: state(Some(false), vec![ours.clone()]), ..settled.clone() };
+        assert_eq!(export_check(&stopped, BackendKind::Sharing).verdict, Verdict::Warn);
+
+        let conflicted = SyncReport {
+            plan: Reconciliation {
+                conflicts: vec![Conflict {
+                    name: SmbName::parse("Vault").expect("a legal export name"),
+                    existing_path: "/Users/alex/Public".to_owned(),
+                    existing_guest_access: true,
+                }],
+                ..Reconciliation::default()
+            },
+            ..settled.clone()
+        };
+        let check = export_check(&conflicted, BackendKind::Sharing);
+        assert_eq!(check.verdict, Verdict::Fail);
+        assert!(check.detail.contains("did not create"), "{}", check.detail);
     }
 }

@@ -38,10 +38,26 @@
 //! 4. **Compared in constant time**, by a comparison that does not
 //!    short-circuit, so the fingerprint table cannot be walked one byte at a
 //!    time.
-//! 5. **Invalidated on rotation.** [`Credentials::invalidate`] is called when
-//!    the console password changes; without it a rotated password would keep
-//!    working for a minute, which is the minute somebody rotated it *in*.
-//! 6. **Never logged.** [`Presented`]'s `Debug` prints the user name and the
+//! 5. **Discardable on rotation, and today discarded by the process ending.**
+//!    [`Credentials::invalidate`] empties the table at once. It is deliberately
+//!    *not* called from anywhere in this deployment, and the reason is worth
+//!    stating rather than leaving as an apparent omission: the console password
+//!    is read from disk once, when the daemon builds its API, so
+//!    `selfhost console-password` takes effect at the next restart — and a
+//!    restart takes the whole table with it, along with the key that made its
+//!    fingerprints mean anything. There is therefore no window in which this
+//!    cache can answer for a password the running process no longer holds. The
+//!    method exists for the day a rotation route lands in the daemon, which is
+//!    the day this sentence has to change with it.
+//! 6. **Bounded in the CPU it can be made to spend.** The table stops a
+//!    *repeated* credential costing 70 ms twice, and [`Credentials::throttled`]
+//!    stops one wrong credential costing it ten times. Neither bounds an
+//!    attacker who simply never repeats himself: every distinct credential is a
+//!    cache miss, and a cache miss is a PBKDF2 run. So the ceiling that actually
+//!    holds is [`MAX_CONCURRENT_VERIFICATIONS`], which is per *process* and
+//!    cannot be evicted, rate-limited around, or spread across user names — see
+//!    [`Credentials::verification_slot`].
+//! 7. **Never logged.** [`Presented`]'s `Debug` prints the user name and the
 //!    word `<redacted>`; there is no `Display`, no field accessor for the
 //!    password other than the one the verifier consumes, and nothing here
 //!    formats one.
@@ -61,9 +77,14 @@
 //! than global, so one client's bad password cannot affect another's; it
 //! refuses only the credential that failed, never a login; and it lives in this
 //! crate, which `crates/admin`'s session code does not call. It is a brake on
-//! PBKDF2 burn, not a lockout — an attacker with 64 different wrong passwords
-//! evicts their own counters, and that is fine, because the thing being
-//! protected is CPU rather than a secret.
+//! PBKDF2 burn, not a lockout.
+//!
+//! And being per-credential, it is a brake an attacker steps around by changing
+//! credentials: sixty-four wrong passwords evict each other's counters and none
+//! of them is ever throttled. That is not a hole in the throttle, it is the
+//! wrong tool being asked to hold a different rule, so the rule has its own tool
+//! — [`MAX_CONCURRENT_VERIFICATIONS`], below, which is what actually bounds the
+//! CPU an unauthenticated caller can make this process spend.
 //!
 //! # What this credential is allowed to do, which is not everything
 //!
@@ -83,6 +104,7 @@ use selfhost_identity::Caller;
 use std::fmt;
 use std::sync::{Mutex, PoisonError};
 use std::time::{Duration, Instant};
+use tokio::sync::{Semaphore, SemaphorePermit};
 
 /// How many verified-or-rejected credentials are remembered at once.
 ///
@@ -104,6 +126,48 @@ pub const ENTRY_TTL: Duration = Duration::from_secs(60);
 /// How many failures against one credential are answered before it is refused
 /// without being verified.
 pub const MAX_FAILURES: u32 = 10;
+
+/// How many cold PBKDF2 verifications this process will run at once.
+///
+/// # What goes wrong without it
+///
+/// Every check that stands between a stranger and 70 ms of CPU is keyed on the
+/// credential: the cache is, and so is [`Credentials::throttled`]. A caller who
+/// never presents the same credential twice therefore misses the cache every
+/// time and is never throttled, and each of those misses becomes a
+/// `spawn_blocking` task. Tokio's blocking pool is 512 threads by default and
+/// nothing else bounds this, so a few hundred concurrent `/dav` requests — none
+/// of them authenticated, none of them ever going to be — take every core the
+/// box has *and* the pool that **every filesystem operation in this crate runs
+/// on**. The share stops answering, the console stops answering, and the
+/// requests that did it were all rejected.
+///
+/// The gate in front of that is a source address, not an identity, and on this
+/// box "inside the gate" includes three co-hosted web applications: a bug in any
+/// one of them is a request from inside it. So the ceiling is not a hypothetical.
+///
+/// # Why two, and why a queue rather than a refusal
+///
+/// A deployment has **one** console password, so the honest working set is one
+/// verification at a time; the second slot is there so a second client, or an
+/// operator retyping while a mount is connecting, is not waiting behind a
+/// stranger.
+///
+/// Callers past the ceiling **wait** rather than being refused, and that is the
+/// load-bearing half of the choice. A refusal here would be a `401`, and this
+/// module's whole reason for existing is that macOS and Windows read a second
+/// `401` as *the password you stored is wrong* and throw the keychain item away
+/// — so a burst of traffic from anywhere on the box would unmount the
+/// operator's drive. Waiting costs latency under attack, which is latency that
+/// already existed when 512 verifications were fighting for four cores, and it
+/// leaves the blocking pool free for the work that is actually serving somebody.
+///
+/// The queue is also why a burst of *legitimate* traffic now costs one
+/// verification rather than one each: Finder opening a mount issues its requests
+/// in parallel, every one of them missed the cache before the first had
+/// finished, and [`Credentials::verification_slot`]'s call site asks the cache
+/// again once it holds a slot.
+pub const MAX_CONCURRENT_VERIFICATIONS: usize = 2;
 
 /// The window failures are counted in.
 pub const FAILURE_WINDOW: Duration = Duration::from_secs(60);
@@ -215,6 +279,14 @@ pub struct Credentials {
     key: hmac::Key,
     /// The decisions, most recently decided last.
     entries: Mutex<Vec<Entry>>,
+    /// Permission to run a cold verification, [`MAX_CONCURRENT_VERIFICATIONS`]
+    /// at a time.
+    ///
+    /// Held here rather than in the route because it is a property of the thing
+    /// being protected — the one password every `/dav` request is checked
+    /// against — and a ceiling owned by a call site is a ceiling the second call
+    /// site does not have.
+    slots: Semaphore,
 }
 
 /// One remembered credential.
@@ -251,7 +323,32 @@ impl Credentials {
         Ok(Self {
             key: hmac::Key::new(hmac::HMAC_SHA256, &secret),
             entries: Mutex::new(Vec::new()),
+            slots: Semaphore::new(MAX_CONCURRENT_VERIFICATIONS),
         })
+    }
+
+    /// Waits for permission to run one cold PBKDF2 verification.
+    ///
+    /// The ceiling [`MAX_CONCURRENT_VERIFICATIONS`] describes, and the whole of
+    /// its enforcement. The permit is released when the returned value is
+    /// dropped, so a caller holds it for exactly as long as it is verifying and
+    /// a caller that returns early — by finding the answer in the cache, or by
+    /// failing — releases it on the way out without having to remember to.
+    ///
+    /// The queue is fair, so a request that arrives while a flood is in progress
+    /// is served after the requests already waiting rather than being starved
+    /// behind an endless stream of new ones.
+    ///
+    /// `None` is returned only if the semaphore has been closed, which nothing
+    /// in this crate does. It is written as an `Option` rather than an `expect`
+    /// because the workspace builds with `panic = "abort"`, where an `expect` on
+    /// an unreachable branch is the whole box rather than one failed request —
+    /// and because the safe reading of "the ceiling is gone" is to verify
+    /// anyway, which is what this deployment did before the ceiling existed. It
+    /// must never become a refusal: a refusal on this path is a `401`, and a
+    /// second `401` is how a mounted drive loses its stored credential.
+    pub async fn verification_slot(&self) -> Option<SemaphorePermit<'_>> {
+        self.slots.acquire().await.ok()
     }
 
     /// What is known about this credential.
@@ -340,10 +437,20 @@ impl Credentials {
 
     /// Forgets everything, immediately.
     ///
-    /// Called when the console password is rotated. Without it a password that
-    /// was just changed would keep opening shares for up to [`ENTRY_TTL`] — and
-    /// the minute after a rotation is exactly the minute the old password was
-    /// rotated away from.
+    /// For a rotation that happens **while this process is running**, so that a
+    /// password just changed cannot keep opening shares for up to [`ENTRY_TTL`]
+    /// — the minute after a rotation being exactly the minute the old password
+    /// was rotated away from.
+    ///
+    /// No such rotation exists in this deployment yet: the console password is
+    /// read from disk once, when the daemon builds its API, so
+    /// `selfhost console-password` takes effect at the next restart and the
+    /// restart discards this table wholesale. This is therefore called by
+    /// nothing but its own test, deliberately and not by oversight — it is the
+    /// half of the rule that will be needed the day a rotation route lands, and
+    /// writing it then rather than now would mean writing it in the same change
+    /// that first makes it necessary. See property 5 in this module's
+    /// documentation.
     ///
     /// Failure counts go with it, deliberately: an operator who has just fixed
     /// their password must not be told to wait.
@@ -674,6 +781,41 @@ mod tests {
         assert_eq!(caller.credential(), Credential::Password);
         assert_eq!(caller.identity(), &Identity::Owner);
         assert!(caller.credential().is_deployment_wide());
+    }
+
+    /// The hole the per-credential throttle cannot close: a caller who never
+    /// presents the same credential twice misses the cache every time and is
+    /// never throttled, so nothing keyed on the credential bounds what he
+    /// spends. This asserts that the ceiling which is *not* keyed on his choices
+    /// holds regardless.
+    #[tokio::test]
+    async fn a_caller_who_never_repeats_a_credential_still_cannot_run_more_than_the_ceiling() {
+        let cache = credentials();
+        let mut held = Vec::new();
+        for attempt in 0..MAX_CONCURRENT_VERIFICATIONS {
+            // Every one of these is a distinct credential: a cache miss, and
+            // never throttled, exactly as an attacker would arrange.
+            assert_eq!(cache.look_up(&presented("owner", &format!("miss-{attempt}"))), Cached::Unknown);
+            assert!(!cache.throttled(&presented("owner", &format!("miss-{attempt}"))));
+            held.push(cache.verification_slot().await.expect("the ceiling is open"));
+        }
+        assert_eq!(held.len(), MAX_CONCURRENT_VERIFICATIONS);
+
+        // The next one waits. `timeout` is how "waits" is asserted without a
+        // test that hangs when the ceiling is removed.
+        let refused_for_now = tokio::time::timeout(
+            Duration::from_millis(50),
+            cache.verification_slot(),
+        )
+        .await;
+        assert!(refused_for_now.is_err(), "a verification past the ceiling ran anyway");
+
+        // And it is a queue, not a lockout: a slot released lets the next one
+        // through, so a burst costs latency rather than a `401` — which on this
+        // path would take the operator's mounted drive with it.
+        held.pop();
+        let next = tokio::time::timeout(Duration::from_secs(1), cache.verification_slot()).await;
+        assert!(next.expect("the queue drains").is_some());
     }
 
     #[test]

@@ -43,6 +43,19 @@
 //! Two cheaper refusals come first, so a person who ran this by mistake gets a
 //! sentence rather than a ten-second wait: a missing `--session`, and a
 //! `--session` that is not the one this process is actually in.
+//!
+//! # `--allow-input` is a capability the parent grants, not a secret
+//!
+//! The daemon puts `--allow-input` on this command line when
+//! `[desktop].allow_input` is true, and without it the agent builds no injector
+//! at all. That does not contradict the paragraph above: the flag authenticates
+//! nothing and grants nothing on its own. Somebody who runs this by hand with the
+//! flag gets a process that cannot reach the daemon's pipe, so nothing ever asks
+//! it to type; and were it somehow handed input, it would be typing into its own
+//! user's session as its own user, which is what a person at that keyboard can do
+//! anyway. What the flag rules out is the case that matters — a *daemon-spawned*
+//! agent holding an injector inside the console session in a deployment whose
+//! operator switched input off.
 
 /// The refusal every path here ends with, so the sentence exists once.
 ///
@@ -68,7 +81,7 @@ pub fn run(arguments: &[String]) -> Result<(), String> {
         // No session means nobody chose one, which means nobody spawned this.
         None => return Err(NOT_FOR_HUMANS.to_owned()),
     };
-    run_in_session(session)
+    run_in_session(session, arguments)
 }
 
 /// The Windows body: check the session, then hand over to the agent itself.
@@ -80,9 +93,16 @@ pub fn run(arguments: &[String]) -> Result<(), String> {
 /// another person's name. The pipe cannot catch that: its DACL is built around
 /// the *intended* session's user, and after a switch this process may still be
 /// that user.
+///
+/// The rest of the argument vector is carried through rather than discarded
+/// because `[desktop].allow_input` reaches this process on it, and only on it:
+/// `selfhost_screen::agent::AgentOptions::from_arguments` reads the one flag that
+/// grants an injector — fail-closed, so an argv this build does not recognise is a
+/// view-only agent. See `selfhost_screen::agent::InputPolicy` for why the switch
+/// travels here and not over the pipe.
 #[cfg(windows)]
-fn run_in_session(session: u32) -> Result<(), String> {
-    use selfhost_screen::agent::{run, AgentOptions, StreamConfig};
+fn run_in_session(session: u32, arguments: &[String]) -> Result<(), String> {
+    use selfhost_screen::agent::{run, AgentOptions};
 
     match selfhost_screen::windows::gdi::current_session() {
         Some(mine) if mine == session => {}
@@ -105,7 +125,7 @@ fn run_in_session(session: u32) -> Result<(), String> {
         }
     }
 
-    run(AgentOptions { session, config: StreamConfig::default() })
+    run(AgentOptions::from_arguments(session, arguments))
         .map_err(|fault| format!("the desktop agent stopped: {fault}"))
 }
 
@@ -116,7 +136,7 @@ fn run_in_session(session: u32) -> Result<(), String> {
 /// a platform it was never meant for must see a non-zero exit and stop trying,
 /// not a process that returns cleanly and looks like it worked.
 #[cfg(not(windows))]
-fn run_in_session(session: u32) -> Result<(), String> {
+fn run_in_session(session: u32, _arguments: &[String]) -> Result<(), String> {
     Err(format!(
         "there is no desktop agent on this platform: the agent exists to reach an interactive \
          session from a service running in Windows session 0, and nothing here has that problem. \

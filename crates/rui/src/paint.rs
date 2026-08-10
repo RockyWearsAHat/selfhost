@@ -380,10 +380,23 @@ fn draw<'tree, S>(
     if let (Some(action), Some(drag)) = (&el.on_drag, response.drag) {
         actions.push(Box::new(move |state| action(state, drag)));
     }
-    if let Some(action) = &el.on_key {
-        if response.focused {
-            for &(key, modifiers) in frame.input.keys() {
+    if response.focused {
+        // The three keyboard handlers are dispatched together because they are
+        // three views of one thing that happened, and a frame that ran one of
+        // them and skipped another would be a press without its release.
+        if let Some(action) = &el.on_key {
+            for (key, modifiers) in frame.input.keys() {
                 actions.push(Box::new(move |state| action(state, key, modifiers)));
+            }
+        }
+        if let Some(action) = &el.on_key_up {
+            for (key, modifiers) in frame.input.released_keys() {
+                actions.push(Box::new(move |state| action(state, key, modifiers)));
+            }
+        }
+        if let Some(action) = &el.on_raw_key {
+            for &stroke in frame.input.strokes() {
+                actions.push(Box::new(move |state| action(state, stroke)));
             }
         }
     }
@@ -955,7 +968,7 @@ fn apply_edits(
 ) -> Edit {
     let mut edit = Edit { changed: false, submitted: false };
 
-    for &(key, modifiers) in input.keys() {
+    for (key, modifiers) in input.keys() {
         // The accelerator with a letter is a command and never typing, so it is
         // decided before anything else looks at the key.
         if modifiers.command_only() {
@@ -1279,14 +1292,15 @@ mod tests {
     /// The key `character` pressed with the platform accelerator held.
     fn shortcut(character: char) -> Event {
         Event::KeyDown {
-            key: Key::Character(character),
+            key: Some(Key::Character(character)),
+            code: None,
             modifiers: Modifiers { command: true, ..Modifiers::NONE },
         }
     }
 
     /// A key pressed with nothing, or with only shift, held.
     fn press(key: Key, shift: bool) -> Event {
-        Event::KeyDown { key, modifiers: Modifiers { shift, ..Modifiers::NONE } }
+        Event::KeyDown { key: Some(key), code: None, modifiers: Modifiers { shift, ..Modifiers::NONE } }
     }
 
     /// A caret at `offset` with nothing selected.

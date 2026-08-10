@@ -46,6 +46,14 @@
 //! in a document, and a cut one reads as a machined panel — and a toolkit that
 //! can only draw one of them has already decided.
 //!
+//! # The one thing here that is not a distance field
+//!
+//! [`Canvas::blit_bgra`] copies a picture somebody else made — a decoded image,
+//! a screen captured on another machine — and there is no field to evaluate
+//! because there is no shape: the answer for each pixel is already written down.
+//! It is a copy and never a resample, which is what keeps it costing what a
+//! copy costs; see [`Bgra`] for the byte order and that decision.
+//!
 //! # Gradients and glows cost what a flat fill costs
 //!
 //! Two things above a flat fill are what stop an interface reading as a grid of
@@ -154,6 +162,117 @@ impl Mask {
     /// Whether the mask covers no area.
     pub fn is_empty(&self) -> bool {
         self.width == 0 || self.height == 0
+    }
+}
+
+/// A rectangle of 32-bit BGRA pixels somebody else owns.
+///
+/// The one thing this library draws that it did not rasterise: a picture that
+/// arrived from outside — a screen captured on another machine, a decoded
+/// image, a frame from a camera. [`Canvas::blit_bgra`] copies it; this type is
+/// how the copy is *described*, and the only place the description is checked.
+///
+/// # Why the bytes are BGRA and the stride is separate
+///
+/// Both facts come from what real capture buffers look like rather than from
+/// what would be convenient here. Every platform this library runs on hands out
+/// screen pixels in exactly the order the canvas already stores them — B, G, R,
+/// A on a little-endian machine, which is `0xAARRGGBB` read as a word — so the
+/// common case is a copy and never a conversion, the same trade
+/// [the module header](self) makes for presenting.
+///
+/// A stride wider than the row is the normal case and not the exception:
+/// Core Graphics pads every row of a capture to a multiple of sixteen or sixty-four
+/// bytes, and a Windows DIB pads to four. A blitter that assumed
+/// `stride == width * 4` would draw a picture that skewed a little further
+/// right on every row — the classic symptom, and one that only appears at
+/// widths the padding is not already a multiple of, which is why it survives
+/// casual testing.
+///
+/// # Why alpha is carried but not used
+///
+/// The surface is opaque (see [the module header](self)), and a screen capture
+/// has nothing behind it to show through: alpha in these buffers is either 255
+/// or, on macOS, *undefined* — `kCGImageAlphaNoneSkipFirst` means the byte is
+/// there and means nothing. Honouring it would blend a remote desktop against
+/// whatever this window happened to be showing, controlled by a byte the
+/// capturing platform does not promise to set. So the byte is skipped, and the
+/// blit writes opaque pixels.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Bgra<'a> {
+    width: u32,
+    height: u32,
+    stride: usize,
+    bytes: &'a [u8],
+}
+
+impl<'a> Bgra<'a> {
+    /// Describes `bytes` as a `width` by `height` picture whose rows are
+    /// `stride` bytes apart, or `None` if they cannot be.
+    ///
+    /// The check is here, once, rather than in the blit: a frame arrives from a
+    /// network or a foreign capture API, so "the sizes agree with the buffer"
+    /// is exactly the kind of claim that is someone else's mistake. Refusing it
+    /// at the door means [`Canvas::blit_bgra`] indexes rows it has already
+    /// proven are there, and a mis-described frame is a picture that does not
+    /// appear rather than a read past the end of a buffer.
+    ///
+    /// The last row is allowed to be short of a full stride, since a buffer
+    /// sized exactly `height * width * 4` with padding on every row but the
+    /// last is a real thing a capture API returns.
+    pub fn new(width: u32, height: u32, stride: usize, bytes: &'a [u8]) -> Option<Self> {
+        let row = (width as usize).checked_mul(4)?;
+        if stride < row {
+            return None;
+        }
+        if width > 0 && height > 0 {
+            let full = stride.checked_mul(height as usize - 1)?;
+            let needed = full.checked_add(row)?;
+            if bytes.len() < needed {
+                return None;
+            }
+        }
+        Some(Self { width, height, stride, bytes })
+    }
+
+    /// The same, for a picture whose rows have no padding between them.
+    pub fn packed(width: u32, height: u32, bytes: &'a [u8]) -> Option<Self> {
+        Self::new(width, height, (width as usize).checked_mul(4)?, bytes)
+    }
+
+    /// Width in pixels.
+    pub fn width(&self) -> u32 {
+        self.width
+    }
+
+    /// Height in pixels.
+    pub fn height(&self) -> u32 {
+        self.height
+    }
+
+    /// How many bytes apart two rows are.
+    pub fn stride(&self) -> usize {
+        self.stride
+    }
+
+    /// Whether it covers no area, and so draws nothing.
+    pub fn is_empty(&self) -> bool {
+        self.width == 0 || self.height == 0
+    }
+
+    /// One row of the picture, exactly `width * 4` bytes.
+    ///
+    /// `None` past the last row. Every caller is inside bounds this type
+    /// established in [`Bgra::new`], so this cannot fail for a row the blit
+    /// asks for — it answers an `Option` anyway so that the one indexing
+    /// decision lives here rather than at each use.
+    fn row(&self, y: u32) -> Option<&'a [u8]> {
+        if y >= self.height {
+            return None;
+        }
+        let start = self.stride.checked_mul(y as usize)?;
+        let end = start.checked_add((self.width as usize).checked_mul(4)?)?;
+        self.bytes.get(start..end)
     }
 }
 
@@ -617,7 +736,7 @@ impl Canvas {
     ///
     /// The neon-HUD counterpart of [`Canvas::line`]. Where a line lays opaque
     /// paint down, a beam *adds* light through
-    /// [`blend_add`](crate::color::blend_add), so two beams that cross sum toward
+    /// [`blend_add`], so two beams that cross sum toward
     /// white at the crossing rather than one hiding the other, and a beam over
     /// its own glow blooms. `thickness` is the lit core's width and `blur` is how
     /// far the halo reaches past it, fading quadratically to nothing; both are
@@ -646,7 +765,7 @@ impl Canvas {
     /// `clamp(0.5 - d_device)` that antialiases every other shape antialiases
     /// this one — a [`Sculpt::Fill`] blends over, a [`Sculpt::Stroke`] folds the
     /// distance about the edge, and a [`Sculpt::Glow`] adds light through
-    /// [`blend_add`](crate::color::blend_add) so overlapping glows bloom.
+    /// [`blend_add`] so overlapping glows bloom.
     pub fn sculpt(&mut self, shape: &Shape, paint: &crate::sdf::Paint, style: Sculpt) {
         let scale = self.scale;
         // Grow the shape's own bounds by whatever the style reaches past the
@@ -778,6 +897,92 @@ impl Canvas {
                 }
                 let index = pixel_row + x as usize;
                 self.pixels[index] = blend_over(self.pixels[index], color, coverage);
+            }
+        }
+    }
+
+    /// Copies a BGRA picture into `dest`, one source pixel per device pixel.
+    ///
+    /// The bitmap primitive, and the only drawing here that does not come from
+    /// a distance field: a picture made somewhere else — a screen captured on
+    /// another machine, a decoded image — put on this surface. See [`Bgra`] for
+    /// the byte order and for why the alpha byte is skipped.
+    ///
+    /// # It does not scale, and that is the point
+    ///
+    /// One source pixel lands on one *device* pixel, anchored at `dest`'s
+    /// top-left and clipped to `dest`. A picture larger than `dest` is cropped
+    /// and a smaller one leaves the rest of `dest` as it was; neither is
+    /// resampled.
+    ///
+    /// Scaling would make this a filter rather than a copy — a weight computed
+    /// per pixel over millions of them, every frame, in software, which is
+    /// precisely the cost every other primitive here is shaped to avoid. It also
+    /// cannot be done well in one line: nearest-neighbour shimmers on a moving
+    /// picture and bilinear blurs text, and which of those is wrong depends on what the
+    /// picture *is*, which this cannot know. So the decision stays with whoever
+    /// has the picture: ask the far end for the size that fits, or resample
+    /// deliberately before handing it over.
+    ///
+    /// A caller that wants a *part* of a picture builds a [`Bgra`] over the
+    /// bytes from that offset with the same stride — which is why panning
+    /// around a screen larger than the pane needs nothing more here.
+    ///
+    /// # What it is careful about
+    ///
+    /// Three things, each of which is a way real pictures arrive and each of
+    /// which is a corrupt frame if it is got wrong: a `dest` that hangs off the
+    /// edge of the surface, a `dest` whose origin is *negative* — a viewport
+    /// scrolled up out of view — and a stride wider than the row.
+    pub fn blit_bgra(&mut self, dest: Rect, source: &Bgra<'_>) {
+        if source.is_empty() {
+            return;
+        }
+        let device = self.device_rect(dest);
+        // Rounded rather than truncated: truncation moves toward zero, so a
+        // viewport scrolled to a negative origin would jump half a pixel the
+        // moment it crossed the top-left corner of the window.
+        let left = device.min_x().round() as i32;
+        let top = device.min_y().round() as i32;
+        let (Some(right), Some(bottom)) =
+            (left.checked_add_unsigned(source.width()), top.checked_add_unsigned(source.height()))
+        else {
+            return;
+        };
+
+        let bounds = self
+            .clip
+            .intersect(self.device_bounds(dest))
+            .intersect(PixelBounds { left, top, right, bottom });
+        if bounds.is_empty() {
+            return;
+        }
+
+        for y in bounds.top..bounds.bottom {
+            // Every one of these is inside a rectangle already intersected with
+            // the picture's own extent, so none of them can be `None`; they are
+            // asked as questions rather than asserted because a slice index that
+            // is wrong is a panic and this crate aborts on one.
+            let Some(row) = source.row((y - top) as u32) else {
+                continue;
+            };
+            let first = ((bounds.left - left) as usize) * 4;
+            let last = ((bounds.right - left) as usize) * 4;
+            let Some(span) = row.get(first..last) else {
+                continue;
+            };
+            let start = (y as usize) * self.width as usize + bounds.left as usize;
+            let Some(target) = self.pixels.get_mut(start..start + span.len() / 4) else {
+                continue;
+            };
+            for (word, pixel) in target.iter_mut().zip(span.chunks_exact(4)) {
+                let Ok(bgra) = <[u8; 4]>::try_from(pixel) else {
+                    continue;
+                };
+                // B, G, R, A read little-endian is 0xAARRGGBB, which is the
+                // word this surface stores; the alpha is replaced rather than
+                // trusted.
+                *word = (u32::from_le_bytes(bgra) & 0x00ff_ffff) | 0xff00_0000;
             }
         }
     }
@@ -1214,7 +1419,7 @@ impl Canvas {
     /// The additive counterpart of [`Canvas::segment_shape`]. It keeps that
     /// scan's per-row narrowing to the strip the line crosses, but reads the
     /// distance field across the whole reach — core and halo alike — and
-    /// composites with [`blend_add`](crate::color::blend_add) so overlapping
+    /// composites with [`blend_add`] so overlapping
     /// beams brighten toward white instead of the later one hiding the earlier.
     fn segment_glow(&mut self, segment: &Segment, blur: f32, color: Color) {
         let reach = segment.half + blur + 1.0;
@@ -2077,6 +2282,166 @@ mod tests {
         assert_eq!(pixel_at(&canvas, 0, 0), Color::WHITE);
         assert_eq!(pixel_at(&canvas, 2, 2), Color::BLACK);
         assert_eq!(pixel_at(&canvas, 3, 0), Color::BLACK, "the mask wrapped onto the next row");
+    }
+
+    // ----- a picture from somewhere else -------------------------------------
+
+    /// One BGRA pixel, in the byte order a capture buffer holds it.
+    fn bgra(color: Color) -> [u8; 4] {
+        [color.b, color.g, color.r, 0xff]
+    }
+
+    /// A picture of `width` by `height` in one colour, with `padding` bytes of
+    /// whatever a capture API left at the end of each row.
+    fn picture(width: u32, height: u32, color: Color, padding: usize) -> (Vec<u8>, usize) {
+        let stride = width as usize * 4 + padding;
+        let mut bytes = Vec::with_capacity(stride * height as usize);
+        for _ in 0..height {
+            for _ in 0..width {
+                bytes.extend_from_slice(&bgra(color));
+            }
+            // Deliberately not zero: padding that happened to be black would
+            // let a blitter that copies it draw the right picture anyway.
+            bytes.extend(std::iter::repeat_n(0x7f, padding));
+        }
+        (bytes, stride)
+    }
+
+    #[test]
+    fn a_picture_lands_one_source_pixel_per_device_pixel() {
+        let mut canvas = blank(8, 8, 1.0);
+        let (bytes, stride) = picture(2, 2, Color::WHITE, 0);
+        let source = Bgra::new(2, 2, stride, &bytes).expect("the buffer describes the picture");
+        canvas.blit_bgra(Rect::new(3.0, 3.0, 2.0, 2.0), &source);
+
+        assert_eq!(pixel_at(&canvas, 3, 3), Color::WHITE);
+        assert_eq!(pixel_at(&canvas, 4, 4), Color::WHITE);
+        assert_eq!(pixel_at(&canvas, 5, 3), Color::BLACK, "right edge is exclusive");
+        assert_eq!(pixel_at(&canvas, 2, 3), Color::BLACK);
+    }
+
+    #[test]
+    fn a_picture_is_clipped_by_the_canvas_edge_rather_than_wrapping() {
+        // The failure this replaces is not a missing pixel: a blit that walked
+        // past the end of a row writes the next row's beginning, so a picture
+        // hanging off the right edge reappears down the left one.
+        let mut canvas = blank(4, 4, 1.0);
+        let (bytes, stride) = picture(4, 4, Color::WHITE, 0);
+        let source = Bgra::new(4, 4, stride, &bytes).expect("the buffer describes the picture");
+        canvas.blit_bgra(Rect::new(2.0, 2.0, 4.0, 4.0), &source);
+
+        assert_eq!(pixel_at(&canvas, 2, 2), Color::WHITE);
+        assert_eq!(pixel_at(&canvas, 3, 3), Color::WHITE);
+        assert_eq!(pixel_at(&canvas, 0, 3), Color::BLACK, "the picture wrapped onto the next row");
+        assert_eq!(pixel_at(&canvas, 1, 1), Color::BLACK, "nothing above or left of it");
+    }
+
+    #[test]
+    fn a_picture_at_a_negative_origin_shows_its_far_corner() {
+        // A viewport scrolled up and to the left: the first rows and columns are
+        // off the surface, and what is on it must be the *rest* of the picture
+        // rather than the whole of it moved into view.
+        let mut canvas = blank(4, 4, 1.0);
+        let mut bytes = Vec::new();
+        for y in 0u32..4 {
+            for x in 0u32..4 {
+                // Each pixel says where it came from, in its blue channel.
+                bytes.extend_from_slice(&[(y * 4 + x) as u8, 0, 0, 0xff]);
+            }
+        }
+        let source = Bgra::packed(4, 4, &bytes).expect("the buffer describes the picture");
+        canvas.blit_bgra(Rect::new(-2.0, -2.0, 4.0, 4.0), &source);
+
+        assert_eq!(pixel_at(&canvas, 0, 0).b, 2 * 4 + 2, "the pixel at (2, 2) of the picture");
+        assert_eq!(pixel_at(&canvas, 1, 0).b, 2 * 4 + 3);
+        assert_eq!(pixel_at(&canvas, 0, 1).b, 3 * 4 + 2);
+        assert_eq!(pixel_at(&canvas, 2, 2), Color::BLACK, "past the picture's own extent");
+    }
+
+    #[test]
+    fn a_row_wider_than_the_picture_does_not_skew_it() {
+        // What every real capture buffer looks like: Core Graphics pads each row
+        // out to a multiple of sixteen or sixty-four bytes. A blitter that
+        // assumed the rows were packed would shift each one further right than
+        // the last, which is a picture that leans.
+        let mut canvas = blank(8, 8, 1.0);
+        let (bytes, stride) = picture(3, 3, Color::WHITE, 20);
+        assert_eq!(stride, 32, "three pixels padded out to a multiple of sixteen");
+        let source = Bgra::new(3, 3, stride, &bytes).expect("the buffer describes the picture");
+        canvas.blit_bgra(Rect::new(0.0, 0.0, 3.0, 3.0), &source);
+
+        for y in 0..3 {
+            for x in 0..3 {
+                assert_eq!(pixel_at(&canvas, x, y), Color::WHITE, "({x}, {y}) came out wrong");
+            }
+        }
+        assert_eq!(pixel_at(&canvas, 3, 0), Color::BLACK, "the padding was drawn");
+    }
+
+    #[test]
+    fn a_picture_is_cropped_by_its_destination() {
+        // A remote screen larger than the pane showing it. The overflow must be
+        // dropped rather than drawn over whatever is beside the pane.
+        let mut canvas = blank(8, 8, 1.0);
+        let (bytes, stride) = picture(6, 6, Color::WHITE, 0);
+        let source = Bgra::new(6, 6, stride, &bytes).expect("the buffer describes the picture");
+        canvas.blit_bgra(Rect::new(1.0, 1.0, 3.0, 3.0), &source);
+
+        assert_eq!(pixel_at(&canvas, 3, 3), Color::WHITE);
+        assert_eq!(pixel_at(&canvas, 4, 3), Color::BLACK, "drawn outside its destination");
+        assert_eq!(pixel_at(&canvas, 3, 4), Color::BLACK);
+    }
+
+    #[test]
+    fn a_picture_obeys_the_clip_it_is_drawn_inside() {
+        let mut canvas = blank(8, 8, 1.0);
+        let previous = canvas.push_clip(Rect::new(0.0, 0.0, 4.0, 8.0));
+        let (bytes, stride) = picture(8, 8, Color::WHITE, 0);
+        let source = Bgra::new(8, 8, stride, &bytes).expect("the buffer describes the picture");
+        canvas.blit_bgra(Rect::new(0.0, 0.0, 8.0, 8.0), &source);
+        canvas.pop_clip(previous);
+
+        assert_eq!(pixel_at(&canvas, 3, 4), Color::WHITE);
+        assert_eq!(pixel_at(&canvas, 4, 4), Color::BLACK, "the clip was ignored");
+    }
+
+    #[test]
+    fn a_picture_is_opaque_however_the_capture_left_its_alpha() {
+        // macOS captures with `kCGImageAlphaNoneSkipFirst`: the byte is present
+        // and means nothing. Trusting it would blend a remote desktop against
+        // whatever this window was showing.
+        let mut canvas = blank(4, 4, 1.0);
+        let bytes = [0xff, 0xff, 0xff, 0x00];
+        let source = Bgra::packed(1, 1, &bytes).expect("the buffer describes the picture");
+        canvas.blit_bgra(Rect::new(0.0, 0.0, 1.0, 1.0), &source);
+        assert_eq!(pixel_at(&canvas, 0, 0), Color::WHITE);
+        assert_eq!(canvas.pixels()[0] >> 24, 0xff, "the surface stopped being opaque");
+    }
+
+    #[test]
+    fn a_picture_the_buffer_cannot_hold_is_refused_at_the_door() {
+        // A frame from a network is somebody else's arithmetic. The refusal is
+        // what keeps the blit itself free of a length it has to re-check.
+        let bytes = [0u8; 15];
+        assert_eq!(Bgra::packed(2, 2, &bytes), None, "sixteen bytes are needed");
+        assert_eq!(Bgra::new(4, 1, 8, &bytes), None, "a stride narrower than the row");
+        assert!(Bgra::new(2, 2, 8, &[0u8; 16]).is_some());
+        assert!(Bgra::packed(0, 0, &[]).is_some(), "an empty picture is describable");
+    }
+
+    #[test]
+    fn a_picture_at_a_retina_scale_still_lands_pixel_for_pixel() {
+        // Blitting is the one thing here that is not in logical units all the
+        // way down: a captured pixel is a *device* pixel, or a remote screen
+        // arrives at half its resolution on a Retina display.
+        let mut canvas = blank(8, 8, 2.0);
+        let (bytes, stride) = picture(4, 4, Color::WHITE, 0);
+        let source = Bgra::new(4, 4, stride, &bytes).expect("the buffer describes the picture");
+        canvas.blit_bgra(Rect::new(1.0, 1.0, 3.0, 3.0), &source);
+
+        assert_eq!(pixel_at(&canvas, 2, 2), Color::WHITE, "logical (1, 1) is device (2, 2)");
+        assert_eq!(pixel_at(&canvas, 5, 5), Color::WHITE, "four device pixels across");
+        assert_eq!(pixel_at(&canvas, 1, 1), Color::BLACK);
     }
 
     // ----- rings, arcs, and lines --------------------------------------------

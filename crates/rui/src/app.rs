@@ -54,6 +54,8 @@ use crate::paint::{self, Frame};
 use crate::shell::{self, Error, LoadedFonts, WindowOptions};
 use crate::text::{FontId, Fonts};
 use crate::theme::{Appearance, Theme};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::Duration;
 
 /// What running an application in a window amounts to.
@@ -86,6 +88,12 @@ pub struct App<S> {
     /// `None` for the library's own ground — the palette's vertical gradient —
     /// which is what nearly every application wants. See [`App::ground`].
     ground: Option<Ground>,
+    /// What another thread has asked the loop for.
+    ///
+    /// Always present, and free while nobody holds a clone: an unrequested
+    /// window reads two atomics per frame and waits exactly as it always did.
+    /// See [`Redraw`].
+    redraw: Redraw,
     /// What the last frame amounted to, for anything that cannot see it.
     access: AccessTree,
     /// How that differed from the frame before, which is what gets pushed.
@@ -120,6 +128,106 @@ type ThemeFor = Box<dyn Fn(Appearance, FontId, FontId) -> Theme>;
 /// *replaces* the library's clear rather than following it.
 type Ground = Box<dyn Fn(&mut Canvas, &Theme)>;
 
+/// A way to ask for a frame from a thread that is not drawing one.
+///
+/// Everything else in this library is driven by the person using it: a key, a
+/// click, an animation the interface itself started. This is for the case that
+/// is not — a picture arriving on a socket, a job finishing, a log line read on
+/// a worker thread. Without it, such a program shows its news at
+/// [`App::idle_timeout`]: four times a second by default, and twice a second in
+/// a console that lengthened the timeout to keep an idle window free.
+///
+/// It is [`Send`] and [`Sync`] and holds no part of the interface, so it can be
+/// cloned into any thread or task. Nothing it does can run application code,
+/// draw, or touch the state — it says *when*, and never *what*.
+///
+/// ```ignore
+/// let app = App::new("Console", state, view);
+/// let redraw = app.redraw();
+/// redraw.within(Duration::from_millis(16));      // while a stream is live
+/// std::thread::spawn(move || {
+///     while let Some(frame) = stream.next() {
+///         // ... put the frame where the view can see it ...
+///         redraw.request();
+///     }
+/// });
+/// app.run()
+/// ```
+///
+/// # Why it is a bound on latency and not a wake-up
+///
+/// A request does not interrupt the window: the loop is inside the platform's
+/// own event wait, and prising it out of there means one primitive per backend —
+/// a run-loop source, a posted message, a pipe an X connection selects on —
+/// which is three implementations of the hardest thing to test in the library
+/// for a saving of at most one wait.
+///
+/// So instead a request *shortens* the wait: [`Redraw::within`] says how long a
+/// frame may be left waiting, and the loop asks the platform for input for no
+/// longer than that. A live stream sets it to a frame's worth of time and gets
+/// frames at that pace; nothing else pays anything, because a window with no
+/// handle in another thread never lowers the bound and waits exactly as it did.
+/// The trade is stated here rather than hidden: this buys bounded latency, not
+/// zero latency, and it is the [`Backend`](crate::shell) seam staying at the
+/// size it is.
+#[derive(Debug, Clone)]
+pub struct Redraw(Arc<Pending>);
+
+/// What a [`Redraw`] and the loop share.
+#[derive(Debug, Default)]
+struct Pending {
+    /// Whether a frame has been asked for since the last one was drawn.
+    wanted: AtomicBool,
+    /// The longest a request may be left waiting, in milliseconds.
+    ///
+    /// Zero — the state a window starts in and returns to — means the loop
+    /// waits [`App::idle_timeout`] as it always did.
+    latency: AtomicU32,
+}
+
+impl Redraw {
+    /// Asks for a frame to be drawn.
+    ///
+    /// Cheap enough to call per arriving item and idempotent: ten requests
+    /// between two frames are one frame, because what is being asked for is
+    /// that the screen catch up with the state, not that a frame happen ten
+    /// times. Ordering is `Release`/`Acquire` against the loop's own read, so
+    /// whatever was written before the request is visible to the frame that
+    /// answers it.
+    pub fn request(&self) {
+        self.0.wanted.store(true, Ordering::Release);
+    }
+
+    /// How long a request may be left waiting before the loop answers it.
+    ///
+    /// The pace at which the interface can keep up with something arriving from
+    /// outside: sixteen milliseconds for a video-rate stream, a second for a
+    /// log. It is a ceiling and not a frame rate — nothing is drawn unless a
+    /// request or an event asks for it.
+    ///
+    /// [`Duration::ZERO`] puts the window back to sleep, and is what to call
+    /// when whatever was arriving has stopped. Leaving a short bound set with
+    /// nothing to draw does not spin — an unrequested wake draws nothing — but
+    /// it does wake a sleeping laptop's core sixty times a second for no reason.
+    pub fn within(&self, latency: Duration) {
+        let bounded = latency.as_millis().try_into().unwrap_or(u32::MAX);
+        self.0.latency.store(bounded, Ordering::Release);
+    }
+
+    /// Whether a frame has been asked for, clearing the request.
+    fn take(&self) -> bool {
+        self.0.wanted.swap(false, Ordering::Acquire)
+    }
+
+    /// The longest the loop may wait, or `None` for as long as it likes.
+    fn bound(&self) -> Option<Duration> {
+        match self.0.latency.load(Ordering::Acquire) {
+            0 => None,
+            milliseconds => Some(Duration::from_millis(u64::from(milliseconds))),
+        }
+    }
+}
+
 /// How long the loop waits for input before drawing again anyway.
 ///
 /// A quarter of a second by default: enough that an interface showing something
@@ -143,6 +251,7 @@ impl<S> App<S> {
             running: Box::new(|_| true),
             theme: Box::new(Theme::new),
             ground: None,
+            redraw: Redraw(Arc::new(Pending::default())),
             access: AccessTree::new(),
             access_update: AccessUpdate::default(),
             #[cfg(feature = "reload")]
@@ -322,6 +431,18 @@ impl<S> App<S> {
         &self.state
     }
 
+    /// The same, to be changed by whoever holds the application.
+    ///
+    /// The interface changes its own state through handlers, and that is what
+    /// nearly everything should use. This is for the case a handler cannot
+    /// reach: something that arrived from outside — a frame off a socket, a job
+    /// that finished — put into the state by whoever owns the application
+    /// before the next frame is drawn. Pair it with [`Redraw::request`] so the
+    /// screen catches up without waiting for the idle timeout.
+    pub fn state_mut(&mut self) -> &mut S {
+        &mut self.state
+    }
+
     /// What the last frame amounted to, for anything that cannot see it.
     ///
     /// Built from the description that was just drawn, so it cannot disagree
@@ -477,9 +598,43 @@ impl<S> App<S> {
         }
     }
 
-    /// How long the loop may wait before drawing again.
+    /// A handle another thread can ask for a frame with.
+    ///
+    /// Taken before [`App::run`] and cloned into whatever produces news from
+    /// outside the interface. See [`Redraw`] for what it does and does not
+    /// promise.
+    pub fn redraw(&self) -> Redraw {
+        self.redraw.clone()
+    }
+
+    /// How long the loop may go without drawing at all.
+    ///
+    /// The application's own [`App::idle_timeout`], and deliberately not the
+    /// shortened wait below: the timeout is how stale the screen may get, which
+    /// is the application's decision, while the wait is only how long the loop
+    /// may sleep at a stretch.
     pub(crate) fn idle(&self) -> Duration {
         self.idle
+    }
+
+    /// How long the loop may wait for input in one go.
+    ///
+    /// Whichever is shorter: the idle timeout, or the latency another thread
+    /// asked [`Redraw::within`] for. A window nobody has asked anything of
+    /// waits exactly the timeout, as it always did.
+    pub(crate) fn wait(&self) -> Duration {
+        match self.redraw.bound() {
+            Some(bound) => self.idle.min(bound),
+            None => self.idle,
+        }
+    }
+
+    /// Whether another thread has asked for a frame, clearing the request.
+    ///
+    /// Asked once per turn of the loop, by the loop, which is what makes
+    /// "ten requests are one frame" true.
+    pub(crate) fn take_redraw_request(&self) -> bool {
+        self.redraw.take()
     }
 
     /// Whether the loop should keep going.
@@ -522,4 +677,89 @@ pub fn run<S: 'static>(
     view: impl Fn(&S) -> El<S> + 'static,
 ) -> Result<(), Error> {
     App::new(title, state, view).run()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::widgets::text;
+
+    /// An application with nothing in it, for exercising the loop's decisions.
+    fn quiet() -> App<()> {
+        App::new("test", (), |_: &()| text("still"))
+    }
+
+    #[test]
+    fn a_window_nobody_has_asked_anything_of_waits_exactly_its_timeout() {
+        // The whole promise of the redraw handle costing nothing: an
+        // application that never takes one behaves as it did before there was
+        // one to take.
+        let app = quiet().idle_timeout(Duration::from_millis(500));
+        assert_eq!(app.wait(), Duration::from_millis(500));
+        assert!(!app.take_redraw_request());
+    }
+
+    #[test]
+    fn a_shorter_latency_shortens_the_wait_without_shortening_the_timeout() {
+        // Two different questions: how long the loop may sleep at a stretch, and
+        // how stale the screen may get. Confusing them would make a live stream
+        // redraw the whole interface at the stream's pace whether or not a frame
+        // had arrived.
+        let app = quiet().idle_timeout(Duration::from_millis(500));
+        let redraw = app.redraw();
+
+        redraw.within(Duration::from_millis(16));
+        assert_eq!(app.wait(), Duration::from_millis(16));
+        assert_eq!(app.idle(), Duration::from_millis(500), "the timeout is the application's");
+
+        redraw.within(Duration::ZERO);
+        assert_eq!(app.wait(), Duration::from_millis(500), "the window went back to sleep");
+    }
+
+    #[test]
+    fn a_latency_longer_than_the_timeout_does_not_slow_the_window_down() {
+        let app = quiet().idle_timeout(Duration::from_millis(250));
+        app.redraw().within(Duration::from_secs(10));
+        assert_eq!(app.wait(), Duration::from_millis(250));
+    }
+
+    #[test]
+    fn many_requests_between_two_frames_are_one_frame() {
+        // What makes it safe to call per arriving item: the loop asks once a
+        // turn, and what is being asked for is that the screen catch up.
+        let app = quiet();
+        let redraw = app.redraw();
+
+        redraw.request();
+        redraw.request();
+        redraw.request();
+        assert!(app.take_redraw_request());
+        assert!(!app.take_redraw_request(), "the request outlived the frame that answered it");
+    }
+
+    #[test]
+    fn a_request_can_be_made_from_another_thread() {
+        // The reason the type exists. `App` is not `Send` and never will be —
+        // the handle is, and carries nothing of the interface with it.
+        let app = quiet();
+        let redraw = app.redraw();
+        let worker = std::thread::spawn(move || {
+            redraw.within(Duration::from_millis(16));
+            redraw.request();
+        });
+        worker.join().expect("the worker thread panicked");
+
+        assert!(app.take_redraw_request());
+        assert_eq!(app.wait(), Duration::from_millis(16));
+    }
+
+    #[test]
+    fn an_absurd_latency_is_carried_rather_than_wrapping_round() {
+        // A duration in years does not become a millisecond. It is clamped at
+        // the widest bound the counter holds, which is longer than any timeout
+        // an application would set and so has no effect on the wait.
+        let app = quiet().idle_timeout(Duration::from_millis(250));
+        app.redraw().within(Duration::from_secs(60 * 60 * 24 * 365));
+        assert_eq!(app.wait(), Duration::from_millis(250));
+    }
 }

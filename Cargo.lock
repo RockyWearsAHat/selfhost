@@ -271,6 +271,7 @@ dependencies = [
  "selfhost-http",
  "selfhost-identity",
  "selfhost-json",
+ "selfhost-mesh",
  "selfhost-storage",
  "selfhost-supervisor",
  "selfhost-ws",
@@ -301,6 +302,7 @@ dependencies = [
  "selfhost-git",
  "selfhost-http",
  "selfhost-identity",
+ "selfhost-json",
  "selfhost-mail",
  "selfhost-mesh",
  "selfhost-proxy",
@@ -326,12 +328,16 @@ dependencies = [
 name = "selfhost-console"
 version = "0.1.0"
 dependencies = [
+ "ring",
  "rui",
  "selfhost-config",
+ "selfhost-desk",
  "selfhost-firewall",
  "selfhost-http",
  "selfhost-json",
+ "selfhost-screen",
  "selfhost-supervisor",
+ "selfhost-ws",
 ]
 
 [[package]]
@@ -456,6 +462,7 @@ version = "0.1.0"
 dependencies = [
  "ring",
  "selfhost-config",
+ "selfhost-dns",
  "selfhost-http",
  "selfhost-identity",
  "selfhost-json",

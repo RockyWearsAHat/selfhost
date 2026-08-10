@@ -26,8 +26,12 @@
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
+mod channel;
 mod client;
+mod nas;
 mod poller;
+mod registry;
+mod remote;
 mod state;
 mod tunnel;
 mod view;
@@ -79,14 +83,17 @@ fn start() -> Result<(), String> {
     // would mean a console opened before its daemon exits instead of opening —
     // which from the Dock looks like an application that does nothing at all.
     let token_path = options.token_path.clone();
-    let connect = move || -> Result<Client, String> {
+    // Shared rather than owned by the poller alone: the desktop stream opens
+    // its own socket and needs the same credential, and reading the token in
+    // two places would be two things to keep in step.
+    let connect: view::Connector = Arc::new(move || -> Result<Client, String> {
         let token = match (&remote_token, &token_path) {
             (Some(token), _) => token.clone(),
             (None, Some(path)) => read_token(path)?,
             (None, None) => find_token()?,
         };
         Client::new(address, token)
-    };
+    });
 
     let shared = Arc::new(Mutex::new(Snapshot::default()));
     let running = Arc::new(AtomicBool::new(true));
@@ -95,14 +102,17 @@ fn start() -> Result<(), String> {
         .ssh
         .clone()
         .map(|spec| tunnel::spawn(spec, Arc::clone(&shared), Arc::clone(&running)));
-    let poller = poller::spawn(connect, Arc::clone(&shared), Arc::clone(&running));
+    let for_poller = Arc::clone(&connect);
+    let poller =
+        poller::spawn(move || for_poller(), Arc::clone(&shared), Arc::clone(&running));
 
     let via = options.ssh.as_ref().map(|spec| spec.destination.clone());
     let title = match &via {
         Some(destination) => format!("selfhost — {destination}"),
         None => format!("selfhost — {address}"),
     };
-    let console = Console::new(Arc::clone(&shared), Arc::clone(&running), address, via);
+    let console =
+        Console::new(Arc::clone(&shared), Arc::clone(&running), address, via).reaching(connect);
     let outcome = console.run(title).map_err(|error| error.to_string());
 
     // Told to stop, then waited for: a command may be half-written on a socket,

@@ -9,10 +9,14 @@
 //! [`Snapshot::services`] while drawing. A cached summary is a second copy of
 //! the truth, and the first thing it does is disagree with the first copy.
 
+use crate::nas::{Column, Listing, Share};
+use crate::registry::{Person, Trail};
+use crate::remote::{Agent, Node, Settings};
 use selfhost_config::ServiceSpec;
 use selfhost_firewall::FirewallState;
 use selfhost_supervisor::state::ServiceStatus;
 use std::collections::VecDeque;
+use std::path::PathBuf;
 
 /// How many log lines the console keeps for the service being watched.
 ///
@@ -130,6 +134,62 @@ impl Logs {
     }
 }
 
+/// One file operation the operator asked for on a share.
+///
+/// Held apart from [`Command`]'s service actions because they answer a different
+/// question — [`Command::service`] names the service a lifecycle action is
+/// about, and none of these is about a service at all. Folding them into the
+/// same variants would make that accessor lie.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FileAction {
+    /// Make one directory, never a tree.
+    ///
+    /// One and not a tree because the daemon's `mkdir` is one, and because
+    /// WebDAV's `MKCOL` must answer `409` for a missing parent — the two
+    /// protocols must not disagree about what the same button does.
+    Mkdir {
+        /// Where it goes, as a plain share-relative path.
+        path: String,
+    },
+    /// Move or rename one name to another, inside the same share.
+    Rename {
+        /// The name as it is.
+        from: String,
+        /// The name it becomes.
+        to: String,
+    },
+    /// Remove one name, depth-infinity for a directory.
+    Delete {
+        /// What to remove.
+        path: String,
+    },
+    /// Copy one file out of the share onto this machine.
+    Download {
+        /// What to fetch.
+        path: String,
+        /// Where to write it.
+        to: PathBuf,
+    },
+    /// Copy one file from this machine into the share.
+    Upload {
+        /// What to read.
+        from: PathBuf,
+        /// Where it lands, as a plain share-relative path.
+        path: String,
+    },
+}
+
+impl FileAction {
+    /// The path inside the share this acts on, for the message that reports it.
+    fn subject(&self) -> &str {
+        match self {
+            Self::Mkdir { path } | Self::Delete { path } | Self::Download { path, .. } => path,
+            Self::Rename { from, .. } => from,
+            Self::Upload { path, .. } => path,
+        }
+    }
+}
+
 /// Something the operator asked for that the poller has to carry out.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Command {
@@ -143,16 +203,41 @@ pub enum Command {
     Uninstall(String),
     /// Install or replace a service.
     Install(Box<ServiceSpec>),
+    /// Act on one name inside one share.
+    Files {
+        /// Which share.
+        share: String,
+        /// What to do in it.
+        action: FileAction,
+    },
+    /// Take away one person's credential.
+    ///
+    /// The one thing the PEOPLE plate can change. Registering is a browser
+    /// ceremony this program cannot perform; revoking is not, and an owner who
+    /// has lost a device needs the shortest path to it.
+    RevokePasskey {
+        /// The credential's id.
+        id: String,
+        /// Whose it is, so the notice can say a name rather than a base64 blob.
+        user: String,
+    },
 }
 
 impl Command {
-    /// The service this command is about.
+    /// The service this command is about, or the empty name for one that is
+    /// about no service.
+    ///
+    /// The empty string rather than an `Option` because every caller of this is
+    /// asking "is the rail's row for `name` waiting on something", and the empty
+    /// name matches no service — so a file action or a revocation is invisible
+    /// to the rail without every call site growing a `match`.
     pub fn service(&self) -> &str {
         match self {
             Self::Start(name) | Self::Stop(name) | Self::Restart(name) | Self::Uninstall(name) => {
                 name
             }
             Self::Install(spec) => &spec.name,
+            Self::Files { .. } | Self::RevokePasskey { .. } => "",
         }
     }
 
@@ -167,6 +252,12 @@ impl Command {
             Self::Restart(_) => "restart requested…",
             Self::Uninstall(_) => "uninstall requested…",
             Self::Install(_) => "install requested…",
+            Self::Files { action: FileAction::Mkdir { .. }, .. } => "creating the folder…",
+            Self::Files { action: FileAction::Rename { .. }, .. } => "renaming…",
+            Self::Files { action: FileAction::Delete { .. }, .. } => "deleting…",
+            Self::Files { action: FileAction::Download { .. }, .. } => "downloading…",
+            Self::Files { action: FileAction::Upload { .. }, .. } => "uploading…",
+            Self::RevokePasskey { .. } => "revoking…",
         }
     }
 
@@ -179,8 +270,197 @@ impl Command {
             Self::Restart(_) => format!("Restarting {name}"),
             Self::Uninstall(_) => format!("Uninstalled {name}"),
             Self::Install(_) => format!("Installed {name}"),
+            Self::Files { share, action } => {
+                let subject = action.subject();
+                // The share is named as well as the path, because the plate can
+                // be showing a different share by the time the notice lands.
+                match action {
+                    FileAction::Mkdir { .. } => format!("Created {share}/{subject}"),
+                    FileAction::Rename { to, .. } => format!("Renamed {subject} to {to}"),
+                    FileAction::Delete { .. } => format!("Deleted {share}/{subject}"),
+                    FileAction::Download { to, .. } => format!("Saved to {}", to.display()),
+                    FileAction::Upload { .. } => format!("Uploaded {share}/{subject}"),
+                }
+            }
+            Self::RevokePasskey { user, .. } => format!("Revoked a passkey held by {user}"),
         }
     }
+}
+
+/// Which of the console's four screens is open.
+///
+/// # Why the poller reads this
+///
+/// It looks like interface state, and it is — but it is also the one fact that
+/// decides *what the daemon is asked for*. A console that fetched the audit
+/// tail, every share's usage and every node's agent report on every poll would
+/// be doing four times the work to draw one screen, and three quarters of it
+/// for a plate nobody has open. This is the same argument the exposure map
+/// makes about costing the log nothing: a panel that is not being read should
+/// not be paid for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Screen {
+    /// The rail of services and one service in detail.
+    #[default]
+    Services,
+    /// The shares, one directory at a time.
+    Files,
+    /// The peer picker, the session, and the viewport.
+    Desktop,
+    /// The identity registry and the audit tail.
+    People,
+}
+
+impl Screen {
+    /// The screens, in the order the tabs draw them.
+    pub const ALL: [Screen; 4] = [Self::Services, Self::Files, Self::Desktop, Self::People];
+
+    /// The word on the tab.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Services => "SERVICES",
+            Self::Files => "FILES",
+            Self::Desktop => "DESKTOP",
+            Self::People => "PEOPLE",
+        }
+    }
+}
+
+/// Where the FILES plate is looking, and what it found.
+///
+/// Held in the snapshot rather than beside the form on the console, because the
+/// poller is what fetches a listing and it has to know which directory of which
+/// share is being read. The alternative — the interface asking for a listing
+/// through the command queue — would make browsing a *command*, and a browse
+/// that failed would then be indistinguishable from a delete that failed.
+#[derive(Debug)]
+pub struct Files {
+    /// Every share this caller may open, or `None` until first fetched.
+    ///
+    /// `None` means "not answered yet" and `Some(vec![])` means "none of them
+    /// are yours", which are different sentences — see
+    /// [`crate::nas::shares_note`].
+    pub shares: Option<Vec<Share>>,
+    /// Which share is open, if any.
+    pub share: Option<String>,
+    /// The directory inside it, as a plain path; the root is empty.
+    pub path: String,
+    /// What that directory holds, once it has been read.
+    pub listing: Option<Listing>,
+    /// Why the last listing failed, in the daemon's own words.
+    ///
+    /// Kept beside the listing rather than replacing it: a refused refresh
+    /// leaves the last good directory on screen with the reason above it, which
+    /// is more use than a blank pane.
+    pub trouble: Option<String>,
+    /// Which column the rows are ordered by.
+    pub column: Column,
+    /// Whether that order runs up or down.
+    pub ascending: bool,
+    /// Which row is chosen, by name.
+    ///
+    /// By name and not by index, for the reason [`Snapshot::selected_service`]
+    /// resolves a service by name: a directory can change between two frames and
+    /// an index would then point at a different file entirely.
+    pub selected: Option<String>,
+}
+
+impl Default for Files {
+    /// A plate that has read nothing, ordered by name, smallest first.
+    ///
+    /// Written out rather than derived because exactly one field's derived
+    /// default is wrong: `ascending` would be `false`, and a file browser that
+    /// opened on Z-to-A is a file browser that looks broken. The rest are the
+    /// honest empties.
+    fn default() -> Self {
+        Self {
+            shares: None,
+            share: None,
+            path: String::new(),
+            listing: None,
+            trouble: None,
+            column: Column::Name,
+            ascending: true,
+            selected: None,
+        }
+    }
+}
+
+impl Files {
+    /// The share currently open, if it is still one this caller may see.
+    pub fn share(&self) -> Option<&Share> {
+        let id = self.share.as_deref()?;
+        self.shares.as_ref()?.iter().find(|share| share.id == id)
+    }
+
+    /// The listing to draw, which is `None` while one for a different place is
+    /// still the last thing that arrived.
+    ///
+    /// The guard that stops a reply that lost a race being drawn under the wrong
+    /// heading — the same argument [`crate::poller`] makes about a log fetch.
+    pub fn listing(&self) -> Option<&Listing> {
+        let listing = self.listing.as_ref()?;
+        (Some(listing.share.as_str()) == self.share.as_deref() && listing.path == self.path)
+            .then_some(listing)
+    }
+
+    /// Opens a share at its root.
+    pub fn open(&mut self, share: &str) {
+        self.share = Some(share.to_owned());
+        self.go(String::new());
+    }
+
+    /// Walks to a directory inside the open share.
+    pub fn go(&mut self, path: String) {
+        self.path = path;
+        self.selected = None;
+        self.trouble = None;
+    }
+}
+
+/// What the DESKTOP plate knows about the deployment and the fleet.
+///
+/// The *stream* is not here. Pixels arrive on their own thread at up to thirty
+/// frames a second, and putting them behind the lock the whole interface reads
+/// through would make every other plate wait on a screen — see
+/// [`crate::channel`], which owns the picture and publishes it separately.
+#[derive(Debug, Default)]
+pub struct Desk {
+    /// The operator's switches, or `None` when this deployment serves no
+    /// desktop — which is the ordinary case and is drawn as a sentence.
+    pub settings: Option<Settings>,
+    /// The machines this caller may watch, or `None` until first fetched.
+    pub nodes: Option<Vec<Node>>,
+    /// Which machine the plate is pointed at.
+    pub peer: Option<String>,
+    /// What the capture agent on that machine is doing.
+    pub agent: Option<Agent>,
+}
+
+impl Desk {
+    /// The machine the plate is pointed at, if it is still one that is offered.
+    pub fn peer(&self) -> Option<&Node> {
+        let name = self.peer.as_deref()?;
+        self.nodes.as_ref()?.iter().find(|node| node.node == name)
+    }
+}
+
+/// Who holds authority on this box, and what it has been used for.
+#[derive(Debug, Default)]
+pub struct People {
+    /// Everyone who holds a credential, or `None` until first fetched.
+    pub holders: Option<Vec<Person>>,
+    /// Why the registry could not be read — on a deployment where this
+    /// console's credential is not the owner, both halves answer `401`.
+    pub trouble: Option<String>,
+    /// The tail of the control-action record.
+    pub trail: Option<Trail>,
+    /// Whether the pointer's own records are hidden.
+    ///
+    /// Defaults to hidden: a desktop session writes one record per authorised
+    /// pointer move, and a trail that opens on ten thousand of them is a trail
+    /// in which the one keystroke that matters cannot be found.
+    pub hide_pointer_noise: bool,
 }
 
 /// Everything both threads can see.
@@ -211,6 +491,14 @@ pub struct Snapshot {
     /// polled yet" from "the daemon reports no managed firewall" and draw neither
     /// as the other.
     pub firewall: Option<FirewallState>,
+    /// Which screen is open, and so what the poller fetches.
+    pub screen: Screen,
+    /// Where the FILES plate is looking, and what it found.
+    pub files: Files,
+    /// What the DESKTOP plate knows about the deployment and the fleet.
+    pub desk: Desk,
+    /// Who holds authority here, and what it has been used for.
+    pub people: People,
     /// Commands the interface has asked for and the poller has not run yet.
     pub commands: VecDeque<Command>,
 }
