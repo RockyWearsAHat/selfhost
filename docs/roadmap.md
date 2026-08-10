@@ -41,8 +41,9 @@ build step, and started — with every step reported in the service's own output
 
 Worth stating plainly rather than leaving to be discovered: IMAP here is
 deliberately narrower than the ambition once written below. There is no
-`BODYSTRUCTURE`, no server-side `SEARCH`, no `APPEND`, and no `IDLE` — a
-command literal (`{n}` continuation) is not parsed at all. What exists is
+server-side `SEARCH`, no `APPEND`, and no `IDLE`. Command literals (`{n}` and
+RFC 7888 `{n+}`) *are* parsed — Apple Mail sends `LOGIN` credentials only that
+way, so account setup is impossible without them. What exists is
 enough for a normal client to `LOGIN`, `LIST`/`SELECT` the fixed folder set,
 `FETCH`, and `STORE` flags — reading mail that already arrived, not the full
 RFC 3501/9051 surface. `\Recent` is always reported as `0`: this store's
