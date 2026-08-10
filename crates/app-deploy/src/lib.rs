@@ -206,6 +206,8 @@ impl AppSpec {
             instances: vec![Instance { node: self.node.clone(), port: self.port }],
             health: self.health.clone(),
             canonical_redirect: self.canonical_redirect,
+            allowed_cidrs: Vec::new(),
+            console: false,
         }
     }
 

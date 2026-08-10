@@ -4,15 +4,24 @@
 //! every way of getting authorisation wrong — is exercised without binding a
 //! port. The socket layer is tested separately in `wire.rs`.
 
-use selfhost_admin::{Api, Store, Token};
+use selfhost_admin::{Api, ConsolePassword, Sessions, Store, Token};
 use selfhost_http::{Body, Request, Response};
 use selfhost_json::Json;
 use selfhost_supervisor::Supervisor;
 
 const TOKEN: &str = "0123456789abcdef";
 
+/// The console password every session test logs in with.
+const PASSWORD: &str = "hunter2";
+
 /// An API over a scratch directory, plus the directory that cleans it up.
 fn api(name: &str) -> (Api, ScratchDir) {
+    let (api, _watches, dir) = api_with_watches(name);
+    (api, dir)
+}
+
+/// The same, keeping hold of the watch set so a test can see what it follows.
+fn api_with_watches(name: &str) -> (Api, selfhost_git::Watches, ScratchDir) {
     let dir = ScratchDir::new(name);
     let token = write_token(dir.path(), TOKEN);
     let watches = selfhost_git::Watches::default();
@@ -77,11 +86,37 @@ fn write_token(dir: &std::path::Path, value: &str) -> Token {
     Token::load_or_create(dir).expect("loads the token we just wrote")
 }
 
+/// The same API, with console login enabled over a known password.
+///
+/// Sessions are injectable so the expiry test can use lifetimes measured in
+/// nothing rather than hours; every other test passes `Sessions::new()`.
+fn console_api(name: &str, sessions: Sessions) -> (Api, ScratchDir) {
+    let (api, dir) = api(name);
+    ConsolePassword::write(dir.path(), PASSWORD).expect("password written");
+    let api = api.with_console_auth_parts(ConsolePassword::load(dir.path()), sessions);
+    (api, dir)
+}
+
 /// Builds a request, parsing it the same way the server would.
 fn request(method: &str, target: &str, auth: Option<&str>, body: &str) -> (Request, Vec<u8>) {
+    request_with(method, target, auth, &[], body)
+}
+
+/// The same, with arbitrary extra headers — how a test presents a cookie or
+/// the CSRF header.
+fn request_with(
+    method: &str,
+    target: &str,
+    auth: Option<&str>,
+    headers: &[(&str, &str)],
+    body: &str,
+) -> (Request, Vec<u8>) {
     let mut text = format!("{method} {target} HTTP/1.1\r\nHost: 127.0.0.1\r\n");
     if let Some(token) = auth {
         text.push_str(&format!("Authorization: Bearer {token}\r\n"));
+    }
+    for (name, value) in headers {
+        text.push_str(&format!("{name}: {value}\r\n"));
     }
     if !body.is_empty() {
         text.push_str(&format!("Content-Length: {}\r\n", body.len()));
@@ -106,6 +141,31 @@ async fn call(
     let (request, body) = request(method, target, auth, body);
     let response = api.handle(&request, &body).await;
     (response.status.code(), body_json(&response))
+}
+
+/// Sends a request with extra headers, returning the full response.
+///
+/// Returns the [`Response`] rather than the digested pair because the session
+/// tests assert on the `Set-Cookie` header, not just the body.
+async fn call_with(api: &Api, method: &str, target: &str, headers: &[(&str, &str)], body: &str) -> Response {
+    let (request, body) = request_with(method, target, None, headers, body);
+    api.handle(&request, &body).await
+}
+
+/// Logs in and returns the session cookie's `name=value` pair.
+async fn login(api: &Api) -> String {
+    let response =
+        call_with(api, "POST", "/api/session", &[("X-Selfhost-Console", "1")], &format!(r#"{{"password":"{PASSWORD}"}}"#)).await;
+    assert_eq!(response.status.code(), 200, "login should succeed: {:?}", body_json(&response));
+    session_cookie_pair(&response)
+}
+
+/// Extracts `selfhost_session=<id>` from a response's `Set-Cookie` header.
+fn session_cookie_pair(response: &Response) -> String {
+    let header = response.headers.get_str("set-cookie").expect("a Set-Cookie header");
+    let pair = header.split(';').next().expect("cookie pair").trim();
+    assert!(pair.starts_with("selfhost_session="), "unexpected cookie: {header}");
+    pair.to_owned()
 }
 
 fn body_json(response: &Response) -> Json {
@@ -152,9 +212,48 @@ async fn every_real_endpoint_refuses_an_unauthenticated_caller() {
         ("DELETE", "/api/services/x"),
         ("GET", "/api/services/x/logs"),
         ("POST", "/api/services/x/start"),
+        ("POST", "/api/services/x/deploy"),
+        // The firewall reveals the deployment's open ports, so it too is behind
+        // the token wall — only /api/health is unauthenticated.
+        ("GET", "/api/firewall"),
+        ("POST", "/api/firewall/reconcile"),
+        // The session probe: POST and DELETE /api/session are deliberately
+        // reachable without credentials (logging in is how credentials are
+        // *obtained*), but the GET probe is a refusal like any other.
+        ("GET", "/api/session"),
     ] {
         let (status, _) = call(&api, method, target, None, "").await;
         assert_eq!(status, 401, "{method} {target} should require a token");
+    }
+}
+
+#[tokio::test]
+async fn firewall_state_is_reported_as_json() {
+    let (api, _dir) = api("firewall-state");
+    let (status, body) = send(&api, "GET", "/api/firewall", "").await;
+    assert_eq!(status, 200);
+    // The scratch config leaves `manage` off, so the daemon governs nothing and
+    // says so rather than erroring.
+    assert_eq!(body.get("managed").and_then(Json::as_bool), Some(false));
+    assert!(body.get("backend").and_then(Json::as_str).is_some(), "{body:?}");
+    assert!(body.get("rules").and_then(Json::as_array).is_some(), "{body:?}");
+}
+
+#[tokio::test]
+async fn firewall_reconcile_is_wired_and_answers_in_json() {
+    let (api, _dir) = api("firewall-reconcile");
+    // Route is wired (not a 404) and returns JSON. Whether the host firewall can
+    // actually be driven is the backend's concern and machine-dependent, so this
+    // asserts the daemon-admin contract only: reconcile either succeeds (200) or
+    // reports why it could not (500) — never a silent 404.
+    let (status, body) = send(&api, "POST", "/api/firewall/reconcile", "").await;
+    assert_ne!(status, 404, "the reconcile route must be wired");
+    assert!(
+        status == 200 || status == 500,
+        "reconcile answers 200 or a 500 with a reason, got {status}: {body:?}"
+    );
+    if status == 500 {
+        assert!(body.get("error").and_then(Json::as_str).is_some(), "{body:?}");
     }
 }
 
@@ -332,6 +431,7 @@ async fn acting_on_a_service_that_does_not_exist_is_a_404_not_a_silent_success()
         ("DELETE", "/api/services/ghost"),
         ("GET", "/api/services/ghost/logs"),
         ("POST", "/api/services/ghost/start"),
+        ("POST", "/api/services/ghost/deploy"),
     ] {
         let (status, _) = send(&api, method, target, "").await;
         assert_eq!(status, 404, "{method} {target}");
@@ -345,6 +445,252 @@ async fn an_unknown_endpoint_is_a_404() {
     assert_eq!(status, 404);
     let (status, _) = send(&api, "POST", "/api/services/x/detonate", "").await;
     assert_eq!(status, 404);
+}
+
+#[tokio::test]
+async fn installing_a_watched_service_starts_watching_it_there_and_then() {
+    // Not at the next daemon restart: a service installed from the console that
+    // is not polled until somebody reboots the daemon looks exactly like one
+    // whose branch nobody has pushed to.
+    let (api, watches, _dir) = api_with_watches("install-watch");
+    let (status, _) = send(&api, "PUT", "/api/services/site", &watched_body("site", 60)).await;
+    assert_eq!(status, 200);
+    assert_eq!(watches.count().await, 1);
+
+    let (status, _) = send(&api, "DELETE", "/api/services/site", "").await;
+    assert_eq!(status, 200);
+    assert_eq!(watches.count().await, 0, "a watch must not outlive its service");
+}
+
+#[tokio::test]
+async fn a_service_whose_watch_is_invalid_is_refused_with_the_offending_field() {
+    let (api, watches, _dir) = api_with_watches("bad-watch");
+    let (status, body) = send(&api, "PUT", "/api/services/site", &watched_body("site", 1)).await;
+    assert_eq!(status, 422);
+
+    let problems = body.get("problems").and_then(Json::as_array).expect("problems").to_vec();
+    assert!(
+        problems
+            .iter()
+            .any(|p| p.get("field").and_then(Json::as_str) == Some("service.git.interval_secs")),
+        "{problems:?}"
+    );
+    assert_eq!(watches.count().await, 0, "a refused service must not be watched");
+}
+
+#[tokio::test]
+async fn a_repository_url_that_would_run_a_command_is_refused_by_the_api() {
+    let (api, _watches, _dir) = api_with_watches("evil-watch");
+    let body = Json::object([
+        ("name", Json::string("site")),
+        ("program", Json::string("/bin/true")),
+        (
+            "git",
+            Json::object([
+                ("repository", Json::string("ext::sh -c 'id > /tmp/pwned'")),
+                ("path", Json::string("checkouts/site")),
+            ]),
+        ),
+    ])
+    .to_text();
+
+    let (status, _) = send(&api, "PUT", "/api/services/site", &body).await;
+    assert_eq!(status, 422, "git's ext:: transport runs its argument as a command");
+}
+
+#[tokio::test]
+async fn deploying_a_service_with_no_git_watch_is_a_404() {
+    let (api, _dir) = api("deploy-no-watch");
+    send(&api, "PUT", "/api/services/app", &long_running_body("app")).await;
+
+    let (status, body) = send(&api, "POST", "/api/services/app/deploy", "").await;
+    assert_eq!(status, 404);
+    assert!(body.get("error").and_then(Json::as_str).is_some());
+
+    api.supervisor().shutdown().await;
+}
+
+#[tokio::test]
+async fn deploying_a_watched_service_is_accepted_without_waiting_for_the_poll_interval() {
+    // 202, not 200 — this reports the deployment was accepted, mirroring every
+    // other action route; it does not await the stop/pull/build/start sequence,
+    // which can take as long as the build step allows.
+    let (api, watches, _dir) = api_with_watches("deploy-watched");
+    send(&api, "PUT", "/api/services/site", &watched_body("site", 60)).await;
+    assert_eq!(watches.count().await, 1);
+
+    let (status, body) = send(&api, "POST", "/api/services/site/deploy", "").await;
+    assert_eq!(status, 202);
+    assert_eq!(body.get("accepted").and_then(Json::as_bool), Some(true));
+    assert_eq!(body.get("service").and_then(Json::as_str), Some("site"));
+}
+
+// ---- cookie-session authentication -----------------------------------------
+
+#[tokio::test]
+async fn logging_in_sets_a_cookie_that_authorises_reads_without_extra_headers() {
+    let (api, _dir) = console_api("login", Sessions::new());
+    let response =
+        call_with(&api, "POST", "/api/session", &[("X-Selfhost-Console", "1")], &format!(r#"{{"password":"{PASSWORD}"}}"#))
+            .await;
+    assert_eq!(response.status.code(), 200);
+    assert_eq!(body_json(&response).get("ok").and_then(Json::as_bool), Some(true));
+
+    // The cookie carries every defensive attribute, not just the id.
+    let header = response.headers.get_str("set-cookie").expect("a Set-Cookie header");
+    for attribute in ["HttpOnly", "Secure", "SameSite=Strict", "Path=/", "Max-Age=43200"] {
+        assert!(header.contains(attribute), "missing {attribute}: {header}");
+    }
+
+    // A GET with the cookie needs no CSRF header.
+    let cookie = session_cookie_pair(&response);
+    let listed = call_with(&api, "GET", "/api/services", &[("Cookie", &cookie)], "").await;
+    assert_eq!(listed.status.code(), 200, "the session should open the API");
+
+    // And the probe agrees the session is live.
+    let probe = call_with(&api, "GET", "/api/session", &[("Cookie", &cookie)], "").await;
+    assert_eq!(probe.status.code(), 200);
+}
+
+#[tokio::test]
+async fn a_wrong_console_password_gets_the_same_uninformative_401_as_no_credentials() {
+    let (api, _dir) = console_api("wrongpw", Sessions::new());
+    let response =
+        call_with(&api, "POST", "/api/session", &[("X-Selfhost-Console", "1")], r#"{"password":"not-the-password"}"#).await;
+    assert_eq!(response.status.code(), 401);
+    assert!(response.headers.get_str("set-cookie").is_none(), "no cookie on failure");
+
+    // Identical body to any other unauthorised request: a guesser learns
+    // nothing about whether a console password is even configured.
+    let (_, unauthenticated) = call(&api, "GET", "/api/services", None, "").await;
+    assert_eq!(body_json(&response), unauthenticated);
+}
+
+#[tokio::test]
+async fn a_sixth_rapid_login_failure_is_rate_limited_even_with_the_right_password() {
+    let (api, _dir) = console_api("ratelimit", Sessions::new());
+    for _ in 0..5 {
+        let response = call_with(&api, "POST", "/api/session", &[("X-Selfhost-Console", "1")], r#"{"password":"wrong"}"#).await;
+        assert_eq!(response.status.code(), 401, "failures under the limit are ordinary 401s");
+    }
+
+    // The gate is closed for the rest of the window — the right password
+    // included, or five guesses would still buy a sixth free try.
+    let response =
+        call_with(&api, "POST", "/api/session", &[("X-Selfhost-Console", "1")], &format!(r#"{{"password":"{PASSWORD}"}}"#))
+            .await;
+    assert_eq!(response.status.code(), 429);
+    assert_eq!(
+        body_json(&response).get("error").and_then(Json::as_str),
+        Some("too many attempts")
+    );
+}
+
+#[tokio::test]
+async fn a_cookie_authenticated_write_needs_the_console_header() {
+    let (api, _dir) = console_api("csrf", Sessions::new());
+    let cookie = login(&api).await;
+
+    // Without X-Selfhost-Console a non-GET is refused — 401 with the standard
+    // body, indistinguishable from any other refusal — because a cross-site
+    // page can make the browser attach the cookie but not a custom header.
+    let forged =
+        call_with(&api, "POST", "/api/services/ghost/start", &[("Cookie", &cookie)], "").await;
+    assert_eq!(forged.status.code(), 401);
+
+    // With the header the same request passes authorisation and reaches the
+    // route, which answers 404 for the nonexistent service.
+    let real = call_with(
+        &api,
+        "POST",
+        "/api/services/ghost/start",
+        &[("Cookie", &cookie), ("X-Selfhost-Console", "1")],
+        "",
+    )
+    .await;
+    assert_eq!(real.status.code(), 404, "authorised, then refused only by the route");
+}
+
+#[tokio::test]
+async fn a_login_post_without_the_console_header_is_refused_before_the_gate() {
+    let (api, _dir) = console_api("login-csrf", Sessions::new());
+
+    // A cross-site simple POST (no custom header, no preflight) must not even
+    // reach the password check — otherwise it could drive the global failure
+    // gate and lock every legitimate login. The refusal is the standard 401,
+    // and crucially it does NOT count as a failure: the correct password still
+    // works immediately afterwards from a real (header-bearing) request.
+    let forged =
+        call_with(&api, "POST", "/api/session", &[], &format!(r#"{{"password":"{PASSWORD}"}}"#)).await;
+    assert_eq!(forged.status.code(), 401);
+
+    let real = login(&api).await;
+    assert!(real.starts_with("selfhost_session="), "real login still works: {real}");
+}
+
+#[tokio::test]
+async fn bearer_requests_never_need_the_console_header() {
+    // The console client and the webhook relay present the token exactly as
+    // they always have; the CSRF rule is for cookies only.
+    let (api, _dir) = console_api("bearer-no-header", Sessions::new());
+    let (status, _) = send(&api, "POST", "/api/services/ghost/start", "").await;
+    assert_eq!(status, 404, "authorised by the token alone, refused only by the route");
+}
+
+#[tokio::test]
+async fn logging_out_revokes_the_session_and_expires_the_cookie() {
+    let (api, _dir) = console_api("logout", Sessions::new());
+    let cookie = login(&api).await;
+
+    let out = call_with(&api, "DELETE", "/api/session", &[("Cookie", &cookie)], "").await;
+    assert_eq!(out.status.code(), 200);
+    let header = out.headers.get_str("set-cookie").expect("an expiring Set-Cookie");
+    assert!(header.contains("Max-Age=0"), "the browser must discard the cookie: {header}");
+
+    let after = call_with(&api, "GET", "/api/services", &[("Cookie", &cookie)], "").await;
+    assert_eq!(after.status.code(), 401, "a revoked session must stop working");
+}
+
+#[tokio::test]
+async fn an_expired_session_is_refused() {
+    use std::time::Duration;
+    // Zero lifetimes via the injectable store: the session is expired the
+    // moment it is minted, standing in for the 12-hour absolute and 2-hour
+    // idle limits without a 12-hour test.
+    let (api, _dir) = console_api("expired", Sessions::with_expiry(Duration::ZERO, Duration::ZERO));
+    let cookie = login(&api).await;
+    let response = call_with(&api, "GET", "/api/services", &[("Cookie", &cookie)], "").await;
+    assert_eq!(response.status.code(), 401);
+}
+
+#[tokio::test]
+async fn login_without_a_configured_password_fails_closed() {
+    // No console.passwd on disk: the login route answers the standard 401 —
+    // never a panic, never a hint that the password is simply unset.
+    let (plain, dir) = api("nopasswd");
+    let api = plain.with_console_auth(dir.path());
+    let response = call_with(&api, "POST", "/api/session", &[("X-Selfhost-Console", "1")], r#"{"password":"anything"}"#).await;
+    assert_eq!(response.status.code(), 401);
+
+    let (_, unauthenticated) = call(&api, "GET", "/api/services", None, "").await;
+    assert_eq!(body_json(&response), unauthenticated);
+}
+
+#[tokio::test]
+async fn a_login_body_that_is_not_json_is_a_400_not_a_counted_failure() {
+    let (api, _dir) = console_api("badbody", Sessions::new());
+    let response = call_with(&api, "POST", "/api/session", &[("X-Selfhost-Console", "1")], "{not json").await;
+    assert_eq!(response.status.code(), 400);
+    let response = call_with(&api, "POST", "/api/session", &[("X-Selfhost-Console", "1")], r#"{"password":42}"#).await;
+    assert_eq!(response.status.code(), 400, "a non-string password is malformed, not a guess");
+}
+
+#[tokio::test]
+async fn an_invented_cookie_does_not_authorise_anything() {
+    let (api, _dir) = console_api("forged-cookie", Sessions::new());
+    let forged = format!("selfhost_session={}", "0".repeat(64));
+    let response = call_with(&api, "GET", "/api/services", &[("Cookie", &forged)], "").await;
+    assert_eq!(response.status.code(), 401);
 }
 
 /// A scratch directory that removes itself when dropped.

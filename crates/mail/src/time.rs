@@ -34,6 +34,16 @@ pub(crate) fn civil(secs: u64) -> (&'static str, i64, u32, u32, u32, u32, u32) {
     (weekday, year, month, day, hour, minute, second)
 }
 
+/// The current moment as a compact UTC log stamp, `MM-DD HH:MM:SSZ`.
+///
+/// Every narrated log line carries this prefix so an operator can correlate
+/// events across the daemon's streams (mail, ACME, proxy) and against client
+/// logs; without it an intermittent failure has no timeline at all.
+pub fn stamp() -> String {
+    let (_, _, month, day, hour, minute, second) = civil(secs_since_epoch(SystemTime::now()));
+    format!("{month:02}-{day:02} {hour:02}:{minute:02}:{second:02}Z")
+}
+
 /// Days-since-epoch to (year, month, day), proleptic Gregorian, UTC.
 ///
 /// Howard Hinnant's `civil_from_days` algorithm — the standard closed-form

@@ -1,0 +1,23 @@
+[package]
+name = "selfhost-acme"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "ACME (RFC 8555) client: account key, JWS, order state machine, HTTP-01 solver, and CSR."
+
+[dependencies]
+selfhost-http = { workspace = true }
+selfhost-json = { workspace = true }
+selfhost-config = { workspace = true }
+tokio = { workspace = true }
+tokio-rustls = { workspace = true }
+rustls = { workspace = true }
+webpki-roots = { workspace = true }
+ring = { workspace = true }
+rcgen = { workspace = true }
+
+[lints.rust]
+unsafe_code = "forbid"
+missing_docs = "warn"

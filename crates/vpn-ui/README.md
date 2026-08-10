@@ -14,8 +14,12 @@ Render its looks any time with `cargo run -p selfhost-vpn-ui -- --render <dir>`
   nodes and the link between them — dormant and dashed when off, a charge
   travelling along it while it reaches the server, solid and breathing when up,
   broken when it fails.
-- **Open Admin Console** — adds `127.0.0.1 admin.rockywearsahat.com` to
-  `/etc/hosts` (one password prompt) and opens `https://admin.rockywearsahat.com:8443`.
+- **Open Admin Console** — opens `https://admin.rockywearsahat.com` (no port).
+  First use runs a one-time privileged setup (one password prompt) that installs
+  the scoped resolver file and the loopback 443 gate, and removes the legacy
+  `/etc/hosts` line; after that the app's embedded split-DNS responder
+  (`127.0.0.1:53535`) resolves the name and the gate carries the connection to
+  the tunnel's local end. Mechanism details live in `docs/VPN.md` (*Using it*).
   Enabled only while the tunnel is up.
 - **Keys** — shows the client and server identity fingerprints and when the key
   last rotated. **Rotate now** runs the safe rotation; **AUTO** rotates the
@@ -46,6 +50,10 @@ The panel drives the Secure-VPN client installed under `~/.securevpn/`:
 - `~/.securevpn/keys/client.key` + `server.pub` — this machine's identity and
   the pinned server key.
 - `~/.securevpn/rotate-keys.sh` — the rotation script (`build-app.sh` copies it).
+- **Scoped resolver + 443 gate** — `/etc/resolver/admin.rockywearsahat.com`
+  (`nameserver 127.0.0.1`, `port 53535`) and the launchd-managed loopback 443
+  gate. The app installs both on the first **Open Admin Console** (one admin
+  prompt); see `docs/VPN.md`.
 - **macOS Local Network permission.** On the LAN the endpoint resolves to the
   box's private address (split-horizon DNS), so the app needs Local Network
   access. Reinstalling the bundle resets that grant, and until it is restored

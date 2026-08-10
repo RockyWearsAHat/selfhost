@@ -359,6 +359,8 @@ role = \"owner\"
             instances: vec![],
             health: Health::default(),
             canonical_redirect: true,
+            allowed_cidrs: vec![],
+            console: false,
         }
     }
 

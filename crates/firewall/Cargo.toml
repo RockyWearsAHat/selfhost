@@ -1,0 +1,20 @@
+[package]
+name = "selfhost-firewall"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Reconciles the host firewall so only the operator's chosen scope can reach the public listeners."
+
+[dependencies]
+selfhost-config = { workspace = true }
+selfhost-json = { workspace = true }
+tokio = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time"] }
+
+[lints.rust]
+unsafe_code = "forbid"
+missing_docs = "warn"

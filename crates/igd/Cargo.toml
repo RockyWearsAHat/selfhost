@@ -1,0 +1,15 @@
+[package]
+name = "selfhost-igd"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "UPnP-IGD control client: discover the router and ask it its WAN address and port forwards. SSDP, the description fetch, and the SOAP POST are written here, not pulled from a dependency."
+
+[dependencies]
+tokio = { workspace = true }
+
+[lints.rust]
+unsafe_code = "forbid"
+missing_docs = "warn"

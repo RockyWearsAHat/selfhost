@@ -208,6 +208,14 @@ impl Session {
         self.authenticated
     }
 
+    /// The sender of the transaction in progress, once `MAIL FROM` is given.
+    ///
+    /// A read-only view for the connection layer — the greylist keys on it — so
+    /// the driver need not parse `MAIL FROM` a second time.
+    pub fn current_sender(&self) -> Option<&Path> {
+        self.sender.as_ref()
+    }
+
     /// Records that TLS is now in effect.
     pub fn tls_established(&mut self) {
         self.tls_active = true;

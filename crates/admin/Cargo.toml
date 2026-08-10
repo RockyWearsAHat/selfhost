@@ -8,7 +8,12 @@ repository.workspace = true
 description = "The loopback control API the console drives."
 
 [dependencies]
+# Console password hashing (PBKDF2-HMAC-SHA256). The same single crypto
+# provider the rest of the workspace links; no second implementation is added.
+ring = { workspace = true }
 selfhost-config = { workspace = true }
+selfhost-firewall = { workspace = true }
+selfhost-git = { workspace = true }
 selfhost-http = { workspace = true }
 selfhost-json = { workspace = true }
 selfhost-supervisor = { workspace = true }

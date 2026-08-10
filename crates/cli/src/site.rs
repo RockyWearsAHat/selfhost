@@ -218,6 +218,8 @@ fn add(arguments: &[String], config_path: &Path) -> Result<(), String> {
         instances,
         health: Health::default(),
         canonical_redirect,
+        allowed_cidrs: vec![],
+        console: false,
     };
 
     let source = read_source(config_path)?;
@@ -473,6 +475,8 @@ mod tests {
             instances: vec![],
             health: Health::default(),
             canonical_redirect: true,
+            allowed_cidrs: vec![],
+            console: false,
         };
         assert_eq!(kind_of(&site), "static");
 

@@ -257,6 +257,27 @@ impl Supervisor {
         Some(handle.shared.logs.lock().await.since(from, limit))
     }
 
+    /// Records a line in a service's captured output. Returns whether it exists.
+    ///
+    /// For things that happen *to* a service without being printed *by* it — a
+    /// deployment pulling new code, a watch that could not reach its remote. They
+    /// belong in the same stream as the process output and the supervisor's own
+    /// commentary, because "pulled 4f3a1c9, restarting" is only meaningful next to
+    /// the output that follows it; a separate place to look is a place where the
+    /// operator has to correlate two logs by timestamp to learn one fact.
+    ///
+    /// The line is recorded exactly as given, so the caller says who it is from —
+    /// the supervisor's own notes are tagged `[supervisor]`, a deployment's `[git]`.
+    pub async fn note(&self, name: &str, line: impl Into<String>) -> bool {
+        match self.services.lock().await.get(name) {
+            Some(handle) => {
+                handle.shared.logs.lock().await.push(Stream::Stderr, line.into());
+                true
+            }
+            None => false,
+        }
+    }
+
     /// Stops every service and forgets them all.
     ///
     /// Called on daemon shutdown so children stop the way their specs ask,

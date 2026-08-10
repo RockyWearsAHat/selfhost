@@ -225,7 +225,7 @@ pub async fn serve_submission(listener: TcpListener, submission: Submission) -> 
 /// every credential continuation line are base64-wrapped passwords, so client
 /// lines pass through [`verb_summary`] and the SASL reads are never echoed.
 fn log_submission(peer: SocketAddr, message: impl AsRef<str>) {
-    eprintln!("[submission] {peer} {}", message.as_ref());
+    eprintln!("{} [submission] {peer} {}", crate::time::stamp(), message.as_ref());
 }
 
 /// The loggable form of one client line: its uppercased verb — plus, for
@@ -266,7 +266,8 @@ async fn handle_connection(
                 }
             };
             session.tls_established();
-            log_submission(peer, "TLS established via STARTTLS");
+            let sni = tls.get_ref().1.server_name().unwrap_or("<none>").to_owned();
+            log_submission(peer, format!("TLS established via STARTTLS (sni={sni})"));
             let _ = converse(&mut tls, peer, &mut session, &submission).await?;
             log_submission(peer, "closed");
             Ok(())

@@ -142,6 +142,44 @@ impl CertificateStore {
 
         Ok((chain, key))
     }
+
+    /// Installs an ACME-issued chain and key for `host`, replacing any prior pair.
+    ///
+    /// Each half is written to a sibling temporary file and then renamed over its
+    /// target, so a reader — including the running SNI resolver on a `refresh` —
+    /// never observes a half-written certificate or a chain that does not match
+    /// its key. The key is created `0600` before it holds any bytes, exactly as a
+    /// self-signed key is.
+    pub fn install(&self, host: &str, chain_pem: &str, key_pem: &str) -> Result<(), TlsError> {
+        write_atomic(&self.certificate_path(host), chain_pem.as_bytes(), false)?;
+        write_atomic(&self.key_path(host), key_pem.as_bytes(), true)?;
+        Ok(())
+    }
+
+    /// Every hostname with a complete pair on disk, for seeding the SNI resolver.
+    ///
+    /// Scans `*.crt.pem` and keeps only those whose matching `*.key.pem` is also
+    /// present. The name returned is the on-disk (sanitised) form; for ordinary
+    /// hostnames — the only shape a browser sends in SNI — that is the hostname
+    /// unchanged, and feeding it back through [`Self::load`] is a no-op sanitise.
+    pub fn hosts(&self) -> Vec<String> {
+        let mut hosts = Vec::new();
+        let Ok(entries) = fs::read_dir(&self.directory) else {
+            return hosts;
+        };
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else { continue };
+            if let Some(stem) = name.strip_suffix(".crt.pem") {
+                if self.directory.join(format!("{stem}.key.pem")).is_file() {
+                    hosts.push(stem.to_owned());
+                }
+            }
+        }
+        hosts.sort();
+        hosts.dedup();
+        hosts
+    }
 }
 
 /// Writes a file that only its owner can read.
@@ -169,6 +207,33 @@ fn write_private(path: &Path, contents: &[u8]) -> io::Result<()> {
     }
 }
 
+/// Writes `contents` to `path` atomically via a temporary sibling and a rename.
+///
+/// Rename within a directory is atomic on the platforms this runs on, so a
+/// concurrent reader sees either the old file or the whole new one. When
+/// `private`, the temporary is created `0600` so the key is never briefly
+/// world-readable — the same guarantee [`write_private`] gives a fresh key.
+fn write_atomic(path: &Path, contents: &[u8], private: bool) -> io::Result<()> {
+    let mut temp = path.as_os_str().to_owned();
+    temp.push(format!(".tmp.{}", std::process::id()));
+    let temp = PathBuf::from(temp);
+
+    if private {
+        write_private(&temp, contents)?;
+    } else {
+        fs::write(&temp, contents)?;
+    }
+
+    match fs::rename(&temp, path) {
+        Ok(()) => Ok(()),
+        Err(error) => {
+            // Leave no half-written orphan behind on a failed swap.
+            let _ = fs::remove_file(&temp);
+            Err(error)
+        }
+    }
+}
+
 /// Reduces a hostname to characters safe in a filename.
 ///
 /// A wildcard host like `*.example.com` would otherwise be an illegal filename
@@ -191,6 +256,20 @@ pub fn server_config(
 
     // Advertise HTTP/1.1 only. HTTP/2 is not implemented here yet, and claiming
     // it in ALPN would make browsers open a connection we cannot speak on.
+    config.alpn_protocols = vec![b"http/1.1".to_vec()];
+    Ok(Arc::new(config))
+}
+
+/// Builds a server configuration that picks its certificate per connection.
+///
+/// Unlike [`server_config`], which serves one fixed pair, this hands rustls a
+/// [`ResolvesServerCert`](rustls::server::ResolvesServerCert) — the SNI resolver —
+/// so a freshly issued ACME certificate can take effect without rebuilding the
+/// listener. ALPN is `http/1.1` only, matching [`server_config`].
+pub fn server_config_with_resolver(
+    resolver: Arc<dyn rustls::server::ResolvesServerCert>,
+) -> Result<Arc<ServerConfig>, TlsError> {
+    let mut config = ServerConfig::builder().with_no_client_auth().with_cert_resolver(resolver);
     config.alpn_protocols = vec![b"http/1.1".to_vec()];
     Ok(Arc::new(config))
 }
@@ -245,6 +324,65 @@ mod tests {
 
         let mode = fs::metadata(store.key_path("localhost")).unwrap().permissions().mode();
         assert_eq!(mode & 0o077, 0, "private key is readable by others");
+    }
+
+    #[test]
+    fn install_round_trips_a_chain_and_key() {
+        // What the ACME task hands back is PEM; installing then loading must
+        // yield material rustls accepts, or issuance would silently produce an
+        // unservable certificate.
+        let store = CertificateStore::open(&temp_data("install")).unwrap();
+        let generated = rcgen::generate_simple_self_signed(vec!["issued.example".to_owned()]).unwrap();
+        store
+            .install("issued.example", &generated.cert.pem(), &generated.key_pair.serialize_pem())
+            .unwrap();
+
+        assert!(store.has_pair("issued.example"));
+        let (chain, key) = store.load("issued.example").unwrap();
+        assert!(server_config(chain, key).is_ok());
+    }
+
+    #[test]
+    fn install_overwrites_a_prior_pair() {
+        let store = CertificateStore::open(&temp_data("reinstall")).unwrap();
+        store.load_or_generate_self_signed("issued.example", &[]).unwrap();
+        let before = fs::read(store.certificate_path("issued.example")).unwrap();
+
+        let fresh = rcgen::generate_simple_self_signed(vec!["issued.example".to_owned()]).unwrap();
+        store
+            .install("issued.example", &fresh.cert.pem(), &fresh.key_pair.serialize_pem())
+            .unwrap();
+        let after = fs::read(store.certificate_path("issued.example")).unwrap();
+
+        assert_ne!(before, after, "renewal must replace the stored certificate");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_installed_key_is_not_world_readable() {
+        use std::os::unix::fs::PermissionsExt;
+        let store = CertificateStore::open(&temp_data("install-perms")).unwrap();
+        let generated = rcgen::generate_simple_self_signed(vec!["issued.example".to_owned()]).unwrap();
+        store
+            .install("issued.example", &generated.cert.pem(), &generated.key_pair.serialize_pem())
+            .unwrap();
+
+        let mode = fs::metadata(store.key_path("issued.example")).unwrap().permissions().mode();
+        assert_eq!(mode & 0o077, 0, "installed private key is readable by others");
+    }
+
+    #[test]
+    fn hosts_lists_only_complete_pairs() {
+        let store = CertificateStore::open(&temp_data("hosts")).unwrap();
+        store.load_or_generate_self_signed("a.example", &[]).unwrap();
+        store.load_or_generate_self_signed("b.example", &[]).unwrap();
+        // A certificate with no matching key must not be offered to the resolver.
+        fs::write(store.certificate_path("lonely.example"), "not a real cert").unwrap();
+
+        let hosts = store.hosts();
+        assert!(hosts.contains(&"a.example".to_owned()));
+        assert!(hosts.contains(&"b.example".to_owned()));
+        assert!(!hosts.contains(&"lonely.example".to_owned()));
     }
 
     #[test]

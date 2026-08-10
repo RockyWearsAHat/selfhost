@@ -326,5 +326,5 @@ impl ServerCertVerifier for AcceptAnyServerCert {
 
 /// Writes one clearly-tagged line to stderr, matching `acme_task`'s `log`.
 fn log(message: impl AsRef<str>) {
-    eprintln!("mail: {}", message.as_ref());
+    eprintln!("{} mail: {}", selfhost_mail::stamp(), message.as_ref());
 }

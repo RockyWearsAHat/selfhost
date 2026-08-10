@@ -27,6 +27,11 @@ sites/*
 # OS noise
 .DS_Store
 
+# Tool caches: the dx document index and the Helpers project index. Both are
+# rebuilt from the tree they describe, so committing them only stores staleness.
+.doc/
+.helpers/
+
 # Scratch directory for the service-manager demo (see .demo/svc)
 .demo/
 
