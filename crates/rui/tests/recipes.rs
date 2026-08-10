@@ -18,9 +18,10 @@
 
 use rui::testing::Harness;
 use rui::{
-    Align, Anchor, Drag, El, Key, Modifiers, Painter, Point, Radius, Rect, Role, Size, Tone,
-    caption, col, draw, panel, row, text,
+    Align, Anchor, Bgra, Color, Drag, El, Key, KeyCode, KeyPhase, KeyStroke, Modifiers, Painter,
+    Point, Radius, Rect, Role, Size, Tone, caption, col, draw, panel, row, text,
 };
+use std::sync::Arc;
 
 /// Everything the controls below are wired to.
 #[derive(Default)]
@@ -30,6 +31,24 @@ struct Settings {
     volume: f32,
     format: usize,
     tip: Option<String>,
+    /// The last picture the far machine sent, if a session is up.
+    ///
+    /// Behind an [`Arc`] because the description is rebuilt every frame and the
+    /// drawing inside it owns what it draws: a clone per frame of a megabyte of
+    /// screen would cost more than rasterising the interface does, and a clone
+    /// of the pointer costs nothing.
+    screen: Option<Arc<Screen>>,
+    /// Physical keys forwarded to the far machine and not yet released.
+    held: Vec<KeyCode>,
+}
+
+/// A picture from another machine, in the byte order every capture uses.
+struct Screen {
+    width: u32,
+    height: u32,
+    /// Rows `stride` bytes apart — wider than the pixels, as a real capture is.
+    stride: usize,
+    bytes: Vec<u8>,
 }
 
 // ---------------------------------------------------------------------------
@@ -116,6 +135,33 @@ fn radio_group<S: 'static>(
             .on_click(move |state: &mut S| choose(state, index))
         })
         .collect::<Vec<_>>())
+}
+
+/// A pane showing another machine's screen, and sending it the keyboard.
+///
+/// The control this library was missing every piece of: a bitmap primitive to
+/// draw a captured frame with, the physical key rather than the character a
+/// layout made of it, and the release as well as the press.
+fn viewport<S: 'static>(
+    size: Size,
+    screen: Option<Arc<Screen>>,
+    forward: impl Fn(&mut S, KeyStroke) + 'static,
+) -> El<S> {
+    draw(size, move |painter: &mut Painter<'_>, rect: Rect| {
+        // A frame whose sizes disagree with its buffer is drawn as no frame at
+        // all rather than as whatever is past the end of it.
+        let picture = screen.as_ref().and_then(|screen| {
+            Bgra::new(screen.width, screen.height, screen.stride, &screen.bytes)
+        });
+        match picture {
+            Some(picture) => painter.canvas().blit_bgra(rect, &picture),
+            None => painter.fill(rect, Radius::Units(2.0), Tone::Sunken),
+        }
+    })
+    .key("screen")
+    .role(Role::Image)
+    .label("Remote screen")
+    .on_raw_key(forward)
 }
 
 // ---------------------------------------------------------------------------
@@ -288,3 +334,68 @@ fn a_note_that_is_up_does_not_come_up_again_every_frame() {
 }
 
 
+
+#[test]
+fn a_viewport_shows_another_machines_screen_and_sends_it_the_keyboard() {
+    // Every one of the four things this library gained, through the public
+    // surface, in the shape the console will use them: a captured frame drawn
+    // into a pane, the physical key forwarded rather than the character, and
+    // the release that stops the far machine holding it down.
+    let mut harness = Harness::new(Settings::default(), |settings: &Settings| {
+        col(viewport(
+            Size::new(120.0, 80.0),
+            settings.screen.clone(),
+            |settings: &mut Settings, stroke: KeyStroke| {
+                let Some(code) = stroke.code else {
+                    return;
+                };
+                match stroke.phase {
+                    KeyPhase::Down => settings.held.push(code),
+                    KeyPhase::Up => settings.held.retain(|down| *down != code),
+                }
+            },
+        ))
+        .align(Align::Start)
+    });
+
+    let rect = harness.find_key("screen").expect("the pane is on screen").rect;
+    let inside = rect.center();
+    assert_ne!(
+        harness.pixel(inside.x as u32, inside.y as u32),
+        Some(Color::WHITE),
+        "nothing has arrived yet, so the pane is showing its own empty state"
+    );
+
+    harness.state_mut().screen = Some(Arc::new(captured(120, 80, Color::WHITE)));
+    harness.frame();
+    assert_eq!(
+        harness.pixel(inside.x as u32, inside.y as u32),
+        Some(Color::WHITE),
+        "the frame that arrived is what is on screen"
+    );
+
+    // Driving it: a function key, which this library has no name for at all.
+    harness.click(inside);
+    let function_key = KeyCode::new(96);
+    harness.raw_key(function_key, None);
+    assert_eq!(harness.state().held, [function_key], "the far machine was told nothing");
+
+    harness.raw_key_up(function_key, None);
+    assert!(harness.state().held.is_empty(), "left held down on the far machine");
+
+    harness.assert_accessible();
+}
+
+/// A picture of one colour, padded as a capture API pads its rows.
+fn captured(width: u32, height: u32, color: Color) -> Screen {
+    let padding = 48;
+    let stride = width as usize * 4 + padding;
+    let mut bytes = Vec::with_capacity(stride * height as usize);
+    for _ in 0..height {
+        for _ in 0..width {
+            bytes.extend_from_slice(&[color.b, color.g, color.r, 0xff]);
+        }
+        bytes.extend(std::iter::repeat_n(0x7f, padding));
+    }
+    Screen { width, height, stride, bytes }
+}

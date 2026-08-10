@@ -12,8 +12,13 @@
 //! this caller may have a stream, and only if the answer is yes does it hand the
 //! socket over to one of the loops in this module. Everything that *decides* is
 //! still pure and still tested without a port; everything that *moves bytes*
-//! lives in this file and is tested against `tokio::io::duplex` rather than a
-//! listener. Nothing in this crate binds an address it did not already bind.
+//! lives in this file and is tested here against `tokio::io::duplex`. Nothing in
+//! this crate binds an address it did not already bind.
+//!
+//! The pipe is not the whole story, and pretending it was is how a duplicated
+//! handshake survived three thousand tests. `tests/wire.rs` binds a loopback
+//! port, speaks a real handshake and asserts on the bytes that come back; the
+//! duplex tests below cover the loop, and that file covers the wire.
 //!
 //! # What a stream owes that a request does not
 //!
@@ -37,6 +42,38 @@
 //!   by parking the task somewhere the deadlines cannot fire.
 //! - **It has a hard end.** `Limits::max_lifetime` closes it whatever else is
 //!   true, so no bug in the checks above can produce an immortal connection.
+//!
+//! # One handshake, written in one place
+//!
+//! [`Upgraded`] is the only value in this crate that names a connection which
+//! has stopped being HTTP, and [`Upgraded::answer`] is the only function that
+//! writes a `101`. That is not tidiness either: this route layer once wrote the
+//! handshake response twice on the desktop path — once generically for every
+//! stream and once again inside the desktop arm — and two complete `HTTP/1.1
+//! 101 Switching Protocols` heads back to back is not a cosmetic duplicate. The
+//! second head *is* the first thing the client reads as frame data: its leading
+//! `H` is `0x48`, so RSV1 is set and the opcode is `8`, and every RFC 6455
+//! client in existence — including this repository's own native console —
+//! closes the connection on it. The stream was therefore dead on arrival for
+//! every viewer, on every platform.
+//!
+//! Deleting the second write would have fixed that afternoon and nothing else,
+//! because the next route added would have been written the same way. So the
+//! write is gone from the routes entirely: a route cannot be *handed* a
+//! connection until the handshake has been answered, because answering it is
+//! what produces the [`Upgraded`] the route takes. There is one head-writing
+//! call site, it consumes the raw stream, and it hands back something that is
+//! no longer a raw stream. This is the same shape the two duplicated upgrade
+//! sniffs were collapsed into: one definition, and no way to spell it twice.
+//!
+//! What differs between the two kinds of stream this daemon serves is *who* the
+//! `101` is written for, and that is the [`Answering`] parameter rather than a
+//! second function. A console stream is authorised **before** the handshake is
+//! answered, by a redeemed ticket, so it answers from an [`Admission`]. A peer
+//! link's credential does not exist yet at that moment — a worker proves its
+//! enrolment in the first frame *after* the `101`, against the very handshake
+//! key that head was derived from — so it answers from a [`PeerKey`]. Both go
+//! through the same door.
 //!
 //! # The shape, and why it is two tasks rather than one `select!`
 //!
@@ -213,27 +250,149 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for Prefixed<S> {
     }
 }
 
-/// Writes the `101 Switching Protocols` that completes a handshake.
+/// Whoever a `101 Switching Protocols` is being written for, and the head they
+/// are owed.
 ///
-/// Serialised by `selfhost_ws::handshake::response_head` rather than through
-/// [`crate::Api`]'s ordinary response path, for the same reason the proxy
-/// forwards it verbatim: the general path derives framing from a body this
+/// The one abstraction [`Upgraded::answer`] is generic over, and the reason
+/// there is a single handshake writer rather than one per route. See the module
+/// note: the two kinds of stream this daemon serves differ only in *what the
+/// accept value is derived from*, and expressing that as an implementation of
+/// this trait is what keeps the difference from becoming a second copy of the
+/// write.
+///
+/// Every head is serialised by `selfhost_ws::handshake::response_head` rather
+/// than through [`crate::Api`]'s ordinary response path, for the same reason the
+/// proxy forwards it verbatim: the general path derives framing from a body this
 /// response does not have, and the proxy splices security headers into anything
 /// it writes as a response — fields that mean nothing to a connection that has
 /// stopped being HTTP, in a message a browser checks strictly before it hands
 /// the socket to the page.
+pub trait Answering {
+    /// The complete `101` head, blank line included.
+    ///
+    /// An error here is a header that could not be serialised, which for values
+    /// this server chose cannot happen — and is reported rather than swallowed
+    /// anyway, because a handshake that half-wrote is a connection nobody can
+    /// diagnose from either end.
+    fn response_head(&self) -> io::Result<Vec<u8>>;
+}
+
+impl Answering for Admission {
+    /// The head that answers a ticketed console handshake.
+    ///
+    /// The subprotocol comes from [`Admission`], which only ever carries a token
+    /// this server chose from a fixed list; the header layer's CR/LF check
+    /// stands behind that anyway.
+    fn response_head(&self) -> io::Result<Vec<u8>> {
+        handshake::response_head(&self.accept, self.subprotocol.as_deref()).map_err(into_io)
+    }
+}
+
+/// The `Sec-WebSocket-Key` a peer link's handshake carried.
 ///
-/// The subprotocol comes from [`Admission`], which only ever carries a token
-/// this server chose from a fixed list; the header layer's CR/LF check stands
-/// behind that anyway, and a failure there is reported rather than swallowed.
-pub async fn answer<S>(stream: &mut S, admission: &Admission) -> io::Result<()>
+/// # Why the key survives the handshake, when nothing else does
+///
+/// A worker's credential is not presented in the request head. It arrives in the
+/// first frame after the `101`, as an HMAC over — among other things — this key
+/// and the `Sec-WebSocket-Accept` derived from it. That binding is what makes a
+/// captured proof worthless on any connection but the one it was computed for,
+/// so the key has to outlive the head it was read from and reach
+/// `selfhost_mesh::accept::admit`, which recomputes the accept value from it
+/// rather than being handed both and risking a mismatched pair.
+///
+/// It is not a secret: RFC 6455 sends it in the clear, and a proxy may log it.
+/// It is a *nonce*, and the replay ledger on the other side of the admission is
+/// what makes a repeat of one worthless.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PeerKey(String);
+
+impl PeerKey {
+    /// The key from a handshake `selfhost_ws` has already validated.
+    pub fn new(key: &str) -> Self {
+        Self(key.to_owned())
+    }
+
+    /// The key itself, for the proof that binds to it.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl Answering for PeerKey {
+    /// The head that answers a peer link's handshake.
+    ///
+    /// No subprotocol is echoed, because the dialler offers none: a link is one
+    /// protocol with a version in its greeting, negotiated by the mux layer
+    /// rather than by a header, and echoing a token nobody offered is a protocol
+    /// error on this side.
+    fn response_head(&self) -> io::Result<Vec<u8>> {
+        handshake::response_head(&selfhost_ws::accept_key(&self.0), None).map_err(into_io)
+    }
+}
+
+/// Reports a header that could not be serialised as an I/O failure.
+fn into_io(error: impl std::fmt::Display) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, error.to_string())
+}
+
+/// A connection whose handshake has been answered — exactly once, here.
+///
+/// # What this type is for
+///
+/// It is the only thing a stream route is given, and the only way to obtain one
+/// is [`Upgraded::answer`], which consumes the raw stream and writes the `101`.
+/// A route therefore cannot be reached before the handshake is answered, and
+/// cannot answer it a second time, because it never holds the thing a second
+/// answer would be written to. That is the whole point; see the module note for
+/// the bug that made it necessary.
+///
+/// `W` is whoever the handshake was answered for — an [`Admission`] for a
+/// console stream, a [`PeerKey`] for a peer link — so a loop that needs one
+/// cannot be handed the other, and the check is the compiler's rather than a
+/// `match` arm somebody has to remember to write.
+pub struct Upgraded<S, W> {
+    /// The connection, with whatever arrived alongside the request head
+    /// delivered before anything the socket produces. See [`Prefixed`].
+    io: Prefixed<S>,
+    /// Whoever the `101` was written for.
+    whom: W,
+}
+
+impl<S, W> Upgraded<S, W>
 where
-    S: AsyncWrite + Unpin,
+    S: AsyncRead + AsyncWrite + Unpin,
+    W: Answering,
 {
-    let head = handshake::response_head(&admission.accept, admission.subprotocol.as_deref())
-        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error.to_string()))?;
-    stream.write_all(&head).await?;
-    stream.flush().await
+    /// Writes the `101` and hands back the upgraded connection.
+    ///
+    /// `leftover` is everything the request-head reader took past the blank
+    /// line; it is delivered before the socket rather than dropped, which is the
+    /// difference between a stream that works and one that deadlocks on its
+    /// first message with no error anywhere to explain it — see [`Prefixed`].
+    pub async fn answer(mut stream: S, leftover: Vec<u8>, whom: W) -> io::Result<Self> {
+        let head = whom.response_head()?;
+        stream.write_all(&head).await?;
+        stream.flush().await?;
+        Ok(Self { io: Prefixed::new(leftover, stream), whom })
+    }
+
+    /// Whoever the handshake was answered for, for a log line taken before the
+    /// stream is consumed.
+    pub fn whom(&self) -> &W {
+        &self.whom
+    }
+
+    /// The connection and the credential it was opened on, for the loop that
+    /// will now drive them.
+    pub fn into_parts(self) -> (Prefixed<S>, W) {
+        (self.io, self.whom)
+    }
+}
+
+impl<S, W: std::fmt::Debug> std::fmt::Debug for Upgraded<S, W> {
+    fn fmt(&self, out: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        out.debug_struct("Upgraded").field("whom", &self.whom).finish_non_exhaustive()
+    }
 }
 
 /// The console's live snapshot, in the shape the SPA already knows how to draw.
@@ -268,15 +427,19 @@ pub fn snapshot_message(services: Json, firewall: Option<Json>) -> Json {
 /// one-way by design, and a console that has something to say has ordinary
 /// CSRF-protected routes to say it on. Accepting and ignoring inbound messages
 /// would mean a page could keep a stream busy with traffic nothing reads.
+///
+/// Takes the [`Upgraded`] connection rather than a socket and an [`Admission`]
+/// side by side, so that this loop cannot be started on a connection whose
+/// handshake was never answered — or answered twice.
 pub async fn events<S>(
-    io: S,
+    upgraded: Upgraded<S, Admission>,
     api: Api,
-    admission: Admission,
     watch: Watch,
 ) -> Result<Closed, StreamError>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
+    let (io, admission) = upgraded.into_parts();
     let limits = Limits::default();
     let mut duplex = Duplex::server(io, limits);
     let mut producer =
@@ -475,11 +638,44 @@ mod tests {
         }
     }
 
+    /// The head an [`Answering`] value produces, as text.
+    fn head_of(whom: &impl Answering) -> String {
+        String::from_utf8(whom.response_head().expect("a serialisable head")).expect("ASCII")
+    }
+
+    /// Reads one HTTP head off a stream, and not one byte past it.
+    ///
+    /// A byte at a time, deliberately: everything after the blank line belongs
+    /// to the new protocol, and a test that over-read would eat the very frame
+    /// it is about to assert on — the same trap [`Prefixed`] exists for.
+    async fn read_head<S: AsyncRead + Unpin>(stream: &mut S) -> String {
+        let mut head = Vec::new();
+        let mut byte = [0u8; 1];
+        while !head.ends_with(b"\r\n\r\n") {
+            let read = stream.read(&mut byte).await.expect("the head");
+            assert_ne!(read, 0, "the stream ended mid-head");
+            head.push(byte[0]);
+        }
+        String::from_utf8(head).expect("ASCII")
+    }
+
+    /// Answers a handshake on `io` and runs the events loop over it.
+    ///
+    /// The two halves the socket layer performs in that order, in one call, so
+    /// that a test drives the real sequence — including the `101` — rather than
+    /// a loop started on a connection no client could have completed.
+    async fn serve_events<S>(io: S, api: Api, watch: Watch) -> Result<Closed, StreamError>
+    where
+        S: AsyncRead + AsyncWrite + Unpin,
+    {
+        let upgraded =
+            Upgraded::answer(io, Vec::new(), admission(None)).await.expect("the handshake");
+        events(upgraded, api, watch).await
+    }
+
     #[tokio::test]
     async fn the_hundred_and_one_is_a_complete_head_and_nothing_more() {
-        let mut out = Vec::new();
-        answer(&mut out, &admission(Some("selfhost.events.1"))).await.expect("write");
-        let head = String::from_utf8(out).expect("ASCII");
+        let head = head_of(&admission(Some("selfhost.events.1")));
 
         assert!(head.starts_with("HTTP/1.1 101 Switching Protocols\r\n"), "{head}");
         assert!(head.contains("Upgrade: websocket\r\n"), "{head}");
@@ -495,10 +691,44 @@ mod tests {
 
     #[tokio::test]
     async fn a_client_that_offered_no_protocol_gets_no_protocol_back() {
-        let mut out = Vec::new();
-        answer(&mut out, &admission(None)).await.expect("write");
-        let head = String::from_utf8(out).expect("ASCII");
+        let head = head_of(&admission(None));
         assert!(!head.contains("Sec-WebSocket-Protocol"), "{head}");
+    }
+
+    #[tokio::test]
+    async fn a_peer_link_is_answered_from_its_handshake_key_and_offered_no_protocol() {
+        // The dialler sends no `Sec-WebSocket-Protocol`, so echoing one would be
+        // a token nobody offered — and the accept value is the one the worker's
+        // enrolment proof is bound to, which is why it is derived here from the
+        // key rather than passed in beside it.
+        let head = head_of(&PeerKey::new("dGhlIHNhbXBsZSBub25jZQ=="));
+        assert!(head.starts_with("HTTP/1.1 101 Switching Protocols\r\n"), "{head}");
+        assert!(head.contains("Sec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\n"), "{head}");
+        assert!(!head.contains("Sec-WebSocket-Protocol"), "{head}");
+    }
+
+    #[tokio::test]
+    async fn answering_writes_exactly_one_head_and_then_the_protocol_begins() {
+        // The regression this type exists for: two `101` heads back to back,
+        // where the second is read by every RFC 6455 client as a frame with RSV1
+        // set and opcode 8. Asserted on the raw bytes, because that is the only
+        // place the duplicate was ever visible.
+        let (mut far, near) = tokio::io::duplex(4096);
+        let upgraded = Upgraded::answer(near, Vec::new(), admission(Some("selfhost.events.1")))
+            .await
+            .expect("the handshake is answered");
+
+        let head = read_head(&mut far).await;
+        assert_eq!(head.matches("HTTP/1.1").count(), 1, "{head}");
+
+        // Nothing follows the head until the loop behind it says something, and
+        // what it says is a frame rather than a second head.
+        let (mut io, _whom) = upgraded.into_parts();
+        io.write_all(b"\x82\x02hi").await.expect("a frame");
+        io.flush().await.expect("flush");
+        let mut frame = [0u8; 4];
+        far.read_exact(&mut frame).await.expect("the first frame");
+        assert_eq!(&frame, b"\x82\x02hi", "the first bytes after the head were not the frame");
     }
 
     #[tokio::test]
@@ -631,9 +861,11 @@ mod tests {
         // re-sent an unchanged snapshot every sweep would be the 500 ms poll
         // again with extra steps.
         let (api, _scratch) = api_for_streaming("pushes-a-snapshot");
-        let (client, server) = tokio::io::duplex(64 * 1024);
+        let (mut client, server) = tokio::io::duplex(64 * 1024);
 
-        let serving = tokio::spawn(events(server, api, admission(None), Watch::default()));
+        let serving = tokio::spawn(serve_events(server, api, Watch::default()));
+        let head = read_head(&mut client).await;
+        assert_eq!(head.matches("HTTP/1.1").count(), 1, "{head}");
         let mut peer = selfhost_ws::Duplex::client(client, Limits::default());
 
         let first = peer.recv().await.expect("a snapshot");
@@ -656,9 +888,10 @@ mod tests {
     #[tokio::test]
     async fn a_client_that_speaks_on_a_one_way_stream_is_closed() {
         let (api, _scratch) = api_for_streaming("one-way");
-        let (client, server) = tokio::io::duplex(64 * 1024);
+        let (mut client, server) = tokio::io::duplex(64 * 1024);
 
-        let serving = tokio::spawn(events(server, api, admission(None), Watch::default()));
+        let serving = tokio::spawn(serve_events(server, api, Watch::default()));
+        read_head(&mut client).await;
         let mut peer = selfhost_ws::Duplex::client(client, Limits::default());
         // Drain the opening snapshot so the send below is unambiguous.
         peer.recv().await.expect("a snapshot");
@@ -674,8 +907,9 @@ mod tests {
     #[tokio::test]
     async fn a_viewer_that_hangs_up_ends_the_stream() {
         let (api, _scratch) = api_for_streaming("hang-up");
-        let (client, server) = tokio::io::duplex(64 * 1024);
-        let serving = tokio::spawn(events(server, api, admission(None), Watch::default()));
+        let (mut client, server) = tokio::io::duplex(64 * 1024);
+        let serving = tokio::spawn(serve_events(server, api, Watch::default()));
+        read_head(&mut client).await;
 
         // The peer is kept alive across the await on purpose. A real browser
         // half-closes: the close frame goes out and the socket stays writable

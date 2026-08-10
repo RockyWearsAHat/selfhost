@@ -34,7 +34,7 @@
 use crate::accessibility::AccessUpdate;
 use crate::input::Composition;
 use crate::theme::Appearance;
-use crate::{Canvas, Event, Key, Modifiers, Point, PointerButton, Rect};
+use crate::{Canvas, Event, Key, KeyCode, Modifiers, Point, PointerButton, Rect};
 use std::ffi::c_void;
 use std::time::Duration;
 
@@ -759,16 +759,22 @@ impl Window {
             WM_MOUSEHWHEEL => {
                 events.push(Event::Scrolled { x: wheel_amount(message.word), y: 0.0 })
             }
-            WM_KEYDOWN | WM_SYSKEYDOWN => {
-                if let Some(key) = key_for_code(message.word as i32) {
-                    events.push(Event::KeyDown { key, modifiers });
-                }
-            }
-            WM_KEYUP | WM_SYSKEYUP => {
-                if let Some(key) = key_for_code(message.word as i32) {
-                    events.push(Event::KeyUp { key, modifiers });
-                }
-            }
+            // Reported whether or not this library has a name for the key. The
+            // virtual-key code is what the function row, the keypad, and the
+            // left and right halves of a modifier pair have instead of a name,
+            // and it is what anything forwarding a keystroke to another machine
+            // sends; `key_for_code` is the meaning, and it is allowed to have
+            // none.
+            WM_KEYDOWN | WM_SYSKEYDOWN => events.push(Event::KeyDown {
+                key: key_for_code(message.word as i32),
+                code: Some(KeyCode::new(message.word as u32)),
+                modifiers,
+            }),
+            WM_KEYUP | WM_SYSKEYUP => events.push(Event::KeyUp {
+                key: key_for_code(message.word as i32),
+                code: Some(KeyCode::new(message.word as u32)),
+                modifiers,
+            }),
             WM_CHAR => {
                 // A key held with the accelerator is a command, not typing.
                 if modifiers.command {

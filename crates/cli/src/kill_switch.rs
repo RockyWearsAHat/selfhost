@@ -26,11 +26,23 @@
 //!
 //! # How the daemon honours it
 //!
-//! The daemon polls [`POLL_INTERVAL`] and holds the answer in one flag. A stream
-//! reads that flag on every frame, so an engaged switch ends every running
-//! session inside one poll — comfortably under the WebSocket ping interval the
-//! plan requires — and [`crate::desk_task`] refuses to open a new one while it
-//! is set. Nothing is cached across the poll and nothing is remembered: removing
+//! Two readings, deliberately, because the two questions have different costs
+//! and only one of them can afford to be a poll.
+//!
+//! A **running** stream reads a flag the daemon refreshes every
+//! [`POLL_INTERVAL`]. That ends every live session inside one poll —
+//! comfortably under the WebSocket ping interval the plan requires — without
+//! putting a `stat` in a loop that runs several times a second.
+//!
+//! A **new** session asks the disk, through `desk_task::Desk::halted`. It has to:
+//! admitting on the polled flag alone was measured letting a complete
+//! 3024×1964 keyframe out to a viewer who connected 2.5 seconds after the
+//! switch went in, because the flag still carried the previous poll's answer.
+//! The same test at eight seconds sent nothing, which is how that was
+//! identified as a race rather than a bypass. One `stat`, on a route that has
+//! already passed the console gate, is what closes it.
+//!
+//! Nothing is cached across either reading and nothing is remembered: removing
 //! the file is as immediate as creating it.
 //!
 //! # Failing closed, on purpose

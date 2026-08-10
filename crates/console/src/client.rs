@@ -24,11 +24,17 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
 /// connection over a slow link is the same request over a much longer wire.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// The largest response body accepted.
+/// The largest **control-plane** response body accepted.
 ///
-/// A log fetch is the biggest thing this asks for, and it is bounded by the
-/// number of lines requested. A reply approaching this is a daemon that is not
-/// the one we think we are talking to.
+/// A log fetch is the biggest thing the control API is asked for, and it is
+/// bounded by the number of lines requested. A reply approaching this is a
+/// daemon that is not the one we think we are talking to.
+///
+/// A file is not a control-plane answer and is not held to this — see
+/// [`Client::fetch`], which passes [`crate::nas::MAX_TRANSFER`] instead. The two
+/// are separate numbers on purpose: raising one to let a film through would
+/// raise the other, and the control plane's ceiling is the thing that catches a
+/// daemon answering with something it should not.
 const MAX_BODY: usize = 8 * 1024 * 1024;
 
 /// Why a request did not produce an answer.
@@ -103,6 +109,27 @@ impl Method {
     }
 }
 
+/// What one request came back as, refusal and all.
+///
+/// Three arms rather than a `Result`, because a refusal and a failure are not
+/// the same event and the caller that wants this distinguishes them: the daemon
+/// answering *no, and here is why in structured form* is a fact to render, and a
+/// socket that would not open is a fact about the link.
+#[derive(Debug)]
+pub enum Answer {
+    /// The daemon agreed, and this is what it said.
+    Ok(Json),
+    /// The daemon refused, and this is the whole body it refused with.
+    Refused {
+        /// The status it answered with.
+        status: Status,
+        /// Its body, parsed, or [`Json::Null`] when there was none.
+        body: Json,
+    },
+    /// The request never got an answer.
+    Failed(ClientError),
+}
+
 /// A connection to one daemon's control API.
 #[derive(Debug, Clone)]
 pub struct Client {
@@ -126,6 +153,25 @@ impl Client {
         Ok(Self { address, token })
     }
 
+    /// Where this client's daemon is.
+    ///
+    /// Read by [`crate::channel`], which opens its own socket to the same place
+    /// rather than borrowing this one: a desktop stream is held open for hours
+    /// and this client's whole design is one request per connection.
+    pub fn address(&self) -> SocketAddr {
+        self.address
+    }
+
+    /// The bearer credential, for the one caller that builds its own request.
+    ///
+    /// Deliberately narrow. It exists because a WebSocket handshake is written
+    /// by hand — no other request in this program is — and the alternative was
+    /// a second copy of the token read from the same file, which is a second
+    /// thing to keep in step and a second thing to leak.
+    pub fn token(&self) -> &str {
+        &self.token
+    }
+
     /// Sends a request and reads the JSON it answers with.
     pub fn request(
         &self,
@@ -134,35 +180,8 @@ impl Client {
         body: Option<&Json>,
     ) -> Result<Json, ClientError> {
         let body = body.map(|value| value.to_text().into_bytes()).unwrap_or_default();
-        let mut stream = TcpStream::connect_timeout(&self.address, CONNECT_TIMEOUT)
-            .map_err(ClientError::Unreachable)?;
-        stream.set_read_timeout(Some(REQUEST_TIMEOUT)).map_err(ClientError::Io)?;
-        stream.set_write_timeout(Some(REQUEST_TIMEOUT)).map_err(ClientError::Io)?;
-        // One small request; batching it into one write avoids a needless round
-        // trip caused by the head and the body landing in separate segments.
-        stream.set_nodelay(true).map_err(ClientError::Io)?;
-
-        let mut request = Vec::with_capacity(256 + body.len());
-        request.extend_from_slice(method.as_str().as_bytes());
-        request.extend_from_slice(b" ");
-        request.extend_from_slice(path.as_bytes());
-        request.extend_from_slice(b" HTTP/1.1\r\nHost: ");
-        request.extend_from_slice(self.address.to_string().as_bytes());
-        request.extend_from_slice(b"\r\nAuthorization: Bearer ");
-        request.extend_from_slice(self.token.as_bytes());
-        request.extend_from_slice(b"\r\nAccept: application/json\r\nConnection: close\r\n");
-        if !body.is_empty() {
-            request.extend_from_slice(b"Content-Type: application/json\r\nContent-Length: ");
-            request.extend_from_slice(body.len().to_string().as_bytes());
-            request.extend_from_slice(b"\r\n");
-        }
-        request.extend_from_slice(b"\r\n");
-        request.extend_from_slice(&body);
-
-        stream.write_all(&request).map_err(ClientError::Io)?;
-        stream.flush().map_err(ClientError::Io)?;
-
-        let (status, payload) = read_response(&mut stream)?;
+        let content_type = (!body.is_empty()).then_some("application/json");
+        let (status, payload) = self.exchange(method, path, content_type, &body, "application/json")?;
         let text = std::str::from_utf8(&payload)
             .map_err(|_| ClientError::Protocol("the body is not UTF-8".into()))?;
         let value = if text.trim().is_empty() {
@@ -185,6 +204,38 @@ impl Client {
         Err(ClientError::Refused { status, message })
     }
 
+    /// Sends a request and hands the refusal back **whole**.
+    ///
+    /// # Why one route needs the body of a refusal
+    ///
+    /// [`ClientError::Refused`] keeps the daemon's `error` string, which is all
+    /// every other call in this console has ever wanted. The desktop ticket mint
+    /// is the exception: `crates/admin` deliberately answers it with a *legible*
+    /// refusal — `reauthenticate` with the window in seconds, or `setting` with
+    /// the name of the switch that is off — and those two fields are the whole
+    /// difference between "authenticate again" and "no credential will ever
+    /// help". Flattening them to a sentence would throw away the only thing that
+    /// tells a person which of the two they are looking at.
+    pub fn ask(&self, method: Method, path: &str, body: Option<&Json>) -> Answer {
+        let body = body.map(|value| value.to_text().into_bytes()).unwrap_or_default();
+        let content_type = (!body.is_empty()).then_some("application/json");
+        let answered = self.exchange(method, path, content_type, &body, "application/json");
+        let (status, payload) = match answered {
+            Ok(answered) => answered,
+            Err(error) => return Answer::Failed(error),
+        };
+        let value = std::str::from_utf8(&payload)
+            .ok()
+            .filter(|text| !text.trim().is_empty())
+            .and_then(|text| selfhost_json::parse(text).ok())
+            .unwrap_or(Json::Null);
+        if (200..300).contains(&status.code()) {
+            Answer::Ok(value)
+        } else {
+            Answer::Refused { status, body: value }
+        }
+    }
+
     /// Reads a resource.
     pub fn get(&self, path: &str) -> Result<Json, ClientError> {
         self.request(Method::Get, path, None)
@@ -204,10 +255,141 @@ impl Client {
     pub fn delete(&self, path: &str) -> Result<Json, ClientError> {
         self.request(Method::Delete, path, None)
     }
+
+    /// Fetches a resource as bytes rather than as JSON.
+    ///
+    /// The download half of the FILES plate. Kept apart from [`Client::get`]
+    /// because a file is not a document this program understands: it is opaque,
+    /// it goes straight to a path the operator named, and parsing it as JSON
+    /// would be both wrong and — on a large file — expensive before it failed.
+    ///
+    /// **The whole body lands in memory**, which is why [`crate::nas::MAX_TRANSFER`]
+    /// exists and is checked before the request is made. Streaming to the
+    /// destination file as the bytes arrive is the right end state and is worth
+    /// a note rather than a half-built one: it needs a second read loop that
+    /// owns the destination, and the ceiling makes the difference an operator
+    /// notices only above half a gigabyte.
+    pub fn fetch(&self, path: &str) -> Result<Vec<u8>, ClientError> {
+        let ceiling = usize::try_from(crate::nas::MAX_TRANSFER).unwrap_or(MAX_BODY);
+        let (status, payload) =
+            self.exchange_within(Method::Get, path, None, &[], "*/*", ceiling)?;
+        if (200..300).contains(&status.code()) {
+            return Ok(payload);
+        }
+        Err(self.refusal(status, &payload))
+    }
+
+    /// Sends bytes to a resource, with the content type the caller declares.
+    ///
+    /// The upload half. The daemon's bulk plane takes the body as it is, framed
+    /// by `Content-Length`, and answers JSON — so the refusal path is the same
+    /// one every other call in this client uses and the success path carries
+    /// whatever the storage API chose to say about where the bytes landed.
+    pub fn send(&self, path: &str, content_type: &str, body: &[u8]) -> Result<Json, ClientError> {
+        let (status, payload) = self.exchange(Method::Put, path, Some(content_type), body, "application/json")?;
+        if (200..300).contains(&status.code()) {
+            let text = std::str::from_utf8(&payload).unwrap_or_default();
+            return Ok(if text.trim().is_empty() {
+                Json::Null
+            } else {
+                selfhost_json::parse(text).unwrap_or(Json::Null)
+            });
+        }
+        Err(self.refusal(status, &payload))
+    }
+
+    /// One round trip: a head, an optional body, and whatever came back.
+    ///
+    /// The single place a request is built, so the credential, the framing and
+    /// the deadlines are stated once however the body is going to be read.
+    fn exchange(
+        &self,
+        method: Method,
+        path: &str,
+        content_type: Option<&str>,
+        body: &[u8],
+        accept: &str,
+    ) -> Result<(Status, Vec<u8>), ClientError> {
+        self.exchange_within(method, path, content_type, body, accept, MAX_BODY)
+    }
+
+    /// The same round trip, with the ceiling the caller is prepared to hold.
+    ///
+    /// The ceiling is a parameter because the two planes have genuinely
+    /// different ones: eight megabytes is generous for a control answer and
+    /// absurd for a file, and one number serving both would have to be the
+    /// larger — which would stop the control plane from ever noticing that
+    /// something other than the daemon is answering on this port.
+    fn exchange_within(
+        &self,
+        method: Method,
+        path: &str,
+        content_type: Option<&str>,
+        body: &[u8],
+        accept: &str,
+        ceiling: usize,
+    ) -> Result<(Status, Vec<u8>), ClientError> {
+        let mut stream = TcpStream::connect_timeout(&self.address, CONNECT_TIMEOUT)
+            .map_err(ClientError::Unreachable)?;
+        stream.set_read_timeout(Some(REQUEST_TIMEOUT)).map_err(ClientError::Io)?;
+        stream.set_write_timeout(Some(REQUEST_TIMEOUT)).map_err(ClientError::Io)?;
+        // One small request; batching it into one write avoids a needless round
+        // trip caused by the head and the body landing in separate segments.
+        stream.set_nodelay(true).map_err(ClientError::Io)?;
+
+        let mut request = Vec::with_capacity(256 + body.len());
+        request.extend_from_slice(method.as_str().as_bytes());
+        request.extend_from_slice(b" ");
+        request.extend_from_slice(path.as_bytes());
+        request.extend_from_slice(b" HTTP/1.1\r\nHost: ");
+        request.extend_from_slice(self.address.to_string().as_bytes());
+        request.extend_from_slice(b"\r\nAuthorization: Bearer ");
+        request.extend_from_slice(self.token.as_bytes());
+        request.extend_from_slice(b"\r\nAccept: ");
+        request.extend_from_slice(accept.as_bytes());
+        request.extend_from_slice(b"\r\nConnection: close\r\n");
+        if let Some(content_type) = content_type {
+            request.extend_from_slice(b"Content-Type: ");
+            request.extend_from_slice(content_type.as_bytes());
+            request.extend_from_slice(b"\r\nContent-Length: ");
+            request.extend_from_slice(body.len().to_string().as_bytes());
+            request.extend_from_slice(b"\r\n");
+        }
+        request.extend_from_slice(b"\r\n");
+        request.extend_from_slice(body);
+
+        stream.write_all(&request).map_err(ClientError::Io)?;
+        stream.flush().map_err(ClientError::Io)?;
+        read_response(&mut stream, ceiling)
+    }
+
+    /// A non-success answer as a refusal, with whatever explanation it carried.
+    ///
+    /// A bulk route answers JSON on the way *out* even when the way in was
+    /// bytes, so the same `error` field every other refusal carries is read
+    /// here too; a body that is not JSON falls back to the status's own phrase.
+    fn refusal(&self, status: Status, payload: &[u8]) -> ClientError {
+        let message = std::str::from_utf8(payload)
+            .ok()
+            .and_then(|text| selfhost_json::parse(text).ok())
+            .as_ref()
+            .and_then(|value| value.get("error"))
+            .and_then(Json::as_str)
+            .unwrap_or_else(|| status.reason())
+            .to_owned();
+        ClientError::Refused { status, message }
+    }
 }
 
 /// Reads one response: the head, then exactly the body it framed.
-fn read_response(stream: &mut TcpStream) -> Result<(Status, Vec<u8>), ClientError> {
+///
+/// `ceiling` bounds what this end is prepared to hold in memory. It is checked
+/// against the *declared* length before a byte of body is read and again as the
+/// bytes arrive, because a peer that lies about a length and a peer that simply
+/// keeps sending are two different ways to make this process allocate — and
+/// under `panic = "abort"` an allocation that fails is not an error, it is the
+/// console going away.
+fn read_response(stream: &mut TcpStream, ceiling: usize) -> Result<(Status, Vec<u8>), ClientError> {
     let mut buffer = Vec::with_capacity(4096);
     let mut scratch = [0u8; 4096];
 
@@ -222,7 +404,7 @@ fn read_response(stream: &mut TcpStream) -> Result<(Status, Vec<u8>), ClientErro
                     ));
                 }
                 buffer.extend_from_slice(&scratch[..read]);
-                if buffer.len() > MAX_BODY {
+                if buffer.len() > ceiling {
                     return Err(ClientError::Protocol("the response head is too large".into()));
                 }
             }
@@ -235,7 +417,7 @@ fn read_response(stream: &mut TcpStream) -> Result<(Status, Vec<u8>), ClientErro
         ResponseFraming::None => body.clear(),
         ResponseFraming::Fixed(length) => {
             let length = length as usize;
-            if length > MAX_BODY {
+            if length > ceiling {
                 return Err(ClientError::Protocol("the response is too large".into()));
             }
             while body.len() < length {
@@ -254,7 +436,7 @@ fn read_response(stream: &mut TcpStream) -> Result<(Status, Vec<u8>), ClientErro
                     break;
                 }
                 body.extend_from_slice(&scratch[..read]);
-                if body.len() > MAX_BODY {
+                if body.len() > ceiling {
                     return Err(ClientError::Protocol("the response is too large".into()));
                 }
             }

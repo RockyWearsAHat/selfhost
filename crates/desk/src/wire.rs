@@ -577,6 +577,30 @@ pub enum Message {
         /// Which display.
         monitor: u8,
     },
+    /// Permission to put `bytes` more payload bytes on the wire.
+    ///
+    /// # Why the client is allowed a say in this at all
+    ///
+    /// The window that bounds the bytes in flight towards a viewer is, by
+    /// default, the server's own: the sender knows what its socket has swallowed
+    /// and the browser does not. That is enough on a link with one hop, and it is
+    /// **not** enough as soon as there is a relay in the middle, because the
+    /// server's socket then answers for the first hop only and a peer that has
+    /// stopped draining looks, from here, exactly like one that is keeping up.
+    /// This message is the other half of the mux's `CREDIT` frame brought up to
+    /// the desktop protocol, so backpressure can run end to end.
+    ///
+    /// **It is opt-in, and never a gate a silent client can close.** A client
+    /// that never sends one is bounded by the transport alone, which is the
+    /// browser's case today. A client that sends one has declared a window of its
+    /// own, and from that moment the driver honours the smaller of the two — so
+    /// grants must keep coming, or the picture stops and
+    /// [`crate::viewer::Stats::credit_stalls`] says why.
+    Credit {
+        /// How many further payload bytes the client is ready to receive. Added
+        /// to whatever remains of its window, saturating.
+        bytes: u32,
+    },
 }
 
 /// Kind bytes. Grouped by direction: below `0x40` to the viewer, `0x40` and
@@ -612,6 +636,8 @@ mod kind {
     pub const RELEASE_ALL: u8 = 0x45;
     /// [`super::Message::RequestFullFrame`].
     pub const REQUEST_FULL_FRAME: u8 = 0x46;
+    /// [`super::Message::Credit`].
+    pub const CREDIT: u8 = 0x47;
 }
 
 impl Message {
@@ -633,6 +659,7 @@ impl Message {
             Self::Scroll { .. } => kind::SCROLL,
             Self::ReleaseAll => kind::RELEASE_ALL,
             Self::RequestFullFrame { .. } => kind::REQUEST_FULL_FRAME,
+            Self::Credit { .. } => kind::CREDIT,
         }
     }
 
@@ -654,6 +681,7 @@ impl Message {
             Self::Scroll { .. } => "Scroll",
             Self::ReleaseAll => "ReleaseAll",
             Self::RequestFullFrame { .. } => "RequestFullFrame",
+            Self::Credit { .. } => "Credit",
         }
     }
 
@@ -765,6 +793,7 @@ impl Message {
             }
             Self::ReleaseAll => {}
             Self::RequestFullFrame { monitor } => out.push(*monitor),
+            Self::Credit { bytes } => out.extend_from_slice(&bytes.to_be_bytes()),
         }
         if out.len() > MAX_MESSAGE {
             return Err(WireError::Oversize { length: out.len() });
@@ -840,6 +869,7 @@ impl Message {
             kind::REQUEST_FULL_FRAME => {
                 Self::RequestFullFrame { monitor: reader.u8("request.monitor")? }
             }
+            kind::CREDIT => Self::Credit { bytes: reader.u32("credit.bytes")? },
             other => return Err(WireError::UnknownKind(other)),
         };
 
@@ -1255,6 +1285,8 @@ mod tests {
             Message::Scroll { dx: MAX_SCROLL, dy: -MAX_SCROLL },
             Message::ReleaseAll,
             Message::RequestFullFrame { monitor: 2 },
+            Message::Credit { bytes: 0 },
+            Message::Credit { bytes: u32::MAX },
         ]
     }
 
@@ -1290,8 +1322,8 @@ mod tests {
                 if kind < 0x40 { Direction::ToViewer } else { Direction::ToAgent };
             assert_eq!(message.direction(), expected, "{}", message.name());
         }
-        // Fifteen message kinds; a duplicate would make one of them undecodable.
-        assert_eq!(seen.len(), 15);
+        // Sixteen message kinds; a duplicate would make one of them undecodable.
+        assert_eq!(seen.len(), 16);
     }
 
     #[test]
@@ -1309,7 +1341,21 @@ mod tests {
                     | Message::ReleaseAll
                     | Message::RequestFullFrame { .. }
             );
-            assert_eq!(is_input, message.direction() == Direction::ToAgent, "{}", message.name());
+            let to_agent = message.direction() == Direction::ToAgent;
+            if is_input {
+                assert!(to_agent, "{} must not travel towards the viewer", message.name());
+            }
+            // The converse, stated as a closed list rather than as equality: the
+            // client is allowed to say things that are not input, and every one
+            // of them has to be named here, so a new message kind cannot become
+            // an injection route by being added quietly.
+            if to_agent && !is_input {
+                assert!(
+                    matches!(message, Message::Credit { .. }),
+                    "{} travels towards the agent without being input or flow control",
+                    message.name()
+                );
+            }
         }
     }
 
@@ -1320,7 +1366,7 @@ mod tests {
 
     #[test]
     fn an_unknown_kind_is_refused_by_name() {
-        for kind in [0x00u8, 0x09, 0x3F, 0x47, 0xFF] {
+        for kind in [0x00u8, 0x09, 0x3F, 0x48, 0xFF] {
             assert_eq!(Message::decode(&[kind]), Err(WireError::UnknownKind(kind)));
         }
     }

@@ -88,7 +88,38 @@ PUT    /api/services/{name}              install or edit          → services.t
 DELETE /api/services/{name}              uninstall                → services.toml
 GET    /api/services/{name}/logs?from=N  incremental output tail
 POST   /api/services/{name}/start|stop|restart
+GET    /api/firewall                     the host firewall's state
+POST   /api/firewall/reconcile           re-assert the rules
+
+GET    /api/storage/shares               the shares this caller may open
+GET    /api/storage/shares/{id}/list     one directory
+GET    /api/storage/shares/{id}/stat     one entry
+POST   /api/storage/shares/{id}/mkdir|rename
+DELETE /api/storage/shares/{id}/entry
+GET    /api/storage/blob/{id}/{path...}  download   — streams, never buffered
+PUT    /api/storage/blob/{id}/{path...}  upload     — streams, never buffered
+
+GET    /api/desktop                      the settings this deployment chose
+GET    /api/desktop/nodes                machines this box can reach
+GET    /api/desktop/agent                is the capture agent alive, and why not
+POST   /api/desktop/ticket               mint a single-use stream ticket
+GET    /api/desktop/session?peer={node}  the WebSocket upgrade, ticket-authorised
+GET    /api/audit                        what the dangerous capabilities did
+
+*      /dav, /dav/{share}/{path...}      WebDAV — its OWN Basic credential
 ```
+
+Three notes on that table. **The byte plane is separate from the JSON plane on
+purpose:** `/api/storage/blob/*` and the WebDAV byte verbs own their socket and
+stream, because answering them through the ordinary request path would mean
+reading a share's largest file into a `Vec` under `panic = "abort"`. **WebDAV is
+not under `/api`** — the proxy relays `/dav` to this port with the request target
+completely unchanged, so the routes are `/dav/...` here — and it authenticates
+with HTTP Basic against the console password and *nothing else*: the cookie and
+the bearer token are refused there, and Basic is refused on `/api/*`. **A desktop
+stream is authorised by a ticket, not by the cookie**, because a browser cannot
+put a custom header on a WebSocket handshake and there is no preflight on one; the
+protectable moment is moved to the `POST` that mints it.
 
 Lifecycle actions answer `202`: the command was accepted, not that it finished.
 Supervision is asynchronous, so the console polls for the outcome — which it must
@@ -855,6 +886,135 @@ That is not a dirty-region scheme. Nothing decides *which part* of the window to
 repaint, because a system that works that out can work it out wrongly, and the
 symptom is a stale pixel still showing a service as running after it has died.
 
+## The two new plate families, in both consoles
+
+Two subsystems landed at once — files and a machine's own screen — and they
+arrived in *two* consoles that answer to the same doctrine and are not the same
+program. Everything above in this document is still the argument; this section is
+only what those two additions decided, and the three places the consoles honestly
+differ.
+
+### Where they live
+
+The native console gained a **tab row** and four screens: SERVICES, FILES,
+DESKTOP, PEOPLE. That is a real change to the shape of the window, and it bought
+something worth the 0.4 ms it costs to draw: the poller reads which screen is
+open, so **a plate nobody is looking at costs nothing** — no listing fetched, no
+node polled, no registry read. The browser console keeps its single scrolling
+page and hides a plate until the daemon reports something to put in it: a
+deployment with no `[[shares]]` and a caller who holds none both get a sentence,
+never an error, because absence is a state of the configuration and not a fault.
+
+### FILES
+
+A file manager rather than a listing. One plate per share carrying its id, what
+it is, and a **segmented gauge** of what it holds — which is the lamp vocabulary
+widened rather than a new mark: lit slots, so a full share reads the way a bad
+lamp does, and a share whose usage cannot be measured says so instead of drawing
+a bar at zero. Then a breadcrumb, a sortable four-column listing, and one field
+that serves new-folder, rename and upload in turn.
+
+The rule that governs the whole plate is that **every name in it is hostile
+text**. It was uploaded by whoever uploaded it; it may contain a slash, a
+percent, a newline's worth of trouble. In the browser every server string reaches
+the DOM through `textContent` and every link is built by the one encoder — the
+page's CSP is `default-src 'none'` and there is no route from a name to a script.
+In the native console the same discipline is a type: a path is percent-encoded
+exactly once, by one function, and a share id is checked against the daemon's own
+grammar before it is put in a URL. The decisions themselves — quota readings,
+size and date text, sort order, breadcrumbs, the form's five refusals — are pure
+functions in `crates/console/src/nas.rs`, each one mirroring its named
+counterpart in `sites/console/app.js` and asserted against it.
+
+### DESKTOP
+
+The plate that had to be designed against a specific failure: **a person typing
+into a window that is not sending their keys anywhere, or worse, into one that
+is.** So the mode is stated three times over, deliberately redundantly. There is
+a mode banner with a lamp and a word. The viewport frame itself takes the focus
+while a keyboard is held, lights its bezel and wears a `DRIVING` badge — a remote
+desktop whose only sign of being live is a word elsewhere on the page is one
+people type into by accident. And when the keyboard is held but the frame is not
+focused, a veil says `CLICK TO TAKE THE KEYBOARD`, because that is the one state
+in which keys are silently kept by the browser.
+
+**WATCH and TAKE CONTROL are two buttons because they are two sessions.** A
+stream opened by WATCH carries viewing and nothing else, and no key, pointer or
+wheel event is forwarded on it. TAKE CONTROL closes it and opens a *new* stream
+with a ticket minted for control — asking for the passkey at the moment it is
+clicked, however long the console has been open. There is no code path that
+upgrades a watching session in place, and that is the property that makes an old
+session not a keyboard: the capability set of a live stream is fixed in its
+opening message and neither console can widen one.
+
+Refusals are drawn **over** the picture rather than beside it, in the agent's own
+sentence plus what to do about it, because the person reading one is looking at
+the screen they just failed to type into. A machine that is down keeps its reason
+and the time it was last seen; absence is never the answer.
+
+### PEOPLE
+
+The roster by *person* rather than by device, with REVOKE, beside the audit tail.
+It exists because passkeys became named: a verified assertion answers whose
+credential signed it, so the session it mints carries that identity as
+cryptographic fact rather than claim. The trail beside it is what the dangerous
+capabilities actually did — who, when, what, and whether it was allowed — with
+the pointer's own records foldable away, since a drive session writes one line
+per input message and a trail nobody can read is a trail nobody checks.
+
+### The viewport, and why it is drawn twice in two different ways
+
+The native console composites with `Canvas::blit_bgra`, the one bitmap primitive
+`rui` has: a **1:1 device-pixel copy, never a resample**. The far machine's frame
+is fitted to the pane on the stream's own thread and published into a picture
+behind a lock separate from the snapshot's, so a frame arriving does not block the
+interface and the interface does not block a frame. The browser draws two stacked
+canvases from `ArrayBuffer`s through `putImageData` — the screen, and the cursor
+composited over it from its own channel. That is a security decision as much as a
+rendering one: the page's CSP has no `blob:` and no `data:`, which forbids blob
+URLs, `createImageBitmap`, Workers and WebCodecs, and **that CSP is the strongest
+single defence the console has**, so the viewport was built to need no widening
+of it.
+
+The one place this section bends the doctrine above is motion. An idle console
+must stop drawing, and a live viewport redraws because a far machine changed —
+which is a fact, not a decoration. Two things keep it honest: waking and drawing
+became separate decisions, so a stream's pace does not re-rasterise the interface
+for nothing; and the frame is blitted rather than rebuilt.
+
+**Measured, on an M-series Mac, at the three window sizes this document's cost
+table uses (0.9 / 2.7 / 3.6 Mpx):** blitting a full-window frame costs
+0.07 / 0.21 / 0.28 ms, and a 1920×1080 capture cropped into a 560×320 logical
+pane at 2× costs 0.11 ms. The surface comparison that normally decides whether to
+present costs 0.07–0.29 ms when the frame is identical and **0.00 ms when it
+differs** — it exits on its first word — so a viewport turns that cost into
+nothing and pays for its own blit. What a viewport actually adds is the present
+happening on every frame instead of hardly ever. About 4 ms a frame all told at
+1180×760: roughly 12% of one core at 30 fps. The SERVICES screen itself went from
+1.5 / 2.3 / 2.7 ms to 2.0 / 2.8 / 3.3 ms when the tab row arrived — measured and
+recorded rather than discovered later.
+
+### Three places the two consoles honestly differ
+
+1. **The native console holds a bearer token and has no passkey prompt.** When
+   the daemon says a login is too old to authorise a keyboard, the browser
+   console asks for the passkey inline; the native one sends the operator to the
+   browser, because it cannot perform a ceremony it has no authenticator for.
+2. **Dates.** The browser renders instants in local time. The native console
+   renders them in UTC, because nothing in its dependency set knows the machine's
+   timezone. The two agree about the instant and label it differently, and both
+   say which they are showing.
+3. **The pointer.** `rui`'s `on_hover` is a boolean and `on_drag` fires only
+   while a button is held, so the native viewport forwards a press, a drag and a
+   release exactly — and does not track a hand moving over the picture. That is
+   one missing library primitive, not console plumbing, and it is the largest
+   remaining parity gap. Keystrokes travel as physical HID usages, which is exact
+   on macOS and Windows (with the caveat that Windows reports the side-less
+   `VK_SHIFT`/`VK_CONTROL`/`VK_MENU`, so those read as the left-hand key and
+   AltGr behaves as left Alt on a non-US layout) and does **nothing at all** from
+   an X11 console, where a keycode is an index into a per-server keymap with no
+   fixed meaning.
+
 ## State
 
 **Built, and verified against a running daemon.** `selfhost daemon` supervises
@@ -891,9 +1051,11 @@ SELFHOST_FRAME_DIR=/tmp/frames \
 
 `reference_frames` draws every screen the console can be on — watching a
 service, the install form, the smallest window the backend allows, nothing
-connected, a failure announced, and a link still being made — at the real
-backing scale and through the real layout, to six PNGs, and then prints what a
-frame costs at three window sizes. It is how the *look* is judged on a machine
+connected, a failure announced, a link still being made, and, since the two new
+plate families arrived, FILES, DESKTOP with and without a live session, and
+PEOPLE, each also at 560×420 — at the real backing scale and through the real
+layout, to **fourteen** PNGs, and then prints what a frame costs at three window
+sizes. It is how the *look* is judged on a machine
 that is not the target, which the font-less tests by construction cannot do. It
 skips itself, saying so, unless `SELFHOST_FRAME_DIR` names somewhere to write and
 a font is installed.
@@ -927,7 +1089,15 @@ the bundle, and reopens it if it was open. Finish any session that touched
 **Compile-verified only.** The Windows and X11 backends type-check for
 `x86_64-pc-windows-gnu` and `x86_64-unknown-linux-gnu` but have never been run —
 everything so far has been built and tested on a Mac. They are the first thing
-to exercise when the Windows machine arrives.
+to exercise when the Windows machine arrives, and `cargo run -p rui --example
+counter` on each is the cheapest way to do it.
+
+**The desktop stream has never crossed a real socket.** `crates/console/src/
+channel.rs` writes the RFC 6455 client handshake by hand, verifies the accept
+key, refuses a subprotocol it does not know, decodes masked frames, assembles
+tiles onto a surface and fits each completed frame on its own thread — all of it
+unit-tested, and no byte of it has reached a real agent. The first live run is
+the thing to watch: the handshake, then the first `Hello`.
 
 **The SSH transport and Git deployment are built, and verified live.** The
 console opened a tunnel as a managed child, showed a live daemon's services
@@ -938,8 +1108,12 @@ started, and printed the checked-out file; a second commit stopped it, updated
 the working copy, and started it again on the new commit.
 
 **Not built.** Views for sites and certificates. The console shows services,
-which is what the control API serves; the sites-and-certificates view waits on
-an API that reports them. There is no view for a Git watch either: a watched
-service reports every deployment into its own output, which the console already
-tails, but the branch and interval are only editable in `data/services.toml` or
-over the API.
+files, desktops and people, which is what the control API serves; the
+sites-and-certificates view waits on an API that reports them. There is no view
+for a Git watch either: a watched service reports every deployment into its own
+output, which the console already tails, but the branch and interval are only
+editable in `data/services.toml` or over the API. And the console's *start the
+capture agent* button has nothing to call — `selfhost_admin::Fleet` has no
+operator-start method, so the only way to clear a surrendered agent today is to
+clear the kill switch. The daemon side of that is already wired and tested; it
+wants one method and one route.

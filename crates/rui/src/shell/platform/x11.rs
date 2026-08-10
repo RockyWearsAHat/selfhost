@@ -51,7 +51,7 @@
 
 use crate::accessibility::AccessUpdate;
 use crate::theme::Appearance;
-use crate::{Canvas, Event, Key, Modifiers, Point, PointerButton, Rect};
+use crate::{Canvas, Event, Key, KeyCode, Modifiers, Point, PointerButton, Rect};
 use std::cell::RefCell;
 use std::ffi::{CStr, c_char, c_int, c_long, c_uint, c_ulong, c_void};
 use std::time::Duration;
@@ -1085,13 +1085,22 @@ impl Window {
                 std::ptr::null_mut(),
             );
 
-            if let Some(named) = key_for_symbol(keysym) {
-                events.push(if event.kind == KEY_PRESS {
-                    Event::KeyDown { key: named, modifiers }
-                } else {
-                    Event::KeyUp { key: named, modifiers }
-                });
-            }
+            // The keysym is what the layout made of the key and the hardware
+            // keycode is the key itself, which is exactly the difference between
+            // what a widget wants and what a keystroke forwarded to another
+            // machine wants. Both go out, and the event is sent even when the
+            // keysym names nothing this library has a word for — the function
+            // row, the keypad, either half of a modifier pair.
+            //
+            // An X11 keycode is the evdev scancode plus eight, and means nothing
+            // to Windows or macOS; see [`KeyCode`](crate::KeyCode).
+            let named = key_for_symbol(keysym);
+            let code = Some(KeyCode::new(key.keycode));
+            events.push(if event.kind == KEY_PRESS {
+                Event::KeyDown { key: named, code, modifiers }
+            } else {
+                Event::KeyUp { key: named, code, modifiers }
+            });
 
             // A key held with the accelerator is a command, not typing.
             if event.kind != KEY_PRESS || modifiers.command || written <= 0 {

@@ -1,7 +1,7 @@
 # selfhost
 
-Host websites, databases, DNS, and mail from your own hardware. One config file,
-one binary, no vendor.
+Host websites, databases, DNS, mail, files, and a machine's own screen from your
+own hardware. One config file, one binary, no vendor.
 
 ## Why this exists
 
@@ -50,8 +50,12 @@ path — nothing a visitor sends reaches either:
   no independence — the repository is GitHub's either way.
 
 Everything above the socket is ours: HTTP parsing, the reverse proxy, load
-balancing, health checking, byte ranges, ACME, the DNS wire format, SMTP, and
-IMAP.
+balancing, health checking, byte ranges, ACME, the DNS wire format, SMTP, IMAP,
+RFC 6455 WebSockets, WebDAV, and this project's own remote-desktop protocol. The
+six crates added in August 2026 — `ws`, `identity`, `desk`, `mesh`, `screen`,
+`storage` — add **no** package to the dependency list between them; platform
+integration is raw FFI, and the operating system's own SMB server is *run* rather
+than reimplemented, like `ssh` and `git`.
 
 The reason is not purity. An external binary drags in its own release cadence,
 its own platform matrix, its own checksum-and-download layer, and its own
@@ -61,13 +65,26 @@ whose job is to stay up unattended.
 
 ## Status
 
-**1,600+ tests pass.** The proxy runs and serves, the daemon supervises
+**3,117 tests pass.** The proxy runs and serves, the daemon supervises
 services, the desktop console drives it — over an SSH tunnel it manages itself —
 and a push to a watched branch redeploys the service built from it. ACME
 issuance, the authoritative DNS server (split-horizon, dynamic apex A), the mail
 server (SMTP, submission, IMAP), the firewall manager, and the web console all
 run today — [`docs/roadmap.md`](docs/roadmap.md) has the honest breakdown of
 what remains.
+
+Two subsystems landed in August 2026 and both are **off unless a file says
+otherwise**: **network storage** (shares served over the console API, over
+WebDAV at `/dav`, and over the operating system's own SMB server) and **remote
+desktop** (a machine's screen and keyboard, reached through the console site,
+authorised by a single-use ticket rather than a cookie, with watching and driving
+as separate capabilities and driving requiring a *fresh* credential). Neither
+binds a socket — the admin API is still loopback-only and the only public surface
+is still the proxy on 80/443. Neither has ever run on Windows: about nine
+thousand lines of Windows-only code type-check for `x86_64-pc-windows-gnu` and
+have never executed. `desktop-lab.dx` and `nas-lab.dx` carry the evidence,
+including what is unverified, and `docs/SECURITY.md` §3.7 is the specification
+they answer to.
 
 Selfhost also updates *itself*: an opt-in `[self_update]` section names the
 repository this deployment is a clone of, the daemon polls the branch, and a
@@ -99,21 +116,34 @@ fix — reverse DNS and the NAT in front of the router belong to the ISP, and
 ```
 crates/
   http/     HTTP/1.1 parsing and serialisation. Pure, no I/O, no dependencies.
+  json/     JSON, for the control API.
+  ws/       RFC 6455 WebSockets. Binary frames only; five of six modules pure.
   config/   Deployment config model and validation. The source of truth.
-  proxy/    TLS termination, static serving, reverse proxy, load balancing.
+  identity/ Who the caller is and what they may do. Sits below everything asking.
+  proxy/    TLS termination, static serving, reverse proxy, load balancing, and
+            the two loopback relays (/api/* and /dav).
   mail/     Addresses and the SMTP session state machine.
-  dns/      DNS wire format and a stub resolver.
-  supervisor/ Runs services and keeps them running.
+  dns/      DNS wire format, stub resolver, authoritative zones.
+  acme/     RFC 8555 certificate issuance. igd/ registrar/ app-deploy/ alongside.
+  supervisor/ Runs services and keeps them running. firewall/ reconciles rules.
+  storage/  Shares: the confining resolver, WebDAV, quotas, and the OS's own
+            SMB server driven as a program.
+  desk/     The remote-desktop protocol. Pure; `unsafe_code = "forbid"`.
+  screen/   This machine's pixels and input devices. The FFI lives here.
+  mesh/     One outbound link carrying many channels. A worker dials; nothing
+            listens.
   admin/    The loopback control API the console drives.
-  json/     JSON, for that API.
   git/      Watches a branch and redeploys the service built from it.
   rui/      `rui`: a declarative interface library — elements, style, layout,
             rasteriser, TrueType engine, windows. No dependencies, and nothing
             in it knows about selfhost. Its own repository is at
             github.com/RockyWearsAHat/rui. See crates/rui/README.md.
   console/  The `selfhost-console` desktop binary, written in `rui`.
+  vpn-ui/   SelfHostVPN.app, the desktop VPN panel.
   cli/      The `selfhost` binary, including `doctor` and `daemon`.
-docs/       Getting started, measured constraints, roadmap.
+docs/       Getting started, the security guidebook, measured constraints,
+            roadmap.
+*.dx        The index and the runnable labs — start at index.dx.
 ```
 
 ## Security properties enforced in code
@@ -137,6 +167,23 @@ These are unit-tested rather than asserted:
   path it is about to remove and refuses any that is not inside the project
   directory, so a working copy configured elsewhere — or a `path` of `/` typed
   into the catalogue — is reported and left alone rather than obeyed.
+- **A share path refuses `..` rather than popping it**, and matches it *after*
+  trimming trailing dots and spaces, on every platform — Windows strips those
+  before the filesystem sees a component, so `".. "` would pass an exact-equality
+  refusal and normalise back to `..`. Confinement is then enforced again at the
+  open, by a descriptor walk, because canonicalise-then-open is a race the moment
+  a caller can create a symlink — and on a share they can.
+- **Driving a machine needs a fresh credential, not a live session.** A control
+  ticket is minted only when the login it rides was proved by password or passkey
+  within a configured window (default 120 s), is single-use, expires in 30 s, and
+  is checked again at the handshake and again on every input message. Watching
+  and driving are separate capabilities, and an unattended bearer token is
+  refused the keyboard unless a config field says otherwise.
+- **A kill switch that is not the console.** `touch <data_dir>/desktop.disabled`
+  ends every desktop stream within one poll and refuses every new one. It is a
+  file rather than a command so that nothing — not the config, not the API, not a
+  password, not the daemon's health — has to still be working to use it, and it
+  fails closed.
 
 Verified live against a running instance, not only in unit tests: `401` without
 a token and with a wrong one against the control API, `404` for three encodings

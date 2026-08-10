@@ -1445,6 +1445,811 @@ async fn drive(prefix: Vec<u8>, request: Request, plan: storage_api::Bulk) -> St
     String::from_utf8_lossy(&written).into_owned()
 }
 
+// ---- WebDAV -----------------------------------------------------------------
+//
+// The rules about *what a path may reach*, what a `207` looks like and what a
+// lock excludes live in `selfhost-storage` and are tested there without a
+// socket. What is tested here is the joining: which credential opens a mount,
+// what an unauthenticated request looks like whatever the verb, and — the rule
+// that is the opposite of every other route in this crate — that a refusal
+// *after* authentication is never a second 401, because macOS and Windows both
+// read one as "the stored password is wrong" and prompt for ever.
+
+use selfhost_admin::dav_api;
+
+/// The console API with a password, a writable `vault` and a read-only
+/// `photos`, and a configured console hostname so `Destination` has an
+/// authority to be checked against.
+fn dav_api_with_shares(name: &str) -> (Api, ScratchDir) {
+    let (plain, dir) = api(name);
+    ConsolePassword::write(dir.path(), PASSWORD).expect("password written");
+    let ledger = Arc::new(Ledger::new());
+    let volumes = Volumes::from_opened(vec![
+        open_share(dir.path(), "vault", &ledger, false, Vec::new()),
+        open_share(dir.path(), "photos", &ledger, true, Vec::new()),
+    ]);
+    let api = plain
+        .with_console_auth_parts(ConsolePassword::load(dir.path()), Sessions::new())
+        .with_console_origin(CONSOLE_HOST)
+        .with_storage(volumes);
+    (api, dir)
+}
+
+/// The console site's configured hostname in these tests.
+const CONSOLE_HOST: &str = "console.example";
+
+/// Every verb this build answers, as a WebDAV client spells it.
+const DAV_VERBS: [&str; 12] = [
+    "OPTIONS", "PROPFIND", "PROPPATCH", "MKCOL", "GET", "HEAD", "PUT", "DELETE", "COPY", "MOVE",
+    "LOCK", "UNLOCK",
+];
+
+/// An `Authorization: Basic` header value.
+fn basic(user: &str, password: &str) -> String {
+    format!("Basic {}", base64(format!("{user}:{password}").as_bytes()))
+}
+
+/// Standard base64, written here because this crate deliberately has no base64
+/// dependency and its own decoder is private.
+fn base64(bytes: &[u8]) -> String {
+    const ALPHABET: &[u8; 64] =
+        b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::new();
+    for chunk in bytes.chunks(3) {
+        let mut packed = 0u32;
+        for index in 0..3 {
+            packed = (packed << 8) | u32::from(chunk.get(index).copied().unwrap_or(0));
+        }
+        for index in 0..4 {
+            if index <= chunk.len() {
+                let position = usize::try_from((packed >> (18 - 6 * index)) & 0x3f).expect("6 bits");
+                out.push(char::from(ALPHABET[position]));
+            } else {
+                out.push('=');
+            }
+        }
+    }
+    out
+}
+
+/// A WebDAV request carrying the console password.
+async fn dav(api: &Api, method: &str, target: &str, body: &str) -> Response {
+    dav_with(api, method, target, &[], body).await
+}
+
+/// The same, with extra headers.
+async fn dav_with(
+    api: &Api,
+    method: &str,
+    target: &str,
+    headers: &[(&str, &str)],
+    body: &str,
+) -> Response {
+    let credential = basic("owner", PASSWORD);
+    let mut all = vec![("Authorization", credential.as_str())];
+    all.extend_from_slice(headers);
+    call_with(api, method, target, &all, body).await
+}
+
+/// A response body as text, for the XML answers.
+fn body_text(response: &Response) -> String {
+    match &response.body {
+        Body::Bytes(bytes) => String::from_utf8_lossy(bytes).into_owned(),
+        _ => String::new(),
+    }
+}
+
+#[tokio::test]
+async fn every_webdav_verb_refuses_an_unauthenticated_caller_with_one_identical_challenge() {
+    // The uniform-401 property, and the realm is the part that must never vary:
+    // Finder keys its keychain item on it and Windows keys its credential on
+    // it, so a challenge that differed by share, by verb or by whether the
+    // share exists would look like a different server on every request.
+    let (api, _dir) = dav_api_with_shares("dav-noauth");
+    let mut challenge: Option<String> = None;
+    for verb in DAV_VERBS {
+        for target in ["/dav", "/dav/", "/dav/vault", "/dav/vault/a.txt", "/dav/attic/secret.txt"]
+        {
+            let response = call_with(&api, verb, target, &[], "").await;
+            assert_eq!(response.status.code(), 401, "{verb} {target}");
+            assert!(body_text(&response).is_empty(), "{verb} {target} said something");
+            let offered = response
+                .headers
+                .get_str("www-authenticate")
+                .expect("every 401 here carries a challenge")
+                .to_owned();
+            match &challenge {
+                None => challenge = Some(offered),
+                Some(first) => assert_eq!(first, &offered, "{verb} {target}"),
+            }
+        }
+    }
+    let challenge = challenge.expect("at least one challenge");
+    assert!(challenge.starts_with("Basic realm="), "{challenge}");
+    assert!(challenge.contains("charset=\"UTF-8\""), "{challenge}");
+}
+
+#[tokio::test]
+async fn a_wrong_password_and_a_malformed_header_are_the_same_answer_as_none_at_all() {
+    let (api, _dir) = dav_api_with_shares("dav-wrong");
+    let anonymous = call_with(&api, "PROPFIND", "/dav/vault", &[], "").await;
+    for hostile in [
+        basic("owner", "not the password"),
+        basic("", ""),
+        "Basic !!!!".to_owned(),
+        "Basic".to_owned(),
+        "Digest username=\"owner\"".to_owned(),
+    ] {
+        let refused =
+            call_with(&api, "PROPFIND", "/dav/vault", &[("Authorization", &hostile)], "").await;
+        assert_eq!(refused.status.code(), 401, "{hostile}");
+        assert_eq!(
+            refused.headers.get_str("www-authenticate"),
+            anonymous.headers.get_str("www-authenticate"),
+            "{hostile}"
+        );
+        assert_eq!(body_text(&refused), body_text(&anonymous), "{hostile}");
+    }
+}
+
+#[tokio::test]
+async fn neither_the_bearer_token_nor_a_session_cookie_opens_a_mount() {
+    // Deliberate. A cookie would make every `/dav` path a cross-site request
+    // forgery surface on the very origin that holds the console session, and
+    // the bearer token would put the deployment's root credential into a
+    // keychain that replays it for the life of a mount.
+    let (api, _dir) = dav_api_with_shares("dav-otherdoors");
+    let cookie = login(&api).await;
+    let bearer = format!("Bearer {TOKEN}");
+    for headers in [
+        vec![("Authorization", bearer.as_str())],
+        vec![("Cookie", cookie.as_str())],
+        vec![("Cookie", cookie.as_str()), ("X-Selfhost-Console", "1")],
+    ] {
+        let refused = call_with(&api, "PROPFIND", "/dav/vault", &headers, "").await;
+        assert_eq!(refused.status.code(), 401, "{headers:?}");
+        assert!(refused.headers.get_str("www-authenticate").is_some(), "{headers:?}");
+    }
+}
+
+#[tokio::test]
+async fn the_credential_that_opens_a_mount_opens_nothing_that_drives_the_machine() {
+    // The identity rule made observable. `Credential::Password` is unattended —
+    // a keychain replays it on every request for the life of a mount, with
+    // nobody present — so the Basic door reaches shares and reaches nothing
+    // else, whatever `[desktop].bearer_may_control` is set to.
+    let (api, _dir) = dav_api_with_shares("dav-onedoor");
+    let credential = basic("owner", PASSWORD);
+
+    let opened = dav(&api, "OPTIONS", "/dav", "").await;
+    assert_eq!(opened.status.code(), 200, "the mount opens");
+
+    for target in [
+        "/api/services",
+        "/api/desktop",
+        "/api/desktop/nodes",
+        "/api/desktop/agent?peer=local",
+        "/api/storage/shares",
+        "/api/audit",
+        "/api/firewall",
+    ] {
+        let refused =
+            call_with(&api, "GET", target, &[("Authorization", &credential)], "").await;
+        assert_eq!(refused.status.code(), 401, "{target}");
+    }
+    let minted = call_with(
+        &api,
+        "POST",
+        "/api/desktop/ticket",
+        &[("Authorization", &credential), ("X-Selfhost-Console", "1")],
+        "",
+    )
+    .await;
+    assert_eq!(minted.status.code(), 401, "a mount must never mint a stream ticket");
+}
+
+#[tokio::test]
+async fn options_answers_the_four_headers_that_make_a_mount_happen() {
+    let (api, _dir) = dav_api_with_shares("dav-options");
+    // Both the mount root and a share root: Finder asks the first before it
+    // knows a share exists, and a 404 for it ends the attempt.
+    for target in ["/dav", "/dav/", "/dav/vault", "/dav/vault/"] {
+        let response = dav(&api, "OPTIONS", target, "").await;
+        assert_eq!(response.status.code(), 200, "{target}");
+        // Class 2 is locking, and without it both clients mount read-only.
+        assert_eq!(response.headers.get_str("dav"), Some("1, 2"), "{target}");
+        // Without this the Windows Mini-Redirector tries FrontPage first.
+        assert_eq!(response.headers.get_str("ms-author-via"), Some("DAV"), "{target}");
+        assert_eq!(response.headers.get_str("accept-ranges"), Some("bytes"), "{target}");
+        let allow = response.headers.get_str("allow").expect("an Allow header").to_owned();
+        for verb in DAV_VERBS {
+            assert!(allow.contains(verb), "{target}: {allow} omits {verb}");
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_verb_this_build_does_not_serve_is_a_405_that_says_what_to_send_instead() {
+    // Not a 501: that says the *server* does not understand the method, which is
+    // untrue and which some clients treat as fatal for the whole mount.
+    let (api, _dir) = dav_api_with_shares("dav-405");
+    for verb in ["POST", "PATCH", "TRACE", "REPORT", "SEARCH"] {
+        let response = dav(&api, verb, "/dav/vault/a.txt", "").await;
+        assert_eq!(response.status.code(), 405, "{verb}");
+        assert!(response.headers.get_str("allow").is_some(), "{verb} must say what is allowed");
+    }
+}
+
+#[tokio::test]
+async fn a_propfind_lists_a_share_and_reports_the_free_space_finder_insists_on() {
+    let (api, dir) = dav_api_with_shares("dav-propfind");
+    std::fs::write(dir.path().join("vault").join("notes.txt"), "hello").expect("a file");
+
+    let response = dav_with(&api, "PROPFIND", "/dav/vault", &[("Depth", "1")], "").await;
+    assert_eq!(response.status.code(), 207, "{:?}", body_text(&response));
+    let body = body_text(&response);
+    // The collection's own href ends in a slash: Finder builds a child's URL by
+    // appending to it, so one without would produce children a level too high.
+    assert!(body.contains("<D:href>/dav/vault/</D:href>"), "{body}");
+    assert!(body.contains("<D:href>/dav/vault/notes.txt</D:href>"), "{body}");
+    assert!(body.contains("<D:collection/>"), "{body}");
+    // RFC 4331. Without these Finder reads zero free space and refuses every
+    // copy before it starts.
+    assert!(body.contains("quota-available-bytes"), "{body}");
+    assert!(body.contains("quota-used-bytes"), "{body}");
+
+    // Depth 0 is the resource alone.
+    let alone = dav_with(&api, "PROPFIND", "/dav/vault", &[("Depth", "0")], "").await;
+    assert_eq!(alone.status.code(), 207);
+    assert!(!body_text(&alone).contains("notes.txt"), "{}", body_text(&alone));
+}
+
+#[tokio::test]
+async fn a_hostile_filename_reaches_the_client_as_a_link_to_itself_and_not_to_another_file() {
+    // A directory can hold `a%2fb.txt`, whose own text placed in a URL asks for
+    // `a/b.txt` one level down — so a client shown the raw name copies,
+    // overwrites or deletes a different file than the one it was shown. Every
+    // href goes through the encoded type, which has no constructor from a
+    // String, and this is that rule observed from outside.
+    let (api, dir) = dav_api_with_shares("dav-href");
+    std::fs::write(dir.path().join("vault").join("a%2fb.txt"), "x").expect("a hostile name");
+
+    let response = dav_with(&api, "PROPFIND", "/dav/vault", &[("Depth", "1")], "").await;
+    assert_eq!(response.status.code(), 207);
+    let body = body_text(&response);
+    assert!(body.contains("a%252fb.txt"), "the percent is encoded: {body}");
+    assert!(!body.contains("<D:href>/dav/vault/a%2fb.txt</D:href>"), "{body}");
+}
+
+#[tokio::test]
+async fn depth_infinity_is_refused_with_the_condition_that_tells_a_client_to_retry() {
+    let (api, _dir) = dav_api_with_shares("dav-depth");
+    // An absent Depth header means infinity, which RFC 4918 requires and which
+    // is the opposite of the safe-looking default.
+    for headers in [vec![], vec![("Depth", "infinity")], vec![("Depth", "Infinity")]] {
+        let response = dav_with(&api, "PROPFIND", "/dav/vault", &headers, "").await;
+        assert_eq!(response.status.code(), 403, "{headers:?}");
+        assert!(body_text(&response).contains("propfind-finite-depth"), "{headers:?}");
+    }
+    let confused = dav_with(&api, "PROPFIND", "/dav/vault", &[("Depth", "2")], "").await;
+    assert_eq!(confused.status.code(), 400);
+}
+
+#[tokio::test]
+async fn an_authenticated_caller_naming_no_share_gets_a_404_and_is_never_asked_again() {
+    // The one place this crate's uniform 401 is deliberately not the answer. A
+    // second 401 is what makes both desktop clients throw away the credential
+    // they stored and prompt for ever — and it conceals nothing, because the
+    // only credential that opens /dav is the deployment-wide one, which holds
+    // every share there is.
+    let (api, _dir) = dav_api_with_shares("dav-noshare");
+    for target in ["/dav/attic", "/dav/attic/deep/file.txt", "/dav/NOT%20A%20SHARE/x"] {
+        let response = dav_with(&api, "PROPFIND", target, &[("Depth", "0")], "").await;
+        assert_eq!(response.status.code(), 404, "{target}");
+        assert!(
+            response.headers.get_str("www-authenticate").is_none(),
+            "{target} must not re-challenge"
+        );
+    }
+    let missing = dav_with(&api, "PROPFIND", "/dav/vault/nowhere.txt", &[("Depth", "0")], "").await;
+    assert_eq!(missing.status.code(), 404);
+}
+
+#[tokio::test]
+async fn a_share_the_caller_may_not_write_refuses_every_writing_verb_with_403() {
+    // `read_only` is a statement about the data and binds the owner too, so
+    // this is the refusal a mount meets even holding the root credential — and
+    // it is made by the route, before a descriptor is opened, for the byte
+    // plane as much as for the document plane.
+    let (api, dir) = dav_api_with_shares("dav-readonly");
+    std::fs::write(dir.path().join("photos").join("holiday.jpg"), "x").expect("a file");
+
+    for (verb, target, headers) in [
+        ("MKCOL", "/dav/photos/new", vec![]),
+        ("DELETE", "/dav/photos/holiday.jpg", vec![]),
+        ("PROPPATCH", "/dav/photos/holiday.jpg", vec![]),
+        ("PUT", "/dav/photos/new.txt", vec![("Content-Length", "0")]),
+        (
+            "MOVE",
+            "/dav/photos/holiday.jpg",
+            vec![("Destination", "https://console.example/dav/photos/other.jpg")],
+        ),
+    ] {
+        let response = dav_with(&api, verb, target, &headers, "").await;
+        assert_eq!(response.status.code(), 403, "{verb} {target}");
+    }
+
+    // Reading it is fine, which is the whole point of a read-only share.
+    let listed = dav_with(&api, "PROPFIND", "/dav/photos", &[("Depth", "1")], "").await;
+    assert_eq!(listed.status.code(), 207, "{:?}", body_text(&listed));
+
+    // And a copy *into* it is refused by the destination's own rules, not the
+    // source's — the asymmetry a function given only a path would have missed.
+    let copied = dav_with(
+        &api,
+        "COPY",
+        "/dav/vault",
+        &[("Destination", "https://console.example/dav/photos/vault-copy")],
+        "",
+    )
+    .await;
+    assert_eq!(copied.status.code(), 403);
+
+    // The other direction is an ordinary request and must not be refused: a
+    // COPY *reads* its source, so a read-only share is a perfectly good place
+    // to copy out of. Asking the source for write would have broken it.
+    let rescued = dav_with(
+        &api,
+        "COPY",
+        "/dav/photos/holiday.jpg",
+        &[("Destination", "https://console.example/dav/vault/holiday.jpg")],
+        "",
+    )
+    .await;
+    assert_eq!(rescued.status.code(), 201, "{:?}", body_text(&rescued));
+    assert!(dir.path().join("vault").join("holiday.jpg").exists());
+    assert!(dir.path().join("photos").join("holiday.jpg").exists(), "the source is untouched");
+}
+
+#[tokio::test]
+async fn mkcol_makes_one_directory_and_refuses_a_second_a_body_and_a_missing_parent() {
+    let (api, dir) = dav_api_with_shares("dav-mkcol");
+
+    let made = dav(&api, "MKCOL", "/dav/vault/papers", "").await;
+    assert_eq!(made.status.code(), 201, "{:?}", body_text(&made));
+    // A collection's Location ends in a slash, and it is built by the encoder
+    // rather than spelled here.
+    assert_eq!(made.headers.get_str("location"), Some("/dav/vault/papers/"));
+    assert!(dir.path().join("vault").join("papers").is_dir());
+
+    // RFC 4918 §9.3.1: onto an existing resource this is 405, not 409.
+    let again = dav(&api, "MKCOL", "/dav/vault/papers", "").await;
+    assert_eq!(again.status.code(), 405);
+
+    // A body is 415: this build implements no extended MKCOL, and ignoring one
+    // would create a collection that is not the one that was asked for.
+    let bodied = dav(&api, "MKCOL", "/dav/vault/other", "<x/>").await;
+    assert_eq!(bodied.status.code(), 415);
+
+    // One directory, never a tree: a missing parent is 409, so a typo does not
+    // build a path.
+    let orphan = dav(&api, "MKCOL", "/dav/vault/nope/deeper", "").await;
+    assert_eq!(orphan.status.code(), 409);
+    assert!(!dir.path().join("vault").join("nope").exists());
+}
+
+#[tokio::test]
+async fn delete_removes_a_tree_and_then_says_it_is_gone() {
+    let (api, dir) = dav_api_with_shares("dav-delete");
+    std::fs::create_dir_all(dir.path().join("vault").join("tree").join("inner"))
+        .expect("a tree");
+    std::fs::write(dir.path().join("vault").join("tree").join("inner").join("a.txt"), "x")
+        .expect("a leaf");
+
+    let removed = dav(&api, "DELETE", "/dav/vault/tree", "").await;
+    assert_eq!(removed.status.code(), 204, "{:?}", body_text(&removed));
+    assert!(!dir.path().join("vault").join("tree").exists(), "depth-infinity, as §9.6 means");
+
+    let gone = dav_with(&api, "PROPFIND", "/dav/vault/tree", &[("Depth", "0")], "").await;
+    assert_eq!(gone.status.code(), 404);
+}
+
+#[tokio::test]
+async fn copy_and_move_funnel_the_destination_through_the_same_resolver_as_the_request_line() {
+    // A MOVE whose destination escapes its root is a write-anywhere primitive
+    // as complete as a traversal, and Overwrite: T compounds it. Every refusal
+    // below is one somebody has exploited on some other server.
+    let (api, dir) = dav_api_with_shares("dav-transfer");
+    let vault = dir.path().join("vault");
+    std::fs::write(vault.join("one.txt"), "first").expect("a file");
+    std::fs::write(vault.join("two.txt"), "second").expect("another file");
+
+    let destination = format!("https://{CONSOLE_HOST}/dav/vault/copied.txt");
+    let copied =
+        dav_with(&api, "COPY", "/dav/vault/one.txt", &[("Destination", &destination)], "").await;
+    assert_eq!(copied.status.code(), 201, "{:?}", body_text(&copied));
+    assert_eq!(copied.headers.get_str("location"), Some("/dav/vault/copied.txt"));
+    assert_eq!(std::fs::read_to_string(vault.join("copied.txt")).expect("the copy"), "first");
+
+    // Overwrite: F onto an occupied destination is a precondition the client
+    // stated, so 412 — never 409, which the client reads as a missing parent.
+    let refused = dav_with(
+        &api,
+        "COPY",
+        "/dav/vault/two.txt",
+        &[("Destination", &destination), ("Overwrite", "F")],
+        "",
+    )
+    .await;
+    assert_eq!(refused.status.code(), 412);
+    assert_eq!(std::fs::read_to_string(vault.join("copied.txt")).expect("untouched"), "first");
+
+    // With T (the default) it replaces, and a replacement is 204.
+    let replaced =
+        dav_with(&api, "COPY", "/dav/vault/two.txt", &[("Destination", &destination)], "").await;
+    assert_eq!(replaced.status.code(), 204);
+    assert_eq!(std::fs::read_to_string(vault.join("copied.txt")).expect("replaced"), "second");
+
+    // A MOVE leaves nothing behind.
+    let moved = dav_with(
+        &api,
+        "MOVE",
+        "/dav/vault/one.txt",
+        &[("Destination", &format!("https://{CONSOLE_HOST}/dav/vault/moved.txt"))],
+        "",
+    )
+    .await;
+    assert_eq!(moved.status.code(), 201);
+    assert!(!vault.join("one.txt").exists());
+
+    // Every way of getting the header wrong.
+    for (header, expected) in [
+        (None, 400),
+        (Some("https://elsewhere.example/dav/vault/x"), 502),
+        (Some("/etc/passwd"), 400),
+        (Some("//elsewhere.example/dav/vault/x"), 400),
+        (Some(&format!("https://{CONSOLE_HOST}/dav/vault/../../etc/passwd")), 404),
+        (Some(&format!("https://{CONSOLE_HOST}/dav/attic/x")), 409),
+        (Some(&format!("https://{CONSOLE_HOST}/dav/photos/x")), 403),
+    ] {
+        let headers: Vec<(&str, &str)> =
+            header.map_or_else(Vec::new, |value| vec![("Destination", value)]);
+        let response = dav_with(&api, "MOVE", "/dav/vault/two.txt", &headers, "").await;
+        assert_eq!(response.status.code(), expected, "Destination: {header:?}");
+        assert!(vault.join("two.txt").exists(), "nothing moved: {header:?}");
+    }
+
+    // An Overwrite spelling that is neither T nor F is a 400: guessing at a
+    // third means guessing whether the client meant to destroy something.
+    let confused = dav_with(
+        &api,
+        "MOVE",
+        "/dav/vault/two.txt",
+        &[("Destination", &destination), ("Overwrite", "maybe")],
+        "",
+    )
+    .await;
+    assert_eq!(confused.status.code(), 400);
+}
+
+#[tokio::test]
+async fn a_lock_excludes_a_second_client_and_the_token_is_what_lets_a_write_through() {
+    // Locking is not a formality: both the Windows Mini-Redirector and macOS
+    // WebDAVFS lock before every write, and a server that claimed `DAV: 1, 2`
+    // without one would be mounted and then fail on the first PUT.
+    let (api, _dir) = dav_api_with_shares("dav-lock");
+    let lockinfo = "<?xml version=\"1.0\"?><D:lockinfo xmlns:D=\"DAV:\">\
+                    <D:lockscope><D:exclusive/></D:lockscope>\
+                    <D:locktype><D:write/></D:locktype>\
+                    <D:owner>Rocky</D:owner></D:lockinfo>";
+
+    // A lock on a name that does not exist yet is granted and answered 201 —
+    // the lock-null resource Windows takes before it creates a file.
+    let granted =
+        dav_with(&api, "LOCK", "/dav/vault/doc.txt", &[("Depth", "0")], lockinfo).await;
+    assert_eq!(granted.status.code(), 201, "{:?}", body_text(&granted));
+    let token = granted
+        .headers
+        .get_str("lock-token")
+        .expect("a Lock-Token header, which is where every client reads it")
+        .to_owned();
+    assert!(token.starts_with('<') && token.ends_with('>'), "coded-URL grammar: {token}");
+    assert!(body_text(&granted).contains("lockdiscovery"), "Finder parses the timeout from it");
+    let inner = token.trim_matches(['<', '>']).to_owned();
+
+    // A second client is excluded.
+    let contested =
+        dav_with(&api, "LOCK", "/dav/vault/doc.txt", &[("Depth", "0")], lockinfo).await;
+    assert_eq!(contested.status.code(), 423);
+    assert!(body_text(&contested).contains("lock-token-submitted"), "{}", body_text(&contested));
+
+    // And so is a write that does not submit the token.
+    let blocked = dav_with(&api, "PUT", "/dav/vault/doc.txt", &[("Content-Length", "0")], "").await;
+    assert_eq!(blocked.status.code(), 423);
+
+    // Submitting it lets the holder through. The byte plane owns a connection,
+    // so what is asserted here is the decision the socket layer makes.
+    let condition = format!("(<{inner}>)");
+    let (request, _) = request_with(
+        "PUT",
+        "/dav/vault/doc.txt",
+        None,
+        &[
+            ("Authorization", &basic("owner", PASSWORD)),
+            ("If", &condition),
+            ("Content-Length", "0"),
+        ],
+        "",
+    );
+    let wiring = api.dav_wiring().expect("a wired mount");
+    assert!(dav_api::admit(&wiring, &request).await.is_ok(), "the lock holder writes");
+
+    // A refresh extends what the client already holds; a refresh naming no live
+    // lock is a precondition that is not true.
+    let refreshed = dav_with(
+        &api,
+        "LOCK",
+        "/dav/vault/doc.txt",
+        &[("If", &condition), ("Timeout", "Second-120")],
+        "",
+    )
+    .await;
+    assert_eq!(refreshed.status.code(), 200);
+    let stale = dav_with(
+        &api,
+        "LOCK",
+        "/dav/vault/doc.txt",
+        &[("If", "(<urn:uuid:0000>)")],
+        "",
+    )
+    .await;
+    assert_eq!(stale.status.code(), 412);
+
+    // A token at the wrong URL releases nothing: the token is the capability
+    // and the URL is what an operator reads in a log.
+    let elsewhere =
+        dav_with(&api, "UNLOCK", "/dav/vault/other.txt", &[("Lock-Token", &token)], "").await;
+    assert_eq!(elsewhere.status.code(), 409);
+
+    let released =
+        dav_with(&api, "UNLOCK", "/dav/vault/doc.txt", &[("Lock-Token", &token)], "").await;
+    assert_eq!(released.status.code(), 204);
+    let twice =
+        dav_with(&api, "UNLOCK", "/dav/vault/doc.txt", &[("Lock-Token", &token)], "").await;
+    assert_eq!(twice.status.code(), 409);
+    let missing = dav(&api, "UNLOCK", "/dav/vault/doc.txt", "").await;
+    assert_eq!(missing.status.code(), 400);
+
+    // With the lock gone the write goes through the document plane's decision
+    // unopposed.
+    let clear = dav_with(&api, "PUT", "/dav/vault/doc.txt", &[("Content-Length", "0")], "").await;
+    assert_ne!(clear.status.code(), 423, "the lock was released");
+}
+
+#[tokio::test]
+async fn a_shared_lock_is_refused_rather_than_quietly_granted_as_an_exclusive_one() {
+    // A client that asked for a lock several writers may hold and received one
+    // only it may hold would behave correctly; one that asked for exclusivity
+    // and got a shared lock would not, and a server that blurs the two
+    // eventually does the second.
+    let (api, _dir) = dav_api_with_shares("dav-shared-lock");
+    let shared = "<D:lockinfo xmlns:D=\"DAV:\"><D:lockscope><D:shared/></D:lockscope>\
+                  <D:locktype><D:write/></D:locktype></D:lockinfo>";
+    let response = dav_with(&api, "LOCK", "/dav/vault/x.txt", &[("Depth", "0")], shared).await;
+    assert_eq!(response.status.code(), 403);
+
+    let nonsense = dav_with(&api, "LOCK", "/dav/vault/x.txt", &[("Depth", "0")], "<not-xml").await;
+    assert_eq!(nonsense.status.code(), 400);
+
+    let deep = dav_with(
+        &api,
+        "LOCK",
+        "/dav/vault/x.txt",
+        &[("Depth", "1")],
+        "<D:lockinfo xmlns:D=\"DAV:\"><D:lockscope><D:exclusive/></D:lockscope>\
+         <D:locktype><D:write/></D:locktype></D:lockinfo>",
+    )
+    .await;
+    assert_eq!(deep.status.code(), 400, "Depth: 1 is not a lock depth");
+}
+
+#[tokio::test]
+async fn proppatch_says_plainly_that_it_stored_nothing() {
+    // Explorer issues one after every PUT. Answering 200 to a property we did
+    // not store is a server telling a client a timestamp was preserved when it
+    // was not, and this project does not make that trade anywhere else.
+    let (api, dir) = dav_api_with_shares("dav-proppatch");
+    std::fs::write(dir.path().join("vault").join("a.txt"), "x").expect("a file");
+
+    let body = "<D:propertyupdate xmlns:D=\"DAV:\" xmlns:Z=\"urn:schemas-microsoft-com:\">\
+                <D:set><D:prop><Z:Win32LastModifiedTime>Mon, 1 Jan 2024 00:00:00 GMT\
+                </Z:Win32LastModifiedTime></D:prop></D:set></D:propertyupdate>";
+    let response = dav(&api, "PROPPATCH", "/dav/vault/a.txt", body).await;
+    assert_eq!(response.status.code(), 207, "{:?}", body_text(&response));
+    let answered = body_text(&response);
+    assert!(answered.contains("<D:href>/dav/vault/a.txt</D:href>"), "{answered}");
+    assert!(answered.contains("403"), "each property is refused: {answered}");
+
+    // Of something that is not there, it is a 404 rather than a 207 full of
+    // refusals about a file that does not exist.
+    let nowhere = dav(&api, "PROPPATCH", "/dav/vault/absent.txt", body).await;
+    assert_eq!(nowhere.status.code(), 404);
+}
+
+#[tokio::test]
+async fn a_put_creates_then_replaces_and_a_get_brings_the_bytes_back_as_an_attachment() {
+    let (api, dir) = dav_api_with_shares("dav-bytes");
+
+    let created = drive_dav(&api, "PUT", "/dav/vault/hello.txt", &[], "hello there").await;
+    assert!(created.starts_with("HTTP/1.1 201"), "{created}");
+    assert!(created.contains("Location: /dav/vault/hello.txt"), "{created}");
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("vault").join("hello.txt")).expect("the file"),
+        "hello there"
+    );
+
+    // A second PUT replaces, and a replacement is 204 — which is what a client
+    // uses to decide whether to refresh its view.
+    let replaced = drive_dav(&api, "PUT", "/dav/vault/hello.txt", &[], "again").await;
+    assert!(replaced.starts_with("HTTP/1.1 204"), "{replaced}");
+
+    let fetched = drive_dav(&api, "GET", "/dav/vault/hello.txt", &[], "").await;
+    assert!(fetched.starts_with("HTTP/1.1 200"), "{fetched}");
+    // Pinned to an attachment: /dav is served from the console's own origin, and
+    // a file a caller uploaded and then had rendered inline there is stored
+    // cross-site scripting with the console as its target.
+    assert!(fetched.to_ascii_lowercase().contains("attachment"), "{fetched}");
+    assert!(fetched.ends_with("again"), "{fetched}");
+
+    let headed = drive_dav(&api, "HEAD", "/dav/vault/hello.txt", &[], "").await;
+    assert!(headed.starts_with("HTTP/1.1 200"), "{headed}");
+    assert!(!headed.ends_with("again"), "a HEAD carries no body: {headed}");
+}
+
+#[tokio::test]
+async fn the_byte_plane_refuses_what_it_cannot_frame_and_what_it_cannot_reach() {
+    let (api, _dir) = dav_api_with_shares("dav-byteplane");
+    let credential = basic("owner", PASSWORD);
+    let wiring = api.dav_wiring().expect("a wired mount");
+
+    let (chunked, _) = request_with(
+        "PUT",
+        "/dav/vault/a.txt",
+        None,
+        &[("Authorization", &credential), ("Transfer-Encoding", "chunked")],
+        "",
+    );
+    let refused = dav_api::admit(&wiring, &chunked).await.expect_err("chunked is not framed");
+    assert_eq!(refused.response().status.code(), 411);
+
+    let (anonymous, _) = request_with("GET", "/dav/vault/a.txt", None, &[], "");
+    let challenged = dav_api::admit(&wiring, &anonymous).await.expect_err("no credential");
+    assert_eq!(challenged.response().status.code(), 401);
+    assert!(challenged.response().headers.get_str("www-authenticate").is_some());
+
+    let (document, _) = request_with(
+        "PROPFIND",
+        "/dav/vault",
+        None,
+        &[("Authorization", &credential)],
+        "",
+    );
+    let wrong_plane = dav_api::admit(&wiring, &document).await.expect_err("not a byte verb");
+    assert_eq!(wrong_plane.response().status.code(), 405);
+}
+
+#[tokio::test]
+async fn the_verified_credential_cache_is_on_this_path() {
+    // Not an optimisation. `ConsolePassword::verify` is 600,000 PBKDF2
+    // iterations, WebDAV re-authenticates on essentially every request, and
+    // Finder's first act on a mount is a PROPFIND sweep — so an uncached path
+    // spends roughly seventy milliseconds of a core per file, and a
+    // five-hundred-file mount is thirty-five seconds during which the daemon
+    // serves nobody.
+    let (api, _dir) = dav_api_with_shares("dav-cache");
+    let password = ConsolePassword::load(_dir.path());
+
+    // What one cold verification costs on this machine, measured rather than
+    // assumed: the iteration count is deliberate and the hardware is not.
+    let cold = std::time::Instant::now();
+    assert!(password.verify(PASSWORD), "the password is the one we wrote");
+    let one_verification = cold.elapsed();
+
+    // Warm the cache, then run a sweep the size of a small directory.
+    let first = dav_with(&api, "PROPFIND", "/dav/vault", &[("Depth", "0")], "").await;
+    assert_eq!(first.status.code(), 207);
+
+    const SWEEP: u32 = 20;
+    let swept = std::time::Instant::now();
+    for _ in 0..SWEEP {
+        let response = dav_with(&api, "PROPFIND", "/dav/vault", &[("Depth", "0")], "").await;
+        assert_eq!(response.status.code(), 207);
+    }
+    let sweep = swept.elapsed();
+    assert!(
+        sweep < one_verification * SWEEP / 4,
+        "{SWEEP} requests took {sweep:?}; one verification alone is {one_verification:?}, \
+         so the credential cache is not on this path"
+    );
+
+    // Bounded and keyed: the sweep is one entry, not twenty-one.
+    let wiring = api.dav_wiring().expect("a wired mount");
+    assert_eq!(wiring.webdav.credentials().len(), 1);
+}
+
+#[tokio::test]
+async fn a_credential_that_keeps_failing_is_throttled_and_the_console_door_is_untouched() {
+    // Every WebDAV client's first request is unauthenticated by protocol
+    // design, so feeding those refusals to the console's global login gate
+    // would let mounting a single share lock the operator out of the console
+    // they would use to unmount it. WebDAV gets a counter of its own: per
+    // credential, self-clearing, and in a crate the session code does not call.
+    let (api, _dir) = dav_api_with_shares("dav-throttle");
+    let wrong = basic("owner", "not the password");
+    for _ in 0..(selfhost_storage::auth::MAX_FAILURES * 2) {
+        let refused =
+            call_with(&api, "PROPFIND", "/dav/vault", &[("Authorization", &wrong)], "").await;
+        assert_eq!(refused.status.code(), 401);
+    }
+
+    // The right password still works — the throttle names one credential.
+    let allowed = dav_with(&api, "PROPFIND", "/dav/vault", &[("Depth", "0")], "").await;
+    assert_eq!(allowed.status.code(), 207);
+
+    // And the console's own login is untouched, which is the whole point.
+    let cookie = login(&api).await;
+    let response = call_with(&api, "GET", "/api/services", &[("Cookie", &cookie)], "").await;
+    assert_eq!(response.status.code(), 200);
+}
+
+#[tokio::test]
+async fn a_deployment_with_no_shares_challenges_rather_than_saying_so() {
+    // A mount point that answered 404 with no password and 401 with one would
+    // be a way to read the deployment's configuration from outside it.
+    let (plain, dir) = api("dav-unwired");
+    ConsolePassword::write(dir.path(), PASSWORD).expect("password written");
+    let api = plain.with_console_auth_parts(ConsolePassword::load(dir.path()), Sessions::new());
+    for verb in DAV_VERBS {
+        let response = dav(&api, verb, "/dav/vault/a.txt", "").await;
+        assert_eq!(response.status.code(), 401, "{verb}");
+        assert!(response.headers.get_str("www-authenticate").is_some(), "{verb}");
+    }
+}
+
+/// Runs a WebDAV byte transfer over a duplex and returns everything written
+/// back, exactly as the socket layer would.
+async fn drive_dav(
+    api: &Api,
+    method: &str,
+    target: &str,
+    headers: &[(&str, &str)],
+    body: &str,
+) -> String {
+    let credential = basic("owner", PASSWORD);
+    let length = body.len().to_string();
+    let mut all = vec![("Authorization", credential.as_str())];
+    all.extend_from_slice(headers);
+    if method == "PUT" {
+        all.push(("Content-Length", length.as_str()));
+    }
+    let (request, prefix) = request_with(method, target, None, &all, body);
+    let passage = {
+        let wiring = api.dav_wiring().expect("a wired mount");
+        dav_api::admit(&wiring, &request).await.expect("the owner may transfer")
+    };
+
+    let (mut ours, mut theirs) = tokio::io::duplex(1024 * 1024);
+    let served = tokio::spawn(async move {
+        let report = dav_api::serve(&mut ours, prefix, &request, passage).await;
+        drop(ours);
+        report
+    });
+    let mut written = Vec::new();
+    theirs.read_to_end(&mut written).await.expect("the answer is readable");
+    served.await.expect("the task finished").expect("the transfer is answered");
+    String::from_utf8_lossy(&written).into_owned()
+}
+
 // ---- desktop ----------------------------------------------------------------
 
 /// A fleet that reports two machines and drives nothing.

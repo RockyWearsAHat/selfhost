@@ -769,14 +769,72 @@ pub async fn serve<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
+    let placement = Placement { volume: plan.volume, who: plan.who, at: plan.at };
     match plan.transfer {
         Transfer::Download(disposition) => {
-            download(stream, request, plan.volume, plan.who, plan.at, disposition).await
+            download_bytes(stream, request, placement, disposition, &json_failure).await
         }
         Transfer::Upload { declared, existing } => {
-            upload(stream, prefix, plan.volume, plan.who, plan.at, existing, declared).await
+            upload_bytes(
+                stream,
+                prefix,
+                placement,
+                existing,
+                declared,
+                Answers {
+                    landed: selfhost_storage::api::done(),
+                    truncated: problem(Status(400), "the body ended before the declared length"),
+                    failed: &json_failure,
+                },
+            )
+            .await
         }
     }
+}
+
+/// A storage failure as the JSON file API renders it.
+///
+/// Named rather than written inline because it is now one of **two** renderings
+/// — WebDAV answers the same failures with a bare status, since no WebDAV client
+/// parses a body and the JSON one would carry a refused path into a response
+/// this crate has promised not to put it in. Two protocols, one engine, and the
+/// difference held in one visible place.
+fn json_failure(failure: &Failure) -> Response {
+    selfhost_storage::api::failed(failure)
+}
+
+/// The file a transfer is about: the share, the caller, and the resolved path.
+///
+/// The three travel together everywhere because they are only meaningful
+/// together — a path with no share is not a file, and a share with no caller
+/// cannot decide whether the file may be touched. Bundling them also keeps both
+/// byte-plane entry points inside a parameter count a reader can hold, which
+/// matters more than usual here: these are the two functions in this crate that
+/// move a gigabyte, and a transposed argument would be silent.
+pub struct Placement {
+    /// The share, held so the blocking task can walk it.
+    pub volume: Arc<Volume>,
+    /// Who asked, in the vocabulary the share's own grant check speaks.
+    pub who: Identity,
+    /// The path inside the share, already through the security resolver.
+    pub at: RelativePath,
+}
+
+/// How a transfer's outcome is spoken on the wire.
+///
+/// The bytes are identical for both protocols and the sentences are not: the
+/// browser file manager wants JSON it can render, and WebDAV wants `201`, `204`
+/// and a bare status. Carrying the three answers rather than branching on a
+/// protocol flag is what keeps [`upload_bytes`] from having to know which caller
+/// it has — and keeps a future third caller from adding a third branch to it.
+pub struct Answers<'a> {
+    /// The whole declared length arrived and the file was published.
+    pub landed: Response,
+    /// The body ended early. Nothing was published, and the status says the
+    /// request was the problem rather than the box.
+    pub truncated: Response,
+    /// How this protocol renders a failure the storage engine reported.
+    pub failed: &'a (dyn Fn(&Failure) -> Response + Sync),
 }
 
 /// What a finished transfer did, for the daemon's log.
@@ -816,17 +874,20 @@ impl fmt::Display for Report {
 /// which reuses `http::range::evaluate` and `date::entity_tag` unchanged — the
 /// same code the static file server has always used, so a 206, a 304 and a 416
 /// mean here exactly what they mean there.
-async fn download<S>(
+///
+/// `failed` is how the calling protocol renders a refusal; see [`Answers`] for
+/// why that is a parameter rather than a fixed shape.
+pub async fn download_bytes<S>(
     stream: &mut S,
     request: &Request,
-    volume: Arc<Volume>,
-    who: Identity,
-    at: RelativePath,
+    placement: Placement,
     disposition: Disposition,
+    failed: &(dyn Fn(&Failure) -> Response + Sync),
 ) -> std::io::Result<Report>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
+    let Placement { volume, who, at } = placement;
     let share = volume.share().id().as_str().to_owned();
     let head_only = request.method == Method::Head;
     // `Volume::download` opens a descriptor and reads its metadata, both of
@@ -837,7 +898,7 @@ where
     let opened = match opened {
         Ok(opened) => opened,
         Err(failure) => {
-            let response = selfhost_storage::api::failed(&failure);
+            let response = failed(&failure);
             let status = response.status.code();
             write_response(stream, &response).await?;
             return Ok(Report { share, direction: "download", bytes: 0, status });
@@ -876,8 +937,8 @@ where
 /// directory and publishing it atomically at the end.
 ///
 /// Nothing here ever holds the body: the socket is read into a fixed
-/// [`CHUNK`]-sized buffer, the chunk is handed to a blocking task that owns the
-/// [`Receiver`], and the task writes it. The declared length is admitted against
+/// fixed 64 KiB buffer, the chunk is handed to a blocking task that owns the
+/// [`selfhost_storage::api::Receiver`], and the task writes it. The declared length is admitted against
 /// the share's quota before the first byte and re-checked as bytes land, so a
 /// client that declares a kilobyte and sends a hundred gigabytes is stopped
 /// while it is sending them rather than after.
@@ -886,18 +947,21 @@ where
 /// file. That is the whole reason the feed carries a marker instead of relying on
 /// the channel closing: a closed channel cannot tell "the client finished" from
 /// "the client vanished", and one of those must not publish a file.
-async fn upload<S>(
+///
+/// `answers` is how the calling protocol speaks the three outcomes; see
+/// [`Answers`].
+pub async fn upload_bytes<S>(
     stream: &mut S,
     prefix: Vec<u8>,
-    volume: Arc<Volume>,
-    who: Identity,
-    at: RelativePath,
+    placement: Placement,
     existing: Existing,
     declared: u64,
+    answers: Answers<'_>,
 ) -> std::io::Result<Report>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
+    let Placement { volume, who, at } = placement;
     let share = volume.share().id().as_str().to_owned();
     let opening = {
         let volume = Arc::clone(&volume);
@@ -907,7 +971,9 @@ where
     };
     let mut receiver = match opening {
         Ok(receiver) => receiver,
-        Err(failure) => return refuse_upload(stream, &share, &failure).await,
+        Err(failure) => {
+            return refuse_upload(stream, &share, &(answers.failed)(&failure)).await;
+        }
     };
 
     let (feed, mut chunks) = tokio::sync::mpsc::channel::<Feed>(FEED_DEPTH);
@@ -973,11 +1039,11 @@ where
     };
 
     let response = match finished {
-        Ok(true) => selfhost_storage::api::done(),
+        Ok(true) => answers.landed,
         // The body did not arrive whole. Nothing was published, and the status
         // says the request was the problem rather than the box.
-        Ok(false) => problem(Status(400), "the body ended before the declared length"),
-        Err(failure) => selfhost_storage::api::failed(&failure),
+        Ok(false) => answers.truncated,
+        Err(failure) => (answers.failed)(&failure),
     };
     let status = response.status.code();
     write_response(stream, &response).await?;
@@ -1004,13 +1070,16 @@ enum Feed {
 /// [`crate::handle_connection`](crate) does with every response, so the
 /// unread body dies with the socket rather than being read into memory to be
 /// thrown away.
-async fn refuse_upload<S>(stream: &mut S, share: &str, failure: &Failure) -> std::io::Result<Report>
+async fn refuse_upload<S>(
+    stream: &mut S,
+    share: &str,
+    response: &Response,
+) -> std::io::Result<Report>
 where
     S: AsyncWrite + Unpin,
 {
-    let response = selfhost_storage::api::failed(failure);
     let status = response.status.code();
-    write_response(stream, &response).await?;
+    write_response(stream, response).await?;
     Ok(Report { share: share.to_owned(), direction: "upload", bytes: 0, status })
 }
 

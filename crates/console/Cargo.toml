@@ -12,11 +12,28 @@ name = "selfhost-console"
 path = "src/main.rs"
 
 [dependencies]
+# The random source behind the handshake nonce and the per-frame masks RFC 6455
+# requires of a client. The same `ring` the workspace already links, not a
+# second one.
+ring = { workspace = true }
 selfhost-config = { workspace = true }
+# The remote-desktop vocabulary: the message codec, the tile codec and the key
+# table. Pure and platform-free by its own manifest, which is what makes it the
+# crate both consoles link rather than each inventing a parser for the same
+# bytes.
+selfhost-desk = { workspace = true }
 selfhost-firewall = { workspace = true }
 selfhost-http = { workspace = true }
 selfhost-json = { workspace = true }
+# The two platform key tables, in the one direction they are written and read
+# backwards here. See `remote::usage_for_code` for why a second table is the one
+# thing a keystroke forwarder must never write.
+selfhost-screen = { workspace = true }
 selfhost-supervisor = { workspace = true }
+# RFC 6455 framing and the handshake's accept key. The codec is pure; nothing
+# here starts a runtime, and the desktop stream is read on an ordinary blocking
+# thread beside the poller's.
+selfhost-ws = { workspace = true }
 rui = { workspace = true }
 
 [lints.rust]

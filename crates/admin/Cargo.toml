@@ -25,6 +25,13 @@ selfhost-http = { workspace = true }
 # ask it without depending on the crate that routes to them.
 selfhost-identity = { workspace = true }
 selfhost-json = { workspace = true }
+# The owner's half of a peer link. `GET /api/mesh/link` is the one route on this
+# API whose credential arrives *after* the handshake — a worker proves its
+# enrolment in the first frame — so the admission, the replay ledger and the mux
+# have to run in the process that answered the upgrade. Nothing here binds: the
+# worker dials in, and this crate only ever accepts what the daemon already
+# serves on loopback.
+selfhost-mesh = { workspace = true }
 # The NAS engine. Every rule about what a path may reach and what a caller may
 # do with it lives there and is tested there without a socket; this crate
 # supplies the socket, the runtime and the capability decision.

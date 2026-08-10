@@ -140,6 +140,35 @@ impl AgentPipe {
         })
     }
 
+    /// Creates the pipe for whoever is signed into `session`, resolving the SID.
+    ///
+    /// This is the constructor the daemon uses, and [`AgentPipe::create`] is the
+    /// one the tests use. The difference is deliberate: a security identifier is
+    /// the one value in this subsystem that ends up *concatenated into a security
+    /// descriptor*, so the daemon never handles one at all — it names a session and
+    /// this resolves the console user's token, reads the SID off it and drops the
+    /// token before the pipe exists. A caller that cannot obtain a SID is a caller
+    /// that cannot pass the wrong one.
+    ///
+    /// # Errors
+    ///
+    /// `Ok(None)` means **nobody is signed into that session** — an ordinary state
+    /// on a machine sitting at its login screen, not a failure, and the caller
+    /// should simply not spawn an agent yet. A [`Fault`] means the query itself
+    /// failed: `ERROR_ACCESS_DENIED` from `WTSQueryUserToken` says this process is
+    /// not `LocalSystem`, under which the whole session-0 plan is inoperative, and
+    /// a fault from the creation itself carries the words in [`AgentPipe::create`].
+    ///
+    /// Requires `SE_TCB_NAME`, which `LocalSystem` holds.
+    pub fn for_console_session(session: u32) -> Result<Option<Self>, Fault> {
+        let Some(token) = desktop::console_user_token(session)? else {
+            return Ok(None);
+        };
+        let sid = desktop::token_user_sid(&token)?;
+        drop(token);
+        Ok(Some(Self::create(session, &sid)?))
+    }
+
     /// The pipe's name, for a diagnostics line.
     pub fn name(&self) -> &str {
         &self.name

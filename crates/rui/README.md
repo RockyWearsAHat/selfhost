@@ -82,7 +82,7 @@ button as well, you are either sending a patch upstream or writing it from
 scratch anyway, and the catalogue you were handed turns out to be a list of the
 things you are allowed to want.
 
-What a foundation owes you instead is that any of them can be *written*. Five
+What a foundation owes you instead is that any of them can be *written*. Seven
 primitives cover it:
 
 | primitive | what it gives you |
@@ -91,7 +91,9 @@ primitives cover it:
 | `painter.visual()` | whether it is hovered, held, focused, disabled, and how far its hover has eased |
 | `painter.ease(name, target, seconds)` | the same frame-rate-independent curve every built-in animation runs on, for anything the hover does not already answer |
 | `.on_drag(\|state, drag\|)` | where the pointer is *within it*, every frame it is held — clamped by `drag.fraction()` |
-| `.on_key`, `.on_scroll`, `.on_hover`, `.layer` | the keyboard, the wheel, the pointer arriving, and somewhere to put what opens |
+| `.on_key`, `.on_key_up`, `.on_scroll`, `.on_hover`, `.layer` | the keyboard both ways, the wheel, the pointer arriving, and somewhere to put what opens |
+| `.on_raw_key(\|state, stroke\|)` | the *physical* key and which way it moved, including keys `Key` does not name — what you forward to another machine |
+| `painter.canvas().blit_bgra(rect, &picture)` | a bitmap somebody else made — a decoded image, a screen captured elsewhere — copied in one source pixel per device pixel |
 
 `ease` is what makes "animates on the same curve" true rather than nearly true.
 A figure that counts up to its new number, a bar that sweeps to its reading, a
@@ -449,6 +451,21 @@ settled it waits `App::idle_timeout`, and a window nobody is touching costs
 nothing. Animation advances by *elapsed time*, and the library reads no clock —
 it is told how long the last frame took, which is what makes an animation
 assertable in a test.
+
+News that the interface did not cause — a picture arriving on a socket, a job
+finishing — comes in through `App::redraw()`, a `Send + Sync` handle that says
+*when* and never *what*:
+
+```ignore
+let redraw = app.redraw();
+redraw.within(Duration::from_millis(16));   // while a stream is live
+std::thread::spawn(move || { /* ... */ redraw.request(); });
+```
+
+It bounds latency rather than interrupting the window: a request shortens how
+long the loop may wait, and the loop draws when something asked it to. That
+keeps the backend seam the size it is instead of growing a wake-up primitive per
+platform, and a window nobody has asked anything of waits exactly as it did.
 
 ## Reloading it while you work
 

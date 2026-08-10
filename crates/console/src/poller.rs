@@ -18,7 +18,10 @@
 //! or does not.
 
 use crate::client::{Client, ClientError};
-use crate::state::{Command, Link, LogLine, Snapshot};
+use crate::nas::{self, Listing, Share};
+use crate::registry::{Person, Trail};
+use crate::remote::{Agent, Node, Settings};
+use crate::state::{Command, FileAction, Link, LogLine, Screen, Snapshot};
 use selfhost_firewall::FirewallState;
 use selfhost_json::Json;
 use selfhost_supervisor::state::{ServiceStatus, spec_from_json, spec_to_json};
@@ -116,9 +119,23 @@ fn run(connect: impl Connect, shared: Arc<Mutex<Snapshot>>, running: Arc<AtomicB
         if acted || due {
             last_poll = Some(Instant::now());
             if refresh_services(ready, &shared) {
-                refresh_definition(ready, &shared);
-                refresh_logs(ready, &shared);
-                refresh_firewall(ready, &shared);
+                // The service list is fetched whatever is on screen: the
+                // masthead's own condition is read off it, and every screen
+                // carries the masthead. Everything below is per-screen — see
+                // [`Screen`] for why a plate nobody has open costs nothing.
+                match screen(&shared) {
+                    Screen::Services => {
+                        refresh_definition(ready, &shared);
+                        refresh_logs(ready, &shared);
+                        refresh_firewall(ready, &shared);
+                    }
+                    Screen::Files => {
+                        refresh_shares(ready, &shared);
+                        refresh_listing(ready, &shared);
+                    }
+                    Screen::Desktop => refresh_desktop(ready, &shared),
+                    Screen::People => refresh_people(ready, &shared),
+                }
             }
         }
 
@@ -126,23 +143,41 @@ fn run(connect: impl Connect, shared: Arc<Mutex<Snapshot>>, running: Arc<AtomicB
     }
 }
 
+/// Which screen the interface has open.
+fn screen(shared: &Arc<Mutex<Snapshot>>) -> Screen {
+    shared.lock().expect("the snapshot lock was poisoned").screen
+}
+
 /// Runs one command and reports what the daemon said about it.
 fn carry_out(client: &Client, shared: &Arc<Mutex<Snapshot>>, command: Command) {
-    let name = command.service().to_owned();
-    let Some(path) = service_path(&name) else {
-        let mut snapshot = shared.lock().expect("the snapshot lock was poisoned");
-        snapshot.report_problem(format!("{name:?} is not a usable service name"));
-        return;
-    };
-
+    // The two commands that are about no service take their own path: their
+    // targets are checked against their own grammars, and building a service
+    // path for them would be a path nobody asked for.
     let outcome = match &command {
-        Command::Start(_) => client.post(&format!("{path}/start")),
-        Command::Stop(_) => client.post(&format!("{path}/stop")),
-        Command::Restart(_) => client.post(&format!("{path}/restart")),
-        Command::Uninstall(_) => client.delete(&path),
-        Command::Install(spec) => client.put(&path, &spec_to_json(spec)),
+        Command::Files { share, action } => carry_out_file(client, share, action),
+        Command::RevokePasskey { id, .. } => revoke(client, id),
+        _ => {
+            let name = command.service().to_owned();
+            let Some(path) = service_path(&name) else {
+                let mut snapshot = shared.lock().expect("the snapshot lock was poisoned");
+                snapshot.report_problem(format!("{name:?} is not a usable service name"));
+                return;
+            };
+            match &command {
+                Command::Start(_) => client.post(&format!("{path}/start")),
+                Command::Stop(_) => client.post(&format!("{path}/stop")),
+                Command::Restart(_) => client.post(&format!("{path}/restart")),
+                Command::Uninstall(_) => client.delete(&path),
+                Command::Install(spec) => client.put(&path, &spec_to_json(spec)),
+                // Answered above; stated so the match is closed rather than
+                // defaulted, which is what makes a variant added later a build
+                // error instead of a command that silently does nothing.
+                Command::Files { .. } | Command::RevokePasskey { .. } => return,
+            }
+        }
     };
 
+    let name = command.service().to_owned();
     let mut snapshot = shared.lock().expect("the snapshot lock was poisoned");
     match outcome {
         Ok(_) => {
@@ -154,6 +189,17 @@ fn carry_out(client: &Client, shared: &Arc<Mutex<Snapshot>>, command: Command) {
             }
             if matches!(command, Command::Install(_)) {
                 snapshot.selected = Some(name);
+            }
+            // A directory that has just been written to is stale, and the next
+            // ordinary poll is up to half a second away. Clearing the listing
+            // is what makes the row appear — or disappear — as the press
+            // finishes rather than a beat later.
+            if matches!(command, Command::Files { .. }) {
+                snapshot.files.listing = None;
+                snapshot.files.trouble = None;
+            }
+            if matches!(command, Command::RevokePasskey { .. }) {
+                snapshot.people.holders = None;
             }
         }
         Err(error) => {
@@ -291,6 +337,261 @@ fn refresh_logs(client: &Client, shared: &Arc<Mutex<Snapshot>>) {
         return;
     }
     snapshot.logs.append(lines, next_seq, missed);
+}
+
+/// Carries out one file action against one share.
+///
+/// # Every path is encoded exactly once, here
+///
+/// The console keeps plain paths and this is the only place one becomes part of
+/// a request, through [`nas::url_path`]. That is what makes a file called
+/// `a&b=c` a file rather than a second query parameter, and a directory called
+/// `100%` a directory rather than a malformed escape. The share id is *checked*
+/// rather than encoded, for the reason [`service_path`] checks a service name.
+fn carry_out_file(
+    client: &Client,
+    share: &str,
+    action: &FileAction,
+) -> Result<Json, ClientError> {
+    let Some(base) = share_path(share) else {
+        return Err(refused(400, format!("{share:?} is not a usable share id")));
+    };
+    match action {
+        FileAction::Mkdir { path } => {
+            client.request(
+                crate::client::Method::Post,
+                &format!("{base}/mkdir"),
+                Some(&Json::object([("path", Json::string(path.as_str()))])),
+            )
+        }
+        FileAction::Rename { from, to } => client.request(
+            crate::client::Method::Post,
+            &format!("{base}/rename"),
+            Some(&Json::object([
+                ("from", Json::string(from.as_str())),
+                ("to", Json::string(to.as_str())),
+                // Never `true`. A rename that silently replaced an existing
+                // name would destroy a file the operator did not name, and the
+                // daemon's own refusal is the thing that stops it.
+                ("replace", Json::Bool(false)),
+            ])),
+        ),
+        FileAction::Delete { path } => {
+            client.delete(&format!("{base}/entry?path={}", nas::url_path(path)))
+        }
+        FileAction::Download { path, to } => {
+            let bytes = client.fetch(&blob_path(share, path))?;
+            std::fs::write(to, &bytes)
+                .map(|()| Json::Null)
+                .map_err(|error| refused(500, format!("could not write the file: {error}")))
+        }
+        FileAction::Upload { from, path } => {
+            let bytes = std::fs::read(from)
+                .map_err(|error| refused(400, format!("could not read the file: {error}")))?;
+            if bytes.len() as u64 > nas::MAX_TRANSFER {
+                return Err(refused(
+                    413,
+                    format!(
+                        "this console uploads files up to {} at a time",
+                        nas::size_text(nas::MAX_TRANSFER)
+                    ),
+                ));
+            }
+            // The bulk plane takes the bytes as they are; the type is stated as
+            // the one that claims nothing, because guessing a type from a
+            // suffix is how a file comes back later as something it is not.
+            client.send(&blob_path(share, path), "application/octet-stream", &bytes)
+        }
+    }
+}
+
+/// Takes one credential out of the registry.
+fn revoke(client: &Client, id: &str) -> Result<Json, ClientError> {
+    if !crate::registry::usable_credential_id(id) {
+        return Err(refused(400, "that is not a credential this daemon issued".to_owned()));
+    }
+    client.delete(&format!("/api/webauthn/credentials/{id}"))
+}
+
+/// A refusal this console made on its own, in the shape the daemon's would take.
+///
+/// So that a local objection — an unusable share id, a file that would not open
+/// — reaches the notice bar through the same path a remote one does, rather than
+/// through a second reporting mechanism that would eventually say it differently.
+fn refused(status: u16, message: String) -> ClientError {
+    ClientError::Refused { status: selfhost_http::Status(status), message }
+}
+
+/// The control-plane path for one share, or `None` for an unusable id.
+fn share_path(share: &str) -> Option<String> {
+    nas::usable_share_id(share).then(|| format!("/api/storage/shares/{share}"))
+}
+
+/// The bulk-plane path for one file inside one share.
+///
+/// The share id is already checked by the caller and the remainder is
+/// percent-encoded here — the same split the daemon makes in
+/// `storage_api::split_blob`, from the other side.
+fn blob_path(share: &str, path: &str) -> String {
+    format!("/api/storage/blob/{share}/{}", nas::url_path(path))
+}
+
+/// Fetches every share this caller may open.
+///
+/// A `404` is not a failure and does not become a notice: a daemon built before
+/// the storage subsystem existed, or one with no `[[shares]]`, simply does not
+/// serve this route, and a message per poll for a missing optional feature would
+/// bury the ones that matter. The plate draws the absence as a sentence.
+fn refresh_shares(client: &Client, shared: &Arc<Mutex<Snapshot>>) {
+    let Ok(value) = client.get("/api/storage/shares") else {
+        return;
+    };
+    let shares: Vec<Share> = value
+        .get("shares")
+        .and_then(Json::as_array)
+        .unwrap_or(&[])
+        .iter()
+        .filter_map(Share::from_json)
+        .collect();
+
+    let mut snapshot = shared.lock().expect("the snapshot lock was poisoned");
+    // Choosing the first share saves the operator a press on the common case of
+    // one share, and only ever happens when nothing is chosen.
+    if snapshot.files.share.is_none() {
+        if let Some(first) = shares.first() {
+            snapshot.files.open(&first.id);
+        }
+    }
+    snapshot.files.shares = Some(shares);
+}
+
+/// Fetches the directory the plate is looking at.
+///
+/// A refusal is kept beside the listing rather than replacing it: the last good
+/// directory stays on screen with the reason above it, which is more use to a
+/// person than a blank pane — and the reason is the daemon's own sentence, which
+/// on a quota or a permission carries a number this end does not have.
+fn refresh_listing(client: &Client, shared: &Arc<Mutex<Snapshot>>) {
+    let (share, path, column, ascending) = {
+        let snapshot = shared.lock().expect("the snapshot lock was poisoned");
+        let Some(share) = snapshot.files.share.clone() else {
+            return;
+        };
+        (share, snapshot.files.path.clone(), snapshot.files.column, snapshot.files.ascending)
+    };
+    let Some(base) = share_path(&share) else {
+        return;
+    };
+
+    let asked = format!("{base}/list?path={}", nas::url_path(&path));
+    let (listing, trouble) = match client.get(&asked) {
+        Ok(value) => (Listing::from_json(&share, &value), None),
+        Err(ClientError::Refused { status, message }) => {
+            (None, Some(nas::refusal_text(status.code(), Some(&Json::string(message)))))
+        }
+        // A disconnection is already stated by the masthead; saying it again
+        // over the listing would be the same fact twice.
+        Err(_) => return,
+    };
+
+    let mut snapshot = shared.lock().expect("the snapshot lock was poisoned");
+    // The operator may have walked on while this was in flight. Drawing one
+    // directory's names under another's breadcrumb is worse than drawing none.
+    if snapshot.files.share.as_deref() != Some(share.as_str()) || snapshot.files.path != path {
+        return;
+    }
+    if let Some(mut listing) = listing {
+        nas::sort_entries(&mut listing.entries, column, ascending);
+        snapshot.files.listing = Some(listing);
+    }
+    snapshot.files.trouble = trouble;
+}
+
+/// Fetches the desktop switches, the fleet, and the chosen machine's agent.
+///
+/// Three requests rather than one, because they are three different lifetimes: a
+/// switch changes when somebody edits a file on the box, the fleet changes when
+/// a laptop wakes up, and the agent report changes every time it respawns. A
+/// `404` on the first means this deployment serves no desktop, which is the
+/// ordinary case and is left as `None` for the plate to state.
+fn refresh_desktop(client: &Client, shared: &Arc<Mutex<Snapshot>>) {
+    let settings = client.get("/api/desktop").ok().as_ref().and_then(Settings::from_json);
+    let nodes: Option<Vec<Node>> = client.get("/api/desktop/nodes").ok().map(|value| {
+        value
+            .get("nodes")
+            .and_then(Json::as_array)
+            .unwrap_or(&[])
+            .iter()
+            .filter_map(Node::from_json)
+            .collect()
+    });
+
+    let peer = {
+        let mut snapshot = shared.lock().expect("the snapshot lock was poisoned");
+        snapshot.desk.settings = settings;
+        if let Some(nodes) = &nodes {
+            // The machine the daemon itself runs on is the one every deployment
+            // has, so it is what the picker opens on when nothing is chosen.
+            if snapshot.desk.peer.is_none() {
+                snapshot.desk.peer = nodes
+                    .iter()
+                    .find(|node| node.node == crate::remote::LOCAL_NODE)
+                    .or_else(|| nodes.first())
+                    .map(|node| node.node.clone());
+            }
+        }
+        snapshot.desk.nodes = nodes;
+        snapshot.desk.peer.clone()
+    };
+
+    let Some(peer) = peer.filter(|peer| crate::remote::usable_node_name(peer)) else {
+        return;
+    };
+    let agent = client
+        .get(&format!("/api/desktop/agent?peer={peer}"))
+        .ok()
+        .as_ref()
+        .and_then(Agent::from_json);
+
+    let mut snapshot = shared.lock().expect("the snapshot lock was poisoned");
+    // The picker may have moved on while this was in flight; an agent report
+    // drawn under another machine's name is a lie about which box is up.
+    if snapshot.desk.peer.as_deref() == Some(peer.as_str()) {
+        snapshot.desk.agent = agent;
+    }
+}
+
+/// Fetches the identity registry and the audit tail.
+///
+/// Both are owner-only at the daemon, so both answer `401` on a deployment where
+/// this console's credential is not the owner. That is kept as a sentence rather
+/// than drawn as an empty list: an empty registry and a refused one are
+/// different facts, and only one of them is reassuring.
+fn refresh_people(client: &Client, shared: &Arc<Mutex<Snapshot>>) {
+    let (holders, trouble) = match client.get("/api/webauthn/credentials") {
+        Ok(value) => {
+            let holders = value
+                .get("passkeys")
+                .and_then(Json::as_array)
+                .unwrap_or(&[])
+                .iter()
+                .filter_map(Person::from_json)
+                .collect();
+            (Some(holders), None)
+        }
+        Err(ClientError::Refused { status, message }) => {
+            (None, Some(nas::refusal_text(status.code(), Some(&Json::string(message)))))
+        }
+        Err(_) => return,
+    };
+    let trail = client.get("/api/audit").ok().as_ref().and_then(Trail::from_json);
+
+    let mut snapshot = shared.lock().expect("the snapshot lock was poisoned");
+    snapshot.people.holders = holders;
+    snapshot.people.trouble = trouble;
+    if trail.is_some() {
+        snapshot.people.trail = trail;
+    }
 }
 
 /// Reads one log line from the wire.

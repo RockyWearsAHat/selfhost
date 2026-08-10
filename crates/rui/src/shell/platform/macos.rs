@@ -122,7 +122,7 @@ use crate::accessibility::{AccessNode, AccessState, AccessUpdate, Role};
 use crate::input::Composition;
 use crate::memory::Id;
 use crate::theme::Appearance;
-use crate::{Canvas, Event, Key, Modifiers, Point, PointerButton, Rect};
+use crate::{Canvas, Event, Key, KeyCode, Modifiers, Point, PointerButton, Rect};
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::ffi::{CStr, c_char, c_void};
@@ -1143,13 +1143,17 @@ impl Window {
                     })
             });
 
-            if let Some(key) = key {
-                events.push(if kind == EVENT_KEY_DOWN {
-                    Event::KeyDown { key, modifiers }
-                } else {
-                    Event::KeyUp { key, modifiers }
-                });
-            }
+            // Reported whether or not this library has a name for the key: the
+            // virtual key code is what the function row, the keypad, and the
+            // two halves of a modifier pair have instead of a name, and it is
+            // what anything forwarding a keystroke to another machine sends.
+            // `key_for_code` is the meaning; `keyCode` is the key.
+            let code = Some(KeyCode::new(u32::from(code)));
+            events.push(if kind == EVENT_KEY_DOWN {
+                Event::KeyDown { key, code, modifiers }
+            } else {
+                Event::KeyUp { key, code, modifiers }
+            });
 
             // What is left is the case where there is no input method to ask —
             // an older system, or a view that failed to become the first

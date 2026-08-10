@@ -46,7 +46,7 @@
 
 use crate::accessibility::Role;
 use crate::geom::{Insets, Rect, Size};
-use crate::input::{Drag, Key, Modifiers};
+use crate::input::{Drag, Key, KeyStroke, Modifiers};
 use crate::memory::Id;
 use crate::paint::Painter;
 use crate::style::{Align, Anchor, Axis, Face, Hover, Ink, Justify, Length, Radius, Style, Tone};
@@ -62,6 +62,11 @@ pub type DragAction<S> = Box<dyn Fn(&mut S, Drag)>;
 
 /// What a keypress does, given which key it was and what was held with it.
 pub type KeyAction<S> = Box<dyn Fn(&mut S, Key, Modifiers)>;
+
+/// What one movement of one physical key does.
+///
+/// Both directions through one handler, deliberately — see [`El::on_raw_key`].
+pub type RawKeyAction<S> = Box<dyn Fn(&mut S, KeyStroke)>;
 
 /// What the wheel does, given how far it turned across and down.
 pub type ScrollAction<S> = Box<dyn Fn(&mut S, f32, f32)>;
@@ -118,6 +123,8 @@ pub struct El<S> {
     pub(crate) on_submit: Option<Action<S>>,
     pub(crate) on_drag: Option<DragAction<S>>,
     pub(crate) on_key: Option<KeyAction<S>>,
+    pub(crate) on_key_up: Option<KeyAction<S>>,
+    pub(crate) on_raw_key: Option<RawKeyAction<S>>,
     pub(crate) on_scroll: Option<ScrollAction<S>>,
     pub(crate) on_hover: Option<HoverAction<S>>,
     /// Whether it takes the keyboard, and takes a place in the tab order.
@@ -183,6 +190,8 @@ impl<S> El<S> {
             on_submit: None,
             on_drag: None,
             on_key: None,
+            on_key_up: None,
+            on_raw_key: None,
             on_scroll: None,
             on_hover: None,
             focusable: false,
@@ -607,6 +616,47 @@ impl<S> El<S> {
         self
     }
 
+    /// Runs `action` for every key *released* while it has the keyboard.
+    ///
+    /// The other half of [`El::on_key`], and the half nothing could see until
+    /// there was one. A control that does something while a key is held — a
+    /// button that repeats, a camera that pans, a viewport forwarding the
+    /// keyboard to another machine — has no way to stop without it, and "no way
+    /// to stop" is a key held down for as long as the program runs.
+    ///
+    /// A widget that only acts on presses does not need it; one that acts on a
+    /// press *and holds something as a result* always does.
+    pub fn on_key_up(mut self, action: impl Fn(&mut S, Key, Modifiers) + 'static) -> Self {
+        self.on_key_up = Some(Box::new(action));
+        self.focusable = true;
+        self
+    }
+
+    /// Runs `action` for every movement of every key while it has the keyboard,
+    /// carrying the physical key as well as its meaning.
+    ///
+    /// What [`El::on_key`] cannot do, and why: that handler is told what a key
+    /// *means* on this machine, which is the layout's answer and is therefore
+    /// the wrong thing to send anywhere else. This one is told which key moved
+    /// and which way, including keys [`Key`] does not name — the
+    /// function row, the keypad, the modifiers themselves.
+    ///
+    /// Both directions arrive at the one handler on purpose. Splitting them
+    /// would let a viewport be written that forwards presses and forgets
+    /// releases, which is not a missing feature but a machine with a key held
+    /// down on it; a handler that must match on [`KeyPhase`](crate::input::KeyPhase)
+    /// cannot be written that way by accident.
+    ///
+    /// ```ignore
+    /// draw(Size::new(960.0, 540.0), viewport)
+    ///     .on_raw_key(|app: &mut App, stroke| app.session.forward(stroke))
+    /// ```
+    pub fn on_raw_key(mut self, action: impl Fn(&mut S, KeyStroke) + 'static) -> Self {
+        self.on_raw_key = Some(Box::new(action));
+        self.focusable = true;
+        self
+    }
+
     /// Runs `action` when the wheel turns over it, told how far across and down.
     ///
     /// For a control that answers the wheel without being a scrolling area — a
@@ -872,6 +922,16 @@ impl<S> El<S> {
         self.on_key.as_ref()
     }
 
+    /// What a key coming up in it does, if anything.
+    pub fn key_up_action(&self) -> Option<&KeyAction<S>> {
+        self.on_key_up.as_ref()
+    }
+
+    /// What one physical key's movement in it does, if anything.
+    pub fn raw_key_action(&self) -> Option<&RawKeyAction<S>> {
+        self.on_raw_key.as_ref()
+    }
+
     /// Where this element is anchored, if it was lifted out of the flow by
     /// [`El::layer`].
     pub fn anchor(&self) -> Option<Anchor> {
@@ -887,6 +947,8 @@ impl<S> El<S> {
                 || self.on_submit.is_some()
                 || self.on_drag.is_some()
                 || self.on_key.is_some()
+                || self.on_key_up.is_some()
+                || self.on_raw_key.is_some()
                 || self.on_scroll.is_some()
                 || self.on_hover.is_some()
                 || self.focusable

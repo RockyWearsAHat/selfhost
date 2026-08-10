@@ -117,7 +117,14 @@ pub const RELAYED_ORIGIN: &str = "origin";
 /// The prefix is kept so the line still says which subsystem was reached; only
 /// what comes after it is dropped, query string included, since a query on these
 /// paths carries the same kind of detail as the path does.
-pub const ELIDED_PREFIXES: [&str; 2] = ["/api/storage/blob/", "/api/desktop/"];
+///
+/// [`crate::dav::PREFIX`] is named rather than spelled again: the mount point
+/// and the elision must be the same string forever, and a WebDAV path is the
+/// worst case this rule exists for — a Finder window walking a share writes one
+/// log line per file, which is a directory listing of the household's documents
+/// assembled by the machine that was supposed to be keeping them private.
+pub const ELIDED_PREFIXES: [&str; 3] =
+    ["/api/storage/blob/", "/api/desktop/", crate::dav::PREFIX];
 
 /// What replaces the elided remainder, so a reader can see that something was
 /// withheld rather than wonder at a truncated line.

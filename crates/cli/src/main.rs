@@ -9,6 +9,7 @@ mod audit;
 mod data_dir;
 mod desk_agent;
 mod desk_local;
+mod desk_supervisor;
 mod desk_task;
 mod dns_status;
 mod dns_sync;
@@ -26,6 +27,7 @@ mod self_update;
 mod service_install;
 mod share_command;
 mod site;
+mod storage_command;
 mod teardown;
 mod watch;
 
@@ -100,6 +102,16 @@ Commands
                              Copy files into or out of a share, through the same
                              rules the console and WebDAV write under. Dry-run by
                              default; only --apply writes.
+  storage smb <plan|apply>   Reconcile the operating system's own SMB exports with
+                             the [shares.smb] blocks in the config: read what the
+                             host exports, diff, and print the plan. Dry-run by
+                             default; only `apply` changes the machine, and it
+                             never touches a share point selfhost did not create.
+  storage discover [--host <label>] [--model <name>] [--address <ip>]
+                             What a laptop on this network would see for the
+                             browsable shares — the DNS-SD registrations and
+                             records — and, honestly, whether anything on this
+                             platform will publish them
   node <list|invite|join>    The machines this deployment can reach.
                              `invite <name>` mints a worker's enrolment token on
                              the owner and prints it once; `join` stores it on
@@ -151,6 +163,9 @@ fn main() -> ExitCode {
         "services" => services_command(),
         "share" => load().and_then(|(config, dir)| share_command::share(&arguments, &config, &dir)),
         "sync" => load().and_then(|(config, dir)| share_command::sync(&arguments, &config, &dir)),
+        "storage" => {
+            load().and_then(|(config, dir)| storage_command::storage(&arguments, &config, &dir))
+        }
         "node" => load().and_then(|(config, project_dir)| {
             let data_dir = teardown::data_dir(&config, &project_dir);
             node_command::run(&arguments, &config, &data_dir)
@@ -665,6 +680,19 @@ async fn serve_daemon(
         println!("\n{line}");
     }
 
+    // The owner's half of the peer link. `mesh_task` above is the *worker's*
+    // half — it dials out and binds nothing — and without this the route a
+    // worker dials answers 404, which is what a verification pass found: every
+    // line of `crates/mesh` was unreachable in production while its own tests
+    // passed, because nothing ever called this.
+    //
+    // Declared from `[[nodes]]` with `role = "worker"` and the token
+    // `selfhost node invite` already wrote, so enrolling a machine stays one
+    // command and this stays one line. Still binds nothing: a worker dials the
+    // console site's existing 443, and the link arrives as an upgrade on a
+    // socket the proxy already accepted.
+    api = api.with_peers(selfhost_admin::Peerage::for_owner(&config.nodes, &data_dir));
+
     // Remote desktop. `None` unless `[desktop]` is present and `enabled = true`,
     // and `None` means the subsystem does not exist: no `Fleet` on the API, no
     // kill-switch poll, no agent, and every desktop route indistinguishable from
@@ -674,6 +702,14 @@ async fn serve_daemon(
     // restart, exactly like `[mail]` and `[dns]` — the config watch in `run`
     // reloads the proxy's routing table and nothing else, so there is no path
     // by which a second copy of this subsystem could come into being.
+    //
+    // KNOWN GAP, stated here because the picker is where it shows: the peers it
+    // is handed are the *worker's* view — this machine's own dialled link — so
+    // on an owner it is `None` and the picker offers only `self`. An admitted
+    // link now lands in `Peerage`'s registry, but that registry and
+    // `mesh_task::Peers` are different types answering different questions, and
+    // bridging them is a refactor of this signature rather than an argument.
+    // Until then a second machine can enrol and link, and cannot yet be picked.
     let desk = desk_task::start(&config, &data_dir, mesh.peers().cloned()).map(Arc::new);
     if let Some(desk) = desk.as_ref() {
         println!("\n{}", desk.summary());

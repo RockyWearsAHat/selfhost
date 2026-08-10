@@ -38,8 +38,8 @@
 //! | [`auth`] | impure | Basic-over-TLS and the verified-credential cache |
 //! | [`dav`] | mixed | the WebDAV verb table, the `207` body, and locks that actually exclude |
 //! | [`api`] | impure | what a share lets a caller do, as functions a route calls — the engine both the JSON API and WebDAV run on |
-//! | [`smb`] | impure | driving the platform's own SMB server *(Phase 10)* |
-//! | [`discover`] | mixed | DNS-SD records, published by somebody else's responder *(Phase 10)* |
+//! | [`smb`] | mixed | what the platform's own SMB server should export, and the backend that asks it |
+//! | [`discover`] | **pure** | DNS-SD records, published by somebody else's responder |
 //!
 //! # The division that must not be forgotten
 //!
@@ -91,6 +91,17 @@
 //! is what makes a 5 GB upload cost the daemon a scratch buffer and a 2 GB
 //! download cost it nothing, on a box whose one process also serves ports 80
 //! and 443.
+//!
+//! # The two things this crate delegates rather than implements
+//!
+//! [`smb`] and [`discover`] both stop at the edge of somebody else's software,
+//! and both say so at length in their own documentation. In one line each:
+//! **SMB** is the operating system's server, driven — so an SMB session
+//! authenticates against an *operating-system account* and the console password
+//! cannot open one, on any platform; and **discovery** is the operating system's
+//! responder, fed — so nothing here binds `5353`, and on Windows nothing
+//! publishes DNS-SD at all. Neither is on unless an operator wrote a
+//! `[shares.smb]` block or `browsable = true`.
 
 pub mod api;
 pub mod auth;
@@ -114,4 +125,8 @@ pub use respond::{BlobResponse, Disposition};
 pub use share::{
     Grant, GrantOutcome, Grantee, Mode, Reserved, Share, ShareError, ShareId, Shares, SmbExport,
     SmbName, SmbNameProblem, Want,
+};
+pub use smb::{
+    detect as detect_smb, sync as sync_smb, Apply, DesiredShare, HostSmb, LiveShare, Owned,
+    OwnershipLedger, Reconciliation, SmbBackend, SmbError, SmbState, SyncReport,
 };

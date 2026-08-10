@@ -216,12 +216,11 @@ fn probe() -> Backend {
 /// for session 0's own blank desktop. No amount of care inside this process
 /// fixes that — the pixels have to be captured by a process running *inside* the
 /// session a person is sitting in, reached over
-/// `\\.\pipe\selfhost-desk-<session>`, and that pipe's DACL is built around the
-/// console user's SID. `selfhost_screen::windows::desktop` keeps the SID
-/// `pub(crate)` and `crates/cli` forbids `unsafe`, so the daemon cannot obtain
-/// it and cannot create the pipe. That gap is stated in one sentence rather than
-/// papered over with an agent that would start, fail to connect within its
-/// ten-second deadline, exit, and be respawned until the hour's budget was gone.
+/// `\\.\pipe\selfhost-desk-<session>`. [`crate::desk_supervisor`] creates that
+/// pipe and keeps that agent alive, so the process exists; what does not yet
+/// exist is the splice that forwards its frames into a viewer session, and until
+/// it does this probe reports the backend as unreachable **with that reason**
+/// rather than answering "GDI" above a viewport that will never fill.
 ///
 /// Run by hand from a terminal, the same daemon is in the console user's own
 /// session, and then GDI works in-process with nothing between it and the
@@ -244,10 +243,11 @@ fn probe() -> Backend {
         return Backend::unwired(
             NAME,
             "the daemon is running as a service in session 0, which has no interactive desktop, so \
-             frames must come from an agent process in the console user's session reached over a \
-             named pipe whose DACL names that user's SID — and selfhost-screen does not export the \
-             SID, so the daemon cannot create the pipe. Running `selfhost daemon` from a signed-in \
-             session captures directly instead.",
+             nothing in this process can capture the screen. An agent is supervised in the console \
+             user's session and reached over a named pipe whose DACL names that user — see the \
+             agent's own line for what it is doing — but its frames are not yet spliced into a \
+             viewer session, so this daemon still serves no pixels. Running `selfhost daemon` from \
+             a signed-in session captures directly instead.",
             Condition::NoSession,
         );
     }

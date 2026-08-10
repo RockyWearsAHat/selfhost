@@ -78,6 +78,36 @@
 //!   the fix an operator is tempted to reach for — running the agent as `SYSTEM` —
 //!   would convert this feature into exactly the escalation channel above.
 //!
+//! # What the daemon wires up, in order
+//!
+//! Five calls, and nothing else from this crate is needed to run a desktop:
+//!
+//! 1. **Decide the policy.** [`InputPolicy::from_config`] of
+//!    `[desktop].allow_input`. Everything downstream carries this value; nothing
+//!    downstream re-derives it.
+//! 2. **Build the host.** `windows::spawn::WindowsHost::new(executable, policy)`,
+//!    with the absolute path of this very binary — the agent is one of its
+//!    subcommands. The host builds the agent's argument vector itself, per spawn,
+//!    from the session the supervisor chose and the policy above.
+//! 3. **Build the supervisor.** [`supervisor::Agent::new`] over that host with
+//!    [`supervisor::Limits`], whose `spawns_per_hour` is `[desktop].agent_respawn_cap`.
+//! 4. **Turn the crank.** [`supervisor::Agent::tick`] on a timer; it polls the
+//!    console session, starts an agent when somebody is signed in, notices one
+//!    that died, stops one whose session moved, and answers with the
+//!    [`AgentPhase`] the console renders. Tell it three things it cannot see:
+//!    [`supervisor::Agent::connected`] when the pipe hands over the agent's first
+//!    message, [`supervisor::Agent::set_kill_switch`] when `desktop.disabled`
+//!    appears or goes, and [`supervisor::Agent::operator_start`] when somebody
+//!    presses start.
+//! 5. **Hold the other end.** `windows::pipe::AgentPipe::for_console_session`
+//!    creates the pipe for that session — resolving the console user's SID itself,
+//!    so the daemon never handles one — and `accept`, `read` and `write_all` carry
+//!    the link frames [`agent::encode_link`] and [`agent::decode_link`] define.
+//!
+//! The whole of step 4's decision-making is pure and tested; steps 2 and 5 are
+//! Windows-only, and on every other platform there is no session-0 problem to
+//! solve and therefore no agent to supervise.
+//!
 //! # Modules
 //!
 //! - [`coords`] — **pure.** Virtual-desktop ↔ normalised, and pixels ↔ points.
@@ -123,8 +153,8 @@ pub mod macos;
 pub mod stub;
 
 pub use agent::{
-    AgentReport, AgentStats, CreditWindow, DamageHint, Delivery, DpiAwareness, FrameSink, Integrity,
-    SendError, StreamConfig, Streamer, Tick,
+    AgentOptions, AgentReport, AgentStats, CreditWindow, DamageHint, Delivery, DpiAwareness,
+    FrameSink, InputPolicy, Integrity, SendError, StreamConfig, Streamer, Tick,
 };
 pub use coords::{Bounds, CoordError, Normalised, Point, PointOrigin, VirtualPoint};
 pub use fault::Fault;

@@ -34,40 +34,42 @@
 //! not shown a black rectangle and it is not left waiting on a socket that will
 //! never speak.
 //!
-//! # Why there is still no agent process
+//! # The agent process, and the half of it that is wired
 //!
 //! On Windows a daemon installed as a service runs as `SYSTEM` in session 0 and
-//! cannot capture the console user's screen by any method, so the pixels would
-//! have to come from an agent process spawned into that session and reached over
-//! `\\.\pipe\selfhost-desk-<session>`. Both halves exist in `selfhost-screen`
-//! and both are exercised by its own tests. What is missing is one thing the
-//! daemon needs and this crate cannot obtain: **the console user's SID**, which
-//! is what the pipe's DACL is built around. `selfhost_screen::windows::desktop`
-//! keeps it `pub(crate)`, and `crates/cli` forbids `unsafe`, so there is no
-//! second way to ask.
+//! cannot capture the console user's screen by any method, so the pixels have to
+//! come from an agent process spawned into that session and reached over
+//! `\\.\pipe\selfhost-desk-<session>`. [`crate::desk_supervisor`] is the daemon's
+//! half of that agent's life and is wired here: it creates the pipe with its
+//! explicit DACL, starts the agent into the console session, watches it die,
+//! respawns it with visible backoff under the hour's cap, gives up out loud when
+//! the cap is spent, and publishes every one of those states as a sentence that
+//! this module's [`Fleet::agent`], the daemon's banner and the console all print.
 //!
-//! Spawning an agent without that pipe would not be a partial feature — it would
-//! be an agent that starts, fails to connect within its ten-second deadline,
-//! exits, and is respawned until the hour's budget is spent. So it is not done,
-//! and [`Backend::here`] states the gap in one sentence that both the console
-//! and `doctor` print. A Windows daemon started from a signed-in session is in
-//! that session already and captures directly, which is the path this build
-//! wires; the fix for the service case is one exported function in
-//! `selfhost-screen`.
+//! What is **not** wired is the agent's frames reaching a viewer. A session here
+//! is driven by [`Viewer`] over a [`FrameSource`], and the agent instead produces
+//! an encoded message stream that the daemon is meant to *forward* rather than
+//! consume — a splice, with credit carried end to end, which lives above this
+//! crate's seam. Until that exists [`Backend::here`] tells a session-0 daemon's
+//! console that it cannot reach the desktop **and why**, which is the honesty
+//! this subsystem is built around: a backend that cannot produce a pixel never
+//! claims it can. A Windows daemon started from a signed-in session is in that
+//! session already and captures directly, which is the path this build serves in
+//! full.
 
 use selfhost_admin::desk_api::LOCAL_NODE;
 use selfhost_admin::{AgentReport, Fleet, Handover, NodeReport};
 use selfhost_config::{Config, Desktop};
 use selfhost_desk::grant::{Capabilities, SessionId};
 use selfhost_desk::viewer::{
-    CLOSE_GRACE, CapturedFrame, Condition, Ending, FrameSource, Inbound, InputSink, NoInput,
-    NoPointer, Outbound, PointerSource, Restore, SessionDirectory, Standing, StreamError, Task,
-    Viewer, Wiring,
+    CLOSE_GRACE, CapturedFrame, Condition, DEFAULT_SEND_WINDOW, Ending, FrameSource, Inbound,
+    InputSink, NoInput, NoPointer, Outbound, PointerSource, Restore, SessionDirectory, Standing,
+    StreamError, Task, Viewer, Wiring,
 };
 use selfhost_desk::wire::{Message, Monitor, Refusal};
 use selfhost_ws::{CloseCode, Duplex, Event, Limits};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
@@ -76,12 +78,22 @@ pub use crate::desk_local::Backend;
 
 /// How deep the queue of messages waiting for the socket is allowed to get.
 ///
-/// Two, and small on purpose. A desktop stream must show the present, not a
-/// backlog: past a couple of messages in flight the right answer is for the
-/// session driver to stop producing and merge the damage into the next frame it
-/// can afford, which is exactly what it does when [`Outbound::credit`] reads
-/// zero.
-const OUTBOUND_DEPTH: usize = 2;
+/// # This is not the flow control, and the first release made it so by accident
+///
+/// It used to be two, on the reasoning that a desktop stream must show the
+/// present rather than a backlog. That reasoning is right and this is the wrong
+/// place to enforce it: a *frame* is a set of tiles, and a keyframe for a Retina
+/// panel is about fifteen hundred of them. A queue two messages deep makes the
+/// queue itself the window, and a window two messages wide cannot deliver a
+/// frame that is fifteen hundred messages long without the driver stopping
+/// after every second tile.
+///
+/// So the flow control is [`SEND_WINDOW`], measured in bytes, and this is only
+/// deep enough that the pump and the session driver can run at the same time.
+/// The window still bounds the bytes sitting here — it is spent when a message
+/// is accepted and returned when the pump takes it — so this depth costs nothing
+/// beyond the window's own ceiling.
+const OUTBOUND_DEPTH: usize = 64;
 
 /// How deep the queue of messages arriving from the console is allowed to get.
 ///
@@ -90,20 +102,31 @@ const OUTBOUND_DEPTH: usize = 2;
 /// release is a modifier stuck down on somebody's machine.
 const INBOUND_DEPTH: usize = 64;
 
-/// The send window reported to the session driver while a frame can still be
-/// queued.
+/// How many payload bytes may be waiting for the socket at one time.
 ///
-/// # There is no credit protocol on this hop, and that is stated rather than
-/// hidden
+/// # What the number means, and what it emphatically does not
+///
+/// It is the protocol's initial window — [`DEFAULT_SEND_WINDOW`] — used here for
+/// what a window is: a bound on the bytes in flight at one instant. It is spent
+/// as [`SocketOut::send`] accepts a message and returned as the pump hands that
+/// message to the WebSocket writer, so [`Outbound::credit`] answers with the
+/// link's real instantaneous headroom.
+///
+/// It is **not** a ceiling on the size of a frame. The first release read it as
+/// one — the driver summed a whole frame's bytes and dropped the frame if the
+/// total did not fit — and since the first frame of every session is a keyframe,
+/// and a keyframe for a 3024×1964 panel is about fifteen hundred tiles, no frame
+/// was ever deliverable at all. A frame far larger than this window is delivered
+/// by spending the window, having it returned, and spending it again.
+///
+/// # There is no credit *protocol* on this hop unless the client asks for one
 ///
 /// The mux's `CREDIT` frame runs between the owner daemon and a worker's agent.
-/// A browser on the far end of the console relay speaks plain WebSocket and
-/// grants nothing, so the only backpressure available on this hop is the
-/// socket's own. This constant is therefore not a measurement — it is "a frame
-/// still fits", and the real signal is [`OUTBOUND_DEPTH`]: when the queue is
-/// full the credit reported is zero, the driver declines to produce the frame,
-/// and the damage merges forward.
-const FRAME_WINDOW: u32 = 256 * 1024;
+/// A browser on the far end of the console relay speaks plain WebSocket, so
+/// unless it sends [`selfhost_desk::wire::Message::Credit`] the only backpressure
+/// on this hop is this socket's own — which, being a genuine measurement rather
+/// than a switch, is enough.
+const SEND_WINDOW: u32 = DEFAULT_SEND_WINDOW;
 
 /// The remote-desktop subsystem, held by the daemon and shared with the API.
 ///
@@ -129,6 +152,14 @@ pub struct Desk {
     peers: Option<Arc<crate::mesh_task::Peers>>,
     /// Where every control action this subsystem takes is written down.
     audit: crate::audit::Auditor,
+    /// The capture agent's supervisor.
+    ///
+    /// Always present, because "there is no agent on this machine and here is
+    /// why" is itself an answer the console has to be given: an `Option` would
+    /// make an absent supervisor indistinguishable from a dead one. On every
+    /// platform but a Windows service it publishes exactly that sentence and
+    /// starts no thread.
+    agent: crate::desk_supervisor::CaptureAgent,
 }
 
 /// Builds the subsystem, or answers `None` because it was not asked for.
@@ -148,13 +179,26 @@ pub fn start(
             nodes.push(node.name.clone());
         }
     }
+    let engaged = crate::kill_switch::present(data_dir);
+    // Built with the deployment's own switch, which is read from the config
+    // exactly once and never re-derived downstream: `allow_input = false` must
+    // mean an agent that holds no injector, and the way it means that is the
+    // argument vector this policy produces.
+    let agent =
+        crate::desk_supervisor::CaptureAgent::start(desktop.allow_input, desktop.agent_respawn_cap);
+    // The switch is handed over before the first turn rather than at the first
+    // poll, so a daemon that starts with the desktop already revoked never starts
+    // an agent at all — the case nobody is watching, and the one where a
+    // supervisor that learned a second later would have spawned one.
+    agent.set_kill_switch(engaged);
     Some(Desk {
         config: desktop,
         data_dir: data_dir.to_path_buf(),
         nodes,
-        stopped: Arc::new(AtomicBool::new(crate::kill_switch::present(data_dir))),
+        stopped: Arc::new(AtomicBool::new(engaged)),
         peers,
         audit: crate::audit::Auditor::in_dir(data_dir),
+        agent,
     })
 }
 
@@ -164,9 +208,43 @@ impl Desk {
         &self.config
     }
 
-    /// Whether the kill switch is engaged right now.
+    /// Whether the kill switch is engaged as of the last poll.
+    ///
+    /// This is the *cheap* answer, and it is the right one for a running stream:
+    /// a frame loop reads it several times a second, and [`Self::halted`]'s
+    /// `stat` at that rate would be a syscall per frame to learn something that
+    /// cannot have changed since the poll by more than [`POLL_INTERVAL`].
+    ///
+    /// It is the wrong answer at the door — see [`Self::halted`].
+    ///
+    /// [`POLL_INTERVAL`]: crate::kill_switch::POLL_INTERVAL
     pub fn stopped(&self) -> bool {
         self.stopped.load(Ordering::Relaxed)
+    }
+
+    /// Whether the kill switch is engaged *at this instant*, asked of the disk.
+    ///
+    /// The distinction from [`Self::stopped`] is not fastidiousness; it was a
+    /// measured hole. Admitting a session on the polled flag alone let a
+    /// complete 3024×1964 keyframe — a legible photograph of the whole screen —
+    /// reach a viewer that connected 2.5 seconds after an operator engaged the
+    /// switch, because the flag was still carrying the previous poll's answer.
+    /// Waiting the full interval instead produced zero tiles, which is how the
+    /// race was identified as a race rather than a bypass.
+    ///
+    /// An operator who touches that file believes it is instant, so at the one
+    /// point where believing otherwise costs a screen, we pay one `stat` of a
+    /// path this process already holds — on a route that has already passed the
+    /// console gate, so it is not a surface anyone can spin. Everywhere the
+    /// answer is merely *reported* rather than *acted on*, the polled flag still
+    /// serves.
+    ///
+    /// The two are OR-ed rather than the file simply replacing the flag:
+    /// [`crate::kill_switch::present`] fails closed, so a volume that cannot be
+    /// read answers `true`, and a flag that is already set must not be talked
+    /// out of it by a filesystem that has started returning errors.
+    pub fn halted(&self) -> bool {
+        self.stopped() || crate::kill_switch::present(&self.data_dir)
     }
 
     /// What the daemon prints at startup, so an operator reading the banner
@@ -181,7 +259,14 @@ impl Desk {
             viewers = self.config.max_viewers,
             fps = self.config.max_fps,
             tile = self.config.tile,
-            input = if self.config.allow_input { "allowed" } else { "refused" },
+            // Read back from the value that was actually handed to the agent
+            // spawner rather than from the config field beside it. They agree —
+            // one is built from the other — and asking the object that holds the
+            // consequence is what keeps them agreeing: a banner that said
+            // "refused" while an armed policy had already reached a process in
+            // somebody's session would be the one lie this subsystem cannot
+            // afford.
+            input = if self.agent.input_policy().allows() { "allowed" } else { "refused" },
         );
         let backend = Backend::here();
         sentence.push_str(&format!("\n  capture      {}", backend.name));
@@ -191,6 +276,10 @@ impl Desk {
             // the answer is usually one they can act on in a minute.
             sentence.push_str(&format!("\n               unavailable — {}", backend.why));
         }
+        // The agent's own line, always: on a machine that needs none it says so,
+        // and on the one deployment that does it is the difference between "the
+        // desktop does not work" and "nobody is signed in yet".
+        sentence.push_str(&format!("\n  agent        {}", self.agent.status().line()));
         sentence.push_str(&format!(
             "\n  kill switch  {} ({})",
             if self.stopped() { "ENGAGED — no stream will run" } else { "clear" },
@@ -230,6 +319,11 @@ impl Desk {
         loop {
             ticker.tick().await;
             let engaged = crate::kill_switch::present(&self.data_dir);
+            // One reader of the filesystem, two consumers of the answer. The
+            // streams and the agent supervisor must never hold different beliefs
+            // about a switch whose whole purpose is to be believed immediately,
+            // and a second poll would be a second belief.
+            self.agent.set_kill_switch(engaged);
             let changed = self.stopped.swap(engaged, Ordering::Relaxed) != engaged;
             let first_and_engaged = recorded.is_none() && engaged;
             if !changed && !first_and_engaged {
@@ -252,6 +346,15 @@ impl Desk {
                     path.display()
                 );
             } else {
+                // Removing the switch is the operator's "start". It is the only
+                // such signal this daemon has, and it is the right one: an agent
+                // that exhausted its hourly cap stays surrendered until a person
+                // says otherwise, and a person who has just deleted the file that
+                // was holding the desktop down has said otherwise as plainly as
+                // this deployment can be told. Without this, clearing the switch
+                // would revive the streams and leave the agent permanently given
+                // up, which reads as the switch not working.
+                self.agent.operator_start();
                 eprintln!("desktop: kill switch released ({}) — streaming is possible again", path.display());
             }
         }
@@ -305,11 +408,12 @@ impl Desk {
 
     /// Drives one admitted session to its end and says how it ended.
     async fn run_session(&self, handover: Handover) -> String {
-        if self.stopped() {
-            // Belt and braces: the route already asked, but the switch can be
-            // engaged between the handshake and here, and a stream that starts
-            // after the operator said stop is the one case this whole mechanism
-            // exists to prevent.
+        if self.halted() {
+            // Asked of the disk, not of the poll. The route already checked, but
+            // the switch can be engaged between the handshake and here, and a
+            // stream that starts after the operator said stop is the one case
+            // this whole mechanism exists to prevent — so this is the reading
+            // that must be current, whatever it costs.
             return format!(
                 "refused: the kill switch at {} is in place",
                 crate::kill_switch::path_in(&self.data_dir).display()
@@ -374,14 +478,21 @@ impl Desk {
             pump.abort();
         }
 
+        // Both flow-control counters, because they mean different things to
+        // whoever reads this line: stalls are frames the link could not begin,
+        // deferrals are tiles a frame could not finish in one pass. A line that
+        // reported only the first would have said "0 frame(s), 6 credit
+        // stall(s)" for a link that was in fact perfectly healthy and merely
+        // being asked the wrong question.
         format!(
             "{ending} · {who} · {frames} frame(s), {bytes} byte(s), {stalls} credit stall(s), \
-             {refused} input(s) refused",
+             {deferred} tile(s) deferred, {refused} input(s) refused",
             ending = outcome.ending,
             who = identity,
             frames = outcome.stats.frames_sent,
             bytes = outcome.stats.bytes_sent,
             stalls = outcome.stats.credit_stalls,
+            deferred = outcome.stats.tiles_deferred,
             refused = outcome.stats.inputs_refused,
         )
     }
@@ -404,7 +515,7 @@ impl Fleet for Desk {
     }
 
     fn agent(&self, node: &str) -> AgentReport {
-        if self.stopped() {
+        if self.halted() {
             return AgentReport::absent(
                 node,
                 &format!(
@@ -427,6 +538,22 @@ impl Fleet for Desk {
                 sentence: backend.why,
                 monitors: backend.displays,
                 respawns: 0,
+            };
+        }
+        // The daemon cannot capture in its own process. On the one deployment
+        // where that is expected rather than broken — a Windows service in
+        // session 0 — the supervisor is the thing that knows what is happening,
+        // and its sentence is the one worth showing: "nobody is signed in yet"
+        // and "the agent has failed three times, next attempt in eight seconds"
+        // are different machines, and the backend probe can tell neither.
+        let agent = self.agent.status();
+        if agent.supervised {
+            return AgentReport {
+                node: node.to_owned(),
+                live: agent.live,
+                sentence: format!("{} · {}", agent.line(), backend.why),
+                monitors: agent.monitors,
+                respawns: agent.spawns_last_hour,
             };
         }
         AgentReport::absent(node, &backend.why)
@@ -494,21 +621,41 @@ impl Machine {
         let monitors = screen.as_ref().map(|screen| {
             selfhost_desk::viewer::FrameSource::monitors(screen).to_vec()
         });
-        let hands = match (allow_input, monitors) {
-            (true, Ok(monitors)) => match crate::desk_local::open_hands(monitors).await {
-                Ok((cursor, keys)) => (Some(cursor), Some(keys)),
-                Err(error) => {
-                    // Reported once, here, where the reason is still specific.
-                    // The remote viewer is told only `input-refused`; the
-                    // remediation is for the person at this machine.
-                    eprintln!("desktop: no input on this machine — {}", error.sentence());
-                    (None, None)
+        let hands = match monitors {
+            Ok(monitors) if injector_wanted(allow_input, false, true) => {
+                match crate::desk_local::open_hands(monitors).await {
+                    Ok((cursor, keys)) => (Some(cursor), Some(keys)),
+                    Err(error) => {
+                        // Reported once, here, where the reason is still
+                        // specific. The remote viewer is told only
+                        // `input-refused`; the remediation is for the person at
+                        // this machine.
+                        eprintln!("desktop: no input on this machine — {}", error.sentence());
+                        (None, None)
+                    }
                 }
-            },
+            }
             _ => (None, None),
         };
         Self { screen: LocalScreen { screen, stopped }, cursor: hands.0, keys: hands.1 }
     }
+}
+
+/// Whether this session may build an injector at all.
+///
+/// Pure and total, so the one property the whole default-off posture rests on is
+/// **asserted** rather than believed: `allow_input = false` yields `false` for
+/// every combination of everything else. It is one expression, and it is written
+/// as its own function precisely because a condition spelled inline inside a
+/// `match` arm is a condition that gains a second arm one day.
+///
+/// The other two arguments are not redundant with it. A session admitted while
+/// the kill switch is engaged must build nothing, and a machine whose capture
+/// could not be opened has no display layout to normalise a pointer against — the
+/// coordinate mapping is built from the monitors, so an injector without them
+/// would map every click onto a desktop that was never read.
+fn injector_wanted(allow_input: bool, stopped: bool, screen_opened: bool) -> bool {
+    allow_input && !stopped && screen_opened
 }
 
 /// The screen of the machine this daemon runs on, as the session driver sees it.
@@ -727,6 +874,13 @@ impl SessionDirectory for TicketStanding {
 /// The writing half of a plain WebSocket, as the session driver wants it.
 struct SocketOut {
     outgoing: mpsc::Sender<Outward>,
+    /// Payload bytes accepted here and not yet handed to the WebSocket writer.
+    ///
+    /// Shared with the pump, which is the half that gives them back. An atomic
+    /// rather than a lock because it is read once per message on the driver's hot
+    /// path and written once per message on the pump's, and the two never need to
+    /// agree about anything else.
+    in_flight: Arc<AtomicU64>,
 }
 
 /// One thing to put on the socket.
@@ -738,18 +892,72 @@ enum Outward {
 }
 
 impl Outbound for SocketOut {
+    /// Accepts one message, charging its bytes to the window until the pump
+    /// takes them.
+    ///
+    /// Charged **before** the queue is offered the message rather than after, so
+    /// that a driver writing a long frame sees the window shrink as it goes even
+    /// while the pump is running behind it. This may still park on a full queue —
+    /// [`SocketOut::credit`] reports zero once the queue is full precisely so the
+    /// driver does not walk into that, but the queue can fill between the two —
+    /// and such a park costs at most one message and is bounded anyway by the
+    /// stream's deadline, which the driver wraps every write in.
     fn send<'a>(&'a mut self, frame: &'a [u8]) -> Task<'a, Result<(), StreamError>> {
         let payload = frame.to_vec();
+        let charged = payload.len() as u64;
         Box::pin(async move {
-            self.outgoing.send(Outward::Message(payload)).await.map_err(|_| StreamError::Closed)
+            // The handoff is cooperative, and saying so costs a nanosecond.
+            //
+            // The driver writes a whole frame without awaiting anything else, and
+            // the queue below is deep enough that pushing to it never parks. On a
+            // multi-threaded runtime the pump is meanwhile draining on another
+            // worker, so the window returns as fast as it is spent; on a
+            // single-threaded one it would never be polled at all, the window
+            // would run out part-way through the first frame, and the picture
+            // would arrive a few hundred tiles per second. Yielding here is what
+            // makes the two behave the same, which is the difference between a
+            // transport that works and one that works on the machine it was
+            // written on.
+            tokio::task::yield_now().await;
+            self.in_flight.fetch_add(charged, Ordering::AcqRel);
+            match self.outgoing.send(Outward::Message(payload)).await {
+                Ok(()) => Ok(()),
+                Err(_) => {
+                    // Never handed over, so never given back by the pump. Undone
+                    // here or the window shrinks permanently on every failed
+                    // write of a stream that is closing anyway.
+                    self.in_flight.fetch_sub(charged, Ordering::AcqRel);
+                    Err(StreamError::Closed)
+                }
+            }
         })
     }
 
+    /// The window's real remaining headroom, in bytes.
+    ///
+    /// A measurement, not a switch: the driver re-reads this between the tiles of
+    /// one frame, and it must fall as bytes pile up here and rise as the pump
+    /// drains them. Answering a constant would make a frame larger than the
+    /// window undeliverable — the defect this replaced — and answering zero for
+    /// anything short of a full window would stop the picture.
+    ///
+    /// # Two honest bounds, and the smaller one wins
+    ///
+    /// The byte window is the one that normally binds. A full queue is the other,
+    /// and it exists so the driver **never parks inside a write**: a viewer that
+    /// has stopped reading backs the pump up, the queue fills, and a driver that
+    /// walked into `send` anyway would sit there until the stream's own wall —
+    /// hours — with the capture arm suspended, which is the arm that observes the
+    /// operator's kill switch. Reporting zero instead sends it round the loop to
+    /// decline the frame and merge the damage, which is where it can still be
+    /// stopped.
     fn credit(&self) -> u32 {
-        // Zero when the queue is full, which is how the driver learns to drop
-        // this frame and merge its damage into the next one it can afford. See
-        // [`FRAME_WINDOW`] for why this is a switch rather than a measurement.
-        if self.outgoing.capacity() == 0 { 0 } else { FRAME_WINDOW }
+        if self.outgoing.capacity() == 0 {
+            return 0;
+        }
+        let waiting = self.in_flight.load(Ordering::Acquire);
+        let waiting = u32::try_from(waiting).unwrap_or(u32::MAX);
+        SEND_WINDOW.saturating_sub(waiting)
     }
 
     fn close<'a>(&'a mut self, ending: &'a Ending) -> Task<'a, Result<(), StreamError>> {
@@ -790,6 +998,8 @@ where
 {
     let (outgoing_tx, mut outgoing_rx) = mpsc::channel::<Outward>(OUTBOUND_DEPTH);
     let (incoming_tx, incoming_rx) = mpsc::channel::<Vec<u8>>(INBOUND_DEPTH);
+    let in_flight = Arc::new(AtomicU64::new(0));
+    let returning = Arc::clone(&in_flight);
 
     let pump = async move {
         let sender = duplex.sender();
@@ -799,7 +1009,17 @@ where
         let forward = async move {
             while let Some(outward) = outgoing_rx.recv().await {
                 let sent = match outward {
-                    Outward::Message(payload) => sender.send(payload).await,
+                    Outward::Message(payload) => {
+                        // The window is returned as the bytes leave, which is
+                        // what lets the driver spend it, get it back, and spend
+                        // it again inside a single frame. Measured before the
+                        // send because it consumes the payload, and returned
+                        // after it because until then the bytes are still here.
+                        let carried = payload.len() as u64;
+                        let sent = sender.send(payload).await;
+                        returning.fetch_sub(carried, Ordering::AcqRel);
+                        sent
+                    }
                     Outward::Close(reason) => sender.close(CloseCode::Normal, reason).await,
                 };
                 if sent.is_err() {
@@ -824,7 +1044,11 @@ where
         tokio::join!(forward, read);
     };
 
-    (SocketOut { outgoing: outgoing_tx }, SocketIn { incoming: incoming_rx }, pump)
+    (
+        SocketOut { outgoing: outgoing_tx, in_flight },
+        SocketIn { incoming: incoming_rx },
+        pump,
+    )
 }
 
 #[cfg(test)]
@@ -1153,31 +1377,362 @@ role = \"worker\"
         );
     }
 
+    /// Five seconds of this machine's real screen, through the real transport,
+    /// reported as the numbers an operator would see.
+    ///
+    /// # Why this is `#[ignore]`d rather than run with the suite
+    ///
+    /// It opens a genuine platform capture. That needs the host to have a
+    /// display, to have granted this binary Screen Recording, and to not already
+    /// be running another stream of the same display — none of which a test suite
+    /// may assume, and the last of which macOS is entitled to refuse outright.
+    /// The properties this feature must hold are asserted by the doubles in
+    /// `selfhost-desk`, which run everywhere; this exists so a person can
+    /// *measure* the thing on the machine in front of them:
+    ///
+    /// ```text
+    /// cargo test -p selfhost-cli -- --ignored --nocapture five_seconds
+    /// ```
+    ///
+    /// It asserts only what is true of any working link — that pixels arrived —
+    /// and prints the rest, because frame and byte counts are properties of the
+    /// screen's content and of the machine, not of this code.
+    #[ignore = "opens a real platform capture; run by hand with --ignored"]
+    #[tokio::test]
+    async fn five_seconds_of_this_machines_real_screen() {
+        let (near, far) = tokio::io::duplex(1 << 20);
+        let (mut outbound, mut inbound, pump) =
+            split(Duplex::server(near, Limits::default()));
+        let mut client = Duplex::client(far, Limits::default());
+        let pumping = tokio::spawn(pump);
+        // A viewer that reads everything, which is what makes the send window
+        // return and therefore what the measurement is of.
+        let reading = tokio::spawn(async move {
+            let mut messages = 0u64;
+            while let Ok(Event::Message(_)) = client.recv().await {
+                messages += 1;
+            }
+            messages
+        });
+
+        let stopped = Arc::new(AtomicBool::new(false));
+        let Machine { mut screen, .. } = Machine::open(Arc::clone(&stopped), false).await;
+        let monitors = FrameSource::monitors(&screen).to_vec();
+        println!("displays: {monitors:?}");
+
+        let mut pointer = NoPointer;
+        let mut input = NoInput;
+        let session = selfhost_desk::grant::SessionId::new("live-measurement");
+        let ceilings = selfhost_desk::viewer::Ceilings {
+            max_session: Duration::from_secs(5),
+            ..selfhost_desk::viewer::Ceilings::default()
+        };
+        let directory = TicketStanding::new(&session, ceilings.max_session);
+        let redemption = selfhost_desk::grant::Redemption {
+            session,
+            peer: LOCAL_NODE.to_owned(),
+            capabilities: Capabilities::VIEW,
+        };
+        let seat = selfhost_desk::viewer::Gate::new(1)
+            .admit(LOCAL_NODE)
+            .expect("an empty gate admits");
+
+        let started = Instant::now();
+        let viewer = Viewer::new(
+            Wiring {
+                outbound: &mut outbound,
+                frames: &mut screen,
+                pointer: &mut pointer,
+                input: &mut input,
+            },
+            &directory,
+            seat,
+            &redemption,
+            ceilings,
+        );
+        let outcome = viewer.run(&mut inbound).await;
+        let elapsed = started.elapsed();
+
+        drop(outbound);
+        let delivered = tokio::time::timeout(Duration::from_secs(5), reading)
+            .await
+            .map(|joined| joined.unwrap_or(0))
+            .unwrap_or(0);
+        pumping.abort();
+
+        println!(
+            "{:.1}s · {} · {} frame(s), {} tile(s), {} byte(s), {} credit stall(s), \
+             {} tile(s) deferred, {delivered} message(s) reached the viewer",
+            elapsed.as_secs_f64(),
+            outcome.ending,
+            outcome.stats.frames_sent,
+            outcome.stats.tiles_sent,
+            outcome.stats.bytes_sent,
+            outcome.stats.credit_stalls,
+            outcome.stats.tiles_deferred,
+        );
+
+        if monitors.is_empty() {
+            println!("no capture on this host; nothing to measure");
+            return;
+        }
+        assert!(outcome.stats.frames_sent > 0, "a working capture must deliver frames");
+        assert!(outcome.stats.bytes_sent > u64::from(SEND_WINDOW), "and real pixels with them");
+    }
+
+    /// The transport's window must be a measurement the driver can spend, get
+    /// back, and spend again — which is the whole reason a frame bigger than the
+    /// window is deliverable at all.
+    ///
+    /// Written against a real [`Duplex`] over a real socket pair rather than
+    /// against the accounting alone, because the half that was missing was the
+    /// *return*: an implementation that only ever counts down passes any test of
+    /// `credit()` in isolation and still delivers nothing.
+    #[tokio::test]
+    async fn the_send_window_is_spent_by_queued_bytes_and_returned_as_they_leave() {
+        let (near, far) = tokio::io::duplex(64 * 1024);
+        let (mut out, _incoming, pump) = split(Duplex::server(near, Limits::default()));
+        let mut client = Duplex::client(far, Limits::default());
+
+        assert_eq!(out.credit(), SEND_WINDOW, "a fresh link has its whole window");
+
+        // The pump has not been polled yet, so this message is still here.
+        let tile = vec![0xA5u8; 8 * 1024];
+        out.send(&tile).await.expect("an empty queue takes a message");
+        assert_eq!(
+            out.credit(),
+            SEND_WINDOW - 8 * 1024,
+            "bytes waiting for the socket are bytes in flight"
+        );
+
+        // Six times the window, in messages the size of a busy tile. If the
+        // window did not reopen, this would deadlock rather than fail — which is
+        // why the whole test is bounded below.
+        const ROUNDS: usize = 200;
+        let pumping = tokio::spawn(pump);
+        let reader = tokio::spawn(async move {
+            let mut seen = 0usize;
+            while seen < ROUNDS + 1 {
+                match client.recv().await {
+                    Ok(Event::Message(bytes)) => {
+                        assert_eq!(bytes.len(), 8 * 1024, "a message arrived truncated");
+                        seen += 1;
+                    }
+                    // A ping or a close is not what this test is about; anything
+                    // that is not a message means the stream ended early.
+                    other => panic!("the stream stopped after {seen} messages: {other:?}"),
+                }
+            }
+            seen
+        });
+
+        for _ in 0..ROUNDS {
+            out.send(&tile).await.expect("the link keeps taking messages");
+        }
+        let seen = tokio::time::timeout(Duration::from_secs(10), reader)
+            .await
+            .expect("the whole stream arrives well inside ten seconds")
+            .expect("the reader finishes");
+        assert_eq!(seen, ROUNDS + 1);
+
+        // Everything has left, so the window is whole again. This is the
+        // property the driver's per-tile re-read depends on.
+        assert_eq!(out.credit(), SEND_WINDOW, "the window is returned in full");
+        assert!(
+            u64::try_from(ROUNDS + 1).expect("a small count") * 8 * 1024
+                > u64::from(SEND_WINDOW),
+            "the fixture must exceed the window, or this proves nothing"
+        );
+        drop(out);
+        let _ = tokio::time::timeout(Duration::from_secs(2), pumping).await;
+    }
+
+    /// A viewer that has stopped reading must make the window read **zero**, not
+    /// make the driver park inside a write.
+    ///
+    /// This is the security half of the flow control rather than the performance
+    /// half. The driver's capture arm is the only place the operator's kill
+    /// switch, the secure desktop and the agent's death are ever observed; a
+    /// write that blocks until the stream's own wall suspends that arm for hours.
+    /// So a queue with nothing leaving it answers zero, and the driver goes round
+    /// its loop declining the frame instead.
+    #[tokio::test]
+    async fn a_backed_up_queue_reads_as_no_credit_rather_than_parking_the_driver() {
+        let (near, _far) = tokio::io::duplex(1024);
+        // The pump is never polled, so nothing ever leaves: the exact shape of a
+        // viewer that has stopped reading.
+        let (mut out, _incoming, _pump) = split(Duplex::server(near, Limits::default()));
+
+        // Messages small enough that the byte window cannot possibly be what
+        // runs out — sixty-four of these are a kilobyte against a 256 KiB window,
+        // so a zero here can only be the queue's doing.
+        let crumb = vec![0x5Au8; 16];
+        for filled in 0..OUTBOUND_DEPTH {
+            assert!(
+                out.credit() > 0,
+                "the queue still had room after {filled} of {OUTBOUND_DEPTH} messages"
+            );
+            out.send(&crumb).await.expect("a queue with room takes a message");
+        }
+        assert_eq!(out.credit(), 0, "a queue nothing is leaving grants nothing");
+    }
+
     /// A machine that cannot capture must answer with the *reason* it reports
     /// everywhere else, rather than leaving the driver waiting on a frame that
     /// is not coming.
     ///
-    /// Only asserted for the unwired case. On a machine that *can* capture this
-    /// opens a real screen stream, and several tests running in parallel would
-    /// then be several streams of one display — which macOS is entitled to
-    /// refuse, and does. That refusal is a genuine property of the platform, not
-    /// of this code, and it is recorded at [`Machine::open`] rather than papered
-    /// over with a test that asserts whatever happened to come back.
+    /// # The case is built, not waited for
+    ///
+    /// This test used to open a real [`Machine`] and return early when the host
+    /// had a working backend — which on the development Mac it does, so the test
+    /// asserted nothing at all on the machine it ran on most. A test that is
+    /// vacuous on the developer's own hardware is a test that reports green
+    /// while the property rots.
+    ///
+    /// So the failed screen is constructed directly. That is not a weaker test:
+    /// [`LocalScreen`] holding `Err(condition)` is *exactly* what
+    /// [`Machine::open`] produces when the platform refuses, and it is the object
+    /// the session driver actually talks to. What it stops being is
+    /// host-dependent — every condition is exercised on every machine, including
+    /// the ones that cannot reach that state locally, and no real capture is
+    /// opened, so this test can never be the second concurrent stream of one
+    /// display that macOS is entitled to refuse.
     #[tokio::test]
     async fn a_screen_that_cannot_open_answers_with_the_reason() {
-        let backend = Backend::here();
-        if backend.wired {
-            return;
+        // Every reason a platform can decline, not merely the one this host
+        // happens to give.
+        for reason in [
+            Condition::PermissionDenied,
+            Condition::NoSession,
+            Condition::SessionDisconnected,
+            Condition::AgentExited,
+            Condition::Fatal,
+        ] {
+            let mut screen = LocalScreen {
+                screen: Err(reason),
+                stopped: Arc::new(AtomicBool::new(false)),
+            };
+            assert!(
+                screen.monitors().is_empty(),
+                "a machine with no capture advertises no displays rather than inventing one"
+            );
+            assert_eq!(
+                screen.next_frame(Duration::from_millis(1)).await.err(),
+                Some(reason),
+                "a screen that could not be opened must answer with the reason it failed"
+            );
         }
-        let mut screen = Machine::open(Arc::new(AtomicBool::new(false)), false).await.screen;
-        assert!(
-            screen.monitors().is_empty(),
-            "a machine with no capture advertises no displays rather than inventing one"
-        );
+
+        // And the kill switch outranks all of them, because an operator who
+        // engaged it wants to be told *that*, not about a capture backend that
+        // also happens to be missing.
+        let mut halted = LocalScreen {
+            screen: Err(Condition::PermissionDenied),
+            stopped: Arc::new(AtomicBool::new(true)),
+        };
         assert_eq!(
-            screen.next_frame(Duration::from_millis(1)).await.err(),
-            Some(backend.condition),
-            "an unwired backend answers a session with the condition it reports to doctor"
+            halted.next_frame(Duration::from_millis(1)).await.err(),
+            Some(Condition::Stopped)
         );
+
+        // Finally, the tie to the real thing: on a host that cannot capture, the
+        // screen [`Machine::open`] builds must report the same condition the
+        // backend probe shows in `doctor`. Skipped where the host *can* capture,
+        // since opening a second real stream of this display is a platform
+        // refusal rather than a property of this code — but the rules above were
+        // all asserted regardless.
+        let backend = Backend::here();
+        if !backend.wired {
+            let mut screen = Machine::open(Arc::new(AtomicBool::new(false)), false).await.screen;
+            assert_eq!(
+                screen.next_frame(Duration::from_millis(1)).await.err(),
+                Some(backend.condition),
+                "an unwired backend answers a session with the condition it reports to doctor"
+            );
+        }
+    }
+
+    /// The property the whole default-off posture rests on, walked end to end:
+    /// with `allow_input = false` there is **no route** by which an injector
+    /// comes into being.
+    ///
+    /// It is walked rather than asserted once because wiring the agent spawn
+    /// added a new route — an argument vector handed to a process running as the
+    /// console user — and the previous pass's version of this property held only
+    /// because that route did not exist. Each step below is a different place the
+    /// answer could have been re-derived, and re-deriving it is how they come to
+    /// disagree.
+    #[test]
+    fn a_view_only_deployment_arms_nothing_by_any_route() {
+        let dir = temp_dir("view-only");
+        let desktop = Desktop { enabled: true, allow_input: false, ..Desktop::default() };
+        let desk = start(&config_with(Some(desktop)), &dir, None).expect("the subsystem starts");
+
+        // 1. The deployment's own statement.
+        assert!(!desk.config().allow_input);
+        // 2. The value handed to the agent spawner, which is what decides the
+        //    argv of a process inside somebody's session.
+        assert!(
+            !desk.agent.input_policy().allows(),
+            "a view-only deployment must hand the spawner a view-only policy"
+        );
+        // 3. The banner reads back from that same value, so the two cannot
+        //    disagree in the one place an operator would look.
+        assert!(desk.summary().contains("input refused"), "{}", desk.summary());
+        // 4. And in this process, no injector is built under any conditions.
+        for stopped in [false, true] {
+            for screen in [false, true] {
+                assert!(
+                    !injector_wanted(false, stopped, screen),
+                    "view-only built an injector with stopped={stopped} screen={screen}"
+                );
+            }
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The same predicate from the other side: an armed deployment still refuses
+    /// to build an injector when the operator has revoked the desktop, or when
+    /// there is no display layout to map a pointer against.
+    #[test]
+    fn an_armed_deployment_still_refuses_where_it_must() {
+        assert!(injector_wanted(true, false, true), "armed, clear, and a screen: the one yes");
+        assert!(!injector_wanted(true, true, true), "the kill switch refuses the hands too");
+        assert!(
+            !injector_wanted(true, false, false),
+            "no capture means no display layout, and a pointer with no layout lands anywhere"
+        );
+    }
+
+    /// A deployment that never asked for a desktop supervises nothing, spawns
+    /// nothing and holds no policy at all — because the subsystem does not exist.
+    #[test]
+    fn the_default_deployment_has_no_agent_to_arm() {
+        let dir = temp_dir("default-off");
+        assert!(start(&config_with(None), &dir, None).is_none());
+        assert!(
+            start(&config_with(Some(Desktop::default())), &dir, None).is_none(),
+            "the config's own default is disabled, and disabled means absent"
+        );
+        assert!(!Desktop::default().allow_input, "and input is off in that default as well");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A daemon that starts with the desktop already revoked must not start an
+    /// agent while it waits for its first poll.
+    #[test]
+    fn a_daemon_that_starts_revoked_hands_the_switch_over_before_the_first_turn() {
+        let dir = temp_dir("revoked-agent");
+        crate::kill_switch::engage(&dir).expect("engage before anything starts");
+        let desktop = Desktop { enabled: true, ..Desktop::default() };
+        let desk = start(&config_with(Some(desktop)), &dir, None).expect("the subsystem starts");
+        assert!(desk.stopped());
+        // The agent's own status is what the console reads; on a machine that
+        // supervises none it says so, and on one that does the switch was handed
+        // over before the supervisor's first turn.
+        let status = desk.agent.status();
+        assert!(!status.live, "nothing is live under an engaged switch");
+        assert!(!status.sentence.is_empty(), "and the reason is never blank");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

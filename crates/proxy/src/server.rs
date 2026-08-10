@@ -12,6 +12,7 @@
 //! Parsing upstream response framing so proxied connections can also be reused
 //! is tracked in `docs/roadmap.md`.
 
+use crate::dav::{self, BodyPolicy};
 use crate::files::{self, Resolution};
 use crate::health;
 use crate::upgrade;
@@ -501,8 +502,26 @@ where
     // everything else falls through to the SPA in `static_root`. Validation
     // guarantees a console site has no instances, so `routes_to_app` below
     // can never claim these paths first.
+    // Ahead of the general `/api/*` relay because it is a *subset* of it that
+    // must be carried differently: a whole file in one direction or the other,
+    // where that relay buffers a body and caps it at a size chosen for a JSON
+    // post. Same gate, same loopback address, same verbatim answer — only the
+    // framing differs. See [`relay_console_bulk`].
+    if runtime.site.console && is_console_bulk(request.path()) {
+        return relay_console_bulk(server, request, peer, leftover, stream).await;
+    }
+
     if runtime.site.console && is_console_api(request.path()) {
         return relay_console_api(server, request, peer, leftover, stream).await;
+    }
+
+    // The WebDAV mount, which is the same relay to the same loopback API under
+    // the same gate — the source-address check above has already run, and this
+    // branch is unreachable without it. What differs is the traffic, not the
+    // trust: unfamiliar verbs, the fields those verbs are made of, and bodies
+    // measured in gigabytes rather than kilobytes. See [`crate::dav`].
+    if runtime.site.console && dav::is_dav_path(request.path()) {
+        return relay_console_dav(server, request, peer, leftover, stream).await;
     }
 
     if runtime.site.routes_to_app(request.path()) {
@@ -575,6 +594,14 @@ where
 /// Relays exactly `length` body bytes to `upstream`, same rule as [`take_body`]:
 /// whatever `read_head` already buffered goes first, the socket makes up the
 /// rest.
+///
+/// `length` is a number a stranger chose and, on the WebDAV path, one this proxy
+/// deliberately does not cap — see [`crate::dav::BodyPolicy::Content`]. It is
+/// used only to *bound* a copy through a fixed-size window, never to size a
+/// buffer, and both arithmetic steps below are written so that a declared length
+/// larger than this machine's address space still moves the right bytes in the
+/// right order rather than silently truncating and reading the client's next
+/// request as body.
 async fn relay_body<S>(
     leftover: &mut Vec<u8>,
     stream: &mut S,
@@ -584,12 +611,15 @@ async fn relay_body<S>(
 where
     S: AsyncRead + Unpin,
 {
-    let from_leftover = leftover.len().min(length as usize);
+    // A declared length beyond `usize` cannot be smaller than what is buffered,
+    // so all of `leftover` is body in that case.
+    let from_leftover =
+        usize::try_from(length).map_or(leftover.len(), |declared| leftover.len().min(declared));
     if from_leftover > 0 {
         let chunk: Vec<u8> = leftover.drain(..from_leftover).collect();
         upstream.write_all(&chunk).await?;
     }
-    let remaining = length - from_leftover as u64;
+    let remaining = length.saturating_sub(from_leftover as u64);
     if remaining > 0 {
         let mut limited = stream.take(remaining);
         tokio::io::copy(&mut limited, upstream).await?;
@@ -786,6 +816,57 @@ fn is_console_api(path: &str) -> bool {
     path == "/api" || path.starts_with("/api/")
 }
 
+/// The console API's bulk file plane, which sits under `/api/` and must not be
+/// relayed the way the rest of `/api/` is.
+///
+/// Named from `selfhost_admin` rather than spelled again: the daemon decides
+/// which paths move whole files, and a second copy of that string here would be
+/// a prefix that could drift from the one the daemon streams on — which is a
+/// console whose uploads are refused for a reason nothing in either process
+/// states.
+const BULK_PREFIX: &str = selfhost_admin::storage_api::BLOB_PREFIX;
+
+/// Whether a console path is a bulk file transfer.
+fn is_console_bulk(path: &str) -> bool {
+    path.starts_with(BULK_PREFIX)
+}
+
+/// The three methods the daemon's bulk plane serves.
+///
+/// A closed list, matched before the loopback connection opens, for the reason
+/// [`crate::dav::VERBS`] is closed: `Api::bulk_for` answers `WrongMethod` to
+/// everything else, so carrying an unknown token there would only be this proxy
+/// widening what a stranger can put in front of the process that deploys code on
+/// this box.
+fn bulk_carries(method: &Method) -> bool {
+    matches!(method, Method::Get | Method::Head | Method::Put)
+}
+
+/// The `Allow` field sent with the `405` [`bulk_carries`] produces.
+const BULK_ALLOW: &str = "GET, HEAD, PUT";
+
+/// The header fields relayed on a bulk transfer, over and above the ordinary
+/// console set in [`crate::upgrade::RELAYED`].
+///
+/// Exactly the three `selfhost_storage::respond::blob` reads, and nothing else.
+/// `Range` is what makes an interrupted download resume rather than start again,
+/// and the two conditionals are what turn a revalidation into a `304` instead of
+/// a second copy of the file. Dropping them — which is what the JSON relay did
+/// to this path — is not a refusal a caller can see: it is a download that
+/// silently costs the whole file every time.
+const RELAYED_FOR_BULK: [&str; 3] = ["range", "if-none-match", "if-modified-since"];
+
+/// Whether a header field should be passed to the admin API on a bulk transfer.
+///
+/// Composed from [`crate::upgrade::is_relayed`] rather than restating it: the
+/// body's type, the caller's credentials and the CSRF header the daemon demands
+/// of a non-`GET` are relayed here for exactly the reasons they are relayed on
+/// the rest of `/api/*`.
+fn bulk_is_relayed(name: &str) -> bool {
+    upgrade::is_relayed(name, false)
+        || RELAYED_FOR_BULK.iter().any(|allowed| name.eq_ignore_ascii_case(allowed))
+}
+
 /// Relays a console site's `/api/*` request to the loopback admin API and
 /// returns that API's response verbatim.
 ///
@@ -859,53 +940,18 @@ where
     // belongs to the upstream once the switch is agreed.
     let body = if is_upgrade { Vec::new() } else { take_body(leftover, stream, length).await? };
 
-    let Some(admin_bind) = server.admin_bind else {
-        eprintln!("[proxy] console relay: admin_bind is not configured or does not parse");
-        write_response(stream, Response::error_page(Status::BAD_GATEWAY), false).await?;
+    let Some(mut upstream) = connect_admin(server, "console relay", stream).await? else {
         return Ok(Outcome::MustClose);
     };
-    let mut upstream = match TcpStream::connect(admin_bind).await {
-        Ok(connection) => connection,
-        Err(error) => {
-            eprintln!("[proxy] console relay: could not reach the admin API: {error}");
-            write_response(stream, Response::error_page(Status::BAD_GATEWAY), false).await?;
-            return Ok(Outcome::MustClose);
-        }
-    };
-
-    let mut head = Vec::new();
-    head.extend_from_slice(request.method.as_str().as_bytes());
-    head.push(b' ');
-    head.extend_from_slice(request.target.as_bytes());
-    head.extend_from_slice(b" HTTP/1.1\r\nHost: 127.0.0.1\r\n");
 
     // Only what the admin API acts on is passed along: the body's type and the
     // caller's credentials, widened for this one request by the handshake's own
     // fields when it is a handshake. Everything else — including any framing or
-    // hop-by-hop field the client sent — is dropped and re-derived below. See
+    // hop-by-hop field the client sent — is dropped and re-derived. See
     // `upgrade::RELAYED_FOR_UPGRADE` for what the widening does and does not
     // include, and why.
-    for field in request.headers.iter() {
-        let name = field.name();
-        if upgrade::is_relayed(name, is_upgrade) {
-            head.extend_from_slice(name.as_bytes());
-            head.extend_from_slice(b": ");
-            head.extend_from_slice(field.value());
-            head.extend_from_slice(b"\r\n");
-        }
-    }
-
-    head.extend_from_slice(format!("X-Forwarded-For: {}\r\n", peer.ip()).as_bytes());
-    if is_upgrade {
-        // No `Content-Length`: there is no body, and the two hop-by-hop lines
-        // are the proxy's own statement about this hop rather than an echo of
-        // the client's.
-        head.extend_from_slice(upgrade::UPGRADE_REQUEST_LINES);
-        head.extend_from_slice(b"\r\n");
-    } else {
-        head.extend_from_slice(format!("Content-Length: {}\r\n", body.len()).as_bytes());
-        head.extend_from_slice(b"Connection: close\r\n\r\n");
-    }
+    let framing = if is_upgrade { Framing::Upgrade } else { Framing::Length(body.len() as u64) };
+    let head = admin_request_head(request, peer, |name| upgrade::is_relayed(name, is_upgrade), framing);
 
     upstream.write_all(&head).await?;
     upstream.write_all(&body).await?;
@@ -920,6 +966,356 @@ where
     tokio::io::copy(&mut upstream, stream).await?;
     stream.flush().await?;
     Ok(Outcome::MustClose)
+}
+
+/// Relays a console site's `/api/storage/blob/*` transfer to the loopback admin
+/// API, streaming the body rather than holding it.
+///
+/// # Why this path cannot go through [`relay_console_api`]
+///
+/// It sits under `/api/`, so until this branch existed it did — and the JSON
+/// relay is built for a 2 KiB `POST`: it reads the whole body into a `Vec` and
+/// refuses anything over [`CONSOLE_API_MAX_BODY`] with a `413`. The daemon's own
+/// bulk plane accepts up to `storage_api::BULK_MAX_BODY` and streams every byte
+/// of it to disk without ever holding one, and the console's file picker sends
+/// whole files here. The two therefore disagreed by six orders of magnitude, and
+/// the proxy was the half that said no: **every console upload larger than 64 KiB
+/// was refused**, by the one hop the browser has no way around, for a reason
+/// neither the daemon nor the page could state.
+///
+/// It is the same argument [`relay_console_dav`] makes, arriving at a different
+/// prefix, which is exactly why it is a sibling of that function rather than a
+/// flag on it: one moves a file for a mounted drive and one moves a file for a
+/// browser, and both must move it without this process ever holding it.
+///
+/// # What it refuses before the loopback connection opens
+///
+/// 1. **The verb**, against [`bulk_carries`] — the three the daemon's
+///    `Api::bulk_for` serves. Everything else is `405` with `Allow` and is never
+///    forwarded, so this branch does not become a general-purpose method tunnel
+///    into the process that deploys code on this box.
+/// 2. **A body on a read**, which would otherwise sit unread on this socket and
+///    be parsed as the next request — request smuggling with the proxy as the
+///    willing half.
+/// 3. **Chunked framing**, which the admin API does not accept and which cannot
+///    be measured here without buffering the thing this branch exists not to
+///    buffer.
+///
+/// The gate is unchanged and is not this function's to change: `Site::permits`
+/// ran in [`dispatch`] before this branch was reachable, and nothing here
+/// widens, exempts or re-decides it. Authentication is the daemon's for the same
+/// reason it is on the WebDAV path — the CSRF header a non-`GET` needs is
+/// relayed, judged there, and never judged here.
+async fn relay_console_bulk<S>(
+    server: &Server,
+    request: &Request,
+    peer: SocketAddr,
+    leftover: &mut Vec<u8>,
+    stream: &mut S,
+) -> io::Result<Outcome>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    if !bulk_carries(&request.method) {
+        // Every refusal below closes the connection, for the reason
+        // [`relay_console_dav`] closes on one: a body refused before it was read
+        // is bytes left on this socket, and the only thing that could be done
+        // with them afterwards is to parse them as the next request.
+        let mut response = Response::error_page(Status::METHOD_NOT_ALLOWED);
+        if let Err(error) = response.headers.set("Allow", BULK_ALLOW) {
+            eprintln!("[proxy] bulk relay: could not state Allow: {error}");
+        }
+        write_response(stream, response, false).await?;
+        return Ok(Outcome::MustClose);
+    }
+
+    // Settled before the loopback connection opens, exactly as on the WebDAV
+    // path: the admin API refuses a chunked body, and measuring one here would
+    // mean buffering the very thing this branch exists not to buffer.
+    let declared = match request.body_length() {
+        Ok(selfhost_http::BodyLength::None) => 0,
+        Ok(selfhost_http::BodyLength::Fixed(length)) => length,
+        Ok(selfhost_http::BodyLength::Chunked) | Err(_) => {
+            write_response(stream, Response::error_page(Status::BAD_REQUEST), false).await?;
+            return Ok(Outcome::MustClose);
+        }
+    };
+    if declared > 0 && request.method != Method::Put {
+        // A read carries no body. Refused rather than relayed with the length
+        // forced to zero, so the bytes cannot become the next request.
+        write_response(stream, Response::error_page(Status::BAD_REQUEST), false).await?;
+        return Ok(Outcome::MustClose);
+    }
+
+    // Deliberately uncapped here. The ceiling that belongs to an upload is
+    // `storage_api::BULK_MAX_BODY`, the share's quota and the volume's free
+    // space, none of which this process knows; the declared length is used only
+    // to bound the copy, never to size a buffer, so a declared 100 GiB costs
+    // nothing until 100 GiB genuinely arrive and the daemon can refuse it from
+    // the head while the transfer is still in its first kilobyte.
+    let Some(mut upstream) = connect_admin(server, "bulk relay", stream).await? else {
+        return Ok(Outcome::MustClose);
+    };
+
+    let head = admin_request_head(request, peer, bulk_is_relayed, Framing::Length(declared));
+    upstream.write_all(&head).await?;
+
+    let sent = async {
+        if declared > 0 {
+            relay_body(leftover, stream, &mut upstream, declared).await?;
+        }
+        upstream.flush().await
+    }
+    .await;
+    if let Err(error) = sent {
+        // Not fatal, and not swallowed: the daemon is entitled to answer a `401`
+        // or a quota refusal before it has read the whole body, and once it has
+        // answered it may close its read half. That answer is already in this
+        // socket's receive queue and is what the client needs to see.
+        eprintln!("[proxy] bulk relay: the request body ended early: {error}");
+    }
+
+    tokio::io::copy(&mut upstream, stream).await?;
+    stream.flush().await?;
+    Ok(Outcome::MustClose)
+}
+
+/// Relays a console site's `/dav/*` request to the loopback admin API, streaming
+/// the body rather than holding it.
+///
+/// This is [`relay_console_api`] for a file share, and everything it shares with
+/// that function it shares on purpose: the same loopback address, the same
+/// verbatim response relay, and — decisively — the same
+/// `Site::permits(peer.ip())` gate, which ran in [`dispatch`] before this branch
+/// was reachable and which nothing here widens, exempts or re-decides. A WebDAV
+/// path is gated exactly as `/api/*` is, and the webhook and ACME exemptions
+/// above that gate are untouched: neither of them names this prefix and neither
+/// grew to.
+///
+/// Three things differ, and each is a refusal this function performs *before*
+/// the loopback connection opens.
+///
+/// 1. **The verb is checked against a closed list.** A file client speaks eight
+///    methods this relay had never seen. [`dav::carries`] names all of them and
+///    nothing else; an unrecognised token is answered `405` with `Allow` and is
+///    never forwarded. Forwarding an unknown method blindly would make this a
+///    general-purpose tunnel into the process that deploys code on this box.
+/// 2. **A repeated control field is refused.** See
+///    [`dav::duplicated_control_field`]: two `Destination` fields in one head is
+///    a request built so that two readers might name two different files.
+/// 3. **The body is streamed, never buffered.** [`take_body`] sizes a `Vec` from
+///    the declared `Content-Length`, which on this path is a caller-chosen
+///    number that a file client legitimately sets to several gigabytes — and
+///    under `panic = "abort"` a failed allocation is not an error, it is the box.
+///    [`relay_body`] copies through a fixed-size window instead, so a declared
+///    100 GiB costs nothing until 100 GiB genuinely arrive, and the admin API
+///    can refuse the transfer from the head while it is still in its first
+///    kilobyte.
+///
+/// # Authentication is not this function's business
+///
+/// `Authorization` is relayed and nothing else about it happens here. The proxy
+/// holds no credential for this path, checks none, and caches none: the admin
+/// API is the one place entitled to decide who may read a share, and a proxy
+/// with a second opinion is a proxy that can disagree with the authority — which
+/// is either a bypass or a lockout depending on which way it errs. The `401` and
+/// its `WWW-Authenticate` challenge travel back in the verbatim relay like any
+/// other answer.
+async fn relay_console_dav<S>(
+    server: &Server,
+    request: &Request,
+    peer: SocketAddr,
+    leftover: &mut Vec<u8>,
+    stream: &mut S,
+) -> io::Result<Outcome>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    // Every refusal below closes the connection. A request refused before its
+    // body was read leaves those bytes unread on this socket, and the only thing
+    // that could be done with them afterwards is to parse them as the next
+    // request — which is request smuggling with the proxy as the willing half.
+    if !dav::carries(&request.method) {
+        eprintln!("[proxy] dav relay: refused method {}", dav::loggable_method(&request.method));
+        let mut response = Response::error_page(Status::METHOD_NOT_ALLOWED);
+        // A failure here would only cost the client the hint about what it
+        // should have sent, so the refusal itself still goes out.
+        if let Err(error) = response.headers.set("Allow", dav::ALLOW) {
+            eprintln!("[proxy] dav relay: could not state Allow: {error}");
+        }
+        write_response(stream, response, false).await?;
+        return Ok(Outcome::MustClose);
+    }
+
+    if let Some(name) = dav::duplicated_control_field(&request.headers) {
+        eprintln!("[proxy] dav relay: refused — {name} appears more than once");
+        write_response(stream, Response::error_page(Status::BAD_REQUEST), false).await?;
+        return Ok(Outcome::MustClose);
+    }
+
+    // Framing is settled before the loopback connection opens, for the reason
+    // `relay_console_api` settles it first as well: the admin API rejects
+    // chunked bodies, and measuring one here would mean buffering the very
+    // thing this path exists not to buffer. A chunked upload is therefore
+    // refused outright rather than relayed — a WebDAV client that knows the
+    // size of the file it is sending has no reason to withhold it.
+    let declared = match request.body_length() {
+        Ok(selfhost_http::BodyLength::None) => 0,
+        Ok(selfhost_http::BodyLength::Fixed(length)) => length,
+        Ok(selfhost_http::BodyLength::Chunked) | Err(_) => {
+            write_response(stream, Response::error_page(Status::BAD_REQUEST), false).await?;
+            return Ok(Outcome::MustClose);
+        }
+    };
+
+    match dav::body_policy(&request.method) {
+        BodyPolicy::Forbidden if declared > 0 => {
+            eprintln!(
+                "[proxy] dav relay: refused — {} may not carry a body",
+                dav::loggable_method(&request.method)
+            );
+            write_response(stream, Response::error_page(Status::BAD_REQUEST), false).await?;
+            return Ok(Outcome::MustClose);
+        }
+        BodyPolicy::Document if declared > dav::MAX_DOCUMENT_BODY => {
+            write_response(stream, Response::error_page(Status::CONTENT_TOO_LARGE), false).await?;
+            return Ok(Outcome::MustClose);
+        }
+        // `BodyPolicy::Content` is uncapped here on purpose: the ceilings that
+        // belong to a file upload are the share's quota, the volume's free space
+        // and the daemon's in-flight totals, none of which this process knows.
+        _ => {}
+    }
+
+    let Some(mut upstream) = connect_admin(server, "dav relay", stream).await? else {
+        return Ok(Outcome::MustClose);
+    };
+
+    let head = admin_request_head(request, peer, dav::is_relayed, Framing::Length(declared));
+    upstream.write_all(&head).await?;
+
+    let sent = async {
+        if declared > 0 {
+            relay_body(leftover, stream, &mut upstream, declared).await?;
+        }
+        upstream.flush().await
+    }
+    .await;
+    if let Err(error) = sent {
+        // Not fatal, and not swallowed either. The admin API is entitled to
+        // answer before it has read the whole body — a `401` challenge on a
+        // `PUT` is the ordinary case, and a quota refusal is the next most
+        // common — and once it has answered it may close its read half, which
+        // turns the rest of this copy into a broken pipe. That answer is already
+        // in this socket's receive queue and is exactly what the client needs to
+        // see, so the failure is recorded and the response is still relayed
+        // rather than replaced by a `502` the client could not act on.
+        eprintln!("[proxy] dav relay: the request body ended early: {error}");
+    }
+
+    // Byte for byte, like every other relayed answer: a `207 Multi-Status`, a
+    // ranged `206`, a `401` challenge and a multi-gigabyte download all reach
+    // the client with the admin API's own framing, so the two cannot disagree
+    // about where the response ends.
+    tokio::io::copy(&mut upstream, stream).await?;
+    stream.flush().await?;
+    Ok(Outcome::MustClose)
+}
+
+/// Opens the loopback connection to the admin API, answering the caller `502`
+/// and returning `None` when it cannot.
+///
+/// Shared by both console relays so that "the admin API is unreachable" is one
+/// behaviour with one log line, rather than two that could drift into answering
+/// differently — a difference a caller could measure to tell the two paths
+/// apart.
+async fn connect_admin<S>(
+    server: &Server,
+    label: &str,
+    stream: &mut S,
+) -> io::Result<Option<TcpStream>>
+where
+    S: AsyncWrite + Unpin,
+{
+    let Some(admin_bind) = server.admin_bind else {
+        eprintln!("[proxy] {label}: admin_bind is not configured or does not parse");
+        write_response(stream, Response::error_page(Status::BAD_GATEWAY), false).await?;
+        return Ok(None);
+    };
+    match TcpStream::connect(admin_bind).await {
+        Ok(connection) => Ok(Some(connection)),
+        Err(error) => {
+            eprintln!("[proxy] {label}: could not reach the admin API: {error}");
+            write_response(stream, Response::error_page(Status::BAD_GATEWAY), false).await?;
+            Ok(None)
+        }
+    }
+}
+
+/// What the proxy states about the body of the hop it is about to make.
+///
+/// Named rather than inferred so that the head and the bytes that follow it can
+/// only be decided together. Every framing field the client sent is dropped
+/// before this is applied, so the relayed head says exactly one thing about
+/// where the body ends.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Framing {
+    /// Exactly this many body bytes follow, and the connection closes once the
+    /// answer has been relayed.
+    Length(u64),
+    /// No body and no `Content-Length` — the two hop-by-hop lines RFC 6455
+    /// requires, written by the proxy rather than echoed from the client. See
+    /// [`upgrade::UPGRADE_REQUEST_LINES`].
+    Upgrade,
+}
+
+/// Builds the request head this proxy sends to the loopback admin API.
+///
+/// `relayed` decides which of the caller's header fields travel; everything
+/// else, including anything the client said about framing or about the
+/// connection it arrived on, is dropped and re-derived from `framing`. That is
+/// what makes the relayed head unambiguous: there is exactly one statement in it
+/// about where the body ends, and this process wrote it.
+///
+/// The request target is copied verbatim. It has already been parsed as a target
+/// by `selfhost_http`, which admits no space, CR or LF, so it cannot become a
+/// second request line; and re-encoding it here would be a second chance to get
+/// the escaping wrong on a path the admin API is about to resolve against a
+/// share root.
+fn admin_request_head(
+    request: &Request,
+    peer: SocketAddr,
+    relayed: impl Fn(&str) -> bool,
+    framing: Framing,
+) -> Vec<u8> {
+    let mut head = Vec::new();
+    head.extend_from_slice(request.method.as_str().as_bytes());
+    head.push(b' ');
+    head.extend_from_slice(request.target.as_bytes());
+    head.extend_from_slice(b" HTTP/1.1\r\nHost: 127.0.0.1\r\n");
+
+    for field in request.headers.iter() {
+        let name = field.name();
+        if relayed(name) {
+            head.extend_from_slice(name.as_bytes());
+            head.extend_from_slice(b": ");
+            head.extend_from_slice(field.value());
+            head.extend_from_slice(b"\r\n");
+        }
+    }
+
+    head.extend_from_slice(format!("X-Forwarded-For: {}\r\n", peer.ip()).as_bytes());
+    match framing {
+        Framing::Upgrade => {
+            head.extend_from_slice(upgrade::UPGRADE_REQUEST_LINES);
+            head.extend_from_slice(b"\r\n");
+        }
+        Framing::Length(length) => {
+            head.extend_from_slice(format!("Content-Length: {length}\r\n").as_bytes());
+            head.extend_from_slice(b"Connection: close\r\n\r\n");
+        }
+    }
+    head
 }
 
 /// Reads the admin API's answer to a handshake and either hands the connection
@@ -2371,5 +2767,518 @@ mod tests {
         let cleartext = handshake_head("/api/desktop/stream");
         let response = dispatch_bytes(&server, &cleartext, "10.66.0.2:40000", false, b"").await;
         assert!(response.starts_with(b"HTTP/1.1 308"), "{}", String::from_utf8_lossy(&response));
+    }
+
+    // The WebDAV mount. Every test below asserts one of the properties the
+    // relay was widened under, and several are written so that they can only
+    // pass if the refusal happens *before* the loopback connection opens: the
+    // admin bind is a port nothing listens on, so a relay that was attempted
+    // answers 502 and a relay that was refused answers what the proxy chose.
+
+    /// A WebDAV request head with the fields a real client sends.
+    fn dav_head(method: &str, target: &str, lines: &[&str]) -> String {
+        let mut head =
+            format!("{method} {target} HTTP/1.1\r\nHost: console.example.com\r\n");
+        for line in lines {
+            head.push_str(line);
+            head.push_str("\r\n");
+        }
+        head.push_str("\r\n");
+        head
+    }
+
+    /// A console site whose admin bind is a port nothing listens on.
+    fn console_with_dead_admin(dir: &std::path::Path) -> Server {
+        let mut config = config_with(vec![console_site()]);
+        config.server.admin_bind = "127.0.0.1:1".into();
+        Server::build(&config, dir)
+    }
+
+    #[tokio::test]
+    async fn a_dav_path_is_gated_exactly_as_the_api_is() {
+        // The property the whole feature rests on: `/dav/*` sits *below*
+        // `Site::permits(peer.ip())`, and the exemptions above it — the ACME
+        // challenge and the deploy webhook — were not widened to include it. A
+        // peer outside the gate gets the same 404 an unhosted name gets.
+        let dir = ScratchDataDir::new("dav-gate");
+        write_spa(&dir.0);
+        let server = console_with_dead_admin(&dir.0);
+
+        let head = dav_head("PROPFIND", "/dav/vault/", &["Depth: 1"]);
+        let denied = dispatch_bytes(&server, &head, "203.0.113.9:5000", true, b"").await;
+        let unknown = dispatch_bytes(
+            &server,
+            "GET / HTTP/1.1\r\nHost: not-hosted.example.com\r\n\r\n",
+            "203.0.113.9:5000",
+            true,
+            b"",
+        )
+        .await;
+        assert!(denied.starts_with(b"HTTP/1.1 404"), "{}", String::from_utf8_lossy(&denied));
+        assert_eq!(
+            denied, unknown,
+            "a probe must not be able to tell a share from a hostname that is not hosted"
+        );
+
+        // And the peer inside the gate reaches the relay, failing only because
+        // nothing is listening — which is what makes the 404 above a statement
+        // about the gate rather than about the route.
+        let permitted = dispatch_bytes(&server, &head, "10.66.0.2:40000", true, b"").await;
+        assert!(permitted.starts_with(b"HTTP/1.1 502"), "{}", String::from_utf8_lossy(&permitted));
+    }
+
+    #[tokio::test]
+    async fn the_dav_prefix_is_claimed_only_on_a_console_site_and_only_at_its_own_name() {
+        let dir = ScratchDataDir::new("dav-claim");
+        write_spa(&dir.0);
+
+        // An ordinary site keeps `/dav/*` as its own content: the mount is a
+        // console route, and a site that merely happens to have such a path
+        // must not find its requests relayed into the admin API.
+        let mut ordinary = config_with(vec![gated_site("web", &["console.example.com"])]);
+        ordinary.server.admin_bind = "127.0.0.1:1".into();
+        let plain = Server::build(&ordinary, &dir.0);
+        let response = dispatch_bytes(
+            &plain,
+            &dav_head("PROPFIND", "/dav/vault/", &["Depth: 0"]),
+            "10.66.0.2:40000",
+            true,
+            b"",
+        )
+        .await;
+        assert!(
+            response.starts_with(b"HTTP/1.1 405"),
+            "an ordinary site answered from its static handler, not the relay: {}",
+            String::from_utf8_lossy(&response)
+        );
+
+        // And on the console site, a neighbouring name is still the SPA — the
+        // `/apidocs` lesson, applied to `/davos`.
+        let console = console_with_dead_admin(&dir.0);
+        let lookalike = dispatch_bytes(
+            &console,
+            "GET /davos HTTP/1.1\r\nHost: console.example.com\r\n\r\n",
+            "10.66.0.2:40000",
+            true,
+            b"",
+        )
+        .await;
+        assert!(
+            lookalike.starts_with(b"HTTP/1.1 404"),
+            "/davos was relayed instead of served: {}",
+            String::from_utf8_lossy(&lookalike)
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unknown_method_is_refused_with_the_verbs_that_are_spoken() {
+        // The rule that keeps this from becoming a general-purpose method
+        // tunnel into the process that deploys code on this box. A dead admin
+        // bind proves nothing was forwarded: a relayed request would be 502.
+        let dir = ScratchDataDir::new("dav-405");
+        write_spa(&dir.0);
+        let server = console_with_dead_admin(&dir.0);
+
+        for refused in ["POST", "PATCH", "SEARCH", "REPORT", "ACL", "propfind"] {
+            let head = dav_head(refused, "/dav/vault/notes.txt", &["Content-Length: 0"]);
+            let response = dispatch_bytes(&server, &head, "10.66.0.2:40000", true, b"").await;
+            let text = String::from_utf8_lossy(&response);
+            assert!(text.starts_with("HTTP/1.1 405"), "{refused} was not refused: {text}");
+            assert!(text.contains(&format!("Allow: {}\r\n", dav::ALLOW)), "{text}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_propfind_reaches_the_admin_api_with_its_depth_and_its_document() {
+        let dir = ScratchDataDir::new("dav-propfind");
+        write_spa(&dir.0);
+        const ANSWER: &[u8] = b"HTTP/1.1 207 Multi-Status\r\nContent-Length: 3\r\n\r\n<d>";
+        let (admin_bind, daemon) = fake_daemon(ANSWER).await;
+        let mut config = config_with(vec![console_site()]);
+        config.server.admin_bind = admin_bind.to_string();
+        let server = Server::build(&config, &dir.0);
+
+        let body = b"<?xml version=\"1.0\"?><propfind><allprop/></propfind>";
+        let head = dav_head(
+            "PROPFIND",
+            "/dav/vault/tax/",
+            &[
+                "Depth: 1",
+                "Content-Type: application/xml",
+                "Authorization: Basic dTpw",
+                "User-Agent: WebDAVFS/3.0.0",
+                &format!("Content-Length: {}", body.len()),
+            ],
+        );
+        let response = dispatch_bytes(&server, &head, "10.66.0.2:40000", true, body).await;
+        assert_eq!(response, ANSWER, "{}", String::from_utf8_lossy(&response));
+
+        let relayed = daemon.await.expect("the fake daemon did not panic");
+        assert!(relayed.head.starts_with("PROPFIND /dav/vault/tax/ HTTP/1.1"), "{}", relayed.head);
+        assert!(relayed.head.contains("Depth: 1\r\n"), "{}", relayed.head);
+        assert!(relayed.head.contains("Content-Type: application/xml\r\n"), "{}", relayed.head);
+        // Authentication is the admin API's decision, so its input has to get
+        // there. The proxy forms no opinion of its own about this field.
+        assert!(relayed.head.contains("Authorization: Basic dTpw\r\n"), "{}", relayed.head);
+        assert!(relayed.head.contains("X-Forwarded-For: 10.66.0.2\r\n"), "{}", relayed.head);
+        assert!(
+            relayed.head.contains(&format!("Content-Length: {}\r\n", body.len())),
+            "{}",
+            relayed.head
+        );
+        // Nothing a client merely volunteers is widened onto this path.
+        assert!(!relayed.head.contains("User-Agent"), "{}", relayed.head);
+        assert_eq!(relayed.after_head, body, "the document reached the admin API");
+    }
+
+    #[tokio::test]
+    async fn destination_and_if_are_relayed_verbatim_and_uninterpreted() {
+        // Without these two there is no COPY, no MOVE and no locked write. The
+        // `Destination` here is a full absolute URL — a second parsing surface —
+        // and the proxy's whole job with it is to carry it unchanged to the one
+        // layer that can check it against a share root.
+        let dir = ScratchDataDir::new("dav-move");
+        write_spa(&dir.0);
+        const ANSWER: &[u8] = b"HTTP/1.1 201 Created\r\nContent-Length: 0\r\n\r\n";
+        let (admin_bind, daemon) = fake_daemon(ANSWER).await;
+        let mut config = config_with(vec![console_site()]);
+        config.server.admin_bind = admin_bind.to_string();
+        let server = Server::build(&config, &dir.0);
+
+        const DESTINATION: &str =
+            "https://console.example.com/dav/vault/archive/2019%20return.pdf";
+        const IF: &str = "(<opaquelocktoken:e71d4fae-5dec-22d6-fea5-00a0c91e6be4>)";
+        let head = dav_head(
+            "MOVE",
+            "/dav/vault/inbox/return.pdf",
+            &[
+                &format!("Destination: {DESTINATION}"),
+                "Overwrite: F",
+                &format!("If: {IF}"),
+            ],
+        );
+        let response = dispatch_bytes(&server, &head, "10.66.0.2:40000", true, b"").await;
+        assert_eq!(response, ANSWER, "{}", String::from_utf8_lossy(&response));
+
+        let relayed = daemon.await.expect("the fake daemon did not panic");
+        assert!(relayed.head.contains(&format!("Destination: {DESTINATION}\r\n")), "{}", relayed.head);
+        assert!(relayed.head.contains(&format!("If: {IF}\r\n")), "{}", relayed.head);
+        assert!(relayed.head.contains("Overwrite: F\r\n"), "{}", relayed.head);
+        // Relayed, not rewritten: the escape survives, because re-encoding a
+        // path the daemon is about to resolve is a second chance to get it wrong.
+        assert!(relayed.head.contains("2019%20return.pdf"), "{}", relayed.head);
+    }
+
+    #[tokio::test]
+    async fn a_repeated_destination_is_refused_before_any_upstream_connection() {
+        // Two `Destination` fields is a request built so that two readers might
+        // name two different files. The proxy picks neither.
+        let dir = ScratchDataDir::new("dav-dup");
+        write_spa(&dir.0);
+        let server = console_with_dead_admin(&dir.0);
+
+        let head = dav_head(
+            "COPY",
+            "/dav/vault/a.txt",
+            &[
+                "Destination: https://console.example.com/dav/vault/b.txt",
+                "Destination: https://console.example.com/dav/other/c.txt",
+            ],
+        );
+        let response = dispatch_bytes(&server, &head, "10.66.0.2:40000", true, b"").await;
+        let text = String::from_utf8_lossy(&response);
+        assert!(text.starts_with("HTTP/1.1 400"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn a_multi_gigabyte_put_is_streamed_and_never_sized_into_a_buffer() {
+        // The allocation trap, stated as a test. `take_body` does
+        // `Vec::with_capacity(declared_length)`, so relaying this request the
+        // way `/api/*` is relayed would attempt a 100 GiB allocation from one
+        // line of a request head — and under `panic = "abort"` a failed
+        // allocation is not an error a caller sees, it is the box. Reaching the
+        // daemon at all is the proof that the streaming path was taken; the
+        // relayed `Content-Length` is the proof that the size was believed
+        // rather than capped.
+        const HUGE: u64 = 100 * 1024 * 1024 * 1024;
+        let dir = ScratchDataDir::new("dav-put-huge");
+        write_spa(&dir.0);
+        const ANSWER: &[u8] = b"HTTP/1.1 201 Created\r\nContent-Length: 0\r\n\r\n";
+        let (admin_bind, daemon) = fake_daemon(ANSWER).await;
+        let mut config = config_with(vec![console_site()]);
+        config.server.admin_bind = admin_bind.to_string();
+        let server = Server::build(&config, &dir.0);
+
+        let head = dav_head(
+            "PUT",
+            "/dav/vault/disk-image.dmg",
+            &[
+                "Content-Type: application/octet-stream",
+                &format!("X-Expected-Entity-Length: {HUGE}"),
+                &format!("Content-Length: {HUGE}"),
+            ],
+        );
+        let response = dispatch_bytes(&server, &head, "10.66.0.2:40000", true, b"").await;
+        assert_eq!(response, ANSWER, "{}", String::from_utf8_lossy(&response));
+
+        let relayed = daemon.await.expect("the fake daemon did not panic");
+        assert!(relayed.head.starts_with("PUT /dav/vault/disk-image.dmg HTTP/1.1"), "{}", relayed.head);
+        assert!(relayed.head.contains(&format!("Content-Length: {HUGE}\r\n")), "{}", relayed.head);
+        // macOS announces the size before it sends the file so a copy that
+        // cannot fit is refused in the first kilobyte rather than the last.
+        assert!(
+            relayed.head.contains(&format!("X-Expected-Entity-Length: {HUGE}\r\n")),
+            "{}",
+            relayed.head
+        );
+    }
+
+    #[tokio::test]
+    async fn a_put_larger_than_the_console_api_cap_is_carried_rather_than_refused() {
+        // The `/api/*` ceiling exists because the admin API caps its own reads
+        // at 64 KiB. A file share has no such ceiling and must not inherit one:
+        // a NAS whose largest upload is a proxy constant is not a NAS.
+        let dir = ScratchDataDir::new("dav-put-body");
+        write_spa(&dir.0);
+        const ANSWER: &[u8] = b"HTTP/1.1 204 No Content\r\n\r\n";
+        let (admin_bind, daemon) = fake_daemon(ANSWER).await;
+        let mut config = config_with(vec![console_site()]);
+        config.server.admin_bind = admin_bind.to_string();
+        let server = Server::build(&config, &dir.0);
+
+        let body = vec![b'x'; (CONSOLE_API_MAX_BODY + 1) as usize];
+        let head = dav_head(
+            "PUT",
+            "/dav/vault/notes.txt",
+            &[
+                "Content-Type: text/plain",
+                &format!("Content-Length: {}", body.len()),
+            ],
+        );
+        let response = dispatch_bytes(&server, &head, "10.66.0.2:40000", true, &body).await;
+        assert_eq!(response, ANSWER, "{}", String::from_utf8_lossy(&response));
+
+        let relayed = daemon.await.expect("the fake daemon did not panic");
+        assert_eq!(relayed.after_head.len(), body.len(), "every byte reached the admin API");
+        assert_eq!(relayed.after_head, body);
+    }
+
+    #[tokio::test]
+    async fn a_body_on_a_verb_that_takes_none_is_refused_and_never_left_unread() {
+        // Relaying with the length forced to zero would leave those bytes on the
+        // client's connection to be parsed as the next request. That is request
+        // smuggling with the proxy as the willing half, so the request dies here.
+        let dir = ScratchDataDir::new("dav-nobody");
+        write_spa(&dir.0);
+        let server = console_with_dead_admin(&dir.0);
+
+        for verb in ["OPTIONS", "GET", "HEAD", "DELETE", "COPY", "MOVE", "UNLOCK"] {
+            let head = dav_head("PLACEHOLDER", "/dav/vault/a", &["Content-Length: 4"])
+                .replace("PLACEHOLDER", verb);
+            let response = dispatch_bytes(&server, &head, "10.66.0.2:40000", true, b"data").await;
+            let text = String::from_utf8_lossy(&response);
+            assert!(text.starts_with("HTTP/1.1 400"), "{verb} carried a body: {text}");
+        }
+    }
+
+    #[tokio::test]
+    async fn an_oversized_document_and_a_chunked_body_are_both_refused_before_the_relay() {
+        let dir = ScratchDataDir::new("dav-doc-cap");
+        write_spa(&dir.0);
+        let server = console_with_dead_admin(&dir.0);
+
+        // A `PROPFIND` document is XML, not a file, and nothing legitimate on
+        // that path is large.
+        let oversized = dav_head(
+            "PROPFIND",
+            "/dav/vault/",
+            &["Depth: 0", &format!("Content-Length: {}", dav::MAX_DOCUMENT_BODY + 1)],
+        );
+        let response = dispatch_bytes(&server, &oversized, "10.66.0.2:40000", true, b"").await;
+        let text = String::from_utf8_lossy(&response);
+        assert!(text.starts_with("HTTP/1.1 413"), "{text}");
+
+        // Chunked framing cannot be settled before the loopback connection
+        // opens without buffering the very thing this path exists not to buffer.
+        let chunked =
+            dav_head("PUT", "/dav/vault/a.bin", &["Transfer-Encoding: chunked"]);
+        let response = dispatch_bytes(&server, &chunked, "10.66.0.2:40000", true, b"").await;
+        let text = String::from_utf8_lossy(&response);
+        assert!(text.starts_with("HTTP/1.1 400"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn a_dav_path_cannot_be_used_to_open_a_stream() {
+        // The upgrade widening is a property of `/api/*`, decided per request by
+        // `looks_like_upgrade`. A handshake aimed at the share is an ordinary
+        // request whose handshake fields are dropped, so the daemon can never be
+        // asked to leave HTTP from here.
+        let dir = ScratchDataDir::new("dav-no-upgrade");
+        write_spa(&dir.0);
+        const ANSWER: &[u8] = b"HTTP/1.1 405 Method Not Allowed\r\nContent-Length: 0\r\n\r\n";
+        let (admin_bind, daemon) = fake_daemon(ANSWER).await;
+        let mut config = config_with(vec![console_site()]);
+        config.server.admin_bind = admin_bind.to_string();
+        let server = Server::build(&config, &dir.0);
+
+        let head = handshake_head("/dav/vault/");
+        let response = dispatch_bytes(&server, &head, "10.66.0.2:40000", true, b"").await;
+        assert_eq!(response, ANSWER, "{}", String::from_utf8_lossy(&response));
+
+        let relayed = daemon.await.expect("the fake daemon did not panic");
+        for handshake_field in
+            ["Upgrade", "Sec-WebSocket-Key", "Sec-WebSocket-Protocol", "Origin", "Connection: Upgrade"]
+        {
+            assert!(
+                !relayed.head.contains(handshake_field),
+                "{handshake_field} reached the daemon from a share path: {}",
+                relayed.head
+            );
+        }
+        assert!(relayed.head.contains("Connection: close\r\n"), "{}", relayed.head);
+    }
+
+    #[tokio::test]
+    async fn an_unauthenticated_dav_request_gets_the_admin_apis_own_challenge_back() {
+        // The proxy holds no credential for this path and forms no opinion about
+        // one. A `401` and the `WWW-Authenticate` that makes it actionable are
+        // relayed like any other answer, which is what lets a WebDAV client
+        // authenticate at all.
+        let dir = ScratchDataDir::new("dav-401");
+        write_spa(&dir.0);
+        const CHALLENGE: &[u8] = b"HTTP/1.1 401 Unauthorized\r\n\
+            WWW-Authenticate: Basic realm=\"selfhost\"\r\nContent-Length: 0\r\n\r\n";
+        let (admin_bind, daemon) = fake_daemon(CHALLENGE).await;
+        let mut config = config_with(vec![console_site()]);
+        config.server.admin_bind = admin_bind.to_string();
+        let server = Server::build(&config, &dir.0);
+
+        let head = dav_head("OPTIONS", "/dav", &[]);
+        let response = dispatch_bytes(&server, &head, "10.66.0.2:40000", true, b"").await;
+        assert_eq!(response, CHALLENGE, "{}", String::from_utf8_lossy(&response));
+
+        let relayed = daemon.await.expect("the fake daemon did not panic");
+        assert!(relayed.head.starts_with("OPTIONS /dav HTTP/1.1"), "{}", relayed.head);
+    }
+
+    #[tokio::test]
+    async fn a_console_upload_is_streamed_rather_than_measured_against_a_json_ceiling() {
+        // The console's own file upload is `PUT /api/storage/blob/...` carrying
+        // a whole file, and the daemon's bulk plane accepts up to
+        // `BULK_MAX_BODY`. Relaying it through the JSON path would cap every
+        // upload at `CONSOLE_API_MAX_BODY` and buffer what got through, which is
+        // the same allocation-from-a-header trap `/dav` exists not to have.
+        let dir = ScratchDataDir::new("bulk-stream");
+        write_spa(&dir.0);
+        let server = console_with_dead_admin(&dir.0);
+
+        let body = vec![b'x'; (CONSOLE_API_MAX_BODY as usize) + 1];
+        let head = dav_head(
+            "PUT",
+            "/api/storage/blob/vault/big.bin",
+            &["X-Selfhost-Console: 1", &format!("Content-Length: {}", body.len())],
+        );
+        let response = dispatch_bytes(&server, &head, "10.66.0.2:40000", true, &body).await;
+        assert!(
+            response.starts_with(b"HTTP/1.1 502"),
+            "an upload past the JSON ceiling was refused instead of streamed: {}",
+            String::from_utf8_lossy(&response)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_console_upload_reaches_the_daemon_whole_and_the_head_states_its_length() {
+        let dir = ScratchDataDir::new("bulk-whole");
+        write_spa(&dir.0);
+        const CREATED: &[u8] = b"HTTP/1.1 201 Created\r\nContent-Length: 0\r\n\r\n";
+        let (admin_bind, daemon) = fake_daemon(CREATED).await;
+        let mut config = config_with(vec![console_site()]);
+        config.server.admin_bind = admin_bind.to_string();
+        let server = Server::build(&config, &dir.0);
+
+        let body = vec![b'z'; (CONSOLE_API_MAX_BODY as usize) * 4];
+        let head = dav_head(
+            "PUT",
+            "/api/storage/blob/vault/big.bin",
+            &["X-Selfhost-Console: 1", &format!("Content-Length: {}", body.len())],
+        );
+        let response = dispatch_bytes(&server, &head, "10.66.0.2:40000", true, &body).await;
+        assert_eq!(response, CREATED, "{}", String::from_utf8_lossy(&response));
+
+        let relayed = daemon.await.expect("the fake daemon did not panic");
+        assert!(
+            relayed.head.starts_with("PUT /api/storage/blob/vault/big.bin HTTP/1.1"),
+            "{}",
+            relayed.head
+        );
+        // The proxy states the framing itself, and the bytes that follow it are
+        // the file — all of them, in order.
+        assert!(
+            relayed.head.contains(&format!("Content-Length: {}\r\n", body.len())),
+            "{}",
+            relayed.head
+        );
+        assert_eq!(relayed.after_head.len(), body.len(), "the body was truncated");
+        assert_eq!(relayed.after_head, body, "the body was reordered or corrupted");
+    }
+
+    #[tokio::test]
+    async fn a_console_download_carries_the_fields_a_ranged_read_is_made_of() {
+        // `respond::blob` decides `206` from `Range` and `304` from
+        // `If-None-Match`/`If-Modified-Since`. A relay that dropped them would
+        // make every resumed download start again and every revalidation a full
+        // transfer.
+        let dir = ScratchDataDir::new("bulk-range");
+        write_spa(&dir.0);
+        const PARTIAL: &[u8] = b"HTTP/1.1 206 Partial Content\r\nContent-Length: 0\r\n\r\n";
+        let (admin_bind, daemon) = fake_daemon(PARTIAL).await;
+        let mut config = config_with(vec![console_site()]);
+        config.server.admin_bind = admin_bind.to_string();
+        let server = Server::build(&config, &dir.0);
+
+        let head = dav_head(
+            "GET",
+            "/api/storage/blob/vault/big.bin",
+            &["Range: bytes=100-199", "If-None-Match: \"abc\"", "User-Agent: curl/8"],
+        );
+        let response = dispatch_bytes(&server, &head, "10.66.0.2:40000", true, b"").await;
+        assert_eq!(response, PARTIAL, "{}", String::from_utf8_lossy(&response));
+
+        let relayed = daemon.await.expect("the fake daemon did not panic");
+        assert!(relayed.head.contains("Range: bytes=100-199\r\n"), "{}", relayed.head);
+        assert!(relayed.head.contains("If-None-Match: \"abc\"\r\n"), "{}", relayed.head);
+        // And nothing beyond what the transfer is made of.
+        assert!(!relayed.head.to_ascii_lowercase().contains("user-agent"), "{}", relayed.head);
+    }
+
+    #[tokio::test]
+    async fn a_verb_the_bulk_plane_does_not_serve_never_reaches_the_daemon() {
+        let dir = ScratchDataDir::new("bulk-verb");
+        write_spa(&dir.0);
+        let server = console_with_dead_admin(&dir.0);
+        for refused in ["POST", "DELETE", "PROPFIND", "TRACE"] {
+            let head = dav_head(refused, "/api/storage/blob/vault/x", &["Content-Length: 0"]);
+            let response = dispatch_bytes(&server, &head, "10.66.0.2:40000", true, b"").await;
+            assert!(
+                response.starts_with(b"HTTP/1.1 405"),
+                "{refused} was carried to the bulk plane: {}",
+                String::from_utf8_lossy(&response)
+            );
+        }
+    }
+
+    #[test]
+    fn a_dav_request_never_puts_a_file_path_in_the_access_log() {
+        // On a NAS the paths are the sensitive thing: a Finder window walking a
+        // share writes one line per file, which is a directory listing of the
+        // household's documents assembled by the machine that was supposed to be
+        // keeping them private.
+        assert_eq!(upgrade::loggable_target("/dav/vault/tax/2019%20return.pdf"), "/dav/[elided]");
+        assert_eq!(upgrade::loggable_target("/dav/vault/notes.txt?x=1"), "/dav/[elided]");
+        assert_eq!(upgrade::loggable_target("/dav/"), "/dav/[elided]");
+        // The mount root names no file and stays legible, and a neighbouring
+        // path is not silently elided into looking like one.
+        assert_eq!(upgrade::loggable_target("/dav"), "/dav");
+        assert_eq!(upgrade::loggable_target("/davos/x"), "/davos/x");
     }
 }
