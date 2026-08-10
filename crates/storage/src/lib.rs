@@ -33,10 +33,11 @@
 //! | [`share`] | **pure** | what a share is once checked, and whether a caller may do a thing to it |
 //! | [`listing`] | **pure** | what one directory contains, in the order and shape the console reads |
 //! | [`respond`] | **pure** | the response head for one file: range, validators, and what a browser is allowed to do with the bytes |
-//! | [`quota`] | **pure** | whether one more upload may start, and whether a running one may continue |
-//! | [`fs`] | impure | the descriptor walk that makes a symlink escape impossible, and the create that cannot clobber; the streaming copy is still owed *(Phase 5)* |
-//! | [`auth`] | impure | Basic-over-TLS and the verified-credential cache *(Phase 3)* |
-//! | [`dav`] | mixed | the WebDAV verb table and the `207` body; the read verbs are built, the write verbs are *(Phase 5)* |
+//! | [`quota`] | mostly pure | whether one more upload may start, and whether a running one may continue; plus the one live ledger those answers are measured against |
+//! | [`fs`] | impure | the descriptor walk that makes a symlink escape impossible, the create that cannot clobber, and the rest of the write path's floor |
+//! | [`auth`] | impure | Basic-over-TLS and the verified-credential cache |
+//! | [`dav`] | mixed | the WebDAV verb table, the `207` body, and locks that actually exclude |
+//! | [`api`] | impure | what a share lets a caller do, as functions a route calls — the engine both the JSON API and WebDAV run on |
 //! | [`smb`] | impure | driving the platform's own SMB server *(Phase 10)* |
 //! | [`discover`] | mixed | DNS-SD records, published by somebody else's responder *(Phase 10)* |
 //!
@@ -78,8 +79,20 @@
 //! the LAN; it is **not** a perimeter against this box, and the same machine
 //! hosts co-located applications whose bugs would issue requests from inside it.
 //! Every route still authenticates, and every operation still asks
-//! [`share::Share::permits`].
+//! [`share::Share::permits`] — [`api::Volume`] does that at the top of each
+//! operation rather than leaving it to a route, because a route is a place a
+//! check can be forgotten.
+//!
+//! # Where the bytes go, and where they never do
+//!
+//! Nothing in this crate buffers a file. A download hands back an open handle
+//! and a byte window ([`api::Download`]); an upload is fed in chunks
+//! ([`api::Receiver`]); a server-side copy moves through one fixed buffer. That
+//! is what makes a 5 GB upload cost the daemon a scratch buffer and a 2 GB
+//! download cost it nothing, on a box whose one process also serves ports 80
+//! and 443.
 
+pub mod api;
 pub mod auth;
 pub mod dav;
 pub mod discover;
@@ -91,10 +104,12 @@ pub mod respond;
 pub mod share;
 pub mod smb;
 
-pub use fs::{Dir, Existing, OpenError, Upload, WriteError};
+pub use api::{Download, Failure, Landing, Progress, Receiver, Sessions, Ticket, Volume};
+pub use auth::{Cached, Credentials, Presented};
+pub use fs::{Attributes, Dir, Existing, OpenError, Upload, WriteError};
 pub use listing::{Entry, Kind, Listing};
 pub use path::{RelativePath, Refusal, Resolved};
-pub use quota::{Admission, Limits, Usage};
+pub use quota::{Admission, Ledger, Limits, Reservation, Usage};
 pub use respond::{BlobResponse, Disposition};
 pub use share::{
     Grant, GrantOutcome, Grantee, Mode, Reserved, Share, ShareError, ShareId, Shares, SmbExport,

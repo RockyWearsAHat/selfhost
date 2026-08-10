@@ -180,11 +180,450 @@ pub async fn run(config: &Config, project_dir: &Path, deep: bool, scan_lan: bool
     check_dns(&mut report, config, &resolver, public_ip).await;
     check_authority(&mut report, config, &resolver, public_ip).await;
     check_mail(&mut report, config, &resolver, public_ip, deep).await;
+    check_desktop(&mut report, config, project_dir);
+    check_mesh(&mut report, config, project_dir);
+    check_storage(&mut report, config, project_dir, deep);
     if deep || scan_lan {
         investigate_causes(&mut report, &resolver, public_ip, deep, scan_lan).await;
     }
 
     report
+}
+
+/// Remote desktop: whether it is on, whether anything can capture, whether a
+/// viewer could type, and whether the operator's kill switch is holding it down.
+///
+/// Nothing here asks a running daemon, and the check that would need one says
+/// `Unknown` rather than guessing. Whether an agent is *live* is a fact about a
+/// process this command did not start and cannot see: reporting it as `Pass`
+/// because the config looks right is precisely the failure this whole file
+/// exists to avoid.
+fn check_desktop(report: &mut Report, config: &Config, project_dir: &Path) {
+    let data_dir = crate::teardown::data_dir(config, project_dir);
+    let switch = crate::kill_switch::path_in(&data_dir);
+    let engaged = crate::kill_switch::present(&data_dir);
+    let section = report.section("Remote desktop");
+
+    let Some(desktop) = config.desktop.as_ref().filter(|desktop| desktop.enabled) else {
+        section.checks.push(Check::new(
+            "remote desktop",
+            Verdict::Skipped,
+            match config.desktop.as_ref() {
+                None => "no [desktop] block — the daemon spawns no agent and serves no route".to_owned(),
+                Some(_) => "[desktop] enabled = false — nothing below it applies".to_owned(),
+            },
+        ));
+        // Even switched off, an engaged switch is worth saying: it is the state
+        // somebody will be confused by later, when they turn the feature on and
+        // nothing happens.
+        if engaged {
+            section.checks.push(
+                Check::new(
+                    "desktop kill switch",
+                    Verdict::Warn,
+                    format!("{} is in place", switch.display()),
+                )
+                .with_fix("Remove it with `selfhost desktop enable` before turning [desktop] on."),
+            );
+        }
+        return;
+    };
+
+    section.checks.push(Check::new(
+        "remote desktop is enabled",
+        Verdict::Pass,
+        format!(
+            "{} viewer(s), {} fps, {}px tiles, sessions capped at {}s",
+            desktop.max_viewers, desktop.max_fps, desktop.tile, desktop.max_session_secs
+        ),
+    ));
+
+    // Not a fault — it is what the operator asked for — but it is the single
+    // most consequential line in this config, so it is stated as a warning
+    // rather than buried in a pass.
+    section.checks.push(if desktop.allow_input {
+        Check::new(
+            "input injection",
+            Verdict::Warn,
+            format!(
+                "allowed — a viewer holding DesktopControl can type and click on this machine; a \
+                 control ticket needs a password or passkey within {}s",
+                desktop.reauth_window_secs
+            ),
+        )
+        .with_fix(
+            "This is the highest-privilege capability this box has. Leave it on only while it is \
+             being used, and remember `selfhost desktop disable` revokes it without the console.",
+        )
+    } else {
+        Check::new("input injection", Verdict::Pass, "refused — streams are view-only")
+    });
+
+    // Asked of *this* process on *this* machine, now. The answer is not a
+    // property of the build: a macOS grant is revoked in System Settings (and by
+    // every deploy, since each build is a new code identity), a display is
+    // unplugged, a Windows daemon is in session 0. What this check cannot claim
+    // is that the *daemon's* process has the same answer — it is a different
+    // process, and on macOS a different code identity is a different grant — so
+    // the fix line says where the daemon's own answer is.
+    let backend = crate::desk_task::Backend::here();
+    section.checks.push(if backend.wired {
+        Check::new("capture backend", Verdict::Pass, format!("{} — {}", backend.name, backend.why))
+    } else {
+        Check::new(
+            "capture backend",
+            Verdict::Warn,
+            format!("{} — no frames can be captured on this machine right now", backend.name),
+        )
+        .with_fix(format!(
+            "{}\nA console that connects is told this rather than shown a black rectangle.",
+            backend.why
+        ))
+    });
+
+    // Whether input is *allowed* has three independent answers and an operator
+    // needs all three: the config's switch (above), what the operating system
+    // will let this process do, and whether the kill switch is holding it down
+    // (below). This is the middle one.
+    section.checks.push(input_permission_check(desktop.allow_input));
+
+    // The one question this command genuinely cannot answer.
+    section.checks.push(
+        Check::new(
+            "capture agent",
+            Verdict::Unknown,
+            "whether a stream is running is a fact about the daemon's own process, which this \
+             command did not start and cannot inspect",
+        )
+        .with_fix(
+            "Ask the daemon: the console's DESKTOP plate reports the machine's own sentence, and \
+             it is the daemon's process that holds the operating system's grants.",
+        ),
+    );
+
+    section.checks.push(if engaged {
+        Check::new(
+            "desktop kill switch",
+            Verdict::Warn,
+            format!("ENGAGED — {} is in place, so no stream will run", switch.display()),
+        )
+        .with_fix("`selfhost desktop enable` (or simply delete that file) allows streaming again.")
+    } else {
+        Check::new(
+            "desktop kill switch",
+            Verdict::Pass,
+            format!("clear — create {} to stop every stream within seconds", switch.display()),
+        )
+    });
+
+    // Where the record is, and whether there is one. An operator who has to find
+    // the audit log during an incident should not have to guess the filename.
+    let audit = crate::audit::Auditor::in_dir(&data_dir);
+    section.checks.push(match std::fs::read_to_string(audit.path()) {
+        Ok(text) => Check::new(
+            "audit log",
+            Verdict::Pass,
+            format!("{} line(s) in {}", text.lines().count(), audit.path().display()),
+        ),
+        Err(_) => Check::new(
+            "audit log",
+            Verdict::Pass,
+            format!(
+                "{} does not exist yet — it is created by the first control action",
+                audit.path().display()
+            ),
+        ),
+    });
+}
+
+/// The peer link: whether this machine dials one, whether it can, and — for a
+/// running daemon — whether it is up and why the last one dropped.
+///
+/// # What this command can and cannot see
+///
+/// It can read the configuration and the token file, which is where nearly every
+/// mesh problem actually lives. It **cannot** see the link, because the link
+/// belongs to the daemon's process and this is a different one: a check that
+/// reported "linked" from a config file would be reporting a hope. So the live
+/// state is `Unknown` with the place to look, in exactly the way the capture
+/// agent check is, and the two questions this command *can* answer — is it
+/// configured, and would it start — are answered properly.
+fn check_mesh(report: &mut Report, config: &Config, project_dir: &Path) {
+    let data_dir = crate::teardown::data_dir(config, project_dir);
+    let section = report.section("Peer mesh");
+    let posture = crate::mesh_task::start(config, &data_dir);
+
+    match &posture {
+        crate::mesh_task::Posture::Absent => {
+            section.checks.push(Check::new(
+                "peer link",
+                Verdict::Skipped,
+                "no [mesh] section — this machine dials no owner and accepts no link, which is \
+                 the default and is what an owner looks like",
+            ));
+            return;
+        }
+        crate::mesh_task::Posture::Parked { node } => {
+            section.checks.push(
+                Check::new(
+                    "peer link",
+                    Verdict::Warn,
+                    format!("parked — [mesh] names {node} and dial = false, so nothing links"),
+                )
+                .with_fix("Set dial = true and restart the daemon to bring the link back."),
+            );
+            return;
+        }
+        crate::mesh_task::Posture::Broken(why) => {
+            section.checks.push(
+                Check::new("peer link", Verdict::Fail, why.clone()).with_fix(
+                    "The daemon starts and serves everything else; only the peer link is down.",
+                ),
+            );
+            return;
+        }
+        crate::mesh_task::Posture::Dialling(peers) => {
+            section.checks.push(Check::new(
+                "peer link",
+                Verdict::Pass,
+                format!(
+                    "this machine dials {} as {}, and binds nothing to do it",
+                    peers.owner(),
+                    peers.node()
+                ),
+            ));
+        }
+    }
+
+    // The live half, which only the daemon knows. Stated as unknown rather than
+    // guessed, for the reason this whole file exists.
+    section.checks.push(
+        Check::new(
+            "link state",
+            Verdict::Unknown,
+            "whether the link is up right now, and why the last one dropped, are facts about \
+             the daemon's own process, which this command did not start and cannot inspect",
+        )
+        .with_fix(
+            "Ask the daemon: it prints the link state at startup and the console's node picker \
+             shows each peer with a reason and a last-seen time.",
+        ),
+    );
+
+    // The invariant the whole design rests on, asserted rather than assumed.
+    section.checks.push(Check::new(
+        "listening sockets",
+        Verdict::Pass,
+        "the mesh adds none — the worker dials out over the owner's existing 443, so it passes \
+         the same source-address gate as every other console request and no port is opened at \
+         either end",
+    ));
+}
+
+/// Whether this machine's operating system will let a process drive it.
+///
+/// Separate from the config's `allow_input`, because the two refuse for
+/// different reasons and an operator whose keystrokes vanish needs to know
+/// which: `allow_input = false` is a decision this deployment made, and a
+/// missing Accessibility grant is a decision macOS made and only somebody
+/// sitting at the machine can undo.
+fn input_permission_check(allowed_by_config: bool) -> Check {
+    if !allowed_by_config {
+        return Check::new(
+            "input permission",
+            Verdict::Skipped,
+            "[desktop] allow_input = false, so nothing asks the operating system for the input \
+             device",
+        );
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let grants = selfhost_screen::macos::grant::Grants::read();
+        if grants.accessibility {
+            Check::new(
+                "input permission",
+                Verdict::Warn,
+                "macOS grants this binary Accessibility, so a viewer holding DesktopControl can \
+                 type and click on this machine",
+            )
+            .with_fix(
+                "Revoke it in System Settings ▸ Privacy & Security ▸ Accessibility to make the \
+                 machine view-only without changing the config.",
+            )
+        } else {
+            Check::new(
+                "input permission",
+                Verdict::Warn,
+                "[desktop] allows input but macOS does not grant this binary Accessibility, so \
+                 keystrokes and clicks will be refused",
+            )
+            .with_fix(selfhost_screen::macos::grant::remediation(
+                selfhost_screen::Grant::Accessibility,
+            ))
+        }
+    }
+    #[cfg(windows)]
+    {
+        Check::new(
+            "input permission",
+            Verdict::Warn,
+            "allowed — Windows needs no separate grant to synthesise input, but User Interface \
+             Privilege Isolation silently discards it into any window running at a higher \
+             integrity level than the daemon",
+        )
+        .with_fix(
+            "That refusal is deliberate and is reported to the console as `input-refused \
+             (elevated window)`. Running the daemon elevated to defeat it would turn this \
+             feature into a remote privilege-escalation channel; do not.",
+        )
+    }
+    #[cfg(not(any(windows, target_os = "macos")))]
+    {
+        Check::new(
+            "input permission",
+            Verdict::Warn,
+            "[desktop] allows input but this build has no injector for this platform, so every \
+             keystroke will be refused",
+        )
+    }
+}
+
+/// Network storage: how many shares, whether their roots are there, whether the
+/// writable ones can actually be written to, and how much room is left.
+///
+/// The shares are opened through the same [`Volumes::open`] the daemon uses, so
+/// a refusal here is the refusal that would stop the daemon, word for word.
+/// Measuring what a share *holds* is a whole-subtree walk and is therefore only
+/// done under `--deep`; free space is one call and is always reported.
+fn check_storage(report: &mut Report, config: &Config, project_dir: &Path, deep: bool) {
+    let section = report.section("Network storage");
+
+    if config.shares.is_empty() {
+        section.checks.push(Check::new(
+            "network storage",
+            Verdict::Skipped,
+            "no [[shares]] — the storage routes are not served and nothing is exported",
+        ));
+        return;
+    }
+
+    let data_dir = crate::teardown::data_dir(config, project_dir);
+    let volumes = match crate::open_shares(config, project_dir, &data_dir) {
+        Ok(volumes) => volumes,
+        Err(error) => {
+            section.checks.push(
+                Check::new(
+                    format!("{} declared share(s)", config.shares.len()),
+                    Verdict::Fail,
+                    error,
+                )
+                .with_fix("The daemon refuses to start until this is fixed; it is the same check."),
+            );
+            return;
+        }
+    };
+
+    section.checks.push(Check::new(
+        "declared shares open",
+        Verdict::Pass,
+        format!("{} share(s), every root present and outside what this deployment protects", volumes.len()),
+    ));
+
+    for volume in volumes.all() {
+        let share = volume.share();
+        let id = share.id().as_str();
+
+        section.checks.push(match volume.root().free_space() {
+            Ok(free) => {
+                let mut detail = format!("{} free on the volume holding it", bytes(free));
+                if let Some(quota) = share.quota_bytes() {
+                    detail.push_str(&format!(", quota {}", bytes(quota)));
+                }
+                if deep {
+                    match volume.root().measure() {
+                        Ok(used) => detail.push_str(&format!(", holding {}", bytes(used))),
+                        Err(error) => detail.push_str(&format!(", size unknown ({error})")),
+                    }
+                }
+                Check::new(format!("share \"{id}\" space"), Verdict::Pass, detail)
+            }
+            // A root that opened and then would not report free space is a
+            // question this command could not answer, not one it answered well.
+            Err(error) => Check::new(
+                format!("share \"{id}\" space"),
+                Verdict::Unknown,
+                format!("cannot read free space on {}: {error}", share.root().display()),
+            ),
+        });
+
+        section.checks.push(if share.read_only() {
+            Check::new(
+                format!("share \"{id}\" is writable"),
+                Verdict::Skipped,
+                "published read-only, so nothing is expected to be able to write to it",
+            )
+        } else {
+            writable_check(id, share.root())
+        });
+    }
+}
+
+/// Whether a writable share's root can actually be written to.
+///
+/// Probed rather than inferred. A permission bit says what the mode is, not what
+/// this account can do with it: an ACL, an immutable flag, a read-only mount and
+/// a full disk all leave the mode looking fine. So one empty file is created and
+/// removed — under the reserved temporary prefix the storage crate already uses,
+/// so a file left behind by an interrupted run is one the share itself knows to
+/// ignore — and the answer is what the filesystem said.
+fn writable_check(id: &str, root: &Path) -> Check {
+    let probe = root.join(format!(".selfhost-tmp-doctor-{}", std::process::id()));
+    match std::fs::write(&probe, b"") {
+        Ok(()) => {
+            let cleaned = std::fs::remove_file(&probe);
+            match cleaned {
+                Ok(()) => Check::new(
+                    format!("share \"{id}\" is writable"),
+                    Verdict::Pass,
+                    format!("created and removed a file in {}", root.display()),
+                ),
+                // Writing worked and removing did not, which is a real oddity
+                // and must not be reported as a clean pass.
+                Err(error) => Check::new(
+                    format!("share \"{id}\" is writable"),
+                    Verdict::Warn,
+                    format!("wrote a test file but could not remove it: {error}"),
+                )
+                .with_fix(format!("Delete {} by hand.", probe.display())),
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => Check::new(
+            format!("share \"{id}\" is writable"),
+            Verdict::Fail,
+            format!("{} refuses a write from this account: {error}", root.display()),
+        )
+        .with_fix(
+            "The share is declared writable and is not. Fix the directory's ownership or ACL, or \
+             set read_only = true so the console stops offering an upload button that cannot work.",
+        ),
+        Err(error) => Check::new(
+            format!("share \"{id}\" is writable"),
+            Verdict::Unknown,
+            format!("could not test a write in {}: {error}", root.display()),
+        ),
+    }
+}
+
+/// A byte count a person reads at a glance, for this file's detail lines.
+fn bytes(count: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
+    let mut value = count as f64;
+    let mut unit = 0;
+    while value >= 1024.0 && unit + 1 < UNITS.len() {
+        value /= 1024.0;
+        unit += 1;
+    }
+    if unit == 0 { format!("{count} B") } else { format!("{value:.1} {}", UNITS[unit]) }
 }
 
 /// Config coherence and whether the paths it names exist.

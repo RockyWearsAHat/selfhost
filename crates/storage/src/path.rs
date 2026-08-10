@@ -76,12 +76,13 @@
 //! | Layer | Proves | Mechanism |
 //! |---|---|---|
 //! | `path.rs` (here, pure) | the *text* names one file inside the share | this module |
-//! | `fs.rs` (impure, **still owed** — Phase 3) | the *bytes* live inside the share | descriptor walk, `O_NOFOLLOW\|O_DIRECTORY` per component on unix, `FILE_FLAG_OPEN_REPARSE_POINT` on Windows |
+//! | `fs.rs` (impure) | the *bytes* live inside the share | descriptor walk, `openat` with `O_NOFOLLOW` per component on unix, `NtCreateFile` with `FILE_OPEN_REPARSE_POINT` relative to a parent handle on Windows |
 //!
-//! The second row is a requirement, not a description of code that exists:
-//! [`crate::fs`] today holds only the creation primitive, and its documentation
-//! says which of its promises are kept and which are owed. Nothing in this crate
-//! may treat the walk as done until it is.
+//! Both halves are built, and the second is not optional on the grounds that
+//! the first passed: a pure function cannot `stat`, so it cannot know that
+//! `photos` is a symlink to `/`. [`crate::fs::Dir`] documents which of its
+//! promises are structural and which still have an edge, and it names each edge
+//! rather than leaving it to be found.
 //!
 //! [`Resolved::textual_path`] is named the way it is so that this cannot be
 //! forgotten at a call site. Handing that path to `File::open` is a defect even

@@ -1011,3 +1011,949 @@ impl Drop for ScratchDir {
         let _ = std::fs::remove_dir_all(&self.0);
     }
 }
+
+// ---- storage: the browser file manager's backend ----------------------------
+//
+// The rules about *what a path may reach* live in `selfhost-storage` and are
+// tested there, without a socket, against every traversal shape Windows and
+// APFS make possible. What is tested here is the other half — who may reach a
+// share at all, what an unknown share looks like to somebody who may not have
+// it, and that a bulk transfer inherits every guard an ordinary write has.
+
+use selfhost_admin::storage_api::{self, Denied, Volumes};
+use selfhost_identity::{Capability, Grants, NodeName, Opening, People, PersonName, ShareId};
+use selfhost_storage::api::Volume;
+use selfhost_storage::quota::Ledger;
+use selfhost_storage::share::{Reserved, Share};
+use std::sync::Arc;
+use tokio::io::AsyncReadExt;
+
+/// A share rooted at `<scratch>/<id>`, opened.
+///
+/// The reserved set points at a sibling directory that no share is rooted in,
+/// so these fixtures exercise the ordinary path rather than the refusal — the
+/// refusals belong to `selfhost-storage`'s own suite.
+fn open_share(
+    dir: &std::path::Path,
+    id: &str,
+    ledger: &Arc<Ledger>,
+    read_only: bool,
+    grants: Vec<selfhost_storage::share::Grant>,
+) -> Volume {
+    let base = std::fs::canonicalize(dir).expect("a real scratch directory");
+    let root = base.join(id);
+    std::fs::create_dir_all(&root).expect("a share root");
+    let reserved = Reserved::new(base.join("reserved-data"), None).expect("a reserved set");
+    let share = Share::new(&reserved, id, root, read_only, false, None)
+        .expect("a legal share")
+        .with_grants(grants);
+    Volume::open(share, Arc::clone(ledger)).expect("the root opens")
+}
+
+/// The console API with two shares: a writable `vault` and a read-only `photos`.
+fn storage_api_with_shares(name: &str) -> (Api, ScratchDir) {
+    let (api, dir) = api(name);
+    let ledger = Arc::new(Ledger::new());
+    let volumes = Volumes::from_opened(vec![
+        open_share(dir.path(), "vault", &ledger, false, Vec::new()),
+        open_share(dir.path(), "photos", &ledger, true, Vec::new()),
+    ]);
+    (api.with_storage(volumes), dir)
+}
+
+#[tokio::test]
+async fn every_storage_and_desktop_route_refuses_an_unauthenticated_caller() {
+    let (api, _dir) = storage_api_with_shares("storage-noauth");
+    for (method, target) in [
+        ("GET", "/api/storage/shares"),
+        ("GET", "/api/storage/shares/vault/list?path="),
+        ("GET", "/api/storage/shares/vault/stat?path=a"),
+        ("POST", "/api/storage/shares/vault/mkdir"),
+        ("POST", "/api/storage/shares/vault/rename"),
+        ("DELETE", "/api/storage/shares/vault/entry?path=a"),
+        ("GET", "/api/desktop"),
+        ("GET", "/api/desktop/nodes"),
+        ("GET", "/api/desktop/agent?peer=self"),
+        ("POST", "/api/desktop/ticket"),
+    ] {
+        let (status, _) = call(&api, method, target, None, "").await;
+        assert_eq!(status, 401, "{method} {target} should require a credential");
+    }
+}
+
+#[tokio::test]
+async fn storage_routes_are_the_uniform_401_when_no_share_is_declared() {
+    // A deployment that serves no files must not be distinguishable from one
+    // whose shares this caller simply may not have: both are the same 401, and
+    // neither is a 404 that says the prefix exists.
+    let (api, _dir) = api("storage-none");
+    // To an unauthenticated caller: the uniform 401, so a stranger cannot learn
+    // whether this box serves files at all.
+    for target in [
+        "/api/storage/shares",
+        "/api/storage/shares/vault/list?path=",
+        "/api/storage/shares/vault/stat?path=a",
+    ] {
+        let (status, _) = call(&api, "GET", target, None, "").await;
+        assert_eq!(status, 401, "{target}");
+    }
+    // To the owner, who could list every share if there were any: an honest
+    // answer, because there is nothing they could learn that they do not hold.
+    let (status, body) = send(&api, "GET", "/api/storage/shares/vault/list?path=", "").await;
+    assert_eq!(status, 404, "{body:?}");
+    let (status, body) = send(&api, "GET", "/api/storage/shares", "").await;
+    assert_eq!(status, 401, "with no storage wired there is no set to answer with: {body:?}");
+}
+
+#[tokio::test]
+async fn a_share_lists_creates_stats_renames_and_deletes_for_the_owner() {
+    let (api, dir) = storage_api_with_shares("storage-roundtrip");
+    std::fs::write(dir.path().join("vault").join("notes.txt"), b"hello").expect("a seed file");
+
+    let (status, body) = send(&api, "GET", "/api/storage/shares", "").await;
+    assert_eq!(status, 200, "{body:?}");
+    let listed = body.get("shares").and_then(Json::as_array).expect("a shares array");
+    assert_eq!(listed.len(), 2, "{body:?}");
+
+    let (status, body) = send(&api, "GET", "/api/storage/shares/vault/list?path=", "").await;
+    assert_eq!(status, 200, "{body:?}");
+    let entries = body.get("entries").and_then(Json::as_array).expect("an entries array");
+    assert!(
+        entries.iter().any(|e| e.get("name").and_then(Json::as_str) == Some("notes.txt")),
+        "{body:?}"
+    );
+
+    let (status, body) =
+        send(&api, "POST", "/api/storage/shares/vault/mkdir", r#"{"path":"papers"}"#).await;
+    assert_eq!(status, 200, "{body:?}");
+    assert!(dir.path().join("vault").join("papers").is_dir());
+
+    let (status, body) = send(&api, "GET", "/api/storage/shares/vault/stat?path=papers", "").await;
+    assert_eq!(status, 200, "{body:?}");
+    assert_eq!(body.get("kind").and_then(Json::as_str), Some("dir"), "{body:?}");
+
+    let (status, body) = send(
+        &api,
+        "POST",
+        "/api/storage/shares/vault/rename",
+        r#"{"from":"notes.txt","to":"papers/notes.txt"}"#,
+    )
+    .await;
+    assert!(status == 201 || status == 204, "a move lands as created or replaced: {status} {body:?}");
+    assert!(dir.path().join("vault").join("papers").join("notes.txt").is_file());
+
+    let (status, body) =
+        send(&api, "DELETE", "/api/storage/shares/vault/entry?path=papers", "").await;
+    assert_eq!(status, 200, "{body:?}");
+    assert!(!dir.path().join("vault").join("papers").exists());
+}
+
+#[tokio::test]
+async fn a_read_only_share_refuses_a_write_to_everybody_including_the_owner() {
+    // The flag describes the *data*, not a permission level, so it is checked
+    // before grants and the owner is not an exception to it.
+    let (api, _dir) = storage_api_with_shares("storage-readonly");
+    let (status, body) =
+        send(&api, "POST", "/api/storage/shares/photos/mkdir", r#"{"path":"new"}"#).await;
+    assert_eq!(status, 403, "{body:?}");
+}
+
+#[tokio::test]
+async fn a_share_id_that_could_never_exist_is_the_uniform_401_not_a_404() {
+    // A refusal that told "no such share" apart from "not yours" would be a way
+    // to enumerate what sits behind the wall, one guess at a time.
+    let (api, _dir) = storage_api_with_shares("storage-badid");
+    let too_long = "a".repeat(64);
+    for id in ["Vault", "va%20ult", "..", too_long.as_str()] {
+        let target = format!("/api/storage/shares/{id}/list?path=");
+        let (status, body) = send(&api, "GET", &target, "").await;
+        assert_eq!(status, 401, "{id} leaked a different refusal: {body:?}");
+    }
+}
+
+#[tokio::test]
+async fn an_unknown_but_legal_share_is_a_404_only_after_the_capability_held() {
+    // The owner holds every share capability, so for them a well-formed id that
+    // names nothing is an honest 404. Nobody who could not already list the
+    // shares can reach this answer.
+    let (api, _dir) = storage_api_with_shares("storage-unknown");
+    let (status, _) = send(&api, "GET", "/api/storage/shares/attic/list?path=", "").await;
+    assert_eq!(status, 404);
+}
+
+/// A console API with one share and a named person holding `grants`.
+///
+/// The session is minted directly rather than through a passkey ceremony: what
+/// is under test is what a *person* may do, and the ceremony that proves they
+/// are one is tested above.
+async fn person_api(
+    name: &str,
+    person: &str,
+    grants: Grants,
+) -> (Api, String, ScratchDir) {
+    let sessions = Sessions::new();
+    let (api, dir) = console_api(name, sessions.clone());
+    let ledger = Arc::new(Ledger::new());
+    // The share's own `[[shares.access]]` list grants this person write, so the
+    // only thing these tests vary is the *capability* — the layer this crate
+    // owns. Both layers are real and both must pass; see the note on
+    // `Volume::permit`.
+    let on_the_share = vec![
+        selfhost_storage::share::Grant::parse(person, selfhost_storage::share::Mode::Write)
+            .expect("a legal grant"),
+    ];
+    let volumes =
+        Volumes::from_opened(vec![open_share(dir.path(), "vault", &ledger, false, on_the_share)]);
+    let people = People::load(dir.path());
+    people
+        .set_grants(&PersonName::parse(person).expect("a legal name"), grants)
+        .expect("grants are written");
+    let id = sessions.create(person, Opening::Passkey).expect("a session");
+    (api.with_storage(volumes).with_people(people), format!("selfhost_session={id}"), dir)
+}
+
+#[tokio::test]
+async fn a_person_without_the_capability_gets_the_identical_401_an_anonymous_caller_gets() {
+    // They may read the console — which is what gets them past the floor — and
+    // hold no share capability at all.
+    let mut grants = Grants::none();
+    grants.grant(Capability::ConsoleRead).expect("room for one grant");
+    let (api, cookie, _dir) = person_api("storage-person-none", "Mom", grants).await;
+
+    let refused = call_with(&api, "GET", "/api/storage/shares/vault/list?path=", &[("Cookie", &cookie)], "").await;
+    let anonymous = call_with(&api, "GET", "/api/storage/shares/vault/list?path=", &[], "").await;
+    assert_eq!(refused.status.code(), 401);
+    assert_eq!(anonymous.status.code(), 401);
+    // Byte for byte: a known person holding nothing must not be able to tell
+    // themselves apart from a stranger, or the console becomes a way to
+    // enumerate what exists behind it.
+    assert_eq!(body_json(&refused).to_text(), body_json(&anonymous).to_text());
+
+    // And the set route answers them with an empty list rather than a refusal:
+    // they may read the console, and they may open nothing.
+    let listed = call_with(&api, "GET", "/api/storage/shares", &[("Cookie", &cookie)], "").await;
+    assert_eq!(listed.status.code(), 200);
+    assert_eq!(
+        body_json(&listed).get("shares").and_then(Json::as_array).map(<[Json]>::len),
+        Some(0),
+        "a person holding nothing sees no shares"
+    );
+}
+
+#[tokio::test]
+async fn a_person_granted_read_may_list_and_may_not_write() {
+    let mut grants = Grants::none();
+    grants.grant(Capability::ConsoleRead).expect("room for one grant");
+    grants
+        .grant(Capability::FilesRead(ShareId::parse("vault").expect("a legal id")))
+        .expect("room for one grant");
+    let (api, cookie, _dir) = person_api("storage-person-read", "Mom", grants).await;
+
+    let listed = call_with(&api, "GET", "/api/storage/shares/vault/list?path=", &[("Cookie", &cookie)], "").await;
+    assert_eq!(listed.status.code(), 200, "{:?}", body_json(&listed));
+
+    let write = call_with(
+        &api,
+        "POST",
+        "/api/storage/shares/vault/mkdir",
+        &[("Cookie", &cookie), ("X-Selfhost-Console", "1")],
+        r#"{"path":"nope"}"#,
+    )
+    .await;
+    assert_eq!(write.status.code(), 401, "read does not imply write");
+}
+
+#[tokio::test]
+async fn a_cookie_authenticated_storage_write_needs_the_console_header() {
+    // The CSRF-header-before-store ordering, on the newest non-GET routes: a
+    // forged cross-site write is refused before the session store is consulted,
+    // so it cannot even refresh the operator's idle timer.
+    let mut grants = Grants::none();
+    grants.grant(Capability::ConsoleRead).expect("room for one grant");
+    grants
+        .grant(Capability::FilesWrite(ShareId::parse("vault").expect("a legal id")))
+        .expect("room for one grant");
+    let (api, cookie, dir) = person_api("storage-csrf", "Mom", grants).await;
+
+    let forged = call_with(
+        &api,
+        "POST",
+        "/api/storage/shares/vault/mkdir",
+        &[("Cookie", &cookie)],
+        r#"{"path":"forged"}"#,
+    )
+    .await;
+    assert_eq!(forged.status.code(), 401, "no console header, no write");
+    assert!(!dir.path().join("vault").join("forged").exists(), "nothing was created");
+
+    let honest = call_with(
+        &api,
+        "POST",
+        "/api/storage/shares/vault/mkdir",
+        &[("Cookie", &cookie), ("X-Selfhost-Console", "1")],
+        r#"{"path":"honest"}"#,
+    )
+    .await;
+    assert_eq!(honest.status.code(), 200, "{:?}", body_json(&honest));
+}
+
+// ---- storage: the bulk plane ------------------------------------------------
+
+#[tokio::test]
+async fn a_bulk_transfer_refuses_an_anonymous_caller_and_a_person_identically() {
+    let (api, cookie, _dir) = person_api("bulk-refusals", "Mom", Grants::none()).await;
+
+    let (anonymous, _) = request_with("GET", "/api/storage/blob/vault/notes.txt", None, &[], "");
+    let (known, _) = request_with(
+        "GET",
+        "/api/storage/blob/vault/notes.txt",
+        None,
+        &[("Cookie", &cookie)],
+        "",
+    );
+    let one = api.bulk_for(&anonymous).expect_err("no credential");
+    let two = api.bulk_for(&known).expect_err("a person holding nothing");
+    assert!(matches!(one, Denied::Unauthorised));
+    assert!(matches!(two, Denied::Unauthorised));
+    assert_eq!(one.response().status.code(), two.response().status.code());
+}
+
+#[tokio::test]
+async fn a_bulk_upload_is_refused_before_the_store_without_the_console_header() {
+    let mut grants = Grants::none();
+    grants.grant(Capability::ConsoleRead).expect("room for one grant");
+    grants
+        .grant(Capability::FilesWrite(ShareId::parse("vault").expect("a legal id")))
+        .expect("room for one grant");
+    let (api, cookie, _dir) = person_api("bulk-csrf", "Mom", grants).await;
+
+    let (forged, _) = request_with(
+        "PUT",
+        "/api/storage/blob/vault/notes.txt",
+        None,
+        &[("Cookie", &cookie), ("Content-Length", "5")],
+        "",
+    );
+    assert!(
+        matches!(api.bulk_for(&forged), Err(Denied::Unauthorised)),
+        "a PUT without the console header must not reach the session store"
+    );
+
+    let (honest, _) = request_with(
+        "PUT",
+        "/api/storage/blob/vault/notes.txt",
+        None,
+        &[("Cookie", &cookie), ("X-Selfhost-Console", "1"), ("Content-Length", "5")],
+        "",
+    );
+    assert!(api.bulk_for(&honest).is_ok(), "the same request with the header is admitted");
+}
+
+#[tokio::test]
+async fn a_bulk_transfer_refuses_a_body_it_cannot_frame_and_a_method_it_does_not_serve() {
+    let (api, _dir) = storage_api_with_shares("bulk-framing");
+    let (chunked, _) = request_with(
+        "PUT",
+        "/api/storage/blob/vault/a.txt",
+        Some(TOKEN),
+        &[("Transfer-Encoding", "chunked")],
+        "",
+    );
+    assert!(matches!(api.bulk_for(&chunked), Err(Denied::Unframed(_))));
+
+    let (deleted, _) = request_with("DELETE", "/api/storage/blob/vault/a.txt", Some(TOKEN), &[], "");
+    assert!(matches!(api.bulk_for(&deleted), Err(Denied::WrongMethod)));
+
+    let (bare, _) = request_with("GET", "/api/storage/blob/vault", Some(TOKEN), &[], "");
+    assert!(matches!(api.bulk_for(&bare), Err(Denied::NoPath)));
+}
+
+#[tokio::test]
+async fn a_file_uploaded_over_the_bulk_plane_comes_back_down_it() {
+    let (api, dir) = storage_api_with_shares("bulk-roundtrip");
+
+    // Up. The body travels as the prefix, which is exactly what the socket
+    // layer hands over: the first bytes of a body arrive in the same segment as
+    // the headers far more often than not.
+    let (request, body) =
+        request_with("PUT", "/api/storage/blob/vault/hello.txt", Some(TOKEN), &[], "hello there");
+    let plan = api.bulk_for(&request).expect("the owner may write");
+    let answer = drive(body, request, plan).await;
+    assert!(answer.starts_with("HTTP/1.1 200"), "{answer}");
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("vault").join("hello.txt")).expect("the file"),
+        "hello there"
+    );
+
+    // Down.
+    let (request, _) =
+        request_with("GET", "/api/storage/blob/vault/hello.txt", Some(TOKEN), &[], "");
+    let plan = api.bulk_for(&request).expect("the owner may read");
+    let answer = drive(Vec::new(), request, plan).await;
+    assert!(answer.starts_with("HTTP/1.1 200"), "{answer}");
+    assert!(answer.ends_with("hello there"), "{answer}");
+}
+
+#[tokio::test]
+async fn an_upload_that_ends_early_publishes_nothing() {
+    // A truncated body must leave the destination untouched: the temporary file
+    // is abandoned and the reservation rolled back, because a closed socket
+    // cannot tell "the client finished" from "the client vanished" and only one
+    // of those may publish a file.
+    let (api, dir) = storage_api_with_shares("bulk-truncated");
+    let (mut ours, theirs) = tokio::io::duplex(64 * 1024);
+    let (request, _) = request_with(
+        "PUT",
+        "/api/storage/blob/vault/partial.txt",
+        Some(TOKEN),
+        &[("Content-Length", "64")],
+        "",
+    );
+    let plan = api.bulk_for(&request).expect("the owner may write");
+    // The peer hangs up having sent four of the sixty-four bytes it promised.
+    let feeder = tokio::spawn(async move {
+        let mut theirs = theirs;
+        tokio::io::AsyncWriteExt::write_all(&mut theirs, b"abcd").await.expect("four bytes");
+        // The write half only: the peer stops sending and stays there to read
+        // the answer, which is what a client that lost its file does.
+        tokio::io::AsyncWriteExt::shutdown(&mut theirs).await.expect("half-closed");
+        let mut answer = Vec::new();
+        theirs.read_to_end(&mut answer).await.expect("the answer is readable");
+        answer
+    });
+    let report = storage_api::serve(&mut ours, Vec::new(), &request, plan)
+        .await
+        .expect("the transfer is answered");
+    drop(ours);
+    let answer = feeder.await.expect("the feeder finished");
+    assert!(String::from_utf8_lossy(&answer).starts_with("HTTP/1.1 400"), "{report}");
+    assert_eq!(report.status, 400, "a short body is the request's fault, not the box's");
+    assert!(!dir.path().join("vault").join("partial.txt").exists(), "nothing was published");
+}
+
+/// Runs a bulk transfer over a duplex and returns everything written back.
+async fn drive(prefix: Vec<u8>, request: Request, plan: storage_api::Bulk) -> String {
+    let (mut ours, mut theirs) = tokio::io::duplex(1024 * 1024);
+    let served = tokio::spawn(async move {
+        let report = storage_api::serve(&mut ours, prefix, &request, plan).await;
+        drop(ours);
+        report
+    });
+    let mut written = Vec::new();
+    theirs.read_to_end(&mut written).await.expect("the answer is readable");
+    served.await.expect("the task finished").expect("the transfer is answered");
+    String::from_utf8_lossy(&written).into_owned()
+}
+
+// ---- desktop ----------------------------------------------------------------
+
+/// A fleet that reports two machines and drives nothing.
+///
+/// The whole point of the [`Fleet`] seam: every refusal, every capability
+/// filter and every ticket rule below is exercised on a laptop with no capture
+/// backend, no agent and no peer link.
+struct TestFleet;
+
+impl selfhost_admin::Fleet for TestFleet {
+    fn nodes(&self) -> Vec<selfhost_admin::NodeReport> {
+        vec![
+            selfhost_admin::NodeReport::local(),
+            selfhost_admin::NodeReport {
+                node: "alex-desktop".to_owned(),
+                live: false,
+                last_seen_secs: Some(90),
+                reason: Some("the link was closed by the peer".to_owned()),
+            },
+        ]
+    }
+
+    fn agent(&self, node: &str) -> selfhost_admin::AgentReport {
+        selfhost_admin::AgentReport::absent(node, "no capture backend is built for this host")
+    }
+
+    fn serve<'a>(
+        &'a self,
+        _session: selfhost_admin::Handover,
+    ) -> selfhost_admin::desk_api::Task<'a, String> {
+        Box::pin(async { "the test fleet drives nothing".to_owned() })
+    }
+}
+
+/// The console API with the desktop switched on.
+fn desktop_api(name: &str, config: selfhost_config::Desktop) -> (Api, ScratchDir) {
+    let (api, dir) = api(name);
+    (api.with_desktop(config, Arc::new(TestFleet)), dir)
+}
+
+/// A desktop configuration that is on, allows input, and re-authenticates
+/// within `window` seconds.
+fn desktop_on(window: u64) -> selfhost_config::Desktop {
+    selfhost_config::Desktop {
+        enabled: true,
+        allow_input: true,
+        reauth_window_secs: window,
+        ..selfhost_config::Desktop::default()
+    }
+}
+
+#[tokio::test]
+async fn a_deployment_with_no_desktop_says_so_only_to_a_caller_who_is_already_in() {
+    let (api, _dir) = api("desktop-absent");
+    // Authenticated: an honest 404, the same shape the passkey routes use when
+    // the feature is off.
+    for target in ["/api/desktop", "/api/desktop/nodes", "/api/desktop/agent"] {
+        let (status, _) = send(&api, "GET", target, "").await;
+        assert_eq!(status, 404, "{target}");
+    }
+    // Unauthenticated: the uniform 401, so a stranger cannot learn whether this
+    // box has a screen.
+    for target in ["/api/desktop", "/api/desktop/nodes", "/api/desktop/agent"] {
+        let (status, _) = call(&api, "GET", target, None, "").await;
+        assert_eq!(status, 401, "{target}");
+    }
+}
+
+#[tokio::test]
+async fn a_desktop_that_is_configured_off_is_indistinguishable_from_one_that_is_absent() {
+    // `[desktop].enabled = false` is not a soft default: the routes behave
+    // exactly as they do with no `[desktop]` block at all.
+    let (api, _dir) = desktop_api("desktop-off", selfhost_config::Desktop::default());
+    let (status, _) = send(&api, "GET", "/api/desktop", "").await;
+    assert_eq!(status, 404);
+    let (status, _) = send(&api, "POST", "/api/desktop/ticket", r#"{"want":["desktop.view"]}"#).await;
+    assert_eq!(status, 401, "no desktop, no desktop ticket");
+}
+
+#[tokio::test]
+async fn the_desktop_settings_report_the_operators_own_switches() {
+    let (api, _dir) = desktop_api("desktop-settings", desktop_on(120));
+    let (status, body) = send(&api, "GET", "/api/desktop", "").await;
+    assert_eq!(status, 200, "{body:?}");
+    assert_eq!(body.get("enabled").and_then(Json::as_bool), Some(true));
+    assert_eq!(body.get("allowInput").and_then(Json::as_bool), Some(true));
+    assert_eq!(body.get("reauthWindowSecs").and_then(Json::as_u64), Some(120));
+}
+
+#[tokio::test]
+async fn a_node_that_is_down_is_reported_with_its_reason_rather_than_omitted() {
+    let (api, _dir) = desktop_api("desktop-nodes", desktop_on(120));
+    let (status, body) = send(&api, "GET", "/api/desktop/nodes", "").await;
+    assert_eq!(status, 200, "{body:?}");
+    let nodes = body.get("nodes").and_then(Json::as_array).expect("a nodes array");
+    assert_eq!(nodes.len(), 2, "{body:?}");
+    let down = nodes
+        .iter()
+        .find(|node| node.get("node").and_then(Json::as_str) == Some("alex-desktop"))
+        .expect("the second machine");
+    assert_eq!(down.get("live").and_then(Json::as_bool), Some(false));
+    assert!(down.get("reason").and_then(Json::as_str).is_some(), "absence is never the answer");
+}
+
+#[tokio::test]
+async fn the_node_list_is_filtered_to_the_machines_a_person_may_watch() {
+    let sessions = Sessions::new();
+    let (api, dir) = console_api("desktop-node-filter", sessions.clone());
+    let people = People::load(dir.path());
+    let mut grants = Grants::none();
+    grants.grant(Capability::ConsoleRead).expect("room for one grant");
+    grants
+        .grant(Capability::DesktopView(NodeName::parse("self").expect("a legal node")))
+        .expect("room for one grant");
+    people
+        .set_grants(&PersonName::parse("Mom").expect("a legal name"), grants)
+        .expect("grants are written");
+    let id = sessions.create("Mom", Opening::Passkey).expect("a session");
+    let cookie = format!("selfhost_session={id}");
+    let api = api.with_people(people).with_desktop(desktop_on(120), Arc::new(TestFleet));
+
+    let listed = call_with(&api, "GET", "/api/desktop/nodes", &[("Cookie", &cookie)], "").await;
+    assert_eq!(listed.status.code(), 200);
+    let body = body_json(&listed);
+    let nodes = body.get("nodes").and_then(Json::as_array).expect("a nodes array");
+    assert_eq!(nodes.len(), 1, "only the machine they hold a view of: {body:?}");
+    assert_eq!(nodes[0].get("node").and_then(Json::as_str), Some("self"));
+
+    // The machine they hold nothing for is the ordinary 401 on the agent route,
+    // which is the same answer an unparseable node name gets.
+    let refused =
+        call_with(&api, "GET", "/api/desktop/agent?peer=alex-desktop", &[("Cookie", &cookie)], "")
+            .await;
+    assert_eq!(refused.status.code(), 401);
+    let nonsense =
+        call_with(&api, "GET", "/api/desktop/agent?peer=Not%20A%20Node", &[("Cookie", &cookie)], "")
+            .await;
+    assert_eq!(nonsense.status.code(), refused.status.code());
+}
+
+#[tokio::test]
+async fn a_desktop_ticket_names_its_machine_and_control_always_implies_view() {
+    let (api, dir) = desktop_api("desktop-ticket", desktop_on(900));
+    // A cookie session, because a control ticket is decided against a login
+    // moment and the bearer token has none.
+    ConsolePassword::write(dir.path(), PASSWORD).expect("password written");
+    let sessions = Sessions::new();
+    let api = api
+        .with_console_auth_parts(ConsolePassword::load(dir.path()), sessions)
+        .with_console_origin(DESKTOP_RP);
+    let cookie = login(&api).await;
+
+    let minted = call_with(
+        &api,
+        "POST",
+        "/api/desktop/ticket",
+        &[("Cookie", &cookie), ("X-Selfhost-Console", "1")],
+        r#"{"want":["desktop.control"],"peer":"alex-desktop"}"#,
+    )
+    .await;
+    assert_eq!(minted.status.code(), 200, "{:?}", body_json(&minted));
+    let ticket = body_json(&minted).get("ticket").and_then(Json::as_str).expect("a ticket").to_owned();
+
+    // The ticket carries view as well as control, and it is bound to the machine
+    // that was named: a handshake against a different one must not redeem it.
+    let redeemed = api
+        .upgrade_for(
+            &handshake("/api/desktop/session?peer=alex-desktop", &ticket, &cookie),
+            selfhost_admin::Ability::DesktopView(
+                NodeName::parse("alex-desktop").expect("a legal node"),
+            ),
+        )
+        .expect("the ticket opens the machine it named");
+    assert!(
+        redeemed
+            .abilities
+            .iter()
+            .any(|a| matches!(a, selfhost_admin::Ability::DesktopControl(_))),
+        "control was asked for and is carried"
+    );
+}
+
+#[tokio::test]
+async fn a_ticket_minted_for_one_machine_does_not_open_another() {
+    let (api, dir) = desktop_api("desktop-wrong-machine", desktop_on(900));
+    ConsolePassword::write(dir.path(), PASSWORD).expect("password written");
+    let api = api
+        .with_console_auth_parts(ConsolePassword::load(dir.path()), Sessions::new())
+        .with_console_origin(DESKTOP_RP);
+    let cookie = login(&api).await;
+
+    let minted = call_with(
+        &api,
+        "POST",
+        "/api/desktop/ticket",
+        &[("Cookie", &cookie), ("X-Selfhost-Console", "1")],
+        r#"{"want":["desktop.view"],"peer":"alex-desktop"}"#,
+    )
+    .await;
+    let ticket = body_json(&minted).get("ticket").and_then(Json::as_str).expect("a ticket").to_owned();
+
+    let refused = api.upgrade_for(
+        &handshake("/api/desktop/session?peer=self", &ticket, &cookie),
+        selfhost_admin::Ability::DesktopView(NodeName::parse("self").expect("a legal node")),
+    );
+    assert!(refused.is_err(), "a ticket for the study opens the study and nothing else");
+}
+
+#[tokio::test]
+async fn a_stale_login_is_refused_a_control_ticket_and_told_to_re_authenticate() {
+    // Zero seconds: every login is already too old, which is the boundary this
+    // rule is written around. The rule's own arithmetic is unit-tested in
+    // `desk_api`; what is tested here is that the route applies it and that the
+    // console is told what to do about it.
+    let (api, dir) = desktop_api("desktop-stale", desktop_on(0));
+    ConsolePassword::write(dir.path(), PASSWORD).expect("password written");
+    let api = api
+        .with_console_auth_parts(ConsolePassword::load(dir.path()), Sessions::new())
+        .with_console_origin(DESKTOP_RP);
+    let cookie = login(&api).await;
+
+    let refused = call_with(
+        &api,
+        "POST",
+        "/api/desktop/ticket",
+        &[("Cookie", &cookie), ("X-Selfhost-Console", "1")],
+        r#"{"want":["desktop.control"],"peer":"self"}"#,
+    )
+    .await;
+    assert_eq!(refused.status.code(), 403, "{:?}", body_json(&refused));
+    assert_eq!(
+        body_json(&refused).get("reauthenticate").and_then(Json::as_bool),
+        Some(true),
+        "the console has to know to prompt rather than send them to a login page"
+    );
+
+    // Viewing is unaffected: the freshness rule is about driving a machine.
+    let watching = call_with(
+        &api,
+        "POST",
+        "/api/desktop/ticket",
+        &[("Cookie", &cookie), ("X-Selfhost-Console", "1")],
+        r#"{"want":["desktop.view"],"peer":"self"}"#,
+    )
+    .await;
+    assert_eq!(watching.status.code(), 200, "{:?}", body_json(&watching));
+}
+
+#[tokio::test]
+async fn an_unattended_credential_is_refused_a_keyboard_until_the_operator_arms_it() {
+    // The bearer token opens every existing route and will not open a keyboard,
+    // because no person is proven to be there and it skips every browser-side
+    // defence at once.
+    let (api, _dir) = desktop_api("desktop-bearer", desktop_on(900));
+    let (status, _) = send(
+        &api,
+        "POST",
+        "/api/desktop/ticket",
+        r#"{"want":["desktop.control"],"peer":"self"}"#,
+    )
+    .await;
+    assert_eq!(status, 401, "an unarmed token may not drive the machine");
+
+    let (armed, _) = desktop_api("desktop-bearer-armed", desktop_on(900));
+    let armed = armed.with_policy(selfhost_identity::Policy::new(true));
+    let (status, body) = send(
+        &armed,
+        "POST",
+        "/api/desktop/ticket",
+        r#"{"want":["desktop.control"],"peer":"self"}"#,
+    )
+    .await;
+    assert_eq!(status, 200, "{body:?}");
+}
+
+#[tokio::test]
+async fn a_desktop_ticket_naming_no_legal_machine_is_a_400_rather_than_a_default() {
+    // A target this API chose is not the target the caller asked for, and it
+    // would be authorised as though it were.
+    let (api, _dir) = desktop_api("desktop-badpeer", desktop_on(900));
+    let (status, _) = send(
+        &api,
+        "POST",
+        "/api/desktop/ticket",
+        r#"{"want":["desktop.view"],"peer":"Not A Node"}"#,
+    )
+    .await;
+    assert_eq!(status, 400);
+}
+
+/// The console origin the desktop upgrade tests speak for.
+///
+/// A browser always sends `Origin` on a handshake, so its absence from a cookie
+/// caller is refused — which means every handshake test has to send one, and the
+/// API has to have been told what its own is.
+const DESKTOP_RP: &str = "console.example.com";
+
+/// A handshake head carrying a ticket, a cookie and the console's own origin.
+fn handshake(target: &str, ticket: &str, cookie: &str) -> Request {
+    let raw = format!(
+        "GET {target} HTTP/1.1\r\nHost: 127.0.0.1\r\nUpgrade: websocket\r\n\
+         Connection: Upgrade\r\nSec-WebSocket-Version: 13\r\n\
+         Sec-WebSocket-Key: AAAAAAAAAAAAAAAAAAAAAA==\r\n\
+         Sec-WebSocket-Protocol: selfhost.desktop.1, tkt.{ticket}\r\n\
+         Origin: https://{DESKTOP_RP}\r\n\
+         Cookie: {cookie}\r\n\r\n"
+    );
+    Request::parse(raw.as_bytes()).expect("a well-formed handshake").request
+}
+
+/// A desktop configuration with the clipboard switched on as well.
+fn desktop_with_clipboard(window: u64) -> selfhost_config::Desktop {
+    selfhost_config::Desktop { allow_clipboard: true, ..desktop_on(window) }
+}
+
+/// Logs in over a cookie against a deployment whose desktop is `config`.
+async fn desktop_console(name: &str, config: selfhost_config::Desktop) -> (Api, String, ScratchDir) {
+    let (api, dir) = desktop_api(name, config);
+    ConsolePassword::write(dir.path(), PASSWORD).expect("password written");
+    let api = api
+        .with_console_auth_parts(ConsolePassword::load(dir.path()), Sessions::new())
+        .with_console_origin(DESKTOP_RP);
+    let cookie = login(&api).await;
+    (api, cookie, dir)
+}
+
+/// Asks for a ticket over a cookie, with the CSRF header the mint demands.
+async fn mint(api: &Api, cookie: &str, body: &str) -> Response {
+    call_with(
+        api,
+        "POST",
+        "/api/desktop/ticket",
+        &[("Cookie", cookie), ("X-Selfhost-Console", "1")],
+        body,
+    )
+    .await
+}
+
+#[tokio::test]
+async fn the_clipboard_is_a_capability_of_its_own_and_is_off_until_the_operator_says_otherwise() {
+    // Seeing a screen and taking what was last copied on it are different
+    // powers: the second exfiltrates a password the person at the machine
+    // copied, leaving none of the evidence that watching a screen leaves.
+    let (api, cookie, _dir) = desktop_console("desktop-clipboard-off", desktop_on(900)).await;
+    let refused = mint(&api, &cookie, r#"{"want":["desktop.clipboard"],"peer":"self"}"#).await;
+    assert_eq!(refused.status.code(), 403, "{:?}", body_json(&refused));
+    assert_eq!(
+        body_json(&refused).get("setting").and_then(Json::as_str),
+        Some("[desktop].allow_clipboard"),
+        "the console has to be able to say which switch, in a file, is off"
+    );
+    // Watching the same machine is unaffected: this is one capability, not a
+    // mode the whole subsystem is in.
+    let watching = mint(&api, &cookie, r#"{"want":["desktop.view"],"peer":"self"}"#).await;
+    assert_eq!(watching.status.code(), 200, "{:?}", body_json(&watching));
+
+    let (armed, cookie, _dir) =
+        desktop_console("desktop-clipboard-on", desktop_with_clipboard(900)).await;
+    let minted = mint(&armed, &cookie, r#"{"want":["desktop.clipboard"],"peer":"self"}"#).await;
+    assert_eq!(minted.status.code(), 200, "{:?}", body_json(&minted));
+    let ticket =
+        body_json(&minted).get("ticket").and_then(Json::as_str).expect("a ticket").to_owned();
+
+    // The clipboard travels on the desktop stream, so the ticket carries view
+    // as well — a stream that may read a clipboard but not see a screen is a
+    // stream whose only purpose is exfiltration, and the wire refuses that set.
+    let redeemed = armed
+        .upgrade_for(
+            &handshake("/api/desktop/session?peer=self", &ticket, &cookie),
+            selfhost_admin::Ability::DesktopView(NodeName::parse("self").expect("a legal node")),
+        )
+        .expect("the ticket opens the machine it named");
+    assert!(
+        redeemed
+            .abilities
+            .iter()
+            .any(|a| matches!(a, selfhost_admin::Ability::ClipboardRead(_))),
+        "the clipboard was asked for and is carried: {:?}",
+        redeemed.abilities
+    );
+}
+
+#[tokio::test]
+async fn the_clipboard_is_held_to_the_same_freshness_standard_as_a_keyboard() {
+    // A keyboard types a password out of the operator; a clipboard reads one
+    // they already copied. The window is zero, so every login is already stale.
+    let (api, cookie, _dir) =
+        desktop_console("desktop-clipboard-stale", desktop_with_clipboard(0)).await;
+    let refused = mint(&api, &cookie, r#"{"want":["desktop.clipboard"],"peer":"self"}"#).await;
+    assert_eq!(refused.status.code(), 403, "{:?}", body_json(&refused));
+    assert_eq!(
+        body_json(&refused).get("reauthenticate").and_then(Json::as_bool),
+        Some(true)
+    );
+}
+
+#[tokio::test]
+async fn a_deployment_that_does_not_allow_input_refuses_a_control_ticket_naming_the_switch() {
+    // `[desktop].allow_input = false` is the outermost of the three gates and
+    // the only one that cannot be reached from the console at all.
+    let no_input = selfhost_config::Desktop {
+        enabled: true,
+        allow_input: false,
+        reauth_window_secs: 900,
+        ..selfhost_config::Desktop::default()
+    };
+    let (api, cookie, _dir) = desktop_console("desktop-no-input", no_input).await;
+    let refused = mint(&api, &cookie, r#"{"want":["desktop.control"],"peer":"self"}"#).await;
+    assert_eq!(refused.status.code(), 403, "{:?}", body_json(&refused));
+    assert_eq!(
+        body_json(&refused).get("setting").and_then(Json::as_str),
+        Some("[desktop].allow_input")
+    );
+    let watching = mint(&api, &cookie, r#"{"want":["desktop.view"],"peer":"self"}"#).await;
+    assert_eq!(watching.status.code(), 200, "{:?}", body_json(&watching));
+}
+
+/// Writes one audit record, as the daemon's own writer would.
+fn record_action(log: &selfhost_identity::AuditLog, detail: &str) {
+    let record = selfhost_identity::AuditRecord::now(
+        selfhost_identity::Identity::Owner,
+        selfhost_identity::Credential::Passkey,
+        selfhost_identity::Capability::DesktopControl(
+            NodeName::parse("self").expect("a legal node"),
+        ),
+        selfhost_identity::Decision::Allow,
+        detail,
+    )
+    .expect("entropy");
+    log.append(&record).expect("the log is writable");
+}
+
+#[tokio::test]
+async fn the_audit_trail_reaches_the_console_newest_first() {
+    // An audit trail an operator cannot read is an audit trail nobody checks,
+    // and the person who needs it most is looking at a browser rather than at a
+    // shell on the box.
+    let (api, dir) = api("audit-trail");
+    let log = selfhost_identity::AuditLog::in_dir(dir.path());
+    for index in 0..5 {
+        record_action(&log, &format!("keydown:0x{index:02x}"));
+    }
+    let api = api.with_audit(log);
+
+    let (status, body) = send(&api, "GET", "/api/audit", "").await;
+    assert_eq!(status, 200, "{body:?}");
+    let records = body.get("records").and_then(Json::as_array).expect("a records array");
+    assert_eq!(records.len(), 5);
+    assert_eq!(
+        records[0].get("detail").and_then(Json::as_str),
+        Some("keydown:0x04"),
+        "newest first is the order a tail is read in"
+    );
+    assert_eq!(records[0].get("capability").and_then(Json::as_str), Some("desktop.control"));
+    assert_eq!(records[0].get("target").and_then(Json::as_str), Some("self"));
+    assert_eq!(records[0].get("who").and_then(Json::as_str), Some("owner"));
+    assert_eq!(records[0].get("credential").and_then(Json::as_str), Some("passkey"));
+    assert_eq!(body.get("unreadable").and_then(Json::as_f64), Some(0.0));
+
+    // The caller may ask for less, and may not ask for more than the ceiling.
+    let (_, fewer) = send(&api, "GET", "/api/audit?limit=2", "").await;
+    assert_eq!(fewer.get("returned").and_then(Json::as_f64), Some(2.0));
+    let (_, capped) = send(&api, "GET", "/api/audit?limit=100000", "").await;
+    assert_eq!(capped.get("returned").and_then(Json::as_f64), Some(5.0));
+}
+
+#[tokio::test]
+async fn a_deployment_that_has_recorded_nothing_answers_with_an_empty_trail() {
+    // Not a 404: the console asks this on every refresh, and "there is no audit
+    // here" is a different and wrong thing to show an operator.
+    let (api, dir) = api("audit-empty");
+    let api = api.with_audit(selfhost_identity::AuditLog::in_dir(dir.path()));
+    let (status, body) = send(&api, "GET", "/api/audit", "").await;
+    assert_eq!(status, 200);
+    assert_eq!(body.get("returned").and_then(Json::as_f64), Some(0.0));
+}
+
+#[tokio::test]
+async fn the_trail_is_the_owners_and_a_granted_person_cannot_read_it() {
+    // There is no capability that honestly says "may read the record of
+    // everybody else", and a person who could be granted one could watch the
+    // record of their own supervision.
+    let (api, dir) = api("audit-owner-only");
+    let log = selfhost_identity::AuditLog::in_dir(dir.path());
+    record_action(&log, "keydown:0x04");
+    ConsolePassword::write(dir.path(), PASSWORD).expect("password written");
+    let sessions = Sessions::new();
+    let people = selfhost_identity::People::load(dir.path());
+    let mut grants = selfhost_identity::Grants::none();
+    grants.grant(selfhost_identity::Capability::ConsoleRead).expect("room for one grant");
+    grants
+        .grant(selfhost_identity::Capability::DesktopControl(
+            NodeName::parse("self").expect("a legal node"),
+        ))
+        .expect("room for one grant");
+    people
+        .set_grants(&PersonName::parse("Mom").expect("a legal name"), grants)
+        .expect("grants are written");
+    let id = sessions.create("Mom", Opening::Passkey).expect("a session");
+    let api = api
+        .with_console_auth_parts(ConsolePassword::load(dir.path()), sessions)
+        .with_people(people)
+        .with_audit(log);
+
+    let refused =
+        call_with(&api, "GET", "/api/audit", &[("Cookie", &format!("selfhost_session={id}"))], "")
+            .await;
+    assert_eq!(refused.status.code(), 401);
+    // The owner's own credential reads it.
+    let (status, _) = send(&api, "GET", "/api/audit", "").await;
+    assert_eq!(status, 200);
+}

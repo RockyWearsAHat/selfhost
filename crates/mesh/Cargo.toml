@@ -10,13 +10,21 @@ description = "One link, many channels: the mux header, credit flow control, pee
 [dependencies]
 # HMAC for the enrolment proof's channel binding.
 ring = { workspace = true }
+# The response-head parser the dialler reads the owner's `101` with. The same
+# one the proxy and the ACME client use, so a head that one of them accepts is
+# not one another quietly reads differently.
+selfhost-http = { workspace = true }
 selfhost-identity = { workspace = true }
 selfhost-json = { workspace = true }
 selfhost-ws = { workspace = true }
 tokio = { workspace = true }
 
 [dev-dependencies]
-tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time", "io-util"] }
+# `test-util` is what lets a twenty-second handshake timeout and a thirty-second
+# retry ceiling be asserted in milliseconds: the tests advance tokio's clock
+# rather than sleeping, so a deadline nobody would wait for in CI is still
+# covered. Dev-only, so it cannot reach a shipped binary.
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time", "io-util", "test-util"] }
 
 [lints.rust]
 unsafe_code = "forbid"

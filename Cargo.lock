@@ -265,11 +265,13 @@ version = "0.1.0"
 dependencies = [
  "ring",
  "selfhost-config",
+ "selfhost-desk",
  "selfhost-firewall",
  "selfhost-git",
  "selfhost-http",
  "selfhost-identity",
  "selfhost-json",
+ "selfhost-storage",
  "selfhost-supervisor",
  "selfhost-ws",
  "tokio",
@@ -293,16 +295,23 @@ dependencies = [
  "selfhost-acme",
  "selfhost-admin",
  "selfhost-config",
+ "selfhost-desk",
  "selfhost-dns",
  "selfhost-firewall",
  "selfhost-git",
  "selfhost-http",
+ "selfhost-identity",
  "selfhost-mail",
+ "selfhost-mesh",
  "selfhost-proxy",
  "selfhost-registrar",
+ "selfhost-screen",
+ "selfhost-storage",
  "selfhost-supervisor",
+ "selfhost-ws",
  "tokio",
  "tokio-rustls",
+ "webpki-roots",
 ]
 
 [[package]]
@@ -401,6 +410,7 @@ name = "selfhost-mesh"
 version = "0.1.0"
 dependencies = [
  "ring",
+ "selfhost-http",
  "selfhost-identity",
  "selfhost-json",
  "selfhost-ws",

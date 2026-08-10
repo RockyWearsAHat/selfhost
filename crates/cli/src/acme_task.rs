@@ -310,6 +310,9 @@ mod tests {
             namecheap_ddns: vec![],
             registrar: None,
             self_update: None,
+            shares: vec![],
+            desktop: None,
+            mesh: None,
         }
     }
 

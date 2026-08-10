@@ -21,27 +21,38 @@ use selfhost_desk::wire::{Monitor, MAX_MONITORS};
 use std::ffi::c_void;
 
 /// A Core Graphics point.
+///
+/// Shared with the capture and injection modules rather than re-declared in each:
+/// this is a layout every Core Graphics call in the crate agrees on, and three
+/// copies of it are three chances for one of them to drift.
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
-struct CGPoint {
-    x: f64,
-    y: f64,
+pub(crate) struct CGPoint {
+    /// Horizontal position, in points.
+    pub(crate) x: f64,
+    /// Vertical position, in points, increasing downwards from the main display's
+    /// top-left corner.
+    pub(crate) y: f64,
 }
 
 /// A Core Graphics size.
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
-struct CGSize {
-    width: f64,
-    height: f64,
+pub(crate) struct CGSize {
+    /// Width.
+    pub(crate) width: f64,
+    /// Height.
+    pub(crate) height: f64,
 }
 
 /// A Core Graphics rectangle, returned by value from `CGDisplayBounds`.
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
-struct CGRect {
-    origin: CGPoint,
-    size: CGSize,
+pub(crate) struct CGRect {
+    /// The top-left corner.
+    pub(crate) origin: CGPoint,
+    /// The extent.
+    pub(crate) size: CGSize,
 }
 
 /// `kCGErrorSuccess`.

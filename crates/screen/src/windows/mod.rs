@@ -41,6 +41,29 @@
 //! therefore tested on the developer's Mac, where the rest of this module cannot
 //! even be compiled. The submodules below hold the `unsafe` and are Windows-only.
 //!
+//! The capture half that arrived later keeps the same split. Every decision about
+//! *pixels* — a cursor's identity, the alpha rescue, the four monochrome mask
+//! combinations — is a pure function down this file with a test beside it, and
+//! [`cursor`] is left holding only the calls and the handles they hand over.
+//!
+//! # The submodules
+//!
+//! - [`sys`] — the raw declarations, and nothing else.
+//! - [`desktop`] — which session is on the console, who is in it, which desktop is
+//!   in front.
+//! - [`spawn`] — the sequence above, written out once.
+//! - [`pipe`] — both ends of the channel: the daemon's `AgentPipe` and the agent's
+//!   `DaemonLink`.
+//! - [`gdi`] — screen capture: one reused top-down DIB section, one `BitBlt` a
+//!   frame, and the layout checks that turn a resolution, topology or DPI change
+//!   into a rebuild rather than a stale picture.
+//! - [`cursor`] — the pointer, captured separately so the client composites it,
+//!   and the `DeleteObject` discipline that keeps the GDI handle count flat.
+//! - [`identity`] — what the agent can only learn about itself from inside its own
+//!   session: DPI awareness, window station, desktop and integrity level.
+//! - [`inject`] — `SendInput`, the foreground window's integrity level, and the
+//!   release of everything held when the session ends.
+//!
 //! # The pipe's ACL is the authentication
 //!
 //! There is no shared secret between daemon and agent, and deliberately so.
@@ -53,11 +76,21 @@
 //! block, and the resulting exposure is the operator's remote keystrokes plus a
 //! race to become the screen source.
 
+use crate::agent::Integrity;
+use selfhost_desk::wire::Refusal;
 use std::fmt;
 use std::path::Path;
 
 #[cfg(windows)]
+pub mod cursor;
+#[cfg(windows)]
 pub mod desktop;
+#[cfg(windows)]
+pub mod gdi;
+#[cfg(windows)]
+pub mod identity;
+#[cfg(windows)]
+pub mod inject;
 #[cfg(windows)]
 pub mod pipe;
 #[cfg(windows)]
@@ -323,6 +356,212 @@ pub fn classify_desktop(name: &str) -> InputDesktop {
     }
 }
 
+/// An identity for a cursor shape that survives a recycled handle.
+///
+/// The obvious identity is the `HCURSOR` value, and it is what the wire carries.
+/// The trouble is that an application which creates cursors — an image editor with
+/// a brush preview, a terminal with its own I-beam — destroys them too, and
+/// Windows reuses handle values. A client caching by handle alone would eventually
+/// draw a stale bitmap for a shape that merely inherited an address.
+///
+/// So the id folds the handle together with the extent and the hotspot. Two
+/// different shapes that share a recycled handle *and* have identical dimensions
+/// can still collide, and are then drawn with the wrong one of two same-sized
+/// bitmaps until the shape changes again — a far smaller wrong than the
+/// alternative, and the honest description of what a handle-derived identity can
+/// promise.
+pub fn shape_id(handle: u64, width: u32, height: u32, hotspot_x: u32, hotspot_y: u32) -> u64 {
+    // FNV-1a: four lines, no dependency, and asked to spread five small integers
+    // rather than to resist an adversary.
+    const OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+    const PRIME: u64 = 0x0000_0100_0000_01b3;
+    let mut hash = OFFSET;
+    for value in [
+        handle,
+        u64::from(width),
+        u64::from(height),
+        u64::from(hotspot_x),
+        u64::from(hotspot_y),
+    ] {
+        for byte in value.to_le_bytes() {
+            hash ^= u64::from(byte);
+            hash = hash.wrapping_mul(PRIME);
+        }
+    }
+    hash
+}
+
+/// Whether a BGRA image carries any alpha at all.
+///
+/// Asked of every colour cursor, because plenty of 32-bit cursors — including ones
+/// Windows itself ships — have an all-zero alpha channel and rely entirely on the
+/// AND mask. Sending those through unchanged produces a **completely invisible
+/// pointer** on any client that correctly honours the alpha it was given.
+pub fn alpha_present(bgra: &[u8]) -> bool {
+    bgra.chunks_exact(4).any(|pixel| pixel.get(3).is_some_and(|alpha| *alpha != 0))
+}
+
+/// Makes every pixel opaque, for a shape with neither alpha nor a usable mask.
+pub fn force_opaque(bgra: &mut [u8]) {
+    for pixel in bgra.chunks_exact_mut(4) {
+        if let Some(alpha) = pixel.get_mut(3) {
+            *alpha = 0xFF;
+        }
+    }
+}
+
+/// Recovers a cursor's alpha from its AND mask.
+///
+/// The mask arrives having been read back as 32-bit BGRA, so a set mask bit is a
+/// white pixel and a clear one is black. White means *the desktop shows through*,
+/// which is the opposite polarity to alpha and is the sign error this function
+/// exists to make once, in a place a test can see.
+///
+/// A mask shorter than the image leaves the remaining pixels opaque rather than
+/// refusing: a partly-decoded pointer is visible and slightly wrong, where a
+/// refusal is a session with no pointer at all.
+pub fn mask_alpha(bgra: &mut [u8], mask: &[u8]) {
+    for (index, pixel) in bgra.chunks_exact_mut(4).enumerate() {
+        let transparent = mask.get(index * 4).is_some_and(|blue| *blue != 0);
+        if let Some(alpha) = pixel.get_mut(3) {
+            *alpha = if transparent { 0x00 } else { 0xFF };
+        }
+    }
+}
+
+/// Composes a monochrome cursor from the stacked AND and XOR masks.
+///
+/// A monochrome cursor has no colour bitmap: its mask bitmap is twice the cursor's
+/// height and holds the AND mask above the XOR mask. Both halves arrive here
+/// already read back as 32-bit BGRA, so a set bit is a white pixel.
+///
+/// | AND | XOR | meaning                   |
+/// |-----|-----|---------------------------|
+/// | 0   | 0   | opaque black              |
+/// | 0   | 1   | opaque white              |
+/// | 1   | 0   | transparent               |
+/// | 1   | 1   | **invert** what is behind |
+///
+/// The last combination cannot be expressed in a bitmap the client composites, and
+/// there is no honest way to fake it: inverting needs the pixels behind the
+/// pointer, which the client has and this format does not describe. It is drawn as
+/// opaque black — what the classic monochrome I-beam looks like over the light
+/// background it spends its life on, and legible against most others.
+///
+/// Missing bytes are treated as transparent rather than refused, for the same
+/// reason as [`mask_alpha`].
+pub fn monochrome_bgra(width: u32, height: u32, stacked: &[u8]) -> Vec<u8> {
+    let pixels = (width as usize).saturating_mul(height as usize);
+    let half = pixels.saturating_mul(4);
+    let mut bgra = vec![0u8; half];
+    for index in 0..pixels {
+        let byte = index * 4;
+        let and = stacked.get(byte).copied().unwrap_or(0xFF) != 0;
+        let xor = stacked.get(half.saturating_add(byte)).copied().unwrap_or(0) != 0;
+        let (colour, alpha) = match (and, xor) {
+            (false, false) => (0x00u8, 0xFFu8),
+            (false, true) => (0xFF, 0xFF),
+            (true, false) => (0x00, 0x00),
+            (true, true) => (0x00, 0xFF),
+        };
+        if let Some(pixel) = bgra.get_mut(byte..byte + 4) {
+            pixel.fill(colour);
+            if let Some(slot) = pixel.get_mut(3) {
+                *slot = alpha;
+            }
+        }
+    }
+    bgra
+}
+
+// ══ User Interface Privilege Isolation ════════════════════════════════════════
+//
+// The pure half of the honest-refusal requirement. The calls that produce a
+// `ForegroundIntegrity` live in `inject`, and the policy that turns one into a
+// refusal lives here, where it is tested on a machine with no windows at all.
+
+/// What could be learned about the window that currently has the focus.
+///
+/// Three answers rather than two, because "we could not find out" and "Windows
+/// refused to tell us" mean opposite things and lead to opposite decisions. See
+/// [`uipi_verdict`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ForegroundIntegrity {
+    /// The window's integrity level was read.
+    Known(Integrity),
+    /// Opening the window's process, or reading its token, was refused.
+    ///
+    /// This is **evidence**, not an absence of it. Windows grants
+    /// `PROCESS_QUERY_LIMITED_INFORMATION` to a medium-integrity process against
+    /// any process of the same user at the same or a lower level; being refused
+    /// therefore means the target is above us or belongs to somebody else, and in
+    /// both cases injection into it will be discarded.
+    Denied,
+    /// There is no foreground window, or the query failed for a reason that says
+    /// nothing about integrity — a window that closed between two calls, a desktop
+    /// switch in progress.
+    Unknown,
+}
+
+/// Whether input must be refused because the focused window is above the agent.
+///
+/// # Why this exists at all, and why it must never be "fixed"
+///
+/// The agent runs as the console user at **medium** integrity, deliberately and
+/// permanently. User Interface Privilege Isolation therefore discards any input it
+/// synthesises into a window at a higher level — an elevated PowerShell, an
+/// installer, anything launched through a consent prompt — and it does so
+/// *silently*: `SendInput` returns the full count and `GetLastError` is untouched.
+/// From the far end that is indistinguishable from a frozen machine.
+///
+/// So the agent detects what can be detected and reports `input-refused (elevated
+/// window)` as a **state**. This is normal behaviour to be surfaced, never a bug to
+/// be chased.
+///
+/// The tempting fix — running the agent as `SYSTEM`, or with `uiAccess` — would
+/// make this feature a **remote privilege-escalation channel**: a session that can
+/// drive an elevated window can drive the UAC consent dialog that creates one, and
+/// at that point the remote-desktop capability and full administrative control of
+/// the machine are the same capability. `uiAccess` is unavailable here anyway (it
+/// requires an Authenticode signature and installation under a UAC-protected path,
+/// while this tree builds ad-hoc-signed binaries into a user directory and rewrites
+/// them on every push), but the reason it is not pursued is the first one.
+pub fn uipi_verdict(own: Integrity, foreground: ForegroundIntegrity) -> Option<Refusal> {
+    match foreground {
+        ForegroundIntegrity::Known(level) if level.rid() > own.rid() => {
+            Some(Refusal::ElevatedWindow)
+        }
+        ForegroundIntegrity::Known(_) => None,
+        ForegroundIntegrity::Denied => Some(Refusal::ElevatedWindow),
+        // Never refuse on an absence of evidence: a session that suspended input
+        // every time a window closed mid-query would be unusable, and the honest
+        // description of this case is that UIPI's silence has not been detected —
+        // which is exactly what the trait's documentation already promises.
+        ForegroundIntegrity::Unknown => None,
+    }
+}
+
+/// Whether an event is one that UIPI would swallow.
+///
+/// Pointer **movement** is excluded on purpose. The window server moves the cursor
+/// itself, so a move is not delivered *to* the elevated window and is not blocked;
+/// refusing it would freeze the pointer whenever an elevated window has focus,
+/// which looks exactly like a dead session. Everything that is actually delivered
+/// to the focused window — keys, text, buttons, the wheel — is refused, so the
+/// console can say why it did nothing.
+///
+/// The same split is made on macOS for secure input, for the same reason.
+pub fn blocked_by_elevation(event: &crate::input::InjectedEvent) -> bool {
+    use crate::input::InjectedEvent;
+    match event {
+        InjectedEvent::Key { .. }
+        | InjectedEvent::Text { .. }
+        | InjectedEvent::Button { .. }
+        | InjectedEvent::Scroll { .. } => true,
+        InjectedEvent::PointerMove { .. } => false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -459,5 +698,174 @@ mod tests {
             InputDesktop::Other("Some-Other-Desktop".to_owned())
         );
         assert!(!classify_desktop("Some-Other-Desktop").is_capturable());
+    }
+
+    #[test]
+    fn a_shape_id_separates_shapes_that_share_a_recycled_handle() {
+        // The bug this blunts: an application destroys a cursor, Windows hands the
+        // same address to the next one, and a client caching by handle draws the
+        // old bitmap for the new shape.
+        let arrow = shape_id(0x1234, 32, 32, 0, 0);
+        let beam = shape_id(0x1234, 16, 24, 8, 12);
+        assert_ne!(arrow, beam);
+        assert_eq!(arrow, shape_id(0x1234, 32, 32, 0, 0), "one shape keeps one id");
+        assert_ne!(shape_id(0x1000, 32, 32, 0, 0), shape_id(0x2000, 32, 32, 0, 0));
+    }
+
+    #[test]
+    fn a_cursor_with_no_alpha_at_all_is_recognised() {
+        // Every pixel opaque black with a zero alpha channel: the case that makes
+        // an unrescued pointer invisible.
+        let none = vec![0u8; 64];
+        assert!(!alpha_present(&none));
+        let mut some = none.clone();
+        some[7] = 0x01;
+        assert!(alpha_present(&some));
+    }
+
+    #[test]
+    fn the_and_mask_is_the_opposite_polarity_to_alpha() {
+        // White in the mask means the desktop shows through, which is alpha zero.
+        // Getting this backwards produces a pointer-shaped hole.
+        let mut bgra = vec![0u8; 8];
+        let mask = [0xFF, 0xFF, 0xFF, 0xFF, 0x00, 0x00, 0x00, 0x00];
+        mask_alpha(&mut bgra, &mask);
+        assert_eq!(bgra[3], 0x00, "a set mask bit is transparent");
+        assert_eq!(bgra[7], 0xFF, "a clear mask bit is opaque");
+    }
+
+    #[test]
+    fn a_short_mask_leaves_the_rest_of_the_pointer_visible() {
+        // A partly-decoded pointer is visible and slightly wrong; a refusal is a
+        // session with no pointer at all.
+        let mut bgra = vec![0u8; 16];
+        mask_alpha(&mut bgra, &[0xFF, 0xFF, 0xFF, 0xFF]);
+        assert_eq!(bgra[3], 0x00);
+        assert_eq!(bgra[7], 0xFF);
+        assert_eq!(bgra[15], 0xFF);
+    }
+
+    #[test]
+    fn every_monochrome_combination_composes_to_the_documented_pixel() {
+        // One row of four pixels, exercising all four AND/XOR combinations. The
+        // AND mask is the first half of the buffer and the XOR mask the second.
+        let and = [
+            0x00, 0x00, 0x00, 0x00, // 0
+            0x00, 0x00, 0x00, 0x00, // 0
+            0xFF, 0xFF, 0xFF, 0xFF, // 1
+            0xFF, 0xFF, 0xFF, 0xFF, // 1
+        ];
+        let xor = [
+            0x00, 0x00, 0x00, 0x00, // 0 → opaque black
+            0xFF, 0xFF, 0xFF, 0xFF, // 1 → opaque white
+            0x00, 0x00, 0x00, 0x00, // 0 → transparent
+            0xFF, 0xFF, 0xFF, 0xFF, // 1 → invert, drawn opaque black
+        ];
+        let stacked: Vec<u8> = and.iter().chain(xor.iter()).copied().collect();
+        let bgra = monochrome_bgra(4, 1, &stacked);
+        assert_eq!(bgra.len(), 16);
+        assert_eq!(&bgra[0..4], &[0x00, 0x00, 0x00, 0xFF], "opaque black");
+        assert_eq!(&bgra[4..8], &[0xFF, 0xFF, 0xFF, 0xFF], "opaque white");
+        assert_eq!(&bgra[8..12], &[0x00, 0x00, 0x00, 0x00], "transparent");
+        assert_eq!(&bgra[12..16], &[0x00, 0x00, 0x00, 0xFF], "invert, drawn black");
+    }
+
+    #[test]
+    fn a_truncated_monochrome_mask_is_composed_rather_than_refused() {
+        // Under `panic = "abort"` an indexing mistake here is the whole daemon, so
+        // every read is bounded and a short buffer produces a transparent pixel.
+        let bgra = monochrome_bgra(4, 4, &[]);
+        assert_eq!(bgra.len(), 4 * 4 * 4);
+        assert!(bgra.chunks_exact(4).all(|pixel| pixel[3] == 0x00));
+    }
+
+    #[test]
+    fn an_absurd_monochrome_extent_allocates_nothing_it_cannot_index() {
+        // The extent comes from a bitmap descriptor Windows filled in; a lie in it
+        // must not become an overflowing multiplication.
+        let bgra = monochrome_bgra(0, 0, &[]);
+        assert!(bgra.is_empty());
+    }
+
+    #[test]
+    fn an_elevated_window_refuses_input_rather_than_swallowing_it() {
+        // The honest-failure requirement, as a table. The agent is medium; anything
+        // above it discards what we send and reports nothing.
+        assert_eq!(
+            uipi_verdict(Integrity::Medium, ForegroundIntegrity::Known(Integrity::High)),
+            Some(Refusal::ElevatedWindow)
+        );
+        assert_eq!(
+            uipi_verdict(Integrity::Medium, ForegroundIntegrity::Known(Integrity::System)),
+            Some(Refusal::ElevatedWindow)
+        );
+        assert_eq!(
+            uipi_verdict(Integrity::Medium, ForegroundIntegrity::Known(Integrity::Medium)),
+            None
+        );
+        assert_eq!(
+            uipi_verdict(Integrity::Medium, ForegroundIntegrity::Known(Integrity::Low)),
+            None,
+            "a sandboxed browser tab is below us and receives input normally"
+        );
+    }
+
+    #[test]
+    fn being_refused_the_windows_token_is_evidence_and_not_ignorance() {
+        // Windows grants `PROCESS_QUERY_LIMITED_INFORMATION` against same-user
+        // processes at or below our level. A refusal therefore means the window is
+        // above us, and reporting it is more honest than typing into nothing.
+        assert_eq!(
+            uipi_verdict(Integrity::Medium, ForegroundIntegrity::Denied),
+            Some(Refusal::ElevatedWindow)
+        );
+    }
+
+    #[test]
+    fn nothing_is_refused_on_an_absence_of_evidence() {
+        // A window that closed between two calls, or a desktop switch in progress.
+        // Suspending input here would make the session unusable for a condition
+        // that says nothing about integrity.
+        assert_eq!(uipi_verdict(Integrity::Medium, ForegroundIntegrity::Unknown), None);
+    }
+
+    #[test]
+    fn an_unnamed_integrity_level_still_compares() {
+        // The mandatory-label identifiers are ordered, which is why the comparison
+        // is on the number rather than on the enumeration.
+        assert_eq!(
+            uipi_verdict(Integrity::Medium, ForegroundIntegrity::Known(Integrity::Other(0x2100))),
+            Some(Refusal::ElevatedWindow),
+            "medium-plus is above medium"
+        );
+        assert_eq!(
+            uipi_verdict(Integrity::Medium, ForegroundIntegrity::Known(Integrity::Other(0x1500))),
+            None
+        );
+    }
+
+    #[test]
+    fn the_pointer_keeps_moving_while_an_elevated_window_has_focus() {
+        // Everything delivered *to* the window is refused; movement is not, because
+        // the window server moves the cursor itself and a frozen pointer reads as a
+        // dead session.
+        use crate::input::InjectedEvent;
+        use selfhost_desk::keys::Usage;
+        let key = Usage::from_code("KeyA").expect("the vocabulary has this key");
+        assert!(blocked_by_elevation(&InjectedEvent::Key { usage: key, down: true }));
+        assert!(blocked_by_elevation(&InjectedEvent::Text { unit: 65, down: true }));
+        assert!(blocked_by_elevation(&InjectedEvent::Scroll { dx: 0, dy: 120 }));
+        assert!(blocked_by_elevation(&InjectedEvent::Button {
+            button: selfhost_desk::wire::Button::Left,
+            down: true
+        }));
+        assert!(!blocked_by_elevation(&InjectedEvent::PointerMove { monitor: 0, x: 1, y: 1 }));
+    }
+
+    #[test]
+    fn forcing_opacity_touches_only_the_alpha_channel() {
+        let mut bgra = vec![0x11, 0x22, 0x33, 0x00, 0x44, 0x55, 0x66, 0x00];
+        force_opaque(&mut bgra);
+        assert_eq!(bgra, vec![0x11, 0x22, 0x33, 0xFF, 0x44, 0x55, 0x66, 0xFF]);
     }
 }

@@ -6,8 +6,13 @@
 //! **creation primitive**: the reason a write cannot silently destroy a file
 //! that was already there.
 //!
-//! The streaming copy loop and the quota bookkeeping that wraps it still belong
-//! to Phase 5; what is here is everything those need to be built *on*.
+//! Around those two, this module holds the rest of the write path's floor:
+//! creating and removing directories ([`Dir::create_dir`], [`Dir::remove_dir`],
+//! [`Dir::remove_tree`]), moving a name between two open directories
+//! ([`Dir::rename_into`]), describing what is there ([`Dir::stat`],
+//! [`Dir::entries`]), and the two numbers the quota is enforced against
+//! ([`Dir::free_space`], [`Dir::measure`]). The streaming copy loop and the
+//! bookkeeping that wraps it live in [`crate::api`], which drives these.
 //!
 //! # Why the resolver is not the confinement
 //!
@@ -69,14 +74,14 @@
 //!   directory's names*. Nothing is opened, read or written through that result
 //!   — [`Dir::collision`] uses it only to name a file in a `409` message — so
 //!   the window leaks names at worst and can never move a byte.
-//! - **A staged replace publishes with `std::fs::rename` on textual paths.**
-//!   `rename` never follows the final component, and the directory above it was
-//!   proven link-free by the walk, but a component swapped *afterwards* could
-//!   still redirect the publish. Closing it needs `renameat` on unix and
-//!   `SetFileInformationByHandle(FileRenameInfo)` with a `RootDirectory` on
-//!   Windows. It is owed with the write verbs in Phase 5, which is where
-//!   [`Existing::Replace`] first becomes reachable at all; it is written down
-//!   here rather than left to be discovered.
+//! - **Publishing and moving are relative too, and no longer by path.** A
+//!   staged replace once published with `std::fs::rename` on textual paths,
+//!   which left a component swapped *after* the walk able to redirect it.
+//!   [`Dir::rename_into`] and [`Upload::commit`] now go through `renameat` on
+//!   unix and `SetFileInformationByHandle(FileRenameInfo)` with a
+//!   `RootDirectory` handle on Windows, so both ends of every rename are
+//!   descriptors and neither can be renamed out from under the operation.
+//!   [`Dir::path`] is left with exactly one job: appearing in messages.
 //!
 //! # Why the create happens at the destination name
 //!
@@ -134,7 +139,9 @@
 //!
 //! A replace is atomic in its contents, as before.
 
+use crate::listing::{Entry, Kind};
 use crate::path::{self, RelativePath, Refusal, TEMP_PREFIX};
+use std::borrow::Borrow;
 use std::fmt;
 use std::fs::{File, Metadata};
 use std::io;
@@ -156,6 +163,41 @@ compile_error!(
      is a share a symlink can lead out of. Add a `fs/<platform>.rs` implementing `sys` before \
      enabling this target rather than falling back to opening paths."
 );
+
+/// How far below a directory a recursive operation will descend.
+///
+/// Sixty-four. Deeper than any tree a person makes and far shallower than the
+/// two thousand levels [`crate::path::MAX_PATH_BYTES`] would allow if every
+/// name were one byte — and a share can genuinely hold such a tree, written
+/// over SMB or restored from a backup. The limit is on the *recursion*, so its
+/// job is to keep the stack bounded: under `panic = "abort"` a stack overflow
+/// is not a failed request, it is the daemon that serves 80 and 443
+/// disappearing while a share was being tidied.
+///
+/// Because it bounds the recursion and not the operation, it does not have to
+/// mean a refusal. [`Dir::remove_tree`] keeps the bound and removes a tree of
+/// any depth by resuming from a descriptor, and it is written that way because
+/// deletion is the way out of every other refusal here — a share this API can
+/// build a tree in and not remove one from is a share the operator has to fix
+/// over SSH.
+pub const MAX_TREE_DEPTH: usize = 64;
+
+/// What one name in a directory turned out to be.
+///
+/// Returned as a value rather than as a [`Metadata`] because two of the three
+/// fields are this crate's own answers rather than the platform's: a directory
+/// reports zero bytes (its *contents* are a recursive walk, not a number a
+/// listing may cost), and a modification time the filesystem declined to give
+/// is `None` rather than an epoch that would sort as 1970.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Attributes {
+    /// File or directory. Nothing else is ever reported: a link is a refusal.
+    pub kind: Kind,
+    /// Size in bytes, zero for a directory.
+    pub size: u64,
+    /// Last modification, when the filesystem reported one.
+    pub modified: Option<SystemTime>,
+}
 
 /// Why a name could not be opened.
 ///
@@ -384,6 +426,82 @@ impl Dir {
         Ok(names)
     }
 
+    /// Whether this descriptor and another are open on the same directory.
+    ///
+    /// Asked of the two open objects — `(st_dev, st_ino)` on unix, the file
+    /// index on Windows — and never of their paths, because the question is
+    /// whether two walks arrived at one directory and a path is exactly the
+    /// thing that can have been swapped since. An identity that cannot be
+    /// proven answers `false`: "not proven the same" must never read as a
+    /// match.
+    ///
+    /// [`crate::api::Volume`]'s `COPY` and `MOVE` are what need it. A move whose
+    /// destination is its own source is data loss dressed as a rename, and it
+    /// cannot be recognised from the two request paths alone: two shares can be
+    /// two names for one directory, and a case-folding volume calls
+    /// `report.pdf` and `Report.pdf` one file.
+    pub fn is_same_directory(&self, other: &Self) -> bool {
+        sys::same_object(&self.handle, &other.handle)
+    }
+
+    /// Whether two names, in two open directories, are one object on disk.
+    ///
+    /// The question a `MOVE` or a `COPY` must ask before it clears its
+    /// destination, and the only form of it that is actually answerable. The two
+    /// request paths cannot answer it: a case-folding volume calls `report.pdf`
+    /// and `Report.pdf` one file, APFS calls an NFC and an NFD spelling one file,
+    /// two shares can be two names for one directory, and a hard link made
+    /// before this crate ever saw the volume is one file under two names in one
+    /// directory. Every one of those is a destination whose deletion destroys the
+    /// source.
+    ///
+    /// So the objects are opened and their identity compared. A name that is not
+    /// there, or that this share will not open — a link, a device — answers
+    /// `false`: it is not the source, and clearing it destroys nothing the
+    /// caller still needs.
+    pub fn is_same_child(
+        &self,
+        name: &str,
+        other: &Self,
+        other_name: &str,
+    ) -> Result<bool, OpenError> {
+        let (Some(here), Some(there)) =
+            (self.open_child_object(name)?, other.open_child_object(other_name)?)
+        else {
+            return Ok(false);
+        };
+        Ok(sys::same_object(&here, &there))
+    }
+
+    /// One child opened as whatever it is, for an identity comparison only.
+    ///
+    /// `None` for a name that is absent or that the walk refuses, because the
+    /// only caller is asking *is this the same thing as that*, and both answers
+    /// to that question are "no". Nothing is read or written through the handle;
+    /// the directory arm is tried first because Windows opens the two kinds with
+    /// different dispositions.
+    fn open_child_object(&self, name: &str) -> Result<Option<File>, OpenError> {
+        path::validate_segment(name)?;
+        match sys::open_child_dir(&self.handle, name) {
+            Ok(handle) => return Ok(Some(handle)),
+            Err(OpenError::NotADirectory) => {}
+            Err(OpenError::NotFound | OpenError::Symlink | OpenError::NotAFile) => {
+                return Ok(None)
+            }
+            Err(other) => return Err(other),
+        }
+        match sys::open_child_file(&self.handle, name) {
+            Ok(handle) => Ok(Some(handle)),
+            Err(
+                OpenError::NotFound
+                | OpenError::Symlink
+                | OpenError::NotADirectory
+                | OpenError::NotAFile,
+            ) => Ok(None),
+            Err(other) => Err(other),
+        }
+    }
+
     /// The existing name that would fold onto `proposed`, if this directory
     /// holds one.
     ///
@@ -399,8 +517,9 @@ impl Dir {
     /// - It is also a policy gate on a volume that does **not** fold: `ext4`
     ///   will happily hold `Report.pdf` beside `report.pdf`, and a share that
     ///   accepted both would be a share that cannot be copied to a Mac or a
-    ///   Windows box without one of them destroying the other. So
-    ///   [`Existing::Refuse`] refuses the pair here too, and says which name it
+    ///   Windows box without one of them destroying the other. So the pair is
+    ///   refused here, whatever the caller's intent — [`Upload::begin`] says why
+    ///   `Replace` is not an exemption — and the refusal says which name it
     ///   collided with.
     ///
     /// [`crate::path::collides`] supplies the fold, and its documentation is
@@ -413,15 +532,473 @@ impl Dir {
     /// when it matters is an index kept beside the directory, not a quieter
     /// rule.
     pub fn collision(&self, proposed: &str) -> Result<Option<String>, OpenError> {
+        Ok(self.collisions(proposed)?.into_iter().next())
+    }
+
+    /// Every existing name that folds onto `proposed`, not just the first.
+    ///
+    /// [`Dir::collision`] answers the question a `409` message asks — *which
+    /// file did I collide with* — and one name is enough for that. This answers
+    /// the question a rename asks, which is different and cannot be served by a
+    /// first match: a case-only rename's destination legitimately folds onto the
+    /// file being renamed, and *only* onto it. Deciding that from whichever name
+    /// `readdir` happened to yield first would let `report.pdf` be renamed to
+    /// `Report.pdf` in a directory that also holds `REPORT.PDF`, which is the
+    /// pair no Mac or Windows client can hold at once.
+    ///
+    /// A byte-identical name is never in this list: [`crate::path::collides`] is
+    /// about two *spellings* of one name, and whether an exactly-spelled name may
+    /// be overwritten is the caller's intent to declare, not a collision.
+    fn collisions(&self, proposed: &str) -> Result<Vec<String>, OpenError> {
+        let mut folding = Vec::new();
         for name in self.names()? {
             let Some(text) = name.to_str() else {
                 continue;
             };
             if path::collides(text, proposed) {
-                return Ok(Some(text.to_string()));
+                folding.push(text.to_string());
             }
         }
-        Ok(None)
+        Ok(folding)
+    }
+
+    /// What one child is, how large it is, and when it last changed.
+    ///
+    /// Two opens in the worst case, because the platform seam has one call for
+    /// a directory and one for a file and no third that takes either. That is
+    /// deliberate: a combined open would be a third set of flags to get right
+    /// on Windows, on a path where the only benefit is halving the cost of a
+    /// listing — and a listing already costs one open per entry, which
+    /// [`Dir::names`] states is the price of not reaching a name by path.
+    ///
+    /// A link is [`OpenError::Symlink`] here as everywhere else, so a caller
+    /// building a listing learns that the entry exists and cannot be served
+    /// rather than being handed the target's metadata.
+    pub fn stat(&self, name: &str) -> Result<Attributes, OpenError> {
+        match self.open_dir(name) {
+            Ok(directory) => {
+                let metadata = directory.metadata().map_err(classify_io)?;
+                Ok(Attributes { kind: Kind::Directory, size: 0, modified: metadata.modified().ok() })
+            }
+            Err(OpenError::NotADirectory) => {
+                let metadata = self.open_file(name)?.metadata().map_err(classify_io)?;
+                Ok(Attributes {
+                    kind: Kind::File,
+                    size: metadata.len(),
+                    modified: metadata.modified().ok(),
+                })
+            }
+            Err(other) => Err(other),
+        }
+    }
+
+    /// Whether a child of this name exists at all, whatever it is.
+    ///
+    /// The question `Overwrite: F` asks, and the reason it is a question rather
+    /// than a flag on the rename: a portable "rename unless the destination
+    /// exists" needs a different symbol on each unix, and WebDAV wants a `412`
+    /// with an explanation rather than a failed syscall. A link counts as
+    /// occupied — [`OpenError::Symlink`] is an existence proof — because a
+    /// destination we refuse to write through is still a destination that is
+    /// taken.
+    pub fn occupied(&self, name: &str) -> Result<bool, OpenError> {
+        match self.stat(name) {
+            Ok(_) | Err(OpenError::Symlink) | Err(OpenError::NotAFile) => Ok(true),
+            Err(OpenError::NotFound) => Ok(false),
+            Err(other) => Err(other),
+        }
+    }
+
+    /// Everything in this directory, with each entry's kind, size and
+    /// modification time.
+    ///
+    /// One open per entry, through the descriptor walk, which is the cost
+    /// [`Dir::names`] describes and refuses to avoid with a by-path
+    /// `symlink_metadata`. A name that cannot be reached — not UTF-8, refused
+    /// by the resolver, a link, or something that vanished between the read and
+    /// the open — becomes an entry marked unreachable rather than an error for
+    /// the whole listing: one strange file in a share must not make the share
+    /// unlistable.
+    pub fn entries(&self) -> Result<Vec<Entry>, OpenError> {
+        let mut entries = Vec::new();
+        for name in self.names()? {
+            entries.push(self.entry_for(&name));
+        }
+        Ok(entries)
+    }
+
+    /// One directory entry, with the unreachable cases folded in.
+    ///
+    /// Reachability has two halves and this is where they meet.
+    /// [`Entry::new`] judges the **name**: a name that is not UTF-8, or that the
+    /// resolver refuses, can never appear in a URL. This function judges the
+    /// **thing**: a name the resolver likes is still unreachable if the walk
+    /// will not open what is under it — a symlink, a device node, a FIFO, or
+    /// something that vanished between the read and the open.
+    ///
+    /// Deciding only the first half was a real defect, and a quiet one: a
+    /// symlink out of the share listed as an ordinary zero-byte file with
+    /// `reachable == true`, so the console offered a link and `PROPFIND` minted
+    /// an `href` — for a name that answers every `GET` with a `404`, because
+    /// [`Dir::open_file`] refuses the link the listing had just advertised.
+    fn entry_for(&self, name: &std::ffi::OsStr) -> Entry {
+        match name.to_str().map(|text| self.stat(text)) {
+            Some(Ok(attributes)) => {
+                Entry::new(name, attributes.kind, attributes.size, attributes.modified)
+            }
+            // Shown, at zero bytes, and marked: a file that exists and cannot be
+            // reached is exactly what an operator needs to see, and hiding it
+            // would make the console and Finder show different directories.
+            Some(Err(_)) | None => Entry::unopenable(name),
+        }
+    }
+
+    /// Creates one child directory, refusing to destroy anything.
+    ///
+    /// The same exclusive-create discipline [`Upload::begin`] uses, for the
+    /// same reason and with the same collision oracle: the platform's create
+    /// fails when *that volume* considers the name taken, under whatever
+    /// folding it applies. `MKCOL` on an existing name is therefore a refusal
+    /// the volume made, not a guess this code made.
+    ///
+    /// Returns the new directory already walked to, so a caller that is about
+    /// to write into it does not reach it by path.
+    pub fn create_dir(&self, name: &str) -> Result<Self, WriteError> {
+        path::validate_segment(name)?;
+        if let Some(existing) = self.collision(name)? {
+            return Err(WriteError::Collides { existing });
+        }
+        sys::create_child_dir(&self.handle, name)?;
+        self.sync()?;
+        Ok(self.open_dir(name)?)
+    }
+
+    /// Removes one child file.
+    ///
+    /// Refuses a directory: `unlinkat` without `AT_REMOVEDIR` says so itself on
+    /// unix, and the Windows half opens with `FILE_NON_DIRECTORY_FILE`, so
+    /// neither platform can be talked into removing a tree through this call.
+    pub fn remove_file(&self, name: &str) -> Result<(), WriteError> {
+        path::validate_segment(name)?;
+        sys::remove_child(&self.handle, name, None)?;
+        self.sync()?;
+        Ok(())
+    }
+
+    /// Removes one child directory, which must be empty.
+    ///
+    /// Emptiness is the kernel's rule rather than a scan this code performs,
+    /// which is what makes it race-free: a file that arrived a microsecond ago
+    /// makes the removal fail rather than disappearing with the directory.
+    pub fn remove_dir(&self, name: &str) -> Result<(), WriteError> {
+        path::validate_segment(name)?;
+        sys::remove_child_dir(&self.handle, name)?;
+        self.sync()?;
+        Ok(())
+    }
+
+    /// Removes one child and, if it is a directory, everything beneath it.
+    ///
+    /// `DELETE` on a WebDAV collection is defined as depth-infinity, so this is
+    /// not an optional convenience. Three properties are worth stating because
+    /// each of them is a way this operation could have gone wrong:
+    ///
+    /// - **It descends through descriptors**, never through paths, so a link
+    ///   planted mid-tree during the walk cannot redirect the deletion out of
+    ///   the share. A link *found* in the tree is unlinked as itself, never
+    ///   followed, which is [`Dir::remove_file`]'s guarantee applied at depth.
+    /// - **It removes a tree of any depth, with the recursion still bounded by
+    ///   [`MAX_TREE_DEPTH`].** Those two are not in tension, and the way they
+    ///   are reconciled is the whole of the loop below.
+    /// - **It stops at the first failure and says so.** A partial deletion is
+    ///   visible in the next listing; a partial deletion reported as success is
+    ///   how a caller comes to believe a file is gone when it is not.
+    ///
+    /// # Why deletion, alone among the descents here, has no depth ceiling
+    ///
+    /// Every other recursive walk in this crate answers [`MAX_TREE_DEPTH`] with
+    /// a refusal, and that is right for them: a `COPY` or a `measure` that gives
+    /// up leaves the share exactly as it found it. Deletion cannot do that,
+    /// because **deletion is the way out**. A depth ceiling on it means this API
+    /// can produce a tree it cannot then remove — and it does not take an
+    /// attacker or a restored backup to reach one, since a client that issues
+    /// `MKCOL` a hundred times has built it through the front door. A share with
+    /// an undeletable directory in it is not a bounded failure; it is a share
+    /// the operator has to go to SSH to fix.
+    ///
+    /// So the *recursion* keeps its bound and the *operation* loses its ceiling.
+    /// A pass descends at most [`MAX_TREE_DEPTH`] levels; when it runs out of
+    /// budget it hands back an open descriptor on the deepest directory it
+    /// reached, and the loop starts a fresh pass from there. The stack is
+    /// bounded by the recursion limit exactly as before, the open descriptors by
+    /// one per pass — a few dozen for a tree thousands of levels deep — and
+    /// progress is guaranteed because every pass either finishes its subtree or
+    /// anchors strictly deeper than the last.
+    pub fn remove_tree(&self, name: &str) -> Result<(), WriteError> {
+        // Each anchor is a directory a pass reached its recursion limit in, and
+        // the child of it still to be removed. The innermost is worked first;
+        // when it comes back done, the pass below it is retried — its tree is
+        // now that much shorter.
+        let mut anchors = vec![(self.reopen()?, name.to_string())];
+        while let Some((at, target)) = anchors.pop() {
+            match at.remove_tree_within(&target, 0)? {
+                Removal::Done => {}
+                Removal::Deeper { at: below, name: next } => {
+                    anchors.push((at, target));
+                    anchors.push((below, next));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// One pass of [`Dir::remove_tree`], bounded by the recursion limit.
+    fn remove_tree_within(&self, name: &str, depth: usize) -> Result<Removal, WriteError> {
+        path::validate_segment(name)?;
+        if depth >= MAX_TREE_DEPTH {
+            // The budget is spent, not the tree. A descriptor on this directory
+            // goes back to the loop, which resumes from here with a fresh one —
+            // a descriptor rather than a path, so the resumed pass cannot be
+            // pointed at a different directory than the one this walk reached.
+            return Ok(Removal::Deeper { at: self.reopen()?, name: name.to_string() });
+        }
+        match self.open_dir(name) {
+            Ok(child) => {
+                for entry in child.names()? {
+                    // A name that this crate cannot spell cannot be removed
+                    // through the descriptor walk either, and reaching for it
+                    // by path is the one thing the walk exists to prevent. The
+                    // parent's own removal will then fail as not-empty, which
+                    // is the honest report: the operator is told the directory
+                    // still holds something rather than told it is gone.
+                    let Some(text) = entry.to_str() else {
+                        continue;
+                    };
+                    match child.remove_tree_within(text, depth.saturating_add(1))? {
+                        Removal::Done => {}
+                        // This directory cannot go until that subtree has, and
+                        // its remaining siblings will be found by the retry.
+                        deeper @ Removal::Deeper { .. } => return Ok(deeper),
+                    }
+                }
+                self.remove_dir(name)?;
+                Ok(Removal::Done)
+            }
+            // Not a directory, so it is a file or a link, and both are unlinked
+            // by name without being opened.
+            Err(OpenError::NotADirectory | OpenError::Symlink) => {
+                self.remove_file(name)?;
+                Ok(Removal::Done)
+            }
+            Err(other) => Err(other.into()),
+        }
+    }
+
+    /// Moves one child of this directory to a name in another.
+    ///
+    /// Both ends are open directories, so this is the operation
+    /// [`Upload::commit`]'s by-path publish is documented as still owing: no
+    /// component of either side can be redirected between the walk that proved
+    /// it link-free and the rename itself.
+    ///
+    /// **The destination must be free.** The platform call replaces silently on
+    /// unix and is asked not to on Windows, so relying on either would give the
+    /// two platforms different semantics for the same request; instead the
+    /// occupancy is a decision made here, and a caller that means to overwrite
+    /// removes the destination first — which is exactly what RFC 4918 §9.9.3
+    /// requires of `MOVE` with `Overwrite: T`, and exactly what
+    /// [`WriteError::NameTaken`] tells a caller that did not ask for it.
+    ///
+    /// The case-collision scan runs against the destination directory for the
+    /// same reason [`Upload::begin`] runs it: a `MOVE` of `Report.pdf` into a
+    /// directory holding `report.pdf` is a share that cannot survive being
+    /// copied to a Mac, whatever this volume thinks.
+    ///
+    /// # The one name that folds onto the destination and is not a collision
+    ///
+    /// Renaming `report.pdf` to `Report.pdf` in one directory is a person fixing
+    /// a file's capitalisation, and it is the single rename whose destination
+    /// folds onto its own source. Every rule above fires on it — the fold scan
+    /// finds `report.pdf`, and on APFS or NTFS the occupancy check finds the
+    /// destination taken by the very file being moved — so the operation was
+    /// refused on a case-sensitive volume and, when the caller had said
+    /// `Overwrite: T`, the destination was deleted first and the file ceased to
+    /// exist.
+    ///
+    /// So the source is excluded from both questions — but only from the
+    /// questions, never from the *decision*. The occupancy check still runs on
+    /// that branch, because "the destination folds onto the source" is a fact
+    /// about two spellings and not about two files: on a case-sensitive volume
+    /// `Report.pdf` can be a second, unrelated file, and the two-step rename
+    /// below ends in a replacing rename that would destroy it. What the branch
+    /// buys is that the destination is allowed to be occupied *by the source
+    /// itself*, which [`Dir::is_same_child`] is what proves.
+    ///
+    /// The rename is then done in two steps through a name inside
+    /// [`TEMP_PREFIX`]'s reserved namespace: on
+    /// a folding volume a single rename would be asked to replace the file it is
+    /// moving, which is the platform's business to define and not something to
+    /// find out per filesystem. If the second step fails the first is undone, so
+    /// the file is back under the name it started with rather than under a name
+    /// no listing will show.
+    pub fn rename_into(
+        &self,
+        name: &str,
+        destination: &Self,
+        destination_name: &str,
+    ) -> Result<(), WriteError> {
+        path::validate_segment(name)?;
+        path::validate_segment(destination_name)?;
+        // The fold is asked first, exactly as [`Upload::begin`] asks it first,
+        // so that a name which merely *folds* onto an existing one is refused
+        // with that one's spelling rather than with a bare "already exists" —
+        // on a folding volume both rules fire, and only one of them can explain
+        // itself to a person.
+        let one_directory = self.is_same_directory(destination);
+        let mut folding = destination.collisions(destination_name)?;
+        let folds_onto_source =
+            one_directory && folding.iter().any(|existing| existing == name);
+        folding.retain(|existing| !(one_directory && existing == name));
+        if let Some(existing) = folding.into_iter().next() {
+            return Err(WriteError::Collides { existing });
+        }
+        if folds_onto_source {
+            // The fold says the destination is another spelling of the source,
+            // and on a folding volume it is — there is only one file the two
+            // names can mean. On a case-sensitive volume it may be a *second*
+            // file: this API refuses to create `report.pdf` beside `Report.pdf`,
+            // and a backup, an SMB client or another operating system delivers
+            // the pair anyway. The two-step rename below ends in a *replacing*
+            // rename, so a branch that skipped the occupancy question would
+            // silently overwrite that second file and report success.
+            //
+            // Asked of the objects rather than of the names, for the reason
+            // [`Dir::is_same_child`] gives: names are exactly what cannot answer
+            // it. A destination that is the source is the case-only rename this
+            // branch exists for; a destination that is anything else is taken.
+            if destination.occupied(destination_name)?
+                && !self.is_same_child(name, destination, destination_name)?
+            {
+                return Err(WriteError::NameTaken);
+            }
+            return self.rename_case_only(name, destination_name);
+        }
+        if destination.occupied(destination_name)? {
+            return Err(WriteError::NameTaken);
+        }
+        sys::rename_child(
+            &self.handle,
+            name,
+            &destination.handle,
+            destination_name,
+            Existing::Refuse,
+        )?;
+        self.sync()?;
+        destination.sync()?;
+        Ok(())
+    }
+
+    /// Renames a child onto a spelling of its own name, in two steps.
+    ///
+    /// The case-only rename [`Dir::rename_into`] documents. Private, because it
+    /// is correct exactly under the condition that call site has just proven —
+    /// that the only name folding onto the destination is the source itself —
+    /// and a public entry point would be one a caller could reach without it.
+    fn rename_case_only(&self, name: &str, destination_name: &str) -> Result<(), WriteError> {
+        if name == destination_name {
+            // Not a rename at all. Refusing here rather than performing a
+            // two-step move of a file onto itself keeps the destructive path
+            // reachable only when something actually changes.
+            return Err(WriteError::NameTaken);
+        }
+        let staged = temporary_name();
+        sys::rename_child(&self.handle, name, &self.handle, &staged, Existing::Refuse)?;
+        match sys::rename_child(
+            &self.handle,
+            &staged,
+            &self.handle,
+            destination_name,
+            Existing::Replace,
+        ) {
+            Ok(()) => {
+                self.sync()?;
+                Ok(())
+            }
+            Err(error) => {
+                // Put it back. A file under a `TEMP_PREFIX` name is one no
+                // listing will offer and no request can name, so leaving it
+                // there would be losing it in all the ways that matter.
+                let _ = sys::rename_child(
+                    &self.handle,
+                    &staged,
+                    &self.handle,
+                    name,
+                    Existing::Replace,
+                );
+                let _ = self.sync();
+                Err(error.into())
+            }
+        }
+    }
+
+    /// Bytes an ordinary writer may still put on the volume this directory
+    /// lives on.
+    ///
+    /// The free-space floor's input, and the one number in the write path that
+    /// is a fact about the machine rather than about the share: a full boot
+    /// volume does not make a smaller NAS, it stops the box answering on 443.
+    /// The reserve a filesystem keeps for the superuser is excluded, because
+    /// the daemon is not the superuser and a floor that counted space it cannot
+    /// spend would pass right up to the `ENOSPC` it exists to prevent.
+    pub fn free_space(&self) -> Result<u64, OpenError> {
+        sys::free_space(&self.handle, &self.path).map_err(classify_io)
+    }
+
+    /// The total size of every file at or beneath this directory.
+    ///
+    /// The quota's input. It is a **whole-subtree walk**, one open per entry,
+    /// and that cost is why it is a named function rather than something the
+    /// write path calls per request: a share holding forty thousand files
+    /// cannot afford to be measured on every `PUT`, so the caller measures once
+    /// and keeps the answer, adjusting it as bytes land — which is what
+    /// [`crate::quota::Ledger`] exists to do.
+    ///
+    /// Bounded by [`MAX_TREE_DEPTH`] like every other descent here, saturating
+    /// on the addition so that a volume reporting nonsense produces a large
+    /// number rather than an aborting overflow, and skipping — rather than
+    /// failing on — anything it cannot open: a quota that refused to be
+    /// measured because one file was unreadable would refuse every upload.
+    pub fn measure(&self) -> Result<u64, OpenError> {
+        self.measure_within(0)
+    }
+
+    /// [`Dir::measure`] with the depth it has already descended.
+    fn measure_within(&self, depth: usize) -> Result<u64, OpenError> {
+        if depth >= MAX_TREE_DEPTH {
+            return Ok(0);
+        }
+        let mut total: u64 = 0;
+        for name in self.names()? {
+            let Some(text) = name.to_str() else {
+                continue;
+            };
+            match self.open_dir(text) {
+                Ok(child) => {
+                    total = total.saturating_add(child.measure_within(depth.saturating_add(1))?);
+                }
+                Err(OpenError::NotADirectory) => {
+                    if let Ok(file) = self.open_file(text) {
+                        if let Ok(metadata) = file.metadata() {
+                            total = total.saturating_add(metadata.len());
+                        }
+                    }
+                }
+                // A link, a device, a name the resolver refuses, or something
+                // that vanished mid-walk: not counted, and not fatal.
+                Err(_) => continue,
+            }
+        }
+        Ok(total)
     }
 
     /// Flushes this directory's own metadata, so a name that was published
@@ -451,6 +1028,27 @@ impl Dir {
         let handle = self.handle.try_clone().map_err(classify_io)?;
         Ok(Self { handle, path: self.path.clone() })
     }
+}
+
+/// How far one pass of [`Dir::remove_tree`] got.
+///
+/// Private, and a type rather than a `bool`, because the second case carries the
+/// one thing that makes an unbounded removal possible with a bounded recursion:
+/// an **open descriptor** on the directory the pass stopped in. Handing back a
+/// path instead would mean the resumed pass re-opened a name that could have
+/// become something else in the meantime, which is the redirection the whole
+/// module exists to prevent.
+#[derive(Debug)]
+enum Removal {
+    /// The named child, and everything beneath it, is gone.
+    Done,
+    /// The pass spent its recursion budget with a subtree still standing.
+    Deeper {
+        /// The deepest directory the pass reached, still open.
+        at: Dir,
+        /// The child of it that has still to go.
+        name: String,
+    },
 }
 
 /// Maps a standard-library error onto this module's vocabulary.
@@ -567,10 +1165,25 @@ impl From<OpenError> for WriteError {
 /// A file being written into a share, and the promise that it destroys nothing
 /// the caller did not ask it to.
 ///
-/// The upload borrows the [`Dir`] it writes into, which is how the descriptor
+/// The upload **holds** the [`Dir`] it writes into, which is how the descriptor
 /// walk reaches this far: the file is created *relative to that descriptor*, so
-/// no part of the path can be redirected between the walk and the create. The
-/// borrow is not a lifetime formality — it is the guarantee.
+/// no part of the path can be redirected between the walk and the create. That
+/// is not a lifetime formality — it is the guarantee.
+///
+/// # Why it is generic over how it holds that directory
+///
+/// `D` is `&Dir` for the ordinary case, where a request opens a directory,
+/// streams a body into it and returns. It is `Dir` — owned — for a **resumable**
+/// upload, which outlives the request that started it: the directory descriptor
+/// is kept open for the whole session precisely so that the second chunk lands
+/// in the same directory object the first one did, even if the path has since
+/// been renamed out from under it. A resumable upload that re-walked its path
+/// on every chunk would be a resumable upload an attacker could redirect
+/// halfway through.
+///
+/// One implementation covers both because [`Borrow`] is the whole difference; a
+/// second, owned copy of this type would be a second place for the
+/// exclusive-create discipline to be got subtly wrong.
 ///
 /// # Lifecycle
 ///
@@ -582,9 +1195,9 @@ impl From<OpenError> for WriteError {
 /// not the intended path: a `Drop` cannot return an error, so a caller that
 /// wants to know calls `abandon`.
 #[derive(Debug)]
-pub struct Upload<'a> {
+pub struct Upload<D: Borrow<Dir>> {
     /// The directory this write is confined to, held open for the whole write.
-    directory: &'a Dir,
+    directory: D,
     /// `None` once the handle has been surrendered by `commit`, which is also
     /// how `Drop` knows the upload was finished rather than dropped.
     handle: Option<File>,
@@ -595,7 +1208,7 @@ pub struct Upload<'a> {
     staged: Option<String>,
 }
 
-impl<'a> Upload<'a> {
+impl<D: Borrow<Dir>> Upload<D> {
     /// Creates `name` in `directory` without destroying anything.
     ///
     /// The name is re-validated here rather than trusted, exactly as
@@ -603,10 +1216,24 @@ impl<'a> Upload<'a> {
     /// function from a request line, a WebDAV `Destination` header, or a
     /// directory read, and only one of those three has been past the resolver.
     ///
-    /// Then, for [`Existing::Refuse`] only, the directory is scanned for a name
-    /// that folds onto this one ([`Dir::collision`]) — which catches the pair
-    /// that a case-sensitive volume would otherwise accept and every Mac and
-    /// Windows client would later ruin.
+    /// Then the directory is scanned for a name that folds onto this one
+    /// ([`Dir::collision`]) — which catches the pair that a case-sensitive
+    /// volume would otherwise accept and every Mac and Windows client would
+    /// later ruin.
+    ///
+    /// **The scan runs whatever the caller's intent is**, and the reason is the
+    /// worst bug this file has had. It used to run for [`Existing::Refuse`]
+    /// only, which is to say it ran for every path except the one every ordinary
+    /// upload takes: a `PUT` is [`Existing::Replace`]. So `report.pdf` uploaded
+    /// into a directory holding `Report.pdf` skipped the scan, the exclusive
+    /// create failed because APFS folds the two, the replace path staged and
+    /// renamed — and a *different file*, with a different name, was silently
+    /// overwritten with the uploader's bytes. `Replace` is permission to replace
+    /// the file at **this** name; a file whose name merely folds onto it is not
+    /// that file, and the caller never asked for it.
+    ///
+    /// A byte-identical name is not a collision — [`crate::path::collides`] says
+    /// so — so this refuses nothing an overwrite is entitled to do.
     ///
     /// Then the destination name is created exclusively, which is the collision
     /// oracle described in this module's documentation:
@@ -628,20 +1255,18 @@ impl<'a> Upload<'a> {
     /// This call blocks. Every caller in the daemon runs it on
     /// `spawn_blocking`, the same discipline the mail and admin stores follow
     /// for their own `std::fs` work.
-    pub fn begin(
-        directory: &'a Dir,
-        name: &str,
-        existing: Existing,
-    ) -> Result<Self, WriteError> {
+    pub fn begin(directory: D, name: &str, existing: Existing) -> Result<Self, WriteError> {
         path::validate_segment(name)?;
 
-        if existing == Existing::Refuse {
-            if let Some(collision) = directory.collision(name)? {
-                return Err(WriteError::Collides { existing: collision });
-            }
+        if let Some(collision) = directory.borrow().collision(name)? {
+            return Err(WriteError::Collides { existing: collision });
         }
 
-        match sys::create_child(&directory.handle, name) {
+        // The create is finished before the `match`, so that its borrow of
+        // `directory` has ended by the time an arm moves the directory into the
+        // value being returned.
+        let created = sys::create_child(&directory.borrow().handle, name);
+        match created {
             Ok(handle) => Ok(Self {
                 directory,
                 handle: Some(handle),
@@ -652,7 +1277,7 @@ impl<'a> Upload<'a> {
                 Existing::Refuse => Err(WriteError::NameTaken),
                 Existing::Replace => {
                     let staged = temporary_name();
-                    let handle = sys::create_child(&directory.handle, &staged)?;
+                    let handle = sys::create_child(&directory.borrow().handle, &staged)?;
                     Ok(Self {
                         directory,
                         handle: Some(handle),
@@ -663,6 +1288,16 @@ impl<'a> Upload<'a> {
             },
             Err(other) => Err(other.into()),
         }
+    }
+
+    /// The directory this upload is confined to, however it is held.
+    pub fn directory(&self) -> &Dir {
+        self.directory.borrow()
+    }
+
+    /// The name the bytes will appear under, without the directory.
+    pub fn name(&self) -> &str {
+        &self.name
     }
 
     /// The handle the body is streamed into.
@@ -684,7 +1319,7 @@ impl<'a> Upload<'a> {
 
     /// The name the bytes will appear under, for logs and messages.
     pub fn destination(&self) -> PathBuf {
-        self.directory.path().join(&self.name)
+        self.directory.borrow().path().join(&self.name)
     }
 
     /// Flushes, publishes, and reports anything that went wrong.
@@ -708,13 +1343,21 @@ impl<'a> Upload<'a> {
         handle.sync_all()?;
         drop(handle);
 
+        let directory = self.directory.borrow();
         if let Some(staged) = self.staged.take() {
-            // The one publish that is still done by path; the module
-            // documentation states the residual window and what closes it.
-            let directory = self.directory.path();
-            std::fs::rename(directory.join(&staged), directory.join(&self.name))?;
+            // Relative to the descriptor at both ends, which is what closes the
+            // window this crate's documentation used to record as owed: the
+            // publish cannot be redirected by a component swapped after the
+            // walk, because no component is named.
+            sys::rename_child(
+                &directory.handle,
+                &staged,
+                &directory.handle,
+                &self.name,
+                Existing::Replace,
+            )?;
         }
-        self.directory.sync()?;
+        directory.sync()?;
         Ok(())
     }
 
@@ -739,11 +1382,11 @@ impl<'a> Upload<'a> {
     fn remove(&mut self) -> io::Result<()> {
         let name = self.staged.clone().unwrap_or_else(|| self.name.clone());
         let handle = self.handle.take();
-        sys::remove_child(&self.directory.handle, &name, handle)
+        sys::remove_child(&self.directory.borrow().handle, &name, handle)
     }
 }
 
-impl Drop for Upload<'_> {
+impl<D: Borrow<Dir>> Drop for Upload<D> {
     /// Best-effort cleanup for the path nobody wrote: a panic, a `?` in the
     /// middle of a copy loop, a task cancelled at an `await`.
     ///
@@ -1207,6 +1850,315 @@ mod tests {
         ));
         assert!(OpenError::Symlink.to_string().contains("link"));
         assert!(OpenError::Moved.to_string().contains("moved"));
+    }
+
+    /// A listing describes what is there, and marks what cannot be reached.
+    #[test]
+    fn a_listing_names_every_entry_and_greys_the_ones_that_cannot_be_served() {
+        let root = scratch("entries");
+        std::fs::create_dir(root.join("photos")).expect("a directory");
+        write_file(&root.join("notes.txt"), "hello");
+        let dir = open(&root);
+
+        let entries = dir.entries().expect("listed");
+        assert_eq!(entries.len(), 2);
+        let photos = entries.iter().find(|entry| entry.name == "photos").expect("the directory");
+        assert_eq!(photos.kind, Kind::Directory);
+        assert_eq!(photos.size, 0, "a directory's contents are a walk, not a number");
+        assert!(photos.reachable());
+        let notes = entries.iter().find(|entry| entry.name == "notes.txt").expect("the file");
+        assert_eq!(notes.kind, Kind::File);
+        assert_eq!(notes.size, 5);
+        assert!(notes.modified.is_some());
+
+        assert_eq!(dir.stat("notes.txt").expect("stat").size, 5);
+        assert!(dir.occupied("notes.txt").expect("asked"));
+        assert!(!dir.occupied("absent").expect("asked"));
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A name that another operating system wrote is shown and refused, not
+    /// hidden and not fatal to the whole listing.
+    #[cfg(unix)]
+    #[test]
+    fn a_listing_survives_a_name_this_share_will_never_serve() {
+        let root = scratch("entries-hostile");
+        write_file(&root.join("good.txt"), "fine");
+        // A trailing space is a legal unix name and one the resolver refuses,
+        // because Windows would normalise it to a different name.
+        write_file(&root.join("trailing "), "written elsewhere");
+        std::os::unix::fs::symlink("/etc/passwd", root.join("link.txt")).expect("linked");
+        let dir = open(&root);
+
+        let entries = dir.entries().expect("listed");
+        assert_eq!(entries.len(), 3);
+        assert!(entries.iter().find(|entry| entry.name == "good.txt").expect("good").reachable());
+        assert!(!entries.iter().find(|entry| entry.name == "trailing ").expect("odd").reachable());
+        // A link is listed — hiding it would make the console and Finder show
+        // different directories — at zero bytes and **unreachable**: every `GET`
+        // of it is a `404`, because the walk refuses the link the listing would
+        // otherwise have advertised a URL for.
+        let link = entries.iter().find(|entry| entry.name == "link.txt").expect("the link");
+        assert_eq!(link.size, 0);
+        assert!(!link.reachable(), "a symlink is never a name this share serves");
+        assert!(!link.to_json(&RelativePath::default()).to_text().contains(r#""path""#));
+        assert!(matches!(dir.stat("link.txt"), Err(OpenError::Symlink)));
+        assert!(dir.occupied("link.txt").expect("a link occupies its name"));
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_directory_is_created_exclusively_and_removed_only_when_empty() {
+        let root = scratch("mkcol");
+        let dir = open(&root);
+
+        let photos = dir.create_dir("photos").expect("created");
+        assert_eq!(photos.path(), root.join("photos"));
+        assert!(matches!(dir.create_dir("photos"), Err(WriteError::NameTaken)));
+        // And a name that folds onto it is refused by name on every volume.
+        match dir.create_dir("Photos") {
+            Err(WriteError::Collides { existing }) => assert_eq!(existing, "photos"),
+            other => panic!("expected a named collision, got {other:?}"),
+        }
+
+        write_file(&root.join("photos").join("a.txt"), "a");
+        assert!(dir.remove_dir("photos").is_err(), "a directory with a file in it stays");
+        photos.remove_file("a.txt").expect("removed");
+        dir.remove_dir("photos").expect("removed");
+        assert!(!root.join("photos").exists());
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_tree_is_removed_whole_and_a_file_is_removed_alone() {
+        let root = scratch("rmtree");
+        std::fs::create_dir_all(root.join("a").join("b").join("c")).expect("directories");
+        write_file(&root.join("a").join("one.txt"), "1");
+        write_file(&root.join("a").join("b").join("two.txt"), "2");
+        write_file(&root.join("a").join("b").join("c").join("three.txt"), "3");
+        write_file(&root.join("loose.txt"), "loose");
+        let dir = open(&root);
+
+        dir.remove_tree("a").expect("removed");
+        assert!(!root.join("a").exists());
+        assert!(root.join("loose.txt").exists(), "only what was named goes");
+
+        dir.remove_tree("loose.txt").expect("removed");
+        assert_eq!(dir.names().expect("readable").len(), 0);
+
+        // A directory is never removed by the file call, whatever the caller
+        // believed it was holding.
+        std::fs::create_dir(root.join("kept")).expect("a directory");
+        assert!(dir.remove_file("kept").is_err());
+        assert!(root.join("kept").exists());
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A tree deeper than the recursion limit is still removable, because
+    /// deletion is the way out of every other refusal in this crate.
+    ///
+    /// Several levels deeper than one pass can reach, so the resume path is what
+    /// is being exercised and not an off-by-one at the boundary. Nothing else
+    /// here loses its ceiling: `measure` still stops, and a `COPY` still
+    /// refuses.
+    #[test]
+    fn a_tree_deeper_than_the_recursion_limit_is_still_removed_whole() {
+        let root = scratch("rmtree-deep");
+        let levels = MAX_TREE_DEPTH * 2 + 5;
+        let mut deep = root.join("d");
+        for _ in 0..levels {
+            deep = deep.join("d");
+        }
+        std::fs::create_dir_all(&deep).expect("a deep tree");
+        write_file(&deep.join("bottom.txt"), "at the bottom");
+        // A second branch below the first pass's reach, so the retry has to find
+        // a sibling as well as a descendant.
+        std::fs::create_dir_all(deep.join("sibling")).expect("a second branch");
+        let dir = open(&root);
+
+        dir.remove_tree("d").expect("removed however deep it was");
+        assert!(!root.join("d").exists());
+        assert_eq!(dir.names().expect("readable").len(), 0);
+
+        // Measurement stops at the recursion limit instead of failing, because a
+        // quota that refused to be measured would refuse every upload.
+        let mut shallow = root.join("d");
+        for _ in 0..(MAX_TREE_DEPTH + 2) {
+            shallow = shallow.join("d");
+        }
+        std::fs::create_dir_all(&shallow).expect("a deep tree");
+        assert_eq!(dir.measure().expect("measured"), 0);
+        dir.remove_tree("d").expect("removed");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A link found inside a tree is unlinked as itself, never followed.
+    #[cfg(unix)]
+    #[test]
+    fn removing_a_tree_unlinks_a_planted_link_rather_than_its_target() {
+        let root = scratch("rmtree-link");
+        let outside = scratch("rmtree-link-target");
+        write_file(&outside.join("secret"), "secret");
+        std::fs::create_dir(root.join("tree")).expect("a directory");
+        std::os::unix::fs::symlink(&outside, root.join("tree").join("escape")).expect("linked");
+        std::os::unix::fs::symlink(outside.join("secret"), root.join("tree").join("file"))
+            .expect("linked");
+
+        open(&root).remove_tree("tree").expect("removed");
+        assert!(!root.join("tree").exists());
+        assert_eq!(read_file(&outside.join("secret")), "secret", "the target is untouched");
+
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&outside);
+    }
+
+    #[test]
+    fn a_rename_moves_between_two_open_directories_and_never_clobbers() {
+        let root = scratch("rename");
+        std::fs::create_dir(root.join("from")).expect("a directory");
+        std::fs::create_dir(root.join("to")).expect("a directory");
+        write_file(&root.join("from").join("notes.txt"), "moved");
+        write_file(&root.join("to").join("taken.txt"), "original");
+        let dir = open(&root);
+        let from = dir.open_dir("from").expect("walked");
+        let to = dir.open_dir("to").expect("walked");
+
+        from.rename_into("notes.txt", &to, "notes.txt").expect("moved");
+        assert_eq!(read_file(&root.join("to").join("notes.txt")), "moved");
+        assert!(!root.join("from").join("notes.txt").exists());
+
+        // An occupied destination is refused rather than replaced, which is what
+        // lets `Overwrite: F` be a 412 instead of a lost file.
+        write_file(&root.join("from").join("second.txt"), "second");
+        assert!(matches!(
+            from.rename_into("second.txt", &to, "taken.txt"),
+            Err(WriteError::NameTaken)
+        ));
+        assert_eq!(read_file(&root.join("to").join("taken.txt")), "original");
+
+        // And one that only folds onto an occupied name is refused by name.
+        match from.rename_into("second.txt", &to, "Taken.txt") {
+            Err(WriteError::Collides { existing }) => assert_eq!(existing, "taken.txt"),
+            other => panic!("expected a named collision, got {other:?}"),
+        }
+
+        // A rename within one directory is a plain rename.
+        from.rename_into("second.txt", &from, "renamed.txt").expect("renamed");
+        assert_eq!(read_file(&root.join("from").join("renamed.txt")), "second");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A person fixing a file's capitalisation is the one rename whose
+    /// destination folds onto its own source, and it must not cost them the
+    /// file.
+    ///
+    /// Written to hold on both kinds of volume, like the NFD test above: on
+    /// APFS or NTFS the destination name is *taken by the file being renamed*,
+    /// and on ext4 it is free but folds onto it. Both used to be refusals, and
+    /// on a folding volume a caller that had said `Overwrite: T` reached a
+    /// destination-first delete and lost the file outright.
+    #[test]
+    fn a_case_only_rename_is_a_rename_and_not_a_way_to_lose_the_file() {
+        let root = scratch("rename-case");
+        write_file(&root.join("report.pdf"), "the only copy");
+        let dir = open(&root);
+
+        dir.rename_into("report.pdf", &dir, "Report.pdf").expect("the case is fixed");
+
+        let names: Vec<String> = dir
+            .names()
+            .expect("readable")
+            .into_iter()
+            .map(|name| name.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, ["Report.pdf"], "one file, under the spelling that was asked for");
+        assert_eq!(read_file(&root.join("Report.pdf")), "the only copy");
+
+        // Nothing is staged: a failed second step puts the file back under the
+        // name it started with, and a successful one leaves no litter.
+        assert!(!names.iter().any(|name| name.starts_with(TEMP_PREFIX)));
+
+        // A rename onto the name it already has changes nothing and is refused,
+        // so the two-step path is reachable only when something moves.
+        assert!(matches!(dir.rename_into("Report.pdf", &dir, "Report.pdf"), Err(WriteError::NameTaken)));
+        assert_eq!(read_file(&root.join("Report.pdf")), "the only copy");
+
+        // And the exemption is exactly one name wide: a *third* spelling in the
+        // directory is still the collision no Mac can hold. The pair can only be
+        // built on a case-sensitive volume — on a folding one the second write
+        // lands in the first file — so the case is asserted where it exists
+        // rather than assumed to.
+        write_file(&root.join("other.txt"), "other");
+        write_file(&root.join("OTHER.TXT"), "another");
+        if dir.names().expect("readable").len() == 3 {
+            match dir.rename_into("other.txt", &dir, "Other.txt") {
+                Err(WriteError::Collides { existing }) => assert_eq!(existing, "OTHER.TXT"),
+                other => panic!("expected the third spelling to collide, got {other:?}"),
+            }
+            assert_eq!(read_file(&root.join("OTHER.TXT")), "another");
+        }
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The fold scan runs on the path every ordinary upload takes.
+    ///
+    /// `PUT` is [`Existing::Replace`], and the scan used to be skipped for it —
+    /// so an upload of `report.pdf` beside `Report.pdf` overwrote a *different*
+    /// file on a folding volume and created an uncopyable pair on a
+    /// case-sensitive one. Replacing is permission to replace the file at this
+    /// name, not the file at a name that folds onto it.
+    #[test]
+    fn replacing_a_name_never_replaces_a_different_spelling_of_it() {
+        let root = scratch("replace-fold");
+        write_file(&root.join("Report.pdf"), "original");
+        let dir = open(&root);
+
+        match Upload::begin(&dir, "report.pdf", Existing::Replace) {
+            Err(WriteError::Collides { existing }) => assert_eq!(existing, "Report.pdf"),
+            other => panic!("expected a named collision, got {other:?}"),
+        }
+        assert_eq!(read_file(&root.join("Report.pdf")), "original");
+        assert_eq!(dir.names().expect("readable").len(), 1, "nothing was created");
+
+        // The name it actually names is still replaceable, which is the whole
+        // point of the intent: this refuses nothing an overwrite may do.
+        let mut replacing =
+            Upload::begin(&dir, "Report.pdf", Existing::Replace).expect("the same name replaces");
+        replacing.file().write_all(b"replacement").expect("written");
+        replacing.commit().expect("committed");
+        assert_eq!(read_file(&root.join("Report.pdf")), "replacement");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The two numbers the write path is gated on, measured against a real
+    /// volume rather than mocked: a wrong `statfs` head would read as an absurd
+    /// free-space figure here rather than as a floor that silently never fires.
+    #[test]
+    fn the_volume_reports_a_plausible_free_space_and_the_tree_reports_its_size() {
+        let root = scratch("measure");
+        std::fs::create_dir(root.join("nested")).expect("a directory");
+        write_file(&root.join("a.txt"), "0123456789");
+        write_file(&root.join("nested").join("b.txt"), "01234");
+        let dir = open(&root);
+
+        assert_eq!(dir.measure().expect("measured"), 15);
+
+        let free = dir.free_space().expect("a volume that answers");
+        assert!(free > 1024 * 1024, "a writable scratch volume has at least a megabyte free");
+        assert!(
+            free < 1 << 60,
+            "an exabyte of free space means the statfs fields are being read at the wrong offsets"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

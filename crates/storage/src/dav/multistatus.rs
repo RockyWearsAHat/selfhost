@@ -248,9 +248,13 @@ impl PropertyName {
 /// owed. Clients degrade by showing no creation date, which is visible and
 /// harmless.
 ///
-/// `supportedlock` and `lockdiscovery` are absent for a different reason: this
-/// build implements no locking, and advertising either would be a claim
-/// [`crate::dav::method`] deliberately does not make.
+/// `supportedlock` and `lockdiscovery` carry pre-rendered XML rather than a
+/// structured value, and that is the one place in this module where a variant
+/// holds markup. It is deliberate and it is narrow: both strings come from
+/// [`crate::dav::lock`], which builds them from compile-time element names and
+/// runs every piece of caller text — an owner, a token — through [`escape`]
+/// first. There is still no variant that takes markup from anywhere else, and
+/// there must not be.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Property {
     /// Whether this is a collection. Empty for a file — the empty element is the
@@ -272,6 +276,16 @@ pub enum Property {
     QuotaAvailableBytes(u64),
     /// RFC 4331: bytes this share holds.
     QuotaUsedBytes(u64),
+    /// What kinds of lock this server grants, from
+    /// [`crate::dav::lock::supportedlock`].
+    ///
+    /// Not optional on a class-2 server: a client reads it to learn that only
+    /// exclusive write locks exist here, and so never asks for a shared one and
+    /// never has to handle the refusal.
+    SupportedLock(&'static str),
+    /// The locks currently held on this resource, from
+    /// [`crate::dav::lock::lockdiscovery`].
+    LockDiscovery(String),
 }
 
 impl Property {
@@ -286,6 +300,8 @@ impl Property {
             Self::ETag(_) => "getetag",
             Self::QuotaAvailableBytes(_) => "quota-available-bytes",
             Self::QuotaUsedBytes(_) => "quota-used-bytes",
+            Self::SupportedLock(_) => "supportedlock",
+            Self::LockDiscovery(_) => "lockdiscovery",
         }
     }
 
@@ -309,6 +325,13 @@ impl Property {
                 write_element(out, name, text);
             }
             Self::LastModified(time) => write_element(out, name, &date::format(*time)),
+            // The one pair whose value is already an element tree. Both are
+            // built by `crate::dav::lock` out of compile-time names with every
+            // piece of caller text escaped on the way in, which is why they are
+            // written rather than escaped again — escaping here would render
+            // the elements as text and a client would read no locks at all.
+            Self::SupportedLock(markup) => out.push_str(markup),
+            Self::LockDiscovery(markup) => out.push_str(markup),
         }
     }
 }

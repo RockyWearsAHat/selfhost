@@ -30,10 +30,17 @@
 //!   are logged into and controlling one across the world are **one** code path,
 //!   one router, one authorisation check and one set of tests.
 //!
-//! And the I/O halves, which are placeholders until phase 9 of the build plan and
-//! say so in their own documentation: [`dial`] (the worker dialling out),
-//! [`accept`] (the owner admitting it) and [`splice`] (joining two channels so a
-//! browser reaches a machine it has no link to).
+//! And the I/O halves, which are the only files here that touch a socket:
+//!
+//! - [`link`] — a live link: one WebSocket, many channels, and the
+//!   demultiplexer between them. It interprets nothing beyond the eight-byte
+//!   header, deliberately.
+//! - [`dial`] — the worker dialling out, proving its enrolment, and keeping the
+//!   link up without anybody being asked.
+//! - [`accept`] — the owner admitting it, or refusing it in a way that tells the
+//!   caller nothing at all.
+//! - [`splice`] — joining two channels so a browser reaches a machine it has no
+//!   link to, with credit forwarded end to end.
 //!
 //! # The two facts worth knowing before reading any of it
 //!
@@ -73,14 +80,19 @@ pub mod channel;
 pub mod credit;
 pub mod dial;
 pub mod enroll;
+pub mod link;
 pub mod local;
 pub mod mux;
 pub mod registry;
 pub mod splice;
 
+pub use accept::{Admitted, MemoryTokens, Refused, TokenStore};
 pub use channel::{ChannelId, ChannelState, ChannelTable, Role};
 pub use credit::{CreditStats, LatestOnly, Merge, ReceiveWindow, Reservation, SendWindow};
+pub use dial::{Attempts, Connector, DialConfig, DialError, Session, Target};
 pub use enroll::{Admission, Binding, NodeToken, NonceLedger, Proof};
+pub use link::{ChannelInbox, Hello, Link, LinkControl, LinkError, LinkHandle, OwnedFrame};
 pub use local::{LOCAL_NAME, Route, RouteError, Router};
 pub use mux::{Frame, FrameError, Header, Kind};
-pub use registry::{DropReason, Liveness, NodeName, PeerRecord, Registry};
+pub use registry::{DropReason, Liveness, NodeName, PeerRecord, Registry, SharedRegistry};
+pub use splice::{SpliceEnd, SpliceOutcome, SpliceSide};

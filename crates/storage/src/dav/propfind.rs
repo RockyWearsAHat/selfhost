@@ -44,6 +44,7 @@ use super::multistatus::{
     error_body, or_internal_error, Answered, Href, Mount, MultiStatus, Property, PropertyName,
     ResourceResponse, COLLECTION_TYPE,
 };
+use crate::dav::lock;
 use crate::listing::{Entry, Kind};
 use crate::path::RelativePath;
 use crate::quota::{self, Limits, Usage};
@@ -204,12 +205,29 @@ pub struct Resource {
     pub size: u64,
     /// Last modification, when the filesystem reported one.
     pub modified: Option<SystemTime>,
+    /// The locks held on it, for the `lockdiscovery` property.
+    ///
+    /// Carried on the resource rather than looked up while the answer is being
+    /// built, so this module stays pure: `PROPFIND` is a value in and a `207`
+    /// out, and the registry it would otherwise have to consult is
+    /// [`crate::dav::lock::Locks`], which has a clock and a mutex.
+    pub locks: Vec<crate::dav::lock::Lock>,
 }
 
 impl Resource {
     /// The resource at a path.
     pub fn new(path: RelativePath, kind: Kind, size: u64, modified: Option<SystemTime>) -> Self {
-        Self { path, kind, size, modified }
+        Self { path, kind, size, modified, locks: Vec::new() }
+    }
+
+    /// The same resource, reporting the locks held on it.
+    ///
+    /// Separate from [`Resource::new`] because the overwhelming majority of
+    /// resources in a listing hold no lock, and a constructor that demanded the
+    /// answer would make every caller consult the registry once per entry.
+    pub fn with_locks(mut self, locks: Vec<crate::dav::lock::Lock>) -> Self {
+        self.locks = locks;
+        self
     }
 
     /// One child of a directory being listed, or `None` if it has no URL.
@@ -350,6 +368,13 @@ fn live_properties(mount: &Mount, resource: &Resource, quota: Option<Quota>) -> 
     }
     if let Some(modified) = resource.modified {
         properties.push(Property::LastModified(modified));
+    }
+    // Advertised on every resource, because a class-2 server that did not would
+    // leave a client guessing which lock scopes exist — and this one grants
+    // exactly one.
+    properties.push(Property::SupportedLock(lock::supportedlock()));
+    if !resource.locks.is_empty() {
+        properties.push(Property::LockDiscovery(lock::lockdiscovery(mount, &resource.locks)));
     }
     properties
 }
@@ -893,6 +918,10 @@ mod tests {
                 "<D:getcontenttype>httpd/unix-directory</D:getcontenttype>\n",
                 "<D:quota-available-bytes>1000</D:quota-available-bytes>\n",
                 "<D:quota-used-bytes>2000</D:quota-used-bytes>\n",
+                "<D:supportedlock>\n",
+                "<D:lockentry><D:lockscope><D:exclusive/></D:lockscope>",
+                "<D:locktype><D:write/></D:locktype></D:lockentry>\n",
+                "</D:supportedlock>\n",
                 "</D:prop>\n<D:status>HTTP/1.1 200 OK</D:status>\n</D:propstat>\n",
                 "</D:response>\n",
                 "<D:response>\n",
@@ -903,6 +932,10 @@ mod tests {
                 "<D:getcontenttype>httpd/unix-directory</D:getcontenttype>\n",
                 "<D:quota-available-bytes>1000</D:quota-available-bytes>\n",
                 "<D:quota-used-bytes>2000</D:quota-used-bytes>\n",
+                "<D:supportedlock>\n",
+                "<D:lockentry><D:lockscope><D:exclusive/></D:lockscope>",
+                "<D:locktype><D:write/></D:locktype></D:lockentry>\n",
+                "</D:supportedlock>\n",
                 "</D:prop>\n<D:status>HTTP/1.1 200 OK</D:status>\n</D:propstat>\n",
                 "</D:response>\n",
                 "<D:response>\n",
@@ -914,6 +947,10 @@ mod tests {
                 "<D:getcontenttype>application/octet-stream</D:getcontenttype>\n",
                 "<D:getetag>W/&quot;2a-69800e80&quot;</D:getetag>\n",
                 "<D:getlastmodified>Mon, 02 Feb 2026 02:40:00 GMT</D:getlastmodified>\n",
+                "<D:supportedlock>\n",
+                "<D:lockentry><D:lockscope><D:exclusive/></D:lockscope>",
+                "<D:locktype><D:write/></D:locktype></D:lockentry>\n",
+                "</D:supportedlock>\n",
                 "</D:prop>\n<D:status>HTTP/1.1 200 OK</D:status>\n</D:propstat>\n",
                 "</D:response>\n",
                 "</D:multistatus>\n",

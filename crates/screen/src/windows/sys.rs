@@ -582,3 +582,755 @@ pub(crate) unsafe fn from_wide(text: *const u16, limit: usize) -> String {
     }
     String::from_utf16_lossy(&units)
 }
+
+// ══ Capture ═══════════════════════════════════════════════════════════════════
+//
+// Everything below serves the screen rather than the spawn: the device contexts
+// and DIB section GDI capture blits into, the display enumeration that says what
+// there is to capture, the cursor and icon calls, and the two process-wide facts
+// (DPI awareness, integrity level) the agent states about itself on the way past.
+//
+// The same rules apply as above — no logic, `Bool` is zero for failure, and
+// `GetLastError` is read immediately. Two rules are specific to this half and are
+// worth stating where the declarations are, because both are silent when broken:
+//
+// 1. **Every GDI object the caller is handed, the caller destroys.** `GetIconInfo`
+//    returns two bitmaps that belong to the caller; the per-process GDI handle
+//    quota is 10,000 and a cursor poll at 20 Hz exhausts it in about a minute.
+//    The owning types at the bottom of this file exist so that the release cannot
+//    be attached to one branch of a function that has five.
+// 2. **A DIB section is selected into a device context.** Deleting a bitmap that
+//    is still selected fails silently and leaks it, so the ordering
+//    (deselect → delete the bitmap → delete the context) lives in exactly one
+//    destructor rather than being reconstructed at each call site.
+
+// ── Blit, bitmap and device-context constants ─────────────────────────────────
+
+/// `SRCCOPY`: copy the source rectangle as-is.
+pub(crate) const SRCCOPY: u32 = 0x00CC_0020;
+/// `CAPTUREBLT`: include layered (transparent, per-pixel-alpha) windows in the
+/// copy. Without it a desktop with any modern translucent window on it captures
+/// holes where those windows are, which reads as a corrupt frame rather than as a
+/// missing flag.
+pub(crate) const CAPTUREBLT: u32 = 0x4000_0000;
+/// `BI_RGB`: uncompressed. The only compression this code will accept, because
+/// every other value means the bits are not the pixels.
+pub(crate) const BI_RGB: u32 = 0;
+/// `DIB_RGB_COLORS`: the (absent) colour table holds literal RGB values. At 32
+/// bits per pixel there is no palette, so this is a formality the call still
+/// requires.
+pub(crate) const DIB_RGB_COLORS: u32 = 0;
+
+// ── System metrics ────────────────────────────────────────────────────────────
+
+/// `SM_XVIRTUALSCREEN`: the left edge of the virtual desktop, which is negative
+/// when a display sits left of the primary.
+pub(crate) const SM_XVIRTUALSCREEN: i32 = 76;
+/// `SM_YVIRTUALSCREEN`.
+pub(crate) const SM_YVIRTUALSCREEN: i32 = 77;
+/// `SM_CXVIRTUALSCREEN`.
+pub(crate) const SM_CXVIRTUALSCREEN: i32 = 78;
+/// `SM_CYVIRTUALSCREEN`.
+pub(crate) const SM_CYVIRTUALSCREEN: i32 = 79;
+/// `SM_CMONITORS`: how many displays make up the virtual desktop.
+pub(crate) const SM_CMONITORS: i32 = 80;
+/// `MONITORINFOF_PRIMARY`.
+pub(crate) const MONITORINFOF_PRIMARY: u32 = 1;
+
+// ── Cursor ────────────────────────────────────────────────────────────────────
+
+/// `CURSOR_SHOWING`: the pointer is being drawn.
+pub(crate) const CURSOR_SHOWING: u32 = 0x0000_0001;
+/// `CURSOR_SUPPRESSED`: the pointer exists but is hidden because the user is
+/// working by touch. Reported as *not visible* rather than as an error — a client
+/// that draws a pointer here shows one the person at the machine cannot see.
+pub(crate) const CURSOR_SUPPRESSED: u32 = 0x0000_0002;
+
+// ── DPI ───────────────────────────────────────────────────────────────────────
+
+/// `DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2`, which is the *value* `-4` rather
+/// than a pointer to anything. Passed as an `isize` because that is what the
+/// opaque handle type is on a 64-bit build.
+pub(crate) const DPI_PER_MONITOR_AWARE_V2: isize = -4;
+/// `MDT_EFFECTIVE_DPI`, the only monitor DPI type this code asks for: it is the
+/// one that includes the user's scaling choice, which is what a console needs to
+/// label a display.
+pub(crate) const MDT_EFFECTIVE_DPI: i32 = 0;
+/// The DPI Windows calls 100%. Every scale factor here is a ratio to this.
+pub(crate) const USER_DEFAULT_SCREEN_DPI: u32 = 96;
+
+// ── Integrity ─────────────────────────────────────────────────────────────────
+
+/// `TokenIntegrityLevel`, the information class holding the mandatory label.
+///
+/// The level itself is the last sub-authority of the label's SID, and the names
+/// for its values (`SECURITY_MANDATORY_MEDIUM_RID` and the rest) live in
+/// [`crate::agent::Integrity`] rather than here: they are the vocabulary the
+/// report line speaks, they are needed on platforms this file does not compile
+/// on, and one spelling of a constant is better than two.
+pub(crate) const TOKEN_INTEGRITY_LEVEL_CLASS: i32 = 25;
+
+// ── Opening the pipe from the agent's side ────────────────────────────────────
+
+/// `GENERIC_READ`.
+pub(crate) const GENERIC_READ: u32 = 0x8000_0000;
+/// `GENERIC_WRITE`.
+pub(crate) const GENERIC_WRITE: u32 = 0x4000_0000;
+/// `OPEN_EXISTING`: the agent opens a pipe the daemon has already created, and
+/// must never create one itself — an agent that could create the name could be
+/// beaten to it, which is the squatting case the daemon's
+/// `FILE_FLAG_FIRST_PIPE_INSTANCE` exists to make loud.
+pub(crate) const OPEN_EXISTING: u32 = 3;
+/// `ERROR_FILE_NOT_FOUND`: the daemon has not created the pipe yet. A state
+/// while the agent is racing its own supervisor, not a failure.
+pub(crate) const ERROR_FILE_NOT_FOUND: i32 = 2;
+/// `ERROR_BROKEN_PIPE`: the daemon closed its end. The agent's cue to exit
+/// quietly rather than to report a fault nobody will read.
+pub(crate) const ERROR_BROKEN_PIPE: i32 = 109;
+
+// ── Structures ────────────────────────────────────────────────────────────────
+
+/// `RECT`. Right and bottom are exclusive.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct Rect {
+    /// Left edge, negative on a display left of the primary.
+    pub(crate) left: i32,
+    /// Top edge, negative on a display above the primary.
+    pub(crate) top: i32,
+    /// Right edge, exclusive.
+    pub(crate) right: i32,
+    /// Bottom edge, exclusive.
+    pub(crate) bottom: i32,
+}
+
+/// `POINT`.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct Point {
+    /// Horizontal position.
+    pub(crate) x: i32,
+    /// Vertical position.
+    pub(crate) y: i32,
+}
+
+/// `MONITORINFOEXW`. `cb_size` must equal this structure's size, and the device
+/// name array is what distinguishes it from a plain `MONITORINFO`.
+#[repr(C)]
+pub(crate) struct MonitorInfoExW {
+    /// Size of this structure, in bytes.
+    pub(crate) cb_size: u32,
+    /// The display's rectangle in virtual-desktop coordinates.
+    pub(crate) monitor: Rect,
+    /// The part of it not covered by the taskbar. Unused here, but part of the
+    /// layout and therefore declared.
+    pub(crate) work: Rect,
+    /// [`MONITORINFOF_PRIMARY`], or zero.
+    pub(crate) flags: u32,
+    /// `\\.\DISPLAY1` and friends, NUL-terminated.
+    pub(crate) device: [u16; 32],
+}
+
+/// `BITMAPINFOHEADER`.
+///
+/// A **negative** `height` is the whole reason this structure is spelled out
+/// rather than defaulted: it asks for a top-down DIB, which is the row order
+/// every other layer in this project uses. A bottom-up DIB is not an error and
+/// not visibly broken at a glance — it is the picture upside down, discovered by
+/// a person looking at their own desktop.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct BitmapInfoHeader {
+    /// Size of this structure, in bytes.
+    pub(crate) size: u32,
+    /// Width in pixels.
+    pub(crate) width: i32,
+    /// Height in pixels; negative for top-down.
+    pub(crate) height: i32,
+    /// Colour planes; must be 1.
+    pub(crate) planes: u16,
+    /// Bits per pixel; 32 here, which makes the rows implicitly DWORD-aligned
+    /// and the stride exactly `width * 4`.
+    pub(crate) bit_count: u16,
+    /// [`BI_RGB`].
+    pub(crate) compression: u32,
+    /// Image size in bytes; may be zero for `BI_RGB`.
+    pub(crate) size_image: u32,
+    /// Horizontal resolution, unused.
+    pub(crate) x_pels_per_meter: i32,
+    /// Vertical resolution, unused.
+    pub(crate) y_pels_per_meter: i32,
+    /// Palette entries used; zero at 32 bits per pixel.
+    pub(crate) clr_used: u32,
+    /// Palette entries required; zero at 32 bits per pixel.
+    pub(crate) clr_important: u32,
+}
+
+/// `BITMAPINFO` as the 32-bit `BI_RGB` case needs it.
+///
+/// The trailing colour array is never read at this bit depth, but the structure
+/// the call is documented to take has it, and handing a call a buffer shorter
+/// than the structure it will read is the kind of mistake that works until a
+/// driver reads one field further.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct BitmapInfo {
+    /// The header.
+    pub(crate) header: BitmapInfoHeader,
+    /// The colour table, unused at 32 bits per pixel.
+    pub(crate) colours: [u32; 3],
+}
+
+/// `CURSORINFO`. `cb_size` must be 24 or the call fails.
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct CursorInfo {
+    /// Size of this structure, in bytes.
+    pub(crate) cb_size: u32,
+    /// [`CURSOR_SHOWING`] and/or [`CURSOR_SUPPRESSED`], or zero.
+    pub(crate) flags: u32,
+    /// The current shape, or null when the pointer is hidden.
+    pub(crate) cursor: Handle,
+    /// The hotspot's position in virtual-desktop pixels.
+    pub(crate) screen_pos: Point,
+}
+
+/// `ICONINFO`.
+///
+/// **Both bitmaps belong to the caller.** `GetIconInfo` creates them per call —
+/// including for a cursor whose shape has not changed — and a caller that does
+/// not destroy them exhausts the 10,000-handle GDI quota in minutes at 20 polls a
+/// second. That is what `cursor::IconBitmaps` exists for.
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct IconInfo {
+    /// Non-zero for an icon, zero for a cursor.
+    pub(crate) is_icon: Bool,
+    /// The hotspot's x offset within the bitmap.
+    pub(crate) hotspot_x: u32,
+    /// The hotspot's y offset within the bitmap.
+    pub(crate) hotspot_y: u32,
+    /// The AND mask. Always present; twice the height of the cursor when there
+    /// is no colour bitmap, because it then holds the AND and XOR masks stacked.
+    pub(crate) mask: Handle,
+    /// The colour bitmap, or null for a monochrome cursor.
+    pub(crate) colour: Handle,
+}
+
+/// `BITMAP`, as `GetObjectW` fills it in for an `HBITMAP`.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct Bitmap {
+    /// Always zero.
+    pub(crate) bm_type: i32,
+    /// Width in pixels.
+    pub(crate) width: i32,
+    /// Height in pixels.
+    pub(crate) height: i32,
+    /// Bytes per row, as the bitmap itself is stored.
+    pub(crate) width_bytes: i32,
+    /// Colour planes.
+    pub(crate) planes: u16,
+    /// Bits per pixel.
+    pub(crate) bits_pixel: u16,
+    /// The bits, for a DIB section; null otherwise.
+    pub(crate) bits: *mut c_void,
+}
+
+/// `TOKEN_MANDATORY_LABEL`: the integrity level, as a SID whose last
+/// sub-authority is the level.
+#[repr(C)]
+pub(crate) struct TokenMandatoryLabel {
+    /// The label SID, pointing into the same buffer the structure was read into.
+    pub(crate) label: SidAndAttributes,
+}
+
+// The same argument as the block above: a layout mistake is a call that fails
+// for a reason no error code names, and `CURSORINFO` in particular is rejected
+// outright on a `cbSize` mismatch.
+#[cfg(target_pointer_width = "64")]
+const _: () = assert!(size_of::<Rect>() == 16);
+#[cfg(target_pointer_width = "64")]
+const _: () = assert!(size_of::<Point>() == 8);
+#[cfg(target_pointer_width = "64")]
+const _: () = assert!(size_of::<MonitorInfoExW>() == 104);
+#[cfg(target_pointer_width = "64")]
+const _: () = assert!(size_of::<BitmapInfoHeader>() == 40);
+#[cfg(target_pointer_width = "64")]
+const _: () = assert!(size_of::<BitmapInfo>() == 52);
+#[cfg(target_pointer_width = "64")]
+const _: () = assert!(size_of::<CursorInfo>() == 24);
+#[cfg(target_pointer_width = "64")]
+const _: () = assert!(size_of::<IconInfo>() == 32);
+#[cfg(target_pointer_width = "64")]
+const _: () = assert!(size_of::<Bitmap>() == 32);
+#[cfg(target_pointer_width = "64")]
+const _: () = assert!(size_of::<TokenMandatoryLabel>() == 16);
+
+/// The callback `EnumDisplayMonitors` invokes once per display.
+///
+/// It runs on our own thread, inside the call, so it may touch caller state
+/// through the `lparam` — but it must not unwind, which under `panic = "abort"`
+/// is guaranteed by the build rather than by care.
+pub(crate) type MonitorEnumProc =
+    unsafe extern "system" fn(monitor: Handle, dc: Handle, rect: *mut Rect, data: isize) -> Bool;
+
+/// `SetProcessDpiAwarenessContext`, resolved at run time.
+///
+/// Not imported statically: it arrived in Windows 10 1703, and a statically
+/// imported symbol that is missing stops the process from *starting* — the agent
+/// would fail with a loader error naming a DPI function, on a machine where the
+/// operator is trying to find out why their screen is blank.
+pub(crate) type SetProcessDpiAwarenessContextFn =
+    unsafe extern "system" fn(context: isize) -> Bool;
+
+/// `GetDpiForMonitor` from `shcore.dll`, resolved at run time for the same
+/// reason and because linking `shcore` would need an import library this
+/// workspace does not carry.
+pub(crate) type GetDpiForMonitorFn = unsafe extern "system" fn(
+    monitor: Handle,
+    dpi_type: i32,
+    dpi_x: *mut u32,
+    dpi_y: *mut u32,
+) -> i32;
+
+// ── gdi32 ─────────────────────────────────────────────────────────────────────
+
+#[link(name = "gdi32")]
+unsafe extern "system" {
+    /// Creates a memory device context compatible with `dc`, or with the screen
+    /// when `dc` is null.
+    pub(crate) fn CreateCompatibleDC(dc: Handle) -> Handle;
+
+    /// Destroys a memory device context. Never called on a screen DC, which is
+    /// released rather than deleted — the two are different calls on the same
+    /// C type, which is exactly why they get different owning types here.
+    pub(crate) fn DeleteDC(dc: Handle) -> Bool;
+
+    /// Creates a DIB section: a bitmap whose bits the caller can read directly.
+    ///
+    /// The pointer written to `bits` stays valid until the bitmap is deleted,
+    /// which is what makes frame-to-frame reuse possible — the capture loop
+    /// blits into the same memory rather than allocating a megabyte per frame.
+    pub(crate) fn CreateDIBSection(
+        dc: Handle,
+        info: *const BitmapInfo,
+        usage: u32,
+        bits: *mut *mut c_void,
+        section: Handle,
+        offset: u32,
+    ) -> Handle;
+
+    /// Selects an object into a device context, answering the one it replaced.
+    /// The replaced object must be selected back before the new one is deleted.
+    pub(crate) fn SelectObject(dc: Handle, object: Handle) -> Handle;
+
+    /// Destroys a GDI object. **The** call this whole subsystem's handle
+    /// discipline is about.
+    pub(crate) fn DeleteObject(object: Handle) -> Bool;
+
+    /// Copies pixels between device contexts.
+    pub(crate) fn BitBlt(
+        destination: Handle,
+        x: i32,
+        y: i32,
+        width: i32,
+        height: i32,
+        source: Handle,
+        source_x: i32,
+        source_y: i32,
+        rop: u32,
+    ) -> Bool;
+
+    /// Reads a bitmap's bits into a caller-supplied buffer, converting to the
+    /// format the header describes. Answers the number of scan lines copied, so
+    /// zero is the failure.
+    pub(crate) fn GetDIBits(
+        dc: Handle,
+        bitmap: Handle,
+        start: u32,
+        lines: u32,
+        bits: *mut c_void,
+        info: *mut BitmapInfo,
+        usage: u32,
+    ) -> i32;
+
+    /// Reads a GDI object's descriptor — here, a `BITMAP` for an `HBITMAP`.
+    /// Answers the bytes written, so zero is the failure.
+    pub(crate) fn GetObjectW(object: Handle, size: i32, buffer: *mut c_void) -> i32;
+}
+
+// ── user32, capture half ──────────────────────────────────────────────────────
+
+#[link(name = "user32")]
+unsafe extern "system" {
+    /// A device context for a window, or **for the whole virtual desktop** when
+    /// the window is null. Released with [`ReleaseDC`], never `DeleteDC`.
+    pub(crate) fn GetDC(window: Handle) -> Handle;
+
+    /// Releases a device context obtained from [`GetDC`].
+    pub(crate) fn ReleaseDC(window: Handle, dc: Handle) -> i32;
+
+    /// Enumerates the displays intersecting a rectangle, or all of them when
+    /// both the device context and the rectangle are null.
+    pub(crate) fn EnumDisplayMonitors(
+        dc: Handle,
+        clip: *const Rect,
+        callback: MonitorEnumProc,
+        data: isize,
+    ) -> Bool;
+
+    /// Reads a display's rectangle, work area, flags and device name.
+    pub(crate) fn GetMonitorInfoW(monitor: Handle, info: *mut MonitorInfoExW) -> Bool;
+
+    /// One system metric. Never fails in a way this code can distinguish from a
+    /// legitimate zero, so every caller treats an implausible answer as a state
+    /// rather than reading an error.
+    pub(crate) fn GetSystemMetrics(index: i32) -> i32;
+
+    /// The pointer's position and current shape. Fails with
+    /// `ERROR_ACCESS_DENIED` while the secure desktop is in front, which is the
+    /// signal rather than a failure.
+    pub(crate) fn GetCursorInfo(info: *mut CursorInfo) -> Bool;
+
+    /// The hotspot and bitmaps of a cursor. **Both bitmaps become the caller's
+    /// to destroy, on every call, including for a shape seen a thousand times.**
+    pub(crate) fn GetIconInfo(cursor: Handle, info: *mut IconInfo) -> Bool;
+
+    /// The pre-Windows-8.1 DPI declaration: system-wide awareness only, and
+    /// irreversible for the life of the process. The fallback when the
+    /// per-monitor context call is not present.
+    pub(crate) fn SetProcessDPIAware() -> Bool;
+
+    /// The window station this process is attached to. Not closed: it is a
+    /// borrowed handle to an object the process already belongs to.
+    pub(crate) fn GetProcessWindowStation() -> Handle;
+}
+
+// ── kernel32, capture half ────────────────────────────────────────────────────
+
+#[link(name = "kernel32")]
+unsafe extern "system" {
+    /// A pseudo-handle for the calling process. Does not need closing.
+    pub(crate) fn GetCurrentProcess() -> Handle;
+
+    /// This process's id, for the session lookup below.
+    pub(crate) fn GetCurrentProcessId() -> u32;
+
+    /// Which session a process belongs to. The agent's own answer is what it
+    /// compares against the console session, so that a fast user switch is
+    /// recognised from inside the agent rather than only from the daemon.
+    pub(crate) fn ProcessIdToSessionId(process_id: u32, session: *mut u32) -> Bool;
+
+    /// A handle to an already-loaded module, without taking a reference.
+    pub(crate) fn GetModuleHandleW(name: *const u16) -> Handle;
+
+    /// Loads a module, taking a reference that is deliberately never released:
+    /// the two libraries resolved this way live for the life of the process and
+    /// freeing one while a resolved pointer is still held is a call into
+    /// unmapped memory.
+    pub(crate) fn LoadLibraryW(name: *const u16) -> Handle;
+
+    /// Resolves an exported symbol. The name is ANSI even in the wide API.
+    pub(crate) fn GetProcAddress(module: Handle, name: *const u8) -> *const c_void;
+
+    /// Opens a file or named pipe. The agent's side of the pipe.
+    pub(crate) fn CreateFileW(
+        name: *const u16,
+        desired_access: u32,
+        share_mode: u32,
+        security_attributes: *const SecurityAttributes,
+        creation_disposition: u32,
+        flags: u32,
+        template: Handle,
+    ) -> Handle;
+
+    /// Waits for an instance of a named pipe to become available.
+    pub(crate) fn WaitNamedPipeW(name: *const u16, timeout: u32) -> Bool;
+
+    /// Suspends the calling thread. Used only by the agent's own pacing, which
+    /// is a dedicated thread with nothing else to do.
+    pub(crate) fn Sleep(milliseconds: u32);
+}
+
+// ── advapi32, integrity half ──────────────────────────────────────────────────
+
+#[link(name = "advapi32")]
+unsafe extern "system" {
+    /// Opens a process's access token.
+    pub(crate) fn OpenProcessToken(
+        process: Handle,
+        desired_access: u32,
+        token: *mut Handle,
+    ) -> Bool;
+
+    /// A pointer to a SID's sub-authority count. Never null for a valid SID.
+    pub(crate) fn GetSidSubAuthorityCount(sid: *mut c_void) -> *mut u8;
+
+    /// A pointer to one sub-authority. The **last** one of an integrity label is
+    /// the level, and reading past the count is a read of whatever follows the
+    /// SID, so every caller reads the count first.
+    pub(crate) fn GetSidSubAuthority(sid: *mut c_void, index: u32) -> *mut u32;
+}
+
+/// A screen device context, released on drop.
+///
+/// Deliberately a different type from [`MemoryDc`]: both are `HDC`, and the two
+/// are released by two different calls. Releasing a memory DC with `ReleaseDC`
+/// leaks it silently; deleting a screen DC with `DeleteDC` is worse. One type
+/// each makes the wrong call unspellable.
+#[derive(Debug)]
+pub(crate) struct ScreenDc(Handle);
+
+impl ScreenDc {
+    /// The device context for the whole virtual desktop.
+    ///
+    /// Acquired per frame rather than held for the session: a display topology
+    /// change invalidates what a held one describes, and `GetDC` is cheap next to
+    /// the blit it precedes.
+    pub(crate) fn desktop() -> Option<Self> {
+        let dc = unsafe { GetDC(std::ptr::null_mut()) };
+        if dc.is_null() { None } else { Some(Self(dc)) }
+    }
+
+    /// The raw handle.
+    pub(crate) fn raw(&self) -> Handle {
+        self.0
+    }
+}
+
+impl Drop for ScreenDc {
+    fn drop(&mut self) {
+        unsafe { ReleaseDC(std::ptr::null_mut(), self.0) };
+    }
+}
+
+/// A memory device context, deleted on drop.
+#[derive(Debug)]
+pub(crate) struct MemoryDc(Handle);
+
+impl MemoryDc {
+    /// A memory device context compatible with the screen.
+    pub(crate) fn compatible_with(dc: &ScreenDc) -> Option<Self> {
+        let memory = unsafe { CreateCompatibleDC(dc.raw()) };
+        if memory.is_null() { None } else { Some(Self(memory)) }
+    }
+
+    /// The raw handle.
+    pub(crate) fn raw(&self) -> Handle {
+        self.0
+    }
+}
+
+impl Drop for MemoryDc {
+    fn drop(&mut self) {
+        unsafe { DeleteDC(self.0) };
+    }
+}
+
+/// A GDI object — a bitmap, a brush, a pen — destroyed on drop.
+///
+/// This is the type the ten-minute flat-handle-count acceptance test rests on.
+/// The two bitmaps `GetIconInfo` hands back are wrapped in one of these each, at
+/// the moment they arrive, so that every `?` and every early return between there
+/// and the end of the function still destroys them.
+#[derive(Debug)]
+pub(crate) struct GdiObject(Handle);
+
+impl GdiObject {
+    /// Takes ownership of a GDI handle, refusing null.
+    ///
+    /// Null is the ordinary answer for a monochrome cursor's absent colour
+    /// bitmap, so `None` here is frequently not an error at all — which is why
+    /// this returns an `Option` rather than a `Result` with an opinion in it.
+    pub(crate) fn new(handle: Handle) -> Option<Self> {
+        if handle.is_null() { None } else { Some(Self(handle)) }
+    }
+
+    /// The raw handle.
+    pub(crate) fn raw(&self) -> Handle {
+        self.0
+    }
+}
+
+impl Drop for GdiObject {
+    fn drop(&mut self) {
+        unsafe { DeleteObject(self.0) };
+    }
+}
+
+// ══ Input injection ═══════════════════════════════════════════════════════════
+//
+// One rule dominates this half and it is the reason the layout assertions below
+// exist at all: **`SendInput` validates `cbSize` and fails the whole batch when it
+// disagrees** — returning zero, with `ERROR_INVALID_PARAMETER`, having injected
+// nothing. A structure that is one field or one padding byte wrong therefore
+// produces a keyboard that does nothing, on a remote machine, with a plausible
+// error number that names no field. The `const _: () = assert!(…)` lines turn that
+// into a compile error here.
+//
+// The second rule is that a full return count is **not** success. See
+// `windows/inject.rs`: User Interface Privilege Isolation discards injection into
+// any window above the caller's integrity level and reports nothing at all.
+
+/// `INPUT_MOUSE`.
+pub(crate) const INPUT_MOUSE: u32 = 0;
+/// `INPUT_KEYBOARD`.
+pub(crate) const INPUT_KEYBOARD: u32 = 1;
+
+/// `PROCESS_QUERY_LIMITED_INFORMATION`.
+///
+/// The right chosen deliberately over `PROCESS_QUERY_INFORMATION`: it is the one
+/// Windows grants a medium-integrity process against a *higher*-integrity process
+/// of the same user, which is precisely the case this code needs to be able to
+/// examine. Asking for more would be denied on exactly the windows worth asking
+/// about.
+pub(crate) const PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x0000_1000;
+
+/// `MOUSEINPUT`.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct MouseInput {
+    /// Absolute x as a 16-bit fraction of the virtual desktop, under
+    /// `MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK`.
+    pub(crate) dx: i32,
+    /// Absolute y, under the same flags.
+    pub(crate) dy: i32,
+    /// The wheel delta, or the thumb-button selector.
+    pub(crate) mouse_data: i32,
+    /// Which of the above are meaningful, and what the event is.
+    pub(crate) flags: u32,
+    /// Zero for "now". A timestamp here that is not from the same clock the
+    /// system is using makes events arrive out of order.
+    pub(crate) time: u32,
+    /// An application-defined value, retrievable with `GetMessageExtraInfo`. Zero:
+    /// marking our events would let any application single them out, and the
+    /// events are not a secret but the marking would be a fingerprint.
+    pub(crate) extra_info: usize,
+}
+
+/// `KEYBDINPUT`.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct KeyboardInput {
+    /// The virtual-key code, or **zero** on the unicode path — a non-zero value
+    /// there is taken as a key and the code unit is ignored.
+    pub(crate) virtual_key: u16,
+    /// The set-1 scancode, or the UTF-16 code unit under `KEYEVENTF_UNICODE`.
+    pub(crate) scancode: u16,
+    /// `KEYEVENTF_*`.
+    pub(crate) flags: u32,
+    /// Zero for "now".
+    pub(crate) time: u32,
+    /// As [`MouseInput::extra_info`].
+    pub(crate) extra_info: usize,
+}
+
+/// The union inside `INPUT`.
+///
+/// `HARDWAREINPUT` is declared as well even though nothing here sends one: it is
+/// part of the union's size on paper, and a union that is missing its largest
+/// member is a union of the wrong size — which is the `cbSize` failure above.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub(crate) union InputUnion {
+    /// A mouse event.
+    pub(crate) mouse: MouseInput,
+    /// A keyboard event.
+    pub(crate) keyboard: KeyboardInput,
+    /// `HARDWAREINPUT`: a message and its two halves of `wParam`.
+    pub(crate) hardware: [u32; 2],
+}
+
+/// `INPUT`.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub(crate) struct Input {
+    /// [`INPUT_MOUSE`] or [`INPUT_KEYBOARD`].
+    pub(crate) kind: u32,
+    /// The event itself.
+    pub(crate) event: InputUnion,
+}
+
+// The assertion the whole injection path depends on: `SendInput` compares the size
+// it is given against this and silently injects nothing on a mismatch.
+#[cfg(target_pointer_width = "64")]
+const _: () = assert!(size_of::<Input>() == 40);
+#[cfg(target_pointer_width = "64")]
+const _: () = assert!(size_of::<MouseInput>() == 32);
+#[cfg(target_pointer_width = "64")]
+const _: () = assert!(size_of::<KeyboardInput>() == 24);
+#[cfg(target_pointer_width = "64")]
+const _: () = assert!(size_of::<InputUnion>() == 32);
+
+// ── user32, injection half ────────────────────────────────────────────────────
+
+#[link(name = "user32")]
+unsafe extern "system" {
+    /// Synthesises input. Answers the number of events **inserted into the input
+    /// stream**, which is not the number delivered: UIPI discards injection into a
+    /// higher-integrity window afterwards and says nothing.
+    ///
+    /// `size` must be `size_of::<Input>()` exactly.
+    pub(crate) fn SendInput(count: u32, inputs: *const Input, size: i32) -> u32;
+
+    /// The window with the keyboard focus, or null when no window in this session
+    /// has it — which happens during a desktop switch and is a state rather than a
+    /// failure.
+    pub(crate) fn GetForegroundWindow() -> Handle;
+
+    /// The thread and, through the out-parameter, the process that owns a window.
+    /// Answers zero for an invalid window.
+    pub(crate) fn GetWindowThreadProcessId(window: Handle, process_id: *mut u32) -> u32;
+}
+
+// ── kernel32, injection half ──────────────────────────────────────────────────
+
+#[link(name = "kernel32")]
+unsafe extern "system" {
+    /// Opens a process for querying. Answers null on failure, and
+    /// [`ERROR_ACCESS_DENIED`] is itself informative here — see
+    /// `windows::inject`.
+    pub(crate) fn OpenProcess(
+        desired_access: u32,
+        inherit_handle: Bool,
+        process_id: u32,
+    ) -> Handle;
+}
+
+/// Resolves an optional export, or `None` if this Windows does not have it.
+///
+/// # Safety
+///
+/// `T` must be the exact signature the export has. Getting it wrong is a call
+/// through a pointer with the wrong argument list, which is undefined behaviour
+/// that usually survives long enough to be diagnosed somewhere else entirely —
+/// so every caller of this passes one of the function types declared above and
+/// nothing constructed at the call site.
+pub(crate) unsafe fn optional_export<T: Copy>(library: &str, symbol: &[u8]) -> Option<T> {
+    const _: () = assert!(size_of::<*const c_void>() == size_of::<usize>());
+    if size_of::<T>() != size_of::<*const c_void>() {
+        return None;
+    }
+    // `GetProcAddress` takes a C string; a symbol without its NUL would be read
+    // past its own end.
+    if symbol.last().is_none_or(|last| *last != 0) {
+        return None;
+    }
+    let name = wide_str(library).ok()?;
+    // Already-loaded first: `user32` is always in the process and taking a
+    // reference to it would be a reference nothing releases.
+    let mut module = unsafe { GetModuleHandleW(name.as_ptr()) };
+    if module.is_null() {
+        module = unsafe { LoadLibraryW(name.as_ptr()) };
+    }
+    if module.is_null() {
+        return None;
+    }
+    let address = unsafe { GetProcAddress(module, symbol.as_ptr()) };
+    if address.is_null() {
+        return None;
+    }
+    // Sound by the size check above plus the caller's obligation about `T`.
+    Some(unsafe { std::mem::transmute_copy::<*const c_void, T>(&address) })
+}

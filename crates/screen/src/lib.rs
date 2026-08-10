@@ -41,16 +41,42 @@
 //! # What is here, and what is deliberately not here yet
 //!
 //! Built: the traits, the error vocabulary, the pure coordinate mapping
-//! ([`coords`]), the pure input-lowering plan ([`input`]), the agent supervisor
-//! ([`supervisor`]), and the Windows session-0 agent spawn ([`windows`]).
+//! ([`coords`]), the pure input-lowering plan ([`input`]), the two platform key
+//! tables ([`keymap`]) and the pure synthetic-event plan built on them
+//! ([`synth`]), the agent supervisor ([`supervisor`]), the Windows session-0
+//! agent spawn ([`windows`]), **Windows GDI screen and cursor capture**,
+//! **macOS `CGDisplayStream` capture**, **input injection on both platforms**,
+//! and the agent's own streaming loop ([`agent`]).
 //!
-//! Not built, on purpose: **there is no capture code and no injection code in
-//! this crate yet.** The session-0 problem — a daemon running as a Windows
-//! service in session 0 cannot capture the interactive desktop by any method — is
-//! the single fact that sinks this project if it is discovered late, so the agent
-//! spawn is proven first, with nothing dangerous attached to it. A screen that
-//! cannot be reached is a bug; a keyboard that can be reached before the plumbing
-//! is trustworthy is an incident.
+//! Not built, on purpose:
+//!
+//! - **There is no DXGI Desktop Duplication backend**, and there may never be.
+//!   GDI ships first because it is two hundred lines with no COM in them and it
+//!   works in desktop modes DXGI refuses outright; Desktop Duplication is nine
+//!   hundred lines of hand-bound vtables in which a wrong slot index is silent
+//!   memory corruption rather than a compile error. [`Capture`] is written so it
+//!   can drop in beside the GDI one, and the plan is explicit that it is optional
+//!   forever.
+//! - **There is no ScreenCaptureKit backend.** `CGDisplayStream` is deprecated in
+//!   the SDK and works perfectly from Rust — the `obsoleted` attribute is a C
+//!   availability gate the Rust compiler does not honour — and it needs no
+//!   Objective-C messaging at all beyond one block. ScreenCaptureKit is the same
+//!   trait with a great deal more Objective-C runtime behind it, and it can be
+//!   added later without touching anything above [`Capture`].
+//!
+//! # What injection deliberately cannot do
+//!
+//! Two refusals are designed in rather than missing, and both are documented at
+//! the code that implements them so that nobody later "fixes" them:
+//!
+//! - **The secure desktop is never captured and never typed into**, on either
+//!   platform. A channel that can render *and drive* a consent dialog is by
+//!   construction a remote privilege-escalation channel.
+//! - **The Windows agent runs at medium integrity and cannot type into an
+//!   elevated window.** That is User Interface Privilege Isolation working
+//!   correctly. The console reports `input-refused (elevated window)` as a state;
+//!   the fix an operator is tempted to reach for — running the agent as `SYSTEM` —
+//!   would convert this feature into exactly the escalation channel above.
 //!
 //! # Modules
 //!
@@ -60,21 +86,35 @@
 //!   in exactly one file or it is diagnosed nowhere.
 //! - [`input`] — **pure.** Which mechanism a piece of input must use, and the
 //!   held-key bookkeeping that makes `RELEASE_ALL` possible.
+//! - [`keymap`] — **pure.** The HID vocabulary as Win32 virtual keys and
+//!   scancodes, and as macOS `CGKeyCode`s. Both tables compile and are proven
+//!   total on every platform, so neither can rot on the machine it is not for.
+//! - [`synth`] — **pure.** Which synthetic events a given input event becomes,
+//!   with the flags spelled out: the absolute virtual-desktop pointer, the drag
+//!   that is not a move, the modifier mask macOS will not derive by itself, and
+//!   the held set that makes an autonomous `RELEASE_ALL` possible.
+//! - [`agent`] — **pure, apart from the process body.** What the agent states
+//!   about itself, and the loop that turns frames into tiles: the credit stall,
+//!   the dropped frame, the merged damage and the states-as-prose all live here
+//!   and are driven in tests by a scripted capture with no screen behind it.
 //! - [`supervisor`] — the daemon side of the agent's life. The restart decision
 //!   is pure and exhaustively tested; the process handling is the thin part.
-//! - [`windows`] — the session-0 spawn. Its pure half compiles everywhere so it
-//!   is tested on a developer machine; its FFI half compiles only on Windows.
-//! - `macos` — display enumeration and the permission preflight, so the traits
-//!   have a second implementor and the seam is proven platform-neutral. Compiled
-//!   only there, which is why this entry is not a link: on the production box it
-//!   does not exist.
+//! - [`windows`] — the session-0 spawn, GDI capture, cursor capture, and the
+//!   agent's end of the pipe. Its pure half compiles everywhere so it is tested on
+//!   a developer machine; its FFI half compiles only on Windows.
+//! - `macos` — display enumeration, the permission gate, `CGDisplayStream`
+//!   capture, the pointer, and `CGEvent` injection. Compiled only there, which is
+//!   why this entry is not a link: on the production box it does not exist.
 //! - [`stub`] — every other platform, answering with a typed refusal rather than
 //!   failing to compile.
 
+pub mod agent;
 pub mod coords;
 pub mod fault;
 pub mod input;
+pub mod keymap;
 pub mod supervisor;
+pub mod synth;
 pub mod windows;
 
 #[cfg(target_os = "macos")]
@@ -82,6 +122,10 @@ pub mod macos;
 
 pub mod stub;
 
+pub use agent::{
+    AgentReport, AgentStats, CreditWindow, DamageHint, Delivery, DpiAwareness, FrameSink, Integrity,
+    SendError, StreamConfig, Streamer, Tick,
+};
 pub use coords::{Bounds, CoordError, Normalised, Point, PointOrigin, VirtualPoint};
 pub use fault::Fault;
 pub use input::{InjectedEvent, Mechanism};
@@ -127,6 +171,99 @@ impl Grant {
             }
         }
     }
+
+    /// The permission's own name, as the settings pane spells it.
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::ScreenRecording => "Screen Recording",
+            Self::Accessibility => "Accessibility",
+        }
+    }
+
+    /// The exact pane of System Settings the operator has to open.
+    ///
+    /// Spelled out rather than described because "the privacy settings" sends
+    /// somebody to a list of thirty panes, and the two grants this subsystem needs
+    /// are in two different ones that are revoked independently.
+    pub const fn panel(self) -> &'static str {
+        match self {
+            Self::ScreenRecording => "System Settings › Privacy & Security › Screen Recording",
+            Self::Accessibility => "System Settings › Privacy & Security › Accessibility",
+        }
+    }
+
+    /// The remediation sentence the console renders verbatim, naming the binary.
+    ///
+    /// This is a **product surface, not an error path**, and it is written that way
+    /// on purpose. macOS does not fail a capture it has not consented to: it
+    /// succeeds and hands the process a picture of the desktop wallpaper with every
+    /// window missing. A console that renders "permission denied" — or worse, that
+    /// picture — leaves an operator staring at a remote desktop that looks broken
+    /// in a way nothing on screen explains. So the sentence carries all three facts
+    /// somebody needs and none they do not:
+    ///
+    /// 1. **Which pane**, spelled exactly as macOS spells it.
+    /// 2. **Which binary**, because the grant is per code identity and this
+    ///    workspace has several executables in one directory. An operator who
+    ///    granted the wrong one sees no change at all.
+    /// 3. **That it takes a fresh launch.** macOS reads the decision when the
+    ///    process starts; granting it while the agent is running changes nothing
+    ///    until the agent is restarted, which is the single most common way this
+    ///    remediation is followed correctly and appears not to work.
+    ///
+    /// It also says that a rebuild revokes it, which on this deployment is not a
+    /// footnote: every `cargo build` produces a new ad-hoc code signature with a new
+    /// cdhash, macOS keys the grant to that identity, and **this tree rebuilds
+    /// itself on every push** through `[self_update]`. The honest expectation is
+    /// that the grant dies on each deploy and is re-given by hand. Nothing in this
+    /// crate can avoid that; pretending otherwise would make the console's own
+    /// advice wrong.
+    ///
+    /// The result is bounded to [`selfhost_desk::wire::MAX_DETAIL_BYTES`] by eliding
+    /// the *middle* of the path — the tail identifies the binary and the head is the
+    /// part an operator can guess — so the sentence that reaches the wire is always
+    /// a whole sentence rather than one cut off mid-word by the framing layer.
+    pub fn remediation(self, executable: &std::path::Path) -> String {
+        let head = format!("macOS has not granted this process {}. Add and enable ", self.name());
+        let tail = format!(
+            " in {}, then relaunch it: the grant is read at launch only, and each rebuild \
+             revokes it.",
+            self.panel()
+        );
+        let budget = selfhost_desk::wire::MAX_DETAIL_BYTES
+            .saturating_sub(head.len())
+            .saturating_sub(tail.len());
+        format!("{head}{}{tail}", elide_head(&executable.to_string_lossy(), budget))
+    }
+}
+
+/// Keeps the last `budget` bytes of a path, marking what was dropped.
+///
+/// The *tail* is kept because that is what identifies a binary —
+/// `…/target/release/selfhost` answers the operator's question where
+/// `/Users/alexwaldmann/Desktop/…` does not. Cuts on a character boundary, because
+/// a path is not necessarily ASCII and half a character on the wire is a decoding
+/// error at the far end rather than a shortened sentence.
+fn elide_head(text: &str, budget: usize) -> String {
+    if text.len() <= budget {
+        return text.to_owned();
+    }
+    const MARK: &str = "…";
+    let room = budget.saturating_sub(MARK.len());
+    let mut start = text.len().saturating_sub(room);
+    while start < text.len() && !text.is_char_boundary(start) {
+        start += 1;
+    }
+    format!("{MARK}{}", text.get(start..).unwrap_or_default())
+}
+
+/// The binary this process is running from, for a remediation sentence.
+///
+/// Answers a placeholder rather than failing when the platform will not say: the
+/// sentence is still worth rendering without the path, because the pane it names is
+/// where the operator will see the binary listed anyway.
+pub fn this_executable() -> std::path::PathBuf {
+    std::env::current_exe().unwrap_or_else(|_| std::path::PathBuf::from("the agent binary"))
 }
 
 /// What a screen source is doing, when it is not handing over a frame.
@@ -439,6 +576,28 @@ pub trait Capture {
 pub trait CursorSource {
     /// The pointer's current state.
     fn cursor(&mut self) -> Result<CursorState, CaptureError>;
+
+    /// Forgets which shape the caller was last given, so the next [`Self::cursor`]
+    /// carries the bitmap again.
+    ///
+    /// There are **two** caches of pointer shapes in a live session, and this
+    /// method is the only thing that keeps them in step. The implementation holds
+    /// one, so that a shape is decoded from the platform once rather than thirty
+    /// times a second; `selfhost_desk::cursor::ShapeCache` holds the other, which
+    /// models what the far end is holding and is bounded and least-recently-used
+    /// because an application that creates cursors would otherwise drive an
+    /// unbounded allocation in the client.
+    ///
+    /// A bounded cache evicts. When it evicts the shape that is currently on
+    /// screen, the client no longer has a bitmap for it and this source — believing
+    /// it already handed that shape over — would never send one again, leaving the
+    /// pointer drawn with whichever shape the client happened to keep. Calling this
+    /// resolves it in one frame.
+    ///
+    /// Defaulted to nothing, because a source that decodes the shape every time is
+    /// wasteful rather than wrong, and a platform backend should not have to
+    /// implement a cache it does not have.
+    fn forget_shape(&mut self) {}
 }
 
 /// A sink for synthesised keyboard and pointer events.
@@ -521,6 +680,55 @@ mod tests {
             InjectError::NoSession.refusal(),
             Some(selfhost_desk::wire::Refusal::NotLive)
         );
+    }
+
+    #[test]
+    fn a_remediation_names_the_pane_the_binary_and_the_relaunch() {
+        // The three facts an operator needs. Dropping any one of them produces a
+        // remediation that is followed correctly and appears not to work.
+        let sentence = Grant::ScreenRecording.remediation(std::path::Path::new("/opt/selfhost"));
+        assert!(sentence.contains("System Settings › Privacy & Security › Screen Recording"));
+        assert!(sentence.contains("/opt/selfhost"));
+        assert!(sentence.contains("relaunch"), "{sentence}");
+        assert!(sentence.contains("rebuild"), "the grant dies on every deploy: {sentence}");
+        assert!(sentence.ends_with('.'));
+    }
+
+    #[test]
+    fn the_two_grants_send_the_operator_to_two_different_panes() {
+        // They are granted and revoked independently, and a viewer that only
+        // watches never needs the second one at all.
+        assert_ne!(Grant::ScreenRecording.panel(), Grant::Accessibility.panel());
+        assert!(Grant::Accessibility
+            .remediation(std::path::Path::new("/opt/selfhost"))
+            .contains("Accessibility"));
+    }
+
+    #[test]
+    fn an_absurdly_long_path_still_leaves_a_whole_sentence_on_the_wire() {
+        // The framing layer truncates at `MAX_DETAIL_BYTES` without knowing where a
+        // sentence ends, so the sentence is built to fit rather than cut to fit.
+        let long = std::path::PathBuf::from(format!("/{}/selfhost", "directory/".repeat(40)));
+        let sentence = Grant::ScreenRecording.remediation(&long);
+        assert!(
+            sentence.len() <= selfhost_desk::wire::MAX_DETAIL_BYTES,
+            "{} bytes is over the wire's cap",
+            sentence.len()
+        );
+        assert!(sentence.ends_with('.'));
+        assert!(sentence.contains("selfhost"), "the tail identifies the binary: {sentence}");
+    }
+
+    #[test]
+    fn eliding_a_path_cuts_on_a_character_boundary() {
+        // A path is not necessarily ASCII, and half a character on the wire is a
+        // decode failure at the far end rather than a shortened sentence.
+        let text = "/Users/ünïcødé/target/release/selfhost";
+        for budget in 0..text.len() + 2 {
+            let cut = elide_head(text, budget);
+            assert!(cut.is_char_boundary(0));
+            assert!(std::str::from_utf8(cut.as_bytes()).is_ok());
+        }
     }
 
     #[test]
