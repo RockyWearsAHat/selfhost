@@ -28,12 +28,14 @@ pub mod dkim;
 pub mod imap;
 pub mod imap_net;
 pub mod message;
+pub mod mime;
 pub mod outbound;
 pub mod receive;
 pub mod smtp;
 pub mod store;
 pub mod submission;
 mod time;
+pub use time::stamp;
 
 pub use address::{Address, AddressError, Path};
 pub use client::{

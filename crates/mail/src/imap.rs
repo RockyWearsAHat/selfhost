@@ -30,6 +30,7 @@
 //! exposes no remove. Each such limit is noted where it bites.
 
 use crate::address::Address;
+use crate::mime;
 use crate::submission::decode_plain;
 use std::borrow::Cow;
 use std::fmt;
@@ -341,6 +342,13 @@ pub enum FetchItem {
         /// `<offset.length>` when a substring was requested.
         partial: Option<(u32, Option<u32>)>,
     },
+    /// `BODY` / `BODYSTRUCTURE` — the message's parsed MIME structure.
+    /// `extended` picks the response key: `BODYSTRUCTURE` when true, `BODY`
+    /// when false (both render the same non-extension form).
+    BodyStructure {
+        /// True for the `BODYSTRUCTURE` spelling of the request.
+        extended: bool,
+    },
     /// `RFC822` — equivalent to `BODY[]`, but with the `RFC822` response key.
     Rfc822,
     /// `RFC822.HEADER` — equivalent to `BODY.PEEK[HEADER]`.
@@ -362,6 +370,14 @@ pub enum Section {
     HeaderFields(Vec<String>),
     /// `[HEADER.FIELDS.NOT (...)]` — every header field except the named ones.
     HeaderFieldsNot(Vec<String>),
+    /// `[1.2]`, `[1.MIME]`, … — one MIME part, addressed by its 1-based path,
+    /// with an optional sub-target (`MIME`/`HEADER`/`TEXT`) after the numbers.
+    Part {
+        /// The numeric part path, one index per nesting level.
+        path: Vec<u32>,
+        /// Which bytes of the addressed part.
+        target: mime::Target,
+    },
 }
 
 impl Section {
@@ -373,6 +389,17 @@ impl Section {
             Self::Text => "TEXT".into(),
             Self::HeaderFields(fields) => format!("HEADER.FIELDS ({})", fields.join(" ")),
             Self::HeaderFieldsNot(fields) => format!("HEADER.FIELDS.NOT ({})", fields.join(" ")),
+            Self::Part { path, target } => {
+                let numbers =
+                    path.iter().map(u32::to_string).collect::<Vec<_>>().join(".");
+                let suffix = match target {
+                    mime::Target::Content => "",
+                    mime::Target::Mime => ".MIME",
+                    mime::Target::Header => ".HEADER",
+                    mime::Target::Text => ".TEXT",
+                };
+                format!("{numbers}{suffix}")
+            }
         }
     }
 }
@@ -1282,10 +1309,11 @@ fn parse_fetch_item(token: &str) -> Option<FetchItem> {
         }
         "RFC822.HEADER" => return Some(FetchItem::Rfc822Header),
         "RFC822.TEXT" => return Some(FetchItem::Rfc822Text),
-        // Bare BODY / BODYSTRUCTURE ask for the parsed MIME structure, which
-        // this server does not synthesise; skipping the item leaves the rest of
-        // the fetch intact rather than failing it.
-        "BODY" | "BODYSTRUCTURE" => return None,
+        // Bare BODY / BODYSTRUCTURE ask for the parsed MIME structure. Apple
+        // Mail sends BODYSTRUCTURE with every body poll, and one unparseable
+        // item fails the whole FETCH — so these must parse, not be skipped.
+        "BODY" => return Some(FetchItem::BodyStructure { extended: false }),
+        "BODYSTRUCTURE" => return Some(FetchItem::BodyStructure { extended: true }),
         _ => {}
     }
 
@@ -1322,9 +1350,38 @@ fn parse_section(inside: &str) -> Option<Section> {
     if upper.starts_with("HEADER.FIELDS") {
         return Some(Section::HeaderFields(parse_field_list(trimmed)));
     }
-    // Numeric MIME parts (e.g. `1.2`) are not addressable here; treated as the
-    // whole message so the client still receives content rather than an error.
-    Some(Section::Full)
+    // Anything unrecognised degrades to the whole message rather than failing
+    // the FETCH — a lenient reading keeps exotic clients working.
+    Some(parse_part_section(&upper).unwrap_or(Section::Full))
+}
+
+/// Parses a numeric part section: a dotted 1-based path (`1.2`) with an
+/// optional trailing `MIME`/`HEADER`/`TEXT` sub-target. `None` when the text
+/// is not a part section at all.
+fn parse_part_section(upper: &str) -> Option<Section> {
+    let mut path = Vec::new();
+    let mut target = mime::Target::Content;
+    let mut segments = upper.split('.').peekable();
+    while let Some(segment) = segments.next() {
+        if let Ok(number) = segment.parse::<u32>() {
+            if number == 0 {
+                return None;
+            }
+            path.push(number);
+            continue;
+        }
+        // The first non-numeric segment must be the final sub-target.
+        target = match segment {
+            "MIME" => mime::Target::Mime,
+            "HEADER" => mime::Target::Header,
+            "TEXT" => mime::Target::Text,
+            _ => return None,
+        };
+        if segments.peek().is_some() || path.is_empty() {
+            return None;
+        }
+    }
+    if path.is_empty() { None } else { Some(Section::Part { path, target }) }
 }
 
 /// Extracts the parenthesised field-name list of a `HEADER.FIELDS` section,
@@ -1382,6 +1439,12 @@ fn render_item(buf: &mut Vec<u8>, item: &FetchItem, data: &MessageData) {
         FetchItem::Envelope => {
             buf.extend_from_slice(b"ENVELOPE ");
             buf.extend_from_slice(envelope(&data.raw).as_bytes());
+        }
+        FetchItem::BodyStructure { extended } => {
+            let key = if *extended { "BODYSTRUCTURE" } else { "BODY" };
+            buf.extend_from_slice(key.as_bytes());
+            buf.push(b' ');
+            buf.extend_from_slice(body_structure(&mime::parse(&data.raw), &data.raw).as_bytes());
         }
         FetchItem::Rfc822 => append_literal(buf, "RFC822", &data.raw),
         FetchItem::Rfc822Header => {
@@ -1450,6 +1513,15 @@ fn section_bytes<'a>(section: &Section, raw: &'a [u8]) -> Cow<'a, [u8]> {
         Section::Text => Cow::Borrowed(body_bytes(raw)),
         Section::HeaderFields(fields) => Cow::Owned(selected_headers(raw, fields, true)),
         Section::HeaderFieldsNot(fields) => Cow::Owned(selected_headers(raw, fields, false)),
+        Section::Part { path, target } => {
+            let root = mime::parse(raw);
+            match mime::section(&root, path, *target) {
+                Some(range) => Cow::Borrowed(&raw[range]),
+                // A path naming no part yields empty content rather than an
+                // error; the client's own structure told it what exists.
+                None => Cow::Borrowed(&[][..]),
+            }
+        }
     }
 }
 
@@ -1534,6 +1606,58 @@ fn envelope(raw: &[u8]) -> String {
     format!(
         "({date} {subject} {from} {sender} {reply_to} {to} {cc} {bcc} {in_reply_to} {message_id})"
     )
+}
+
+/// Renders a part tree as the parenthesised `BODY`/`BODYSTRUCTURE` structure
+/// (RFC 3501's non-extension form, which is all a client needs to locate and
+/// decode parts). Multiparts render their children back to back followed by
+/// the subtype; `message/rfc822` embeds the inner message's envelope and
+/// structure, as the specification requires.
+fn body_structure(part: &mime::Part, raw: &[u8]) -> String {
+    if part.is_multipart() {
+        let children: String = part.children.iter().map(|c| body_structure(c, raw)).collect();
+        let children = if children.is_empty() {
+            // A boundary that matched nothing still needs one part slot.
+            "(\"text\" \"plain\" (\"charset\" \"us-ascii\") NIL NIL \"7bit\" 0 0)".into()
+        } else {
+            children
+        };
+        return format!("({children} {})", nstring(Some(&part.subtype)));
+    }
+
+    let params = if part.params.is_empty() {
+        "NIL".into()
+    } else {
+        let rendered: Vec<String> = part
+            .params
+            .iter()
+            .map(|(attr, val)| format!("{} {}", nstring(Some(attr)), nstring(Some(val))))
+            .collect();
+        format!("({})", rendered.join(" "))
+    };
+    let base = format!(
+        "{} {} {params} {} {} {} {}",
+        nstring(Some(&part.kind)),
+        nstring(Some(&part.subtype)),
+        nstring(part.content_id.as_deref()),
+        nstring(part.description.as_deref()),
+        nstring(Some(&part.encoding)),
+        part.body.len(),
+    );
+    if part.is_message() && !part.children.is_empty() {
+        let inner_raw = &raw[part.children[0].header.start..part.children[0].body.end];
+        let inner = &part.children[0];
+        return format!(
+            "({base} {} {} {})",
+            envelope(inner_raw),
+            body_structure(inner, raw),
+            part.line_count(raw)
+        );
+    }
+    if part.kind == "text" {
+        return format!("({base} {})", part.line_count(raw));
+    }
+    format!("({base})")
 }
 
 /// Renders an address header as an IMAP address list, or `NIL` when absent or
@@ -2051,6 +2175,92 @@ mod tests {
         let responses = s.fetch_complete(&plan, &[]);
         assert_eq!(responses.len(), 1);
         assert!(responses[0].text().starts_with("a OK"));
+    }
+
+    #[test]
+    fn apple_mail_body_poll_with_bodystructure_parses() {
+        // Regression: this exact shape used to answer BAD, which is why Apple
+        // Mail rendered every message with an empty body.
+        let mut s = selected_session();
+        let action = s.command(
+            "a3 UID FETCH 5 (INTERNALDATE UID RFC822.SIZE FLAGS BODY.PEEK[HEADER.FIELDS \
+             (date subject from to cc)] BODYSTRUCTURE)",
+        );
+        match action {
+            IAction::Fetch(plan) => {
+                assert!(plan.items.contains(&FetchItem::BodyStructure { extended: true }));
+            }
+            other => panic!("expected Fetch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn bodystructure_of_a_plain_message_describes_the_text_part() {
+        let s = selected_session();
+        let plan = FetchPlan {
+            tag: "a".into(),
+            uid_mode: false,
+            messages: vec![MessageRef { seq: 1, uid: 5 }],
+            items: vec![FetchItem::BodyStructure { extended: true }],
+        };
+        let responses = s.fetch_complete(&plan, &[message(5, vec![])]);
+        let data = responses[0].text().into_owned();
+        // Body is `Body line one\r\nBody line two\r\n`: 30 octets, 2 lines.
+        assert!(data.contains("BODYSTRUCTURE (\"text\" \"plain\" (\"charset\" \"us-ascii\") NIL NIL \"7bit\" 30 2)"), "got: {data}");
+    }
+
+    #[test]
+    fn numeric_section_fetch_returns_that_part_with_the_matching_key() {
+        let s = selected_session();
+        let raw = b"From: a@b.c\r\n\
+            Content-Type: multipart/alternative; boundary=\"XYZ\"\r\n\
+            \r\n\
+            --XYZ\r\n\
+            Content-Type: text/plain\r\n\
+            \r\n\
+            plain body\r\n\
+            --XYZ\r\n\
+            Content-Type: text/html\r\n\
+            \r\n\
+            <b>html</b>\r\n\
+            --XYZ--\r\n"
+            .to_vec();
+        let data =
+            MessageData { uid: 5, flags: vec![], internal_date: "07-Aug-2026 12:00:00 +0000".into(), raw };
+        let plan = FetchPlan {
+            tag: "a".into(),
+            uid_mode: false,
+            messages: vec![MessageRef { seq: 1, uid: 5 }],
+            items: vec![FetchItem::Body {
+                section: Section::Part { path: vec![2], target: mime::Target::Content },
+                peek: true,
+                partial: None,
+            }],
+        };
+        let responses = s.fetch_complete(&plan, &[data]);
+        let text = responses[0].text().into_owned();
+        assert!(text.contains("BODY[2] {11}"), "got: {text}");
+        assert!(text.contains("<b>html</b>"), "got: {text}");
+    }
+
+    #[test]
+    fn part_sections_parse_from_the_wire() {
+        assert_eq!(
+            parse_fetch_item("BODY.PEEK[1.2]"),
+            Some(FetchItem::Body {
+                section: Section::Part { path: vec![1, 2], target: mime::Target::Content },
+                peek: true,
+                partial: None,
+            })
+        );
+        assert_eq!(
+            parse_fetch_item("BODY[1.MIME]"),
+            Some(FetchItem::Body {
+                section: Section::Part { path: vec![1], target: mime::Target::Mime },
+                peek: false,
+                partial: None,
+            })
+        );
     }
 
     #[test]
