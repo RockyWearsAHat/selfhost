@@ -175,10 +175,13 @@ async fn build_and_swap(
     let exe = std::env::current_exe()
         .map_err(|error| format!("cannot locate this process's own binary: {error}"))?;
     let aside = aside_path(&exe);
-    let _ = std::fs::remove_file(&aside);
-    std::fs::rename(&exe, &aside).map_err(|error| {
-        format!("cannot move {} aside for the new build: {error}", exe.display())
-    })?;
+    if let Err(error) = std::fs::rename(&exe, &aside) {
+        // The tree is already on the new commit; leaving it there would make
+        // the next poll read "up to date" while the old binary keeps running.
+        let reason =
+            format!("cannot move {} aside for the new build: {error}", exe.display());
+        return Err(roll_back(project_dir, previous, &exe, &aside, reason).await);
+    }
 
     let command = update.build_command();
     let failure = match run::build_step(&command, project_dir, BUILD_TIMEOUT).await {
@@ -187,7 +190,7 @@ async fn build_and_swap(
         Err(error) => Some(error.to_string()),
     };
     if let Some(reason) = failure {
-        return Err(roll_back(project_dir, previous, &exe, &aside, reason).await);
+        return Err(roll_back(project_dir, previous, &exe, &aside, format!("build failed: {reason}")).await);
     }
 
     // The usual deployment runs from `target/release`, where the build already
@@ -213,7 +216,7 @@ async fn roll_back(
     aside: &Path,
     reason: String,
 ) -> String {
-    let mut report = format!("build failed: {reason}; still running {}", plan::short(previous));
+    let mut report = format!("{reason}; still running {}", plan::short(previous));
     if !exe.exists()
         && let Err(error) = std::fs::rename(aside, exe)
     {
@@ -291,30 +294,40 @@ fn fingerprint(path: &Path) -> Option<(std::time::SystemTime, u64)> {
 }
 
 /// Where the leftover previous binary goes while its process still runs.
+///
+/// Suffixed with this process's id rather than a bare `.old`: the *previous*
+/// update's aside file can still be locked by a sibling process running the
+/// older image, and Windows will not rename onto a locked file — so every
+/// update takes a fresh name, and [`sweep_aside`] deletes whichever have been
+/// released.
 fn aside_path(exe: &Path) -> PathBuf {
     let mut name = exe.as_os_str().to_owned();
-    name.push(".old");
+    name.push(format!(".old.{}", std::process::id()));
     PathBuf::from(name)
 }
 
-/// Deletes the previous build's renamed-aside binary, if one is lying around.
+/// Deletes every renamed-aside previous binary that has been released.
 ///
-/// Runs at watcher startup — which is after a restart, when the old process is
-/// gone and Windows has released the lock that made the rename necessary. A
-/// failure means an unexpected process still holds it; that is worth a warning,
-/// not a refusal to watch.
+/// Runs at watcher startup — after a restart, when this process's predecessor
+/// is gone and its lock with it. A sibling still running an older image keeps
+/// its aside file locked; that failure is expected and quiet-by-name: the next
+/// restart's sweep gets it.
 fn sweep_aside() {
     let Ok(exe) = std::env::current_exe() else { return };
-    let aside = aside_path(&exe);
-    if aside.exists()
-        && let Err(error) = std::fs::remove_file(&aside)
-    {
-        eprintln!(
-            "self-update: could not delete the previous binary {} ({error}) — harmless while \
-             another selfhost process still runs the previous build; the next restart's sweep \
-             gets it",
-            aside.display()
-        );
+    let (Some(dir), Some(file)) = (exe.parent(), exe.file_name()) else { return };
+    let prefix = format!("{}.old", file.to_string_lossy());
+    let Ok(entries) = std::fs::read_dir(dir) else { return };
+    for entry in entries.flatten() {
+        if entry.file_name().to_string_lossy().starts_with(&prefix)
+            && let Err(error) = std::fs::remove_file(entry.path())
+        {
+            eprintln!(
+                "self-update: could not delete the previous binary {} ({error}) — harmless \
+                 while another selfhost process still runs the previous build; the next \
+                 restart's sweep gets it",
+                entry.path().display()
+            );
+        }
     }
 }
 
@@ -341,12 +354,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn the_aside_path_keeps_the_full_name_so_windows_still_sees_an_exe_family() {
-        assert_eq!(aside_path(Path::new("/srv/target/release/selfhost")), PathBuf::from("/srv/target/release/selfhost.old"));
-        assert_eq!(
-            aside_path(Path::new(r"C:\Self-Host\target\release\selfhost.exe")),
-            PathBuf::from(r"C:\Self-Host\target\release\selfhost.exe.old")
-        );
+    fn the_aside_path_keeps_the_full_name_and_is_unique_to_this_process() {
+        // The full name survives (`selfhost.exe.old.…`, not `selfhost.old.…`)
+        // and the process id makes it a name no still-locked leftover holds.
+        let aside = aside_path(Path::new("/srv/target/release/selfhost.exe"));
+        let name = aside.file_name().expect("a file name").to_string_lossy().into_owned();
+        assert!(name.starts_with("selfhost.exe.old."), "{name}");
+        assert!(name.ends_with(&std::process::id().to_string()), "{name}");
     }
 
     #[test]
