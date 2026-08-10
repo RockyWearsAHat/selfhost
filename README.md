@@ -61,11 +61,21 @@ whose job is to stay up unattended.
 
 ## Status
 
-**984 tests pass.** The proxy runs and serves, the daemon supervises services,
-the desktop console drives it — over an SSH tunnel it manages itself — and a push
-to a watched branch redeploys the service built from it. ACME, the authoritative
-DNS server, and the mail connection layer do not exist yet — see
-[`docs/roadmap.md`](docs/roadmap.md) for the honest breakdown.
+**1,600+ tests pass.** The proxy runs and serves, the daemon supervises
+services, the desktop console drives it — over an SSH tunnel it manages itself —
+and a push to a watched branch redeploys the service built from it. ACME
+issuance, the authoritative DNS server (split-horizon, dynamic apex A), the mail
+server (SMTP, submission, IMAP), the firewall manager, and the web console all
+run today — [`docs/roadmap.md`](docs/roadmap.md) has the honest breakdown of
+what remains.
+
+Selfhost also updates *itself*: an opt-in `[self_update]` section names the
+repository this deployment is a clone of, the daemon polls the branch, and a
+push fetches, rebuilds, and restarts every selfhost process — no SSH required.
+It only ever fast-forwards (local commits and modified tracked files refuse the
+deployment rather than being discarded), a failed build rolls back and leaves
+the old build running, and the restart is just an exit: launchd, systemd, or the
+Windows Scheduled Task brings the new binary up.
 
 Verified against a running instance, not only in unit tests: HTTPS with
 keep-alive, HTTP→HTTPS redirect preserving path and query, `206` + `Content-Range`

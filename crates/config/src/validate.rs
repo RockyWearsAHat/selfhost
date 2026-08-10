@@ -86,6 +86,7 @@ impl Config {
         self.check_mail(&mut problems);
         self.check_namecheap_ddns(&mut problems);
         self.check_registrar(&mut problems);
+        self.check_self_update(&mut problems);
 
         if problems.is_empty() { Ok(()) } else { Err(ConfigError::Invalid(problems)) }
     }
@@ -157,6 +158,15 @@ impl Config {
     fn check_registrar(&self, problems: &mut Vec<Problem>) {
         if let Some(registrar) = &self.registrar {
             registrar.check("registrar", problems);
+        }
+    }
+
+    /// The self-update section, when present, must name a runnable repository
+    /// and branch. Delegated to [`crate::git::SelfUpdate::check`], exactly as
+    /// the other opt-in sections validate through their own schema modules.
+    fn check_self_update(&self, problems: &mut Vec<Problem>) {
+        if let Some(update) = &self.self_update {
+            update.check("self_update", problems);
         }
     }
 
@@ -448,6 +458,7 @@ mod tests {
             mail: None,
             namecheap_ddns: vec![],
             registrar: None,
+            self_update: None,
         }
     }
 

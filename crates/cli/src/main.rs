@@ -14,6 +14,7 @@ mod lan_dns;
 mod mail_task;
 mod oui;
 mod proxyware;
+mod self_update;
 mod service_install;
 mod site;
 mod teardown;
@@ -209,6 +210,13 @@ name = "hello"
 domains = ["localhost"]
 static_root = "./sites/hello"
 spa = false
+
+# Uncomment to let a push to your repository update selfhost itself: the daemon
+# polls the branch, rebuilds, and restarts. Needs this directory to be a clone
+# of that repository.
+# [self_update]
+# repository = "https://github.com/you/selfhost.git"
+# branch = "main"
 "#
     );
 
@@ -450,6 +458,15 @@ async fn serve_daemon(
         watched => println!("\nwatching {watched} git branches for deployments"),
     }
 
+    // Stated for the same reason: a deployment that believes it self-updates
+    // but does not is indistinguishable from one nobody has pushed to.
+    if let Some(update) = config.self_update.as_ref().filter(|u| u.enabled) {
+        println!(
+            "\nself-update: watching {} ({}) every {}s",
+            update.repository, update.branch, update.interval_secs
+        );
+    }
+
     // The firewall the daemon drives for the public listeners. Built from config,
     // reconciled once here so the ports are open (or closed) before the API is
     // reachable, then kept honest by the drift watch in the select! below.
@@ -534,6 +551,7 @@ async fn serve_daemon(
     // effect at the next daemon restart.
     let api = Api::new(supervisor.clone(), store, token, watches.clone(), firewall.clone())
         .with_console_auth(&data_dir);
+    let mut updated_to: Option<String> = None;
     let outcome = tokio::select! {
         result = selfhost_admin::serve(listener, api) => {
             result.map_err(|e| format!("the control api stopped: {e}"))
@@ -552,6 +570,13 @@ async fn serve_daemon(
         // The same tracking, aimed at Namecheap's Dynamic DNS instead of this
         // daemon's own authority. Pends forever when `namecheap_ddns` is empty.
         _ = track_namecheap_ddns_if_configured(&config) => Ok(()),
+        // Watches this daemon's own repository; resolving means a new build is
+        // fetched, compiled, and installed, and this process's job is to get
+        // out of its way. Pends forever when `[self_update]` is absent or off.
+        commit = self_update::watch_own_repository(config.self_update.clone(), project_dir.clone()) => {
+            updated_to = Some(commit);
+            Ok(())
+        }
         _ = shutdown_signal() => Ok(()),
     };
 
@@ -574,6 +599,18 @@ async fn serve_daemon(
     // orphan or kill them.
     println!("\nstopping services");
     supervisor.shutdown().await;
+
+    // A self-update ends the process on purpose, after the graceful teardown
+    // above. Nonzero so every service manager restarts it — launchd restarts
+    // any exit, but systemd (on-failure) and the Scheduled Task
+    // (RestartOnFailure) only restart what looks like a failure.
+    if let Some(commit) = updated_to {
+        println!(
+            "\nself-update: now at {}; exiting so the service manager restarts the new build",
+            selfhost_git::plan::short(&commit)
+        );
+        std::process::exit(self_update::RESTART_EXIT);
+    }
     outcome
 }
 
@@ -1391,6 +1428,17 @@ async fn serve(config: Config, project_dir: PathBuf, config_path: PathBuf) -> Re
         }
         result = serve_https(https, Arc::clone(&server), tls_config) => {
             result.map_err(|e| format!("https listener stopped: {e}"))
+        }
+        // The daemon fetches and builds self-updates; this process only follows
+        // the binary on disk, exiting once a new build replaces it so the
+        // service manager restarts onto the new code. Pends forever when
+        // `[self_update]` is absent or off.
+        _ = self_update::watch_binary_replaced(
+            config.self_update.as_ref().is_some_and(|u| u.enabled),
+        ) => {
+            println!("\nself-update: a new selfhost binary is installed; exiting so the \
+                      service manager restarts it");
+            std::process::exit(self_update::RESTART_EXIT);
         }
         _ = tokio::signal::ctrl_c() => {
             println!("\nstopping");
