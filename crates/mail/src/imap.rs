@@ -23,11 +23,15 @@
 //!
 //! # What is intentionally left out
 //!
-//! No `APPEND`, no `IDLE`, no server-side search, no quota, and no command
-//! literals (`{n}` continuations) — clients send `LOGIN` credentials and mailbox
-//! names as quoted strings, which is enough to read mail. `EXPUNGE` is accepted
-//! but performs no deletion, because the store interface this layer targets
-//! exposes no remove. Each such limit is noted where it bites.
+//! No `APPEND`, no `IDLE`, no server-side search, and no quota. `EXPUNGE` is
+//! accepted but performs no deletion, because the store interface this layer
+//! targets exposes no remove. Each such limit is noted where it bites.
+//!
+//! Command literals (`{n}` synchronising and `{n+}` LITERAL+, RFC 7888) *are*
+//! supported: Apple Mail sends `LOGIN` credentials and mailbox names as
+//! literals — never quoted strings — so an account cannot even be added
+//! without them. Literal contents containing CR/LF are refused (no argument a
+//! mail client sends contains a line break); see [`ISession::command`].
 
 use crate::address::Address;
 use crate::mime;
@@ -478,6 +482,21 @@ pub struct ISession {
     /// The tag of an `AUTHENTICATE PLAIN` awaiting its SASL response: the next
     /// line fed to [`ISession::command`] is that response, not a command.
     pending_auth: Option<String>,
+    /// A command paused mid-assembly awaiting literal octets (see
+    /// [`ISession::command`]): the text assembled so far, with each completed
+    /// literal re-quoted, and the octet count the next line must begin with.
+    pending_literal: Option<PendingLiteral>,
+}
+
+/// The in-progress state of a command whose next argument arrives as a
+/// `{n}`/`{n+}` literal on a following line.
+#[derive(Debug)]
+struct PendingLiteral {
+    /// The command text before the literal marker, completed literals already
+    /// folded back in as quoted strings.
+    assembled: String,
+    /// How many octets the literal announced.
+    expected: usize,
 }
 
 impl ISession {
@@ -493,6 +512,7 @@ impl ISession {
             user: None,
             mailbox: None,
             pending_auth: None,
+            pending_literal: None,
         }
     }
 
@@ -542,9 +562,20 @@ impl ISession {
         self.pending_auth.is_some()
     }
 
+    /// Whether the next line fed to [`ISession::command`] begins with literal
+    /// octets rather than a fresh command. A driver that logs traffic must
+    /// consult this too: a `LOGIN` literal line is the password itself, and an
+    /// empty line can be legitimate input (a zero-length literal).
+    pub fn awaiting_literal(&self) -> bool {
+        self.pending_literal.is_some()
+    }
+
     /// The capabilities advertised in the current state.
     fn capabilities(&self) -> Vec<String> {
-        let mut caps = vec!["IMAP4rev1".to_string(), "ID".to_string()];
+        // LITERAL+ (RFC 7888) is advertised unconditionally: literal handling
+        // has no protocol state, and clients decide from the greeting whether
+        // they may stream `{n+}` literals without waiting for continuations.
+        let mut caps = vec!["IMAP4rev1".to_string(), "ID".to_string(), "LITERAL+".to_string()];
         if self.state == IState::NotAuthenticated {
             if self.config.tls_available && !self.tls_active {
                 caps.push("STARTTLS".into());
@@ -566,6 +597,15 @@ impl ISession {
     }
 
     /// Feeds one command line and returns what to do next.
+    ///
+    /// A line may not be a whole command: an argument sent as a literal
+    /// (`{n}`/`{n+}`) splits the command across lines. Assembly happens here —
+    /// literal contents are folded back into the command as quoted strings, so
+    /// the per-command parsers see one uniform syntax — and a synchronising
+    /// literal is answered with the `+` continuation the client is waiting on.
+    /// Literal contents containing CR/LF are refused with a `BAD`: octet
+    /// counting across the driver's line reads would be required to honour
+    /// them, and no argument a mail client sends contains a line break.
     pub fn command(&mut self, line: &str) -> IAction {
         if line.len() > MAX_COMMAND_LINE {
             // No tag is reliably parseable from an over-long line, so this is an
@@ -580,6 +620,40 @@ impl ISession {
         }
 
         let trimmed = line.trim_end_matches(['\r', '\n']);
+
+        // A pending literal owns the head of this line: the announced octet
+        // count is consumed as the literal's contents and the remainder
+        // continues the command.
+        let logical = match self.pending_literal.take() {
+            Some(pending) => match fold_literal(pending, trimmed) {
+                Ok(assembled) => assembled,
+                Err(response) => return respond(response),
+            },
+            None => trimmed.to_owned(),
+        };
+
+        match split_trailing_literal(&logical) {
+            // The command wants octets that have not arrived yet: hold what is
+            // assembled and, for a synchronising literal, invite the rest. A
+            // LITERAL+ client has already sent it, so nothing is written.
+            Some((prefix, expected, synchronizing)) => {
+                if prefix.len() + expected > MAX_COMMAND_LINE {
+                    return respond(refuse_literal(&logical));
+                }
+                self.pending_literal =
+                    Some(PendingLiteral { assembled: prefix.to_owned(), expected });
+                if synchronizing {
+                    respond(IResponse::cont("Ready for literal"))
+                } else {
+                    IAction::Respond(Vec::new())
+                }
+            }
+            None => self.dispatch(&logical),
+        }
+    }
+
+    /// Parses and executes one fully-assembled command line.
+    fn dispatch(&mut self, trimmed: &str) -> IAction {
         let (tag, remainder) = match trimmed.split_once(' ') {
             Some((tag, rest)) => (tag.trim(), rest.trim_start()),
             None => (trimmed.trim(), ""),
@@ -1109,9 +1183,80 @@ fn pattern_matches(pattern: &str, name: &str) -> bool {
     pattern.eq_ignore_ascii_case(name)
 }
 
+/// Splits a command line ending in a literal marker into the text before the
+/// marker, the announced octet count, and whether the literal synchronises
+/// (`{n}` — the client waits for `+`) or not (`{n+}`, RFC 7888 LITERAL+).
+///
+/// The marker must follow a space, as the grammar requires: a `}` inside a
+/// quoted string cannot end the line (a quoted argument ends with `"`), so a
+/// trailing `sp {digits[+]}` is unambiguously a literal announcement.
+fn split_trailing_literal(line: &str) -> Option<(&str, usize, bool)> {
+    let body = line.strip_suffix('}')?;
+    let open = body.rfind('{')?;
+    if open == 0 || !body[..open].ends_with(' ') {
+        return None;
+    }
+    let count = &body[open + 1..];
+    let (digits, synchronizing) = match count.strip_suffix('+') {
+        Some(digits) => (digits, false),
+        None => (count, true),
+    };
+    if digits.is_empty() || !digits.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    let expected = digits.parse().ok()?;
+    Some((&line[..open], expected, synchronizing))
+}
+
+/// Consumes a pending literal's octets from the head of `line`, re-quoting them
+/// into the assembled command, and returns the full logical line so far.
+///
+/// Errs with the `BAD` to send when the line is shorter than the announced
+/// count (the literal contains CR/LF, which this server refuses) or the count
+/// lands mid-way through a multi-byte character.
+fn fold_literal(pending: PendingLiteral, line: &str) -> Result<String, IResponse> {
+    if line.len() < pending.expected || !line.is_char_boundary(pending.expected) {
+        return Err(IResponse::untagged(
+            "BAD literal shorter than announced or split mid-character; \
+             literals containing CR/LF are not supported",
+        ));
+    }
+    let (contents, rest) = line.split_at(pending.expected);
+    let mut assembled = pending.assembled;
+    assembled.push_str(&quote_argument(contents));
+    assembled.push_str(rest);
+    Ok(assembled)
+}
+
+/// Renders an argument as an IMAP quoted string, escaping `\` and `"` so
+/// [`next_arg`] reproduces the exact octets a literal carried.
+fn quote_argument(value: &str) -> String {
+    let mut quoted = String::with_capacity(value.len() + 2);
+    quoted.push('"');
+    for ch in value.chars() {
+        if ch == '\\' || ch == '"' {
+            quoted.push('\\');
+        }
+        quoted.push(ch);
+    }
+    quoted.push('"');
+    quoted
+}
+
+/// The refusal for a literal that would grow the command past
+/// [`MAX_COMMAND_LINE`]: tagged when the command's tag is parseable, untagged
+/// otherwise, so the client can match the failure to its command.
+fn refuse_literal(line: &str) -> IResponse {
+    match line.split_whitespace().next() {
+        Some(tag) => IResponse::tagged(tag, Status::Bad, "literal too large"),
+        None => IResponse::untagged("BAD literal too large"),
+    }
+}
+
 /// Reads the next `astring` argument: a `"quoted"` string (with `\` escapes) or
 /// a bare atom up to the next space. Returns the value and the unconsumed rest.
-/// Command literals (`{n}`) are not supported and yield `None`.
+/// Command literals never reach here: [`ISession::command`] folds them into
+/// quoted strings during assembly, so a `{` yields `None` as malformed input.
 fn next_arg(input: &str) -> Option<(String, &str)> {
     let text = input.trim_start();
     if text.is_empty() {
@@ -1931,6 +2076,129 @@ mod tests {
                 assert_eq!(password, "secret");
             }
             other => panic!("expected Login, got {other:?}"),
+        }
+    }
+
+    // ---- command literals (RFC 3501 {n}, RFC 7888 {n+}) --------------------
+
+    #[test]
+    fn login_with_synchronizing_literals_matches_apple_mails_probe() {
+        // Apple Mail's account-setup probe sends LOGIN exactly this way —
+        // username and password as synchronising literals, never quoted
+        // strings — so this conversation is the gate every "Add account"
+        // attempt stands behind.
+        let mut s = ISession::new(config());
+        s.tls_established();
+
+        let IAction::Respond(responses) = s.command("a1 LOGIN {23}\r\n") else {
+            panic!("expected continuation")
+        };
+        assert!(responses[0].text().starts_with("+ "), "{}", responses[0].text());
+
+        let IAction::Respond(responses) = s.command("alex@rockywearsahat.com {9}\r\n") else {
+            panic!("expected continuation")
+        };
+        assert!(responses[0].text().starts_with("+ "), "{}", responses[0].text());
+
+        match s.command("wordpass!\r\n") {
+            IAction::Login { tag, username, password } => {
+                assert_eq!(tag, "a1");
+                assert_eq!(username, "alex@rockywearsahat.com");
+                assert_eq!(password, "wordpass!");
+            }
+            other => panic!("expected Login, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn literal_plus_streams_without_continuations() {
+        // {n+} (RFC 7888) is sent without waiting; the server must consume the
+        // following octets silently rather than answer each marker.
+        let mut s = ISession::new(config());
+        s.tls_established();
+        let IAction::Respond(responses) = s.command("a LOGIN {4+}\r\n") else { panic!("Respond") };
+        assert!(responses.is_empty(), "nothing to write for LITERAL+");
+        let IAction::Respond(responses) = s.command("dave {6+}\r\n") else { panic!("Respond") };
+        assert!(responses.is_empty());
+        match s.command("secret\r\n") {
+            IAction::Login { username, password, .. } => {
+                assert_eq!(username, "dave");
+                assert_eq!(password, "secret");
+            }
+            other => panic!("expected Login, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn literal_contents_keep_quotes_and_backslashes_verbatim() {
+        // The whole point of a literal is octet-exact transport: a password
+        // holding the characters that would break a quoted string must survive
+        // assembly byte for byte.
+        let mut s = ISession::new(config());
+        s.tls_established();
+        s.command("a LOGIN {4}\r\n");
+        s.command("dave {7}\r\n");
+        match s.command("pa\"ss\\w\r\n") {
+            IAction::Login { password, .. } => assert_eq!(password, "pa\"ss\\w"),
+            other => panic!("expected Login, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_empty_literal_is_a_legitimate_argument() {
+        // {0} announces zero octets; the following line is empty and must not
+        // be dismissed as a blank keep-alive.
+        let mut s = ISession::new(config());
+        s.tls_established();
+        s.command("a LOGIN {4}\r\n");
+        s.command("dave {0}\r\n");
+        assert!(s.awaiting_literal());
+        match s.command("\r\n") {
+            IAction::Login { password, .. } => assert_eq!(password, ""),
+            other => panic!("expected Login, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_oversized_literal_is_refused_with_a_tagged_bad() {
+        let mut s = ISession::new(config());
+        s.tls_established();
+        let IAction::Respond(responses) = s.command("a LOGIN {99999}\r\n") else {
+            panic!("Respond")
+        };
+        assert!(responses[0].text().starts_with("a BAD"), "{}", responses[0].text());
+        assert!(!s.awaiting_literal(), "a refused literal must not stay pending");
+    }
+
+    #[test]
+    fn a_literal_line_shorter_than_announced_is_refused_and_recovers() {
+        // Fewer octets than announced means the literal spanned a CRLF, which
+        // this server refuses; the session must return to reading commands.
+        let mut s = ISession::new(config());
+        s.tls_established();
+        s.command("a LOGIN {10}\r\n");
+        let IAction::Respond(responses) = s.command("short\r\n") else { panic!("Respond") };
+        assert!(responses[0].text().contains("BAD"), "{}", responses[0].text());
+        let IAction::Respond(responses) = s.command("b CAPABILITY\r\n") else { panic!("Respond") };
+        assert!(responses.last().unwrap().text().starts_with("b OK"));
+    }
+
+    #[test]
+    fn capability_advertises_literal_plus_from_the_greeting() {
+        // Clients decide from the greeting whether {n+} may be streamed.
+        let greeting = ISession::new(config()).greeting().text().into_owned();
+        assert!(greeting.contains("LITERAL+"), "{greeting}");
+    }
+
+    #[test]
+    fn select_accepts_a_literal_mailbox_name() {
+        let mut s = ISession::new(config());
+        s.tls_established();
+        s.login_result("a1", Some(Address::parse("dave@example.com").unwrap()));
+        s.command("a2 SELECT {5}\r\n");
+        match s.command("INBOX\r\n") {
+            IAction::Select { mailbox, .. } => assert_eq!(mailbox, "INBOX"),
+            other => panic!("expected Select, got {other:?}"),
         }
     }
 

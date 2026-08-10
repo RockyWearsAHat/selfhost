@@ -213,14 +213,18 @@ where
         // A bare CRLF between commands is tolerated silently (Postel's law):
         // Apple Mail opens its sync connections with one, and answering it
         // with a `BAD` makes the client drop the connection and give up. An
-        // awaited SASL response is exempt — there an empty line is real input.
-        if line.trim().is_empty() && !session.awaiting_secret() {
+        // awaited SASL response or literal is exempt — there an empty line is
+        // real input (a zero-length literal, or an aborted exchange).
+        if line.trim().is_empty() && !session.awaiting_secret() && !session.awaiting_literal() {
             log_imap(peer, ">> (blank line ignored)");
             continue;
         }
 
         if session.awaiting_secret() {
             log_imap(peer, ">> <sasl credentials line>");
+        } else if session.awaiting_literal() {
+            // A LOGIN literal line is the username or password itself.
+            log_imap(peer, ">> <literal octets>");
         } else {
             log_imap(peer, format!(">> {}", command_summary(&line)));
         }
@@ -631,6 +635,28 @@ d LOGOUT\r\n";
         assert!(out.contains("hello"), "the body must be in the FETCH response:\n{out}");
         assert!(out.contains("\\Seen"), "a non-peek BODY[] fetch must mark \\Seen:\n{out}");
         assert!(out.contains("d OK LOGOUT completed"), "{out}");
+    }
+
+    #[tokio::test]
+    async fn login_sent_as_literals_authenticates_end_to_end() {
+        // The exact shape of Apple Mail's account-setup probe: username and
+        // password as synchronising literals. Before literals were supported
+        // this died with "BAD LOGIN requires a username" — surfacing in Mail
+        // as "Unable to verify account name or password" — with the password
+        // never even checked.
+        let root = temp_root("literal-login");
+        let server = server_with(&root);
+
+        let script = "\
+a1 LOGIN {16}\r\n\
+dave@example.com {7}\r\n\
+hunter2\r\n\
+b LOGOUT\r\n";
+        let out = run_conversation(&server, script).await;
+
+        assert!(out.contains("+ "), "each {{n}} literal must be invited:\n{out}");
+        assert!(out.contains("a1 OK"), "literal LOGIN must authenticate:\n{out}");
+        assert!(!out.contains("BAD"), "{out}");
     }
 
     #[tokio::test]
