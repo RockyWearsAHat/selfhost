@@ -12,7 +12,7 @@
 use crate::{Cidr, Config, Role};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 
 /// A single validation failure, naming the field responsible.
@@ -357,6 +357,15 @@ impl Config {
                     });
                 }
 
+                for (j, entry) in site.allowed_cidrs.iter().enumerate() {
+                    if let Some(refusal) = console_gate_refusal(entry) {
+                        problems.push(Problem {
+                            field: format!("sites[{i}].allowed_cidrs[{j}]"),
+                            message: refusal,
+                        });
+                    }
+                }
+
                 if site.static_root.is_none() {
                     problems.push(Problem {
                         field: format!("sites[{i}].static_root"),
@@ -409,6 +418,120 @@ impl Config {
             }
         }
     }
+}
+
+/// The address ranges a console gate may name, and what each one is.
+///
+/// Loopback first because it is the deployed answer: the VPN tunnel exits on the
+/// box as a connection to `127.0.0.1:443`, so the console's gate admits loopback
+/// and nothing else (`docs/VPN.md`). The private and carrier-grade ranges are
+/// here for a deployment whose console is reached over a LAN or an overlay
+/// network instead. Every one of them shares the property that matters: no
+/// packet from the public internet can carry such a source address to this
+/// machine and be answered.
+const CONSOLE_GATE_RANGES: [&str; 7] = [
+    "127.0.0.0/8",    // IPv4 loopback — where a tunnel exits
+    "::1/128",        // IPv6 loopback, the same
+    "10.0.0.0/8",     // RFC 1918
+    "172.16.0.0/12",  // RFC 1918
+    "192.168.0.0/16", // RFC 1918
+    "100.64.0.0/10",  // RFC 6598 carrier-grade NAT, and Tailscale's range
+    "fc00::/7",       // RFC 4193 IPv6 unique-local
+];
+
+/// The broadest IPv4 prefix a console gate may name.
+///
+/// A `/24` is 256 addresses — a tunnel subnet or one LAN segment. Anything
+/// broader is not a gate, it is a gesture: `10.0.0.0/8` admits sixteen million
+/// hosts, and an operator who types it has almost certainly meant "the machines
+/// I own" while writing "every address any router might hand out".
+const CONSOLE_GATE_NARROWEST_IPV4: u8 = 24;
+
+/// Why a console site may not name this CIDR, or `None` when it may.
+///
+/// # Why the console's gate is held to a rule no other site's is
+///
+/// The console fronts the API that starts, stops, reconfigures and — as the
+/// remote-desktop work lands — *drives* this machine. `Site::permits` treats an
+/// empty list as open, and until this rule existed `allowed_cidrs =
+/// ["0.0.0.0/0"]` passed validation cleanly, so the one line standing between
+/// the internet and the control plane could be disarmed without a single
+/// warning. Named ranges and a prefix ceiling turn that from a convention into a
+/// refusal at load.
+///
+/// # What passing this check does *not* mean
+///
+/// It does not mean the gate is authentication. In the deployed topology the
+/// admitted range is loopback, and **everything already executing on this box
+/// passes it** — every local account, and every co-hosted web application whose
+/// upstream can be made to fetch a URL. The gate is a perimeter against the
+/// internet and the LAN, not against the machine itself, which is why every
+/// route behind it still authenticates. `docs/SECURITY.md` §3.5 states this at
+/// length; it is repeated here because this function is where an operator's
+/// intuition that "behind the gate" means "safe" is formed.
+///
+/// A syntactically broken entry yields `None`: the parse check reports it
+/// already, and a second problem about the same characters would only bury the
+/// first.
+///
+/// Public so `selfhost doctor` can report the same judgement on a running
+/// deployment instead of re-deriving it. A diagnostic that disagrees with the
+/// loader about what is acceptable is worse than no diagnostic.
+pub fn console_gate_refusal(entry: &str) -> Option<String> {
+    let (address, prefix) = console_gate_parts(entry)?;
+
+    // `filter_map` rather than `expect`: the ranges are literals and a test
+    // asserts they all parse, but a typo in one must cost a rejected config —
+    // which an operator sees and fixes — rather than an abort in a process that
+    // also serves 80 and 443.
+    let admitted = CONSOLE_GATE_RANGES
+        .iter()
+        .filter_map(|range| Cidr::parse(range).ok())
+        .any(|range| range.contains(address));
+    if !admitted {
+        return Some(format!(
+            "\"{entry}\" is not a private address range, so it can only have been reached \
+             from the public internet. A console site may admit loopback (the address a VPN \
+             tunnel exits on), an RFC 1918 LAN range, carrier-grade NAT (100.64.0.0/10), or \
+             IPv6 unique-local (fc00::/7) — nothing else. The console can control this \
+             deployment; it is never routable."
+        ));
+    }
+
+    if address.is_ipv4() && prefix < CONSOLE_GATE_NARROWEST_IPV4 {
+        return Some(format!(
+            "\"{entry}\" is /{prefix}, which is broader than the /{CONSOLE_GATE_NARROWEST_IPV4} \
+             a console site may admit. Name the addresses the console is actually reached from \
+             — in production that is \"127.0.0.1/32\", the address the VPN tunnel exits on — \
+             rather than a whole network the console will never see a request from."
+        ));
+    }
+
+    None
+}
+
+/// An entry's address and prefix length, or `None` if it does not parse.
+///
+/// Deliberately thin: [`Cidr::parse`] has already decided what a well-formed
+/// entry is and reported the ones that are not, and [`Cidr`] keeps its parts
+/// private, so this splits the text the same way rather than re-deciding
+/// anything. Every judgement above is made with [`Cidr::contains`], so the
+/// meaning of a range is still defined in exactly one place.
+fn console_gate_parts(entry: &str) -> Option<(IpAddr, u8)> {
+    let (address_text, prefix_text) = match entry.split_once('/') {
+        Some((address, prefix)) => (address, Some(prefix)),
+        None => (entry, None),
+    };
+    let address: IpAddr = address_text.parse().ok()?;
+    let widest = if address.is_ipv4() { 32 } else { 128 };
+    let prefix = match prefix_text {
+        None => widest,
+        Some(digits) => match digits.parse::<u8>() {
+            Ok(prefix) if prefix <= widest => prefix,
+            _ => return None,
+        },
+    };
+    Some((address, prefix))
 }
 
 #[cfg(test)]
@@ -682,5 +805,99 @@ mod tests {
         console.console = true;
         console.allowed_cidrs = vec!["10.66.0.0/24".into()];
         assert!(config(vec![owner_node()], vec![console]).validate().is_ok());
+    }
+
+    #[test]
+    fn every_console_gate_range_is_a_parseable_literal() {
+        // The class check silently drops a range it cannot parse, so a typo
+        // would narrow the rule without saying so. This is what makes that
+        // choice safe.
+        for range in CONSOLE_GATE_RANGES {
+            assert!(Cidr::parse(range).is_ok(), "{range} does not parse");
+        }
+    }
+
+    #[test]
+    fn the_deployed_console_gates_are_admitted() {
+        // The values `docs/VPN.md` documents as production (the tunnel's
+        // loopback exit), and the LAN and overlay forms an operator might use
+        // instead. If this test ever fails, a live deployment stops loading.
+        for entry in [
+            "127.0.0.1/32",
+            "::1/128",
+            "127.0.0.1",
+            "10.66.0.0/24",
+            "192.168.1.0/24",
+            "172.16.5.0/24",
+            "100.64.1.0/24",
+            "100.100.100.100/32",
+            "fd00::/8",
+            "fc00::/7",
+            "192.168.1.9",
+        ] {
+            assert_eq!(console_gate_refusal(entry), None, "{entry} should be admitted");
+        }
+    }
+
+    #[test]
+    fn a_console_gate_may_not_name_a_routable_address() {
+        // The failure this rule exists for: a gate that admits the internet.
+        for entry in [
+            "0.0.0.0/0",
+            "::/0",
+            "8.8.8.8/32",
+            "172.83.6.109/32",
+            "2001:db8::/32",
+            "169.254.0.0/16",
+            "172.32.0.0/24",
+        ] {
+            let refusal = console_gate_refusal(entry).unwrap_or_else(|| panic!("{entry} admitted"));
+            assert!(refusal.contains(entry), "the message must name the entry: {refusal}");
+        }
+    }
+
+    #[test]
+    fn a_console_gate_may_not_be_broader_than_a_slash_24() {
+        for (entry, prefix) in
+            [("10.0.0.0/8", "/8"), ("192.168.0.0/16", "/16"), ("100.64.0.0/10", "/10")]
+        {
+            let refusal = console_gate_refusal(entry).unwrap_or_else(|| panic!("{entry} admitted"));
+            assert!(refusal.contains(entry), "{refusal}");
+            assert!(refusal.contains(prefix), "the message must say how broad it is: {refusal}");
+        }
+    }
+
+    #[test]
+    fn a_malformed_console_gate_is_left_to_the_parse_check() {
+        // Reporting the same characters twice buries the message that says what
+        // is actually wrong with them.
+        for entry in ["not-a-network", "10.0.0.0/33", "10.0.0.0/x", ""] {
+            let refusal = console_gate_refusal(entry);
+            assert_eq!(refusal, None, "{entry} is a parse problem, not a gate one");
+        }
+    }
+
+    #[test]
+    fn an_open_console_gate_is_refused_naming_the_entry_and_its_index() {
+        // `allowed_cidrs = ["0.0.0.0/0"]` used to pass validation cleanly. The
+        // console can control this deployment, so it no longer does.
+        let mut console = site("console", "admin.example.com");
+        console.console = true;
+        console.allowed_cidrs = vec!["127.0.0.1/32".into(), "0.0.0.0/0".into()];
+        let problems = problems_of(&config(vec![owner_node()], vec![console]));
+        let problem = problems
+            .iter()
+            .find(|p| p.field == "sites[0].allowed_cidrs[1]")
+            .unwrap_or_else(|| panic!("{problems:?}"));
+        assert!(problem.message.contains("0.0.0.0/0"), "{problem}");
+    }
+
+    #[test]
+    fn an_ordinary_site_may_still_gate_on_anything_that_parses() {
+        // The rule is about what the console fronts, not about CIDRs. A public
+        // site that wants to admit one office's routable range still may.
+        let mut gated = site("a", "a.com");
+        gated.allowed_cidrs = vec!["8.8.8.8/32".into(), "0.0.0.0/0".into()];
+        assert!(config(vec![owner_node()], vec![gated]).validate().is_ok());
     }
 }

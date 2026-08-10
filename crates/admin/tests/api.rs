@@ -567,23 +567,41 @@ async fn a_wrong_console_password_gets_the_same_uninformative_401_as_no_credenti
 }
 
 #[tokio::test]
-async fn a_sixth_rapid_login_failure_is_rate_limited_even_with_the_right_password() {
+async fn a_locked_gate_refuses_more_guesses_and_never_the_right_password() {
+    // The rule the adversarial review changed, and the whole of it in one test.
+    //
+    // The old rule refused *everything* once five failures had landed inside the
+    // window, the operator's own correct password included. On this box that is a
+    // weapon pointed the wrong way: the admin API binds loopback and the console
+    // site's `allowed_cidrs` gate is loopback too, so anything already executing
+    // here — including three co-hosted web apps — can drive five failures and
+    // hold the console's only login shut. The desktop design sends the operator
+    // back through this exact door to be handed a keyboard.
+    //
+    // The rule now: a lockout may refuse a wrong credential and may never refuse
+    // a right one.
     let (api, _dir) = console_api("ratelimit", Sessions::new());
     for _ in 0..5 {
         let response = call_with(&api, "POST", "/api/session", &[("X-Selfhost-Console", "1")], r#"{"password":"wrong"}"#).await;
         assert_eq!(response.status.code(), 401, "failures under the limit are ordinary 401s");
     }
 
-    // The gate is closed for the rest of the window — the right password
-    // included, or five guesses would still buy a sixth free try.
+    // A sixth guess meets the lockout, and pays for it.
+    let guess = call_with(&api, "POST", "/api/session", &[("X-Selfhost-Console", "1")], r#"{"password":"wrong"}"#).await;
+    assert_eq!(guess.status.code(), 429, "a guess past the limit is refused");
+    assert_eq!(body_json(&guess).get("error").and_then(Json::as_str), Some("too many attempts"));
+
+    // The operator, at the same instant, with the same locked gate, gets in.
     let response =
         call_with(&api, "POST", "/api/session", &[("X-Selfhost-Console", "1")], &format!(r#"{{"password":"{PASSWORD}"}}"#))
             .await;
-    assert_eq!(response.status.code(), 429);
-    assert_eq!(
-        body_json(&response).get("error").and_then(Json::as_str),
-        Some("too many attempts")
-    );
+    assert_eq!(response.status.code(), 200, "a locked gate refused the right password");
+    assert!(response.headers.get_str("set-cookie").is_some(), "and it minted a session");
+
+    // A success clears the count, so the next wrong guess is an ordinary 401
+    // again rather than the tail of somebody else's burst.
+    let after = call_with(&api, "POST", "/api/session", &[("X-Selfhost-Console", "1")], r#"{"password":"wrong"}"#).await;
+    assert_eq!(after.status.code(), 401);
 }
 
 #[tokio::test]
@@ -693,7 +711,6 @@ async fn an_invented_cookie_does_not_authorise_anything() {
     assert_eq!(response.status.code(), 401);
 }
 
-/// A scratch directory that removes itself when dropped.
 // ---- passkey (WebAuthn) login -----------------------------------------------
 //
 // The ceremony crypto — signatures, origins, flags, challenges — is unit-tested
@@ -917,7 +934,26 @@ async fn a_forged_assertion_is_refused_and_counts_toward_the_shared_gate() {
         assert_eq!(refused.status.code(), 401);
         assert!(refused.headers.get_str("set-cookie").is_none(), "no cookie on refusal");
     }
-    assert_eq!(login_challenge(&api).await.status.code(), 429, "the gate has locked");
+    // One gate over both login doors: a sixth forged assertion meets the
+    // lockout the password failures would have met.
+    let challenge =
+        body_json(&login_challenge(&api).await).get("challenge").and_then(Json::as_str).unwrap().to_owned();
+    let sixth = call_with(
+        &api,
+        "POST",
+        "/api/webauthn/login",
+        &[("X-Selfhost-Console", "1")],
+        &stranger.login_body(&challenge),
+    )
+    .await;
+    assert_eq!(sixth.status.code(), 429, "the gate has locked");
+
+    // But the challenge route keeps answering, and the password door keeps
+    // opening for the right password. A challenge is a random number that grants
+    // nothing without a signature from hardware the guesser does not have, so
+    // refusing it only ever shut the operator's own second door — and refusing
+    // the correct password is the lockout this deployment cannot afford at all.
+    assert_eq!(login_challenge(&api).await.status.code(), 200, "the biometric door stayed open");
     let password = call_with(
         &api,
         "POST",
@@ -926,7 +962,7 @@ async fn a_forged_assertion_is_refused_and_counts_toward_the_shared_gate() {
         &format!(r#"{{"password":"{PASSWORD}"}}"#),
     )
     .await;
-    assert_eq!(password.status.code(), 429, "one gate over both login doors");
+    assert_eq!(password.status.code(), 200, "a locked gate refused the operator");
 }
 
 #[tokio::test]

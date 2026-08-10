@@ -41,11 +41,20 @@ hand-rolled ciphers. Do **not** reimplement its crypto.
 
 - The **only** public port this adds is TCP **8443**. It answers nothing without
   the client's pre-shared Ed25519 key — a scanner sees a socket that never
-  completes a handshake.
+  completes a handshake. It is part of the box's sanctioned inbound set,
+  enumerated in `docs/SECURITY.md` §1 and justified there as VPN-01; that
+  document is the authority on what may be forwarded, and it lists nothing else
+  for this tunnel.
 - The tunnel exits on the box as a **loopback** connection to `:443`. The proxy
   therefore sees `peer.ip() == 127.0.0.1`, which the console site's
   `allowed_cidrs = ["127.0.0.1/32","::1/128"]` admits. Every other source is
-  refused with a uniform `404`.
+  refused with a uniform `404`. Config validation now refuses to *load* a
+  console site whose gate is wider than that shape — loopback, RFC 1918, CGNAT
+  (`100.64.0.0/10`) or IPv6 unique-local (`fc00::/7`) only, and no IPv4 prefix
+  broader than `/24` — so the one line between the internet and the control
+  plane cannot be disarmed by an edit that looks harmless
+  (`crates/config/src/validate.rs`; `selfhost doctor` reports the same judgement
+  against a running deployment).
 - On the Mac, three loopback-only pieces make the **portless** URL work (all
   described under *Using it* below): a **scoped resolver file** sends lookups for
   the one admin name to vpn-ui's embedded **split-DNS responder**
@@ -64,7 +73,23 @@ hand-rolled ciphers. Do **not** reimplement its crypto.
 
 ## Defence in depth
 
-1. **Network**: only the box's tunnel exit can reach the console (source-IP gate).
+1. **Network**: no request from the internet or from the LAN can reach the
+   console — the source-IP gate admits only the loopback address the tunnel
+   exits on, and answers everything else with the same `404` an unhosted name
+   gets.
+
+   > **What that gate does not do.** It is a perimeter against the internet and
+   > against the LAN. **It is not a perimeter against the box.** Because the
+   > tunnel exits on loopback, `allowed_cidrs = ["127.0.0.1/32","::1/128"]`
+   > admits *anything already executing on the machine*: every local account at
+   > any privilege level, and every co-hosted upstream application (`blog`,
+   > `mayr`, `lvlup`) whose code can be made to fetch a URL. An SSRF or an RCE in
+   > any co-hosted app is, by construction, a request the gate admits. So
+   > "behind `allowed_cidrs`" never means "authenticated": layers 2–3 below are
+   > what actually decide who is admitted, and any future subsystem that can
+   > *drive* this machine rather than serve data needs its own credential —
+   > a fresh one, not a live session — on top of them. `docs/SECURITY.md` VPN-02
+   > carries the same statement; it is written in both places deliberately.
 2. **VPN auth**: reaching the tunnel at all requires the client's Ed25519 private
    key; both sides pin the other's public key (no MITM, no unknown clients).
 3. **Console password**: a PBKDF2-SHA256 (600k) password login mints an

@@ -12,6 +12,7 @@
 //! must count against the same gate the others consult.
 
 use crate::token::{constant_time_eq, hex, random_bytes};
+use selfhost_identity::Opening;
 use std::io;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -44,13 +45,38 @@ struct Entry {
     id: String,
     /// Who logged in: `"owner"` for the password (and the bearer token's
     /// implicit identity), or the passkey holder's own name. Identity, not
-    /// authority — every session opens the same console today, and this field
-    /// is where per-user permissions will attach when they arrive.
+    /// authority — the authority is
+    /// [`People`](selfhost_identity::People)'s, keyed on this name, and
+    /// [`Api::caller`](crate::Api::caller) is where the two are joined.
     user: String,
-    /// When the session was created; drives the absolute expiry.
+    /// What was presented at the login this session stands for.
+    ///
+    /// Recorded because a cookie on its own answers *that* somebody logged in
+    /// and never *how*, and the desktop's freshness rule is written in terms of
+    /// how: a password or a passkey is an act of authentication with a person
+    /// behind it, and the difference is what decides whether this session may
+    /// later be handed a keyboard.
+    opened_by: Opening,
+    /// When the session was created; drives the absolute expiry, and is the
+    /// moment the login happened for the freshness rule.
     created: Instant,
     /// When the session last authenticated a request; drives the idle expiry.
     last_seen: Instant,
+}
+
+/// A live session, as the authorisation seam needs to see it.
+///
+/// Returned rather than a bare name because every caller that wants the holder
+/// also wants the login it stands for, and two lookups over a credential store
+/// is two walks that can disagree about which entry they found.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Authenticated {
+    /// Who holds the session: `"owner"`, or a person's own name.
+    pub user: String,
+    /// What was presented at the login.
+    pub opened_by: Opening,
+    /// When the login happened.
+    pub opened_at: Instant,
 }
 
 /// The shared in-memory session store.
@@ -80,12 +106,15 @@ impl Sessions {
         Self { entries: Arc::new(Mutex::new(Vec::new())), absolute, idle }
     }
 
-    /// Creates a session for `user` and returns its id, evicting the oldest
-    /// if at capacity.
+    /// Creates a session for `user`, opened by `opened_by`, and returns its id,
+    /// evicting the oldest if at capacity.
     ///
     /// The id comes from the operating system's entropy — the same source as
     /// the bearer token — and an entropy failure is an error, never a weaker id.
-    pub fn create(&self, user: &str) -> io::Result<String> {
+    /// `opened_by` is taken rather than defaulted because the two login doors
+    /// are not interchangeable to the freshness rule that reads it later, and a
+    /// default would be a guess made in the one place that knows the answer.
+    pub fn create(&self, user: &str, opened_by: Opening) -> io::Result<String> {
         let id = hex(&random_bytes(SESSION_ID_BYTES)?);
         let now = Instant::now();
         let mut entries = self.lock();
@@ -94,23 +123,33 @@ impl Sessions {
         while entries.len() >= MAX_SESSIONS {
             entries.remove(0);
         }
-        entries.push(Entry { id: id.clone(), user: user.to_owned(), created: now, last_seen: now });
+        entries.push(Entry {
+            id: id.clone(),
+            user: user.to_owned(),
+            opened_by,
+            created: now,
+            last_seen: now,
+        });
         Ok(id)
     }
 
-    /// Who holds the live session named by `presented`, if anyone.
+    /// Who holds the live session named by `presented`, and how they logged in.
     ///
     /// Answers identity only — [`Sessions::validate`] remains the door check
     /// and the idle-timer refresh; this walk touches nothing. Compared in
     /// constant time and never returning early, like every credential here.
-    pub fn identity(&self, presented: &str) -> Option<String> {
+    pub fn authenticated(&self, presented: &str) -> Option<Authenticated> {
         let now = Instant::now();
         let mut entries = self.lock();
         entries.retain(|entry| !self.expired(entry, now));
         let mut found = None;
         for entry in entries.iter() {
             if constant_time_eq(entry.id.as_bytes(), presented.as_bytes()) {
-                found = Some(entry.user.clone());
+                found = Some(Authenticated {
+                    user: entry.user.clone(),
+                    opened_by: entry.opened_by,
+                    opened_at: entry.created,
+                });
             }
         }
         found
@@ -165,35 +204,96 @@ impl Default for Sessions {
 }
 
 /// How many failed logins are tolerated per [`FAILURE_WINDOW`] before the
-/// login route answers 429.
-const FAILURE_LIMIT: usize = 5;
+/// login route answers 429 to a *wrong* credential.
+pub const FAILURE_LIMIT: usize = 5;
 
 /// The sliding window over which login failures are counted.
-const FAILURE_WINDOW: Duration = Duration::from_secs(60);
+pub const FAILURE_WINDOW: Duration = Duration::from_secs(60);
 
-/// The login rate limiter: after [`FAILURE_LIMIT`] failures within
-/// [`FAILURE_WINDOW`], logins are refused for the remainder of the window.
+/// The most failures kept in the window.
 ///
-/// Deliberately global rather than per-IP: the admin API binds loopback, so
-/// every request arrives from the reverse proxy (or an SSH tunnel) and the
-/// source address distinguishes nothing. At one operator's scale, locking the
-/// single login door for under a minute is the right trade against an online
-/// password guesser; the PBKDF2 cost covers the offline one.
+/// The gate answers the same once it is locked, so counting past this buys
+/// nothing and an unbounded vector fed by an attacker is a way to grow the
+/// process. Held well above [`FAILURE_LIMIT`] so the window still slides
+/// honestly rather than being truncated at the limit itself.
+const MAX_FAILURES_HELD: usize = 64;
+
+/// How long a wrong credential waits for its refusal once the gate is locked.
+///
+/// The lockout's remaining cost to a guesser after the rule below took away its
+/// ability to refuse a *correct* credential. Long enough to be felt on every
+/// attempt, short enough that an operator who genuinely mistyped their password
+/// during a burst is not left staring at a spinner.
+pub const LOCKED_PENALTY: Duration = Duration::from_millis(750);
+
+/// The login rate limiter.
+///
+/// # The rule, and the finding that changed it
+///
+/// The gate counts failed logins across both login doors and, once
+/// [`FAILURE_LIMIT`] have landed inside [`FAILURE_WINDOW`], it is *locked*. It
+/// used to refuse everything while locked, correct credentials included. That is
+/// the textbook lockout and on this box it is a weapon pointed the wrong way.
+///
+/// This API binds loopback, and the console site's `allowed_cidrs` gate is
+/// loopback too, because the operator's VPN tunnel exits there. "Behind the
+/// gate" therefore means "reachable by anything already executing on this box,
+/// including three co-hosted web apps". Any one of them with a server-side
+/// request forgery can `POST /api/session` with one custom header, five times,
+/// and hold the console's login shut. The desktop design routes the operator
+/// back through this exact door to be handed a keyboard, so a lockout is not an
+/// inconvenience — it is a remotely-triggered denial of the operator's own
+/// machine.
+///
+/// So the rule is now:
+///
+/// > **A lockout may refuse a wrong credential. It may never refuse a right
+/// > one.**
+///
+/// An attempt is verified whether or not the gate is locked. A correct one is
+/// admitted and clears the count. An incorrect one is refused, and while the
+/// gate is locked it waits [`LOCKED_PENALTY`] first ([`FailureGate::penalise`]),
+/// which is what the lockout costs a guesser now that it cannot cost the
+/// operator anything.
+///
+/// # What this defends, and what it does not
+///
+/// It defends the operator's access: no sequence of failures by anybody can
+/// stop somebody who knows the password or holds a passkey from logging in.
+///
+/// It does **not** identify the source of an attempt. Every request arrives from
+/// loopback and the source address distinguishes nothing, so per-source counting
+/// is not implementable here and this rule does not pretend otherwise. It does
+/// not stop a neighbour from keeping the gate perpetually locked; it only makes
+/// that state harmless to the operator. And it does not bound a *parallel*
+/// guesser's CPU cost: the penalty delays one attempt, not the number of
+/// attempts in flight, so the real ceiling on online guessing remains the PBKDF2
+/// work factor in [`crate::ConsolePassword`] — which is also what makes each of
+/// those attempts expensive to the attacker.
 #[derive(Clone)]
 pub struct FailureGate {
     failures: Arc<Mutex<Vec<Instant>>>,
+    penalty: Duration,
 }
 
 impl FailureGate {
-    /// A gate with no failures recorded.
+    /// A gate with no failures recorded and the production penalty.
     pub fn new() -> Self {
-        Self { failures: Arc::new(Mutex::new(Vec::new())) }
+        Self::with_penalty(LOCKED_PENALTY)
     }
 
-    /// Whether logins are currently refused.
+    /// A gate with an explicit penalty — the seam that keeps the tests of a
+    /// locked gate from spending real seconds asleep.
+    pub fn with_penalty(penalty: Duration) -> Self {
+        Self { failures: Arc::new(Mutex::new(Vec::new())), penalty }
+    }
+
+    /// Whether the gate is currently locked.
     ///
     /// Prunes failures older than the window as it answers, so the gate
-    /// reopens by itself once the window slides past the burst.
+    /// reopens by itself once the window slides past the burst. A locked gate
+    /// refuses a credential that turned out to be wrong; it never decides
+    /// whether a credential is checked at all — see the type's documentation.
     pub fn locked(&self) -> bool {
         let now = Instant::now();
         let mut failures = self.lock();
@@ -203,12 +303,25 @@ impl FailureGate {
 
     /// Records one failed login attempt.
     pub fn record_failure(&self) {
-        self.lock().push(Instant::now());
+        let now = Instant::now();
+        let mut failures = self.lock();
+        failures.retain(|at| now.duration_since(*at) < FAILURE_WINDOW);
+        if failures.len() < MAX_FAILURES_HELD {
+            failures.push(now);
+        }
     }
 
     /// Clears the count after a successful login.
     pub fn reset(&self) {
         self.lock().clear();
+    }
+
+    /// Waits out the penalty a wrong credential owes a locked gate.
+    ///
+    /// Awaited on the refusal path only, after the credential has been checked
+    /// and found wrong, so it is never a cost to somebody who can log in.
+    pub async fn penalise(&self) {
+        tokio::time::sleep(self.penalty).await;
     }
 
     /// The failure times, with lock poisoning treated as fatal, as in
@@ -228,10 +341,15 @@ impl Default for FailureGate {
 mod tests {
     use super::*;
 
+    /// A session opened the way the console password door opens one.
+    fn create(sessions: &Sessions, user: &str) -> io::Result<String> {
+        sessions.create(user, Opening::Password)
+    }
+
     #[test]
     fn a_created_session_validates_and_an_invented_one_does_not() {
         let sessions = Sessions::new();
-        let id = sessions.create("owner").expect("system entropy");
+        let id = create(&sessions, "owner").expect("system entropy");
         assert_eq!(id.len(), SESSION_ID_BYTES * 2, "64 hex characters");
         assert!(sessions.validate(&id));
         assert!(!sessions.validate("0".repeat(64).as_str()));
@@ -244,7 +362,7 @@ mod tests {
         // Api is Clone; a login accepted by one clone must hold on another.
         let sessions = Sessions::new();
         let clone = sessions.clone();
-        let id = sessions.create("owner").unwrap();
+        let id = create(&sessions, "owner").unwrap();
         assert!(clone.validate(&id));
         clone.revoke(&id);
         assert!(!sessions.validate(&id));
@@ -253,7 +371,7 @@ mod tests {
     #[test]
     fn a_revoked_session_stops_validating() {
         let sessions = Sessions::new();
-        let id = sessions.create("owner").unwrap();
+        let id = create(&sessions, "owner").unwrap();
         sessions.revoke(&id);
         assert!(!sessions.validate(&id));
         sessions.revoke(&id); // revoking again is a no-op, not a panic
@@ -262,23 +380,23 @@ mod tests {
     #[test]
     fn an_expired_session_is_rejected_and_purged() {
         let sessions = Sessions::with_expiry(Duration::ZERO, Duration::ZERO);
-        let id = sessions.create("owner").unwrap();
+        let id = create(&sessions, "owner").unwrap();
         assert!(!sessions.validate(&id), "zero lifetime expires immediately");
     }
 
     #[test]
     fn an_idle_session_expires_even_inside_its_absolute_lifetime() {
         let sessions = Sessions::with_expiry(Duration::from_secs(3600), Duration::ZERO);
-        let id = sessions.create("owner").unwrap();
+        let id = create(&sessions, "owner").unwrap();
         assert!(!sessions.validate(&id), "the idle limit binds on its own");
     }
 
     #[test]
     fn the_store_is_capped_by_evicting_the_oldest() {
         let sessions = Sessions::new();
-        let first = sessions.create("owner").unwrap();
+        let first = create(&sessions, "owner").unwrap();
         for _ in 0..MAX_SESSIONS {
-            sessions.create("owner").unwrap();
+            create(&sessions, "owner").unwrap();
         }
         assert!(!sessions.validate(&first), "the oldest session is evicted at capacity");
         let held = sessions.lock().len();
@@ -306,5 +424,48 @@ mod tests {
             clone.record_failure();
         }
         assert!(gate.locked(), "failures recorded on a clone count everywhere");
+    }
+
+    #[test]
+    fn the_failure_window_is_bounded_however_long_a_neighbour_keeps_pushing() {
+        // The gate is fed by anything that can reach loopback, which on this box
+        // includes three co-hosted web apps. It answers the same once locked, so
+        // holding more than the cap buys nothing and would be a way to grow the
+        // process one failed login at a time.
+        let gate = FailureGate::new();
+        for _ in 0..(MAX_FAILURES_HELD * 4) {
+            gate.record_failure();
+        }
+        assert!(gate.locked());
+        assert!(gate.lock().len() <= MAX_FAILURES_HELD, "the window grew without limit");
+    }
+
+    #[tokio::test]
+    async fn the_penalty_is_paid_by_the_refusal_path_and_is_configurable_for_tests() {
+        // The penalty is what a locked gate costs a guesser now that it costs a
+        // correct credential nothing. The seam exists so no test sleeps for
+        // three quarters of a second to prove it.
+        let gate = FailureGate::with_penalty(Duration::ZERO);
+        let started = Instant::now();
+        gate.penalise().await;
+        assert!(started.elapsed() < Duration::from_millis(200), "the seam was ignored");
+        assert_eq!(FailureGate::new().penalty, LOCKED_PENALTY, "production keeps the real cost");
+    }
+
+    #[test]
+    fn a_session_reports_who_holds_it_and_how_they_logged_in() {
+        let sessions = Sessions::new();
+        let id = sessions.create("Mom", Opening::Passkey).expect("system entropy");
+        let held = sessions.authenticated(&id).expect("a live session");
+        assert_eq!(held.user, "Mom");
+        assert_eq!(held.opened_by, Opening::Passkey, "a cookie must answer how, not only who");
+        assert!(held.opened_at.elapsed() < Duration::from_secs(5), "the login moment is this one");
+        assert_eq!(sessions.authenticated("0".repeat(64).as_str()), None);
+        // And reading identity never refreshes the idle timer: that is
+        // `validate`'s job, and a stream re-checking on a timer must not be able
+        // to keep its own session alive.
+        let expiring = Sessions::with_expiry(Duration::from_secs(3600), Duration::ZERO);
+        let id = expiring.create("owner", Opening::Password).unwrap();
+        assert_eq!(expiring.authenticated(&id), None, "an idle-expired session holds nobody");
     }
 }

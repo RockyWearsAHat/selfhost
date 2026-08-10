@@ -12,11 +12,13 @@
 //! diagnostic tells somebody their mail works when it has never been tried.
 
 use crate::{acme_task, assess, investigate};
-use selfhost_config::{AcmeEnvironment, Config};
+use selfhost_admin::token::{Privacy, Token, privacy_of};
+use selfhost_config::validate::console_gate_refusal;
+use selfhost_config::{AcmeEnvironment, Cidr, Config};
 use selfhost_proxy::CertificateStore;
 use selfhost_dns::{RecordType, Resolver, ResolverSource, blocklist_name, is_real_listing};
 use std::fmt;
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::Path;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -171,6 +173,7 @@ pub async fn run(config: &Config, project_dir: &Path, deep: bool, scan_lan: bool
     let resolver = Resolver::system();
 
     check_config(&mut report, config, project_dir);
+    check_secrets(&mut report, config, project_dir);
     check_binds(&mut report, config).await;
     check_certificates(&mut report, config, project_dir);
     let public_ip = check_network(&mut report, &resolver).await;
@@ -217,7 +220,12 @@ fn check_config(report: &mut Report, config: &Config, project_dir: &Path) {
     }
 
     let data_dir = project_dir.join(&config.server.data_dir);
-    match std::fs::create_dir_all(&data_dir) {
+    // `create_if_absent` rather than `prepare`: doctor reports what to do and
+    // never does it, so a directory that already exists is observed here and
+    // judged by `check_secrets` below — repairing it would erase the finding.
+    // One that does not exist yet is still created, as it always has been, and
+    // is created owner-only so the act of diagnosing cannot itself expose it.
+    match crate::data_dir::create_if_absent(&data_dir) {
         Ok(()) => section.checks.push(Check::new(
             "data directory is writable",
             Verdict::Pass,
@@ -228,6 +236,253 @@ fn check_config(report: &mut Report, config: &Config, project_dir: &Path) {
                 .with_fix("Certificates, mail, and databases all live here. Fix the permissions."),
         ),
     }
+}
+
+/// The three things that stand between this deployment and whoever else can
+/// reach the machine: the data directory, the bearer token in it, and the
+/// console's source-address gate.
+///
+/// These are grouped because they fail together in one specific way. The gate
+/// decides who may *ask*; the token is what makes an answer authoritative
+/// without any further question; and the directory is what keeps the token from
+/// being readable by an account that was never admitted through the gate at all.
+/// A deployment can have a perfect gate and still be wide open because the file
+/// underneath it inherited a permissive ACL.
+fn check_secrets(report: &mut Report, config: &Config, project_dir: &Path) {
+    let data_dir = project_dir.join(&config.server.data_dir);
+    let token_path = Token::path_in(&data_dir);
+    let section = report.section("Secrets and access");
+
+    section.checks.push(permission_check(
+        "data directory permissions",
+        &data_dir,
+        privacy_of(&data_dir),
+        "Certificates, private keys, the console password hash and the bearer token all live \
+         here. Anything that can read this directory is the deployment.",
+        &format!(
+            "chmod 700 {dir}\n\
+             Windows, from an elevated prompt:\n\
+             icacls \"{dir}\" /inheritance:r /grant *S-1-5-18:(OI)(CI)F \
+             /grant *S-1-5-32-544:(OI)(CI)F",
+            dir = data_dir.display()
+        ),
+    ));
+
+    section.checks.push(permission_check(
+        "admin token permissions",
+        &token_path,
+        privacy_of(&token_path),
+        "This file is the deployment's root credential: a valid bearer token skips the CSRF \
+         header, the Origin check, the session cookie's expiry, the login rate limiter and \
+         the passkey, all at once.",
+        &format!(
+            "chmod 600 {file}\n\
+             Windows, from an elevated prompt:\n\
+             icacls \"{file}\" /inheritance:r /grant *S-1-5-18:F /grant *S-1-5-32-544:F\n\
+             Assume a token that was ever readable by anyone else is captured: delete the \
+             file, restart the daemon to mint a new one, and re-pair every client.",
+            file = token_path.display()
+        ),
+    ));
+
+    section.checks.push(console_gate_check(config));
+}
+
+/// Turns one permission observation into a report line.
+///
+/// Pure given the observation, so the rule that decides Pass from Unknown is
+/// tested without a filesystem. The rule is the one this whole file is written
+/// around: an answer that could not be obtained is [`Verdict::Unknown`], never
+/// [`Verdict::Pass`]. A "permissions fine" line printed by a check that never
+/// managed to look is worse than no line, because it is the line an operator
+/// stops worrying about.
+fn permission_check(
+    name: &str,
+    path: &Path,
+    outcome: std::io::Result<Privacy>,
+    stakes: &str,
+    fix: &str,
+) -> Check {
+    let where_it_is = path.display();
+    match outcome {
+        Ok(Privacy::Private(detail)) => {
+            Check::new(name, Verdict::Pass, format!("{where_it_is} — {detail}"))
+        }
+        Ok(Privacy::Exposed(detail)) => Check::new(
+            name,
+            Verdict::Fail,
+            format!("{where_it_is} — {detail}. {stakes}"),
+        )
+        .with_fix(fix),
+        Ok(Privacy::Unanswerable(why)) => Check::new(
+            name,
+            Verdict::Unknown,
+            format!("{where_it_is} — could not be judged: {why}. {stakes}"),
+        )
+        .with_fix(fix),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Check::new(
+            name,
+            Verdict::Unknown,
+            format!(
+                "{where_it_is} does not exist yet, so its permissions cannot be checked — \
+                 the daemon creates it on first start"
+            ),
+        ),
+        Err(error) => Check::new(
+            name,
+            Verdict::Unknown,
+            format!("{where_it_is} — could not be read: {error}. {stakes}"),
+        )
+        .with_fix(fix),
+    }
+}
+
+/// What the console site's source-address gate actually admits.
+///
+/// The verdict comes from [`console_gate_refusal`] — the loader's own rule,
+/// called rather than re-derived, so this report can never disagree with what
+/// `selfhost check` would accept.
+///
+/// The detail says the part an operator is most likely to get wrong, and it is
+/// not about breadth. A loopback gate is the *correct* configuration here, and
+/// it still admits every process already executing on this box — including the
+/// co-hosted web applications the same proxy serves. "Behind the gate" therefore
+/// means "not from the internet", not "authenticated", which is why every route
+/// behind it demands a credential of its own.
+fn console_gate_check(config: &Config) -> Check {
+    let Some(site) = config.sites.iter().find(|site| site.console) else {
+        return Check::new(
+            "console source gate",
+            Verdict::Skipped,
+            "no site sets console = true, so nothing relays to the admin API",
+        );
+    };
+
+    let name = format!("console source gate for \"{}\"", site.name);
+    if site.allowed_cidrs.is_empty() {
+        return Check::new(
+            name,
+            Verdict::Fail,
+            "allowed_cidrs is empty, and an empty list is open to everyone".to_owned(),
+        )
+        .with_fix(
+            "Set allowed_cidrs to the addresses the console is actually reached from — \
+             [\"127.0.0.1/32\", \"::1/128\"] when it is reached over the VPN tunnel.",
+        );
+    }
+
+    let refusals: Vec<String> =
+        site.allowed_cidrs.iter().filter_map(|entry| console_gate_refusal(entry)).collect();
+    if !refusals.is_empty() {
+        return Check::new(name, Verdict::Fail, refusals.join(" ")).with_fix(
+            "Narrow allowed_cidrs to the addresses the console is reached from. The console \
+             controls this deployment; it is never reachable from a routable address.",
+        );
+    }
+
+    let listed = site.allowed_cidrs.join(", ");
+    Check::new(
+        name,
+        Verdict::Pass,
+        format!(
+            "admits {listed} only; every other source gets the same 404 an unknown hostname \
+             gets. {}",
+            gate_reach(&site.allowed_cidrs).what_it_is_not()
+        ),
+    )
+}
+
+/// How far a console gate's admitted sources actually reach.
+///
+/// The distinction the operator has to be handed, because the two shapes read
+/// identically in the config file and defend against completely different
+/// things. A loopback gate stops the internet and the LAN and stops nothing on
+/// this box. A gate naming a LAN range stops the internet and admits every
+/// device on that network — a printer, a television, a guest's laptop.
+#[derive(Debug, PartialEq, Eq)]
+enum GateReach {
+    /// Every entry is loopback: the deployed shape, where the console is
+    /// reached through the Secure-VPN tunnel that exits on `127.0.0.1`.
+    LoopbackOnly,
+    /// Loopback, and at least one range beyond this machine, named as written.
+    LoopbackAndBeyond(Vec<String>),
+    /// No loopback entry at all, so the tunnel is not how this console is
+    /// reached.
+    ElsewhereOnly,
+}
+
+impl GateReach {
+    /// The sentence naming what this gate is *not* a perimeter against.
+    ///
+    /// Every arm ends in the same place — the gate is not authentication —
+    /// because that is the sentence a reader has to leave with whatever their
+    /// configuration looks like. It is spelled out here rather than left to
+    /// `docs/VPN.md`, since the operator reading a doctor line is exactly the
+    /// operator who has not read the document.
+    fn what_it_is_not(&self) -> String {
+        match self {
+            Self::LoopbackOnly => "The gate is loopback-only, which is the deployed shape: the \
+                 Secure-VPN tunnel exits on 127.0.0.1. So does every process already running on \
+                 this machine — every local account, and every co-hosted web app this same \
+                 proxy serves. A loopback gate is a perimeter against the internet and the LAN; \
+                 it is not a perimeter against this box, and nothing behind it may treat it as \
+                 authentication"
+                .to_owned(),
+            Self::LoopbackAndBeyond(beyond) => format!(
+                "The gate admits loopback — where the Secure-VPN tunnel exits, and where every \
+                 process already running on this machine sits, co-hosted web apps included — \
+                 and beyond that every host on {}. It is a perimeter against the internet, not \
+                 against this box or those networks, so nothing behind it may treat it as \
+                 authentication",
+                beyond.join(", ")
+            ),
+            Self::ElsewhereOnly => "The gate admits no loopback address, so the Secure-VPN \
+                 tunnel — which exits on 127.0.0.1 — does not reach this console; it is \
+                 reachable only from the listed networks. A gate is a perimeter against the \
+                 internet, not authentication: every host on those networks is admitted, so \
+                 each route behind it still demands a credential of its own"
+                .to_owned(),
+        }
+    }
+}
+
+/// Classifies a console gate's entries by how far they reach.
+///
+/// # Why a per-entry loopback test is enough to say "loopback-only"
+///
+/// Containing `127.0.0.1` does not by itself mean an entry contains *nothing
+/// else*: `0.0.0.0/0` contains loopback too. What makes the shortcut sound is
+/// the precondition — this runs only after [`console_gate_refusal`] has cleared
+/// every entry, and that rule admits an IPv4 entry only when its address falls
+/// in one of the named private ranges *and* its prefix is `/24` or narrower. An
+/// entry that reaches loopback and survives both rules is inside `127.0.0.0/8`
+/// and cannot extend past it. The one v6 loopback range, `::1/128`, is a single
+/// address by construction.
+///
+/// Membership is decided with [`Cidr::contains`] — the same matcher the proxy
+/// uses at request time — rather than by comparing text, because `127.0.0.0/8`
+/// and `127.0.0.1/32` both admit loopback and neither is spelled like the
+/// other. An entry that does not parse is counted as reaching beyond this
+/// machine and named: it admits nothing at request time, but reporting it as
+/// loopback would be the one direction of error that reassures.
+fn gate_reach(entries: &[String]) -> GateReach {
+    let (loopback, beyond): (Vec<&String>, Vec<&String>) =
+        entries.iter().partition(|entry| admits_loopback(entry));
+    match (loopback.is_empty(), beyond.is_empty()) {
+        (false, true) => GateReach::LoopbackOnly,
+        (false, false) => {
+            GateReach::LoopbackAndBeyond(beyond.into_iter().cloned().collect())
+        }
+        (true, _) => GateReach::ElsewhereOnly,
+    }
+}
+
+/// Whether one gate entry admits either loopback address.
+fn admits_loopback(entry: &str) -> bool {
+    Cidr::parse(entry).is_ok_and(|cidr| {
+        cidr.contains(IpAddr::V4(Ipv4Addr::LOCALHOST))
+            || cidr.contains(IpAddr::V6(Ipv6Addr::LOCALHOST))
+    })
 }
 
 /// Whether the configured ports can actually be bound.
@@ -1558,6 +1813,203 @@ mod tests {
         assert_eq!(address_from_ehlo("250 OK"), None);
         assert_eq!(address_from_ehlo("250-hello [not-an-ip]"), None);
         assert_eq!(address_from_ehlo(""), None);
+    }
+
+    #[test]
+    fn a_permission_check_that_could_not_look_reports_unknown() {
+        // The whole point of this file: "could not test" is not "fine". A
+        // platform whose ACLs selfhost does not model, and a file that cannot
+        // be read at all, are both untestable — never passes.
+        let path = Path::new("/data/admin.token");
+        for outcome in [
+            Ok(Privacy::Unanswerable("this platform is not modelled".into())),
+            Err(std::io::Error::other("permission denied reading the ACL")),
+            Err(std::io::Error::new(std::io::ErrorKind::NotFound, "no such file")),
+        ] {
+            let check = permission_check("admin token permissions", path, outcome, "stakes", "fix");
+            assert_eq!(check.verdict, Verdict::Unknown, "{}", check.detail);
+            assert!(check.detail.contains("admin.token"), "{}", check.detail);
+        }
+    }
+
+    #[test]
+    fn a_permission_check_passes_only_on_a_private_file() {
+        let path = Path::new("/data/admin.token");
+        let passing = permission_check(
+            "admin token permissions",
+            path,
+            Ok(Privacy::Private("mode 0600 — owner only".into())),
+            "stakes",
+            "fix",
+        );
+        assert_eq!(passing.verdict, Verdict::Pass);
+        assert!(passing.detail.contains("0600"));
+
+        let failing = permission_check(
+            "admin token permissions",
+            path,
+            Ok(Privacy::Exposed("mode 0644 — any account on this machine can reach it".into())),
+            "the deployment's root credential",
+            "chmod 600 it",
+        );
+        assert_eq!(failing.verdict, Verdict::Fail);
+        assert!(failing.detail.contains("root credential"), "{}", failing.detail);
+        assert!(failing.fix.is_some(), "a failure without a fix is half a diagnostic");
+    }
+
+    /// A deployment whose console site is gated to `gate`, or ungated when the
+    /// list is empty.
+    fn console_config(gate: &str) -> Config {
+        Config::parse(&format!(
+            r#"
+version = 1
+
+[server]
+acme_email = "a@b.com"
+acme = "self-signed"
+
+[[nodes]]
+name = "home"
+role = "owner"
+
+[[sites]]
+name = "console"
+domains = ["admin.example.com"]
+static_root = "./sites/console"
+console = true
+allowed_cidrs = [{gate}]
+"#
+        ))
+        .expect("the fixture parses")
+    }
+
+    /// The deployed shape: a console gated to the tunnel's loopback exit.
+    fn production_config() -> Config {
+        console_config("\"127.0.0.1/32\", \"::1/128\"")
+    }
+
+    #[test]
+    fn the_console_gate_check_reports_what_the_loader_would_accept() {
+        // Production: loopback, and the line has to say what loopback means.
+        let production = console_gate_check(&console_config("\"127.0.0.1/32\", \"::1/128\""));
+        assert_eq!(production.verdict, Verdict::Pass);
+        assert!(production.detail.contains("127.0.0.1/32"), "{}", production.detail);
+        assert!(
+            production.detail.contains("every process already running on this machine"),
+            "a loopback gate must say what it does not defend against: {}",
+            production.detail
+        );
+
+        // A LAN gate is legitimate and carries no such note.
+        let lan = console_gate_check(&console_config("\"192.168.1.0/24\""));
+        assert_eq!(lan.verdict, Verdict::Pass);
+        assert!(!lan.detail.contains("every process"), "{}", lan.detail);
+
+        // The gates the loader refuses have to be built by hand, because
+        // `Config::parse` will not produce them any more — which is the point of
+        // the validation rule. The check still reports them: doctor runs against
+        // whatever a daemon is holding, and a config can reach one by other
+        // routes than this loader.
+        let mut opened = production_config();
+        opened.sites[0].allowed_cidrs = vec!["0.0.0.0/0".into()];
+        let open = console_gate_check(&opened);
+        assert_eq!(open.verdict, Verdict::Fail);
+        assert!(open.detail.contains("0.0.0.0/0"), "{}", open.detail);
+        assert!(open.fix.is_some());
+
+        let mut ungated = production_config();
+        ungated.sites[0].allowed_cidrs.clear();
+        let empty = console_gate_check(&ungated);
+        assert_eq!(empty.verdict, Verdict::Fail);
+        assert!(empty.fix.is_some());
+    }
+
+    #[test]
+    fn a_deployment_without_a_console_has_no_gate_to_report() {
+        // Skipped, not Pass: there is nothing to be right about.
+        let mut config = console_config("\"127.0.0.1/32\"");
+        config.sites[0].console = false;
+        assert_eq!(console_gate_check(&config).verdict, Verdict::Skipped);
+    }
+
+    #[test]
+    fn a_loopback_gate_passes_and_says_what_it_does_not_defend_against() {
+        // The sentence every subsystem behind the gate depends on being told:
+        // loopback admits everything already running on this box.
+        assert!(admits_loopback("127.0.0.1/32"));
+        assert!(admits_loopback("::1/128"));
+        assert!(admits_loopback("127.0.0.0/8"), "a wider loopback block counts too");
+        assert!(!admits_loopback("10.66.0.0/24"));
+        assert!(!admits_loopback("garbage"), "an unparseable entry admits nothing");
+    }
+
+    /// A gate's entries as `gate_reach` takes them.
+    fn gate(entries: &[&str]) -> Vec<String> {
+        entries.iter().map(|entry| (*entry).to_owned()).collect()
+    }
+
+    #[test]
+    fn a_gate_is_loopback_only_only_when_every_entry_is_loopback() {
+        // The deployed shape.
+        assert_eq!(gate_reach(&gate(&["127.0.0.1/32", "::1/128"])), GateReach::LoopbackOnly);
+        assert_eq!(gate_reach(&gate(&["127.0.0.0/8"])), GateReach::LoopbackOnly);
+
+        // The one that would otherwise be reported as loopback-only and is not:
+        // the LAN entry admits every device on the network as well, and the
+        // prose has to name it rather than talk about the tunnel alone.
+        assert_eq!(
+            gate_reach(&gate(&["127.0.0.1/32", "192.168.1.0/24"])),
+            GateReach::LoopbackAndBeyond(vec!["192.168.1.0/24".to_owned()])
+        );
+
+        assert_eq!(gate_reach(&gate(&["192.168.1.0/24"])), GateReach::ElsewhereOnly);
+
+        // An entry the matcher cannot read admits nothing at request time, but
+        // it is reported as reaching beyond this machine: the direction of
+        // error that alarms is the safe one.
+        assert_eq!(
+            gate_reach(&gate(&["127.0.0.1/32", "garbage"])),
+            GateReach::LoopbackAndBeyond(vec!["garbage".to_owned()])
+        );
+    }
+
+    #[test]
+    fn every_reach_says_the_gate_is_not_authentication() {
+        // Whatever the shape, the reader has to leave with this. An operator
+        // who believes the gate authenticates is an operator who will put an
+        // unauthenticated route behind it.
+        for reach in [
+            GateReach::LoopbackOnly,
+            GateReach::LoopbackAndBeyond(vec!["192.168.1.0/24".to_owned()]),
+            GateReach::ElsewhereOnly,
+        ] {
+            let prose = reach.what_it_is_not();
+            assert!(prose.contains("perimeter"), "{prose}");
+            assert!(prose.contains("credential") || prose.contains("authentication"), "{prose}");
+        }
+
+        // And a loopback gate has to name what it does not stop, in the words
+        // that make it concrete: the things already running on this box.
+        assert!(
+            GateReach::LoopbackOnly.what_it_is_not().contains("loopback-only"),
+            "the answer to \"is it loopback-only\" has to be in the line"
+        );
+        let mixed = GateReach::LoopbackAndBeyond(vec!["192.168.1.0/24".to_owned()]).what_it_is_not();
+        assert!(mixed.contains("192.168.1.0/24"), "{mixed}");
+    }
+
+    #[test]
+    fn a_gate_that_admits_loopback_and_a_lan_is_not_reported_as_loopback_only() {
+        // The whole check, not just the classifier: a config an operator could
+        // plausibly write, whose two entries defend against different things.
+        let check = console_gate_check(&console_config("\"127.0.0.1/32\", \"192.168.1.0/24\""));
+        assert_eq!(check.verdict, Verdict::Pass);
+        assert!(check.detail.contains("192.168.1.0/24"), "{}", check.detail);
+        assert!(
+            !check.detail.contains("loopback-only"),
+            "a gate that also admits a LAN is not loopback-only: {}",
+            check.detail
+        );
     }
 
     #[test]

@@ -15,15 +15,31 @@ selfhost-config = { workspace = true }
 selfhost-firewall = { workspace = true }
 selfhost-git = { workspace = true }
 selfhost-http = { workspace = true }
+# Who the caller is and what they may do. Every route here answers a capability
+# question rather than a boolean, and the answer comes from one pure function in
+# a crate that sits below this one — so the storage and desktop subsystems can
+# ask it without depending on the crate that routes to them.
+selfhost-identity = { workspace = true }
 selfhost-json = { workspace = true }
 selfhost-supervisor = { workspace = true }
+# The RFC 6455 handshake and frame codec. It runs in exactly one process — this
+# one, behind loopback — which is the whole reason the proxy that owns 80/443
+# does not link it: under `panic = "abort"` a parser fed by a stranger is a
+# parser that can end whatever process it runs in, and this is the one where
+# that costs a single connection.
+selfhost-ws = { workspace = true }
 tokio = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time"] }
 
 [lints.rust]
-# Not `forbid`: generating the auth token asks the operating system for entropy,
-# which is FFI on Windows. Confined to `token::random_bytes`.
+# Not `forbid`: three things this crate does are operating-system calls with no
+# safe standard-library equivalent, and all three are FFI on Windows. Confined
+# to `token::random_bytes` (entropy for tokens, session ids and tickets),
+# `token::write_private` (creating a file with an explicit owner-only DACL,
+# because a file created by the standard library merely inherits the parent
+# directory's), and `token::privacy_of` (reading that DACL back to report
+# whether a credential file really is private).
 unsafe_code = "deny"
 missing_docs = "warn"

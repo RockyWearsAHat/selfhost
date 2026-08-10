@@ -5,6 +5,7 @@
 
 mod acme_task;
 mod assess;
+mod data_dir;
 mod dns_status;
 mod dns_sync;
 mod doctor;
@@ -407,8 +408,17 @@ async fn serve_daemon(
     address: SocketAddr,
 ) -> Result<(), String> {
     let data_dir = project_dir.join(&config.server.data_dir);
-    std::fs::create_dir_all(&data_dir)
+    // Created before anything reads or writes in it, and created so that only
+    // this account can: the bearer token minted a few lines below, the console
+    // password hash and the passkey registry all live here, and a directory
+    // that inherits its permissions is a directory that hands them to whoever
+    // else has an account on the box. See [`data_dir`] for what each platform
+    // can actually enforce.
+    let prepared = crate::data_dir::prepare(&data_dir)
         .map_err(|e| format!("cannot create {}: {e}", data_dir.display()))?;
+    for note in prepared.notes(&data_dir) {
+        eprintln!("{note}");
+    }
 
     let store = Store::new(&data_dir);
     let node_names: Vec<&str> = config.nodes.iter().map(|n| n.name.as_str()).collect();
@@ -1373,6 +1383,14 @@ async fn serve(config: Config, project_dir: PathBuf, config_path: PathBuf) -> Re
     tokio::spawn(watch_config(Arc::clone(&server), config_path, project_dir.clone()));
 
     let data_dir = project_dir.join(&config.server.data_dir);
+    // Ahead of the certificate store, which would otherwise create this
+    // directory itself with whatever permissions it inherited — and the first
+    // thing it puts in it is a TLS private key.
+    let prepared = crate::data_dir::prepare(&data_dir)
+        .map_err(|e| format!("cannot create {}: {e}", data_dir.display()))?;
+    for note in prepared.notes(&data_dir) {
+        eprintln!("{note}");
+    }
     let store = CertificateStore::open(&data_dir).map_err(|e| e.to_string())?;
 
     // The fallback identity: served on :443 the instant the daemon binds, and for

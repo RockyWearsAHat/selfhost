@@ -1,0 +1,19 @@
+[package]
+name = "selfhost-desk"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "The remote-desktop protocol and its session policy. No FFI, so every console can speak it without linking a platform."
+
+[dependencies]
+selfhost-json = { workspace = true }
+tokio = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time"] }
+
+[lints.rust]
+unsafe_code = "forbid"
+missing_docs = "warn"

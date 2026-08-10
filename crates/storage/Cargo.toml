@@ -1,0 +1,37 @@
+[package]
+name = "selfhost-storage"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Network attached storage: shares, the safe path resolver, streamed file I/O, WebDAV, and SMB delegation."
+
+[dependencies]
+# PBKDF2 verification for share credentials reuses the console password hash.
+ring = { workspace = true }
+selfhost-config = { workspace = true }
+selfhost-http = { workspace = true }
+selfhost-identity = { workspace = true }
+selfhost-json = { workspace = true }
+tokio = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time"] }
+
+[lints.rust]
+# Not `forbid`: the one thing that makes a share a share rather than a hole in
+# the box — resolving a path one component at a time against an **open directory
+# descriptor**, so a symlink planted mid-walk is refused instead of followed —
+# has no safe standard-library route on either platform. `std` opens by whole
+# path, and a whole path is exactly what an attacker gets to redirect.
+#
+# The exemption is confined to `src/fs/unix.rs` (`openat` and `unlinkat`, one
+# declaration each) and `src/fs/windows.rs` (`NtCreateFile` relative to a parent
+# handle, plus `SetFileInformationByHandle` to delete through one), and it is
+# granted with an explicit `#[allow(unsafe_code)]` per declaration and per call
+# site rather than crate-wide. No other module in the crate contains `unsafe`:
+# the whole security core — `path`, `share`, `listing`, `respond`, `quota`, and
+# the WebDAV bodies — is pure safe Rust and is meant to stay that way.
+unsafe_code = "deny"
+missing_docs = "warn"

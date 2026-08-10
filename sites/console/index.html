@@ -48,6 +48,11 @@
     <span class="designation">ADMIN CONSOLE</span>
     <span id="who" class="designation" hidden></span>
     <span class="rule"></span>
+    <!-- Two indicators, not one. The link says whether the daemon is
+         reachable; LIVE says whether it is pushing changes unasked. A console
+         can be perfectly connected and merely polling. -->
+    <span id="live-lamp" class="lamp idle" title="The daemon's push stream"></span>
+    <span id="live-word" class="stateword">POLLING</span>
     <span id="link-sweep" class="sweep" hidden></span>
     <span id="link-lamp" class="lamp warn"></span>
     <span id="link-word" class="stateword warn">CONNECTING</span>
@@ -72,6 +77,29 @@
       </p>
     </div>
     <div id="strip" hidden></div>
+  </section>
+
+  <!-- DIAGNOSTICS: what the push stream is actually doing. Built in the phase
+       that introduced the stream and used to verify every phase after it —
+       when a session feels slow, the question is always which hop is slow, and
+       a console that cannot answer it leaves the operator guessing. Round-trip
+       readings join this plate with the peer link, where a second hop first
+       exists. -->
+  <section id="diagnostics" class="plate" hidden>
+    <div class="section-rule">
+      <h2>DIAGNOSTICS</h2><span class="rule"></span>
+      <span id="dg-lamp" class="lamp idle"></span>
+      <span id="dg-word" class="stateword">POLLING</span>
+    </div>
+    <p id="dg-note" class="caption"></p>
+    <div class="readings">
+      <span class="dial"><span class="fieldlabel">SNAPSHOTS</span><span id="dg-snapshots" class="mono"></span></span>
+      <span class="dial"><span class="fieldlabel">RECEIVED</span><span id="dg-received" class="mono"></span></span>
+      <span class="dial"><span class="fieldlabel">LAST</span><span id="dg-last" class="mono"></span></span>
+      <span class="dial"><span class="fieldlabel">STREAM UP</span><span id="dg-uptime" class="mono"></span></span>
+      <span class="dial"><span class="fieldlabel">RECONNECTS</span><span id="dg-reconnects" class="mono"></span></span>
+      <span class="dial"><span class="fieldlabel">POLL</span><span id="dg-poll" class="mono"></span></span>
+    </div>
   </section>
 
   <!-- FIREWALL: hidden until the daemon reports one; hidden silently on 404. -->

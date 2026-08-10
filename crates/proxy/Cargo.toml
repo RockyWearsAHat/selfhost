@@ -23,6 +23,12 @@ rcgen = { workspace = true }
 # HMAC-SHA256 for verifying a webhook's signature. Not a second crypto
 # provider: `ring` is the one this workspace already links, for TLS.
 ring = { workspace = true }
+# One symbol only: `looks_like_upgrade`, the workspace's single definition of
+# "is this request head a WebSocket handshake?". Linking the crate does not run
+# any of it — see the containment note at the top of `src/upgrade.rs` for why
+# the frame codec must never execute in this process, and why a pure header
+# predicate is not that.
+selfhost-ws = { workspace = true }
 
 [lints.rust]
 unsafe_code = "forbid"

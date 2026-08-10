@@ -1,0 +1,23 @@
+[package]
+name = "selfhost-ws"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "RFC 6455 WebSocket: pure handshake and frame codec, plus a thin duplex. Ours, like everything else on the wire."
+
+[dependencies]
+# SHA-1 for the handshake accept key, and nothing else. RFC 6455 names the
+# algorithm, so this is not a choice — and it is the same `ring` the workspace
+# already links rather than a second implementation.
+ring = { workspace = true }
+selfhost-http = { workspace = true }
+tokio = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time", "io-util"] }
+
+[lints.rust]
+unsafe_code = "forbid"
+missing_docs = "warn"

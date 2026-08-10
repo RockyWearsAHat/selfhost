@@ -259,6 +259,72 @@ function passkeyDay(unix) {
   return new Date(n * 1000).toISOString().slice(0, 10);
 }
 
+/** The masthead's word for the push stream. Four states, because "not
+ *  streaming" has three genuinely different causes and an operator debugging a
+ *  console needs to tell them apart: the handshake is in flight, it was live and
+ *  the link went, or this daemon has no stream to offer and the page is polling
+ *  instead. */
+function streamWord(stream) {
+  const words = { opening: "OPENING", live: "LIVE", lost: "RECONNECTING", off: "POLLING" };
+  return words[stream] || "POLLING";
+}
+
+/** The stream's lamp colour. Amber while reaching, green while live, and idle —
+ *  never red — when there is no stream at all: a daemon that does not offer one
+ *  is not a fault, and the page still works from its poll. */
+function streamLamp(stream) {
+  if (stream === "live") return "ok";
+  if (stream === "opening") return "warn";
+  if (stream === "lost") return "bad";
+  return "idle";
+}
+
+/** How long to wait before the nth reconnection attempt, in ms: half a second,
+ *  doubling, capped at fifteen. The cap matters more than the curve — a console
+ *  left open on a laptop that sleeps for a weekend must not come back and find
+ *  its next attempt scheduled for an hour's time. */
+function backoffDelay(attempt) {
+  const n = Math.max(1, Math.floor(Number(attempt) || 1));
+  return Math.min(15000, 500 * Math.pow(2, n - 1));
+}
+
+/** The subprotocol list a handshake offers: the versioned protocol name, and
+ *  the ticket. `Sec-WebSocket-Protocol` is the one header a page may set on a
+ *  handshake, which is why the credential travels in it. */
+function streamProtocols(ticket) {
+  return ["selfhost.events.1", `tkt.${ticket}`];
+}
+
+/** Whether a minted ticket is the shape this daemon issues: 32 bytes of hex.
+ *  Validated, never escaped, exactly as service names and credential ids are —
+ *  a value that fails here did not come from the daemon and has no business in
+ *  a handshake header. */
+function usableTicket(ticket) {
+  return typeof ticket === "string" && /^[0-9a-f]{64}$/.test(ticket);
+}
+
+/** Bytes in the units a person reads, held to three significant figures so the
+ *  column does not jitter. */
+function byteCount(bytes) {
+  const n = Math.max(0, Math.floor(Number(bytes) || 0));
+  if (n < 1024) return `${n} B`;
+  if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} kB`;
+  return `${(n / (1024 * 1024)).toFixed(1)} MB`;
+}
+
+/** The diagnostics plate's one-line account of the link, which is the sentence
+ *  an operator reads when the console stops feeling live. */
+function diagnosisLine(stream, sinceSecs) {
+  if (stream === "live") {
+    return sinceSecs >= 60
+      ? `live · nothing has changed for ${duration(sinceSecs)}`
+      : "live · the daemon pushes every change as it happens";
+  }
+  if (stream === "opening") return "opening the stream";
+  if (stream === "lost") return "link lost, reconnecting";
+  return "no stream on this daemon · polling every second instead";
+}
+
 /* ── 2. Self-tests: `node app.js` ───────────────────────────────────── */
 
 if (typeof document === "undefined") {
@@ -346,6 +412,42 @@ if (typeof document === "undefined") {
   check("a fresh loss has no age", linkWord("lost", 1), "UNREACHABLE");
   check("an old loss wears its age", linkWord("lost", 95), "UNREACHABLE · 1m 35s");
 
+  check("stream word live", streamWord("live"), "LIVE");
+  check("stream word reconnecting", streamWord("lost"), "RECONNECTING");
+  check("stream word opening", streamWord("opening"), "OPENING");
+  check("an absent stream is not an error word", streamWord("off"), "POLLING");
+  check("an unknown stream state is not an error word", streamWord("nonsense"), "POLLING");
+  check("a live stream is green", streamLamp("live"), "ok");
+  check("a lost stream is red", streamLamp("lost"), "bad");
+  check("no stream at all is not red", streamLamp("off"), "idle");
+
+  check("first retry is soon", backoffDelay(1), 500);
+  check("retries double", backoffDelay(2), 1000);
+  check("retries keep doubling", backoffDelay(5), 8000);
+  check("retries are capped", backoffDelay(9), 15000);
+  check("a weekend of sleep still retries within the cap", backoffDelay(400), 15000);
+  check("a nonsense attempt is the first one", backoffDelay("soon"), 500);
+
+  check("the handshake offers the protocol and the ticket",
+    streamProtocols("ab"), ["selfhost.events.1", "tkt.ab"]);
+  check("a real ticket passes", usableTicket("a".repeat(64)), true);
+  for (const bad of ["", "A".repeat(64), "a".repeat(63), "a".repeat(65), "a b", 7, null]) {
+    check(`ticket refused: ${String(bad).slice(0, 8)}`, usableTicket(bad), false);
+  }
+
+  check("bytes stay bytes", byteCount(512), "512 B");
+  check("kilobytes are named", byteCount(2048), "2.0 kB");
+  check("megabytes are named", byteCount(3 * 1024 * 1024), "3.0 MB");
+  check("a nonsense count is zero", byteCount("lots"), "0 B");
+
+  check("a lost link says what it is doing", diagnosisLine("lost", 0), "link lost, reconnecting");
+  check("a quiet live link wears its silence",
+    diagnosisLine("live", 95), "live · nothing has changed for 1m 35s");
+  check("a busy live link says so",
+    diagnosisLine("live", 3), "live · the daemon pushes every change as it happens");
+  check("no stream explains the poll",
+    diagnosisLine("off", 0), "no stream on this daemon · polling every second instead");
+
   if (failures > 0) { process.exitCode = 1; console.error(`${failures} failure(s)`); }
   else console.log("all self-tests passed");
 } else {
@@ -357,9 +459,24 @@ if (typeof document === "undefined") {
 /** Wires the page up and decides login vs console from the session. */
 function boot() {
 
-  /* How often the daemon is asked while the tab is watched / hidden, ms. */
-  const POLL_FAST = 500;
-  const POLL_SLOW = 5000;
+  /* How often the daemon is asked, in ms.
+   *
+   * The half-second poll this console was built on is gone: the daemon now
+   * pushes its snapshot the moment anything changes, over one WebSocket that
+   * costs nothing while nothing happens. What is left is a safety net — a full
+   * refresh every ten seconds while the stream is live, so a stream that has
+   * quietly stopped delivering cannot leave a stale screen looking live for
+   * ever. When there is no stream (an older daemon, or one that refuses),
+   * POLL_DEGRADED is this page's only source of news and is fast for that
+   * reason, and the DIAGNOSTICS plate says which of the two is happening rather
+   * than leaving it to be guessed from how the page feels. */
+  const POLL_SAFETY = 10000;
+  const POLL_DEGRADED = 1000;
+  const POLL_SLOW = 30000;
+  /* How often the selected service's log tail is fetched while streaming.
+   * Logs are a per-selection cursor, not part of a machine-wide snapshot, so
+   * they keep a poll of their own until the mux gives them a channel. */
+  const POLL_LOGS = 1000;
   /* How many log lines are asked for per fetch, and kept on the page. */
   const LOG_BATCH = 500;
   const LOG_RING = 4000;
@@ -377,6 +494,7 @@ function boot() {
     formOpen: false,
     passkeys: null,             // registered passkeys, or null → panel hidden
     user: null,                 // who this session belongs to, from the daemon
+    stream: "off",              // "off" | "opening" | "live" | "lost"
   };
 
   const $ = (id) => document.getElementById(id);
@@ -385,6 +503,13 @@ function boot() {
   let pollTimer = null;
   let inFlight = false;
   let pollAgain = false;
+  /* The push stream, its reconnection schedule, and what the DIAGNOSTICS plate
+     reports about it. Counters only — nothing here decides anything. */
+  let socket = null;
+  let streamTimer = null;
+  let streamAttempt = 0;
+  let logTimer = null;
+  const streamStats = { snapshots: 0, bytes: 0, reconnects: 0, lastAt: 0, openedAt: 0 };
   /* Whether the log view is pinned to its newest line, and what arrived while
      the reader was scrolled back. */
   let logPinned = true;
@@ -458,6 +583,7 @@ function boot() {
 
   /** Back to the password field, with everything the session showed dropped. */
   function toLogin() {
+    closeStream();
     state.link = "connecting";
     state.services = [];
     state.selected = null;
@@ -484,6 +610,11 @@ function boot() {
     who.textContent = state.user ? `— ${state.user}` : "";
     render();
     poll();
+    // The stream is opened alongside the first poll rather than instead of it:
+    // the poll is what proves the session works and fills the page, and the
+    // handshake takes a ticket and a round trip that the operator should not
+    // have to watch before seeing anything.
+    openStream();
     // Outside the poll on purpose: passkeys change only through this page's
     // own register and remove buttons, which refresh the list themselves.
     refreshPasskeys();
@@ -732,11 +863,179 @@ function boot() {
     }
   }
 
+  /* ── the push stream ──────────────────────────────────────────────── */
+
+  /** Opens the events stream: mint a ticket, then hand it to the handshake.
+   *
+   *  The ticket is why this is two steps. A WebSocket handshake is a GET, a
+   *  page cannot put a custom header on one, and there is no preflight — so the
+   *  cookie alone would authorise it, and a hostile page in a logged-in browser
+   *  could open this stream. The mint is an ordinary POST carrying the CSRF
+   *  header, which such a page cannot forge, and the handshake carries proof
+   *  that it happened.
+   *
+   *  A 404 — a daemon older than this page — settles into "off" silently and
+   *  the poll carries the console, exactly as the firewall and passkey panels
+   *  treat a feature that is not there. */
+  async function openStream() {
+    // "opening" is set synchronously below and is what makes this re-entrant:
+    // there is an await between here and the socket existing, and two opens
+    // racing through that gap would leave one socket unreferenced and never
+    // closed.
+    if (state.view !== "console" || socket || state.stream === "opening") return;
+    clearTimeout(streamTimer);
+    state.stream = "opening";
+    renderMasthead();
+
+    let ticket;
+    try {
+      const reply = await api("/api/desktop/ticket", { method: "POST", body: { want: ["events"] } });
+      if (reply.status === 401) { toLogin(); return; }
+      if (reply.status === 404) { settleStream("off"); return; }
+      ticket = reply.body && reply.body.ticket;
+    } catch {
+      scheduleReconnect();
+      return;
+    }
+    if (!usableTicket(ticket)) { scheduleReconnect(); return; }
+
+    // Same origin, so the CSP's `connect-src 'self'` covers it and no directive
+    // has to be widened for the stream to exist.
+    const scheme = location.protocol === "https:" ? "wss:" : "ws:";
+    try {
+      socket = new WebSocket(`${scheme}//${location.host}/api/events`, streamProtocols(ticket));
+    } catch {
+      scheduleReconnect();
+      return;
+    }
+    socket.binaryType = "arraybuffer";
+    socket.addEventListener("open", onStreamOpen);
+    socket.addEventListener("message", onStreamMessage);
+    socket.addEventListener("close", onStreamEnd);
+    socket.addEventListener("error", onStreamEnd);
+  }
+
+  function onStreamOpen() {
+    streamAttempt = 0;
+    streamStats.openedAt = Date.now();
+    settleStream("live");
+  }
+
+  /** One snapshot. Binary, always: the daemon's codec sends no text frames, so
+   *  nothing in the stack needs a UTF-8 validator and a text frame arriving
+   *  would be a protocol error rather than a message. A payload that is not the
+   *  JSON this page expects is dropped without disturbing what is on screen —
+   *  the safety-net poll is what corrects a console that has fallen behind. */
+  function onStreamMessage(event) {
+    let value;
+    try {
+      const bytes = new Uint8Array(event.data);
+      streamStats.bytes += bytes.length;
+      value = JSON.parse(new TextDecoder().decode(bytes));
+    } catch {
+      return;
+    }
+    if (!value || value.kind !== "snapshot") return;
+    streamStats.snapshots += 1;
+    streamStats.lastAt = Date.now();
+    applySnapshot(value);
+  }
+
+  /** The link went. Every ending arrives here — a close frame, a dropped
+   *  tunnel, a daemon restart — because none of them differ in what the page
+   *  must do about it. */
+  function onStreamEnd() {
+    if (!socket) return;
+    dropSocket();
+    streamStats.reconnects += 1;
+    scheduleReconnect();
+  }
+
+  function scheduleReconnect() {
+    dropSocket();
+    if (state.view !== "console") return;
+    settleStream("lost");
+    streamAttempt += 1;
+    // A little jitter, so a daemon restart does not bring every open console
+    // back at the same instant.
+    const delay = backoffDelay(streamAttempt) + Math.floor(Math.random() * 250);
+    clearTimeout(streamTimer);
+    streamTimer = setTimeout(openStream, delay);
+  }
+
+  /** Forgets the socket without letting its own close handler fire — otherwise
+   *  closing on purpose would schedule a reconnection to something nobody
+   *  wants any more. */
+  function dropSocket() {
+    if (!socket) return;
+    const going = socket;
+    socket = null;
+    going.removeEventListener("open", onStreamOpen);
+    going.removeEventListener("message", onStreamMessage);
+    going.removeEventListener("close", onStreamEnd);
+    going.removeEventListener("error", onStreamEnd);
+    try { going.close(); } catch { /* already gone */ }
+  }
+
+  function closeStream() {
+    clearTimeout(streamTimer);
+    clearTimeout(logTimer);
+    streamAttempt = 0;
+    dropSocket();
+    settleStream("off");
+  }
+
+  /** Records the stream's state and redraws everything that depends on it —
+   *  the masthead lamp, the diagnostics plate, and the poll cadence, which is
+   *  the point: the safety net slows down exactly when the stream takes over. */
+  function settleStream(next) {
+    state.stream = next;
+    renderMasthead();
+    renderDiagnostics();
+    if (state.view === "console") {
+      schedule(pollDelay());
+      scheduleLogs();
+    }
+  }
+
+  /** A pushed snapshot, applied as the poll's own reply would be. Deliberately
+   *  the same shapes `/api/services` and `/api/firewall` answer with, so this
+   *  agrees with the poll by construction rather than by two lots of parsing
+   *  that have to be kept in step. */
+  function applySnapshot(value) {
+    state.link = "connected";
+    lastContact = Date.now();
+    const services = Array.isArray(value.services)
+      ? value.services.filter((s) => s && usableName(s.name)) : [];
+    state.services = services;
+    if (!state.selected || !services.some((s) => s.name === state.selected)) {
+      state.selected = services.length ? services[0].name : null;
+      state.spec = null;
+      resetLogs(state.selected || "");
+      hideConfirm();
+    }
+    state.firewall = value.firewall && typeof value.firewall.backend === "string"
+      ? value.firewall : null;
+    render();
+    // A snapshot only arrives when something changed, so this is not a poll in
+    // disguise: it fetches the two things the snapshot does not carry, at
+    // exactly the moments they are worth fetching.
+    refreshDefinition();
+    refreshLogs();
+  }
+
   /* ── polling ──────────────────────────────────────────────────────── */
 
   function schedule(delay) {
     clearTimeout(pollTimer);
     pollTimer = setTimeout(poll, delay);
+  }
+
+  /** How long until the next full refresh. While the stream is live this is
+   *  only a safety net; without one it is the whole of the console's news. */
+  function pollDelay() {
+    if (document.hidden) return POLL_SLOW;
+    return state.stream === "live" ? POLL_SAFETY : POLL_DEGRADED;
   }
 
   /** One poll. Called on a timer, and directly for an immediate re-poll
@@ -750,11 +1049,24 @@ function boot() {
     } finally {
       inFlight = false;
       if (state.view === "console") {
-        const delay = pollAgain ? 0 : (document.hidden ? POLL_SLOW : POLL_FAST);
+        const delay = pollAgain ? 0 : pollDelay();
         pollAgain = false;
         schedule(delay);
       }
     }
+  }
+
+  /** The log tail's own timer, live only while the stream is: without a stream
+   *  the full poll already fetches logs every second, and two timers asking for
+   *  the same thing is how a console ends up hammering a route nobody meant to
+   *  hammer. */
+  function scheduleLogs() {
+    clearTimeout(logTimer);
+    if (state.stream !== "live" || document.hidden || !state.selected) return;
+    logTimer = setTimeout(async () => {
+      await refreshLogs();
+      scheduleLogs();
+    }, POLL_LOGS);
   }
 
   /** The poll body: services first (that is the connectivity signal), then
@@ -910,6 +1222,10 @@ function boot() {
     hideConfirm();
     render();
     poll();
+    // The log timer follows the selection: it does nothing without one, and a
+    // new selection wants its tail now rather than at the end of the old one's
+    // interval.
+    scheduleLogs();
   }
 
   function stepSelection(step) {
@@ -1001,6 +1317,7 @@ function boot() {
     renderRail();
     renderDetail();
     renderFirewall();
+    renderDiagnostics();
     renderNotice();
   }
 
@@ -1025,6 +1342,41 @@ function boot() {
     $("link-lamp").hidden = face.reaching;
     setLamp($("link-lamp"), face.status);
     setStateWord($("link-word"), face.status, linkWord(state.link, sinceSecs));
+
+    // The LIVE lamp, beside the link's own. Two indicators rather than one
+    // because they answer different questions: the link says whether the daemon
+    // is reachable at all, and this says whether it is telling us things
+    // unasked. A console can be perfectly connected and merely polling.
+    const lamp = streamLamp(state.stream);
+    setLamp($("live-lamp"), lamp);
+    setStateWord($("live-word"), lamp, streamWord(state.stream));
+  }
+
+  /* ── the diagnostics plate ────────────────────────────────────────── */
+
+  /** What the stream is actually doing, in numbers. Built in this phase and
+   *  used to verify every phase after it: when a desktop session feels slow the
+   *  question is always which hop is slow, and a console that cannot answer it
+   *  leaves the operator guessing. Hop and end-to-end round trips join this
+   *  plate with the peer link, which is where a second hop first exists. */
+  function renderDiagnostics() {
+    const panel = $("diagnostics");
+    panel.hidden = state.view !== "console";
+    if (panel.hidden) return;
+
+    const quietSecs = streamStats.lastAt ? Math.floor((Date.now() - streamStats.lastAt) / 1000) : 0;
+    const lamp = streamLamp(state.stream);
+    setLamp($("dg-lamp"), lamp);
+    setStateWord($("dg-word"), lamp, streamWord(state.stream));
+    $("dg-note").textContent = diagnosisLine(state.stream, quietSecs);
+
+    $("dg-snapshots").textContent = String(streamStats.snapshots);
+    $("dg-received").textContent = byteCount(streamStats.bytes);
+    $("dg-last").textContent = streamStats.lastAt ? duration(quietSecs) : "—";
+    $("dg-uptime").textContent = state.stream === "live" && streamStats.openedAt
+      ? duration(Math.floor((Date.now() - streamStats.openedAt) / 1000)) : "—";
+    $("dg-reconnects").textContent = String(streamStats.reconnects);
+    $("dg-poll").textContent = state.stream === "live" ? `${POLL_SAFETY / 1000}s net` : `${POLL_DEGRADED / 1000}s`;
   }
 
   function renderBank() {
@@ -1641,9 +1993,13 @@ function boot() {
     if (logPinned !== wasPinned) renderJump();
   });
 
-  // Back off while nobody is watching; catch up the moment they return.
+  // Back off while nobody is watching; catch up the moment they return. The
+  // stream itself is left alone either way — it costs nothing while nothing
+  // changes, and tearing it down for a hidden tab would mean a handshake and a
+  // fresh ticket every time the operator alt-tabs.
   document.addEventListener("visibilitychange", () => {
     if (!document.hidden && state.view === "console") poll();
+    scheduleLogs();
   });
 
   checkSession();
