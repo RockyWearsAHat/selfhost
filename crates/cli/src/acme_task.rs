@@ -309,6 +309,7 @@ mod tests {
             mail,
             namecheap_ddns: vec![],
             registrar: None,
+            self_update: None,
         }
     }
 

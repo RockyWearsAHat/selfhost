@@ -87,6 +87,56 @@ pub fn reset_args(at: &Path) -> Vec<String> {
     args
 }
 
+/// Arguments for moving the working copy onto a specific, already-known commit.
+///
+/// The rollback half of [`reset_args`]: a build that fails after the tree was
+/// updated must put the tree back on the commit the running build came from, or
+/// the next poll reads the new commit as deployed and never retries. The commit
+/// only ever comes from [`parse_head`]/[`commit_for_ref`], so it is hexadecimal
+/// and cannot reach `git` as an option.
+pub fn reset_to_args(at: &Path, commit: &str) -> Vec<String> {
+    let mut args = global_options();
+    args.push("-C".into());
+    args.push(at.display().to_string());
+    args.push("reset".into());
+    args.push("--hard".into());
+    args.push(commit.to_owned());
+    args
+}
+
+/// Arguments for asking whether tracked files in a working copy are modified.
+///
+/// `-uno` leaves untracked files out of the answer on purpose — the same rule
+/// as [`reset_args`]: untracked files (a build cache, an operator's `.env`)
+/// belong to the deployment and must neither block nor be destroyed by one.
+/// Empty output means clean.
+pub fn status_args(at: &Path) -> Vec<String> {
+    let mut args = global_options();
+    args.push("-C".into());
+    args.push(at.display().to_string());
+    args.push("status".into());
+    args.push("--porcelain".into());
+    args.push("-uno".into());
+    args
+}
+
+/// Arguments for asking whether `commit` is an ancestor of what was fetched.
+///
+/// Exit 0 answers yes, exit 1 answers no, anything else is a real failure —
+/// `git merge-base --is-ancestor`'s own contract. Asked before a self-update's
+/// hard reset: a fetch that is *not* a fast-forward means the working copy
+/// holds commits the branch does not, and resetting would discard them.
+pub fn is_ancestor_args(at: &Path, commit: &str) -> Vec<String> {
+    let mut args = global_options();
+    args.push("-C".into());
+    args.push(at.display().to_string());
+    args.push("merge-base".into());
+    args.push("--is-ancestor".into());
+    args.push(commit.to_owned());
+    args.push("FETCH_HEAD".into());
+    args
+}
+
 /// Arguments for reading the commit a working copy is currently on.
 pub fn head_args(at: &Path) -> Vec<String> {
     let mut args = global_options();
@@ -244,6 +294,29 @@ mod tests {
             let end = args.iter().position(|a| a == "--").expect("a separator");
             assert!(args[end + 1..].iter().any(|a| a.contains("github.com")), "{args:?}");
         }
+    }
+
+    #[test]
+    fn a_rollback_aims_at_the_named_commit_with_the_same_hard_reset() {
+        let args = reset_to_args(Path::new("/data/site"), "1111111111111111111111111111111111111111");
+        assert!(args.contains(&"--hard".to_owned()));
+        assert_eq!(args.last().map(String::as_str), Some("1111111111111111111111111111111111111111"));
+        assert!(args.windows(2).any(|pair| pair == ["-c", "protocol.ext.allow=never"]));
+    }
+
+    #[test]
+    fn the_ancestry_question_compares_the_working_copy_against_what_was_fetched() {
+        let args = is_ancestor_args(Path::new("/data/site"), "1111111");
+        assert!(args.contains(&"--is-ancestor".to_owned()));
+        assert_eq!(args.last().map(String::as_str), Some("FETCH_HEAD"));
+        assert!(args.windows(2).any(|pair| pair == ["-c", "protocol.ext.allow=never"]));
+    }
+
+    #[test]
+    fn a_dirt_check_ignores_untracked_files_for_the_same_reason_reset_spares_them() {
+        let args = status_args(Path::new("/data/site"));
+        assert!(args.contains(&"-uno".to_owned()), "{args:?}");
+        assert!(args.contains(&"--porcelain".to_owned()), "{args:?}");
     }
 
     #[test]

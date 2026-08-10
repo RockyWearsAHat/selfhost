@@ -31,7 +31,7 @@ use std::path::{Path, PathBuf};
 
 pub use cidr::Cidr;
 pub use dns::{Dns, RecordConfig, SoaConfig, ZoneConfig};
-pub use git::GitWatch;
+pub use git::{GitWatch, SelfUpdate};
 pub use mail::{DkimConfig, Mail, MailBind, Mailbox, Relay};
 pub use namecheap::NamecheapDdns;
 pub use registrar::{Registrar, RegistrarProvider};
@@ -67,6 +67,10 @@ pub struct Config {
     /// Absent → no registrar sync.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub registrar: Option<Registrar>,
+    /// Selfhost's own repository, watched so a push updates this deployment
+    /// itself — fetch, rebuild, restart. Absent → no self-update.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub self_update: Option<SelfUpdate>,
 }
 
 /// Host-wide settings.
@@ -528,6 +532,7 @@ mod tests {
             mail: None,
             namecheap_ddns: vec![],
             registrar: None,
+            self_update: None,
         };
 
         assert_eq!(
@@ -565,6 +570,7 @@ mod tests {
             mail: None,
             namecheap_ddns: vec![],
             registrar: None,
+            self_update: None,
         };
 
         let map = config.host_map();

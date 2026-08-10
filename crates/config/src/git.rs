@@ -114,6 +114,106 @@ pub struct GitWatch {
     pub webhook_secret: Option<String>,
 }
 
+/// The build that produces selfhost's own binary, when the config names none.
+pub const DEFAULT_SELF_BUILD: &[&str] = &["cargo", "build", "--release", "-p", "selfhost-cli"];
+
+/// The daemon's own repository, watched so a push updates selfhost itself.
+///
+/// Where a [`GitWatch`] deploys *a service's* branch into its own checkout,
+/// this watches the branch selfhost was built from, in the project directory
+/// the daemon already runs from — the tree holding `selfhost.config.toml` and
+/// `target/`. There is no second checkout: the deployment *is* the working
+/// copy, which is why this is its own type rather than a `GitWatch` with a
+/// hard-coded path.
+///
+/// How an update lands is the daemon's business (`selfhost daemon` polls,
+/// fetches, builds, and exits for its service manager to restart it); this type
+/// only says what to watch and how often.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SelfUpdate {
+    /// The repository this deployment is a clone of.
+    ///
+    /// The same transports as [`GitWatch::repository`], for the same reason: an
+    /// `ext::` URL or a leading dash is code execution as the daemon user.
+    pub repository: String,
+
+    /// The branch a push to which updates this deployment.
+    #[serde(default = "default_branch")]
+    pub branch: String,
+
+    /// Seconds between checks of the remote branch.
+    #[serde(default = "default_interval")]
+    pub interval_secs: u64,
+
+    /// Whether the watch runs at all — kept, like [`GitWatch::enabled`], so it
+    /// can be switched off during an incident without being retyped after.
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+
+    /// The build run in the project directory after an update, before the
+    /// restart. Program and arguments already split, for the reason
+    /// [`GitWatch::post_pull`] gives. Absent → [`DEFAULT_SELF_BUILD`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub build: Option<Vec<String>>,
+}
+
+impl SelfUpdate {
+    /// A watch of `branch` in `repository`, with defaults.
+    pub fn new(repository: impl Into<String>) -> Self {
+        Self {
+            repository: repository.into(),
+            branch: default_branch(),
+            interval_secs: DEFAULT_INTERVAL_SECS,
+            enabled: true,
+            build: None,
+        }
+    }
+
+    /// The build command to run, with the default filled in.
+    pub fn build_command(&self) -> Vec<String> {
+        match &self.build {
+            Some(command) => command.clone(),
+            None => DEFAULT_SELF_BUILD.iter().map(|s| (*s).to_string()).collect(),
+        }
+    }
+
+    /// This watch as a [`GitWatch`] over the project directory itself, so the
+    /// planning helpers that speak `GitWatch` can serve both kinds of watch.
+    pub fn as_watch(&self) -> GitWatch {
+        let mut watch = GitWatch::new(self.repository.clone(), ".");
+        watch.branch = self.branch.clone();
+        watch.interval_secs = self.interval_secs;
+        watch.enabled = self.enabled;
+        watch
+    }
+
+    /// Collects every structural problem with this watch, reported against the
+    /// dotted path `at` exactly as [`GitWatch::check`] does.
+    pub fn check(&self, at: &str, problems: &mut Vec<Problem>) {
+        if let Some(message) = repository_problem(&self.repository) {
+            problems.push(Problem { field: format!("{at}.repository"), message });
+        }
+        if let Some(message) = branch_problem(&self.branch) {
+            problems.push(Problem { field: format!("{at}.branch"), message });
+        }
+        if self.interval_secs < MIN_INTERVAL_SECS {
+            problems.push(Problem {
+                field: format!("{at}.interval_secs"),
+                message: format!(
+                    "must be at least {MIN_INTERVAL_SECS}; a shorter interval spends the \
+                     hosting provider's rate limit without noticing a push any sooner"
+                ),
+            });
+        }
+        if self.build.as_ref().is_some_and(|command| command.is_empty()) {
+            problems.push(Problem {
+                field: format!("{at}.build"),
+                message: "is present but empty; omit it entirely to use the default build".into(),
+            });
+        }
+    }
+}
+
 fn default_branch() -> String {
     DEFAULT_BRANCH.to_owned()
 }
@@ -445,5 +545,49 @@ mod tests {
         let mut watch = GitWatch::new("https://example.com/r.git", "site");
         watch.webhook_secret = Some(String::new());
         assert!(problems_of(&watch).iter().any(|p| p.field.ends_with(".webhook_secret")));
+    }
+
+    fn self_update_problems(update: &SelfUpdate) -> Vec<Problem> {
+        let mut problems = Vec::new();
+        update.check("self_update", &mut problems);
+        problems
+    }
+
+    #[test]
+    fn a_minimal_self_update_is_valid_and_builds_with_the_default_command() {
+        let update = SelfUpdate::new("https://github.com/owner/selfhost.git");
+        assert!(self_update_problems(&update).is_empty());
+        assert_eq!(update.branch, "main");
+        assert!(update.enabled);
+        assert_eq!(update.build_command().first().map(String::as_str), Some("cargo"));
+    }
+
+    #[test]
+    fn a_self_update_repository_that_would_run_a_command_is_refused() {
+        // The same door as GitWatch, locked the same way: this URL is handed to
+        // `git` as the daemon user, in the daemon's own project directory.
+        for bad in ["ext::sh -c evil", "--upload-pack=/tmp/evil", "/srv/local.git"] {
+            let update = SelfUpdate::new(bad);
+            assert!(
+                self_update_problems(&update).iter().any(|p| p.field.ends_with(".repository")),
+                "accepted {bad:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_empty_self_update_build_is_refused_rather_than_run_as_nothing() {
+        let mut update = SelfUpdate::new("https://example.com/r.git");
+        update.build = Some(Vec::new());
+        assert!(self_update_problems(&update).iter().any(|p| p.field.ends_with(".build")));
+    }
+
+    #[test]
+    fn a_self_update_speaks_git_watch_for_the_planning_helpers() {
+        let mut update = SelfUpdate::new("git@github.com:owner/selfhost.git");
+        update.branch = "release".into();
+        let watch = update.as_watch();
+        assert_eq!(watch.remote_ref(), "refs/heads/release");
+        assert_eq!(watch.repository, "git@github.com:owner/selfhost.git");
     }
 }

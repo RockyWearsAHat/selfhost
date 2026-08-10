@@ -262,6 +262,7 @@ mod tests {
             mail: None,
             namecheap_ddns: vec![],
             registrar: None,
+            self_update: None,
         }
     }
 
