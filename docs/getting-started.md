@@ -108,8 +108,13 @@ database is two different websites, not one load-balanced website.
 `www.example.com` sends visitors to `example.com` rather than serving the site
 twice at two addresses.
 
-**`spa = true`** makes any unmatched path return `index.html`. Turn it on for
-React/Vue/Svelte builds, or a reload on `/videos/2024` will 404.
+**Paths resolve the way a static site expects.** `/about` serves `about.html`,
+`/docs/` serves `docs/index.html`, and `/docs` redirects to `/docs/` so the
+page's relative links point inside the directory. Write links without the
+extension; the files stay as your generator emitted them.
+
+**`spa = true`** makes any *still* unmatched path return `index.html`. Turn it on
+for React/Vue/Svelte builds, or a reload on `/videos/2024` will 404.
 
 **`acme` is a ladder, and you climb it in order.** `self-signed` → `staging` →
 `production`. Production Let's Encrypt allows five duplicate certificates per

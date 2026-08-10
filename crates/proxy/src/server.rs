@@ -839,6 +839,17 @@ where
     Ok(Outcome::MustClose)
 }
 
+/// The same request target with a slash appended to its path.
+///
+/// Rebuilt from the raw target rather than from the decoded path, so percent
+/// escapes and the query string reach the browser exactly as they arrived.
+fn with_trailing_slash(target: &str) -> String {
+    match target.split_once('?') {
+        Some((path, query)) => format!("{path}/?{query}"),
+        None => format!("{target}/"),
+    }
+}
+
 /// Serves a request from the site's static root.
 async fn serve_static<S>(
     runtime: &SiteRuntime,
@@ -864,6 +875,15 @@ where
     let resolution = files::resolve(root, request.path(), runtime.site.spa);
     let path = match resolution {
         Resolution::File(path) => path,
+        // A directory asked for without its trailing slash is answered where it
+        // actually lives, so the browser's base URL — and every relative link on
+        // the page — resolves inside the directory rather than beside it.
+        Resolution::TrailingSlash => {
+            let response = Response::redirect(Status::MOVED_PERMANENTLY, &with_trailing_slash(&request.target))
+                .unwrap_or_else(|_| Response::error_page(Status::BAD_REQUEST));
+            write_response(stream, response, keep_alive).await?;
+            return Ok(Outcome::Reusable);
+        }
         // A traversal attempt is answered 404, not 403: confirming that
         // something exists outside the root is information the caller has not
         // earned.
@@ -1243,6 +1263,76 @@ mod tests {
         client.read_to_end(&mut response).await.expect("the refusal to read back");
         let text = String::from_utf8_lossy(&response);
         assert!(text.starts_with("HTTP/1.1 413"), "{text}");
+    }
+
+    /// A site root holding the shape a static-site generator emits: a page as a
+    /// sibling `.html` file, and a section as a directory with an index.
+    fn static_site(label: &str) -> PathBuf {
+        let root =
+            std::env::temp_dir().join(format!("selfhost-serve-{label}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("docs")).unwrap();
+        std::fs::write(root.join("index.html"), b"<h1>home</h1>").unwrap();
+        std::fs::write(root.join("about.html"), b"<h1>about</h1>").unwrap();
+        std::fs::write(root.join("docs/index.html"), b"<h1>docs</h1>").unwrap();
+        root
+    }
+
+    /// Runs one GET through `serve_static` and returns the raw response.
+    async fn get_static(root: PathBuf, target: &str) -> String {
+        let runtime = SiteRuntime {
+            site: site("pages", &["example.com"]),
+            pool: Arc::new(Pool::new(vec![])),
+            static_root: Some(root),
+        };
+        let raw = format!("GET {target} HTTP/1.1\r\nHost: example.com\r\n\r\n");
+        let request = Request::parse(raw.as_bytes()).expect("a well-formed head parses").request;
+
+        let (mut client, mut server_side) = tokio::io::duplex(8192);
+        serve_static(&runtime, &request, &mut server_side, false)
+            .await
+            .expect("serving is not an I/O error");
+        drop(server_side);
+
+        let mut response = Vec::new();
+        client.read_to_end(&mut response).await.expect("the response to read back");
+        String::from_utf8_lossy(&response).into_owned()
+    }
+
+    #[tokio::test]
+    async fn a_clean_url_serves_the_page_instead_of_404ing() {
+        // The bug this guards: `/about` is the link the site's own navigation
+        // writes, and answering it 404 while `about.html` sits in the root
+        // makes every internal link on the site dead.
+        let response = get_static(static_site("clean"), "/about").await;
+        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+        assert!(response.contains("<h1>about</h1>"), "{response}");
+    }
+
+    #[tokio::test]
+    async fn a_section_without_its_slash_is_redirected_to_where_it_lives() {
+        let response = get_static(static_site("slash"), "/docs?page=2").await;
+        assert!(response.starts_with("HTTP/1.1 301"), "{response}");
+        // The query survives, so the redirect does not silently drop state.
+        assert!(response.contains("Location: /docs/?page=2"), "{response}");
+
+        let followed = get_static(static_site("slash"), "/docs/").await;
+        assert!(followed.contains("<h1>docs</h1>"), "{followed}");
+    }
+
+    #[tokio::test]
+    async fn a_path_matching_nothing_is_still_404() {
+        let response = get_static(static_site("miss"), "/nowhere").await;
+        assert!(response.starts_with("HTTP/1.1 404"), "{response}");
+    }
+
+    #[test]
+    fn appending_a_slash_keeps_the_target_otherwise_byte_identical() {
+        assert_eq!(with_trailing_slash("/docs"), "/docs/");
+        assert_eq!(with_trailing_slash("/docs?page=2"), "/docs/?page=2");
+        // Escapes are carried through untouched: re-encoding a decoded path
+        // would be a second chance to get the encoding wrong.
+        assert_eq!(with_trailing_slash("/a%20b"), "/a%20b/");
     }
 
     #[test]
