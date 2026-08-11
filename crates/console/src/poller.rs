@@ -21,7 +21,7 @@ use crate::client::{Client, ClientError};
 use crate::nas::{self, Listing, Share};
 use crate::registry::{Person, Trail};
 use crate::remote::{Agent, Node, Settings};
-use crate::state::{Command, FileAction, Link, LogLine, Screen, Snapshot};
+use crate::state::{Command, FileAction, Link, LogLine, Screen, Snapshot, Viewer};
 use selfhost_firewall::FirewallState;
 use selfhost_json::Json;
 use selfhost_supervisor::state::{ServiceStatus, spec_from_json, spec_to_json};
@@ -121,6 +121,7 @@ fn run(connect: impl Connect, shared: Arc<Mutex<Snapshot>>, running: Arc<AtomicB
             last_poll = Some(Instant::now());
             answered = refresh_services(ready, &shared);
             if answered == Answered::Yes {
+                refresh_viewer(ready, &shared);
                 // The service list is fetched whatever is on screen: the
                 // masthead's own condition is read off it, and every screen
                 // carries the masthead. Everything below is per-screen — see
@@ -152,6 +153,37 @@ fn run(connect: impl Connect, shared: Arc<Mutex<Snapshot>>, running: Arc<AtomicB
 
         std::thread::sleep(TICK);
     }
+}
+
+/// Asks the daemon who this console's credential is, once.
+///
+/// Fetched exactly once per connection rather than every poll: a session's
+/// identity does not change under it, and a grant that does takes effect on the
+/// next connection — which the poller makes by itself whenever the daemon
+/// restarts or the credential goes stale. Costing every poll a request to learn
+/// an answer that is the same every time is the thing [`Screen`] exists to
+/// avoid.
+///
+/// A daemon built before this route existed answers `404`, and the console then
+/// keeps `None` — which draws every screen, exactly as it did before. An older
+/// daemon must not look like a person who holds nothing.
+fn refresh_viewer(client: &Client, shared: &Arc<Mutex<Snapshot>>) {
+    if shared.lock().expect("the snapshot lock was poisoned").viewer.is_some() {
+        return;
+    }
+    let Ok(value) = client.get("/api/whoami") else {
+        return;
+    };
+    let Some(viewer) = Viewer::from_json(&value) else {
+        return;
+    };
+    let mut snapshot = shared.lock().expect("the snapshot lock was poisoned");
+    // A screen this credential may not open must not stay open because it
+    // happened to be the one showing when the answer arrived.
+    if !Screen::for_viewer(Some(&viewer)).contains(&snapshot.screen) {
+        snapshot.screen = Screen::for_viewer(Some(&viewer)).first().copied().unwrap_or_default();
+    }
+    snapshot.viewer = Some(viewer);
 }
 
 /// Which screen the interface has open.

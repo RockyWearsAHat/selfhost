@@ -722,31 +722,50 @@ impl Screen {
 /// this takes the sharp one. It is also four times cheaper, which is what keeps
 /// the whole fit inside a millisecond and a half at 1920×1080.
 ///
-/// A picture smaller than the pane is left at its own size rather than magnified:
-/// one remote pixel per device pixel is the sharpest a screen can be shown, and
-/// stretching it would trade that for filling a rectangle.
+/// # It fills the pane, in both directions
+///
+/// A picture *smaller* than the pane is magnified rather than left at its own
+/// size, and that reverses an earlier decision worth naming: one remote pixel
+/// per device pixel is the sharpest a screen can be shown, so the fit used to
+/// refuse to magnify at all. On a high-density display that rule is what a
+/// person reads as a broken viewer — the pane is measured in *device* pixels, so
+/// a 2560 × 1440 machine drawn into a retina window came out at a little over
+/// half its side, a small picture adrift in a black rectangle, and made full
+/// screen it stayed small on a bigger black rectangle. A remote desktop that
+/// will not fill the screen it was given is not one, so the cap is gone: the
+/// picture takes its tighter axis and the shape is preserved, which is the whole
+/// of what a viewer promises about the far screen's proportions.
+///
+/// # The column table
+///
+/// The source column for each output column is the same for every row, so it is
+/// worked out once per fit rather than once per pixel. That is a division per
+/// output *column* instead of per output pixel, which is what keeps a fit that
+/// now covers a whole 5K screen — six times the pixels the old cap ever allowed
+/// — in the same order of cost as the pane-sized one it replaces.
 fn fit(surface: &Surface, want_width: u32, want_height: u32) -> Picture {
     let (source_width, source_height) = (surface.width(), surface.height());
     if want_width == 0 || want_height == 0 || source_width == 0 || source_height == 0 {
         return Picture::default();
     }
-    // The larger of the two ratios, so the whole picture fits inside the pane on
-    // its tighter axis; capped at one so a small screen is never magnified.
+    // The smaller of the two ratios, so the whole picture fits inside the pane
+    // on its tighter axis and the other one is centred by whoever draws it.
     let across = want_width as f64 / source_width as f64;
     let down = want_height as f64 / source_height as f64;
-    let scale = across.min(down).min(1.0);
+    let scale = across.min(down);
     let width = ((source_width as f64 * scale).round() as u32).max(1);
     let height = ((source_height as f64 * scale).round() as u32).max(1);
 
+    let columns: Vec<usize> =
+        (0..width as usize).map(|x| (x * source_width as usize) / width as usize * 4).collect();
     let mut bytes = vec![0u8; width as usize * height as usize * 4];
     let source = surface.pixels();
     for y in 0..height as usize {
         let source_y = (y * source_height as usize) / height as usize;
         let row = source_y * source_width as usize * 4;
         let target = y * width as usize * 4;
-        for x in 0..width as usize {
-            let source_x = (x * source_width as usize) / width as usize;
-            let from = row + source_x * 4;
+        for (x, offset) in columns.iter().enumerate() {
+            let from = row + offset;
             let (Some(pixel), Some(cell)) =
                 (source.get(from..from + 4), bytes.get_mut(target + x * 4..target + x * 4 + 4))
             else {
@@ -1115,11 +1134,23 @@ mod tests {
     }
 
     #[test]
-    fn a_picture_smaller_than_the_pane_is_never_magnified() {
-        // One remote pixel per device pixel is the sharpest a screen can be
-        // shown; filling the rectangle would trade that away.
+    fn a_picture_smaller_than_the_pane_is_magnified_to_fill_it() {
+        // The pane is measured in device pixels, so on a retina window this is
+        // the ordinary case and not the odd one: a far screen smaller than the
+        // pane it is drawn into, which used to be left adrift in black.
         let fitted = fit(&surface(320, 200), 1000, 1000);
-        assert_eq!((fitted.width, fitted.height), (320, 200));
+        assert_eq!(fitted.width, 1000, "the tighter axis still decides");
+        assert_eq!(fitted.height, 625);
+        assert_eq!(fitted.bytes.len(), 1000 * 625 * 4);
+    }
+
+    #[test]
+    fn a_magnified_picture_carries_the_far_screen_and_not_a_blank() {
+        // The failure a scale factor above one invites: an index computed for
+        // the output that walks off the end of a smaller source, leaving the
+        // filled rectangle the very black it was supposed to replace.
+        let fitted = fit(&surface(320, 200), 1000, 1000);
+        assert!(fitted.bytes.iter().all(|byte| *byte == 0x40), "every pixel came from the source");
     }
 
     #[test]

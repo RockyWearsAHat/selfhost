@@ -13,6 +13,7 @@ use crate::nas::{Column, Listing, Share};
 use crate::registry::{Person, Trail};
 use crate::remote::{Agent, Node, Settings};
 use selfhost_config::ServiceSpec;
+use selfhost_json::Json;
 use selfhost_firewall::FirewallState;
 use selfhost_supervisor::state::ServiceStatus;
 use std::collections::VecDeque;
@@ -331,6 +332,110 @@ impl Screen {
             Self::People => "PEOPLE",
         }
     }
+
+    /// The screens this viewer may actually use, in the same order.
+    ///
+    /// # Why the tab row is derived rather than fixed
+    ///
+    /// A console that draws four tabs to everybody is a console in which three
+    /// of them answer `401` for most people. That is not a permission model
+    /// being enforced, it is a permission model being *discovered* — one
+    /// refusal at a time, by a person who was told they had access. So the row
+    /// is a function of what the daemon says the caller holds, and a screen
+    /// absent from it is absent because the capability behind it is not held.
+    ///
+    /// The owner holds everything, always: [`Policy::decide`] never consults a
+    /// grant set for the owner, so this reads the flag rather than the list,
+    /// exactly as `/api/whoami` documents.
+    ///
+    /// Pure and total, so the mapping from capabilities onto screens is
+    /// asserted rather than trusted.
+    pub fn for_viewer(viewer: Option<&Viewer>) -> Vec<Screen> {
+        // Before the first answer, the console shows what it has always shown.
+        // The alternative — an empty rail while `whoami` is in flight — reads
+        // as a console that has lost its screens, and every plate behind those
+        // tabs already draws a refusal honestly when one comes.
+        let Some(viewer) = viewer else {
+            return Self::ALL.to_vec();
+        };
+        Self::ALL.iter().copied().filter(|screen| viewer.may_open(*screen)).collect()
+    }
+}
+
+/// Who the daemon says this console's credential is, and what it holds.
+///
+/// The answer to `GET /api/whoami`, which is the one route that exists so a
+/// client can shape itself around a person rather than around the owner. Held
+/// as an `Option` on the snapshot: `None` is "not asked yet", never "holds
+/// nothing", and the two must not draw the same.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Viewer {
+    /// The name the daemon knows them by.
+    pub name: String,
+    /// Whether they are the owner, whose authority is an identity and not a
+    /// grant. Read this rather than counting [`Viewer::grants`].
+    pub owner: bool,
+    /// How they proved it: `bearer`, `password`, `passkey`, `session`.
+    pub credential: String,
+    /// The capability words they hold, exactly as the daemon spells them —
+    /// `console.read`, `files.read:vault`, `desktop.view:alex-desktop`.
+    pub grants: Vec<String>,
+}
+
+impl Viewer {
+    /// Reads the answer to `GET /api/whoami`.
+    ///
+    /// A body missing the fields it must have is `None` rather than a viewer
+    /// holding nothing: a console that cannot read the answer must fall back to
+    /// drawing everything and letting each plate report its own refusal, not
+    /// silently hide screens the person may in fact use.
+    pub fn from_json(value: &Json) -> Option<Self> {
+        Some(Self {
+            name: value.get("name")?.as_str()?.to_owned(),
+            owner: value.get("owner")?.as_bool()?,
+            credential: value.get("credential").and_then(Json::as_str).unwrap_or("").to_owned(),
+            grants: value
+                .get("grants")
+                .and_then(Json::as_array)
+                .map(|words| words.iter().filter_map(Json::as_str).map(str::to_owned).collect())
+                .unwrap_or_default(),
+        })
+    }
+
+    /// Whether they hold any capability whose word is `word`, whatever its
+    /// target.
+    ///
+    /// Targets are deliberately ignored here. A tab is a door to a plate that
+    /// then lists what is behind it — the shares this person may open, the
+    /// machines they may watch — and that list is already filtered by the
+    /// daemon. Holding `desktop.view` for one machine out of three is a reason
+    /// to draw the DESKTOP tab, not a reason to hide it.
+    pub fn holds_word(&self, word: &str) -> bool {
+        self.grants.iter().any(|grant| grant.split(':').next() == Some(word))
+    }
+
+    /// Whether this screen has anything on it for them.
+    pub fn may_open(&self, screen: Screen) -> bool {
+        if self.owner {
+            return true;
+        }
+        match screen {
+            // The service rail, the exposure map and the masthead's own
+            // condition are all read off the routes `console.read` opens.
+            Screen::Services => self.holds_word("console.read"),
+            // Either half is enough: a person granted one share sees FILES.
+            Screen::Files => {
+                self.holds_word("files.read")
+                    || self.holds_word("files.write")
+                    || self.holds_word("files.admin")
+            }
+            // Control implies view, so the view word is the honest test.
+            Screen::Desktop => self.holds_word("desktop.view") || self.holds_word("desktop.control"),
+            // The roster and the audit trail are both owner-only routes, so for
+            // anybody else this screen is two refusals and nothing else.
+            Screen::People => false,
+        }
+    }
 }
 
 /// Where the FILES plate is looking, and what it found.
@@ -475,6 +580,11 @@ pub struct People {
 pub struct Snapshot {
     /// Whether the daemon is answering.
     pub link: Link,
+    /// Who this console's credential is, once `GET /api/whoami` has answered.
+    ///
+    /// `None` means not asked yet — never "holds nothing". See
+    /// [`Screen::for_viewer`] for why the difference decides what is drawn.
+    pub viewer: Option<Viewer>,
     /// Where the SSH tunnel is, or `None` when the console is not managing one.
     pub tunnel: Option<Tunnel>,
     /// Every service the daemon knows about, as of the last poll.
@@ -725,5 +835,89 @@ mod tests {
         let notice = snapshot.notice.expect("a notice");
         assert_eq!(notice.kind, NoticeKind::Problem);
         assert_eq!(notice.text, "no such file");
+    }
+
+    /// A viewer holding exactly these capability words.
+    fn holding(words: &[&str]) -> Viewer {
+        Viewer {
+            name: "mom".into(),
+            owner: false,
+            credential: "session".into(),
+            grants: words.iter().map(|word| (*word).to_owned()).collect(),
+        }
+    }
+
+    #[test]
+    fn a_console_that_has_not_asked_yet_draws_every_screen() {
+        // `None` is "not answered", never "holds nothing". Drawing an empty tab
+        // row while whoami is in flight would read as a console that has lost
+        // its screens; every plate behind a tab reports its own refusal.
+        assert_eq!(Screen::for_viewer(None), Screen::ALL.to_vec());
+    }
+
+    #[test]
+    fn the_owner_holds_every_screen_without_holding_a_single_grant() {
+        // The owner's authority is an identity, not a list — the daemon's
+        // policy never consults a grant set for them, so this reads the flag.
+        let owner = Viewer { owner: true, ..holding(&[]) };
+        assert_eq!(Screen::for_viewer(Some(&owner)), Screen::ALL.to_vec());
+    }
+
+    #[test]
+    fn a_person_sees_the_screens_their_capabilities_open_and_no_others() {
+        let watcher = holding(&["console.read", "desktop.view:alex-desktop"]);
+        assert_eq!(Screen::for_viewer(Some(&watcher)), vec![Screen::Services, Screen::Desktop]);
+
+        // One share is enough for FILES: the plate lists what they may open,
+        // and that list is already filtered by the daemon.
+        let reader = holding(&["files.read:vault"]);
+        assert_eq!(Screen::for_viewer(Some(&reader)), vec![Screen::Files]);
+    }
+
+    #[test]
+    fn people_is_the_owners_screen_and_nobody_elses() {
+        // Both routes behind it are owner-only, so for anybody else the screen
+        // is two refusals and nothing else.
+        let everything = holding(&[
+            "console.read",
+            "service.control",
+            "files.admin",
+            "desktop.control:self",
+            "mail.admin",
+        ]);
+        assert!(!Screen::for_viewer(Some(&everything)).contains(&Screen::People));
+    }
+
+    #[test]
+    fn a_person_holding_nothing_gets_a_row_with_nothing_on_it() {
+        // And that is the honest drawing: the alternative is four tabs that
+        // each answer 401, which is a permission model discovered one refusal
+        // at a time.
+        assert!(Screen::for_viewer(Some(&holding(&[]))).is_empty());
+    }
+
+    #[test]
+    fn a_grant_word_is_matched_whole_and_never_by_prefix() {
+        // The failure this prevents: `files.readonly` — or any word a later
+        // version adds — opening a screen because it starts the same way.
+        let viewer = holding(&["files.readable:vault"]);
+        assert!(!viewer.holds_word("files.read"));
+        assert!(holding(&["files.read:vault"]).holds_word("files.read"));
+        assert!(holding(&["console.read"]).holds_word("console.read"));
+    }
+
+    #[test]
+    fn a_whoami_answer_is_read_from_the_wire() {
+        let value = selfhost_json::parse(
+            r#"{"name":"mom","owner":false,"credential":"session","grants":["console.read"]}"#,
+        )
+        .expect("legal JSON");
+        let viewer = Viewer::from_json(&value).expect("a viewer");
+        assert_eq!(viewer.name, "mom");
+        assert!(!viewer.owner);
+        assert_eq!(viewer.grants, ["console.read"]);
+        // A body this console cannot read leaves it drawing everything, rather
+        // than hiding screens the person may in fact use.
+        assert!(Viewer::from_json(&selfhost_json::parse(r#"{"name":"mom"}"#).unwrap()).is_none());
     }
 }

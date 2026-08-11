@@ -208,6 +208,22 @@ trait Backend: Sized {
     /// Whether the window is still on screen.
     fn is_open(&self) -> bool;
 
+    /// Whether the window is currently filling the screen.
+    ///
+    /// Asked every turn of the loop rather than remembered above, because on a
+    /// platform where the *person* can do this — the green button on macOS, a
+    /// window manager's own key on X11 — the answer changes without this
+    /// program being asked, and a remembered one would be wrong from then on.
+    fn is_fullscreen(&self) -> bool;
+
+    /// Asks for the window to fill the screen, or to stop.
+    ///
+    /// A request and not a statement: macOS animates the change over about a
+    /// second and an X11 window manager may decline it altogether, so
+    /// [`Backend::is_fullscreen`] is what says whether it happened. See
+    /// [`FullscreenSync`], which is where the two are reconciled.
+    fn set_fullscreen(&self, filling: bool) -> Result<(), Error>;
+
     /// The plain text on the system clipboard, if it holds any.
     ///
     /// `Ok(None)` is a clipboard holding something that is not text, or nothing
@@ -386,6 +402,85 @@ impl Turn {
     }
 }
 
+/// What has to happen for the window and the application to agree about
+/// filling the screen.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FullscreenMove {
+    /// Ask the window to fill the screen, or to stop.
+    AskWindow(bool),
+    /// Tell the application the platform changed this without being asked.
+    TellApp(bool),
+}
+
+/// How long a window is given to honour a request before it is given up on.
+///
+/// macOS animates the change over about a second, and a request made while that
+/// animation is running is ignored — so the wait has to outlast it. An X11
+/// window manager that simply declines never answers at all, and without a
+/// deadline the interface would stay drawn as though it were filling a screen
+/// it never got.
+const FULLSCREEN_PATIENCE: Duration = Duration::from_secs(3);
+
+/// Keeps the application's idea of filling the screen and the window's own in
+/// step, in whichever direction the change came from.
+///
+/// # Why this is not one comparison
+///
+/// Both ends can change it. The application toggles it from a button, and the
+/// person can toggle it from the platform — the green button, a window
+/// manager's key — so a loop that only pushed one way would fight whoever
+/// pressed the other. And neither end changes it *immediately*: on macOS the
+/// window reports the old answer for the whole of the transition, so a naive
+/// comparison would read a request in flight as the platform having refused it
+/// and hand the application back the state it had just left.
+///
+/// So a request is remembered until the window agrees with it, and only a
+/// change the window makes on its own — while nothing is in flight — is
+/// reported back.
+#[derive(Debug)]
+struct FullscreenSync {
+    /// What the window last said, once nothing was in flight.
+    mirrored: bool,
+    /// A request the window has not yet honoured, and when it was made.
+    awaiting: Option<(bool, Instant)>,
+}
+
+impl FullscreenSync {
+    /// A window that is not filling the screen and has been asked for nothing.
+    fn new(filling: bool) -> Self {
+        Self { mirrored: filling, awaiting: None }
+    }
+
+    /// What to do, given what the window says and what the application wants.
+    fn settle(&mut self, actual: bool, wanted: bool, now: Instant) -> Option<FullscreenMove> {
+        if let Some((target, asked_at)) = self.awaiting {
+            if actual == target {
+                self.awaiting = None;
+                self.mirrored = actual;
+                return None;
+            }
+            if now.saturating_duration_since(asked_at) < FULLSCREEN_PATIENCE {
+                return None;
+            }
+            // The window will not do it. Saying so is the whole point: an
+            // interface that laid itself out for a screen it never got would
+            // leave the person looking at a picture with no way back.
+            self.awaiting = None;
+            self.mirrored = actual;
+            return Some(FullscreenMove::TellApp(actual));
+        }
+        if actual != self.mirrored {
+            self.mirrored = actual;
+            return Some(FullscreenMove::TellApp(actual));
+        }
+        if wanted != actual {
+            self.awaiting = Some((wanted, now));
+            return Some(FullscreenMove::AskWindow(wanted));
+        }
+        None
+    }
+}
+
 /// Opens a window and runs `app` in it until it is closed.
 pub(crate) fn run<S>(
     options: WindowOptions,
@@ -411,6 +506,7 @@ pub(crate) fn run<S>(
         composition_area: None,
     };
     let mut events = Vec::new();
+    let mut fullscreen = FullscreenSync::new(window.is_fullscreen());
     // When a frame is owed however little else has happened. Drawing on every
     // wake would be right but wasteful once another thread has shortened the
     // wait to a stream's pace: an unrequested wake would then re-rasterise the
@@ -441,8 +537,22 @@ pub(crate) fn run<S>(
         // decision, so that a request arriving in the same wait as an event is
         // cleared by the frame that answers both instead of provoking a second.
         let now = Instant::now();
+        // Before the frame, so a toggle pressed on the last one is asked for
+        // now and a change the platform made on its own is in the state this
+        // frame is drawn from rather than in the one after it.
+        let mut told_app = false;
+        if let Some(wanted) = app.wants_fullscreen() {
+            match fullscreen.settle(window.is_fullscreen(), wanted, now) {
+                Some(FullscreenMove::AskWindow(filling)) => window.set_fullscreen(filling)?,
+                Some(FullscreenMove::TellApp(filling)) => {
+                    app.report_fullscreen(filling);
+                    told_app = true;
+                }
+                None => {}
+            }
+        }
         let turn = Turn {
-            requested: app.take_redraw_request(),
+            requested: told_app || app.take_redraw_request(),
             had_events: !events.is_empty(),
             animating: surface.memory.is_animating(),
             idle_elapsed: now >= idle_due,
@@ -485,6 +595,51 @@ mod tests {
         ] {
             assert!(turn.is_due(), "{turn:?} should have drawn");
         }
+    }
+
+    #[test]
+    fn a_toggle_in_the_interface_is_asked_of_the_window_once() {
+        let mut sync = FullscreenSync::new(false);
+        let now = Instant::now();
+        assert_eq!(sync.settle(false, true, now), Some(FullscreenMove::AskWindow(true)));
+        // The whole of a macOS transition, during which the window still says
+        // it is not filling the screen. Asking again would be ignored, and
+        // reporting back would undo the toggle the person just pressed.
+        assert_eq!(sync.settle(false, true, now + Duration::from_millis(500)), None);
+        assert_eq!(sync.settle(true, true, now + Duration::from_millis(900)), None);
+        // And once it has arrived, nothing more is owed either way.
+        assert_eq!(sync.settle(true, true, now + Duration::from_secs(30)), None);
+    }
+
+    #[test]
+    fn a_window_the_person_took_out_of_full_screen_is_reported_back() {
+        // The green button, or Escape: the platform's own answer wins, and the
+        // interface has to be told so it can lay itself out for a window again.
+        let mut sync = FullscreenSync::new(true);
+        let now = Instant::now();
+        assert_eq!(sync.settle(false, true, now), Some(FullscreenMove::TellApp(false)));
+        assert_eq!(sync.settle(false, false, now), None, "the application agreed");
+    }
+
+    #[test]
+    fn a_request_a_window_never_honours_is_given_up_on_rather_than_left_pending() {
+        // An X11 window manager that declines says nothing at all. Without the
+        // deadline the interface would stay drawn for a full screen it never
+        // got, with the control that would undo it hidden inside that layout.
+        let mut sync = FullscreenSync::new(false);
+        let now = Instant::now();
+        assert_eq!(sync.settle(false, true, now), Some(FullscreenMove::AskWindow(true)));
+        assert_eq!(sync.settle(false, true, now + FULLSCREEN_PATIENCE / 2), None);
+        assert_eq!(
+            sync.settle(false, true, now + FULLSCREEN_PATIENCE),
+            Some(FullscreenMove::TellApp(false))
+        );
+    }
+
+    #[test]
+    fn a_window_that_was_never_asked_anything_is_left_alone() {
+        let mut sync = FullscreenSync::new(false);
+        assert_eq!(sync.settle(false, false, Instant::now()), None);
     }
 
     #[test]

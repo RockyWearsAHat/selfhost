@@ -35,6 +35,7 @@ use crate::accessibility::AccessUpdate;
 use crate::input::Composition;
 use crate::theme::Appearance;
 use crate::{Canvas, Event, Key, KeyCode, Modifiers, Point, PointerButton, Rect};
+use std::cell::Cell;
 use std::ffi::c_void;
 use std::time::Duration;
 
@@ -102,6 +103,20 @@ unsafe extern "system" {
     fn GetDpiForWindow(window: Handle) -> u32;
     fn IsWindow(window: Handle) -> i32;
     fn LoadCursorW(instance: Handle, name: *const u16) -> Handle;
+    fn GetWindowRect(window: Handle, rect: *mut WindowRect) -> i32;
+    fn GetWindowLongPtrW(window: Handle, index: i32) -> LongParameter;
+    fn SetWindowLongPtrW(window: Handle, index: i32, value: LongParameter) -> LongParameter;
+    fn SetWindowPos(
+        window: Handle,
+        insert_after: Handle,
+        x: i32,
+        y: i32,
+        width: i32,
+        height: i32,
+        flags: u32,
+    ) -> i32;
+    fn MonitorFromWindow(window: Handle, flags: u32) -> Handle;
+    fn GetMonitorInfoW(monitor: Handle, info: *mut MonitorInfo) -> i32;
 }
 
 #[link(name = "gdi32")]
@@ -192,6 +207,20 @@ struct WindowRect {
     bottom: i32,
 }
 
+/// `MONITORINFO`: where a display is, and which part of it a window may have.
+///
+/// `monitor` is the whole panel and `work` is what is left once the taskbar has
+/// had its share. A full screen wants the first — covering the taskbar is the
+/// difference between filling the screen and merely being large.
+#[repr(C)]
+#[derive(Default, Clone, Copy)]
+struct MonitorInfo {
+    size: u32,
+    monitor: WindowRect,
+    work: WindowRect,
+    flags: u32,
+}
+
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct Message {
@@ -261,6 +290,17 @@ struct CompositionForm {
 
 // Window styles and commands.
 const WS_OVERLAPPEDWINDOW: u32 = 0x00CF_0000;
+/// `WS_POPUP`: a window with no frame, caption, or border of its own.
+const WS_POPUP: u32 = 0x8000_0000;
+/// `GWL_STYLE`: the style word, for reading and putting back.
+const GWL_STYLE: i32 = -16;
+/// `MONITOR_DEFAULTTONEAREST`: the display a window is most on.
+const MONITOR_DEFAULTTONEAREST: u32 = 2;
+/// `SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED`.
+///
+/// The frame change is the one that matters: without it the old frame's
+/// measurements are kept and the client area comes out the wrong size.
+const SWP_FRAME_CHANGED: u32 = 0x0004 | 0x0010 | 0x0020;
 const SW_SHOW: i32 = 5;
 const CW_USEDEFAULT: i32 = i32::MIN;
 const IDC_ARROW: u32 = 32512;
@@ -359,6 +399,15 @@ pub(crate) struct Window {
     /// Client area in device pixels, as of the last pump.
     size: (u32, u32),
     scale: f32,
+    /// The frame and the place to put it back, while the screen is filled.
+    ///
+    /// `None` means the window is its ordinary self. Windows has no full-screen
+    /// mode of its own for a window like this one — what a game or a browser
+    /// does here is exactly this: drop the frame and cover the display — so
+    /// what was dropped has to be kept somewhere, and this is it. A [`Cell`]
+    /// because the seam asks for this through `&self`, in the same way the X11
+    /// backend keeps its clipboard text.
+    windowed: Cell<Option<(LongParameter, WindowRect)>>,
 }
 
 impl Backend for Window {
@@ -415,7 +464,8 @@ impl Backend for Window {
             ShowWindow(handle, SW_SHOW);
             UpdateWindow(handle);
 
-            let mut window = Self { handle, open: true, size: (1, 1), scale: 1.0 };
+            let mut window =
+                Self { handle, open: true, size: (1, 1), scale: 1.0, windowed: Cell::new(None) };
             window.refresh_geometry();
             Ok(window)
         }
@@ -535,6 +585,32 @@ impl Backend for Window {
         self.open
     }
 
+    fn is_fullscreen(&self) -> bool {
+        // What this backend did, and not a question put to the system: Windows
+        // has no notion of a full-screen window to ask about, so the frame this
+        // window took off is the whole of the fact. Nothing outside this file
+        // can put it back, which is why remembering it here cannot go stale in
+        // the way the same trick would on macOS.
+        let windowed = self.windowed.take();
+        let filling = windowed.is_some();
+        self.windowed.set(windowed);
+        filling
+    }
+
+    fn set_fullscreen(&self, filling: bool) -> Result<(), Error> {
+        match (filling, self.windowed.take()) {
+            (true, None) => self.fill_screen(),
+            (false, Some(windowed)) => self.restore_window(windowed),
+            // Already as asked. The `take` above is put back by the arms that
+            // change something; this one has nothing to change.
+            (true, windowed @ Some(_)) => {
+                self.windowed.set(windowed);
+                Ok(())
+            }
+            (false, None) => Ok(()),
+        }
+    }
+
     fn clipboard_text(&self) -> Result<Option<String>, Error> {
         unsafe {
             // Asked before the clipboard is opened, because opening it locks
@@ -643,6 +719,62 @@ impl Backend for Window {
 }
 
 impl Window {
+    /// Takes the frame off and covers the display the window is most on.
+    ///
+    /// The style and the outer rectangle are written down first, because they
+    /// are the only record of what the window was: nothing else on the system
+    /// remembers where a window that has been resized used to be.
+    fn fill_screen(&self) -> Result<(), Error> {
+        unsafe {
+            let mut place = WindowRect::default();
+            if GetWindowRect(self.handle, &mut place) == 0 {
+                return Err(Error::Platform("GetWindowRect failed".into()));
+            }
+            let monitor = MonitorFromWindow(self.handle, MONITOR_DEFAULTTONEAREST);
+            let mut info =
+                MonitorInfo { size: std::mem::size_of::<MonitorInfo>() as u32, ..MonitorInfo::default() };
+            if GetMonitorInfoW(monitor, &mut info) == 0 {
+                return Err(Error::Platform("GetMonitorInfoW failed".into()));
+            }
+            let style = GetWindowLongPtrW(self.handle, GWL_STYLE);
+            // Cast from `u32` rather than through `i32`: `WS_POPUP` has its top
+            // bit set, and going by way of a signed 32-bit value would sign-
+            // extend it into the high half of the style word.
+            let filling =
+                (style & !(WS_OVERLAPPEDWINDOW as LongParameter)) | WS_POPUP as LongParameter;
+            SetWindowLongPtrW(self.handle, GWL_STYLE, filling);
+            let screen = info.monitor;
+            SetWindowPos(
+                self.handle,
+                std::ptr::null_mut(),
+                screen.left,
+                screen.top,
+                screen.right - screen.left,
+                screen.bottom - screen.top,
+                SWP_FRAME_CHANGED,
+            );
+            self.windowed.set(Some((style, place)));
+        }
+        Ok(())
+    }
+
+    /// Puts the frame and the place back, exactly as they were.
+    fn restore_window(&self, (style, place): (LongParameter, WindowRect)) -> Result<(), Error> {
+        unsafe {
+            SetWindowLongPtrW(self.handle, GWL_STYLE, style);
+            SetWindowPos(
+                self.handle,
+                std::ptr::null_mut(),
+                place.left,
+                place.top,
+                place.right - place.left,
+                place.bottom - place.top,
+                SWP_FRAME_CHANGED,
+            );
+        }
+        Ok(())
+    }
+
     /// What the input method has in progress, and where its caret sits in it.
     ///
     /// `index` selects which string to read — the one being composed, or the one
@@ -961,14 +1093,26 @@ mod tests {
 
     #[test]
     fn a_pointer_left_of_the_window_reads_as_negative_not_as_sixty_five_thousand() {
-        let window = Window { handle: std::ptr::null_mut(), open: true, size: (100, 100), scale: 1.0 };
+        let window = Window {
+            handle: std::ptr::null_mut(),
+            open: true,
+            size: (100, 100),
+            scale: 1.0,
+            windowed: Cell::new(None),
+        };
         let packed = (-4i16 as u16 as isize) | ((-9i16 as u16 as isize) << 16);
         assert_eq!(window.position_of(packed), Point::new(-4.0, -9.0));
     }
 
     #[test]
     fn pointer_positions_are_divided_by_the_display_scale() {
-        let window = Window { handle: std::ptr::null_mut(), open: true, size: (200, 200), scale: 2.0 };
+        let window = Window {
+            handle: std::ptr::null_mut(),
+            open: true,
+            size: (200, 200),
+            scale: 2.0,
+            windowed: Cell::new(None),
+        };
         let packed = 40isize | (60isize << 16);
         assert_eq!(window.position_of(packed), Point::new(20.0, 30.0));
     }

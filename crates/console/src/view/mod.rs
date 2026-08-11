@@ -274,6 +274,14 @@ pub struct Console {
     /// changes: a remembered point from another screen would suppress the first
     /// real movement on this one.
     aimed: Option<(i32, i32)>,
+    /// Whether the window is filling the screen.
+    ///
+    /// Written by the person, through [`Console::toggle_full_screen`], and by
+    /// the window itself through the binding in [`application`] — the green
+    /// button and Control-Command-F both go around this program. One fact and
+    /// not two, so the layout and the window cannot come to disagree about
+    /// whether there is a title bar on screen. See [`desktop::stage`].
+    full_screen: bool,
 }
 
 impl Console {
@@ -303,6 +311,7 @@ impl Console {
             viewport_focus: false,
             held: Modifiers::default(),
             aimed: None,
+            full_screen: false,
         }
     }
 
@@ -718,6 +727,31 @@ impl Console {
         self.viewport_focus = true;
     }
 
+    /// Whether the window is filling the screen.
+    pub(crate) fn full_screen(&self) -> bool {
+        self.full_screen
+    }
+
+    /// Asks the window to fill the screen, or to stop.
+    ///
+    /// What a control in the interface presses. The window is not touched here
+    /// — this console has none to touch — so the flag is a *request* until the
+    /// binding in [`application`] carries it out; a platform that refuses puts
+    /// it straight back, which is why nothing else is allowed to depend on the
+    /// two having changed together.
+    pub(crate) fn toggle_full_screen(&mut self) {
+        self.full_screen = !self.full_screen;
+    }
+
+    /// Writes down that the window is, or is no longer, filling the screen.
+    ///
+    /// For the platform's own way in: the green button on macOS, a window
+    /// manager's key, or Escape out of a full screen — none of which this
+    /// program is asked about first.
+    pub(crate) fn set_full_screen(&mut self, filling: bool) {
+        self.full_screen = filling;
+    }
+
     /// Watches a different machine, closing whatever session is open.
     ///
     /// A session belongs to the machine it was minted for — the ticket names it
@@ -880,10 +914,18 @@ impl Console {
     /// vocabulary, and a synthesized keystroke with no code names no key another
     /// machine could be told about.
     pub(crate) fn forward_key(&mut self, stroke: KeyStroke) {
+        let driving = self
+            .session
+            .as_ref()
+            .is_some_and(|session| desktop::forwards_keys(&session.live(), self.viewport_focus));
+        if desktop::leaves_full_screen(stroke, self.full_screen, driving) {
+            self.full_screen = false;
+            return;
+        }
         let Some(session) = &self.session else {
             return;
         };
-        if !desktop::forwards_keys(&session.live(), self.viewport_focus) {
+        if !driving {
             return;
         }
         for (usage, down) in remote::keystroke_messages(self.held, stroke) {
@@ -934,7 +976,15 @@ fn downloads_directory() -> std::path::PathBuf {
 /// library's own colours — which is a thing worth being unable to do by
 /// accident. See [`style::theme`].
 pub(crate) fn application(title: impl Into<String>, console: Console) -> App<Console> {
-    App::new(title, console, view).theme(style::theme).ground(style::ground)
+    App::new(title, console, view)
+        .theme(style::theme)
+        .ground(style::ground)
+        // The one place the window's own state and the console's are tied
+        // together. Both ends move it: FULL SCREEN and Escape from in here, the
+        // green button and Control-Command-F from out there.
+        .fullscreen(Console::full_screen, |console: &mut Console, filling| {
+            console.set_full_screen(filling);
+        })
 }
 
 /// The whole console, as one description.
@@ -955,6 +1005,15 @@ pub fn view(console: &Console) -> El<Console> {
     let snapshot = console.snapshot();
     let screen = snapshot.screen;
 
+    // A filled screen showing a machine's own screen is the far machine and
+    // nothing else — no masthead, no tabs, no page margin. Only the DESKTOP
+    // screen claims it: a window made full screen while a log is open is a
+    // large window with a log in it, which is what its person asked for.
+    if screen == Screen::Desktop && console.full_screen() && console.place == Place::Machine {
+        drop(snapshot);
+        return desktop::stage(console);
+    }
+
     // Standing above the machines is a different place, not a fifth tab: the
     // tab row belongs to a machine, so it is absent here along with everything
     // under it. The masthead stays, because the link it reports is still up —
@@ -968,7 +1027,7 @@ pub fn view(console: &Console) -> El<Console> {
 
     col((
         header(console, &snapshot),
-        screens(screen),
+        screens(screen, snapshot.viewer.as_ref()),
         tunnel_banner(&snapshot).map(banner),
         snapshot.notice.clone().map(notice),
         match screen {
@@ -1001,14 +1060,24 @@ pub fn view(console: &Console) -> El<Console> {
 /// for them and the one place they are not competing with a reading. The chosen
 /// one is marked by a bar on a rule that runs the full width — the rule
 /// separates the row from the page, not the tabs from each other.
-fn screens(screen: Screen) -> El<Console> {
-    let labels: Vec<&str> = Screen::ALL.iter().map(|screen| screen.label()).collect();
-    let chosen = Screen::ALL.iter().position(|candidate| *candidate == screen).unwrap_or(0);
-    tabs(&labels, chosen, |console: &mut Console, index| {
+fn screens(screen: Screen, viewer: Option<&crate::state::Viewer>) -> El<Console> {
+    // The row is what this credential may open, not what the console can draw.
+    // See `Screen::for_viewer`: a tab that answers 401 is a permission model
+    // being discovered one refusal at a time.
+    let open: Vec<Screen> = Screen::for_viewer(viewer);
+    let labels: Vec<&str> = open.iter().map(|screen| screen.label()).collect();
+    let chosen = open.iter().position(|candidate| *candidate == screen).unwrap_or(0);
+    // The handler is a plain `Copy` closure, as every rui handler is, so the row
+    // it dispatches through is a fixed array rather than the vector above.
+    let mut row = [None; Screen::ALL.len()];
+    for (slot, screen) in row.iter_mut().zip(open) {
+        *slot = Some(screen);
+    }
+    tabs(&labels, chosen, move |console: &mut Console, index| {
         // A tab index that names no screen changes nothing, rather than falling
         // back to the first: an out-of-range index is a defect in this row, and
         // silently opening SERVICES would hide it.
-        if let Some(screen) = Screen::ALL.get(index).copied() {
+        if let Some(Some(screen)) = row.get(index).copied() {
             console.show(screen);
         }
     })
@@ -2574,6 +2643,54 @@ mod tests {
 
         harness.move_pointer(screen.center());
         assert!(sent.try_recv().is_err(), "a watching session sent the far machine a pointer");
+    }
+
+    #[test]
+    fn a_full_screen_desktop_gives_the_far_machine_the_whole_window() {
+        // What "like its own whole application" has to mean to be worth the
+        // name: the picture takes the room the masthead, the tabs, the picker
+        // and the page margin were using, and the way back is still on screen.
+        let mut harness =
+            Harness::with_app(application("selfhost", watching(fleet(), still_session(false))))
+                .size(980.0, 680.0);
+        harness.frame();
+        let pane = harness.find_key("screen").expect("the viewport is drawn").rect;
+        assert!(harness.rect_of("SERVICES").is_some(), "the tabs are there to begin with");
+
+        harness.click_text("FULL SCREEN");
+        harness.frame();
+        assert!(harness.state().full_screen(), "the window was asked to fill the screen");
+        assert!(harness.rect_of("SERVICES").is_none(), "the tab row went with the chrome");
+        assert!(harness.rect_of("MACHINES").is_none(), "and so did the picker");
+        let stage = harness.find_key("screen").expect("the viewport is still drawn").rect;
+        assert!(stage.w > pane.w && stage.h > pane.h, "{stage:?} is no larger than {pane:?}");
+        assert!(harness.rect_of("EXIT FULL SCREEN").is_some(), "the way out is on screen");
+    }
+
+    #[test]
+    fn leaving_a_full_screen_puts_the_console_back() {
+        let mut harness =
+            Harness::with_app(application("selfhost", watching(fleet(), still_session(false))))
+                .size(980.0, 680.0);
+        harness.frame();
+        harness.click_text("FULL SCREEN");
+        harness.frame();
+        harness.click_text("EXIT FULL SCREEN");
+        harness.frame();
+        assert!(!harness.state().full_screen());
+        assert!(harness.rect_of("SERVICES").is_some(), "the console came back whole");
+    }
+
+    #[test]
+    fn a_window_filling_the_screen_on_another_plate_is_only_a_large_window() {
+        // The stage belongs to the DESKTOP screen. A person who made the window
+        // full screen while reading a log asked for a bigger log, not for the
+        // console to be taken away from them.
+        let mut harness =
+            Harness::with_app(application("selfhost", console(busy()))).size(980.0, 680.0);
+        harness.state_mut().set_full_screen(true);
+        harness.frame();
+        assert!(harness.rect_of("SERVICES").is_some(), "the tabs stayed on a services plate");
     }
 
     #[test]
