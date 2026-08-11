@@ -72,6 +72,7 @@
 pub mod cursor;
 pub mod grant;
 pub mod keys;
+pub mod relay;
 pub mod state;
 pub mod tiles;
 pub mod viewer;
@@ -83,6 +84,7 @@ pub use grant::{
     Policy, Redemption, SessionId, Ticket, TicketRequest, TICKET_BYTES, TICKET_TTL,
 };
 pub use keys::{HeldKeys, KeyDef, KeyError, KeyKind, Modifier, Side, Usage, KEYS};
+pub use relay::{Relay, Upstream};
 pub use state::{
     Action, Limits, Notice, Observation, Phase, Session, Step, Surrender, Suspension,
 };

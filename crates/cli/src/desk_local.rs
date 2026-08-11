@@ -130,6 +130,16 @@ pub struct Backend {
     /// draws a display picker should draw an empty one in both cases rather than
     /// offer a screen that cannot be produced.
     pub displays: u32,
+    /// Whether the frames come from a supervised agent rather than from this
+    /// process.
+    ///
+    /// True on exactly one deployment: a Windows daemon in session 0, which
+    /// cannot capture anything itself and relays what an agent in the console
+    /// session produces ([`selfhost_desk::relay`]). The distinction is not
+    /// cosmetic — it decides which of the two session drivers
+    /// [`crate::desk_task`] builds, and the two take their pixels from different
+    /// places — so it is carried rather than re-derived from the sentence.
+    pub relayed: bool,
 }
 
 impl Backend {
@@ -149,13 +159,36 @@ impl Backend {
             // billion displays, and a cast that could disagree with the list it
             // came from is not worth the byte it saves.
             displays: u32::try_from(displays).unwrap_or(u32::MAX),
+            relayed: false,
+        }
+    }
+
+    /// A backend whose pixels arrive from a supervised agent.
+    ///
+    /// `wired` is true because the daemon **can** serve a picture — that is the
+    /// whole point of the agent — and the displays are left at zero because only
+    /// the agent knows them and it has not necessarily spoken yet. The agent's
+    /// own report carries the count once it has.
+    // Built by the Windows probe alone, because session 0 is the only place a
+    // daemon cannot capture what it is nonetheless able to serve. Named rather
+    // than `cfg`-gated so that every platform's build type-checks the one
+    // constructor whose field values decide which session driver runs.
+    #[cfg_attr(not(windows), allow(dead_code))]
+    fn relayed(name: &'static str, why: impl Into<String>) -> Self {
+        Self {
+            name,
+            wired: true,
+            why: why.into(),
+            condition: Condition::Retry,
+            displays: 0,
+            relayed: true,
         }
     }
 
     /// A backend that is not reachable, and the reason, in the state that
     /// reason puts a capture attempt in.
     fn unwired(name: &'static str, why: impl Into<String>, condition: Condition) -> Self {
-        Self { name, wired: false, why: why.into(), condition, displays: 0 }
+        Self { name, wired: false, why: why.into(), condition, displays: 0, relayed: false }
     }
 }
 
@@ -217,10 +250,10 @@ fn probe() -> Backend {
 /// fixes that — the pixels have to be captured by a process running *inside* the
 /// session a person is sitting in, reached over
 /// `\\.\pipe\selfhost-desk-<session>`. [`crate::desk_supervisor`] creates that
-/// pipe and keeps that agent alive, so the process exists; what does not yet
-/// exist is the splice that forwards its frames into a viewer session, and until
-/// it does this probe reports the backend as unreachable **with that reason**
-/// rather than answering "GDI" above a viewport that will never fill.
+/// pipe and keeps that agent alive, and [`selfhost_desk::relay`] carries its
+/// messages into a viewer session, so this probe reports a **relayed** backend:
+/// wired, because a picture can be served, and named as relayed, because the
+/// driver that serves it is not the one that captures.
 ///
 /// Run by hand from a terminal, the same daemon is in the console user's own
 /// session, and then GDI works in-process with nothing between it and the
@@ -240,15 +273,14 @@ fn probe() -> Backend {
         );
     };
     if session == 0 {
-        return Backend::unwired(
+        return Backend::relayed(
             NAME,
             "the daemon is running as a service in session 0, which has no interactive desktop, so \
-             nothing in this process can capture the screen. An agent is supervised in the console \
-             user's session and reached over a named pipe whose DACL names that user — see the \
-             agent's own line for what it is doing — but its frames are not yet spliced into a \
-             viewer session, so this daemon still serves no pixels. Running `selfhost daemon` from \
-             a signed-in session captures directly instead.",
-            Condition::NoSession,
+             nothing in this process captures anything. The pixels come from an agent supervised \
+             in the console user's session and reached over a named pipe whose DACL names that \
+             user; the daemon forwards its messages without reading them, and applies this \
+             session's own permissions to every keystroke going the other way. See the agent's own \
+             line for whether one is running.",
         );
     }
     match gdi::monitors() {
