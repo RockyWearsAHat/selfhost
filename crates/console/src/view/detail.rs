@@ -18,6 +18,16 @@ use selfhost_supervisor::state::ServiceState;
 /// the pane at the smallest window the backend allows.
 const ACTION_WIDTH: f32 = 82.0;
 
+/// The same, for the one button that stands alone.
+///
+/// `UNINSTALL` is the longest word in the row and the only one that is not in
+/// the shared-width group — a rule separates it, because it is not a lifecycle
+/// event. Capping it at [`ACTION_WIDTH`] cut it to `UNINST…`, which is the
+/// worst possible ellipsis: a destructive control whose word cannot be read
+/// whole. It gets the width its own word needs, and it still shares the row's
+/// slack on a narrow pane rather than pushing anything off the edge.
+const DESTRUCTIVE_WIDTH: f32 = 104.0;
+
 /// How wide the gutter of sequence numbers beside the output is.
 const SEQ_GUTTER: f32 = 34.0;
 
@@ -159,7 +169,10 @@ fn actions(name: &str, state: &ServiceState, startable: bool, requested: bool) -
         // hand's width of nothing between it and Uninstall, which is the exact
         // defect the rule was drawn to answer.
         style::rule().pad_x(12.0),
-        action("UNINSTALL", Command::Uninstall(name.to_owned())).danger().disabled(requested),
+        action("UNINSTALL", Command::Uninstall(name.to_owned()))
+            .danger()
+            .max_w(DESTRUCTIVE_WIDTH)
+            .disabled(requested),
     ))
     .h(36.0)
     .pad(4.0)
