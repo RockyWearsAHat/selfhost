@@ -31,7 +31,7 @@
 
 use std::time::{Duration, SystemTime};
 
-use selfhost_mail::{deliver_to_host, Address, SmtpClient};
+use selfhost_mail::{Address, SmtpClient, deliver_to_host};
 
 use crate::clock;
 use crate::store::Entry;
@@ -70,7 +70,13 @@ impl Mailbox {
         if helo.is_empty() || host.is_empty() {
             return Err("a mailbox needs a HELO name and an SMTP host".to_string());
         }
-        Ok(Self { from: from.to_string(), to: to.to_string(), helo, host, port })
+        Ok(Self {
+            from: from.to_string(),
+            to: to.to_string(),
+            helo,
+            host,
+            port,
+        })
     }
 }
 
@@ -138,7 +144,11 @@ pub fn message(mailbox: &Mailbox, entry: &Entry, now: SystemTime) -> Vec<u8> {
     ));
 
     let mut out = head.into_bytes();
-    out.extend_from_slice(body.replace('\n', "\r\n").replace("\r\r\n", "\r\n").as_bytes());
+    out.extend_from_slice(
+        body.replace('\n', "\r\n")
+            .replace("\r\r\n", "\r\n")
+            .as_bytes(),
+    );
     out
 }
 
@@ -165,7 +175,12 @@ pub async fn send(mailbox: &Mailbox, message: &[u8]) -> Result<(), String> {
                 DELIVERY_TIMEOUT.as_secs()
             )
         })?
-        .map_err(|error| format!("{}:{} refused the report: {error}", mailbox.host, mailbox.port))?;
+        .map_err(|error| {
+            format!(
+                "{}:{} refused the report: {error}",
+                mailbox.host, mailbox.port
+            )
+        })?;
 
     if delivery.accepted.is_empty() {
         return Err(format!(
@@ -183,7 +198,12 @@ fn subject_for(entry: &Entry) -> String {
     } else {
         String::new()
     };
-    let plain = format!("[{} {}] {}{repeat}", entry.project, entry.kind.as_str(), entry.title);
+    let plain = format!(
+        "[{} {}] {}{repeat}",
+        entry.project,
+        entry.kind.as_str(),
+        entry.title
+    );
     if plain.is_ascii() {
         return plain;
     }
@@ -192,8 +212,7 @@ fn subject_for(entry: &Entry) -> String {
 
 /// Standard base64 with padding (RFC 4648 §4), for the one encoded-word above.
 fn base64(data: &[u8]) -> String {
-    const ALPHABET: &[u8; 64] =
-        b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
     for chunk in data.chunks(3) {
         let mut block = [0u8; 3];
@@ -256,8 +275,14 @@ mod tests {
     use std::time::UNIX_EPOCH;
 
     fn mailbox() -> Mailbox {
-        Mailbox::new("reports@example.com", "owner@example.com", "example.com", "127.0.0.1", 25)
-            .expect("mailbox")
+        Mailbox::new(
+            "reports@example.com",
+            "owner@example.com",
+            "example.com",
+            "127.0.0.1",
+            25,
+        )
+        .expect("mailbox")
     }
 
     fn entry(title: &str) -> Entry {
@@ -291,14 +316,20 @@ mod tests {
     #[test]
     fn the_message_carries_the_headers_a_client_sorts_by() {
         let text = rendered("search answers with the heading");
-        assert!(text.starts_with("Date: Thu, 01 Jan 1970 00:00:00 +0000\r\n"), "{text}");
+        assert!(
+            text.starts_with("Date: Thu, 01 Jan 1970 00:00:00 +0000\r\n"),
+            "{text}"
+        );
         assert!(text.contains("From: dx reports <reports@example.com>\r\n"));
         assert!(text.contains("To: <owner@example.com>\r\n"));
         assert!(text.contains("Subject: [dx bug] search answers with the heading\r\n"));
         assert!(text.contains("Message-ID: <report-1a2b3c4d.0@example.com>\r\n"));
         assert!(text.contains("Auto-Submitted: auto-generated\r\n"));
         assert!(text.contains("X-Report-Id: report-1a2b3c4d\r\n"));
-        assert!(text.contains("\r\n\r\n"), "the head must end with a blank line");
+        assert!(
+            text.contains("\r\n\r\n"),
+            "the head must end with a blank line"
+        );
     }
 
     #[test]
@@ -315,7 +346,10 @@ mod tests {
         let mut repeated = entry("keeps happening");
         repeated.sightings = 7;
         let text = String::from_utf8(message(&mailbox(), &repeated, UNIX_EPOCH)).expect("utf-8");
-        assert!(text.contains("Subject: [dx bug] keeps happening (seen 7 times)"), "{text}");
+        assert!(
+            text.contains("Subject: [dx bug] keeps happening (seen 7 times)"),
+            "{text}"
+        );
     }
 
     /// The property the whole intake depends on: a title cannot open a second header.
@@ -327,7 +361,12 @@ mod tests {
         let text = rendered(&title);
         let head = text.split("\r\n\r\n").next().expect("head");
         assert!(!head.to_lowercase().contains("\r\nbcc:"), "{head}");
-        assert_eq!(head.lines().filter(|line| line.starts_with("Subject:")).count(), 1);
+        assert_eq!(
+            head.lines()
+                .filter(|line| line.starts_with("Subject:"))
+                .count(),
+            1
+        );
     }
 
     #[test]
@@ -356,7 +395,10 @@ mod tests {
         let mut long = entry("wrapped");
         long.detail = "word ".repeat(120);
         let text = String::from_utf8(message(&mailbox(), &long, UNIX_EPOCH)).expect("utf-8");
-        assert!(text.lines().all(|line| line.chars().count() <= 80), "a line ran long");
+        assert!(
+            text.lines().all(|line| line.chars().count() <= 80),
+            "a line ran long"
+        );
     }
 
     #[test]
@@ -369,7 +411,10 @@ mod tests {
     #[test]
     fn the_whole_message_ends_with_crlf_line_endings_only() {
         let text = rendered("endings");
-        assert!(!text.contains("\r\r"), "a doubled carriage return would corrupt DATA");
+        assert!(
+            !text.contains("\r\r"),
+            "a doubled carriage return would corrupt DATA"
+        );
         for line in text.split("\r\n") {
             assert!(!line.contains('\n'), "a bare LF survived: {line:?}");
         }

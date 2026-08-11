@@ -147,7 +147,9 @@ impl Store {
             StoreError::Io(format!("could not create {}: {error}", dir.display()))
         })?;
         restrict(dir);
-        Ok(Self { dir: dir.to_path_buf() })
+        Ok(Self {
+            dir: dir.to_path_buf(),
+        })
     }
 
     /// The directory this store lives in.
@@ -163,8 +165,9 @@ impl Store {
     /// [`StoreError::Io`] when the directory cannot be created.
     pub fn add_project(&self, key: &str) -> Result<(), StoreError> {
         let dir = self.project_dir(key);
-        fs::create_dir_all(&dir)
-            .map_err(|error| StoreError::Io(format!("could not create {}: {error}", dir.display())))?;
+        fs::create_dir_all(&dir).map_err(|error| {
+            StoreError::Io(format!("could not create {}: {error}", dir.display()))
+        })?;
         restrict(&dir);
         Ok(())
     }
@@ -284,7 +287,9 @@ impl Store {
     /// the listing — one bad file must not hide the rest.
     pub fn list(&self, project: &str) -> Result<Vec<Entry>, StoreError> {
         if !self.has_project(project) {
-            return Err(StoreError::NoProject(format!("no project `{project}` on this box")));
+            return Err(StoreError::NoProject(format!(
+                "no project `{project}` on this box"
+            )));
         }
         let mut entries: Vec<Entry> = self
             .records(project)?
@@ -360,7 +365,10 @@ impl Store {
         })?;
         let value = selfhost_json::parse(&text)
             .map_err(|error| StoreError::Unreadable(format!("{}: {error}", path.display())))?;
-        let id = path.file_stem().and_then(|stem| stem.to_str()).unwrap_or_default();
+        let id = path
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .unwrap_or_default();
         entry(project, id, &value).ok_or_else(|| {
             StoreError::Unreadable(format!("{} is not a report record", path.display()))
         })
@@ -409,8 +417,12 @@ impl Store {
             .filter_map(Result::ok)
             .map(|entry| entry.path())
             .filter(|path| {
-                path.extension().is_some_and(|extension| extension == "json")
-                    && path.file_stem().and_then(|stem| stem.to_str()).is_some_and(is_record_id)
+                path.extension()
+                    .is_some_and(|extension| extension == "json")
+                    && path
+                        .file_stem()
+                        .and_then(|stem| stem.to_str())
+                        .is_some_and(is_record_id)
             })
             .collect();
         paths.sort();
@@ -428,7 +440,8 @@ impl Store {
 
     /// The file one id is stored in.
     fn record_path(&self, project: &str, id: &str) -> PathBuf {
-        self.project_dir(project).join(format!("{}.json", safe_id(id)))
+        self.project_dir(project)
+            .join(format!("{}.json", safe_id(id)))
     }
 }
 
@@ -445,7 +458,11 @@ fn safe_key(key: &str) -> String {
         .take(crate::report::MAX_PROJECT)
         .collect();
     let trimmed = cleaned.trim_matches('-').to_string();
-    if trimmed.is_empty() { "unnamed".to_string() } else { trimmed }
+    if trimmed.is_empty() {
+        "unnamed".to_string()
+    } else {
+        trimmed
+    }
 }
 
 /// The id with every character that is not `[a-z0-9-]` replaced — no separator, no `..`, no
@@ -460,7 +477,11 @@ fn safe_id(id: &str) -> String {
         })
         .take(64)
         .collect();
-    if cleaned.is_empty() { "report-unnamed".to_string() } else { cleaned }
+    if cleaned.is_empty() {
+        "report-unnamed".to_string()
+    } else {
+        cleaned
+    }
 }
 
 /// Whether a file stem is one of this crate's record ids.
@@ -521,7 +542,13 @@ pub fn to_json(entry: &Entry) -> Json {
 
 /// One record from JSON, or `None` when the value is not one.
 fn entry(project: &str, id: &str, value: &Json) -> Option<Entry> {
-    let text = |key: &str| value.get(key).and_then(Json::as_str).unwrap_or_default().to_string();
+    let text = |key: &str| {
+        value
+            .get(key)
+            .and_then(Json::as_str)
+            .unwrap_or_default()
+            .to_string()
+    };
     let title = text("title");
     if title.is_empty() {
         return None;
@@ -535,7 +562,10 @@ fn entry(project: &str, id: &str, value: &Json) -> Option<Entry> {
                 .iter()
                 .map(|item| {
                     let field = |key: &str| {
-                        item.get(key).and_then(Json::as_str).unwrap_or_default().to_string()
+                        item.get(key)
+                            .and_then(Json::as_str)
+                            .unwrap_or_default()
+                            .to_string()
                     };
                     Sighting {
                         at: field("at"),
@@ -561,7 +591,10 @@ fn entry(project: &str, id: &str, value: &Json) -> Option<Entry> {
         last_at: text("last_at"),
         sightings: value.get("sightings").and_then(Json::as_u64).unwrap_or(1) as usize,
         seen,
-        delivered: value.get("delivered").and_then(Json::as_bool).unwrap_or(false),
+        delivered: value
+            .get("delivered")
+            .and_then(Json::as_bool)
+            .unwrap_or(false),
     })
 }
 
@@ -606,19 +639,27 @@ mod tests {
     #[test]
     fn one_defect_reported_twice_is_one_record_with_two_sightings() {
         let store = scratch("twice");
-        let first = store.record(&report("a search misses", "once")).expect("first");
+        let first = store
+            .record(&report("a search misses", "once"))
+            .expect("first");
         assert!(first.fresh);
         assert_eq!(first.entry.sightings, 1);
 
         let mut again = report("a search misses", "and again");
         again.at = "2026-08-12T00:00:00Z".to_string();
         let second = store.record(&again).expect("second");
-        assert!(!second.fresh, "the same defect must not create a second record");
+        assert!(
+            !second.fresh,
+            "the same defect must not create a second record"
+        );
         assert_eq!(second.entry.sightings, 2);
         assert_eq!(second.entry.last_at, "2026-08-12T00:00:00Z");
         assert_eq!(store.count("dx").expect("count"), 1);
         assert_eq!(second.entry.seen.len(), 2);
-        assert_eq!(second.entry.detail, "once", "the first words are the record's words");
+        assert_eq!(
+            second.entry.detail, "once",
+            "the first words are the record's words"
+        );
     }
 
     #[test]
@@ -655,11 +696,15 @@ mod tests {
         let recorded = store.record(&report("undelivered", "d")).expect("record");
         assert_eq!(store.undelivered(10).expect("waiting").len(), 1);
 
-        store.mark_delivered("dx", &recorded.entry.id).expect("mark");
+        store
+            .mark_delivered("dx", &recorded.entry.id)
+            .expect("mark");
         assert!(store.undelivered(10).expect("waiting").is_empty());
 
         // A repeat sighting is news again, so it goes back on the queue.
-        store.record(&report("undelivered", "again")).expect("again");
+        store
+            .record(&report("undelivered", "again"))
+            .expect("again");
         assert_eq!(store.undelivered(10).expect("waiting").len(), 1);
     }
 
@@ -673,11 +718,20 @@ mod tests {
             store.record(&again).expect("record");
         }
         let entry = &store.list("dx").expect("list")[0];
-        assert_eq!(entry.sightings, MAX_SIGHTINGS_KEPT + 20, "the count is never reduced");
+        assert_eq!(
+            entry.sightings,
+            MAX_SIGHTINGS_KEPT + 20,
+            "the count is never reduced"
+        );
         assert!(entry.seen.len() <= MAX_SIGHTINGS_KEPT);
 
-        let size = fs::metadata(store.record_path("dx", &entry.id)).expect("size").len();
-        assert!(size as usize <= MAX_RECORD_BYTES + 1_024, "record grew to {size} bytes");
+        let size = fs::metadata(store.record_path("dx", &entry.id))
+            .expect("size")
+            .len();
+        assert!(
+            size as usize <= MAX_RECORD_BYTES + 1_024,
+            "record grew to {size} bytes"
+        );
     }
 
     #[test]
@@ -686,13 +740,18 @@ mod tests {
         let path = store.record_path("../../etc", "../../passwd");
         assert!(path.starts_with(store.directory()));
         assert!(!path.to_string_lossy().contains(".."));
-        assert!(!store.has_project("../../etc"), "traversal must not resolve to a project");
+        assert!(
+            !store.has_project("../../etc"),
+            "traversal must not resolve to a project"
+        );
     }
 
     #[test]
     fn closing_a_report_that_does_not_exist_says_so() {
         let store = scratch("close");
-        let error = store.close("dx", "report-deadbeef").expect_err("no such report");
+        let error = store
+            .close("dx", "report-deadbeef")
+            .expect_err("no such report");
         assert!(error.to_string().contains("holds no report"), "{error}");
 
         let recorded = store.record(&report("closable", "d")).expect("record");
@@ -709,14 +768,19 @@ mod tests {
 
         let recorded = store.record(&filed).expect("recorded anyway");
         assert!(recorded.fresh);
-        assert!(path.with_extension("json.broken").exists(), "the bad bytes are kept");
+        assert!(
+            path.with_extension("json.broken").exists(),
+            "the bad bytes are kept"
+        );
     }
 
     #[test]
     fn a_feed_answer_is_bounded_however_many_reports_exist() {
         let store = scratch("bounded-feed");
         for nth in 0..(MAX_FEED + 5) {
-            store.record(&report(&format!("defect {nth}"), "d")).expect("record");
+            store
+                .record(&report(&format!("defect {nth}"), "d"))
+                .expect("record");
         }
         assert_eq!(store.list("dx").expect("list").len(), MAX_FEED);
     }
@@ -724,7 +788,9 @@ mod tests {
     #[test]
     fn a_record_round_trips_through_the_json_a_subscriber_reads() {
         let store = scratch("round-trip");
-        let recorded = store.record(&report("round trip", "the words")).expect("record");
+        let recorded = store
+            .record(&report("round trip", "the words"))
+            .expect("record");
         let encoded = to_json(&recorded.entry).to_text();
         let decoded = entry(
             "dx",

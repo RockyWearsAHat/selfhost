@@ -47,7 +47,7 @@ use tokio::net::{TcpListener, TcpStream};
 use crate::clock;
 use crate::limit::{Decision, Limiter, Meter, Rate};
 use crate::notify::{self, Mailbox};
-use crate::report::{project_key, Refusal, Report};
+use crate::report::{Refusal, Report, project_key};
 use crate::store::{self, Store, StoreError};
 
 /// The largest request body accepted. A report is prose; sixteen kilobytes is a generous
@@ -116,7 +116,12 @@ impl Service {
     pub fn new(store: Store, config: Config) -> Self {
         let limiter = Mutex::new(Limiter::new(config.per_source, config.global));
         let mail_meter = Mutex::new(Meter::new(config.mail_rate));
-        Self { store, config, limiter, mail_meter }
+        Self {
+            store,
+            config,
+            limiter,
+            mail_meter,
+        }
     }
 
     /// The configuration this intake runs with.
@@ -138,7 +143,14 @@ impl Service {
     /// without a stamp that changes between runs. Nothing in here awaits: a report is stored
     /// and answered, and the mail it produces is delivered by [`deliver_pending`] afterwards,
     /// so a slow SMTP server can never hold a reporter's connection open.
-    pub fn answer(&self, request: &Request, body: &[u8], client: &str, now: Instant, wall: SystemTime) -> Response {
+    pub fn answer(
+        &self,
+        request: &Request,
+        body: &[u8],
+        client: &str,
+        now: Instant,
+        wall: SystemTime,
+    ) -> Response {
         let (path, query) = split_target(&request.target);
         let route = self.config.route.as_str();
 
@@ -150,13 +162,23 @@ impl Service {
             };
         }
         if path == format!("{route}/health") {
+            // The one route with no allowance to spend: it is what the proxy's health check
+            // calls on its own timer, and a health check that can be rate-limited is a site
+            // that drops out of rotation because somebody else was rude.
             return self.health(request);
         }
-        if path == format!("{route}/feed") {
-            return self.feed(request, query);
-        }
-        if path == format!("{route}/close") {
-            return self.close(request, body);
+        // Everything else costs an allowance *before* the token is looked at, so a stranger
+        // cannot try tokens at line speed. A subscribed checkout syncs every few minutes and
+        // never comes near the burst.
+        if path == format!("{route}/feed") || path == format!("{route}/close") {
+            if let Decision::Refuse(seconds) = self.admit(client, now) {
+                return retry_after(seconds);
+            }
+            return if path.ends_with("/feed") {
+                self.feed(request, query)
+            } else {
+                self.close(request, body)
+            };
         }
         refuse(Status::NOT_FOUND, "no such endpoint")
     }
@@ -197,7 +219,10 @@ impl Service {
             Err(error) => {
                 // The reporter is told the truth without being told this box's paths.
                 eprintln!("[{}] reports: {error}", selfhost_mail::stamp());
-                refuse(Status::INTERNAL_SERVER_ERROR, "the report could not be stored")
+                refuse(
+                    Status::INTERNAL_SERVER_ERROR,
+                    "the report could not be stored",
+                )
             }
         }
     }
@@ -262,7 +287,10 @@ impl Service {
             return refuse(Status::BAD_REQUEST, "the body is not JSON");
         };
         let project = match project_key(
-            value.get("project").and_then(Json::as_str).unwrap_or(&self.config.default_project),
+            value
+                .get("project")
+                .and_then(Json::as_str)
+                .unwrap_or(&self.config.default_project),
         ) {
             Ok(project) => project,
             Err(refusal) => return refuse(Status::BAD_REQUEST, refusal.message()),
@@ -273,14 +301,20 @@ impl Service {
         match self.store.close(&project, id) {
             Ok(()) => answer(
                 Status::OK,
-                Json::object([("closed", Json::string(id)), ("project", Json::string(&project))]),
+                Json::object([
+                    ("closed", Json::string(id)),
+                    ("project", Json::string(&project)),
+                ]),
             ),
             Err(StoreError::Unreadable(message) | StoreError::NoProject(message)) => {
                 refuse(Status::NOT_FOUND, &message)
             }
             Err(error) => {
                 eprintln!("[{}] reports: {error}", selfhost_mail::stamp());
-                refuse(Status::INTERNAL_SERVER_ERROR, "the report could not be closed")
+                refuse(
+                    Status::INTERNAL_SERVER_ERROR,
+                    "the report could not be closed",
+                )
             }
         }
     }
@@ -301,7 +335,10 @@ impl Service {
         if constant_time_eq(offered.trim().as_bytes(), expected.as_bytes()) {
             return None;
         }
-        Some(refuse(Status::UNAUTHORIZED, "this endpoint needs the owner's token"))
+        Some(refuse(
+            Status::UNAUTHORIZED,
+            "this endpoint needs the owner's token",
+        ))
     }
 
     /// Spends one allowance for `client`.
@@ -316,7 +353,10 @@ impl Service {
 
     /// Whether a notification may be sent right now.
     fn may_notify(&self, now: Instant) -> bool {
-        self.mail_meter.lock().map(|mut meter| meter.take(now).admitted()).unwrap_or(false)
+        self.mail_meter
+            .lock()
+            .map(|mut meter| meter.take(now).admitted())
+            .unwrap_or(false)
     }
 }
 
@@ -351,7 +391,11 @@ pub async fn deliver_pending(service: &Service, now: Instant, wall: SystemTime) 
                 }
             }
             Err(reason) => {
-                eprintln!("[{}] reports: {} not delivered — {reason}", selfhost_mail::stamp(), entry.id);
+                eprintln!(
+                    "[{}] reports: {} not delivered — {reason}",
+                    selfhost_mail::stamp(),
+                    entry.id
+                );
                 return;
             }
         }
@@ -393,7 +437,10 @@ pub async fn serve(listener: TcpListener, service: Arc<Service>) -> std::io::Res
         tokio::spawn(async move {
             if let Err(error) = handle_connection(stream, peer, service).await {
                 if error.kind() != std::io::ErrorKind::UnexpectedEof {
-                    eprintln!("[{}] reports: {peer} ended: {error}", selfhost_mail::stamp());
+                    eprintln!(
+                        "[{}] reports: {peer} ended: {error}",
+                        selfhost_mail::stamp()
+                    );
                 }
             }
         });
@@ -413,7 +460,11 @@ async fn handle_connection(
     let read = tokio::time::timeout(REQUEST_TIMEOUT, read_request(&mut stream)).await;
     let outcome = match read {
         Err(_) => {
-            return write(&mut stream, &refuse(Status(408), "the request took too long")).await;
+            return write(
+                &mut stream,
+                &refuse(Status(408), "the request took too long"),
+            )
+            .await;
         }
         Ok(outcome) => outcome?,
     };
@@ -426,6 +477,10 @@ async fn handle_connection(
     let response = service.answer(&request, &body, &client, Instant::now(), SystemTime::now());
     let filed = response.status == Status::OK && request.method == Method::Post;
     write(&mut stream, &response).await?;
+    // The reporter is done: close the socket before this task spends up to twenty seconds
+    // talking to a mail server, so a slow delivery holds nothing of theirs open.
+    let _ = stream.shutdown().await;
+    drop(stream);
 
     if filed {
         // After the answer, never during it: the reporter waits for the database, not for a
@@ -455,7 +510,10 @@ async fn read_request(
                 }
                 buffer.extend_from_slice(&scratch[..read]);
                 if buffer.len() > MAX_BODY * 2 {
-                    return Ok(Err(refuse(Status::CONTENT_TOO_LARGE, "the request is too large")));
+                    return Ok(Err(refuse(
+                        Status::CONTENT_TOO_LARGE,
+                        "the request is too large",
+                    )));
                 }
             }
             Err(error) => {
@@ -539,12 +597,14 @@ fn query_value<'a>(query: &'a str, key: &str) -> Option<&'a str> {
 
 /// A JSON answer with the headers `docs/SECURITY.md` requires of an app behind the proxy.
 fn answer(status: Status, value: Json) -> Response {
-    let mut response =
-        match Response::bytes(status, "application/json; charset=utf-8", value.to_text().into_bytes())
-        {
-            Ok(response) => response,
-            Err(_) => Response::empty(Status::INTERNAL_SERVER_ERROR),
-        };
+    let mut response = match Response::bytes(
+        status,
+        "application/json; charset=utf-8",
+        value.to_text().into_bytes(),
+    ) {
+        Ok(response) => response,
+        Err(_) => Response::empty(Status::INTERNAL_SERVER_ERROR),
+    };
     // PUB-06: upstream heads reach the client verbatim, so the app sets these itself.
     let _ = response.headers.set("X-Content-Type-Options", "nosniff");
     let _ = response.headers.set("X-Frame-Options", "DENY");
@@ -577,7 +637,10 @@ fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
     if left.len() != right.len() {
         return false;
     }
-    left.iter().zip(right).fold(0u8, |differences, (a, b)| differences | (a ^ b)) == 0
+    left.iter()
+        .zip(right)
+        .fold(0u8, |differences, (a, b)| differences | (a ^ b))
+        == 0
 }
 
 /// Writes one response and closes the write half.
@@ -609,12 +672,17 @@ mod tests {
         store.add_project("dx").expect("project");
         Service::new(
             store,
-            Config { token: Some("secret-token".to_string()), ..Config::default() },
+            Config {
+                token: Some("secret-token".to_string()),
+                ..Config::default()
+            },
         )
     }
 
     fn request(head: &str) -> Request {
-        Request::parse(head.as_bytes()).expect("request parses").request
+        Request::parse(head.as_bytes())
+            .expect("request parses")
+            .request
     }
 
     fn post(body: &str) -> Request {
@@ -632,7 +700,13 @@ mod tests {
     }
 
     fn file(service: &Service, body: &str, client: &str) -> Response {
-        service.answer(&post(body), body.as_bytes(), client, Instant::now(), UNIX_EPOCH)
+        service.answer(
+            &post(body),
+            body.as_bytes(),
+            client,
+            Instant::now(),
+            UNIX_EPOCH,
+        )
     }
 
     #[test]
@@ -656,8 +730,16 @@ mod tests {
         let body = r#"{"kind":"bug","title":"same","detail":"one"}"#;
         file(&service, body, "203.0.113.9");
         let second = file(&service, body, "198.51.100.4");
-        assert!(text(&second).contains("\"known\":true"), "{}", text(&second));
-        assert!(text(&second).contains("\"sightings\":2"), "{}", text(&second));
+        assert!(
+            text(&second).contains("\"known\":true"),
+            "{}",
+            text(&second)
+        );
+        assert!(
+            text(&second).contains("\"sightings\":2"),
+            "{}",
+            text(&second)
+        );
     }
 
     #[test]
@@ -666,8 +748,13 @@ mod tests {
         let now = Instant::now();
         for nth in 0..3 {
             let body = format!(r#"{{"kind":"bug","title":"defect {nth}","detail":"d"}}"#);
-            let response =
-                service.answer(&post(&body), body.as_bytes(), "203.0.113.9", now, UNIX_EPOCH);
+            let response = service.answer(
+                &post(&body),
+                body.as_bytes(),
+                "203.0.113.9",
+                now,
+                UNIX_EPOCH,
+            );
             assert_eq!(response.status, Status::OK);
         }
         let body = r#"{"kind":"bug","title":"one too many","detail":"d"}"#;
@@ -675,7 +762,13 @@ mod tests {
         assert_eq!(refused.status, Status::TOO_MANY_REQUESTS);
         assert!(refused.headers.get_str("retry-after").is_some());
         // And it did not cost the reporter's neighbour anything.
-        let other = service.answer(&post(body), body.as_bytes(), "198.51.100.4", now, UNIX_EPOCH);
+        let other = service.answer(
+            &post(body),
+            body.as_bytes(),
+            "198.51.100.4",
+            now,
+            UNIX_EPOCH,
+        );
         assert_eq!(other.status, Status::OK);
     }
 
@@ -714,7 +807,11 @@ mod tests {
         let body = r#"{"project":"stranger","kind":"bug","title":"t","detail":"d"}"#;
         let response = file(&service, body, "203.0.113.9");
         assert_eq!(response.status, Status::NOT_FOUND);
-        assert!(text(&response).contains("reports project add"), "{}", text(&response));
+        assert!(
+            text(&response).contains("reports project add"),
+            "{}",
+            text(&response)
+        );
     }
 
     #[test]
@@ -729,17 +826,33 @@ mod tests {
     #[test]
     fn every_answer_carries_the_headers_an_app_behind_the_proxy_must_set() {
         let service = service("headers");
-        let response = file(&service, r#"{"kind":"bug","title":"t","detail":"d"}"#, "203.0.113.9");
-        assert_eq!(response.headers.get_str("x-content-type-options"), Some("nosniff"));
+        let response = file(
+            &service,
+            r#"{"kind":"bug","title":"t","detail":"d"}"#,
+            "203.0.113.9",
+        );
+        assert_eq!(
+            response.headers.get_str("x-content-type-options"),
+            Some("nosniff")
+        );
         assert_eq!(response.headers.get_str("x-frame-options"), Some("DENY"));
         assert_eq!(response.headers.get_str("cache-control"), Some("no-store"));
-        assert!(response.headers.get_str("content-security-policy").is_some());
+        assert!(
+            response
+                .headers
+                .get_str("content-security-policy")
+                .is_some()
+        );
     }
 
     #[test]
     fn the_feed_needs_the_owners_token_and_carries_the_whole_report() {
         let service = service("feed");
-        file(&service, r#"{"kind":"bug","title":"in the feed","detail":"the words"}"#, "203.0.113.9");
+        file(
+            &service,
+            r#"{"kind":"bug","title":"in the feed","detail":"the words"}"#,
+            "203.0.113.9",
+        );
 
         let anonymous = request("GET /api/reports/feed?project=dx HTTP/1.1\r\nHost: x\r\n\r\n");
         let refused = service.answer(&anonymous, &[], "203.0.113.9", Instant::now(), UNIX_EPOCH);
@@ -753,7 +866,48 @@ mod tests {
         assert_eq!(answered.status, Status::OK);
         let payload = text(&answered);
         assert!(payload.contains("in the feed"), "{payload}");
-        assert!(payload.contains("the words"), "the feed carries the detail a checkout folds in");
+        assert!(
+            payload.contains("the words"),
+            "the feed carries the detail a checkout folds in"
+        );
+    }
+
+    /// A 256-bit token is not guessable, but a route that answers "wrong" at line speed is
+    /// still a route worth making expensive — and the same allowance stops a token route
+    /// being a free amplifier for anyone who finds it.
+    #[test]
+    fn guessing_at_the_token_costs_the_guesser_an_allowance() {
+        let service = service("token-rate");
+        let now = Instant::now();
+        let wrong = request(
+            "GET /api/reports/feed HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer nope\r\n\r\n",
+        );
+        for _ in 0..3 {
+            assert_eq!(
+                service
+                    .answer(&wrong, &[], "203.0.113.9", now, UNIX_EPOCH)
+                    .status,
+                Status::UNAUTHORIZED
+            );
+        }
+        assert_eq!(
+            service
+                .answer(&wrong, &[], "203.0.113.9", now, UNIX_EPOCH)
+                .status,
+            Status::TOO_MANY_REQUESTS
+        );
+
+        // The health check is deliberately outside that allowance: it runs on the proxy's
+        // own timer, and a site must not leave rotation because somebody else was rude.
+        let health = request("GET /api/reports/health HTTP/1.1\r\nHost: x\r\n\r\n");
+        for _ in 0..5 {
+            assert_eq!(
+                service
+                    .answer(&health, &[], "203.0.113.9", now, UNIX_EPOCH)
+                    .status,
+                Status::OK
+            );
+        }
     }
 
     #[test]
@@ -763,7 +917,9 @@ mod tests {
             "GET /api/reports/feed HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer nope\r\n\r\n",
         );
         assert_eq!(
-            service.answer(&wrong, &[], "203.0.113.9", Instant::now(), UNIX_EPOCH).status,
+            service
+                .answer(&wrong, &[], "203.0.113.9", Instant::now(), UNIX_EPOCH)
+                .status,
             Status::UNAUTHORIZED
         );
 
@@ -774,7 +930,9 @@ mod tests {
         let tokenless = Service::new(store, Config::default());
         let asked = request("GET /api/reports/feed HTTP/1.1\r\nHost: x\r\n\r\n");
         assert_eq!(
-            tokenless.answer(&asked, &[], "203.0.113.9", Instant::now(), UNIX_EPOCH).status,
+            tokenless
+                .answer(&asked, &[], "203.0.113.9", Instant::now(), UNIX_EPOCH)
+                .status,
             Status::NOT_FOUND,
             "a route that cannot be used is not a route to probe"
         );
@@ -783,7 +941,11 @@ mod tests {
     #[test]
     fn closing_a_report_removes_it_from_the_feed() {
         let service = service("close");
-        let filed = file(&service, r#"{"kind":"bug","title":"fixed soon","detail":"d"}"#, "203.0.113.9");
+        let filed = file(
+            &service,
+            r#"{"kind":"bug","title":"fixed soon","detail":"d"}"#,
+            "203.0.113.9",
+        );
         let id = text(&filed)
             .split("\"filed\":\"")
             .nth(1)
@@ -797,8 +959,13 @@ mod tests {
              Content-Length: {}\r\n\r\n",
             body.len()
         ));
-        let closed =
-            service.answer(&closing, body.as_bytes(), "127.0.0.1", Instant::now(), UNIX_EPOCH);
+        let closed = service.answer(
+            &closing,
+            body.as_bytes(),
+            "127.0.0.1",
+            Instant::now(),
+            UNIX_EPOCH,
+        );
         assert_eq!(closed.status, Status::OK);
         assert!(service.store().list("dx").expect("list").is_empty());
     }
@@ -806,11 +973,19 @@ mod tests {
     #[test]
     fn the_health_route_says_nothing_about_content() {
         let service = service("health");
-        file(&service, r#"{"kind":"bug","title":"secret title","detail":"d"}"#, "203.0.113.9");
+        file(
+            &service,
+            r#"{"kind":"bug","title":"secret title","detail":"d"}"#,
+            "203.0.113.9",
+        );
         let asked = request("GET /api/reports/health HTTP/1.1\r\nHost: x\r\n\r\n");
         let answered = service.answer(&asked, &[], "203.0.113.9", Instant::now(), UNIX_EPOCH);
         assert_eq!(answered.status, Status::OK);
-        assert!(!text(&answered).contains("secret title"), "{}", text(&answered));
+        assert!(
+            !text(&answered).contains("secret title"),
+            "{}",
+            text(&answered)
+        );
     }
 
     #[test]
@@ -834,7 +1009,9 @@ mod tests {
 
     #[tokio::test]
     async fn the_intake_refuses_to_bind_anywhere_but_loopback() {
-        let error = bind("0.0.0.0:0".parse().expect("address")).await.expect_err("refused");
+        let error = bind("0.0.0.0:0".parse().expect("address"))
+            .await
+            .expect_err("refused");
         assert!(error.to_string().contains("must be loopback"), "{error}");
         assert!(bind("127.0.0.1:0".parse().expect("address")).await.is_ok());
     }
@@ -844,7 +1021,9 @@ mod tests {
     #[tokio::test]
     async fn a_real_request_over_a_real_socket_is_stored() {
         let service = Arc::new(service("socket"));
-        let listener = bind("127.0.0.1:0".parse().expect("address")).await.expect("bind");
+        let listener = bind("127.0.0.1:0".parse().expect("address"))
+            .await
+            .expect("bind");
         let address = listener.local_addr().expect("address");
         let serving = Arc::clone(&service);
         tokio::spawn(async move {

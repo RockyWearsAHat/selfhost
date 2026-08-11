@@ -71,7 +71,10 @@ struct Bucket {
 impl Bucket {
     /// A full bucket as of `now`.
     fn full(rate: Rate, now: Instant) -> Self {
-        Self { tokens: f64::from(rate.burst), last: now }
+        Self {
+            tokens: f64::from(rate.burst),
+            last: now,
+        }
     }
 
     /// Refills for the time since the last look, then spends one token if there is one.
@@ -112,7 +115,9 @@ impl Meter {
 
     /// Spends one allowance, or says how long to wait.
     pub fn take(&mut self, now: Instant) -> Decision {
-        let bucket = self.bucket.get_or_insert_with(|| Bucket::full(self.rate, now));
+        let bucket = self
+            .bucket
+            .get_or_insert_with(|| Bucket::full(self.rate, now));
         bucket.take(self.rate, now)
     }
 }
@@ -158,7 +163,9 @@ impl Limiter {
             }
         }
 
-        let global = self.global.get_or_insert_with(|| Bucket::full(self.global_rate, now));
+        let global = self
+            .global
+            .get_or_insert_with(|| Bucket::full(self.global_rate, now));
         global.take(self.global_rate, now)
     }
 
@@ -228,7 +235,11 @@ mod tests {
         }
         assert!(!limiter.admit("one", start).admitted());
         // Three a minute: twenty seconds buys exactly one.
-        assert!(limiter.admit("one", start + Duration::from_secs(20)).admitted());
+        assert!(
+            limiter
+                .admit("one", start + Duration::from_secs(20))
+                .admitted()
+        );
     }
 
     #[test]
@@ -261,7 +272,11 @@ mod tests {
         for nth in 0..(MAX_TRACKED + 200) {
             let _ = limiter.admit(&format!("source-{nth}"), now);
         }
-        assert!(limiter.tracked() <= MAX_TRACKED, "tracked {}", limiter.tracked());
+        assert!(
+            limiter.tracked() <= MAX_TRACKED,
+            "tracked {}",
+            limiter.tracked()
+        );
     }
 
     #[test]

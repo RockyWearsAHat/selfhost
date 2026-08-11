@@ -13,7 +13,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Seconds since the Unix epoch, saturating at the epoch for a clock set before it.
 fn seconds(time: SystemTime) -> u64 {
-    time.duration_since(UNIX_EPOCH).map_or(0, |since| since.as_secs())
+    time.duration_since(UNIX_EPOCH)
+        .map_or(0, |since| since.as_secs())
 }
 
 /// Splits a Unix timestamp into `(year, month, day, hour, minute, second, weekday)`, UTC.
@@ -49,7 +50,11 @@ fn civil_from_days(z: i64) -> (i64, u32, u32) {
     let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
     let shifted_month = (5 * day_of_year + 2) / 153;
     let day = (day_of_year - (153 * shifted_month + 2) / 5 + 1) as u32;
-    let month = if shifted_month < 10 { shifted_month + 3 } else { shifted_month - 9 } as u32;
+    let month = if shifted_month < 10 {
+        shifted_month + 3
+    } else {
+        shifted_month - 9
+    } as u32;
     (if month <= 2 { year + 1 } else { year }, month, day)
 }
 
@@ -75,7 +80,10 @@ pub fn rfc5322(time: SystemTime) -> String {
         "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
     ];
     let (year, month, day, hour, minute, second, weekday) = civil(seconds(time));
-    let month_name = MONTHS.get(month.saturating_sub(1) as usize).copied().unwrap_or("Jan");
+    let month_name = MONTHS
+        .get(month.saturating_sub(1) as usize)
+        .copied()
+        .unwrap_or("Jan");
     let day_name = DAYS.get(weekday).copied().unwrap_or("Thu");
     format!("{day_name}, {day:02} {month_name} {year:04} {hour:02}:{minute:02}:{second:02} +0000")
 }
@@ -99,7 +107,10 @@ mod tests {
     fn a_leap_day_is_the_day_it_says_it_is() {
         // 2024-02-29T12:34:56Z — the case a naive 365-day arithmetic gets wrong.
         assert_eq!(iso8601(at(1_709_210_096)), "2024-02-29T12:34:56Z");
-        assert_eq!(rfc5322(at(1_709_210_096)), "Thu, 29 Feb 2024 12:34:56 +0000");
+        assert_eq!(
+            rfc5322(at(1_709_210_096)),
+            "Thu, 29 Feb 2024 12:34:56 +0000"
+        );
     }
 
     #[test]
