@@ -54,5 +54,5 @@ pub mod store;
 pub use limit::{Limiter, Rate};
 pub use notify::Mailbox;
 pub use report::{Kind, Refusal, Report};
-pub use service::{bind, serve, Config, Service};
+pub use service::{Config, Service, bind, serve};
 pub use store::{Entry, Recorded, Store, StoreError};

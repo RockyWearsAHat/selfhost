@@ -28,7 +28,7 @@
 //! cleaned fields and never read from the request: a client that could choose its own id could
 //! overwrite another report's record.
 
-use ring::digest::{digest, SHA256};
+use ring::digest::{SHA256, digest};
 use selfhost_json::Json;
 
 /// Longest accepted title. Longer is refused: the title is identity, and one that does not
@@ -262,14 +262,20 @@ pub fn project_key(value: &str) -> Result<String, Refusal> {
     let lowered = one_line(value).to_lowercase();
     let key: String = lowered
         .chars()
-        .map(|character| if character == '_' || character == ' ' { '-' } else { character })
+        .map(|character| {
+            if character == '_' || character == ' ' {
+                '-'
+            } else {
+                character
+            }
+        })
         .collect();
     let trimmed = key.trim_matches('-');
     let legal = !trimmed.is_empty()
         && trimmed.chars().count() <= MAX_PROJECT
-        && trimmed
-            .chars()
-            .all(|character| character.is_ascii_lowercase() || character.is_ascii_digit() || character == '-');
+        && trimmed.chars().all(|character| {
+            character.is_ascii_lowercase() || character.is_ascii_digit() || character == '-'
+        });
     if !legal {
         return Err(Refusal(format!(
             "`{}` is not a project key — a key is 1 to {MAX_PROJECT} characters of a-z, 0-9 and -",
@@ -310,7 +316,13 @@ fn hex(bytes: &[u8]) -> String {
 #[must_use]
 pub fn one_line(text: &str) -> String {
     text.chars()
-        .map(|character| if character.is_control() { ' ' } else { character })
+        .map(|character| {
+            if character.is_control() {
+                ' '
+            } else {
+                character
+            }
+        })
         .collect::<String>()
         .split_whitespace()
         .collect::<Vec<_>>()
@@ -344,7 +356,9 @@ pub fn lines(text: &str, max: usize) -> String {
 /// Refuses `value` when it is longer than `max`, naming the field.
 fn capped(value: String, max: usize, field: &str) -> Result<String, Refusal> {
     if value.chars().count() > max {
-        return Err(Refusal(format!("`{field}` is longer than {max} characters")));
+        return Err(Refusal(format!(
+            "`{field}` is longer than {max} characters"
+        )));
     }
     Ok(value)
 }
@@ -413,7 +427,10 @@ mod tests {
     fn a_report_may_name_the_project_it_is_about() {
         let report = filed(r#"{"project":"Self-Host","kind":"bug","title":"t","detail":"d"}"#)
             .expect("accepted");
-        assert_eq!(report.project, "self-host", "a key is canonical, not as typed");
+        assert_eq!(
+            report.project, "self-host",
+            "a key is canonical, not as typed"
+        );
     }
 
     #[test]
@@ -454,18 +471,24 @@ mod tests {
         .expect("accepted");
         assert_eq!(one.id(), again.id(), "one defect, one id");
 
-        let other =
-            filed(r#"{"kind":"suggestion","title":"search misses","detail":"a","route":"dx_search"}"#)
-                .expect("accepted");
-        assert_ne!(one.id(), other.id(), "a different kind is a different thing");
+        let other = filed(
+            r#"{"kind":"suggestion","title":"search misses","detail":"a","route":"dx_search"}"#,
+        )
+        .expect("accepted");
+        assert_ne!(
+            one.id(),
+            other.id(),
+            "a different kind is a different thing"
+        );
         assert!(one.id().starts_with("report-") && one.id().len() == 15);
     }
 
     #[test]
     fn a_workspace_path_is_reduced_to_its_name() {
-        let report =
-            filed(r#"{"kind":"bug","title":"t","detail":"d","workspace":"/Users/someone/code/App"}"#)
-                .expect("accepted");
+        let report = filed(
+            r#"{"kind":"bug","title":"t","detail":"d","workspace":"/Users/someone/code/App"}"#,
+        )
+        .expect("accepted");
         assert_eq!(report.workspace, "App");
 
         let windows =
@@ -477,34 +500,51 @@ mod tests {
     #[test]
     fn an_identity_field_over_its_cap_is_refused_by_name() {
         let long = "x".repeat(MAX_TITLE + 1);
-        let error =
-            filed(&format!(r#"{{"kind":"bug","title":"{long}","detail":"d"}}"#)).expect_err("refused");
+        let error = filed(&format!(
+            r#"{{"kind":"bug","title":"{long}","detail":"d"}}"#
+        ))
+        .expect_err("refused");
         assert!(error.message().contains("`title` is longer"), "{error}");
     }
 
     #[test]
     fn a_long_detail_is_kept_and_cut_rather_than_lost() {
         let long = "y".repeat(MAX_DETAIL + 500);
-        let report =
-            filed(&format!(r#"{{"kind":"bug","title":"t","detail":"{long}"}}"#)).expect("accepted");
-        assert_eq!(report.detail.chars().count(), MAX_DETAIL + TRUNCATED.chars().count());
+        let report = filed(&format!(
+            r#"{{"kind":"bug","title":"t","detail":"{long}"}}"#
+        ))
+        .expect("accepted");
+        assert_eq!(
+            report.detail.chars().count(),
+            MAX_DETAIL + TRUNCATED.chars().count()
+        );
         assert!(report.detail.ends_with(TRUNCATED));
     }
 
     #[test]
     fn an_empty_title_or_detail_says_which_one() {
         let no_title = filed(r#"{"kind":"bug","title":"   ","detail":"d"}"#).expect_err("refused");
-        assert!(no_title.message().contains("`title` is required"), "{no_title}");
+        assert!(
+            no_title.message().contains("`title` is required"),
+            "{no_title}"
+        );
         let no_detail = filed(r#"{"kind":"bug","title":"t","detail":""}"#).expect_err("refused");
-        assert!(no_detail.message().contains("`detail` is required"), "{no_detail}");
+        assert!(
+            no_detail.message().contains("`detail` is required"),
+            "{no_detail}"
+        );
     }
 
     #[test]
     fn a_feature_request_is_a_suggestion_rather_than_a_refusal() {
         let report = filed(r#"{"kind":"feature","title":"t","detail":"d"}"#).expect("accepted");
         assert_eq!(report.kind, Kind::Suggestion);
-        let error = filed(r#"{"kind":"catastrophe","title":"t","detail":"d"}"#).expect_err("refused");
-        assert!(error.message().contains("bug, suggestion, or observation"), "{error}");
+        let error =
+            filed(r#"{"kind":"catastrophe","title":"t","detail":"d"}"#).expect_err("refused");
+        assert!(
+            error.message().contains("bug, suggestion, or observation"),
+            "{error}"
+        );
     }
 
     /// A refusal is shown to whoever sent the request, so it may not echo their bytes back
@@ -512,8 +552,8 @@ mod tests {
     #[test]
     fn a_refusal_does_not_echo_an_unbounded_field() {
         let shout = "z".repeat(5_000);
-        let error =
-            filed(&format!(r#"{{"kind":"{shout}","title":"t","detail":"d"}}"#)).expect_err("refused");
+        let error = filed(&format!(r#"{{"kind":"{shout}","title":"t","detail":"d"}}"#))
+            .expect_err("refused");
         assert!(error.message().len() < 200, "{}", error.message().len());
     }
 
