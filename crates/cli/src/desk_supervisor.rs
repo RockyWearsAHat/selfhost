@@ -488,6 +488,17 @@ pub(crate) struct Supervised<H: selfhost_screen::AgentHost, C: AgentChannel> {
     /// desktop, monitor count, DPI mode, integrity level. Only the agent can say
     /// any of it.
     said: Option<String>,
+    /// The last thing *any* agent said, kept across the death of the agent that
+    /// said it.
+    ///
+    /// [`Supervised::said`] is forgotten with its agent, which is right for a
+    /// live plate and wrong for a post-mortem: an agent that connects, reports
+    /// what it found, and then fails has put the reason in exactly this string,
+    /// and clearing it on the way to reporting the failure throws away the only
+    /// account of it. Observed on ALEX-DESKTOP, where the supervisor could say
+    /// "its streaming loop stopped with a fault; the fault it reported is on the
+    /// last status it sent" while having just discarded that status.
+    last_said: Option<String>,
     /// How many displays the agent reported.
     monitors: u32,
     /// The last channel-side fault, which the supervisor's own record cannot
@@ -519,6 +530,7 @@ impl<H: selfhost_screen::AgentHost, C: AgentChannel> Supervised<H, C> {
             console: selfhost_screen::ConsoleSession::Attaching,
             connected: false,
             said: None,
+            last_said: None,
             monitors: 0,
             fault: None,
         }
@@ -707,6 +719,7 @@ impl<H: selfhost_screen::AgentHost, C: AgentChannel> Supervised<H, C> {
                 }
             }
             selfhost_desk::wire::Message::Status { detail, .. } if !detail.is_empty() => {
+                self.last_said = Some(detail.clone());
                 self.said = Some(detail);
             }
             _ => {}
@@ -718,9 +731,22 @@ impl<H: selfhost_screen::AgentHost, C: AgentChannel> Supervised<H, C> {
         use selfhost_screen::AgentPhase;
 
         let mut sentence = self.phase.sentence();
-        if let (AgentPhase::Live { .. }, Some(said)) = (self.phase, self.said.as_deref()) {
-            sentence.push_str(" · ");
-            sentence.push_str(said);
+        match (self.phase, self.said.as_deref(), self.last_said.as_deref()) {
+            // A live agent describes itself: session, window station, desktop,
+            // displays, integrity.
+            (AgentPhase::Live { .. }, Some(said), _) => {
+                sentence.push_str(" · ");
+                sentence.push_str(said);
+            }
+            // A dead one leaves an account, and it is the most useful sentence
+            // this plate ever carries: whatever the agent managed to say before
+            // it stopped. Marked as past, so nobody reads it as the current
+            // state of a machine that has no agent on it at all.
+            (_, _, Some(last)) => {
+                sentence.push_str(" · it last said: ");
+                sentence.push_str(last);
+            }
+            _ => {}
         }
         // The supervisor's own record first: it knows why a spawn failed, and the
         // channel only ever knows why a pipe did.
@@ -1367,6 +1393,47 @@ mod tests {
         assert_eq!(live.notice, Notice::Live);
         assert_eq!(live.session, Some(1));
         assert_eq!(live.monitors, 2, "and its own report says how many displays it has");
+    }
+
+    /// A dead agent's last words survive it, and are marked as past.
+    ///
+    /// The defect this pins: the supervisor reported "its streaming loop stopped
+    /// with a fault; the fault it reported is on the last status it sent" while
+    /// having discarded that status one line earlier, because `said` is
+    /// forgotten with its agent. The post-mortem needs what the live plate does
+    /// not.
+    #[test]
+    fn what_the_agent_said_before_it_died_outlives_it() {
+        let now = Instant::now();
+        let (mut supervised, machine) = driver(InputPolicy::ViewOnly, 5);
+        machine.borrow_mut().console = ConsoleSession::User(1);
+        supervised.turn(now, quiet());
+        supervised.channel.inbox.push(hello(1));
+        supervised.channel.inbox.push(
+            selfhost_desk::wire::Message::Status {
+                notice: Notice::Starting,
+                detail: "session 1 as ALEX, WinSta0\\Default, 2 displays".to_owned(),
+            }
+            .encode()
+            .expect("encodes"),
+        );
+        let live = supervised.turn(now + Duration::from_millis(100), quiet());
+        assert!(live.live, "the agent is up");
+        assert!(live.sentence.contains("2 displays"), "and describes itself: {}", live.sentence);
+
+        machine.borrow_mut().exit = Some(6);
+        let dead = supervised.turn(now + Duration::from_millis(200), quiet());
+        assert!(!dead.live, "the agent is gone");
+        assert!(
+            dead.sentence.contains("2 displays"),
+            "and what it said outlives it: {}",
+            dead.sentence
+        );
+        assert!(
+            dead.sentence.contains("it last said"),
+            "marked as past, not as the state of a machine with no agent: {}",
+            dead.sentence
+        );
     }
 
     #[test]
