@@ -233,6 +233,18 @@ pub struct AgentReport {
     pub dpi: DpiAwareness,
     /// What it is running at.
     pub integrity: Integrity,
+    /// Which screen source it opened, as one word.
+    ///
+    /// On the line because it is the answer to the one question this subsystem
+    /// could not previously answer for itself: a full-screen Direct3D game is
+    /// **black** under GDI and correct under duplication, and both are a healthy
+    /// stream carrying real frames. Without this word an operator looking at a
+    /// black rectangle has nothing to distinguish "the machine is showing black"
+    /// from "this source cannot see what the machine is showing".
+    ///
+    /// Empty on a platform or a build with no source open yet, which the sentence
+    /// renders as `no capture`.
+    pub capture: String,
 }
 
 impl AgentReport {
@@ -244,7 +256,7 @@ impl AgentReport {
     /// "will what it sees be correct".
     pub fn sentence(&self) -> String {
         format!(
-            "agent live in session {} as {} · {}\\{} · {} monitor{} · {} · {}",
+            "agent live in session {} as {} · {}\\{} · {} monitor{} · {} · {} · {}",
             self.session,
             self.user,
             self.window_station,
@@ -253,6 +265,7 @@ impl AgentReport {
             if self.monitors.len() == 1 { "" } else { "s" },
             self.dpi.label(),
             self.integrity.label(),
+            if self.capture.is_empty() { "no capture" } else { &self.capture },
         )
     }
 }
@@ -1409,7 +1422,8 @@ mod windows_body {
         Departure, FrameSink, InputPolicy, LinkFrame, SendError, Streamer,
     };
     use crate::windows::{
-        cursor::GdiCursor, gdi::GdiCapture, identity, inject::WinInjector, pipe::DaemonLink,
+        capture::WindowsCapture, cursor::GdiCursor, identity, inject::WinInjector,
+        pipe::DaemonLink,
     };
     use crate::{Capture, Fault, InjectError, Injector};
     use selfhost_desk::keys::HeldKeys;
@@ -1462,10 +1476,15 @@ mod windows_body {
             monitors: Vec::new(),
             dpi,
             integrity: identity::process_integrity(),
+            capture: String::new(),
         };
 
         let mut screen = Screen::open();
-        let report = AgentReport { monitors: screen.monitors().to_vec(), ..report };
+        let report = AgentReport {
+            monitors: screen.monitors().to_vec(),
+            capture: screen.description(),
+            ..report
+        };
 
         // Classified here rather than by the caller inspecting the fault, because
         // this is the only line that knows the failure was the *link*. A caller
@@ -1743,8 +1762,10 @@ mod windows_body {
     /// unplugged mid-session, which is a path the state machine already handles, and
     /// the console shows the sentence instead of a dead session.
     enum Screen {
-        /// A working GDI capture.
-        Live(GdiCapture),
+        /// A working capture — duplication where the machine has it, GDI where it
+        /// does not. Which one is [`WindowsCapture::backend`], and it matters to
+        /// the operator: only one of the two can see a full-screen game.
+        Live(WindowsCapture),
         /// None yet, and the reason.
         Absent(crate::CaptureError),
     }
@@ -1752,9 +1773,29 @@ mod windows_body {
     impl Screen {
         /// Builds one, or remembers why it could not.
         fn open() -> Self {
-            match GdiCapture::new() {
+            match WindowsCapture::open() {
                 Ok(capture) => Self::Live(capture),
                 Err(condition) => Self::Absent(condition),
+            }
+        }
+
+        /// Which source this is, and what it cannot show — for the agent's line on
+        /// the console.
+        ///
+        /// The caveat travels with the word rather than being looked up from it,
+        /// because the place that reads this line is the place where somebody is
+        /// asking why the picture is black, and a word they have to go and
+        /// interpret is a word that will not answer them.
+        fn description(&self) -> String {
+            match self {
+                Self::Live(capture) => {
+                    let backend = capture.backend();
+                    match backend.caveat() {
+                        Some(caveat) => format!("{} capture ({caveat})", backend.word()),
+                        None => format!("{} capture", backend.word()),
+                    }
+                }
+                Self::Absent(condition) => format!("no capture: {}", condition.sentence()),
             }
         }
 
@@ -2556,6 +2597,7 @@ mod tests {
             ],
             dpi: DpiAwareness::PerMonitorV2,
             integrity: Integrity::Medium,
+            capture: "duplication capture".to_owned(),
         };
         let line = report.sentence();
         assert!(line.contains("session 1"), "{line}");
@@ -2564,6 +2606,24 @@ mod tests {
         assert!(line.contains("2 monitors"), "{line}");
         assert!(line.contains("per-monitor-v2"), "{line}");
         assert!(line.contains("medium-integrity"), "{line}");
+        assert!(line.contains("duplication capture"), "{line}");
+    }
+
+    #[test]
+    fn a_report_with_no_source_open_says_so_rather_than_leaving_a_gap() {
+        // An empty field would render as two separators with nothing between
+        // them, which reads as a formatting bug rather than as a fact.
+        let report = AgentReport {
+            session: 1,
+            user: "ALEX".to_owned(),
+            window_station: "WinSta0".to_owned(),
+            desktop: "Default".to_owned(),
+            monitors: Vec::new(),
+            dpi: DpiAwareness::PerMonitorV2,
+            integrity: Integrity::Medium,
+            capture: String::new(),
+        };
+        assert!(report.sentence().ends_with("no capture"), "{}", report.sentence());
     }
 
     #[test]
@@ -2584,6 +2644,7 @@ mod tests {
             }],
             dpi: DpiAwareness::Unaware,
             integrity: Integrity::Other(0x1234),
+            capture: "GDI capture".to_owned(),
         };
         let line = report.sentence();
         assert!(line.contains("1 monitor ·"), "{line}");

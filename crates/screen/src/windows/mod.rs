@@ -64,7 +64,12 @@
 //!   `DaemonLink`.
 //! - [`gdi`] — screen capture: one reused top-down DIB section, one `BitBlt` a
 //!   frame, and the layout checks that turn a resolution, topology or DPI change
-//!   into a rebuild rather than a stale picture.
+//!   into a rebuild rather than a stale picture. It cannot see Direct3D.
+//! - [`dxgi`] — the other screen capture: DXGI Desktop Duplication, which reads
+//!   the composited output and therefore *can* see a game. The only COM in this
+//!   workspace.
+//! - [`capture`] — which of the two a machine gets, and the sentence explaining
+//!   what it loses if it gets the older one.
 //! - [`cursor`] — the pointer, captured separately so the client composites it,
 //!   and the `DeleteObject` discipline that keeps the GDI handle count flat.
 //! - [`identity`] — what the agent can only learn about itself from inside its own
@@ -85,14 +90,18 @@
 //! race to become the screen source.
 
 use crate::agent::Integrity;
-use selfhost_desk::wire::Refusal;
+use selfhost_desk::wire::{Monitor, Refusal};
 use std::fmt;
 use std::path::Path;
 
 #[cfg(windows)]
+pub mod capture;
+#[cfg(windows)]
 pub mod cursor;
 #[cfg(windows)]
 pub mod desktop;
+#[cfg(windows)]
+pub mod dxgi;
 #[cfg(windows)]
 pub mod gdi;
 #[cfg(windows)]
@@ -570,10 +579,76 @@ pub fn blocked_by_elevation(event: &crate::input::InjectedEvent) -> bool {
     }
 }
 
+/// Whether a DXGI output's rectangle is the display a [`Monitor`] describes.
+///
+/// # Why the match is on geometry and not on an index
+///
+/// `IDXGIAdapter::EnumOutputs` and `EnumDisplayMonitors` are two independent
+/// orderings of the same displays. They agree on most machines and not on all, and
+/// a viewer that quietly shows the *other* monitor is a failure no log records and
+/// nobody reports as one — the picture is a real screen, just not the one that was
+/// asked for. `DXGI_OUTPUT_DESC::DesktopCoordinates` is the same virtual-desktop
+/// rectangle [`gdi::monitors`] already read, so the two can be compared exactly.
+///
+/// Takes the four edges rather than the structure so that it lives here, in the
+/// half of this module that compiles on every platform and is therefore tested on
+/// a machine with no graphics adapter at all. See [`dxgi::DxgiCapture`].
+pub fn output_covers(
+    left: i32,
+    top: i32,
+    right: i32,
+    bottom: i32,
+    monitor: &Monitor,
+) -> bool {
+    // Saturating, because these arrive from a driver: a rectangle whose edges run
+    // backwards must be refused, not overflow, in a crate that aborts on a panic.
+    let width = right.saturating_sub(left);
+    let height = bottom.saturating_sub(top);
+    left == monitor.origin_x
+        && top == monitor.origin_y
+        && u32::try_from(width).is_ok_and(|width| width == monitor.width)
+        && u32::try_from(height).is_ok_and(|height| height == monitor.height)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::path::PathBuf;
+
+    /// A display at a place on the virtual desktop.
+    fn display(origin_x: i32, origin_y: i32, width: u32, height: u32) -> Monitor {
+        Monitor { id: 0, origin_x, origin_y, width, height, scale_permille: 1000, primary: true }
+    }
+
+    #[test]
+    fn an_output_at_the_displays_place_is_the_display() {
+        assert!(output_covers(0, 0, 2560, 1440, &display(0, 0, 2560, 1440)));
+    }
+
+    #[test]
+    fn a_second_display_of_the_same_size_is_told_apart_by_where_it_is() {
+        // The failure this rule prevents: two identical monitors, and a viewer
+        // showing the wrong one because the two enumerations disagreed about
+        // which comes first.
+        let right_hand = display(2560, 0, 2560, 1440);
+        assert!(!output_covers(0, 0, 2560, 1440, &right_hand));
+        assert!(output_covers(2560, 0, 5120, 1440, &right_hand));
+    }
+
+    #[test]
+    fn a_display_left_of_the_primary_has_negative_coordinates_and_still_matches() {
+        assert!(output_covers(-1920, -200, 0, 880, &display(-1920, -200, 1920, 1080)));
+    }
+
+    #[test]
+    fn an_output_of_a_different_size_at_the_same_origin_is_not_the_display() {
+        assert!(!output_covers(0, 0, 1920, 1080, &display(0, 0, 2560, 1440)));
+    }
+
+    #[test]
+    fn a_rectangle_whose_edges_run_backwards_matches_nothing() {
+        assert!(!output_covers(0, 0, -100, -100, &display(0, 0, 2560, 1440)));
+    }
 
     #[test]
     fn a_pipe_is_named_per_session() {

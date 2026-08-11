@@ -1297,6 +1297,566 @@ unsafe extern "system" {
     ) -> Handle;
 }
 
+// ── DXGI Desktop Duplication, and the Direct3D 11 device it needs ─────────────
+//
+// The only COM in this workspace. Everything above is a flat C export whose
+// signature a wrong guess merely fails to link; a COM interface is a pointer to a
+// pointer to an array of function pointers, and a method named at the wrong index
+// is a call to a *different function* with the wrong argument list — undefined
+// behaviour that usually survives long enough to be diagnosed somewhere else
+// entirely. `gdi.rs` names that risk as the reason Desktop Duplication was left
+// unwritten for so long.
+//
+// So the slot order below is not remembered, guessed, or copied from an example.
+// It was extracted from this deployment's own SDK headers — `dxgi.h`, `dxgi1_2.h`
+// and `d3d11.h` under `Windows Kits\10\Include\10.0.19041.0`, the same headers the
+// operating system on ALEX-DESKTOP was built against — by walking each
+// `typedef struct I…Vtbl` and listing its members in declaration order. Every slot
+// is written out, including the ones this crate never calls, because a vtable with
+// a *hole* in it silently renumbers everything below the hole. The unused ones are
+// [`Slot`], and they carry the method's real name so the next reader can check the
+// table against the header without running anything.
+//
+// The inheritance is flattened deliberately. `IDXGIOutput1` is written as its
+// twenty-three slots rather than as `IDXGIOutput` plus three, because COM
+// inheritance *is* prefix layout and spelling it out is what makes the file
+// checkable line-by-line against the header.
+
+/// A COM `HRESULT`. Negative is failure; [`S_OK`] is the only success this crate
+/// accepts, because every call here either produced its out-parameter or did not.
+pub(crate) type Hresult = i32;
+
+/// The one success code.
+pub(crate) const S_OK: Hresult = 0;
+
+/// `E_ACCESSDENIED`. From `DuplicateOutput` this is the secure desktop — a UAC
+/// prompt or the lock screen — and not a permission the operator can grant.
+pub(crate) const E_ACCESSDENIED: Hresult = 0x8007_0005u32 as Hresult;
+
+/// `DXGI_ERROR_INVALID_CALL`: a frame acquired twice without a release. A defect
+/// in this file rather than a condition of the machine.
+pub(crate) const DXGI_ERROR_INVALID_CALL: Hresult = 0x887A_0001u32 as Hresult;
+
+/// `DXGI_ERROR_NOT_FOUND`: the end of an enumeration.
+pub(crate) const DXGI_ERROR_NOT_FOUND: Hresult = 0x887A_0002u32 as Hresult;
+
+/// `DXGI_ERROR_UNSUPPORTED`: this adapter cannot duplicate an output at all.
+pub(crate) const DXGI_ERROR_UNSUPPORTED: Hresult = 0x887A_0004u32 as Hresult;
+
+/// `DXGI_ERROR_DEVICE_REMOVED`: the graphics driver restarted or the GPU was
+/// reset. Everything built on the device is gone and must be built again.
+pub(crate) const DXGI_ERROR_DEVICE_REMOVED: Hresult = 0x887A_0005u32 as Hresult;
+
+/// `DXGI_ERROR_DEVICE_RESET`, the other half of a driver restart.
+pub(crate) const DXGI_ERROR_DEVICE_RESET: Hresult = 0x887A_0007u32 as Hresult;
+
+/// `DXGI_ERROR_NOT_CURRENTLY_AVAILABLE`: every duplication slot this output has
+/// is held by somebody else. Recoverable the moment they let go.
+pub(crate) const DXGI_ERROR_NOT_CURRENTLY_AVAILABLE: Hresult = 0x887A_0022u32 as Hresult;
+
+/// `DXGI_ERROR_ACCESS_LOST`: the duplication is void — a mode change, a desktop
+/// switch, or a game taking the output exclusively. Rebuild, do not fail.
+pub(crate) const DXGI_ERROR_ACCESS_LOST: Hresult = 0x887A_0026u32 as Hresult;
+
+/// `DXGI_ERROR_WAIT_TIMEOUT`: nothing changed within the timeout. The single most
+/// common answer on a still desktop, and never a failure.
+pub(crate) const DXGI_ERROR_WAIT_TIMEOUT: Hresult = 0x887A_0027u32 as Hresult;
+
+/// `DXGI_ERROR_SESSION_DISCONNECTED`: the session this duplication belongs to is
+/// no longer on the console.
+pub(crate) const DXGI_ERROR_SESSION_DISCONNECTED: Hresult = 0x887A_0028u32 as Hresult;
+
+/// `D3D_DRIVER_TYPE_HARDWARE`.
+pub(crate) const D3D_DRIVER_TYPE_HARDWARE: u32 = 1;
+
+/// `D3D11_SDK_VERSION`. A different value is refused outright by the runtime.
+pub(crate) const D3D11_SDK_VERSION: u32 = 7;
+
+/// `D3D11_USAGE_STAGING`: GPU-to-CPU transfer, the only usage that can be mapped
+/// for reading.
+pub(crate) const D3D11_USAGE_STAGING: u32 = 3;
+
+/// `D3D11_CPU_ACCESS_READ`.
+pub(crate) const D3D11_CPU_ACCESS_READ: u32 = 0x0002_0000;
+
+/// `D3D11_MAP_READ`.
+pub(crate) const D3D11_MAP_READ: u32 = 1;
+
+/// `DXGI_FORMAT_B8G8R8A8_UNORM` — the desktop's own format, and the byte order
+/// this project's wire already speaks, so the staging copy needs no conversion.
+pub(crate) const DXGI_FORMAT_B8G8R8A8_UNORM: u32 = 87;
+
+/// A `GUID`, as an interface id.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub(crate) struct Guid {
+    /// First four bytes.
+    pub(crate) data1: u32,
+    /// Next two.
+    pub(crate) data2: u16,
+    /// Next two.
+    pub(crate) data3: u16,
+    /// The remaining eight, already in wire order.
+    pub(crate) data4: [u8; 8],
+}
+
+/// `IID_IDXGIDevice`.
+pub(crate) const IID_IDXGI_DEVICE: Guid = Guid {
+    data1: 0x54ec_77fa,
+    data2: 0x1377,
+    data3: 0x44e6,
+    data4: [0x8c, 0x32, 0x88, 0xfd, 0x5f, 0x44, 0xc8, 0x4c],
+};
+
+/// `IID_IDXGIOutput1`, the interface that carries `DuplicateOutput`.
+pub(crate) const IID_IDXGI_OUTPUT1: Guid = Guid {
+    data1: 0x00cd_dea8,
+    data2: 0x939b,
+    data3: 0x4b83,
+    data4: [0xa3, 0x40, 0xa6, 0x85, 0x22, 0x66, 0x66, 0xcc],
+};
+
+/// `IID_ID3D11Texture2D`.
+pub(crate) const IID_ID3D11_TEXTURE2D: Guid = Guid {
+    data1: 0x6f15_aaf2,
+    data2: 0xd208,
+    data3: 0x4e89,
+    data4: [0x9a, 0xb4, 0x48, 0x95, 0x35, 0xd3, 0x4f, 0x9c],
+};
+
+/// A vtable entry this crate never calls.
+///
+/// Present so the slots below it keep their indices. Never transmuted and never
+/// called; the name in the field is the header's name for the method.
+pub(crate) type Slot = *const c_void;
+
+/// Any COM interface pointer: a pointer to a pointer to a vtable.
+///
+/// Written as one type because [`Unknown::release`] and `QueryInterface` are the
+/// same three slots on every interface in this file, so the reference counting is
+/// written once rather than per interface.
+#[repr(C)]
+pub(crate) struct Unknown {
+    /// The vtable, whose first three entries are `IUnknown`'s.
+    pub(crate) vtable: *const UnknownVtbl,
+}
+
+/// `IUnknownVtbl` — the three slots every interface below begins with.
+#[repr(C)]
+pub(crate) struct UnknownVtbl {
+    /// `QueryInterface`.
+    pub(crate) query_interface:
+        unsafe extern "system" fn(this: *mut Unknown, iid: *const Guid, out: *mut *mut c_void) -> Hresult,
+    /// `AddRef`.
+    pub(crate) add_ref: unsafe extern "system" fn(this: *mut Unknown) -> u32,
+    /// `Release`.
+    pub(crate) release: unsafe extern "system" fn(this: *mut Unknown) -> u32,
+}
+
+/// `IDXGIDeviceVtbl`, slots 0–11.
+#[repr(C)]
+pub(crate) struct DxgiDeviceVtbl {
+    /// `QueryInterface`, `AddRef`, `Release`.
+    pub(crate) unknown: UnknownVtbl,
+    /// `SetPrivateData`.
+    pub(crate) set_private_data: Slot,
+    /// `SetPrivateDataInterface`.
+    pub(crate) set_private_data_interface: Slot,
+    /// `GetPrivateData`.
+    pub(crate) get_private_data: Slot,
+    /// `GetParent`.
+    pub(crate) get_parent: Slot,
+    /// `GetAdapter` — slot 7.
+    pub(crate) get_adapter:
+        unsafe extern "system" fn(this: *mut Unknown, adapter: *mut *mut Unknown) -> Hresult,
+    /// `CreateSurface`.
+    pub(crate) create_surface: Slot,
+    /// `QueryResourceResidency`.
+    pub(crate) query_resource_residency: Slot,
+    /// `SetGPUThreadPriority`.
+    pub(crate) set_gpu_thread_priority: Slot,
+    /// `GetGPUThreadPriority`.
+    pub(crate) get_gpu_thread_priority: Slot,
+}
+
+/// `IDXGIAdapterVtbl`, slots 0–9.
+#[repr(C)]
+pub(crate) struct DxgiAdapterVtbl {
+    /// `QueryInterface`, `AddRef`, `Release`.
+    pub(crate) unknown: UnknownVtbl,
+    /// `SetPrivateData`.
+    pub(crate) set_private_data: Slot,
+    /// `SetPrivateDataInterface`.
+    pub(crate) set_private_data_interface: Slot,
+    /// `GetPrivateData`.
+    pub(crate) get_private_data: Slot,
+    /// `GetParent`.
+    pub(crate) get_parent: Slot,
+    /// `EnumOutputs` — slot 7. Answers [`DXGI_ERROR_NOT_FOUND`] past the end.
+    pub(crate) enum_outputs: unsafe extern "system" fn(
+        this: *mut Unknown,
+        index: u32,
+        output: *mut *mut Unknown,
+    ) -> Hresult,
+    /// `GetDesc`.
+    pub(crate) get_desc: Slot,
+    /// `CheckInterfaceSupport`.
+    pub(crate) check_interface_support: Slot,
+}
+
+/// `IDXGIOutput1Vtbl`, slots 0–22. The first nineteen are `IDXGIOutput`'s.
+#[repr(C)]
+pub(crate) struct DxgiOutput1Vtbl {
+    /// `QueryInterface`, `AddRef`, `Release`.
+    pub(crate) unknown: UnknownVtbl,
+    /// `SetPrivateData`.
+    pub(crate) set_private_data: Slot,
+    /// `SetPrivateDataInterface`.
+    pub(crate) set_private_data_interface: Slot,
+    /// `GetPrivateData`.
+    pub(crate) get_private_data: Slot,
+    /// `GetParent`.
+    pub(crate) get_parent: Slot,
+    /// `GetDesc` — slot 7, which is how an output is matched to a display.
+    pub(crate) get_desc:
+        unsafe extern "system" fn(this: *mut Unknown, desc: *mut DxgiOutputDesc) -> Hresult,
+    /// `GetDisplayModeList`.
+    pub(crate) get_display_mode_list: Slot,
+    /// `FindClosestMatchingMode`.
+    pub(crate) find_closest_matching_mode: Slot,
+    /// `WaitForVBlank`.
+    pub(crate) wait_for_vblank: Slot,
+    /// `TakeOwnership`.
+    pub(crate) take_ownership: Slot,
+    /// `ReleaseOwnership`.
+    pub(crate) release_ownership: Slot,
+    /// `GetGammaControlCapabilities`.
+    pub(crate) get_gamma_control_capabilities: Slot,
+    /// `SetGammaControl`.
+    pub(crate) set_gamma_control: Slot,
+    /// `GetGammaControl`.
+    pub(crate) get_gamma_control: Slot,
+    /// `SetDisplaySurface`.
+    pub(crate) set_display_surface: Slot,
+    /// `GetDisplaySurfaceData`.
+    pub(crate) get_display_surface_data: Slot,
+    /// `GetFrameStatistics`.
+    pub(crate) get_frame_statistics: Slot,
+    /// `GetDisplayModeList1`.
+    pub(crate) get_display_mode_list1: Slot,
+    /// `FindClosestMatchingMode1`.
+    pub(crate) find_closest_matching_mode1: Slot,
+    /// `GetDisplaySurfaceData1`.
+    pub(crate) get_display_surface_data1: Slot,
+    /// `DuplicateOutput` — slot 22, the whole point of this interface.
+    pub(crate) duplicate_output: unsafe extern "system" fn(
+        this: *mut Unknown,
+        device: *mut Unknown,
+        duplication: *mut *mut Unknown,
+    ) -> Hresult,
+}
+
+/// `IDXGIOutputDuplicationVtbl`, slots 0–14.
+#[repr(C)]
+pub(crate) struct DxgiOutputDuplicationVtbl {
+    /// `QueryInterface`, `AddRef`, `Release`.
+    pub(crate) unknown: UnknownVtbl,
+    /// `SetPrivateData`.
+    pub(crate) set_private_data: Slot,
+    /// `SetPrivateDataInterface`.
+    pub(crate) set_private_data_interface: Slot,
+    /// `GetPrivateData`.
+    pub(crate) get_private_data: Slot,
+    /// `GetParent`.
+    pub(crate) get_parent: Slot,
+    /// `GetDesc`.
+    pub(crate) get_desc: Slot,
+    /// `AcquireNextFrame` — slot 8.
+    pub(crate) acquire_next_frame: unsafe extern "system" fn(
+        this: *mut Unknown,
+        timeout_ms: u32,
+        info: *mut DxgiOutduplFrameInfo,
+        resource: *mut *mut Unknown,
+    ) -> Hresult,
+    /// `GetFrameDirtyRects`.
+    pub(crate) get_frame_dirty_rects: Slot,
+    /// `GetFrameMoveRects`.
+    pub(crate) get_frame_move_rects: Slot,
+    /// `GetFramePointerShape`.
+    pub(crate) get_frame_pointer_shape: Slot,
+    /// `MapDesktopSurface`.
+    pub(crate) map_desktop_surface: Slot,
+    /// `UnMapDesktopSurface`.
+    pub(crate) unmap_desktop_surface: Slot,
+    /// `ReleaseFrame` — slot 14. Owed for every acquire that succeeded.
+    pub(crate) release_frame: unsafe extern "system" fn(this: *mut Unknown) -> Hresult,
+}
+
+/// `ID3D11DeviceVtbl`, slots 0–5. Everything past `CreateTexture3D` is unused and
+/// unwritten: this is the one vtable in the file that is *truncated*, which is
+/// sound only because no slot after the last one named here is ever called.
+#[repr(C)]
+pub(crate) struct D3d11DeviceVtbl {
+    /// `QueryInterface`, `AddRef`, `Release`.
+    pub(crate) unknown: UnknownVtbl,
+    /// `CreateBuffer`.
+    pub(crate) create_buffer: Slot,
+    /// `CreateTexture1D`.
+    pub(crate) create_texture_1d: Slot,
+    /// `CreateTexture2D` — slot 5, which builds the staging surface.
+    pub(crate) create_texture_2d: unsafe extern "system" fn(
+        this: *mut Unknown,
+        desc: *const D3d11Texture2dDesc,
+        initial: *const c_void,
+        texture: *mut *mut Unknown,
+    ) -> Hresult,
+}
+
+/// `ID3D11DeviceContextVtbl`, slots 0–47, truncated after `CopyResource` for the
+/// same reason as [`D3d11DeviceVtbl`].
+#[repr(C)]
+pub(crate) struct D3d11DeviceContextVtbl {
+    /// `QueryInterface`, `AddRef`, `Release`.
+    pub(crate) unknown: UnknownVtbl,
+    /// `GetDevice`.
+    pub(crate) get_device: Slot,
+    /// `GetPrivateData`.
+    pub(crate) get_private_data: Slot,
+    /// `SetPrivateData`.
+    pub(crate) set_private_data: Slot,
+    /// `SetPrivateDataInterface`.
+    pub(crate) set_private_data_interface: Slot,
+    /// `VSSetConstantBuffers`.
+    pub(crate) vs_set_constant_buffers: Slot,
+    /// `PSSetShaderResources`.
+    pub(crate) ps_set_shader_resources: Slot,
+    /// `PSSetShader`.
+    pub(crate) ps_set_shader: Slot,
+    /// `PSSetSamplers`.
+    pub(crate) ps_set_samplers: Slot,
+    /// `VSSetShader`.
+    pub(crate) vs_set_shader: Slot,
+    /// `DrawIndexed`.
+    pub(crate) draw_indexed: Slot,
+    /// `Draw`.
+    pub(crate) draw: Slot,
+    /// `Map` — slot 14.
+    pub(crate) map: unsafe extern "system" fn(
+        this: *mut Unknown,
+        resource: *mut Unknown,
+        subresource: u32,
+        map_type: u32,
+        flags: u32,
+        mapped: *mut D3d11MappedSubresource,
+    ) -> Hresult,
+    /// `Unmap` — slot 15.
+    pub(crate) unmap: unsafe extern "system" fn(
+        this: *mut Unknown,
+        resource: *mut Unknown,
+        subresource: u32,
+    ),
+    /// `PSSetConstantBuffers`.
+    pub(crate) ps_set_constant_buffers: Slot,
+    /// `IASetInputLayout`.
+    pub(crate) ia_set_input_layout: Slot,
+    /// `IASetVertexBuffers`.
+    pub(crate) ia_set_vertex_buffers: Slot,
+    /// `IASetIndexBuffer`.
+    pub(crate) ia_set_index_buffer: Slot,
+    /// `DrawIndexedInstanced`.
+    pub(crate) draw_indexed_instanced: Slot,
+    /// `DrawInstanced`.
+    pub(crate) draw_instanced: Slot,
+    /// `GSSetConstantBuffers`.
+    pub(crate) gs_set_constant_buffers: Slot,
+    /// `GSSetShader`.
+    pub(crate) gs_set_shader: Slot,
+    /// `IASetPrimitiveTopology`.
+    pub(crate) ia_set_primitive_topology: Slot,
+    /// `VSSetShaderResources`.
+    pub(crate) vs_set_shader_resources: Slot,
+    /// `VSSetSamplers`.
+    pub(crate) vs_set_samplers: Slot,
+    /// `Begin`.
+    pub(crate) begin: Slot,
+    /// `End`.
+    pub(crate) end: Slot,
+    /// `GetData`.
+    pub(crate) get_data: Slot,
+    /// `SetPredication`.
+    pub(crate) set_predication: Slot,
+    /// `GSSetShaderResources`.
+    pub(crate) gs_set_shader_resources: Slot,
+    /// `GSSetSamplers`.
+    pub(crate) gs_set_samplers: Slot,
+    /// `OMSetRenderTargets`.
+    pub(crate) om_set_render_targets: Slot,
+    /// `OMSetRenderTargetsAndUnorderedAccessViews`.
+    pub(crate) om_set_render_targets_and_unordered_access_views: Slot,
+    /// `OMSetBlendState`.
+    pub(crate) om_set_blend_state: Slot,
+    /// `OMSetDepthStencilState`.
+    pub(crate) om_set_depth_stencil_state: Slot,
+    /// `SOSetTargets`.
+    pub(crate) so_set_targets: Slot,
+    /// `DrawAuto`.
+    pub(crate) draw_auto: Slot,
+    /// `DrawIndexedInstancedIndirect`.
+    pub(crate) draw_indexed_instanced_indirect: Slot,
+    /// `DrawInstancedIndirect`.
+    pub(crate) draw_instanced_indirect: Slot,
+    /// `Dispatch`.
+    pub(crate) dispatch: Slot,
+    /// `DispatchIndirect`.
+    pub(crate) dispatch_indirect: Slot,
+    /// `RSSetState`.
+    pub(crate) rs_set_state: Slot,
+    /// `RSSetViewports`.
+    pub(crate) rs_set_viewports: Slot,
+    /// `RSSetScissorRects`.
+    pub(crate) rs_set_scissor_rects: Slot,
+    /// `CopySubresourceRegion` — slot 46.
+    pub(crate) copy_subresource_region: Slot,
+    /// `CopyResource` — slot 47, the whole GPU-side cost of a frame.
+    pub(crate) copy_resource: unsafe extern "system" fn(
+        this: *mut Unknown,
+        destination: *mut Unknown,
+        source: *mut Unknown,
+    ),
+}
+
+/// `DXGI_OUTPUT_DESC`.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub(crate) struct DxgiOutputDesc {
+    /// `DeviceName`, e.g. `\\.\DISPLAY1`, NUL-padded.
+    pub(crate) device_name: [u16; 32],
+    /// The output's place on the virtual desktop, which is what identifies it.
+    pub(crate) desktop_coordinates: Rect,
+    /// Whether this output is part of the desktop at all.
+    pub(crate) attached_to_desktop: Bool,
+    /// `DXGI_MODE_ROTATION`.
+    pub(crate) rotation: u32,
+    /// `HMONITOR`.
+    pub(crate) monitor: Handle,
+}
+
+/// `DXGI_OUTDUPL_POINTER_POSITION`.
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub(crate) struct DxgiOutduplPointerPosition {
+    /// Where the pointer is.
+    pub(crate) position: Point,
+    /// Whether it is being drawn.
+    pub(crate) visible: Bool,
+}
+
+/// `DXGI_OUTDUPL_FRAME_INFO`.
+///
+/// `last_present_time` of zero is the field this crate reads most: it means the
+/// acquire returned a *pointer* update and no new desktop image, which is a frame
+/// that must be released and not encoded.
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub(crate) struct DxgiOutduplFrameInfo {
+    /// When the desktop image was last presented; zero means it was not.
+    pub(crate) last_present_time: i64,
+    /// When the pointer last moved.
+    pub(crate) last_mouse_update_time: i64,
+    /// How many frames were coalesced into this one.
+    pub(crate) accumulated_frames: u32,
+    /// Whether the dirty rectangles were merged.
+    pub(crate) rects_coalesced: Bool,
+    /// Whether protected content was blacked out of this frame.
+    pub(crate) protected_content_masked_out: Bool,
+    /// The pointer's position and visibility.
+    pub(crate) pointer_position: DxgiOutduplPointerPosition,
+    /// Bytes of metadata waiting.
+    pub(crate) total_metadata_buffer_size: u32,
+    /// Bytes of pointer shape waiting.
+    pub(crate) pointer_shape_buffer_size: u32,
+}
+
+/// `DXGI_SAMPLE_DESC`.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub(crate) struct DxgiSampleDesc {
+    /// Samples per pixel; one, for a surface that is only ever copied.
+    pub(crate) count: u32,
+    /// Quality level.
+    pub(crate) quality: u32,
+}
+
+/// `D3D11_TEXTURE2D_DESC`.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub(crate) struct D3d11Texture2dDesc {
+    /// Width in pixels.
+    pub(crate) width: u32,
+    /// Height in pixels.
+    pub(crate) height: u32,
+    /// Mip levels; one.
+    pub(crate) mip_levels: u32,
+    /// Array size; one.
+    pub(crate) array_size: u32,
+    /// `DXGI_FORMAT`.
+    pub(crate) format: u32,
+    /// Multisampling.
+    pub(crate) sample_desc: DxgiSampleDesc,
+    /// `D3D11_USAGE`.
+    pub(crate) usage: u32,
+    /// Bind flags; none, because this surface is never bound to the pipeline.
+    pub(crate) bind_flags: u32,
+    /// CPU access flags.
+    pub(crate) cpu_access_flags: u32,
+    /// Misc flags.
+    pub(crate) misc_flags: u32,
+}
+
+/// `D3D11_MAPPED_SUBRESOURCE`.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub(crate) struct D3d11MappedSubresource {
+    /// The pixels.
+    pub(crate) data: *mut c_void,
+    /// Bytes per row, which is **not** width × 4: the driver pads it.
+    pub(crate) row_pitch: u32,
+    /// Bytes per depth slice.
+    pub(crate) depth_pitch: u32,
+}
+
+// The layouts these calls reject a mismatch on, checked at compile time on the
+// machine that builds this rather than at run time on the machine that runs it.
+#[cfg(target_pointer_width = "64")]
+const _: () = assert!(size_of::<DxgiOutduplFrameInfo>() == 48);
+#[cfg(target_pointer_width = "64")]
+const _: () = assert!(size_of::<DxgiOutputDesc>() == 96);
+#[cfg(target_pointer_width = "64")]
+const _: () = assert!(size_of::<D3d11Texture2dDesc>() == 44);
+#[cfg(target_pointer_width = "64")]
+const _: () = assert!(size_of::<D3d11MappedSubresource>() == 16);
+#[cfg(target_pointer_width = "64")]
+const _: () = assert!(size_of::<Guid>() == 16);
+
+/// `D3D11CreateDevice`, resolved at run time.
+///
+/// Not imported statically, for the reason [`SetProcessDpiAwarenessContextFn`]
+/// gives and one more: a static import of `d3d11.dll` would make the *agent* fail
+/// to start on a machine with no Direct3D at all, where the whole point of this
+/// module is that such a machine quietly keeps the GDI capture it already had.
+pub(crate) type D3d11CreateDeviceFn = unsafe extern "system" fn(
+    adapter: *mut Unknown,
+    driver_type: u32,
+    software: Handle,
+    flags: u32,
+    feature_levels: *const u32,
+    feature_level_count: u32,
+    sdk_version: u32,
+    device: *mut *mut Unknown,
+    feature_level: *mut u32,
+    context: *mut *mut Unknown,
+) -> Hresult;
+
 /// Resolves an optional export, or `None` if this Windows does not have it.
 ///
 /// # Safety
