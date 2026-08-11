@@ -1050,7 +1050,7 @@ impl AgentChannel for PipeChannel {
     }
 
     fn send(&mut self, message: &[u8]) -> Result<(), Fault> {
-        use selfhost_screen::agent::{encode_link, LinkFrame};
+        use selfhost_screen::agent::encode_link;
 
         // No pipe, or nobody on it: the message has nowhere to go and that is an
         // ordinary state, not a fault. See the trait's contract.
@@ -1060,7 +1060,7 @@ impl AgentChannel for PipeChannel {
         if !self.accepted {
             return Ok(());
         }
-        let frame = encode_link(&LinkFrame::Message(message.to_vec()))?;
+        let frame = encode_link(&link_frame(message))?;
         pipe.write_all(&frame, WRITE_WAIT)
     }
 
@@ -1100,6 +1100,40 @@ impl AgentChannel for PipeChannel {
     }
 }
 
+/// Wraps one outgoing message in the frame the link expects for it.
+///
+/// # Credit is a frame here, not a payload
+///
+/// The link between daemon and agent has **two** vocabularies, and they are not
+/// interchangeable: `LinkFrame::Message` carries a protocol message the agent
+/// interprets, and `LinkFrame::Credit` carries a window grant the agent's own
+/// send window consumes. `selfhost_desk::relay` speaks the first vocabulary
+/// because it is written against a socket, so its `Message::Credit` has to be
+/// translated into the second on the way out — sent as a payload it is a message
+/// the agent decodes, finds no use for, and drops, and the agent then waits for a
+/// grant that has already been delivered in a form it does not read.
+///
+/// That is what a session against ALEX-DESKTOP looked like: a clean handshake, a
+/// correct display, and twenty-eight bytes in eight seconds.
+///
+/// The translation reads the kind byte and, for exactly one kind, the four bytes
+/// after it. Nothing else is parsed, and no other kind is treated specially —
+/// the daemon-does-not-interpret rule survives, because this is a length-fixed
+/// read at a fixed offset rather than a decode.
+fn link_frame(message: &[u8]) -> selfhost_screen::agent::LinkFrame {
+    use selfhost_screen::agent::LinkFrame;
+
+    const CREDIT_MESSAGE: usize = 5;
+    if message.len() == CREDIT_MESSAGE
+        && message.first() == Some(&selfhost_desk::wire::kind::CREDIT)
+    {
+        if let Some(bytes) = message.get(1..CREDIT_MESSAGE).and_then(|b| b.try_into().ok()) {
+            return LinkFrame::Credit(u32::from_be_bytes(bytes));
+        }
+    }
+    LinkFrame::Message(message.to_vec())
+}
+
 /// Takes one whole message off the front of a partly-arrived stream.
 ///
 /// `Ok(None)` means *not a whole frame yet*, which is the ordinary case on a
@@ -1133,6 +1167,40 @@ mod tests {
     use std::cell::RefCell;
     use std::rc::Rc;
     use std::time::Instant;
+
+    /// A credit grant becomes the link's own credit frame; everything else does
+    /// not.
+    ///
+    /// The defect this pins cost a working stream: `selfhost_desk::relay` speaks
+    /// `Message::Credit` because it is written against a socket, the agent's send
+    /// window is fed only by `LinkFrame::Credit`, and a grant sent as a payload is
+    /// a message the agent decodes, finds no use for and drops. Both ends then
+    /// wait — the agent for a window, the console for a picture.
+    #[test]
+    fn a_credit_message_crosses_the_link_as_a_credit_frame() {
+        use selfhost_desk::wire::Message;
+        use selfhost_screen::agent::LinkFrame;
+
+        let grant = Message::Credit { bytes: 256 * 1024 }.encode().expect("encodes");
+        assert_eq!(
+            link_frame(&grant),
+            LinkFrame::Credit(256 * 1024),
+            "a grant is a window, not something to interpret"
+        );
+
+        // Everything else stays a message, including the one that is nearly the
+        // same shape.
+        let full_frame = Message::RequestFullFrame { monitor: 0 }.encode().expect("encodes");
+        assert_eq!(link_frame(&full_frame), LinkFrame::Message(full_frame.clone()));
+        let release = Message::ReleaseAll.encode().expect("encodes");
+        assert_eq!(link_frame(&release), LinkFrame::Message(release.clone()));
+
+        // And a truncated grant is not mistaken for one: the length is checked
+        // before the bytes are read, so a short frame stays a message and the
+        // agent refuses it rather than this end inventing a window from padding.
+        let truncated = vec![selfhost_desk::wire::kind::CREDIT, 0, 0];
+        assert_eq!(link_frame(&truncated), LinkFrame::Message(truncated.clone()));
+    }
 
     /// The scripted machine both fakes speak for, so the order in which they were
     /// called is observable.
