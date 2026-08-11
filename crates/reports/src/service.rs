@@ -75,6 +75,9 @@ pub struct Config {
     pub per_source: Rate,
     /// What everyone together may file.
     pub global: Rate,
+    /// What one source may *read* — the token routes, counted separately so that a checkout
+    /// syncing on a timer can never spend the allowance an agent needs to file.
+    pub per_reader: Rate,
     /// Where notifications go, when the box has a mailbox for them.
     pub mail: Option<Mailbox>,
     /// How often a notification may be sent, however many reports arrive.
@@ -93,6 +96,9 @@ impl Default for Config {
             per_source: Rate::new(3, 3.0),
             // The whole box: a burst of twenty, then one a second sustained.
             global: Rate::new(20, 60.0),
+            // Reading is cheap and a subscribed checkout does it on a timer, so the burst is
+            // larger; it exists to make guessing at the token expensive, not to ration syncs.
+            per_reader: Rate::new(10, 30.0),
             mail: None,
             // At most one message a minute, so a flood is a database problem, not an inbox one.
             mail_rate: Rate::new(3, 1.0),
@@ -106,7 +112,8 @@ impl Default for Config {
 pub struct Service {
     store: Store,
     config: Config,
-    limiter: Mutex<Limiter>,
+    filing: Mutex<Limiter>,
+    reading: Mutex<Limiter>,
     mail_meter: Mutex<Meter>,
 }
 
@@ -114,12 +121,14 @@ impl Service {
     /// An intake over `store`, configured by `config`.
     #[must_use]
     pub fn new(store: Store, config: Config) -> Self {
-        let limiter = Mutex::new(Limiter::new(config.per_source, config.global));
+        let filing = Mutex::new(Limiter::new(config.per_source, config.global));
+        let reading = Mutex::new(Limiter::new(config.per_reader, config.global));
         let mail_meter = Mutex::new(Meter::new(config.mail_rate));
         Self {
             store,
             config,
-            limiter,
+            filing,
+            reading,
             mail_meter,
         }
     }
@@ -171,7 +180,7 @@ impl Service {
         // cannot try tokens at line speed. A subscribed checkout syncs every few minutes and
         // never comes near the burst.
         if path == format!("{route}/feed") || path == format!("{route}/close") {
-            if let Decision::Refuse(seconds) = self.admit(client, now) {
+            if let Decision::Refuse(seconds) = self.admit(&self.reading, client, now) {
                 return retry_after(seconds);
             }
             return if path.ends_with("/feed") {
@@ -185,7 +194,7 @@ impl Service {
 
     /// `POST <route>` — the one open door.
     fn file(&self, body: &[u8], client: &str, now: Instant, wall: SystemTime) -> Response {
-        if let Decision::Refuse(seconds) = self.admit(client, now) {
+        if let Decision::Refuse(seconds) = self.admit(&self.filing, client, now) {
             return retry_after(seconds);
         }
         let Ok(text) = std::str::from_utf8(body) else {
@@ -341,9 +350,13 @@ impl Service {
         ))
     }
 
-    /// Spends one allowance for `client`.
-    fn admit(&self, client: &str, now: Instant) -> Decision {
-        match self.limiter.lock() {
+    /// Spends one allowance for `client` out of `limiter`.
+    ///
+    /// Filing and reading have a limiter each, so a checkout syncing every few minutes and an
+    /// agent filing a burst of reports never take each other's allowance — and a stranger
+    /// guessing at the token cannot stop either.
+    fn admit(&self, limiter: &Mutex<Limiter>, client: &str, now: Instant) -> Decision {
+        match limiter.lock() {
             Ok(mut limiter) => limiter.admit(client, now),
             // A poisoned lock means a panic happened while holding it. Under `panic = "abort"`
             // that cannot happen; if it somehow did, refusing is the safe half of the choice.
@@ -877,7 +890,21 @@ mod tests {
     /// being a free amplifier for anyone who finds it.
     #[test]
     fn guessing_at_the_token_costs_the_guesser_an_allowance() {
-        let service = service("token-rate");
+        // A reading allowance the size of the filing one, so the property is asserted in four
+        // requests rather than eleven. The shipped burst is larger, because a subscribed
+        // checkout reads on a timer and this limiter exists to make guessing expensive.
+        let dir = std::env::temp_dir().join("selfhost-reports-service-token-rate");
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = Store::open(&dir).expect("store");
+        store.add_project("dx").expect("project");
+        let service = Service::new(
+            store,
+            Config {
+                token: Some("secret-token".to_string()),
+                per_reader: Rate::new(3, 3.0),
+                ..Config::default()
+            },
+        );
         let now = Instant::now();
         let wrong = request(
             "GET /api/reports/feed HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer nope\r\n\r\n",
@@ -908,6 +935,17 @@ mod tests {
                 Status::OK
             );
         }
+
+        // And filing is a separate allowance, so a reader that has spent its own — a checkout
+        // syncing on a timer, or somebody trying tokens — has not taken the one an agent needs
+        // to report what it just hit. A read starving a write is the bug this pair prevents.
+        let body = r#"{"kind":"bug","title":"still able to file","detail":"d"}"#;
+        assert_eq!(
+            service
+                .answer(&post(body), body.as_bytes(), "203.0.113.9", now, UNIX_EPOCH)
+                .status,
+            Status::OK
+        );
     }
 
     #[test]
