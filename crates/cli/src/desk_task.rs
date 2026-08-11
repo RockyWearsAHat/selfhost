@@ -1849,17 +1849,6 @@ role = \"worker\"
         }
     }
 
-    /// The property the whole default-off posture rests on, walked end to end:
-    /// with `allow_input = false` there is **no route** by which an injector
-    /// comes into being.
-    ///
-    /// It is walked rather than asserted once because wiring the agent spawn
-    /// added a new route — an argument vector handed to a process running as the
-    /// console user — and the previous pass's version of this property held only
-    /// because that route did not exist. Each step below is a different place the
-    /// answer could have been re-derived, and re-deriving it is how they come to
-    /// disagree.
-    #[test]
     /// A relayed backend's report comes from the supervisor, never from the probe.
     ///
     /// The defect this pins, found by running it on the production box rather
@@ -1882,9 +1871,10 @@ role = \"worker\"
             relayed.wired && relayed.relayed,
             "a relayed backend is wired, which is why `wired` alone cannot decide this"
         );
-        // The condition the report is written against: only a backend that is
-        // wired *and not* relayed may answer from the probe.
-        assert!(!(relayed.wired && !relayed.relayed), "the relayed arm must fall through");
+        // The predicate the report is written against, asserted as a predicate:
+        // only a backend that is wired *and not* relayed may answer from the
+        // probe, so this one must fall through to the supervisor.
+        assert!(!answers_from_probe(&relayed), "the relayed arm must fall through");
 
         let direct = crate::desk_local::Backend {
             name: "CGDisplayStream",
@@ -1894,9 +1884,28 @@ role = \"worker\"
             displays: 2,
             relayed: false,
         };
-        assert!(direct.wired && !direct.relayed, "a direct backend still answers from the probe");
+        assert!(answers_from_probe(&direct), "a direct backend still answers from the probe");
     }
 
+    /// Whether [`Fleet::agent`] may answer from the capture probe alone.
+    ///
+    /// The predicate itself, named once so the test asserts the thing the report
+    /// branches on rather than a re-spelling of it that can drift away from it.
+    fn answers_from_probe(backend: &crate::desk_local::Backend) -> bool {
+        backend.wired && !backend.relayed
+    }
+
+    /// The property the whole default-off posture rests on, walked end to end:
+    /// with `allow_input = false` there is **no route** by which an injector
+    /// comes into being.
+    ///
+    /// It is walked rather than asserted once because wiring the agent spawn
+    /// added a new route — an argument vector handed to a process running as the
+    /// console user — and the previous pass's version of this property held only
+    /// because that route did not exist. Each step below is a different place the
+    /// answer could have been re-derived, and re-deriving it is how they come to
+    /// disagree.
+    #[test]
     fn a_view_only_deployment_arms_nothing_by_any_route() {
         let dir = temp_dir("view-only");
         let desktop = Desktop { enabled: true, allow_input: false, ..Desktop::default() };
