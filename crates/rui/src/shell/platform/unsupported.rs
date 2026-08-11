@@ -46,6 +46,14 @@ impl Backend for Window {
         false
     }
 
+    fn is_fullscreen(&self) -> bool {
+        false
+    }
+
+    fn set_fullscreen(&self, _filling: bool) -> Result<(), Error> {
+        Err(Error::Unsupported)
+    }
+
     fn clipboard_text(&self) -> Result<Option<String>, Error> {
         Err(Error::Unsupported)
     }

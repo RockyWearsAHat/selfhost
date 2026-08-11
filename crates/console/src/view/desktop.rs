@@ -89,6 +89,73 @@ pub fn view(console: &Console) -> El<Console> {
     row((machines(&snapshot), session(console, &snapshot))).gap(8.0).grow()
 }
 
+/// The far screen with nothing else on it: what a full screen is *for*.
+///
+/// # Why this is a different description and not the same one with the rail
+/// hidden
+///
+/// A remote desktop shown inside a console is a picture among readings, and the
+/// readings are why the console exists. A remote desktop filling a screen is the
+/// far machine *being* this window — the thing a person asked for when they made
+/// it full screen — and every unit spent on a plate edge, a page margin or a tab
+/// row is a unit the picture does not get. So the stage draws two things: one
+/// strip that says whose screen this is and how to get out, and the picture.
+///
+/// Nothing here is a second implementation of the viewport. It is
+/// [`viewport`] — the same element, the same handles, the same forwarding — so
+/// a keyboard that works in the pane works here, and neither can be fixed
+/// without the other.
+pub fn stage(console: &Console) -> El<Console> {
+    let live = console.session_live();
+    col((bar(console, live.as_ref()), viewport(console, live.as_ref()))).gap(2.0).grow()
+}
+
+/// The one strip of console left on the stage: where this is, and the way out.
+///
+/// Deliberately not a summary of the pane below it. Three facts earn their
+/// height at the top of a filled screen: which machine is under the pointer,
+/// whether what is typed reaches it, and how to leave — the last because a
+/// window with no title bar has taken away the way a person would otherwise
+/// close it, and hiding the replacement would be the defect this whole screen
+/// exists to avoid.
+fn bar(console: &Console, live: Option<&Live>) -> El<Console> {
+    let peer = console
+        .snapshot()
+        .desk
+        .peer()
+        .map_or_else(|| "NO MACHINE".to_owned(), |peer| peer.node.to_uppercase());
+    let driving = live.is_some_and(Live::may_control);
+    let mode = live.map(|live| {
+        Mode::of(live.may_control(), live.far_end_is_live(), console.viewport_has_keys())
+    });
+    row((
+        micro(peer).tracking(1.2),
+        mode.map(|mode| {
+            row((style::lamp(mode.status()), style::state_word(mode.status(), mode.word().to_owned())))
+                .gap(6.0)
+                .align(Align::Center)
+        }),
+        spacer().grow(),
+        // Absent while the keyboard is held, for the reason `controls` gives:
+        // it is not unavailable, it is done.
+        (!driving).then(|| {
+            button("TAKE CONTROL")
+                .key("stage-control")
+                .on_click(|console: &mut Console| console.open_session(true))
+        }),
+        button("EXIT FULL SCREEN")
+            .key("stage-exit")
+            .on_click(|console: &mut Console| console.toggle_full_screen()),
+        // The words rather than a hint that fades: a person who has just lost
+        // the title bar is looking for exactly this, and a session holding the
+        // keyboard has no Escape to spare — see [`leaves_full_screen`].
+        caption(if driving { "⌃⌘F leaves" } else { "Esc leaves" }),
+    ))
+    .gap(10.0)
+    .pad_each(4.0, 8.0, 4.0, 8.0)
+    .align(Align::Center)
+}
+
 /// The picker: every machine this credential may watch, and how it is.
 ///
 /// Absence is never the answer. A machine that is down is drawn with the reason
@@ -510,6 +577,13 @@ fn controls(snapshot: &crate::state::Snapshot, live: Option<&Live>) -> El<Consol
         open.then(|| {
             button("FULL FRAME").on_click(|console: &mut Console| console.request_full_frame())
         }),
+        // Present whether or not a session is open, and never greyed: making
+        // the window fill the screen is this window's own business, and a
+        // person who has just chosen a machine is entitled to give it the
+        // screen before the picture arrives.
+        button("FULL SCREEN")
+            .key("full-screen")
+            .on_click(|console: &mut Console| console.toggle_full_screen()),
         spacer().grow(),
         live.map(diagnostics),
     ))
@@ -580,6 +654,18 @@ pub type ViewportHandles = (Arc<Mutex<Picture>>, Arc<Mutex<(u32, u32)>>);
 /// console in the background typing into somebody's machine.
 pub fn forwards_keys(live: &Live, aimed: bool) -> bool {
     Mode::of(live.may_control(), live.far_end_is_live(), aimed) == Mode::Driving
+}
+
+/// Whether a keystroke is this window being asked to leave the full screen.
+///
+/// Escape, and only while the session is *watching*. A session holding the
+/// keyboard needs Escape on the far machine far more than it needs a second way
+/// out of a full screen — a remote desktop that swallowed it could not close a
+/// dialogue over there — so a driving session leaves by the control on the bar
+/// or by the platform's own shortcut, which never reaches this program at all.
+/// Pure, so the rule is asserted without a window.
+pub fn leaves_full_screen(stroke: rui::KeyStroke, full_screen: bool, driving: bool) -> bool {
+    full_screen && !driving && stroke.is_down() && stroke.key == Some(rui::Key::Escape)
 }
 
 #[cfg(test)]
@@ -675,6 +761,42 @@ mod tests {
         };
         assert!(monitors(&[monitor(0)], 0).is_none(), "a row of one button is chrome");
         assert!(monitors(&[monitor(0), monitor(1)], 0).is_some());
+    }
+
+    /// A key going down, with nothing held.
+    fn pressed(key: rui::Key) -> rui::KeyStroke {
+        rui::KeyStroke {
+            code: None,
+            key: Some(key),
+            modifiers: rui::Modifiers::default(),
+            phase: rui::KeyPhase::Down,
+        }
+    }
+
+    #[test]
+    fn escape_leaves_a_full_screen_that_is_only_being_watched() {
+        assert!(leaves_full_screen(pressed(rui::Key::Escape), true, false));
+    }
+
+    #[test]
+    fn escape_belongs_to_the_far_machine_while_the_keyboard_is_held() {
+        // The failure this prevents is a dialogue on the far machine that
+        // cannot be dismissed, because the one key that would do it closed a
+        // full screen over here instead.
+        assert!(!leaves_full_screen(pressed(rui::Key::Escape), true, true));
+    }
+
+    #[test]
+    fn nothing_leaves_a_window_that_is_not_filling_the_screen() {
+        assert!(!leaves_full_screen(pressed(rui::Key::Escape), false, false));
+        assert!(!leaves_full_screen(pressed(rui::Key::Enter), true, false), "only Escape");
+    }
+
+    #[test]
+    fn a_key_coming_back_up_leaves_nothing() {
+        let mut release = pressed(rui::Key::Escape);
+        release.phase = rui::KeyPhase::Up;
+        assert!(!leaves_full_screen(release, true, false), "one press is one leaving");
     }
 
     #[test]

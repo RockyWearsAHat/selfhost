@@ -443,6 +443,11 @@ const LEAVE_WINDOW_MASK: c_long = 1 << 5;
 const POINTER_MOTION_MASK: c_long = 1 << 6;
 const EXPOSURE_MASK: c_long = 1 << 15;
 const STRUCTURE_NOTIFY_MASK: c_long = 1 << 17;
+/// `SubstructureNotifyMask`, one of the two a root-window message is sent with.
+const SUBSTRUCTURE_NOTIFY_MASK: c_long = 1 << 19;
+/// `SubstructureRedirectMask`, the other; together they are what the window
+/// manager is listening for on the root window.
+const SUBSTRUCTURE_REDIRECT_MASK: c_long = 1 << 20;
 
 // Modifier bits in an event's `state`.
 const SHIFT_MASK: c_uint = 1 << 0;
@@ -466,6 +471,17 @@ const ANY_PROPERTY_TYPE: Atom = 0;
 const PROP_MODE_REPLACE: c_int = 0;
 /// `Success`, which is what every Xlib call answering a status returns on one.
 const SUCCESS: c_int = 0;
+
+/// `_NET_WM_STATE_REMOVE` and `_NET_WM_STATE_ADD`, the first word of the
+/// message that asks a window manager to change one of a window's states.
+const NET_WM_STATE_REMOVE: c_long = 0;
+const NET_WM_STATE_ADD: c_long = 1;
+
+/// How many of a window's states are read at once.
+///
+/// A window manager keeps a handful — maximised, above, sticky, full screen —
+/// and thirty-two is far past any of them while staying a single read.
+const WINDOW_STATE_WORDS: c_long = 32;
 
 /// How many words of a selection are read at once.
 ///
@@ -513,6 +529,10 @@ struct Atoms {
     incremental: Atom,
     /// The property on our own window that answers are delivered into.
     delivery: Atom,
+    /// `_NET_WM_STATE`: the list of states the window manager has this window in.
+    window_state: Atom,
+    /// `_NET_WM_STATE_FULLSCREEN`: the one of those states this backend asks for.
+    state_fullscreen: Atom,
 }
 
 /// A window on X11.
@@ -597,6 +617,8 @@ impl Backend for Window {
                 targets: XInternAtom(display, c"TARGETS".as_ptr(), 0),
                 incremental: XInternAtom(display, c"INCR".as_ptr(), 0),
                 delivery: XInternAtom(display, c"RUI_SELECTION".as_ptr(), 0),
+                window_state: XInternAtom(display, c"_NET_WM_STATE".as_ptr(), 0),
+                state_fullscreen: XInternAtom(display, c"_NET_WM_STATE_FULLSCREEN".as_ptr(), 0),
             };
 
             // Without this the window manager's close button kills the
@@ -724,6 +746,76 @@ impl Backend for Window {
 
     fn is_open(&self) -> bool {
         self.open
+    }
+
+    fn is_fullscreen(&self) -> bool {
+        // Read from `_NET_WM_STATE` rather than remembered, because the window
+        // manager is the one that decides: it may have declined the request,
+        // and the person may have used its own key to do this without us.
+        unsafe {
+            let mut kind: Atom = 0;
+            let mut format: c_int = 0;
+            let mut count: c_ulong = 0;
+            let mut remaining: c_ulong = 0;
+            let mut data: *mut u8 = std::ptr::null_mut();
+            let status = XGetWindowProperty(
+                self.display,
+                self.window,
+                self.atoms.window_state,
+                0,
+                WINDOW_STATE_WORDS,
+                0,
+                XA_ATOM,
+                &mut kind,
+                &mut format,
+                &mut count,
+                &mut remaining,
+                &mut data,
+            );
+            if status != SUCCESS || data.is_null() {
+                return false;
+            }
+            // A property of atoms arrives as an array of `long`, whatever the
+            // format says: that is the X client library's own convention for a
+            // 32-bit property, and reading it as `u32` would halve it on a
+            // 64-bit machine.
+            let states = std::slice::from_raw_parts(data.cast::<c_ulong>(), count as usize);
+            let filling = states.contains(&self.atoms.state_fullscreen);
+            XFree(data.cast::<c_void>());
+            filling
+        }
+    }
+
+    fn set_fullscreen(&self, filling: bool) -> Result<(), Error> {
+        // The state of a mapped window is changed by asking the window manager,
+        // never by writing the property: a client that sets `_NET_WM_STATE`
+        // itself is writing down an answer only the window manager can give,
+        // and a manager that honours the specification will overwrite it.
+        unsafe {
+            let mut event: XEvent = std::mem::zeroed();
+            let message = &mut *(&raw mut event).cast::<XClientMessageEvent>();
+            message.kind = CLIENT_MESSAGE;
+            message.display = self.display;
+            message.window = self.window;
+            message.message_type = self.atoms.window_state;
+            message.format = 32;
+            message.data[0] = if filling { NET_WM_STATE_ADD } else { NET_WM_STATE_REMOVE };
+            message.data[1] = self.atoms.state_fullscreen as c_long;
+            // The second state is none, and the source is a normal application
+            // rather than a pager — both are fields of the message the
+            // specification defines.
+            message.data[3] = 1;
+            let root = XRootWindow(self.display, XDefaultScreen(self.display));
+            XSendEvent(
+                self.display,
+                root,
+                0,
+                SUBSTRUCTURE_NOTIFY_MASK | SUBSTRUCTURE_REDIRECT_MASK,
+                &mut event,
+            );
+            XFlush(self.display);
+        }
+        Ok(())
     }
 
     /// Asks whoever owns the clipboard what it holds, and waits for the answer.

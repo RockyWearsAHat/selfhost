@@ -88,6 +88,12 @@ pub struct App<S> {
     /// `None` for the library's own ground — the palette's vertical gradient —
     /// which is what nearly every application wants. See [`App::ground`].
     ground: Option<Ground>,
+    /// Whether the window should fill the screen, and how to say it changed.
+    ///
+    /// `None` for an application that never asked, which is every one that does
+    /// not draw something worth a whole screen: nothing is read from the window
+    /// and nothing is ever asked of it. See [`App::fullscreen`].
+    fullscreen: Option<(Condition<S>, Report<S>)>,
     /// What another thread has asked the loop for.
     ///
     /// Always present, and free while nobody holds a clone: an unrequested
@@ -112,6 +118,9 @@ type View<S> = Box<dyn Fn(&S) -> El<S>>;
 
 /// Something the application is asked about its own state each frame.
 type Condition<S> = Box<dyn Fn(&S) -> bool>;
+
+/// How a change the platform made on its own is written into the state.
+type Report<S> = Box<dyn Fn(&mut S, bool)>;
 
 /// What the interface is drawn from, derived once a frame from the appearance.
 ///
@@ -251,6 +260,7 @@ impl<S> App<S> {
             running: Box::new(|_| true),
             theme: Box::new(Theme::new),
             ground: None,
+            fullscreen: None,
             redraw: Redraw(Arc::new(Pending::default())),
             access: AccessTree::new(),
             access_update: AccessUpdate::default(),
@@ -415,6 +425,50 @@ impl<S> App<S> {
         mono_font: FontId,
     ) -> Theme {
         (self.theme)(appearance, ui_font, mono_font)
+    }
+
+    /// Whether the window should be filling the screen, and where to write it
+    /// down when the platform changes that on its own.
+    ///
+    /// Two closures and not one, because both ends can change this. `wanted` is
+    /// asked every turn of the loop and is what a control in the interface
+    /// toggles; `changed` is called when the person used the platform's own way
+    /// in — the green button on macOS, a window manager's key — so that the
+    /// state a frame is drawn from cannot come to disagree with the window it
+    /// is drawn into.
+    ///
+    /// ```ignore
+    /// App::new("Console", console, view)
+    ///     .fullscreen(|console: &Console| console.filling_screen, |console, on| {
+    ///         console.filling_screen = on;
+    ///     })
+    ///     .run()
+    /// ```
+    ///
+    /// An application that never calls this is never asked and never asks:
+    /// its window is whatever the person dragged it to, exactly as before.
+    pub fn fullscreen(
+        mut self,
+        wanted: impl Fn(&S) -> bool + 'static,
+        changed: impl Fn(&mut S, bool) + 'static,
+    ) -> Self {
+        self.fullscreen = Some((Box::new(wanted), Box::new(changed)));
+        self
+    }
+
+    /// Whether the interface wants the window to fill the screen.
+    ///
+    /// `None` from an application that never bound it, which is the answer the
+    /// loop reads as "ask the window nothing".
+    pub(crate) fn wants_fullscreen(&self) -> Option<bool> {
+        self.fullscreen.as_ref().map(|(wanted, _)| wanted(&self.state))
+    }
+
+    /// Writes down that the window is, or is no longer, filling the screen.
+    pub(crate) fn report_fullscreen(&mut self, filling: bool) {
+        if let Some((_, changed)) = &self.fullscreen {
+            changed(&mut self.state, filling);
+        }
     }
 
     /// When the application should close its own window.
