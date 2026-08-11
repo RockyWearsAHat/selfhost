@@ -748,14 +748,23 @@ impl<H: selfhost_screen::AgentHost, C: AgentChannel> Supervised<H, C> {
             }
             _ => {}
         }
-        // The supervisor's own record first: it knows why a spawn failed, and the
-        // channel only ever knows why a pipe did.
-        let fault = self
-            .agent
-            .supervision()
-            .last_fault()
-            .map(Fault::sentence)
-            .or_else(|| self.fault.as_ref().map(Fault::sentence));
+        // **Both, when there are both.** These are two different observations of
+        // one event and neither implies the other: the supervisor's record says
+        // what the agent *decided* — the exit code it chose — and the channel's
+        // says what this end *saw* on the pipe. Preferring the first and
+        // discarding the second hid the only useful half of the most common
+        // failure: an agent that is disconnected by this end reports a broken
+        // stream, and the reason it was disconnected is knowable only here.
+        let fault = match (
+            self.agent.supervision().last_fault().map(Fault::sentence),
+            self.fault.as_ref().map(Fault::sentence),
+        ) {
+            (Some(agent), Some(channel)) if agent != channel => {
+                Some(format!("{agent}; on this end, {channel}"))
+            }
+            (Some(agent), _) => Some(agent),
+            (None, channel) => channel,
+        };
         AgentStatus {
             supervised: true,
             live: matches!(self.phase, AgentPhase::Live { .. }),
