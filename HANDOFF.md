@@ -168,17 +168,31 @@ credential on the request — a browser carries the cookie, and anything else mu
 send its `Authorization` header, or the handshake is the same uninformative
 `401` as an unauthenticated caller gets.
 
-**The session-0 half is now written and has still never run.** A Windows daemon
-installed as a service is `SYSTEM` in session 0 and cannot capture the console
-user's desktop by any method — checked on the box, not assumed:
-`Get-Process selfhost | Select SI` answers `0` for both processes there. The
-agent produces an encoded message stream rather than pixels, so
-`crates/desk/src/relay.rs` is a second driver that forwards it byte for byte
-under this session's own deadline, capability re-check and kill switch, reading
-one byte of each message to decide direction and decoding nothing. One agent
-serves one session and a second is refused, because the agent diffs against
-*the* client's surface. Nine tests cover it against a scripted agent; the pipe
-under it is Windows-only and unrun.
+**The session-0 half runs, on the box it was written for (2026-08-11).** A
+Windows daemon installed as a service is `SYSTEM` in session 0 and cannot capture
+the console user's desktop by any method — `Get-Process selfhost | Select SI`
+answers `0` for both processes there. The agent produces an encoded message
+stream rather than pixels, so `crates/desk/src/relay.rs` is a second driver that
+forwards it byte for byte under this session's own deadline, capability re-check
+and kill switch, reading one byte of each message to decide direction and
+decoding nothing. Measured through an SSH tunnel from this Mac: **932 tiles and
+3.47 MB in ten seconds** of that machine's real 2560×1440 panel — a complete
+keyframe — and the native console drew it live.
+
+It took **seven defects**, six of them findable only by running it, and the
+sequence is worth knowing because four of the six were failures of *reporting*
+rather than of function: the plate answered from the wrong source, every failure
+exited 1, the agent's last words were deleted, and the channel's own account was
+preferred away. Only once all four were fixed did Windows name the real fault in
+its own words — `ImpersonateNamedPipeClient` cannot run before a read, so the
+client check failed every time and disconnected the agent it had just accepted.
+Then three more: a relay that refunds credit cannot *start* a stream, credit was
+being granted in a vocabulary the agent does not read, and the data path ran at
+the supervisor's one-second decision cadence. `desktop-lab.dx` lists all seven.
+
+**Input has still never crossed it.** `allow_input = true` on that box and
+nothing has typed through the relay; `bearer_may_control = false`, so proving it
+needs a console login rather than the bearer token.
 
 **And the thing that used to read stronger than it was is now true.** The daemon
 drove sessions with a ticket-shaped stand-in, so a mid-stream revocation ended
@@ -237,9 +251,10 @@ Be exact about this, because everything above is macOS.
   mapped at all, so desktop keystroke forwarding from a Linux console does
   nothing — an X11 keycode is an index into a per-server keymap with no fixed
   meaning.
-- **No desktop stream has ever crossed a real socket to a real *agent*.** One has
-  now crossed a real socket to a real *screen* — see §3.2 — but that was this
-  Mac capturing itself. Nothing has yet read a frame off a named pipe.
+- ~~**No desktop stream has ever crossed a real socket to a real agent.**~~
+  Closed 2026-08-11: frames are read off the named pipe on ALEX-DESKTOP and
+  relayed to a console on this Mac. What has *not* crossed it is **input** — no
+  keystroke or click has gone the other way, on any machine.
 - **The SMB backends for Windows and Linux** — the `SmbShare` cmdlets, the
   `icacls` forms, `testparm -s`, `smbcontrol all reload-config` — are written
   from documentation and have met no host. macOS is the opposite: flags read off
