@@ -2262,13 +2262,18 @@ async fn serve_desktop(
         bits = capabilities.bits(),
     );
 
+    let redemption = desk_api::redemption(session.as_deref(), &node, capabilities);
     let ended = wiring
         .serve(desk_api::Handover {
             io: Box::new(io),
-            redemption: desk_api::redemption(session.as_deref(), &node, capabilities),
+            redemption: redemption.clone(),
             ceilings: wiring.ceilings(),
             seat,
             identity: admission.identity().clone(),
+            // The real directory, bound to the machine this stream watches.
+            // Built here because this is the one place that holds both the
+            // session store and the node the ticket named.
+            directory: api.standings().map(|standings| standings.for_redemption(&redemption)),
         })
         .await;
     println!("admin: desktop stream on {node} ended: {ended}");
