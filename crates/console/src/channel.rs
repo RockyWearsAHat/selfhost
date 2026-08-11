@@ -897,7 +897,17 @@ fn check_handshake(head: &IncomingResponse, key: &str) -> Result<(), String> {
     if head.status.code() != 101 {
         return Err(refusal_reason(head.status.code(), head.status.reason()));
     }
-    let accepted = head.headers.get_str("sec-websocket-accept").unwrap_or_default();
+    // Absent and wrong are told apart, because they mean different things: no
+    // header at all is something that is not a WebSocket server answering on
+    // this path, and a header that disagrees with the nonce is something that
+    // answered without reading the request — a proxy, or a cached response.
+    // Collapsing the two into one message sends the reader looking for the
+    // wrong fault.
+    let Some(accepted) = head.headers.get_str("sec-websocket-accept") else {
+        return Err("the answer carried no Sec-WebSocket-Accept, so whatever is on that port is \
+                    not this daemon"
+            .into());
+    };
     if accepted != selfhost_ws::accept_key(key) {
         return Err("the answer did not come from something that read the handshake".into());
     }
@@ -1035,6 +1045,25 @@ impl Session {
     pub fn settle(&self, surface: &Surface) {
         let (width, height) = *self.fit.lock().unwrap_or_else(|p| p.into_inner());
         *self.picture.lock().unwrap_or_else(|p| p.into_inner()) = fit(surface, width, height);
+    }
+
+    /// A session that never opens a socket but keeps what is sent to it.
+    ///
+    /// The other half of a still life, and what the pointer and keyboard tests
+    /// cannot do without: what a viewport *sends* is the whole of what driving
+    /// a far machine means, and [`Session::still_life`] deliberately drops its
+    /// receiver so nothing it is told is remembered. The queue is deep enough
+    /// that a test never blocks on it.
+    pub fn recorded(
+        peer: &str,
+        control: bool,
+        live: Live,
+        picture: Picture,
+    ) -> (Self, std::sync::mpsc::Receiver<Message>) {
+        let (outgoing, incoming) = std::sync::mpsc::sync_channel(256);
+        let mut session = Self::still_life(peer, control, live, picture);
+        session.outgoing = outgoing;
+        (session, incoming)
     }
 
     /// A session that never opens a socket, showing `picture`.

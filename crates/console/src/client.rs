@@ -80,6 +80,22 @@ impl ClientError {
     pub fn is_disconnection(&self) -> bool {
         matches!(self, Self::Unreachable(_) | Self::Io(_))
     }
+
+    /// Whether this means the token in hand is no longer the daemon's.
+    ///
+    /// The daemon writes a new token every time it starts, and on the production
+    /// box the self-updater restarts it on every push — so a console that holds
+    /// the token it read at launch and never reads another answers `401` for
+    /// ever and has to be quit and started again. This is what tells the poller
+    /// to throw its client away and build one from a freshly read credential.
+    ///
+    /// It is `401` and not `403`: unauthorised means the credential was not
+    /// accepted, which a new one can fix, while forbidden means it was accepted
+    /// and is not allowed to do that — and re-reading a token does not change
+    /// what its holder may do.
+    pub fn is_stale_credential(&self) -> bool {
+        matches!(self, Self::Refused { status, .. } if status.code() == 401)
+    }
 }
 
 /// The methods this client uses.

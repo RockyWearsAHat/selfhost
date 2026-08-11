@@ -22,34 +22,40 @@
 //!
 //! The encryption and the authentication are then OpenSSH's, which is a better
 //! answer than anything this program could invent.
+//!
+//! # Which machine, and changing it
+//!
+//! Typing that at a terminal is the *first* pairing and nothing else. A machine
+//! is paired once and remembered, a launch with no arguments opens the one used
+//! last — which is what an application icon produces — and the window changes
+//! machines without being restarted, from the overview the masthead steps back
+//! to. What this file does is read the command line and open the first machine;
+//! [`session`] is where a connection lives and how it is exchanged for another,
+//! and [`view::machines`] is the place the operator does it from.
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
 mod channel;
 mod client;
+mod machines;
 mod nas;
 mod poller;
 mod registry;
 mod remote;
+mod session;
 mod state;
 mod tunnel;
 mod view;
 
-use client::Client;
-use state::Snapshot;
+use session::{Bound, Credential, Target};
 use std::net::SocketAddr;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
 use tunnel::TunnelSpec;
 use view::Console;
 
 /// Where the daemon listens unless told otherwise.
 const DEFAULT_ADDRESS: &str = "127.0.0.1:9191";
-
-/// Where the daemon writes its token, relative to the project directory.
-const DEFAULT_TOKEN_PATH: &str = "data/admin.token";
 
 fn main() -> std::process::ExitCode {
     match start() {
@@ -69,131 +75,176 @@ fn start() -> Result<(), String> {
         return Ok(());
     }
 
-    let address = options.address();
-    // A remote console reads its token over SSH, once, before the window opens.
-    // That failure belongs on the terminal: `--ssh` is typed at one, and the
-    // fix — a key to add, a host to accept — is a command to run there.
-    let remote_token = match (&options.ssh, &options.token_path) {
+    let store_path = machines::default_path();
+    if options.list {
+        return list_machines(store_path.as_deref());
+    }
+    if let Some(name) = &options.forget {
+        return forget_machine(store_path.as_deref(), name);
+    }
+
+    // Which machine this launch is for, decided before anything connects. An
+    // explicit flag always wins; with no connection flag at all the console
+    // opens the machine it was last on, which is the whole point — a launch from
+    // the Dock carries no arguments and used to mean "look for a local daemon",
+    // which on a workstation means "fail".
+    let chosen = choose_machine(&options, store_path.as_deref())?;
+
+    // A launch that names a connection outright reads its token before the
+    // window opens, because that failure belongs on the terminal `--ssh` was
+    // typed at: the fix — a key to add, a host to accept — is a command to run
+    // there. A launch that named nothing has no terminal to report to, so its
+    // token is read by the poller and a refusal reaches the window instead.
+    // That distinction is the Dock: an icon click used to fail here, before any
+    // window existed, and looked like an application that does nothing at all.
+    let held = match (&options.ssh, &options.token_path) {
         (Some(spec), None) => Some(tunnel::fetch_token(spec, &options.remote_token)?),
         _ => None,
     };
 
-    // A local console does not read its token until it polls, and asks again on
-    // every poll. The token is written by the daemon, so requiring it up front
-    // would mean a console opened before its daemon exits instead of opening —
-    // which from the Dock looks like an application that does nothing at all.
-    let token_path = options.token_path.clone();
-    // Shared rather than owned by the poller alone: the desktop stream opens
-    // its own socket and needs the same credential, and reading the token in
-    // two places would be two things to keep in step.
-    let connect: view::Connector = Arc::new(move || -> Result<Client, String> {
-        let token = match (&remote_token, &token_path) {
-            (Some(token), _) => token.clone(),
-            (None, Some(path)) => read_token(path)?,
-            (None, None) => find_token()?,
-        };
-        Client::new(address, token)
-    });
+    // Saved only now, on the far side of a token that actually arrived: a
+    // pairing is a connection that has worked at least once, so a bad key or a
+    // wrong address leaves the store as it was rather than adding an entry the
+    // operator would have to discover was useless.
+    if let Some(name) = &options.pair {
+        pair_machine(store_path.as_deref(), name, &options)?;
+    }
 
-    let shared = Arc::new(Mutex::new(Snapshot::default()));
-    let running = Arc::new(AtomicBool::new(true));
-
-    let tunnel = options
-        .ssh
-        .clone()
-        .map(|spec| tunnel::spawn(spec, Arc::clone(&shared), Arc::clone(&running)));
-    let for_poller = Arc::clone(&connect);
-    let poller =
-        poller::spawn(move || for_poller(), Arc::clone(&shared), Arc::clone(&running));
-
-    let via = options.ssh.as_ref().map(|spec| spec.destination.clone());
-    let title = match &via {
-        Some(destination) => format!("selfhost — {destination}"),
-        None => format!("selfhost — {address}"),
+    let options = match &chosen {
+        Some(machine) => options.bound_to(machine),
+        None => options,
     };
-    let console =
-        Console::new(Arc::clone(&shared), Arc::clone(&running), address, via).reaching(connect);
-    let outcome = console.run(title).map_err(|error| error.to_string());
+    let bound = match &chosen {
+        Some(machine) => Bound::of(machine),
+        None => Bound::new(
+            options.address(),
+            options.ssh.as_ref().map(|spec| spec.destination.clone()),
+        ),
+    };
+    let target = Target::new(options.address(), options.credential());
+    let target = match held {
+        Some(token) => target.holding(token),
+        None => target,
+    };
 
-    // Told to stop, then waited for: a command may be half-written on a socket,
-    // and dropping the process on top of it leaves the daemon reading a
-    // truncated request it then has to report as malformed. The tunnel is waited
-    // for too, so closing the window does not leave `ssh` forwarding a port.
-    running.store(false, Ordering::Relaxed);
-    let _ = poller.join();
-    if let Some(tunnel) = tunnel {
-        let _ = tunnel.join();
+    let title = bound.title();
+    let mut console = Console::paired(load_machines(store_path.as_deref()), store_path);
+    console.open(bound, target, options.ssh.clone());
+    console.run(title).map_err(|error| error.to_string())
+}
+
+/// Reads the paired-machine store, or an empty one on a machine with no home.
+///
+/// A store that cannot be located is not an error: the console still runs, it
+/// simply cannot remember anything, which is exactly what it did before there
+/// was a store at all.
+fn load_machines(path: Option<&std::path::Path>) -> machines::Machines {
+    path.and_then(|path| machines::Machines::load(path).ok()).unwrap_or_default()
+}
+
+/// Which machine this launch is for.
+///
+/// The order is the decision. `--ssh` describes a connection outright and wins.
+/// `--machine` names one already paired. `--token-file` and `--daemon` say the
+/// operator means a specific local daemon, so neither is overridden. Only a
+/// launch that asked for nothing falls through to the machine opened last —
+/// which is the launch an application icon produces.
+fn choose_machine(
+    options: &Options,
+    store: Option<&std::path::Path>,
+) -> Result<Option<machines::Machine>, String> {
+    if options.ssh.is_some() {
+        return Ok(None);
     }
-    outcome
-}
-
-/// Reads the bearer token the daemon generated.
-///
-/// Never creates one. The token is proof of having read a file the daemon wrote
-/// with mode `0600`; a console that generated its own when the file was missing
-/// would authenticate against nothing and report a confusing 401 instead of the
-/// real problem, which is that it is looking in the wrong place.
-fn read_token(path: &std::path::Path) -> Result<String, String> {
-    std::fs::read_to_string(path).map_err(|error| {
-        format!(
-            "cannot read the admin token from {}: {error}\n\
-             The daemon writes it there when it starts. Run the console from the same \
-             directory as `selfhost.config.toml`, or pass --token-file.",
-            path.display()
-        )
-    })
-}
-
-/// Finds the token when nobody said where it is.
-///
-/// Two places, in this order, and the order is the point:
-///
-/// 1. `data/admin.token` under the working directory — what a console started
-///    from a terminal inside the project should use, and what it has always
-///    used. Looking anywhere else first would let a note left by some other
-///    daemon quietly win over the project the operator is standing in.
-/// 2. Wherever a running daemon recorded itself. This is the case the Dock
-///    needs: an application launched by the Finder has no working directory
-///    worth resolving against, so step one cannot succeed for it.
-///
-/// A failure names both, because "cannot read data/admin.token" from an icon
-/// click is an answer to a question nobody asked.
-fn find_token() -> Result<String, String> {
-    locate_token(
-        std::path::Path::new(DEFAULT_TOKEN_PATH),
-        selfhost_config::home::recorded().as_deref(),
-    )
-}
-
-/// The search itself, with both candidates supplied.
-///
-/// Separated from [`find_token`] so the order and the failure can be asserted
-/// on. Which one wins is a decision, not a detail, and a test is the only thing
-/// that stops it from being quietly reversed.
-fn locate_token(
-    beside_us: &std::path::Path,
-    recorded: Option<&std::path::Path>,
-) -> Result<String, String> {
-    if let Ok(token) = std::fs::read_to_string(beside_us) {
-        return Ok(token);
+    let paired = load_machines(store);
+    if let Some(name) = &options.machine {
+        return paired.get(name).cloned().map(Some).ok_or_else(|| {
+            format!(
+                "no machine named {name:?} is paired here. Pair one with:\n  \
+                 selfhost-console --pair {name} --ssh <[user@]host>\n\n\
+                 Paired now: {}",
+                named(&paired)
+            )
+        });
     }
-    if let Some(directory) = recorded {
-        if let Ok(token) = std::fs::read_to_string(directory.join(DEFAULT_TOKEN_PATH)) {
-            return Ok(token);
+    if options.token_path.is_some() || options.address != default_address() {
+        return Ok(None);
+    }
+    Ok(paired.opening().cloned())
+}
+
+/// The names of every paired machine, for a message that has to list them.
+fn named(paired: &machines::Machines) -> String {
+    if paired.is_empty() {
+        return "nothing".into();
+    }
+    paired.entries().iter().map(|machine| machine.name.as_str()).collect::<Vec<_>>().join(", ")
+}
+
+/// The address the console talks to when nothing said otherwise.
+fn default_address() -> SocketAddr {
+    DEFAULT_ADDRESS.parse().expect("the default address is valid")
+}
+
+/// Saves a pairing that has just been proved to work.
+fn pair_machine(
+    store: Option<&std::path::Path>,
+    name: &str,
+    options: &Options,
+) -> Result<(), String> {
+    let path = store.ok_or("this account has no home directory, so nothing can be paired")?;
+    let spec = options.ssh.as_ref().expect("--pair is refused without --ssh");
+    let mut machine = machines::Machine::new(name, spec.destination.clone());
+    machine.ssh_port = spec.ssh_port;
+    machine.identity = spec.identity.clone();
+    machine.port = spec.remote_port;
+    machine.remote_token = options.remote_token.clone();
+
+    let problems = machine.problems();
+    if !problems.is_empty() {
+        return Err(format!("cannot pair this machine:\n  {}", problems.join("\n  ")));
+    }
+
+    let mut paired = machines::Machines::load(path)?;
+    paired.pair(machine);
+    paired.opened(name);
+    paired.save(path)?;
+    eprintln!("selfhost-console: paired {name:?} — it opens by default from now on");
+    Ok(())
+}
+
+/// Prints what is paired, and which one opens by default.
+fn list_machines(store: Option<&std::path::Path>) -> Result<(), String> {
+    let paired = load_machines(store);
+    if paired.is_empty() {
+        println!("No machines are paired yet. Pair one with:");
+        println!("  selfhost-console --pair <name> --ssh <[user@]host>");
+        return Ok(());
+    }
+    let opening = paired.opening().map(|machine| machine.name.clone());
+    for machine in paired.entries() {
+        let mark = if Some(&machine.name) == opening.as_ref() { "→" } else { " " };
+        println!("{mark} {:<20} {}", machine.name, machine.destination);
+        if let Some(identity) = &machine.identity {
+            println!("    key    {}", identity.display());
         }
+        println!("    port   {}", machine.port);
+        println!("    token  {}", machine.remote_token);
     }
+    Ok(())
+}
 
-    let second = match recorded {
-        Some(directory) => directory.join(DEFAULT_TOKEN_PATH).display().to_string(),
-        None => "nowhere — no running daemon has recorded itself".to_owned(),
-    };
-    Err(format!(
-        "no admin token found. Looked in:\n  {}\n  {second}\n\n\
-         Start the daemon with `selfhost daemon` in the directory holding \
-         selfhost.config.toml, then open this again — it records where it is running so \
-         the console can find it. Or pass --token-file.",
-        std::path::absolute(beside_us).unwrap_or_else(|_| beside_us.to_owned()).display(),
-    ))
+/// Removes a pairing.
+fn forget_machine(store: Option<&std::path::Path>, name: &str) -> Result<(), String> {
+    let path = store.ok_or("this account has no home directory, so nothing is paired")?;
+    let mut paired = machines::Machines::load(path)?;
+    if paired.get(name).is_none() {
+        return Err(format!("no machine named {name:?} is paired. Paired now: {}", named(&paired)));
+    }
+    paired.forget(name);
+    paired.save(path)?;
+    println!("Forgot {name:?}.");
+    Ok(())
 }
 
 /// What the console was asked to do.
@@ -207,6 +258,15 @@ struct Options {
     remote_token: String,
     /// A token file on this machine. Overrides reading one over SSH.
     token_path: Option<PathBuf>,
+    /// Save the connection these flags describe under this name, once it has
+    /// been proved to work, and open it.
+    pair: Option<String>,
+    /// Open this already-paired machine.
+    machine: Option<String>,
+    /// Remove this pairing and exit.
+    forget: Option<String>,
+    /// List what is paired and exit.
+    list: bool,
     help: bool,
 }
 
@@ -218,6 +278,10 @@ impl Options {
             ssh: None,
             remote_token: tunnel::DEFAULT_REMOTE_TOKEN.to_owned(),
             token_path: None,
+            pair: None,
+            machine: None,
+            forget: None,
+            list: false,
             help: false,
         };
 
@@ -247,6 +311,10 @@ impl Options {
                     remote_port = Some(parse_port(&value("--remote-port")?, "--remote-port")?);
                 }
                 "--remote-token" => options.remote_token = value("--remote-token")?,
+                "--pair" => options.pair = Some(value("--pair")?),
+                "--machine" => options.machine = Some(value("--machine")?),
+                "--forget" => options.forget = Some(value("--forget")?),
+                "--machines" => options.list = true,
                 other => return Err(format!("unknown option {other}\n\n{USAGE}")),
             }
         }
@@ -287,7 +355,34 @@ impl Options {
             }
         }
 
+        // Pairing saves the connection the other flags describe, so there has to
+        // be one. Without this the operator gets a pairing named after a local
+        // daemon, which cannot be opened from anywhere else and is the one entry
+        // this store must never hold.
+        if options.pair.is_some() && options.ssh.is_none() {
+            return Err(
+                "--pair names the connection --ssh describes, so it needs one:\n  \
+                 selfhost-console --pair <name> --ssh <[user@]host>"
+                    .into(),
+            );
+        }
+        if options.machine.is_some() && options.ssh.is_some() {
+            return Err("--machine opens a paired machine; --ssh describes a new one".into());
+        }
+
         Ok(options)
+    }
+
+    /// These options, pointed at a paired machine.
+    ///
+    /// Separate from parsing because the store is consulted only after the
+    /// command line has been read: a flag always wins over a remembered machine,
+    /// and expressing that as "parse, then bind what was not stated" keeps the
+    /// precedence in one readable place instead of spread through the parser.
+    fn bound_to(mut self, machine: &machines::Machine) -> Self {
+        self.ssh = Some(machine.tunnel());
+        self.remote_token = machine.remote_token.clone();
+        self
     }
 
     /// The address the console actually talks to.
@@ -298,6 +393,25 @@ impl Options {
         match &self.ssh {
             Some(spec) => spec.local_address(),
             None => self.address,
+        }
+    }
+
+    /// Where this launch's bearer token comes from.
+    ///
+    /// A token file named by hand wins over reading one over SSH, because
+    /// naming one is an instruction and the tunnel is only a route. With
+    /// neither, the console looks where a daemon on this machine would have
+    /// written one — and keeps looking, poll after poll, so a console opened
+    /// before its daemon connects when the daemon starts.
+    fn credential(&self) -> Credential {
+        match (&self.token_path, &self.ssh) {
+            (Some(path), _) => Credential::File(path.clone()),
+            (None, Some(spec)) => Credential::OverSsh {
+                spec: spec.clone(),
+                path: self.remote_token.clone(),
+                pair: None,
+            },
+            (None, None) => Credential::Discovered,
         }
     }
 }
@@ -332,8 +446,30 @@ const USAGE: &str = "\
 selfhost-console — the desktop console for a selfhost daemon
 
 Usage:
+  selfhost-console                            Open the machine you were last on
+  selfhost-console --machine <name>           Open a paired machine
+  selfhost-console --pair <name> --ssh <host> Pair a machine, then open it
   selfhost-console [--daemon <address|port>] [--token-file <path>]
   selfhost-console --ssh <[user@]host> [tunnel options]
+
+Paired machines:
+  Opened with no arguments — which is what an application icon does — the
+  console opens the machine it was on last. Machines are paired once and kept
+  in the platform's state directory; the file holds a destination, a port and
+  the path of a key, never a token and never key material.
+
+  None of this has to be typed. The masthead's MACHINES control steps back to
+  the list of paired machines, where one is opened, forgotten, or added — the
+  window changes machines without being restarted. These flags are the same
+  operations from a terminal, and for the first pairing on a headless setup.
+
+  --pair <name>          Save the connection the other flags describe under this
+                         name, once it has been proved to work, and open it.
+                         A pairing that cannot read the daemon's token over that
+                         connection is refused rather than saved.
+  --machine <name>       Open a machine already paired.
+  --machines             List what is paired, marking the one that opens.
+  --forget <name>        Remove a pairing.
 
 Options:
   --daemon <address>     Where the daemon's control API is listening.
@@ -411,68 +547,6 @@ mod tests {
     fn help_is_recognised_in_both_spellings() {
         assert!(parse(&["-h"]).expect("valid").help);
         assert!(parse(&["--help"]).expect("valid").help);
-    }
-
-    /// A directory of this test's own, holding a token at the usual place.
-    fn project_with_token(name: &str, token: &str) -> PathBuf {
-        let unique = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|since| since.as_nanos())
-            .unwrap_or(0);
-        let root = std::env::temp_dir().join(format!("selfhost-console-{name}-{unique}"));
-        let data = root.join("data");
-        std::fs::create_dir_all(&data).expect("a writable temporary directory");
-        std::fs::write(data.join("admin.token"), token).expect("writable");
-        root
-    }
-
-    #[test]
-    fn a_token_beside_the_console_wins_over_one_a_daemon_recorded() {
-        // The order matters and is not arbitrary. An operator standing in a
-        // project expects to be talking to *that* project; letting a note left
-        // by some other daemon win would silently connect them elsewhere.
-        let here = project_with_token("here", "the-local-one");
-        let elsewhere = project_with_token("elsewhere", "the-recorded-one");
-        let token = locate_token(&here.join(DEFAULT_TOKEN_PATH), Some(&elsewhere))
-            .expect("both exist");
-        assert_eq!(token, "the-local-one");
-        let _ = std::fs::remove_dir_all(&here);
-        let _ = std::fs::remove_dir_all(&elsewhere);
-    }
-
-    #[test]
-    fn the_recorded_daemon_is_used_when_there_is_nothing_beside_the_console() {
-        // This is the case an icon in the Dock is in: launched by the Finder,
-        // with no working directory worth resolving `data/` against.
-        let elsewhere = project_with_token("dock", "the-recorded-one");
-        let token = locate_token(std::path::Path::new("/no/such/admin.token"), Some(&elsewhere))
-            .expect("the recorded daemon has one");
-        assert_eq!(token, "the-recorded-one");
-        let _ = std::fs::remove_dir_all(&elsewhere);
-    }
-
-    #[test]
-    fn finding_no_token_anywhere_names_every_place_that_was_tried() {
-        let error = locate_token(std::path::Path::new("data/admin.token"), None)
-            .expect_err("nothing to find");
-        assert!(error.contains("data/admin.token"), "{error}");
-        assert!(error.contains("no running daemon has recorded itself"), "{error}");
-        assert!(error.contains("selfhost daemon"), "the message should say what to run");
-
-        let missing = std::path::Path::new("/no/such/project");
-        let error = locate_token(std::path::Path::new("data/admin.token"), Some(missing))
-            .expect_err("nothing to find");
-        assert!(
-            error.contains("/no/such/project"),
-            "the recorded directory should be named when there is one: {error}"
-        );
-    }
-
-    #[test]
-    fn a_missing_token_file_says_where_it_looked_and_how_to_change_it() {
-        let error = read_token(&PathBuf::from("/no/such/admin.token")).expect_err("should fail");
-        assert!(error.contains("/no/such/admin.token"));
-        assert!(error.contains("--token-file"));
     }
 
     #[test]
@@ -558,6 +632,92 @@ mod tests {
     fn every_tunnel_option_needs_its_value() {
         for flag in ["--ssh", "--ssh-port", "--identity", "--local-port", "--remote-port", "--remote-token"] {
             assert!(parse(&[flag]).is_err(), "{flag} was accepted with no value");
+        }
+    }
+
+    /// A store holding one machine, written where a test may write.
+    fn stored(machine: machines::Machine) -> (PathBuf, machines::Machines) {
+        let directory = std::env::temp_dir()
+            .join(format!("selfhost-console-choose-{}-{:?}", std::process::id(), machine.name));
+        let path = directory.join("machines");
+        let mut paired = machines::Machines::default();
+        let name = machine.name.clone();
+        paired.pair(machine);
+        paired.opened(&name);
+        paired.save(&path).expect("the store saves");
+        (path, paired)
+    }
+
+    #[test]
+    fn a_launch_with_no_arguments_opens_the_machine_last_used() {
+        let (path, _) = stored(machines::Machine::new("desk", "alex@10.0.0.4"));
+        let options = parse(&[]).expect("no arguments is valid");
+        let chosen = choose_machine(&options, Some(&path)).expect("a stored machine is found");
+        assert_eq!(chosen.map(|machine| machine.destination), Some("alex@10.0.0.4".into()));
+        let _ = std::fs::remove_dir_all(path.parent().expect("a parent"));
+    }
+
+    #[test]
+    fn an_explicit_ssh_destination_wins_over_the_remembered_machine() {
+        let (path, _) = stored(machines::Machine::new("winner", "alex@10.0.0.5"));
+        let options = parse(&["--ssh", "someone@elsewhere"]).expect("valid");
+        assert!(
+            choose_machine(&options, Some(&path)).expect("no lookup happens").is_none(),
+            "the store overrode an explicit --ssh"
+        );
+        let _ = std::fs::remove_dir_all(path.parent().expect("a parent"));
+    }
+
+    #[test]
+    fn asking_for_a_local_daemon_is_not_overridden_by_a_remembered_machine() {
+        let (path, _) = stored(machines::Machine::new("elsewhere", "alex@10.0.0.6"));
+        for arguments in [vec!["--token-file", "/tmp/t"], vec!["--daemon", "9292"]] {
+            let options = parse(&arguments).expect("valid");
+            assert!(
+                choose_machine(&options, Some(&path)).expect("no lookup").is_none(),
+                "{arguments:?} was overridden by the store"
+            );
+        }
+        let _ = std::fs::remove_dir_all(path.parent().expect("a parent"));
+    }
+
+    #[test]
+    fn opening_a_machine_that_is_not_paired_says_what_is() {
+        let (path, _) = stored(machines::Machine::new("real", "alex@10.0.0.7"));
+        let options = parse(&["--machine", "imaginary"]).expect("valid");
+        let complaint = choose_machine(&options, Some(&path)).expect_err("no such machine");
+        assert!(complaint.contains("imaginary"), "{complaint}");
+        assert!(complaint.contains("real"), "the message did not list what is paired: {complaint}");
+        let _ = std::fs::remove_dir_all(path.parent().expect("a parent"));
+    }
+
+    #[test]
+    fn a_paired_machine_becomes_the_tunnel_this_launch_uses() {
+        let mut machine = machines::Machine::new("desk", "alex@10.0.0.8");
+        machine.port = 9292;
+        machine.remote_token = "somewhere/else.token".into();
+        let options = parse(&[]).expect("valid").bound_to(&machine);
+        let spec = options.ssh.as_ref().expect("a tunnel");
+        assert_eq!(spec.destination, "alex@10.0.0.8");
+        assert_eq!(options.address(), spec.local_address());
+        assert_eq!(options.remote_token, "somewhere/else.token");
+    }
+
+    #[test]
+    fn pairing_without_a_connection_to_pair_is_refused() {
+        let complaint = parse(&["--pair", "desk"]).expect_err("--pair needs --ssh");
+        assert!(complaint.contains("--ssh"), "{complaint}");
+    }
+
+    #[test]
+    fn opening_a_paired_machine_and_describing_a_new_one_are_different_requests() {
+        assert!(parse(&["--machine", "desk", "--ssh", "host"]).is_err());
+    }
+
+    #[test]
+    fn the_usage_names_the_paired_machine_flags() {
+        for flag in ["--pair", "--machine", "--machines", "--forget"] {
+            assert!(USAGE.contains(flag), "{flag} is not in the usage text");
         }
     }
 }

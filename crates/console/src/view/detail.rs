@@ -97,6 +97,7 @@ fn guidance(snapshot: &Snapshot) -> &'static str {
         Link::Connected => "Choose a service on the left, or add one.",
         Link::Connecting => "Waiting for the daemon.",
         Link::Lost(_) => "The daemon is not answering.",
+        Link::Unpaired => "No machine is paired. Pair one from MACHINES to begin.",
     }
 }
 
@@ -135,16 +136,16 @@ fn actions(name: &str, state: &ServiceState, startable: bool, requested: bool) -
 
     row((
         action(
-            "Start",
+            "START",
             Command::Start(name.to_owned()),
         )
         .primary()
         .disabled(!startable || requested),
-        action("Stop", Command::Stop(name.to_owned())).disabled(!stoppable || requested),
+        action("STOP", Command::Stop(name.to_owned())).disabled(!stoppable || requested),
         // Restart is offered whatever the state: on a stopped service it means
         // "start", and the supervisor treats it that way. Greying it out would
         // make the operator work out which of two buttons is the live one.
-        action("Restart", Command::Restart(name.to_owned())).disabled(requested),
+        action("RESTART", Command::Restart(name.to_owned())).disabled(requested),
         // A rule across the space between the two groups, with a tick at the end
         // of it — the same mark every heading in the window is ruled with. On a
         // wide pane that space is most of the row, and empty it read as a button
@@ -158,7 +159,7 @@ fn actions(name: &str, state: &ServiceState, startable: bool, requested: bool) -
         // hand's width of nothing between it and Uninstall, which is the exact
         // defect the rule was drawn to answer.
         style::rule().pad_x(12.0),
-        action("Uninstall", Command::Uninstall(name.to_owned())).danger().disabled(requested),
+        action("UNINSTALL", Command::Uninstall(name.to_owned())).danger().disabled(requested),
     ))
     .h(36.0)
     .pad(4.0)
@@ -188,7 +189,7 @@ const DEFINITION_PENDING: &str = "The definition has not been fetched yet.";
 /// will not press.
 fn edit_button(spec: Option<ServiceSpec>) -> El<Console> {
     let waiting = spec.is_none();
-    let control = button("Edit")
+    let control = button("EDIT")
         .ghost()
         .h(20.0)
         .pad_x(10.0)

@@ -31,7 +31,12 @@ use std::path::{Path, PathBuf};
 /// The state directory rather than the config directory: this is something a
 /// program wrote about a running process, not something a person configured,
 /// and it is meaningless once the machine has restarted.
-fn state_directory() -> Option<PathBuf> {
+///
+/// Public because the note is no longer the only thing that belongs here — the
+/// console keeps its paired-machine list beside it — and a second copy of this
+/// platform logic is exactly the kind of duplication that drifts. Callers place
+/// their own file inside; nothing here decides what that file is.
+pub fn state_directory() -> Option<PathBuf> {
     if cfg!(target_os = "macos") {
         let home = std::env::var_os("HOME")?;
         Some(Path::new(&home).join("Library/Application Support/selfhost"))

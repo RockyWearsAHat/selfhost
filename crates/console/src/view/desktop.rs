@@ -36,11 +36,17 @@
 //! fit happens on the stream's own thread rather than in the frame loop. Thirty
 //! frames a second is therefore comfortably inside a tenth of one core.
 //!
-//! Two gaps are real and are recorded as OPEN in the lab rather than hidden:
-//! **a pointer that is not pressed does not move the far pointer** — `rui`
-//! reports hover as a boolean and a position only during a drag — and **the
+//! One gap is real and is recorded as OPEN in the lab rather than hidden: **the
 //! far machine's cursor is whatever its own capture drew into the frame**,
-//! because this console has no sub-frame layer to track one on.
+//! because this console has no sub-frame layer to track one on. The browser
+//! draws the far pointer on a second canvas moved by CSS transform, so it
+//! tracks between frames; here the picture is the whole of what is shown.
+//!
+//! The pointer itself does track. A hand moving over the picture with nothing
+//! pressed moves the far pointer, through `rui`'s `on_pointer_move` — the
+//! library primitive this console's viewport was the reason for, since a drag
+//! reports a position only while a button is held and a screen you can click
+//! but not point at is not a remote desktop.
 
 use super::style;
 use super::Console;
@@ -390,6 +396,11 @@ fn viewport(console: &Console, live: Option<&Live>) -> El<Console> {
     .border(1.0, if focused { Tone::Accent } else { Tone::Border })
     .clip()
     .focusable()
+    // Named, so a test can aim the pointer at the picture rather than at
+    // whatever happens to be under a guessed coordinate. It is also the one
+    // element on this plate whose identity must not move when the controls
+    // above it change, since its scroll and focus are stored under it.
+    .key("screen")
     .role(Role::Image)
     .label("The remote screen")
     // A press is what aims the keyboard, and it is also the first thing a
@@ -399,6 +410,15 @@ fn viewport(console: &Console, live: Option<&Live>) -> El<Console> {
         console.aim_at_viewport();
         if armed {
             console.forward_pointer(drag);
+        }
+    })
+    // And a hand moving over the picture with nothing pressed, which is the
+    // other half of pointing at a screen: the far pointer tracks this one
+    // rather than jumping to wherever the next click lands. It does not aim the
+    // keyboard — passing over a window is not asking to type into it.
+    .on_pointer_move(move |console: &mut Console, at| {
+        if armed {
+            console.point_at(at);
         }
     })
     // Both directions of every key, through the physical path: `Key` has no

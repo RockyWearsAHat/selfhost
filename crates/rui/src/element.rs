@@ -46,7 +46,7 @@
 
 use crate::accessibility::Role;
 use crate::geom::{Insets, Rect, Size};
-use crate::input::{Drag, Key, KeyStroke, Modifiers};
+use crate::input::{Drag, Key, KeyStroke, Modifiers, Pointing};
 use crate::memory::Id;
 use crate::paint::Painter;
 use crate::style::{Align, Anchor, Axis, Face, Hover, Ink, Justify, Length, Radius, Style, Tone};
@@ -73,6 +73,9 @@ pub type ScrollAction<S> = Box<dyn Fn(&mut S, f32, f32)>;
 
 /// What the pointer arriving or leaving does, given which of the two it was.
 pub type HoverAction<S> = Box<dyn Fn(&mut S, bool)>;
+
+/// What a pointer moving over an element does, given where within it it now is.
+pub type PointerAction<S> = Box<dyn Fn(&mut S, Pointing)>;
 
 /// An application's own drawing, given the painter and the room it was placed in.
 pub type Drawing = Box<dyn Fn(&mut Painter<'_>, Rect)>;
@@ -127,6 +130,7 @@ pub struct El<S> {
     pub(crate) on_raw_key: Option<RawKeyAction<S>>,
     pub(crate) on_scroll: Option<ScrollAction<S>>,
     pub(crate) on_hover: Option<HoverAction<S>>,
+    pub(crate) on_pointer_move: Option<PointerAction<S>>,
     /// Whether it takes the keyboard, and takes a place in the tab order.
     pub(crate) focusable: bool,
     /// Whether it lightens under the pointer and darkens under a press.
@@ -194,6 +198,7 @@ impl<S> El<S> {
             on_raw_key: None,
             on_scroll: None,
             on_hover: None,
+            on_pointer_move: None,
             focusable: false,
             reactive: false,
             disabled: false,
@@ -684,6 +689,37 @@ impl<S> El<S> {
         self
     }
 
+    /// Runs `action` every time the pointer moves over it, told where within it
+    /// it now is — in the element's own coordinates, the same origin
+    /// [`Drag::at`] uses.
+    ///
+    /// The third of the three pointer handlers, and the one the other two
+    /// cannot stand in for. [`El::on_hover`] answers *whether* the pointer is
+    /// here and deliberately says nothing about where; [`El::on_drag`] answers
+    /// where, continuously, but only while a button is held. Between them sits
+    /// a hand moving over an element it has not pressed, which is a map that
+    /// reads out coordinates, a picture that shows what is under the pointer,
+    /// and a viewport forwarding a pointer to another machine — the case this
+    /// was written for, where a pointer that only moved when pressed is a
+    /// remote desktop that cannot be pointed at.
+    ///
+    /// It fires on movement, never on presence: a frame drawn for an animation
+    /// or for news from another thread runs no handler, and a hand resting
+    /// still runs none either, so an element carrying this does not turn a
+    /// resting pointer into an endless redraw. Buttons make no difference to
+    /// it — an element with this *and* [`El::on_drag`] hears a movement over
+    /// itself through both, which is why the drag handler is the right place
+    /// for the gesture and this one the right place for the position.
+    ///
+    /// ```ignore
+    /// draw(Size::new(960.0, 540.0), viewport)
+    ///     .on_pointer_move(|app: &mut App, at| app.session.point_at(at.fraction()))
+    /// ```
+    pub fn on_pointer_move(mut self, action: impl Fn(&mut S, Pointing) + 'static) -> Self {
+        self.on_pointer_move = Some(Box::new(action));
+        self
+    }
+
     /// Lifts this element out of its parent's stacking and places it against
     /// the parent's edge, drawn above everything else.
     ///
@@ -726,11 +762,16 @@ impl<S> El<S> {
     /// Drawn at all, rather than omitted, because a control that vanishes when
     /// it is unavailable makes the row around it jump and leaves the person
     /// unsure whether it was ever there.
+    ///
+    /// It does not *clear* whether the element takes the keyboard, it overrules
+    /// it — see [`El::takes_focus`]. Clearing was the earlier reading and it made
+    /// the answer depend on the order the builders were written in:
+    /// `.disabled(true).on_click(…)` put the control back in the tab order
+    /// while `.on_click(…).disabled(true)` did not, though the two describe the
+    /// same greyed button. Nothing in an interface should turn on which setter
+    /// came last.
     pub fn disabled(mut self, disabled: bool) -> Self {
         self.disabled = disabled;
-        if disabled {
-            self.focusable = false;
-        }
         self
     }
 
@@ -951,10 +992,23 @@ impl<S> El<S> {
                 || self.on_raw_key.is_some()
                 || self.on_scroll.is_some()
                 || self.on_hover.is_some()
+                || self.on_pointer_move.is_some()
                 || self.focusable
                 || self.reactive
                 || self.scrolls
                 || !self.style.hover.is_empty())
+    }
+
+    /// Whether Tab can reach it: it takes the keyboard, and is not disabled.
+    ///
+    /// The one answer to that question, so that the focus walk, the tab-order
+    /// audit and anything else asking cannot come to different conclusions
+    /// about the same element. A greyed control keeps whatever it declared —
+    /// it is a button, and becomes reachable again the moment its reason for
+    /// being greyed passes — but while it is greyed nothing may hand it the
+    /// keyboard.
+    pub fn takes_focus(&self) -> bool {
+        self.focusable && !self.disabled
     }
 
     /// Whether it holds a caret and takes typing.
@@ -1107,6 +1161,19 @@ mod tests {
     fn a_disabled_element_leaves_the_tab_order_and_takes_no_events() {
         let element: El<Counter> = button("Install").on_click(|_| {}).disabled(true);
         assert!(!element.interactive());
-        assert!(!element.focusable);
+        assert!(!element.takes_focus());
+    }
+
+    #[test]
+    fn a_greyed_control_is_out_of_the_tab_order_whichever_order_it_was_written_in() {
+        // The defect this holds shut: `disabled` used to clear `focusable`, so
+        // a handler attached afterwards put the control back in the tab order
+        // while the audit and the focus walk disagreed about whether it was
+        // there. Both readings describe the same greyed button.
+        let after: El<Counter> = button("Install").on_click(|_| {}).disabled(true);
+        let before: El<Counter> = button("Install").disabled(true).on_click(|_| {});
+        assert!(!after.takes_focus());
+        assert!(!before.takes_focus());
+        assert!(!after.interactive() && !before.interactive());
     }
 }

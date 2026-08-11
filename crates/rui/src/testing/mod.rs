@@ -111,6 +111,11 @@ pub struct Probe {
     /// Whether clicking it does anything.
     pub clickable: bool,
     /// Whether it takes the keyboard, and a place in the tab order.
+    ///
+    /// A greyed control reads `false` here however it was written, because Tab
+    /// steps straight over one — see [`El::takes_focus`](crate::El::takes_focus).
+    /// The audit and the walk therefore count the same elements, which is the
+    /// only way [`Harness::assert_tab_order`] can mean anything.
     pub focusable: bool,
     /// Whether it was lifted out of the flow by [`El::layer`](crate::El::layer).
     pub layered: bool,
@@ -546,6 +551,12 @@ impl<S: 'static> Harness<S> {
     /// [`El::layer`](crate::El::layer) comes after all of it, because that is
     /// the order it is drawn in and the two must not disagree.
     ///
+    /// A greyed control is not one of them: Tab steps over it, so the audit
+    /// steps over it too. A screen carrying one used to fail this for the wrong
+    /// reason — the walk and the count disagreed — which meant an interface
+    /// could only be audited by first removing the very controls that say a
+    /// thing exists but is not available.
+    ///
     /// It drives frames and leaves the keyboard wherever the walk ended, so
     /// call it at the end of a test rather than in the middle of one.
     ///
@@ -777,7 +788,7 @@ fn probe<S>(el: &El<S>, parent: Option<Id>) -> Probe {
         rect: el.rect,
         disabled: el.is_disabled(),
         clickable: el.click_action().is_some(),
-        focusable: el.focusable,
+        focusable: el.takes_focus(),
         layered: el.anchor().is_some(),
     }
 }

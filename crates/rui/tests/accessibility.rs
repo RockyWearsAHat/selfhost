@@ -509,6 +509,34 @@ fn an_assistive_activation_of_a_disabled_control_does_nothing() {
     );
 }
 
+#[test]
+fn a_screen_carrying_a_greyed_control_still_passes_the_tab_audit() {
+    // The defect this holds shut, and it was in the audit rather than in the
+    // interface: `assert_tab_order` counted a disabled element as one Tab
+    // should reach while `rui`'s own walk stepped over it, so any screen
+    // honestly greying a control it cannot offer failed for the wrong reason —
+    // and the way to pass was to draw fewer facts.
+    fn view(_: &Counted) -> El<Counted> {
+        col((
+            button("Start").on_click(|counted: &mut Counted| counted.presses += 1),
+            // Both orders, because the audit and the walk must agree about the
+            // same greyed button however it was written.
+            button("Restart").on_click(|_: &mut Counted| {}).disabled(true),
+            button("Uninstall").disabled(true).on_click(|_: &mut Counted| {}),
+        ))
+        .gap(6.0)
+        .align(Align::Start)
+    }
+
+    let mut harness = Harness::new(Counted::default(), view);
+    harness.assert_tab_order();
+
+    harness.tab();
+    let focused = harness.focused();
+    harness.tab();
+    assert_eq!(harness.focused(), focused, "Tab found somewhere else to go among two greyed keys");
+}
+
 // ---------------------------------------------------------------------------
 // Emission is a diff
 // ---------------------------------------------------------------------------

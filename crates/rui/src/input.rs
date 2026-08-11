@@ -110,15 +110,57 @@ impl Drag {
     /// control reading it can never be handed a value outside its own range or
     /// a NaN from dividing by an empty rectangle.
     pub fn fraction(&self) -> Point {
-        let across = if self.rect.w > 0.0 { self.at.x / self.rect.w } else { 0.0 };
-        let down = if self.rect.h > 0.0 { self.at.y / self.rect.h } else { 0.0 };
-        Point::new(across.clamp(0.0, 1.0), down.clamp(0.0, 1.0))
+        fraction_within(self.at, self.rect)
     }
 
     /// Whether the button came up this frame.
     pub fn ended(&self) -> bool {
         self.phase == Phase::Ended
     }
+}
+
+/// Where the pointer is over an element it has not pressed.
+///
+/// What [`Drag`] is to a gesture, this is to a hand simply moving: the same two
+/// facts — where within the element, and how big the element is — with no press
+/// to be part of. Carried by
+/// [`El::on_pointer_move`](crate::El::on_pointer_move).
+///
+/// The rectangle travels with the position because a position alone cannot be
+/// turned into anything: a viewport forwarding a pointer to a far screen, a map
+/// reading out coordinates and a picture picking a pixel all need to know what
+/// share of the element the pointer is at, and the element is the only thing
+/// that knows its own size. Handing over both is what makes [`Pointing::fraction`]
+/// answerable here rather than something every caller re-derives from a rectangle
+/// it had to store during a draw.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Pointing {
+    /// The pointer, relative to the element's top-left corner.
+    pub at: Point,
+    /// Where the element was drawn, in window coordinates.
+    pub rect: Rect,
+}
+
+impl Pointing {
+    /// How far across and down the element the pointer is, from zero to one.
+    ///
+    /// Clamped and NaN-free, exactly as [`Drag::fraction`] is — the same
+    /// computation, so a control driven by both cannot read two different
+    /// answers for one position.
+    pub fn fraction(&self) -> Point {
+        fraction_within(self.at, self.rect)
+    }
+}
+
+/// Where a point sits within a rectangle, from zero to one on each axis.
+///
+/// One implementation for [`Drag`] and [`Pointing`]. Clamped, and zero on an
+/// axis with no extent, so nothing reading it is handed a value outside its own
+/// range or a NaN from dividing by an empty rectangle.
+fn fraction_within(at: Point, rect: Rect) -> Point {
+    let across = if rect.w > 0.0 { at.x / rect.w } else { 0.0 };
+    let down = if rect.h > 0.0 { at.y / rect.h } else { 0.0 };
+    Point::new(across.clamp(0.0, 1.0), down.clamp(0.0, 1.0))
 }
 
 /// Which modifier keys were held.
@@ -448,6 +490,14 @@ pub struct Input {
     pointer: Point,
     /// Whether the pointer is over the window at all.
     pointer_inside: bool,
+    /// Whether it arrived somewhere new during this frame.
+    ///
+    /// A thing that *happened*, so it is cleared with the presses and the
+    /// keystrokes rather than persisting like the position itself. It is what
+    /// separates "the pointer is here" from "the pointer just came here": an
+    /// element told the former every frame would forward a position to another
+    /// machine for as long as a hand rested over it.
+    moved: bool,
     /// Where the pointer was when each button was pressed.
     ///
     /// A drag is judged from where it *began*, so that releasing outside a
@@ -495,6 +545,7 @@ impl Input {
     /// held down, what an input method is still composing. What is cleared is
     /// what merely *happened*.
     pub fn begin_frame(&mut self) {
+        self.moved = false;
         self.pressed = [false; 3];
         self.released = [false; 3];
         self.scroll = (0.0, 0.0);
@@ -507,19 +558,19 @@ impl Input {
     pub fn apply(&mut self, event: Event) {
         match event {
             Event::PointerMoved(position) => {
-                self.pointer = position;
+                self.place(position);
                 self.pointer_inside = true;
             }
             Event::PointerLeft => self.pointer_inside = false,
             Event::PointerDown { position, button } => {
-                self.pointer = position;
+                self.place(position);
                 self.pointer_inside = true;
                 self.held[button.index()] = true;
                 self.pressed[button.index()] = true;
                 self.press_origin[button.index()] = Some(position);
             }
             Event::PointerUp { position, button } => {
-                self.pointer = position;
+                self.place(position);
                 self.held[button.index()] = false;
                 self.released[button.index()] = true;
             }
@@ -542,6 +593,17 @@ impl Input {
         }
     }
 
+    /// Puts the pointer somewhere, noting whether that is somewhere new.
+    ///
+    /// One place, because every positioned event moves it and a press that
+    /// forgot to say so would be a movement no element could hear.
+    fn place(&mut self, position: Point) {
+        if position != self.pointer {
+            self.moved = true;
+        }
+        self.pointer = position;
+    }
+
     /// Where the pointer is, in logical units.
     pub fn pointer(&self) -> Point {
         self.pointer
@@ -550,6 +612,15 @@ impl Input {
     /// Whether the pointer is over the window.
     pub fn pointer_inside(&self) -> bool {
         self.pointer_inside
+    }
+
+    /// Whether the pointer arrived somewhere new during this frame.
+    ///
+    /// False on a frame drawn for any other reason — an animation, a poll, a
+    /// keystroke — which is what lets [`El::on_pointer_move`](crate::El::on_pointer_move)
+    /// report movement rather than presence.
+    pub fn pointer_moved(&self) -> bool {
+        self.moved
     }
 
     /// Whether a button is held down right now.

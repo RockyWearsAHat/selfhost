@@ -19,7 +19,7 @@
 use rui::testing::Harness;
 use rui::{
     Align, Anchor, Bgra, Color, Drag, El, Key, KeyCode, KeyPhase, KeyStroke, Modifiers, Painter,
-    Point, Radius, Rect, Role, Size, Tone, caption, col, draw, panel, row, text,
+    Point, Pointing, Radius, Rect, Role, Size, Tone, caption, col, draw, panel, row, text,
 };
 use std::sync::Arc;
 
@@ -40,6 +40,9 @@ struct Settings {
     screen: Option<Arc<Screen>>,
     /// Physical keys forwarded to the far machine and not yet released.
     held: Vec<KeyCode>,
+    /// Where the pointer has been told the far machine to put its own, in the
+    /// pane's own coordinates, in the order it was told.
+    pointed: Vec<Point>,
 }
 
 /// A picture from another machine, in the byte order every capture uses.
@@ -137,15 +140,19 @@ fn radio_group<S: 'static>(
         .collect::<Vec<_>>())
 }
 
-/// A pane showing another machine's screen, and sending it the keyboard.
+/// A pane showing another machine's screen, and sending it the keyboard and the
+/// pointer.
 ///
 /// The control this library was missing every piece of: a bitmap primitive to
 /// draw a captured frame with, the physical key rather than the character a
-/// layout made of it, and the release as well as the press.
+/// layout made of it, the release as well as the press, and — the last one — a
+/// pointer position that arrives without a button being held, since a hand
+/// moving over a remote screen is the whole of pointing at it.
 fn viewport<S: 'static>(
     size: Size,
     screen: Option<Arc<Screen>>,
     forward: impl Fn(&mut S, KeyStroke) + 'static,
+    point: impl Fn(&mut S, Pointing) + 'static,
 ) -> El<S> {
     draw(size, move |painter: &mut Painter<'_>, rect: Rect| {
         // A frame whose sizes disagree with its buffer is drawn as no frame at
@@ -162,6 +169,7 @@ fn viewport<S: 'static>(
     .role(Role::Image)
     .label("Remote screen")
     .on_raw_key(forward)
+    .on_pointer_move(point)
 }
 
 // ---------------------------------------------------------------------------
@@ -354,6 +362,7 @@ fn a_viewport_shows_another_machines_screen_and_sends_it_the_keyboard() {
                     KeyPhase::Up => settings.held.retain(|down| *down != code),
                 }
             },
+            |settings: &mut Settings, at: Pointing| settings.pointed.push(at.at),
         ))
         .align(Align::Start)
     });
@@ -384,6 +393,66 @@ fn a_viewport_shows_another_machines_screen_and_sends_it_the_keyboard() {
     assert!(harness.state().held.is_empty(), "left held down on the far machine");
 
     harness.assert_accessible();
+}
+
+#[test]
+fn a_hand_moving_over_the_viewport_moves_the_far_pointer_without_pressing_anything() {
+    // The gap this closes. `on_hover` answers whether the pointer is here and
+    // `on_drag` answers where it is only while a button is held, so before
+    // `on_pointer_move` a remote screen could be clicked but not *pointed at* —
+    // the far cursor stood still until something was dragged.
+    let mut harness = pointing();
+    let rect = harness.find_key("screen").expect("the pane is on screen").rect;
+
+    harness.move_pointer(Point::new(rect.x + 10.0, rect.y + 20.0));
+    harness.move_pointer(Point::new(rect.x + 30.0, rect.y + 40.0));
+
+    assert_eq!(
+        harness.state().pointed,
+        [Point::new(10.0, 20.0), Point::new(30.0, 40.0)],
+        "the far machine is told where in its own screen the pointer is, not where in this window"
+    );
+    assert!(harness.state().held.is_empty(), "nothing was pressed to make that happen");
+}
+
+#[test]
+fn a_pointer_resting_on_the_viewport_sends_nothing_at_all() {
+    // The other half of "movement, not presence". A handler told every frame
+    // that the pointer is still where it was would forward a position down a
+    // socket for as long as a hand rested on the picture, and — because writing
+    // to the state is what asks for the next frame — would never stop drawing.
+    let mut harness = pointing();
+    let rect = harness.find_key("screen").expect("the pane is on screen").rect;
+
+    harness.move_pointer(rect.center());
+    assert_eq!(harness.state().pointed.len(), 1);
+
+    harness.frames(10);
+    assert_eq!(harness.state().pointed.len(), 1, "ten frames of a hand holding still");
+}
+
+#[test]
+fn the_pointer_leaving_the_viewport_stops_the_far_pointer_rather_than_dragging_it_along() {
+    let mut harness = pointing();
+    let rect = harness.find_key("screen").expect("the pane is on screen").rect;
+
+    harness.move_pointer(rect.center());
+    harness.move_pointer(Point::new(rect.x + rect.w + 40.0, rect.y + rect.h + 40.0));
+
+    assert_eq!(harness.state().pointed.len(), 1, "a position outside the pane is not the pane's");
+}
+
+/// A window holding nothing but the viewport, for the pointer tests.
+fn pointing() -> Harness<Settings> {
+    Harness::new(Settings::default(), |settings: &Settings| {
+        col(viewport(
+            Size::new(120.0, 80.0),
+            settings.screen.clone(),
+            |_: &mut Settings, _: KeyStroke| {},
+            |settings: &mut Settings, at: Pointing| settings.pointed.push(at.at),
+        ))
+        .align(Align::Start)
+    })
 }
 
 /// A picture of one colour, padded as a capture API pads its rows.

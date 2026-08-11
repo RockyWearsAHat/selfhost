@@ -116,9 +116,11 @@ fn run(connect: impl Connect, shared: Arc<Mutex<Snapshot>>, running: Arc<AtomicB
             carry_out(ready, &shared, command);
         }
 
+        let mut answered = Answered::No;
         if acted || due {
             last_poll = Some(Instant::now());
-            if refresh_services(ready, &shared) {
+            answered = refresh_services(ready, &shared);
+            if answered == Answered::Yes {
                 // The service list is fetched whatever is on screen: the
                 // masthead's own condition is read off it, and every screen
                 // carries the masthead. Everything below is per-screen — see
@@ -137,6 +139,15 @@ fn run(connect: impl Connect, shared: Arc<Mutex<Snapshot>>, running: Arc<AtomicB
                     Screen::People => refresh_people(ready, &shared),
                 }
             }
+        }
+
+        // A refused credential is thrown away rather than retried for ever. The
+        // daemon writes a new token every time it starts — which on the
+        // production box is every push — so the next poll builds a client from
+        // a freshly read one and the console reconnects itself instead of
+        // having to be quit and started again.
+        if answered == Answered::StaleCredential {
+            client = None;
         }
 
         std::thread::sleep(TICK);
@@ -212,7 +223,7 @@ fn carry_out(client: &Client, shared: &Arc<Mutex<Snapshot>>, command: Command) {
 }
 
 /// Fetches every service's state; answers whether the daemon replied.
-fn refresh_services(client: &Client, shared: &Arc<Mutex<Snapshot>>) -> bool {
+fn refresh_services(client: &Client, shared: &Arc<Mutex<Snapshot>>) -> Answered {
     match client.get("/api/services") {
         Ok(value) => {
             let services: Vec<ServiceStatus> = value
@@ -233,19 +244,41 @@ fn refresh_services(client: &Client, shared: &Arc<Mutex<Snapshot>>) -> bool {
                 snapshot.spec = None;
             }
             snapshot.services = services;
-            true
+            Answered::Yes
         }
         Err(error) => {
+            let stale = error.is_stale_credential();
             let mut snapshot = shared.lock().expect("the snapshot lock was poisoned");
             if error.is_disconnection() {
                 snapshot.link = Link::Lost(error.to_string());
+            } else if stale {
+                // Not reported as a problem: the console is about to fix it by
+                // itself, and a notice saying the daemon refused it would be a
+                // bar to dismiss for something nobody has to do anything about.
+                snapshot.link = Link::Connecting;
             } else {
                 snapshot.link = Link::Connected;
                 snapshot.report_problem(describe(&error));
             }
-            false
+            if stale { Answered::StaleCredential } else { Answered::No }
         }
     }
+}
+
+/// What one fetch of the service list came to.
+///
+/// Three answers and not a boolean, because the third one is an instruction: a
+/// daemon that refused the credential wants a *new client*, and a poller told
+/// only "that did not work" would ask the same refused token again every half
+/// second for as long as the window stayed open.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Answered {
+    /// The daemon replied, and the snapshot now holds what it said.
+    Yes,
+    /// It did not, and nothing more is to be done this tick.
+    No,
+    /// It refused the token in hand, which a freshly read one may fix.
+    StaleCredential,
 }
 
 /// Fetches the selected service's full definition.
