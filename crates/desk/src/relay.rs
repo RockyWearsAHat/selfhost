@@ -426,14 +426,30 @@ impl<'a> Relay<'a> {
             self.write(&bytes, deadline).await?;
         }
 
-        if let Some(bytes) = arrived {
-            if self.machine.phase() == Phase::Live && live.contains(Capabilities::VIEW) {
-                self.forward(&bytes, deadline).await?;
+        match arrived {
+            Some(bytes) => {
+                if self.machine.phase() == Phase::Live && live.contains(Capabilities::VIEW) {
+                    self.forward(&bytes, deadline).await?;
+                }
+                // Whether or not it was forwarded, the agent spent its window on
+                // it, so the window is returned. Dropping a message the client
+                // may not see is not a reason to stall the machine that produced
+                // it.
+                self.credit(bytes.len(), deadline).await?;
             }
-            // Whether or not it was forwarded, the agent spent its window on it,
-            // so the window is returned. Dropping a message the client may not
-            // see is not a reason to stall the machine that produced it.
-            self.credit(bytes.len(), deadline).await?;
+            // **Nothing arrived, so whatever is owed is flushed.** The batch
+            // exists to keep one grant from riding behind every tile; it must
+            // never become a threshold that strands credit. A frame's tail is
+            // almost always smaller than the batch, so without this the last few
+            // kilobytes of every burst are never returned — the agent spends its
+            // window down to a remainder and stops, and the picture stops with
+            // the bottom four-fifths of the screen never drawn. Observed on
+            // ALEX-DESKTOP as a desktop that filled its top strip and stayed
+            // there.
+            //
+            // A quiet moment is exactly when this costs nothing: there is no
+            // message to ride behind, and the agent is by definition not busy.
+            None => self.flush_credit(deadline).await?,
         }
 
         Ok(match step.action {
@@ -501,12 +517,27 @@ impl<'a> Relay<'a> {
         if self.uncredited < CREDIT_BATCH {
             return Ok(());
         }
+        self.flush_credit(deadline).await
+    }
+
+    /// Returns everything owed, however little that is.
+    ///
+    /// Called when the batch is full and again whenever nothing arrived, which is
+    /// what keeps [`CREDIT_BATCH`] a batching rule rather than a minimum. See the
+    /// idle arm of [`Relay::pump`] for what treating it as a minimum cost.
+    async fn flush_credit(&mut self, deadline: tokio::time::Instant) -> Result<(), Ending> {
+        if self.uncredited == 0 {
+            return Ok(());
+        }
         let grant = u32::try_from(self.uncredited).unwrap_or(u32::MAX);
         self.uncredited = 0;
-        match timeout_at(deadline, self.upstream.deliver(&Message::Credit { bytes: grant })).await {
-            Err(_elapsed) => Err(Ending::Deadline),
-            Ok(_) => Ok(()),
+        if timeout_at(deadline, self.upstream.deliver(&Message::Credit { bytes: grant }))
+            .await
+            .is_err()
+        {
+            return Err(Ending::Deadline);
         }
+        Ok(())
     }
 
     /// Reads one message from the console and acts on it.
@@ -1101,6 +1132,57 @@ mod tests {
         let refunds = &grants[1..];
         assert_eq!(refunds.len(), 1, "one batch, once the batch was full: {grants:?}");
         assert!(refunds[0] >= CREDIT_BATCH as u32, "and it returns what was written: {grants:?}");
+    }
+
+    /// A remainder smaller than the batch is still returned.
+    ///
+    /// The defect this pins: the batch was acting as a *minimum*, so the tail of
+    /// every burst — which is nearly always under 64 KiB — was never granted
+    /// back. The agent spent its window down to a remainder and stopped, and on
+    /// ALEX-DESKTOP that looked like a desktop that drew its top strip and then
+    /// nothing at all.
+    #[tokio::test]
+    async fn a_remainder_under_the_batch_is_returned_when_the_agent_goes_quiet() {
+        // One small message, then silence, then the kill switch to end it.
+        let small = Message::Status { notice: Notice::Live, detail: "x".into() }
+            .encode()
+            .expect("encodes");
+        assert!((small.len() as u64) < CREDIT_BATCH, "the point of the test");
+        let mut agent = FakeAgent::with(vec![
+            Ok(small.clone()),
+            Err(Condition::Retry),
+            Err(Condition::Stopped),
+        ]);
+        let handed = Arc::clone(&agent.delivered);
+        let mut out = Recorder::default();
+        let directory = granted(Capabilities::VIEW);
+        let gate = Gate::new(2);
+
+        let relay = Relay::new(
+            &mut out,
+            &mut agent,
+            &directory,
+            gate.admit("self").expect("a seat"),
+            &redemption(Capabilities::VIEW),
+            ceilings(),
+        );
+        let _ = relay.run(&mut FakeConsole::silent()).await;
+
+        let grants: Vec<u32> = handed
+            .lock()
+            .expect("not poisoned")
+            .iter()
+            .filter_map(|message| match message {
+                Message::Credit { bytes } => Some(*bytes),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(grants.first(), Some(&OPENING_WINDOW), "the opening window");
+        assert_eq!(
+            grants.get(1),
+            Some(&(small.len() as u32)),
+            "and the remainder, exactly, once the agent went quiet: {grants:?}"
+        );
     }
 
     /// A console's own credit grant is not passed on.
