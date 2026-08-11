@@ -613,7 +613,16 @@ impl Fleet for Desk {
             );
         }
         let backend = Backend::here();
-        if backend.wired {
+        // `wired` alone is the wrong question, and asking it cost the one report
+        // that matters on the production box. A relayed backend is wired — a
+        // picture *can* be served — but this process is not the thing serving
+        // it, so its own probe knows nothing about whether an agent is running,
+        // how many displays that agent found, or how many times it has been
+        // restarted this hour. Answering from the probe published `0 monitors,
+        // 0 respawns` under a sentence about session 0 while the supervisor was
+        // three respawns deep, which is precisely the state an operator opens
+        // this plate to see.
+        if backend.wired && !backend.relayed {
             return AgentReport {
                 node: node.to_owned(),
                 live: true,
@@ -1851,6 +1860,43 @@ role = \"worker\"
     /// answer could have been re-derived, and re-deriving it is how they come to
     /// disagree.
     #[test]
+    /// A relayed backend's report comes from the supervisor, never from the probe.
+    ///
+    /// The defect this pins, found by running it on the production box rather
+    /// than by reading it: `Backend::relayed` is `wired`, so a report that asked
+    /// only `wired` answered from the probe — which on a session-0 daemon knows
+    /// nothing about the agent. The plate showed `0 monitors, 0 respawns` under
+    /// a sentence about session 0 while the supervisor was respawning an agent
+    /// every thirty seconds.
+    #[test]
+    fn a_relayed_backend_reports_the_supervisor_and_not_the_probe() {
+        let relayed = crate::desk_local::Backend {
+            name: "GDI",
+            wired: true,
+            why: "session 0".to_owned(),
+            condition: Condition::Retry,
+            displays: 0,
+            relayed: true,
+        };
+        assert!(
+            relayed.wired && relayed.relayed,
+            "a relayed backend is wired, which is why `wired` alone cannot decide this"
+        );
+        // The condition the report is written against: only a backend that is
+        // wired *and not* relayed may answer from the probe.
+        assert!(!(relayed.wired && !relayed.relayed), "the relayed arm must fall through");
+
+        let direct = crate::desk_local::Backend {
+            name: "CGDisplayStream",
+            wired: true,
+            why: "this machine's own screen".to_owned(),
+            condition: Condition::Retry,
+            displays: 2,
+            relayed: false,
+        };
+        assert!(direct.wired && !direct.relayed, "a direct backend still answers from the probe");
+    }
+
     fn a_view_only_deployment_arms_nothing_by_any_route() {
         let dir = temp_dir("view-only");
         let desktop = Desktop { enabled: true, allow_input: false, ..Desktop::default() };
