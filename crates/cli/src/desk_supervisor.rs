@@ -1387,8 +1387,16 @@ mod tests {
         assert!(backoff.sentence.contains("failed 1 time"), "{}", backoff.sentence);
         assert_eq!(supervised.channel.recycled, 1, "the client is forgotten, the pipe is kept");
         assert_eq!(machine.borrow().opened(), ["open 1"], "and the pipe is not recreated");
+        // The *sentence* the code stands for, not the number. Code 3 is
+        // `Departure::UnknownSession`, and what an operator needs on the plate is
+        // what that means — the number is the transport, and asserting it here
+        // would let the vocabulary drift away from the thing that reads it.
         assert!(
-            backoff.fault.as_deref().unwrap_or_default().contains("exited with code 3"),
+            backoff
+                .fault
+                .as_deref()
+                .unwrap_or_default()
+                .contains(selfhost_screen::Departure::UnknownSession.sentence()),
             "the reason travels with the phase: {backoff:?}"
         );
     }

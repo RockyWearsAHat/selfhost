@@ -57,6 +57,8 @@
 //! agent holding an injector inside the console session in a deployment whose
 //! operator switched input off.
 
+use selfhost_screen::Departure;
+
 /// The refusal every path here ends with, so the sentence exists once.
 ///
 /// Names what to run instead. An operator who reached this line was looking for
@@ -69,17 +71,31 @@ the daemon can create. Running it by hand does nothing.
   selfhost daemon           start the daemon, which starts this when it needs to
   selfhost desktop status   whether remote desktop is on, and what it can see";
 
-/// Runs the agent, or explains why it will not.
+/// Runs the agent, or explains why it will not — and the exit code that says
+/// which.
 ///
 /// `arguments` is the whole argv tail, `arguments[0]` being `desk-agent`, which
 /// is the shape every other command in this binary takes.
-pub fn run(arguments: &[String]) -> Result<(), String> {
+///
+/// **The code is the diagnosis.** This process runs in a session with no console
+/// and no log, and everything it can say about a failure before the pipe is up
+/// goes to a stderr nobody holds — so the number a parent reads has to carry the
+/// reason. [`selfhost_screen::Departure`] is the vocabulary, shared with the
+/// supervisor that reads it, and `main` exits with this rather than the uniform
+/// failure every other command uses.
+pub fn depart(arguments: &[String]) -> (Departure, Result<(), String>) {
     let session = match crate::value_of(arguments, "--session") {
-        Some(given) => given
-            .parse::<u32>()
-            .map_err(|error| format!("--session {given}: {error}\n\n{NOT_FOR_HUMANS}"))?,
+        Some(given) => match given.parse::<u32>() {
+            Ok(session) => session,
+            Err(error) => {
+                return (
+                    Departure::NotSpawned,
+                    Err(format!("--session {given}: {error}\n\n{NOT_FOR_HUMANS}")),
+                )
+            }
+        },
         // No session means nobody chose one, which means nobody spawned this.
-        None => return Err(NOT_FOR_HUMANS.to_owned()),
+        None => return (Departure::NotSpawned, Err(NOT_FOR_HUMANS.to_owned())),
     };
     run_in_session(session, arguments)
 }
@@ -101,32 +117,42 @@ pub fn run(arguments: &[String]) -> Result<(), String> {
 /// view-only agent. See `selfhost_screen::agent::InputPolicy` for why the switch
 /// travels here and not over the pipe.
 #[cfg(windows)]
-fn run_in_session(session: u32, arguments: &[String]) -> Result<(), String> {
+fn run_in_session(session: u32, arguments: &[String]) -> (Departure, Result<(), String>) {
     use selfhost_screen::agent::{run, AgentOptions};
 
     match selfhost_screen::windows::gdi::current_session() {
         Some(mine) if mine == session => {}
         Some(mine) => {
-            return Err(format!(
-                "the daemon aimed this agent at session {session} and it started in session \
-                 {mine}, so the console changed hands while it was starting. Exiting rather \
-                 than capturing a session it was not sent to."
-            ));
+            return (
+                Departure::WrongSession,
+                Err(format!(
+                    "the daemon aimed this agent at session {session} and it started in session \
+                     {mine}, so the console changed hands while it was starting. Exiting rather \
+                     than capturing a session it was not sent to."
+                )),
+            );
         }
         // Not knowing which session this is means not being able to prove the
         // agent belongs where it was sent, and this is the one process in the
         // deployment that must never guess.
         None => {
-            return Err(
-                "cannot read which session this process is in, so it cannot prove it belongs \
-                 in the one the daemon aimed it at. Exiting."
-                    .to_owned(),
+            return (
+                Departure::UnknownSession,
+                Err("cannot read which session this process is in, so it cannot prove it belongs \
+                     in the one the daemon aimed it at. Exiting."
+                    .to_owned()),
             );
         }
     }
 
-    run(AgentOptions::from_arguments(session, arguments))
-        .map_err(|fault| format!("the desktop agent stopped: {fault}"))
+    // The link is opened inside `run`, and it is the failure worth telling apart
+    // from every other: a pipe that will not have this agent is a pipe still
+    // held by one that did not exit, which is a different machine from a screen
+    // that will not open.
+    match run(AgentOptions::from_arguments(session, arguments)) {
+        Ok(()) => (Departure::Done, Ok(())),
+        Err(stop) => (stop.departure, Err(format!("the desktop agent stopped: {stop}"))),
+    }
 }
 
 /// Everywhere else there is no agent, because there is no session-0 problem to
@@ -136,12 +162,15 @@ fn run_in_session(session: u32, arguments: &[String]) -> Result<(), String> {
 /// a platform it was never meant for must see a non-zero exit and stop trying,
 /// not a process that returns cleanly and looks like it worked.
 #[cfg(not(windows))]
-fn run_in_session(session: u32, _arguments: &[String]) -> Result<(), String> {
-    Err(format!(
+fn run_in_session(session: u32, _arguments: &[String]) -> (Departure, Result<(), String>) {
+    (
+        Departure::NotSpawned,
+        Err(format!(
         "there is no desktop agent on this platform: the agent exists to reach an interactive \
          session from a service running in Windows session 0, and nothing here has that problem. \
-         (asked for session {session})\n\n{NOT_FOR_HUMANS}"
-    ))
+             (asked for session {session})\n\n{NOT_FOR_HUMANS}"
+        )),
+    )
 }
 
 #[cfg(test)]
@@ -151,18 +180,22 @@ mod tests {
     #[test]
     fn no_session_argument_is_refused_without_touching_anything() {
         let arguments = vec!["desk-agent".to_owned()];
-        let refusal = run(&arguments).expect_err("a bare invocation is refused");
+        let (departure, result) = depart(&arguments);
+        let refusal = result.expect_err("a bare invocation is refused");
         assert!(
             refusal.contains("selfhost daemon"),
             "the refusal names what to run instead: {refusal}"
         );
+        assert_eq!(departure, Departure::NotSpawned, "and the code says nobody spawned it");
     }
 
     #[test]
     fn a_session_that_is_not_a_number_is_refused() {
         let arguments = vec!["desk-agent".to_owned(), "--session".to_owned(), "console".to_owned()];
-        let refusal = run(&arguments).expect_err("a malformed session is refused");
+        let (departure, result) = depart(&arguments);
+        let refusal = result.expect_err("a malformed session is refused");
         assert!(refusal.contains("--session console"), "the refusal quotes what was given");
+        assert_eq!(departure, Departure::NotSpawned);
     }
 
     /// On a platform with no agent the refusal must be a refusal, whatever
@@ -172,7 +205,39 @@ mod tests {
     #[test]
     fn a_platform_without_an_agent_refuses_rather_than_succeeding() {
         let arguments = vec!["desk-agent".to_owned(), "--session".to_owned(), "1".to_owned()];
-        let refusal = run(&arguments).expect_err("there is no agent here");
+        let (departure, result) = depart(&arguments);
+        let refusal = result.expect_err("there is no agent here");
         assert!(refusal.contains("session 1"));
+        assert_ne!(departure.code(), 0, "a refusal must never exit zero");
+    }
+
+    /// Every code this build writes decodes back to what wrote it, and nothing
+    /// writes `1`.
+    ///
+    /// The second half is the load-bearing one: `1` is what every other command
+    /// in the binary exits with, so it has to keep meaning "something else
+    /// entirely" — which is exactly the ambiguity that made nine identical
+    /// failures on the production box undiagnosable.
+    #[test]
+    fn every_departure_round_trips_and_none_of_them_is_one() {
+        for departure in [
+            Departure::Done,
+            Departure::NotSpawned,
+            Departure::UnknownSession,
+            Departure::WrongSession,
+            Departure::LinkRefused,
+            Departure::StreamFailed,
+        ] {
+            let code = departure.code();
+            assert_ne!(code, 1, "{departure:?} must not collide with the uniform failure");
+            assert_eq!(
+                Departure::from_code(i32::from(code)),
+                Some(departure),
+                "{departure:?} must decode back to itself"
+            );
+            assert!(!departure.sentence().is_empty(), "{departure:?} must say something");
+        }
+        assert_eq!(Departure::from_code(1), None, "1 is deliberately not in the vocabulary");
+        assert_eq!(Departure::from_code(-1073741819), None, "nor is an access violation");
     }
 }
