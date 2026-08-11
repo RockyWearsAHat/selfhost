@@ -206,6 +206,17 @@ impl Grants {
     /// is a separate decision from driving it. And [`Capability::NodeAdmin`]
     /// implies no power over the nodes it administers: managing a list of
     /// machines and sitting at one of them are different jobs.
+    ///
+    /// The three configuration capabilities — [`Capability::SiteAdmin`],
+    /// [`Capability::DnsAdmin`] and [`Capability::MailAdmin`] — imply nothing and
+    /// are implied by nothing, including each other, and that is the whole reason
+    /// there are three of them rather than one `ConfigAdmin`. They are adjacent
+    /// in an obvious way and independent in the way that matters: adding a
+    /// mailbox creates an identity that can receive password resets, adding a DNS
+    /// record can move a domain and can satisfy an ACME challenge for it, and
+    /// adding a site changes what this box answers for. Somebody who should be
+    /// able to do one of those is very often somebody who should not be able to
+    /// do the other two.
     pub fn holds(&self, want: &Capability) -> bool {
         self.0.iter().any(|held| satisfies(held, want))
     }
@@ -565,6 +576,40 @@ mod tests {
     /// Every identity the model has, for the sweep.
     fn every_identity() -> Vec<Identity> {
         vec![Identity::Owner, person()]
+    }
+
+    #[test]
+    fn a_configuration_capability_implies_nothing_and_is_implied_by_nothing() {
+        // Three grants that are adjacent in an obvious way and independent in the
+        // way that matters. The sweep is both directions across all three, plus
+        // every other capability, because the failure this prevents is the one
+        // nobody sees: a person granted mail administration quietly able to point
+        // a hostname somewhere, because one implication was written for tidiness.
+        let configuring =
+            [Capability::SiteAdmin, Capability::DnsAdmin, Capability::MailAdmin];
+        for held in &configuring {
+            let grants = Grants::new([held.clone()]).expect("one grant");
+            for want in Capability::every_shape(&share(), &node()) {
+                assert_eq!(
+                    grants.holds(&want),
+                    *held == want,
+                    "holding {held} must open {want} only if they are the same capability"
+                );
+            }
+        }
+        // And nothing else reaches them, including the two existing administrative
+        // grants, which are the ones most likely to be assumed to.
+        for held in [
+            Capability::FilesAdmin,
+            Capability::NodeAdmin,
+            Capability::ServiceControl,
+            Capability::ConsoleRead,
+        ] {
+            let grants = Grants::new([held.clone()]).expect("one grant");
+            for want in &configuring {
+                assert!(!grants.holds(want), "{held} must not reach {want}");
+            }
+        }
     }
 
     #[test]
