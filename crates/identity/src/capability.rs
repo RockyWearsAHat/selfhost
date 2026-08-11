@@ -235,6 +235,34 @@ pub enum Capability {
     /// registry. Deliberately implies no power *over* those nodes' desktops —
     /// managing a list of machines and driving one of them are different jobs.
     NodeAdmin,
+    /// Create, change and remove **websites**: their hostnames, where the files
+    /// are, which instances serve them, and which networks may reach them.
+    ///
+    /// The most consequential capability in this list and the one to read
+    /// carefully. Every other power here acts *within* what this deployment
+    /// already exposes; this one changes what it exposes. Someone holding it can
+    /// point a hostname this box answers for at a directory or at a port, and can
+    /// widen a site's `allowed_cidrs`. It is therefore never implied by anything,
+    /// and the console it is administered from is itself a site.
+    SiteAdmin,
+    /// Create, change and remove **DNS records** in the zones this deployment
+    /// serves, and push them to the registrar.
+    ///
+    /// Separate from [`Capability::SiteAdmin`] because the two fail differently:
+    /// a wrong site is a page nobody can reach, and a wrong DNS record is a
+    /// domain pointed somewhere else entirely — including, if the record is the
+    /// one ACME validates against, somewhere that can be issued a certificate for
+    /// it. Delegating the ability to add a subdomain is not delegating the
+    /// ability to move the apex, but the grammar cannot express that, so the
+    /// whole zone travels with the grant and the audit line is how it is watched.
+    DnsAdmin,
+    /// Create, change and remove **mailboxes and aliases**.
+    ///
+    /// Its own capability rather than a corner of the others because mail is the
+    /// one surface where creating an account creates an *identity elsewhere*: a
+    /// mailbox that can receive a password reset is a way into every service that
+    /// trusts the address. Granting it hands over that, and nothing else.
+    MailAdmin,
 }
 
 impl Capability {
@@ -256,6 +284,9 @@ impl Capability {
             Self::DesktopControl(_) => "desktop.control",
             Self::ClipboardRead(_) => "clipboard.read",
             Self::NodeAdmin => "node.admin",
+            Self::SiteAdmin => "site.admin",
+            Self::DnsAdmin => "dns.admin",
+            Self::MailAdmin => "mail.admin",
         }
     }
 
@@ -265,7 +296,13 @@ impl Capability {
     /// JSON string needs no escaping and no length check of its own.
     pub fn target(&self) -> Option<&str> {
         match self {
-            Self::ConsoleRead | Self::ServiceControl | Self::FilesAdmin | Self::NodeAdmin => None,
+            Self::ConsoleRead
+            | Self::ServiceControl
+            | Self::FilesAdmin
+            | Self::NodeAdmin
+            | Self::SiteAdmin
+            | Self::DnsAdmin
+            | Self::MailAdmin => None,
             Self::FilesRead(share) | Self::FilesWrite(share) => Some(share.as_str()),
             Self::DesktopView(node) | Self::DesktopControl(node) | Self::ClipboardRead(node) => {
                 Some(node.as_str())
@@ -293,6 +330,9 @@ impl Capability {
             ("service.control", None) => Some(Self::ServiceControl),
             ("files.admin", None) => Some(Self::FilesAdmin),
             ("node.admin", None) => Some(Self::NodeAdmin),
+            ("site.admin", None) => Some(Self::SiteAdmin),
+            ("dns.admin", None) => Some(Self::DnsAdmin),
+            ("mail.admin", None) => Some(Self::MailAdmin),
             ("files.read", target) => share(target).map(Self::FilesRead),
             ("files.write", target) => share(target).map(Self::FilesWrite),
             ("desktop.view", target) => node(target).map(Self::DesktopView),
@@ -327,7 +367,23 @@ impl Capability {
             Self::DesktopControl(node.clone()),
             Self::ClipboardRead(node.clone()),
             Self::NodeAdmin,
+            Self::SiteAdmin,
+            Self::DnsAdmin,
+            Self::MailAdmin,
         ]
+    }
+
+    /// Whether holding this capability lets a caller change what this deployment
+    /// *is*, as against what it currently reports.
+    ///
+    /// The three configuration capabilities, as one predicate, because they share
+    /// a property none of the others have: they edit `selfhost.config.toml`, and
+    /// the file they edit is the description the whole deployment is derived
+    /// from. Callers use this to demand a fresh credential and to write the
+    /// louder audit line — a grant that can rewrite the deployment should not
+    /// ride silently in a cookie that was minted twelve hours ago.
+    pub fn edits_the_deployment(&self) -> bool {
+        matches!(self, Self::SiteAdmin | Self::DnsAdmin | Self::MailAdmin)
     }
 }
 
@@ -392,7 +448,7 @@ mod tests {
     #[test]
     fn every_capability_round_trips_through_its_wire_form() {
         let shapes = Capability::every_shape(&share(), &node());
-        assert_eq!(shapes.len(), 9, "extend every_shape when a variant is added");
+        assert_eq!(shapes.len(), 12, "extend every_shape when a variant is added");
         for capability in &shapes {
             let text = capability.to_string();
             assert_eq!(
@@ -406,6 +462,51 @@ mod tests {
         assert_eq!(Capability::FilesWrite(share()).to_string(), "files.write:vault");
         assert_eq!(Capability::DesktopControl(node()).to_string(), "desktop.control:alex-desktop");
         assert_eq!(Capability::NodeAdmin.to_string(), "node.admin");
+        assert_eq!(Capability::SiteAdmin.to_string(), "site.admin");
+        assert_eq!(Capability::DnsAdmin.to_string(), "dns.admin");
+        assert_eq!(Capability::MailAdmin.to_string(), "mail.admin");
+    }
+
+    #[test]
+    fn the_three_configuration_capabilities_are_the_ones_that_edit_the_deployment() {
+        // The predicate exists so a caller does not have to remember the list,
+        // and the negative half is the point: none of the powers that merely act
+        // within what the deployment already exposes may be mistaken for one that
+        // changes what it exposes.
+        for editing in [Capability::SiteAdmin, Capability::DnsAdmin, Capability::MailAdmin] {
+            assert!(editing.edits_the_deployment(), "{editing} edits selfhost.config.toml");
+        }
+        for acting in [
+            Capability::ConsoleRead,
+            Capability::ServiceControl,
+            Capability::FilesAdmin,
+            Capability::NodeAdmin,
+            Capability::FilesWrite(share()),
+            Capability::DesktopControl(node()),
+            Capability::ClipboardRead(node()),
+        ] {
+            assert!(!acting.edits_the_deployment(), "{acting} does not rewrite the config");
+        }
+    }
+
+    #[test]
+    fn administering_the_configuration_is_not_driving_a_machine() {
+        // Two independent asymmetries. An unattended token is refused the powers
+        // that drive a machine; that refusal must not quietly extend to editing
+        // config, nor must editing config quietly acquire a keyboard.
+        for editing in [Capability::SiteAdmin, Capability::DnsAdmin, Capability::MailAdmin] {
+            assert!(!editing.drives_a_machine(), "{editing} is not a keyboard");
+        }
+    }
+
+    #[test]
+    fn a_configuration_capability_takes_no_target() {
+        // `site.admin:example` would read as "may administer only this site" and
+        // grant something this grammar cannot enforce, so it is refused outright
+        // rather than silently reduced to the whole-deployment grant.
+        for text in ["site.admin:example", "dns.admin:rockywearsahat.com", "mail.admin:alex"] {
+            assert_eq!(Capability::parse(text), None, "{text} must not parse");
+        }
     }
 
     #[test]
