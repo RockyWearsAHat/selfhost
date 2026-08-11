@@ -263,7 +263,13 @@ fn probe() -> Backend {
 fn probe() -> Backend {
     use selfhost_screen::windows::gdi;
 
-    const NAME: &str = "GDI";
+    // Two sources ship on Windows and the choice is made per session, by
+    // `selfhost_screen::windows::capture::WindowsCapture`, at the moment a capture
+    // is opened. This probe deliberately does not open one to find out — a
+    // duplication is a scarce slot on the output, and taking one to print a status
+    // line could deny it to the session that actually needs it. So the name says
+    // what this build will try, and the agent's own line says what it got.
+    const NAME: &str = "duplication, or GDI";
     let Some(session) = gdi::current_session() else {
         return Backend::unwired(
             NAME,
@@ -279,8 +285,10 @@ fn probe() -> Backend {
              nothing in this process captures anything. The pixels come from an agent supervised \
              in the console user's session and reached over a named pipe whose DACL names that \
              user; the daemon forwards its messages without reading them, and applies this \
-             session's own permissions to every keystroke going the other way. See the agent's own \
-             line for whether one is running.",
+             session's own permissions to every keystroke going the other way. The agent picks its \
+             own source there: DXGI Desktop Duplication where the machine has it, which is the \
+             only one of the two that can see a full-screen Direct3D game, and GDI otherwise. See \
+             the agent's own line for whether one is running.",
         );
     }
     match gdi::monitors() {
@@ -847,7 +855,11 @@ fn new_capture() -> Result<Box<dyn selfhost_screen::Capture>, Condition> {
 
 #[cfg(windows)]
 fn new_capture() -> Result<Box<dyn selfhost_screen::Capture>, Condition> {
-    selfhost_screen::windows::gdi::GdiCapture::new()
+    // The chooser rather than GDI directly, so a daemon run by hand in an
+    // interactive session gets the same source the agent would: one that can see a
+    // game. `WindowsCapture::open` falls back by itself, so this path never fails
+    // for a machine that merely lacks duplication.
+    selfhost_screen::windows::capture::WindowsCapture::open()
         .map(|capture| Box::new(capture) as Box<dyn selfhost_screen::Capture>)
         .map_err(|error| condition_of(&error))
 }
