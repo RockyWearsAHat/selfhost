@@ -733,6 +733,13 @@ impl Backend for Window {
             let _: () = send1(window, sel(c"setOpaque:"), true);
 
             install_menu(application, &options.title);
+            // Before the window is shown, so a Quit pressed the instant it
+            // appears is already an orderly one. A failure here is not fatal
+            // and is not reported: the window works, Quit simply goes back to
+            // being AppKit's abrupt one.
+            if let Ok(delegate) = application_delegate() {
+                let _: () = send1(application, sel(c"setDelegate:"), delegate);
+            }
 
             let _: () = send(application, sel(c"finishLaunching"));
             let _: () = send1(window, sel(c"makeKeyAndOrderFront:"), std::ptr::null_mut::<c_void>());
@@ -2356,6 +2363,94 @@ fn key_for_code(code: u16) -> Option<Key> {
 /// field.
 fn is_function_key(character: char) -> bool {
     ('\u{f700}'..='\u{f8ff}').contains(&character)
+}
+
+/// The name of the application-delegate class this backend builds at run time.
+const DELEGATE_CLASS: &CStr = c"RuiAppDelegate";
+
+/// How that class is named in a failure to build it.
+const DELEGATE_OWNER: &str = "application delegate";
+
+/// `NSTerminateCancel`: the application is not to be torn down after all.
+const TERMINATE_CANCEL: usize = 0;
+
+/// The delegate that turns Quit into an orderly close, built once per process.
+///
+/// # The defect this exists for
+///
+/// AppKit's `terminate:` — which is Command-Q, the Quit item, the Dock's own
+/// Quit and the AppleEvent `osascript` sends — tears the process down from
+/// inside the run loop. [`Backend::run`](crate::shell::Backend) never returns,
+/// so **nothing an application put on the stack is ever dropped**: no
+/// destructor, no flush, no child process reaped. The selfhost console found it
+/// the hard way — quitting left the `ssh -L` it had spawned holding port 9191
+/// for ever, so the next launch reported a tunnel it could not open while
+/// talking happily through the orphan.
+///
+/// Closing the window with the red button has never had this problem, because
+/// that path is a fact the loop reads: the window stops being visible, the loop
+/// ends, `run` returns, and everything unwinds. So the fix is to make Quit take
+/// exactly that path — close the windows, refuse the termination, and let the
+/// loop notice — rather than to invent a second shutdown that would then have
+/// to be kept in step with the first.
+fn application_delegate() -> Result<Object, Error> {
+    let class_object = match class(DELEGATE_CLASS) {
+        existing if !existing.is_null() => existing,
+        _ => {
+            let superclass = class(c"NSObject");
+            if superclass.is_null() {
+                return Err(Error::Platform("the Objective-C runtime has no NSObject".into()));
+            }
+            let built = unsafe { objc_allocateClassPair(superclass, DELEGATE_CLASS.as_ptr(), 0) };
+            if built.is_null() {
+                return Err(Error::Platform("a delegate class could not be created".into()));
+            }
+            // `Q@:@` — returns an unsigned word, takes the receiver, the
+            // selector, and the application asking.
+            add_method(
+                built,
+                DELEGATE_OWNER,
+                c"applicationShouldTerminate:",
+                should_terminate as *const c_void,
+                c"Q@:@",
+            )?;
+            unsafe { objc_registerClassPair(built) };
+            built
+        }
+    };
+
+    let delegate: Object = unsafe { send(send(class_object, sel(c"alloc")), sel(c"init")) };
+    if delegate.is_null() {
+        return Err(Error::Platform("a delegate could not be created".into()));
+    }
+    Ok(delegate)
+}
+
+/// Answers a Quit by closing every window and refusing to terminate.
+///
+/// The loop is watching each window's visibility, so this *is* the shutdown:
+/// the frame after this one finds nothing visible, ends, and lets the
+/// application's own destructors run. See [`application_delegate`].
+///
+/// # Safety
+///
+/// Called by the Objective-C runtime with an `NSApplication` as `application`.
+unsafe extern "C" fn should_terminate(
+    _self: Object,
+    _selector: Sel,
+    application: Object,
+) -> usize {
+    unsafe {
+        let windows: Object = send(application, sel(c"windows"));
+        let count: usize = send(windows, sel(c"count"));
+        for index in 0..count {
+            let window: Object = send1(windows, sel(c"objectAtIndex:"), index);
+            if !window.is_null() {
+                let _: () = send1(window, sel(c"close"), std::ptr::null_mut::<c_void>());
+            }
+        }
+    }
+    TERMINATE_CANCEL
 }
 
 /// Installs the one menu a window needs, so Command-Q works.

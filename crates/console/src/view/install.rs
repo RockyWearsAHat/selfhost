@@ -204,8 +204,8 @@ impl InstallForm {
 pub fn view(console: &Console) -> El<Console> {
     let form = console.form();
     let heading = match form.editing() {
-        Some(name) => format!("Edit {name}"),
-        None => "Add a service".to_owned(),
+        Some(name) => format!("EDIT {}", name.to_uppercase()),
+        None => "ADD A SERVICE".to_owned(),
     };
 
     style::plate((
@@ -327,7 +327,7 @@ fn arguments(form: &InstallForm) -> El<Console> {
         "ARGUMENTS",
         col((
             col(rows).gap(4.0),
-            button("+ Argument")
+            button("+  ARGUMENT")
                 .w(128.0)
                 .disabled(full)
                 .on_click(|console: &mut Console| console.form_mut().arguments.push(String::new())),
@@ -379,10 +379,10 @@ fn readback(form: &InstallForm) -> Option<El<Console>> {
 
 /// The Install and Cancel buttons.
 fn footer(form: &InstallForm) -> El<Console> {
-    let submit = if form.editing().is_some() { "Save" } else { "Install" };
+    let submit = if form.editing().is_some() { "SAVE" } else { "INSTALL" };
     row((
         spacer().grow(),
-        button("Cancel").w(96.0).on_click(|console: &mut Console| console.form_mut().close()),
+        button("CANCEL").w(96.0).on_click(|console: &mut Console| console.form_mut().close()),
         button(submit).primary().w(110.0).on_click(Console::submit_form),
     ))
     .gap(8.0)

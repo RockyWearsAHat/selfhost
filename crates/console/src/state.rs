@@ -38,6 +38,13 @@ pub enum Link {
     Connected,
     /// It stopped answering, and this is what went wrong.
     Lost(String),
+    /// There is no daemon to hear from: nothing is paired and nothing is open.
+    ///
+    /// Distinct from [`Link::Connecting`] because that is a claim — something is
+    /// being dialled — and on a console with no machine at all nothing is. It
+    /// was the first run's own lie: a fresh install reported `CONNECTING
+    /// 127.0.0.1:9191` for ever at an address nothing was reaching for.
+    Unpaired,
 }
 
 /// Where the SSH tunnel is, when the console is managing one.

@@ -905,6 +905,22 @@ page and hides a plate until the daemon reports something to put in it: a
 deployment with no `[[shares]]` and a caller who holds none both get a sentence,
 never an error, because absence is a state of the configuration and not a fault.
 
+**And one place above the four.** The native console is a client rather than a
+page served by the machine it is about, so it holds several machines; the list of
+them is reached from the masthead's `‹ MACHINES` and is deliberately *not* a
+fifth tab. A tab beside SERVICES would say that choosing which machine to look at
+is the same kind of act as choosing which of its readings to read, and it is not
+— the four screens all belong to one machine, and the overview is where you stand
+above it. The browser console has no equivalent and needs none: it is already
+opened at one machine's address, and that address is the gate.
+
+A row in that list draws **no lamp**. Only the machine that is open has a
+connection to report; saying anything about the others would mean probing every
+paired machine on every frame, or drawing a grey lamp that reads as *down* for a
+machine that is merely asleep. What a row states instead is what it *is* — the
+destination, the port, the key, the token path — and every one of those is a
+thing this project has got wrong at least once.
+
 ### FILES
 
 A file manager rather than a listing. One plate per share carrying its id, what

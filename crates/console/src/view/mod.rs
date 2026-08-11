@@ -60,36 +60,30 @@ mod detail;
 mod exposure;
 pub(crate) mod files;
 mod install;
+mod machines;
 mod people;
 mod style;
 
 use crate::channel::{Live, Session};
-use crate::client::Client;
+use crate::machines::{Machine, Machines};
 use crate::nas;
 use crate::remote::{self, ControlRefusal};
+use crate::session::{self, Bound, Connector, Credential, Link as MachineLink, Pairing, Place, Target};
 use crate::state::{Command, FileAction, Link, NoticeKind, Screen, Snapshot, Tunnel};
+use machines::PairForm;
 use files::FilesForm;
 use install::InstallForm;
 use rui::style::Justify;
 use rui::{
-    Align, App, Drag, El, Key, KeyStroke, Modifiers, Phase, Redraw, Role, Status, Tone, button,
-    caption, col, figure, heading, micro, paragraph, row, spacer, tabs, text, title,
+    Align, App, Drag, El, Key, KeyStroke, Modifiers, Phase, Point, Pointing, Redraw, Role, Status,
+    Tone, button, caption, col, figure, heading, micro, paragraph, row, spacer, tabs, text, title,
 };
 use selfhost_desk::wire::{Button, Message};
 use selfhost_supervisor::state::{ServiceState, ServiceStatus};
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
-
-/// How a console reaches its daemon, when it has been given one.
-///
-/// A function and not a [`Client`], for the reason [`crate::poller::Connect`] is
-/// one: the token the daemon wrote may not exist when the window opens, and a
-/// console launched from the Dock before its daemon has started must still show
-/// a window. Shared with the poller rather than duplicated, so there is one
-/// place a credential is read from disk.
-pub type Connector = Arc<dyn Fn() -> Result<Client, String> + Send + Sync>;
 
 /// The margin the whole window is inset by.
 ///
@@ -208,15 +202,38 @@ const IDLE_REDRAW: Duration = Duration::from_millis(500);
 
 /// The console.
 pub struct Console {
-    shared: Arc<Mutex<Snapshot>>,
-    running: Arc<AtomicBool>,
-    address: SocketAddr,
-    /// The server the tunnel reaches, when the console is managing one.
+    /// What the open machine's threads write into, and this window reads.
     ///
-    /// Shown beside the address so that a console pointed at loopback says which
-    /// machine that loopback port actually leads to — two consoles open on two
-    /// servers would otherwise both read `127.0.0.1:9191`.
-    via: Option<String>,
+    /// Replaced — not written through — when the operator changes machines: the
+    /// new link brings its own, and the old one's threads keep writing into a
+    /// snapshot nobody reads any more. See [`crate::session`].
+    shared: Arc<Mutex<Snapshot>>,
+    /// Which machine this window is showing, at what address, over what.
+    bound: Bound,
+    /// Where the operator is standing: on the machine, or above it.
+    place: Place,
+    /// Every machine paired on this computer, as the store last read.
+    machines: Machines,
+    /// Where that store lives, or `None` on an account with no home directory.
+    store: Option<PathBuf>,
+    /// The form on the overview that adds a machine.
+    pair_form: PairForm,
+    /// Where the console is talking and with what, behind the connector.
+    ///
+    /// `None` in a console that was never given a link — every frame test, and
+    /// every reference frame.
+    target: Option<Arc<Mutex<Target>>>,
+    /// The threads keeping the open machine's connection up.
+    link: Option<MachineLink>,
+    /// Links told to stop, kept until their threads have noticed.
+    ///
+    /// A switch does not wait for the old threads: one may be half-way through
+    /// a request that has yet to time out, and stalling the window on it would
+    /// make changing machines feel like the program had hung. They are held
+    /// rather than detached so that a window closing still joins them — a
+    /// detached tunnel thread whose `ssh` outlives the process is a forward left
+    /// open on somebody's machine.
+    retiring: Vec<MachineLink>,
     form: InstallForm,
     /// The one text field the FILES plate uses, and what it is for.
     files_form: FilesForm,
@@ -249,21 +266,34 @@ pub struct Console {
     /// delivers a modifier as an ordinary key event — see
     /// [`crate::remote::modifier_changes`], which is where the argument is.
     held: Modifiers,
+    /// The last pixel of the far screen this console aimed its pointer at.
+    ///
+    /// Kept so that a movement naming the pixel already under the far pointer
+    /// is not sent again — see [`Console::aim_far_pointer`]. It belongs to a
+    /// session and to one display within it, so it is cleared whenever either
+    /// changes: a remembered point from another screen would suppress the first
+    /// real movement on this one.
+    aimed: Option<(i32, i32)>,
 }
 
 impl Console {
-    /// A console showing the daemon at `address`, reached over `via` if tunnelled.
-    pub fn new(
-        shared: Arc<Mutex<Snapshot>>,
-        running: Arc<AtomicBool>,
-        address: SocketAddr,
-        via: Option<String>,
-    ) -> Self {
+    /// A console drawing `shared`, pointed at whatever `bound` describes.
+    ///
+    /// It has no link of its own: nothing is polled, no tunnel is opened, and
+    /// no daemon can be reached. That is what every frame test and every
+    /// reference frame is built with, which is why they can be drawn on a
+    /// machine with nothing running.
+    pub fn showing(shared: Arc<Mutex<Snapshot>>, bound: Bound) -> Self {
         Self {
             shared,
-            running,
-            address,
-            via,
+            bound,
+            place: Place::default(),
+            machines: Machines::default(),
+            store: None,
+            pair_form: PairForm::default(),
+            target: None,
+            link: None,
+            retiring: Vec::new(),
             form: InstallForm::default(),
             files_form: FilesForm::default(),
             connect: None,
@@ -272,27 +302,214 @@ impl Console {
             control_trouble: None,
             viewport_focus: false,
             held: Modifiers::default(),
+            aimed: None,
         }
     }
 
-    /// Gives this console the means to open a desktop session.
+    /// A console that knows what is paired on this computer, showing nothing yet.
     ///
-    /// Separate from [`Console::new`] so that everything else — every plate,
-    /// every reference frame, every layout test — is built without one and
-    /// cannot accidentally reach a daemon while a frame is being drawn.
-    pub fn reaching(mut self, connect: Connector) -> Self {
+    /// [`Console::open`] is what gives it a machine. Splitting the two is what
+    /// lets the window be built before anything connects — and it is the same
+    /// path a switch takes later, so the launch case cannot work while the
+    /// switch case rots.
+    pub fn paired(machines: Machines, store: Option<PathBuf>) -> Self {
+        let mut console = Self::showing(
+            Arc::new(Mutex::new(Snapshot::default())),
+            Bound::new(
+                "127.0.0.1:9191".parse().expect("the default address is valid"),
+                None,
+            ),
+        );
+        console.machines = machines;
+        console.store = store;
+        // Said once, because nothing else will ever say it: a console with no
+        // machine has no poller to report a link, so a snapshot left at its
+        // default would claim it was connecting to an address nothing is
+        // dialling. [`Console::open`] brings a fresh snapshot with it, so this
+        // survives exactly as long as it is true.
+        if console.machines.is_empty() {
+            console.with_snapshot(|snapshot| snapshot.link = crate::state::Link::Unpaired);
+        }
+        console
+    }
+
+    /// Opens a connection, closing whatever was open before it.
+    ///
+    /// The one path onto a machine, taken by the launch and by every switch
+    /// afterwards. The desktop session goes with the old machine — a ticket
+    /// names the machine it was minted for — and the new link's snapshot
+    /// replaces the old one wholesale, so nothing of the previous machine is
+    /// left on screen to be read as this one's.
+    pub fn open(&mut self, bound: Bound, target: Target, spec: Option<crate::tunnel::TunnelSpec>) {
+        self.retire_link();
+        let target = Arc::new(Mutex::new(target));
+        let connect = session::connector(&target);
+        let link = MachineLink::open(spec, Arc::clone(&connect));
+        self.shared = link.snapshot();
+        self.target = Some(target);
         self.connect = Some(connect);
-        self
+        self.link = Some(link);
+        if let Some(name) = bound.machine.clone() {
+            self.remember_opened(&name);
+        }
+        self.bound = bound;
+        self.place = Place::Machine;
+    }
+
+    /// Stops the open link without waiting for its threads.
+    ///
+    /// Finished ones are dropped on the way past, so the list holds only what is
+    /// still stopping and a long session does not accumulate handles.
+    fn retire_link(&mut self) {
+        self.close_session();
+        self.retiring.retain(|link| !link.finished());
+        if let Some(link) = self.link.take() {
+            link.closing();
+            self.retiring.push(link);
+        }
+    }
+
+    /// Every machine paired on this computer, for the overview to draw.
+    pub(crate) fn machines(&self) -> &Machines {
+        &self.machines
+    }
+
+    /// Which machine this window is on, at what address, over what.
+    pub(crate) fn bound(&self) -> &Bound {
+        &self.bound
+    }
+
+    /// Where the operator is standing.
+    pub(crate) fn place(&self) -> Place {
+        self.place
+    }
+
+    /// The pairing form, for the plate that draws it.
+    pub(crate) fn pair_form(&self) -> &PairForm {
+        &self.pair_form
+    }
+
+    /// The same, to be edited by whatever was just typed.
+    pub(crate) fn pair_form_mut(&mut self) -> &mut PairForm {
+        &mut self.pair_form
+    }
+
+    /// Steps back to the list of machines.
+    ///
+    /// The link is left up. Standing above a machine is not leaving it: the
+    /// poller keeps its snapshot current, so stepping back in finds the plates
+    /// as they would have been rather than as they were, and a desktop session
+    /// is not torn down by looking away from it for a moment.
+    pub(crate) fn show_overview(&mut self) {
+        // Read from disk rather than from memory, because the file is the truth:
+        // a pairing made from this window is written by whichever thread first
+        // proved the connection, and a machine paired by another console — or
+        // by the command line — belongs on this list too.
+        if let Some(path) = &self.store {
+            if let Ok(paired) = Machines::load(path) {
+                self.machines = paired;
+            }
+        }
+        self.place = Place::Overview;
+    }
+
+    /// Steps back onto the machine this window is bound to.
+    pub(crate) fn show_machine(&mut self) {
+        self.place = Place::Machine;
+    }
+
+    /// Opens a machine already paired here, closing whatever was open.
+    pub(crate) fn open_machine(&mut self, name: &str) {
+        let Some(machine) = self.machines.get(name).cloned() else {
+            self.with_snapshot(|snapshot| {
+                snapshot.report_problem(format!("{name:?} is no longer paired on this computer."))
+            });
+            return;
+        };
+        self.open_paired(&machine, None);
+    }
+
+    /// Opens a paired machine, optionally saving it once it answers.
+    fn open_paired(&mut self, machine: &Machine, pair: Option<Pairing>) {
+        let spec = machine.tunnel();
+        let target = Target::new(
+            spec.local_address(),
+            Credential::OverSsh {
+                spec: spec.clone(),
+                path: machine.remote_token.clone(),
+                pair,
+            },
+        );
+        self.open(Bound::of(machine), target, Some(spec));
+    }
+
+    /// Validates the pairing form and opens what it describes.
+    ///
+    /// **The store is not written here.** A pairing is a connection that has
+    /// worked at least once, and nothing at this point has proved that one does
+    /// — so the machine is opened carrying a note that saves it the moment a
+    /// token actually arrives from it, on whichever thread gets one. A machine
+    /// that never answers is therefore never written down, and the window says
+    /// why in the words `ssh` used.
+    pub(crate) fn submit_pair_form(&mut self) {
+        let machine = match self.pair_form.submit() {
+            Ok(machine) => machine,
+            Err(problems) => {
+                self.pair_form.trouble = problems;
+                return;
+            }
+        };
+        if self.store.is_none() {
+            self.pair_form.trouble =
+                vec!["this account has no home directory, so nothing can be paired".into()];
+            return;
+        }
+        let pairing =
+            self.store.clone().map(|store| Pairing { store, machine: machine.clone() });
+        self.pair_form.close();
+        self.open_paired(&machine, pairing);
+    }
+
+    /// Forgets a pairing, here and in the file.
+    ///
+    /// A machine that is open stays open — closing somebody's session because
+    /// they tidied the list would be a surprise, and the window still says what
+    /// it is connected to.
+    pub(crate) fn forget_machine(&mut self, name: &str) {
+        self.machines.forget(name);
+        let Some(path) = &self.store else { return };
+        if let Err(reason) = self.machines.save(path) {
+            self.with_snapshot(|snapshot| snapshot.report_problem(reason));
+        }
+    }
+
+    /// Records which machine is open, without letting that failure stop it.
+    ///
+    /// Best effort by design: the console is already connecting by the time this
+    /// runs, and refusing to show a working machine because a note could not be
+    /// written would trade the whole session for a preference.
+    fn remember_opened(&mut self, name: &str) {
+        let Some(path) = self.store.clone() else { return };
+        let Ok(mut paired) = Machines::load(&path) else { return };
+        paired.opened(name);
+        if let Err(reason) = paired.save(&path) {
+            eprintln!("selfhost-console: could not record which machine was open: {reason}");
+        }
     }
 
     /// Opens the window and runs until it is closed.
+    ///
+    /// There is no second way out and no flag saying so. The window closing —
+    /// by its own button, or by a Quit that `rui` turns into one — is what ends
+    /// the loop, and returning from here is what runs this console's own
+    /// destructor: the links are stopped and joined there, so nothing is left
+    /// holding a forwarded port. An `AtomicBool` shutting the application down
+    /// used to live here and was a predicate nothing ever cleared.
     pub fn run(self, title: String) -> Result<(), rui::Error> {
-        let running = Arc::clone(&self.running);
         let mut app = application(title, self)
             .size(980.0, 680.0)
             .min_size(560.0, 420.0)
-            .idle_timeout(IDLE_REDRAW)
-            .while_running(move |_| running.load(Ordering::Relaxed));
+            .idle_timeout(IDLE_REDRAW);
         // The handle exists only once there is a loop to ask for a frame, so it
         // is handed to the console here rather than at construction.
         let redraw = app.redraw();
@@ -549,6 +766,7 @@ impl Console {
     /// Closes whatever session is open, releasing the far machine's keys.
     pub(crate) fn close_session(&mut self) {
         self.release_far_keys();
+        self.aimed = None;
         // Dropping is what stops the thread: the flag is cleared and the read
         // deadline expires, so the daemon does not keep a place in its ceiling
         // for a viewer that has gone.
@@ -563,7 +781,12 @@ impl Console {
     }
 
     /// Watches a different display of the same machine.
-    pub(crate) fn watch_monitor(&self, monitor: u8) {
+    ///
+    /// The remembered aim goes with it: a pixel of the display just left names
+    /// a different place on this one, and holding it would swallow the first
+    /// movement made here.
+    pub(crate) fn watch_monitor(&mut self, monitor: u8) {
+        self.aimed = None;
         if let Some(session) = &self.session {
             session.watch(monitor);
         }
@@ -578,29 +801,69 @@ impl Console {
         }
     }
 
-    /// Sends one pointer press, drag or release to the far machine.
+    /// Puts the far machine's pointer where a position within the viewport
+    /// says, and answers whether this session is taking input at all.
     ///
-    /// # What this can and cannot carry
+    /// The one place a [`Message::PointerMove`] is sent, so the two handlers
+    /// that produce one — a hand moving over the picture, and a button being
+    /// dragged across it — cannot come to disagree about where the far pointer
+    /// is. The fraction is turned into a pixel of the *far* screen by
+    /// [`Picture::remote_point`], which is the only thing that knows how the
+    /// arriving frame was fitted into this pane.
     ///
-    /// A press, the movement while it is held, and the release. **A pointer
-    /// moving with no button down is not forwarded**, because `rui` reports
-    /// hover as a boolean and a position only during a drag — so the far
-    /// pointer follows a click and a drag exactly, and does not track a hand
-    /// moving over the picture. That is a real difference from the browser and
-    /// it is recorded as OPEN in `console-lab.dx` rather than papered over.
-    pub(crate) fn forward_pointer(&mut self, drag: Drag) {
+    /// Repeats are dropped. A pane a third the width of the screen it shows
+    /// maps three of this machine's pixels onto one of theirs, so a hand moving
+    /// slowly produces frame after frame naming the same far pixel — and every
+    /// one of them would be a message on a socket to say nothing changed. What
+    /// is remembered is the point actually sent, so the next different one is
+    /// sent whatever happened in between.
+    ///
+    /// [`Picture::remote_point`]: crate::channel::Picture::remote_point
+    fn aim_far_pointer(&mut self, fraction: Point) -> bool {
         let Some(session) = &self.session else {
-            return;
+            return false;
         };
         let live = session.live();
         if !desktop::forwards_keys(&live, self.viewport_focus) {
+            return false;
+        }
+        let Some(point) = session.picture().remote_point(fraction.x, fraction.y) else {
+            return false;
+        };
+        if self.aimed != Some(point) {
+            session.send(Message::PointerMove { monitor: live.monitor, x: point.0, y: point.1 });
+        }
+        self.aimed = Some(point);
+        true
+    }
+
+    /// Follows a hand moving over the picture, with nothing pressed.
+    ///
+    /// The far pointer tracks this one exactly as the browser's does. It is a
+    /// separate handler from [`Console::forward_pointer`] rather than a phase of
+    /// it because the two answer different questions: a drag is a *gesture*,
+    /// which continues wherever the pointer goes and so must be reported even
+    /// once it has left the picture, while this is simply where the pointer is
+    /// and stops at the edge of the pane — a hand moving off the viewport and
+    /// across this window's own controls is not still pointing at the far
+    /// machine.
+    pub(crate) fn point_at(&mut self, pointing: Pointing) {
+        self.aim_far_pointer(pointing.fraction());
+    }
+
+    /// Sends one pointer press, drag or release to the far machine.
+    ///
+    /// The press and the release are the whole of what this adds over
+    /// [`Console::point_at`]: the position under a held button travels the same
+    /// path every other position does, so a click lands where the picture says
+    /// it will.
+    pub(crate) fn forward_pointer(&mut self, drag: Drag) {
+        if !self.aim_far_pointer(drag.fraction()) {
             return;
         }
-        let fraction = drag.fraction();
-        let Some((x, y)) = session.picture().remote_point(fraction.x, fraction.y) else {
+        let Some(session) = &self.session else {
             return;
         };
-        session.send(Message::PointerMove { monitor: live.monitor, x, y });
         match drag.phase {
             Phase::Began => session.send(Message::Button { button: Button::Left, down: true }),
             Phase::Moved => {}
@@ -692,6 +955,17 @@ pub fn view(console: &Console) -> El<Console> {
     let snapshot = console.snapshot();
     let screen = snapshot.screen;
 
+    // Standing above the machines is a different place, not a fifth tab: the
+    // tab row belongs to a machine, so it is absent here along with everything
+    // under it. The masthead stays, because the link it reports is still up —
+    // looking away from a machine does not disconnect it.
+    if console.place == Place::Overview {
+        drop(snapshot);
+        return col((header(console, &console.snapshot()), machines::view(console)))
+            .pad(PAGE_PAD)
+            .gap(8.0);
+    }
+
     col((
         header(console, &snapshot),
         screens(screen),
@@ -779,19 +1053,31 @@ fn services(console: &Console, snapshot: &Snapshot) -> El<Console> {
 /// only that something is amber.
 fn header(console: &Console, snapshot: &Snapshot) -> El<Console> {
     let (status, label, detail) =
-        connection_summary(snapshot, console.address, console.via.as_deref());
+        connection_summary(snapshot, console.bound.address, console.bound.via.as_deref());
     let reaching =
         snapshot.link == Link::Connecting || matches!(snapshot.tunnel, Some(Tunnel::Opening));
 
     row((
         style::mark(),
-        title("SELFHOST").tracking(WORDMARK).align_self(Align::Center),
+        title("SELFHOST").tracking(WORDMARK).align_self(Align::Center).whole(),
         // The instrument's designation, in the voice a block label uses. A
         // wordmark alone names a product; a wordmark with what the instrument
         // *is* set quietly beside it names a machine's front panel, and the
         // masthead is the one strip in the window that is a panel rather than
         // a reading.
-        heading("SUPERVISOR CONSOLE").tracking(1.8).align_self(Align::Center),
+        //
+        // It is the strip's payer, and it is the right one: it is the only
+        // thing up here that reports nothing. When the window narrows past what
+        // the mark, the name, the step control and the link state need, this
+        // goes entirely rather than every one of them giving a syllable — a
+        // masthead reading `SELFHO… SUPERVISOR CONS… ‹ MACHI… CONNECT…` is four
+        // half-facts where there was room for three whole ones.
+        heading("SUPERVISOR CONSOLE").tracking(1.8).align_self(Align::Center).whole(),
+        // The one way between the two places, and the only control on the
+        // masthead. It sits with the nameplate rather than beside the link mark
+        // because it is about *which* machine, and the marks to its right are
+        // about how that machine is.
+        machines::step_control(console),
         style::rule(),
         style::link_mark(status, label.to_uppercase(), reaching),
         micro(detail).max_w(300.0).align_self(Align::Center),
@@ -827,8 +1113,14 @@ fn connection_summary(
                 Link::Connecting => (Status::Warn, "connecting"),
                 Link::Connected => (Status::Ok, "connected"),
                 Link::Lost(_) => (Status::Bad, "no daemon"),
+                // Idle and not Bad: a console with nothing paired is not
+                // broken, it is new. Empty is not the same fact as failed, and
+                // the plate below it says what to do rather than what went
+                // wrong.
+                Link::Unpaired => (Status::Idle, "no machine"),
             };
             let detail = match (&snapshot.link, via) {
+                (Link::Unpaired, _) => "nothing is paired on this computer yet".to_owned(),
                 (Link::Lost(reason), _) => reason.clone(),
                 (_, Some(destination)) => format!("{address} · ssh {destination}"),
                 (_, None) => address.to_string(),
@@ -1072,6 +1364,7 @@ fn condition(snapshot: &Snapshot) -> String {
     match &snapshot.link {
         Link::Connecting => return "Reaching the daemon".into(),
         Link::Lost(_) => return "The daemon is not answering".into(),
+        Link::Unpaired => return "No machine is paired".into(),
         Link::Connected => {}
     }
 
@@ -1197,7 +1490,7 @@ fn outstanding(service: &ServiceStatus) -> Option<(u8, u64, NextMove)> {
                 // attempt anyway, and what the operator is asking for is that it
                 // be made now instead of at the end of the delay. Restart is the
                 // one command the daemon accepts whatever the state.
-                ("Retry now", Command::Restart(service.name.clone())),
+                ("RETRY NOW", Command::Restart(service.name.clone())),
             ),
         )),
         ServiceState::GaveUp { attempts, reason } => Some((
@@ -1206,7 +1499,7 @@ fn outstanding(service: &ServiceStatus) -> Option<(u8, u64, NextMove)> {
             move_of(
                 format!("{name} gave up after {attempts} attempts"),
                 reason.clone(),
-                ("Start", Command::Start(service.name.clone())),
+                ("START", Command::Start(service.name.clone())),
             ),
         )),
         ServiceState::Unstartable { reason } => Some((
@@ -1220,7 +1513,7 @@ fn outstanding(service: &ServiceStatus) -> Option<(u8, u64, NextMove)> {
                 // changes the outcome: it is the thing to press *after* fixing
                 // it, and a console that hid it would leave the operator
                 // hunting the rail for a way to try again.
-                ("Start", Command::Start(service.name.clone())),
+                ("START", Command::Start(service.name.clone())),
             ),
         )),
         _ => None,
@@ -1555,6 +1848,28 @@ pub(crate) fn title_rule(label: String, tail: Option<El<Console>>) -> El<Console
     row((title(label).align_self(Align::Center), style::rule(), tail)).gap(10.0).h(24.0)
 }
 
+/// Closing the window stops every connection this console opened, and waits.
+///
+/// Waiting is right *here* and wrong during a switch. A command may be
+/// half-written on a socket, and dropping the process on top of one leaves the
+/// daemon reading a truncated request it then has to report as malformed; an
+/// `ssh` left forwarding is worse still, because nothing afterwards owns it.
+/// The links retired by earlier switches are joined too, which is why they were
+/// kept rather than detached.
+impl Drop for Console {
+    fn drop(&mut self) {
+        // The desktop stream first: it holds its own socket, and the daemon
+        // keeps a place in its viewer ceiling until the far end notices.
+        self.session = None;
+        if let Some(link) = self.link.take() {
+            link.shutdown();
+        }
+        for link in self.retiring.drain(..) {
+            link.shutdown();
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1591,11 +1906,9 @@ mod tests {
 
     /// A console showing `snapshot`, ready to be described or drawn.
     pub(crate) fn console(snapshot: Snapshot) -> Console {
-        Console::new(
+        Console::showing(
             Arc::new(Mutex::new(snapshot)),
-            Arc::new(AtomicBool::new(true)),
-            "127.0.0.1:9191".parse().expect("a valid address"),
-            None,
+            Bound::new("127.0.0.1:9191".parse().expect("a valid address"), None),
         )
     }
 
@@ -1849,7 +2162,7 @@ mod tests {
         let next = next_move(&populated()).expect("a machine with something outstanding");
         assert_eq!(next.headline, "backups retries in 40s");
         assert_eq!(next.detail, "attempt 3 · 1 more waiting");
-        assert_eq!(next.control.0, "Retry now");
+        assert_eq!(next.control.0, "RETRY NOW");
         assert_eq!(next.control.1, Command::Restart("backups".into()));
     }
 
@@ -1960,7 +2273,46 @@ mod tests {
             ("the desktop plate, narrow", watching(fleet(), still_session(true)), (560.0, 420.0)),
             ("the people plate", console(roster()), (980.0, 680.0)),
             ("the people plate, narrow", console(roster()), (560.0, 420.0)),
+            // The place above all of them, which is a place and not a fifth
+            // tab: the list of machines, and the form that adds one.
+            ("the machines overview", overview(), (980.0, 680.0)),
+            ("the machines overview, narrow", overview(), (560.0, 420.0)),
+            ("the machines overview with nothing paired", first_run(), (980.0, 680.0)),
         ]
+    }
+
+    /// A console standing above three paired machines, on one of them.
+    pub(crate) fn overview() -> Console {
+        let mut console = console(busy());
+        console.machines = paired();
+        console.bound = Bound::of(paired().get("alex-desktop").expect("paired"));
+        console.place = Place::Overview;
+        console
+    }
+
+    /// The first run: nothing paired, nothing open, and a form to fill in.
+    pub(crate) fn first_run() -> Console {
+        let mut console = console(Snapshot { link: Link::Unpaired, ..Snapshot::default() });
+        console.place = Place::Overview;
+        console
+    }
+
+    /// Three machines of the shape this project actually has.
+    fn paired() -> Machines {
+        let mut store = Machines::default();
+        let mut desktop = Machine::new("alex-desktop", "alex@192.168.1.8");
+        desktop.identity = Some(PathBuf::from("/Users/alex/.ssh/alexdesktop_ed25519"));
+        // The finding that cost a session: the daemon's project directory over
+        // there is not the login directory, so the token is not where the
+        // default says it is.
+        desktop.remote_token = "Self-Host/data/admin.token".into();
+        store.pair(desktop);
+        let mut pi = Machine::new("hallway-pi", "pi@192.168.1.20");
+        pi.ssh_port = Some(2222);
+        store.pair(pi);
+        store.pair(Machine::new("workshop", "rocky@10.0.0.4"));
+        store.opened("alex-desktop");
+        store
     }
 
     #[test]
@@ -1976,6 +2328,8 @@ mod tests {
             draw_frame(560, 420, console(snapshot));
         }
         draw_frame(560, 420, watching(fleet(), still_session(true)));
+        draw_frame(560, 420, overview());
+        draw_frame(560, 420, first_run());
     }
 
     #[test]
@@ -2154,6 +2508,152 @@ mod tests {
         harness.frame();
         assert!(harness.rect_of("WATCHING").is_some());
         assert!(harness.rect_of("DRIVING").is_none(), "a view is never drawn as control");
+    }
+
+    #[test]
+    fn a_hand_moving_over_the_picture_moves_the_far_machines_pointer() {
+        // The gap this closes, and it was a library gap: before
+        // `rui::El::on_pointer_move` a position reached this console only while
+        // a button was held, so the far pointer stood still until something was
+        // dragged. The browser console has always tracked; the two now agree.
+        let (session, sent) = recorded_session(true);
+        let mut harness =
+            Harness::with_app(application("selfhost", watching(fleet(), session))).size(980.0, 680.0);
+        harness.frame();
+        let screen = harness.find_key("screen").expect("the viewport is drawn").rect;
+
+        harness.move_pointer(rui::Point::new(screen.x + screen.w * 0.25, screen.y + screen.h * 0.5));
+        let first = sent.try_recv().expect("nothing was sent for a hand moving over the picture");
+        let Message::PointerMove { x, y, .. } = first else {
+            panic!("the far machine was told {first:?} rather than where to point");
+        };
+        assert!(x > 0 && y > 0, "a quarter of the way across the picture is not its corner");
+
+        // Moving again, far enough to land on a different pixel of the far
+        // screen, is a second message.
+        harness.move_pointer(rui::Point::new(screen.x + screen.w * 0.75, screen.y + screen.h * 0.5));
+        let second = sent.try_recv().expect("the second movement was not sent");
+        let Message::PointerMove { x: further, .. } = second else {
+            panic!("the far machine was told {second:?}");
+        };
+        assert!(further > x, "the far pointer went the way the hand did");
+    }
+
+    #[test]
+    fn a_movement_landing_on_the_pixel_the_far_pointer_is_already_on_is_not_sent_twice() {
+        // A pane a third the width of the screen it shows maps three of this
+        // machine's pixels onto one of theirs, so a hand moving slowly produces
+        // frame after frame naming the same far pixel. Every one of them would
+        // be a message saying nothing changed.
+        let (session, sent) = recorded_session(true);
+        let mut harness =
+            Harness::with_app(application("selfhost", watching(fleet(), session))).size(980.0, 680.0);
+        harness.frame();
+        let screen = harness.find_key("screen").expect("the viewport is drawn").rect;
+
+        let at = rui::Point::new(screen.x + screen.w * 0.5, screen.y + screen.h * 0.5);
+        harness.move_pointer(at);
+        assert!(matches!(sent.try_recv(), Ok(Message::PointerMove { .. })), "the first is sent");
+
+        // A movement of a fraction of a pixel of the far screen: a different
+        // place in this window, the same place over there.
+        harness.move_pointer(rui::Point::new(at.x + 0.01, at.y));
+        assert!(sent.try_recv().is_err(), "the far pointer was told to stay where it already was");
+    }
+
+    #[test]
+    fn a_watching_session_moves_nothing_when_the_pointer_crosses_the_picture() {
+        // Viewing and driving are separate capabilities and the daemon decides
+        // them; a pointer that moved the far machine's under a view-only ticket
+        // would be this console driving without one.
+        let (session, sent) = recorded_session(false);
+        let mut harness =
+            Harness::with_app(application("selfhost", watching(fleet(), session))).size(980.0, 680.0);
+        harness.frame();
+        let screen = harness.find_key("screen").expect("the viewport is drawn").rect;
+
+        harness.move_pointer(screen.center());
+        assert!(sent.try_recv().is_err(), "a watching session sent the far machine a pointer");
+    }
+
+    #[test]
+    fn the_masthead_steps_back_to_the_machines_and_forward_onto_the_open_one() {
+        // The one way between the two places. It is a step and not a tab: the
+        // tab row belongs to a machine, so it is not drawn at all up here.
+        let mut harness =
+            Harness::with_app(application("selfhost", console(busy()))).size(980.0, 680.0);
+        harness.frame();
+        assert!(harness.rect_of("SERVICES").is_some(), "the tabs belong to the machine");
+
+        harness.click_text("\u{2039} MACHINES");
+        assert_eq!(harness.state().place(), Place::Overview);
+        harness.frame();
+        assert!(harness.rect_of("SERVICES").is_none(), "the tab row followed the machine");
+        assert!(harness.rect_of("PAIR A MACHINE").is_some(), "and the overview is drawn");
+    }
+
+    #[test]
+    fn the_overview_lists_every_paired_machine_and_marks_the_open_one() {
+        let mut harness =
+            Harness::with_app(application("selfhost", overview())).size(980.0, 680.0);
+        harness.frame();
+        for name in ["alex-desktop", "hallway-pi", "workshop"] {
+            assert!(harness.rect_of(name).is_some(), "{name} is not on the list");
+        }
+        assert!(
+            harness.find_key("open alex-desktop").is_none(),
+            "the machine already open was offered an OPEN it does not need"
+        );
+        assert!(harness.find_key("open workshop").is_some(), "every other machine opens");
+        // The token path that is not the default is stated, because it is the
+        // one that bites: the daemon's project directory on ALEX-DESKTOP is not
+        // the login directory, and a pairing that does not say so cannot read a
+        // token at all.
+        let drawn = harness.text().join("\n");
+        assert!(drawn.contains("Self-Host/data/admin.token"), "{drawn}");
+        assert!(drawn.contains("alex@192.168.1.8"), "the address is stated too: {drawn}");
+    }
+
+    #[test]
+    fn a_console_with_nothing_paired_says_so_and_shows_the_form() {
+        // The first run, and the state a fresh install is in. An empty list is
+        // furnished rather than blank: empty is not broken.
+        let mut harness =
+            Harness::with_app(application("selfhost", first_run())).size(980.0, 680.0);
+        harness.frame();
+        assert!(harness.rect_of("No machine is paired on this computer yet.").is_some());
+        assert!(harness.find_key("pair-name").is_some(), "the form is what the place is for");
+    }
+
+    #[test]
+    fn forgetting_a_machine_takes_it_off_the_list() {
+        let mut console = overview();
+        assert_eq!(console.machines().entries().len(), 3);
+        console.forget_machine("workshop");
+        assert!(console.machines().get("workshop").is_none());
+        assert_eq!(console.machines().entries().len(), 2, "and nothing else went with it");
+    }
+
+    #[test]
+    fn opening_a_machine_that_is_no_longer_paired_says_so_rather_than_doing_nothing() {
+        // The race a second console makes possible: this one forgot the machine
+        // while that one was still showing it.
+        let mut console = overview();
+        console.open_machine("imaginary");
+        let snapshot = console.snapshot();
+        let notice = snapshot.notice.as_ref().expect("a notice");
+        assert!(notice.text.contains("imaginary"), "{}", notice.text);
+    }
+
+    #[test]
+    fn the_pairing_form_states_every_problem_at_once() {
+        // The refusal stays on the form, beside what is being typed, rather
+        // than becoming a notice at the top of a window nobody is looking at.
+        let mut console = first_run();
+        console.pair_form_mut().name = "Alex Desktop".into();
+        console.submit_pair_form();
+        assert!(!console.pair_form().trouble.is_empty());
+        assert_eq!(console.place(), Place::Overview, "a refused form does not navigate");
     }
 
     #[test]
@@ -2373,7 +2873,26 @@ mod tests {
     /// photographs is the blit a stream would have produced and not a
     /// hand-built buffer.
     pub(crate) fn still_session(control: bool) -> crate::channel::Session {
-        use crate::channel::{LinkState, Live, Picture, Session};
+        use crate::channel::{Picture, Session};
+        let (live, surface) = still_parts(control);
+        Session::still_life("alex-desktop", control, live, Picture::fitted(&surface, 1_400, 900))
+    }
+
+    /// The same session, keeping every message the console sends it.
+    ///
+    /// What proves a pointer or a key actually left this window, as against
+    /// merely being handled: the still life above drops its receiver.
+    pub(crate) fn recorded_session(
+        control: bool,
+    ) -> (crate::channel::Session, std::sync::mpsc::Receiver<selfhost_desk::wire::Message>) {
+        use crate::channel::{Picture, Session};
+        let (live, surface) = still_parts(control);
+        Session::recorded("alex-desktop", control, live, Picture::fitted(&surface, 1_400, 900))
+    }
+
+    /// What a still session is made of: a link that is up, and a screen.
+    fn still_parts(control: bool) -> (crate::channel::Live, selfhost_desk::tiles::Surface) {
+        use crate::channel::{LinkState, Live};
         use selfhost_desk::grant::Capabilities;
         use selfhost_desk::state::Notice;
         use selfhost_desk::wire::Monitor;
@@ -2410,7 +2929,7 @@ mod tests {
         live.frames = 1_284;
         live.bytes = 41_200_512;
 
-        Session::still_life("alex-desktop", control, live, Picture::fitted(&surface, 1_400, 900))
+        (live, surface)
     }
 
     /// A console reading the registry and the trail.
@@ -2631,6 +3150,28 @@ mod tests {
             written(name, roster(), |_| {}, size);
         }
 
+        // The place above the machine: the list, the form, and the first-run
+        // state of both, which is the very first thing a fresh install draws.
+        // It takes its console whole rather than through `written`, because
+        // what makes it the overview is the console and not the snapshot.
+        let mut place = |name: &str, console: Console, size: (u32, u32)| {
+            let mut app = application("selfhost", console);
+            for (scale, path) in [
+                (2.0, format!("{directory}/{name}.png")),
+                (1.0, format!("{directory}/web/{name}.png")),
+            ] {
+                let canvas = app.render(size.0, size.1, scale, Appearance::Dark, &mut fonts);
+                let pixels = rui::image::rgba(&canvas);
+                let png = rui::image::png(canvas.width(), canvas.height(), &pixels)
+                    .expect("a frame should encode");
+                std::fs::write(&path, png).expect("the directory should be writable");
+                println!("wrote {path}");
+            }
+        };
+        place("machines", overview(), (1000, 660));
+        place("machines-narrow", overview(), (560, 420));
+        place("machines-empty", first_run(), (1000, 660));
+
         // The viewport, which is the one screen whose drawing cannot be
         // photographed from a snapshot: it needs a session holding pixels. The
         // picture goes through the real fitting path and the real
@@ -2749,4 +3290,3 @@ mod tests {
         }
     }
 }
-

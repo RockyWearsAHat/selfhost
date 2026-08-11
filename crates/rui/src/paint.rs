@@ -27,7 +27,7 @@ use crate::canvas::{Canvas, Corner};
 use crate::color::Color;
 use crate::element::{El, Node};
 use crate::geom::{Insets, Point, Rect};
-use crate::input::{Drag, Input, Key, Phase, PointerButton};
+use crate::input::{Drag, Input, Key, Phase, Pointing, PointerButton};
 use crate::memory::{Caret, Id, Memory, Response};
 use crate::sdf::{Paint, Sculpt, Shape};
 use crate::style::{Align, Ink, Radius, Tone};
@@ -412,6 +412,19 @@ fn draw<'tree, S>(
             actions.push(Box::new(move |state| action(state, hovered)));
         }
     }
+    if let Some(action) = &el.on_pointer_move {
+        // Movement, not presence: the input says whether the pointer arrived
+        // somewhere new during this frame, so a frame drawn for an animation or
+        // for news from another thread runs nothing.
+        if response.hovered && frame.input.pointer_moved() {
+            let pointer = frame.input.pointer();
+            let pointing = Pointing {
+                at: Point::new(pointer.x - el.rect.x, pointer.y - el.rect.y),
+                rect: el.rect,
+            };
+            actions.push(Box::new(move |state| action(state, pointing)));
+        }
+    }
 
     if el.children.is_empty() {
         return;
@@ -449,7 +462,7 @@ fn interact<S>(el: &El<S>, frame: &mut Frame<'_>) -> Response {
     // inside; see [`Hit`].
     let hovered = input.pointer_inside() && frame.hit.target == Some(el.id);
 
-    if el.focusable {
+    if el.takes_focus() {
         frame.memory.offer_focus(el.id);
     }
     if hovered && input.pressed(PointerButton::Primary) {
@@ -574,7 +587,7 @@ fn decorate<S>(el: &El<S>, frame: &mut Frame<'_>, response: &Response, lit: f32)
     // clicked repeats the click back at the person. A field is the exception —
     // its caret earns the ring however focus arrived, and a well being typed
     // into should look held either way.
-    if response.focused && el.focusable && (el.is_field() || frame.memory.focus_visible()) {
+    if response.focused && el.takes_focus() && (el.is_field() || frame.memory.focus_visible()) {
         let ring = rect.expand(Insets::uniform(FOCUS_OFFSET));
         let color = Tone::Focus.resolve(theme);
         frame.canvas.stroke(ring, corner.grown(FOCUS_OFFSET), FOCUS_THICKNESS, color);

@@ -950,8 +950,20 @@ pub fn link_mark<S>(status: Status, label: String, reaching: bool) -> El<S> {
 }
 
 /// A mark and the word beside it, spaced and aligned the one way.
+///
+/// The word stands whole or is not drawn at all — the trade
+/// `view::service_row` makes for its own state word, made here because the
+/// lamp is right beside it: a verdict cut down the middle (`CONNECT…`) is a
+/// fact half-deleted on exactly the reading being looked at, and the mark
+/// already says the same thing in a hue and a fill. So when the strip runs
+/// short the honest options are the word entire or the lamp alone, and this
+/// offers exactly those two.
+///
+/// The one exception is argued at `view::ALARM_UNIT` and lives there: a red
+/// word is a summons, it never yields, and it is built from [`state_word`]
+/// directly rather than through this.
 fn marked<S>(head: El<S>, status: Status, label: String) -> El<S> {
-    row((head, state_word(status, label))).gap(6.0).align(Align::Center)
+    row((head, state_word(status, label).whole())).gap(6.0).align(Align::Center)
 }
 
 #[cfg(test)]

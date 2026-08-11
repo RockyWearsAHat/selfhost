@@ -158,7 +158,7 @@ pub use font::{Font, FontError};
 pub use geom::{Insets, Point, Rect, Size};
 pub use input::{
     Composition, Drag, Event, Input, Key, KeyCode, KeyPhase, KeyStroke, Modifiers, Phase,
-    PointerButton,
+    PointerButton, Pointing,
 };
 pub use memory::{FocusSource, Id, Memory, Response};
 pub use paint::{Painter, Visual};
