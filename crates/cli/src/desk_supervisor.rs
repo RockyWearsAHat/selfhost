@@ -1120,6 +1120,10 @@ impl AgentChannel for PipeChannel {
 /// after it. Nothing else is parsed, and no other kind is treated specially —
 /// the daemon-does-not-interpret rule survives, because this is a length-fixed
 /// read at a fixed offset rather than a decode.
+/// Called by the Windows channel, and by the test above on every platform, which
+/// is the point of it being a free function over bytes rather than a branch
+/// inside `PipeChannel::send`.
+#[cfg_attr(not(any(windows, test)), allow(dead_code))]
 fn link_frame(message: &[u8]) -> selfhost_screen::agent::LinkFrame {
     use selfhost_screen::agent::LinkFrame;
 
