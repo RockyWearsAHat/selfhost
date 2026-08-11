@@ -47,18 +47,28 @@
 //! count against the respawn budget and all of them are rendered as prose, because
 //! a machine at its login screen is a machine working correctly.
 //!
-//! # What this does not yet do, said plainly
+//! # How the agent's frames reach a viewer
 //!
-//! It supervises the agent; it does not yet carry the agent's **frames** into a
-//! console session. The daemon's session driver takes a
-//! [`FrameSource`](selfhost_desk::viewer::FrameSource) and this machine's own
-//! screen is one ([`crate::desk_local`]); the agent instead produces an encoded
-//! message stream, and joining the two is a splice — forwarding payloads the
-//! daemon never interprets, with credit carried end to end — which lives above
-//! this crate's seam. Until that exists a session-0 daemon reports, through
-//! [`crate::desk_local::Backend`], that it cannot reach the desktop *and why*,
-//! which is the honesty seam this subsystem is built around: a backend that
-//! cannot produce a pixel never claims it can.
+//! This module supervises the agent and pumps its pipe; it does not interpret
+//! what comes off it. A session attaches with [`CaptureAgent::attach`] and is
+//! handed the two ends of that pipe as channels — the agent's whole encoded
+//! messages coming out, and messages going in — and
+//! [`selfhost_desk::relay::Relay`] is the driver that carries them, applying
+//! this session's own deadline, capability re-check and kill switch to a byte
+//! stream it never decodes.
+//!
+//! Exactly one session attaches at a time, and that is a property of the agent
+//! rather than a limit chosen here: the agent holds a model of *the* client's
+//! surface and sends the difference against it, so a second viewer on one agent
+//! would be sent the difference against somebody else's picture. The refusal
+//! says so.
+//!
+//! Two things are deliberately *not* in this file. The relay never blocks this
+//! thread — a session that stops reading is detached, because this thread is
+//! also what keeps the supervisor's belief that the agent is alive true. And
+//! nothing here decides what a missing message means: a quiet pipe on a still
+//! desktop, a dead agent and an engaged kill switch are three different answers
+//! and [`crate::desk_task`] is where they are told apart.
 //!
 //! # `allow_input = false` cannot produce an injector by this route
 //!

@@ -127,6 +127,21 @@ Everything in this list was done by running it, not by testing it:
   including over a managed `ssh -L` tunnel whose refused key was reported as
   *tunnel down · the server refused the key · `ssh-add`* rather than as a missing
   daemon.
+- **The console holds several machines** (2026-08-10). Machines are paired once
+  and kept in the platform's state directory, a launch with no arguments — which
+  is what the Dock produces — opens the one used last, and the masthead's
+  `‹ MACHINES` steps back to a list where one is opened, forgotten or added
+  *without restarting the window*. `crates/console/src/session.rs` is where a
+  connection lives: each `Link` owns its two threads **and the snapshot they
+  write into**, so a poller finishing a request from the machine just left
+  cannot put its services under this one's name. Three defects went with it, all
+  of them things that looked like the program being broken: a Dock launch whose
+  machine was asleep exited before drawing any window at all; a console never
+  recovered from a daemon restart, because the token was read once and the
+  daemon writes a new one every time it starts — which the self-updater makes it
+  do on every push; and a fresh install reported `CONNECTING 127.0.0.1:9191` for
+  ever at an address nothing was dialling. `console-lab.dx` has the frames and
+  the ledger.
 
 ### 3.2 The two new subsystems, and exactly how far they got
 
@@ -139,19 +154,37 @@ proxy on 80/443.
 **Remote desktop** (`desktop-lab.dx` is the document; `docs/SECURITY.md` §3.7
 SCR-01…03 is the specification). The protocol, the capture and injection layers,
 the ticket mint, the freshness rule, the per-message capability re-check, the
-audit trail, the kill switch and both consoles' plates are written and tested. On
-this Mac the whole recovery path is exercised without a display by feeding
-observations to a state machine. **What is not done:** the agent's frames do not
-reach a viewer on a session-0 Windows service — the *splice* between the agent's
-message stream and the daemon's `FrameSource` seam is unwritten, and until it
-exists a session-0 daemon supervises a live agent and tells the console it cannot
-reach the desktop, with the reason. A Windows daemon started from a signed-in
-session captures directly and that path is served in full. **And one thing that
-reads stronger than it is:** the daemon drives sessions with `TicketStanding`
-(`crates/cli/src/desk_task.rs`), which reports the standing the *ticket*
-established, so a mid-stream revocation ends the stream at its ceiling rather
-than at the next keystroke. The real directory (`Api::standings`) exists and is
-not wired. Three lines in `crates/cli`, no interface change.
+audit trail, the kill switch and both consoles' plates are written and tested.
+
+**It works, and that was proved by running it (2026-08-11).** A loopback daemon
+with `[desktop] enabled = true` answered `101` on
+`/api/desktop/session?peer=self` against a redeemed `desktop.view` ticket and
+sent 29 frames, 2,036 tiles and 22.5 MB of this Mac's 3024×1964 panel in four
+seconds; the native console then opened the same session from its DESKTOP plate
+and drew it. Before that, no pixel from this subsystem had ever been on a
+socket. Note the one thing that catches a caller out: the WebSocket upgrade
+needs **both** the ticket in `Sec-WebSocket-Protocol` *and* an ordinary
+credential on the request — a browser carries the cookie, and anything else must
+send its `Authorization` header, or the handshake is the same uninformative
+`401` as an unauthenticated caller gets.
+
+**The session-0 half is now written and has still never run.** A Windows daemon
+installed as a service is `SYSTEM` in session 0 and cannot capture the console
+user's desktop by any method — checked on the box, not assumed:
+`Get-Process selfhost | Select SI` answers `0` for both processes there. The
+agent produces an encoded message stream rather than pixels, so
+`crates/desk/src/relay.rs` is a second driver that forwards it byte for byte
+under this session's own deadline, capability re-check and kill switch, reading
+one byte of each message to decide direction and decoding nothing. One agent
+serves one session and a second is refused, because the agent diffs against
+*the* client's surface. Nine tests cover it against a scripted agent; the pipe
+under it is Windows-only and unrun.
+
+**And one thing that reads stronger than it is:** the daemon drives sessions with
+`TicketStanding` (`crates/cli/src/desk_task.rs`), which reports the standing the
+*ticket* established, so a mid-stream revocation ends the stream at its ceiling
+rather than at the next keystroke. The real directory (`Api::standings`) exists
+and is not wired. Three lines in `crates/cli`, no interface change.
 
 **Network storage** (`nas-lab.dx`; `docs/SECURITY.md` §3.7 NAS-01…03). Shares,
 the confining resolver, the descriptor walk, quotas, the JSON API and its bulk
@@ -166,9 +199,12 @@ the DNS-SD records; `storage smb apply` has deliberately never been run; and
 `/dav` has **no configuration switch**, so it is live wherever a console password
 and a `[[shares]]` block coexist.
 
-**The peer mesh** is dialled but not answered: `crates/mesh/src/accept.rs` exists
-and the owner has **no `/api/mesh/link` route**, so a worker's dial lands on a
-404 and the registry records the reason. The dialler also verifies the owner's
+**The peer mesh** is dialled and now answered but not yet spliced:
+`crates/admin/src/mesh_api.rs` answers `GET /api/mesh/link` and admits or
+refuses a dial on its merits (`crates/mesh/src/accept.rs`) — the route is no
+longer a 404. What's still missing is `crates/mesh/src/splice.rs`: written and
+tested, but nothing outside `crates/mesh` calls it, so an admitted link
+carries no traffic anywhere yet. The dialler also verifies the owner's
 certificate against the bundled Mozilla roots with no accept-any path, so an
 owner on `acme = "self-signed"` cannot be dialled at all.
 
@@ -199,8 +235,9 @@ Be exact about this, because everything above is macOS.
   mapped at all, so desktop keystroke forwarding from a Linux console does
   nothing — an X11 keycode is an index into a per-server keymap with no fixed
   meaning.
-- **No desktop stream has ever crossed a real socket** to a real agent, in either
-  console.
+- **No desktop stream has ever crossed a real socket to a real *agent*.** One has
+  now crossed a real socket to a real *screen* — see §3.2 — but that was this
+  Mac capturing itself. Nothing has yet read a frame off a named pipe.
 - **The SMB backends for Windows and Linux** — the `SmbShare` cmdlets, the
   `icacls` forms, `testparm -s`, `smbcontrol all reload-config` — are written
   from documentation and have met no host. macOS is the opposite: flags read off
@@ -302,8 +339,9 @@ later step assumes them.
 5. **Confirm the secure desktop is never captured.** A UAC consent dialog or the
    login window must produce a *named state* in the console, not pixels.
 6. **Only then, the picture.** A Windows daemon started from a signed-in session
-   is the path that is served in full — try that before the service, because it
-   isolates a capture problem from the session-0 splice that is still unwritten.
+   is the path proved on this Mac, one capture away from identical — try that
+   before the service, because it isolates a capture problem from the relay,
+   which is written but has never met a real agent.
 7. **The audit trail.** `wc -l data/audit.log` grows by exactly one line per
    control action; typed text is a unit count and is never quoted. Nothing
    rotates this file — a long drive session is one line per keystroke.
