@@ -302,11 +302,20 @@ impl AgentPipe {
     /// Called when the agent dies or the session moves. Without it the pipe stays
     /// in a connected state and the replacement agent's `CreateFileW` fails with
     /// a busy pipe, which looks exactly like a squatter.
+    ///
+    /// # Unconditional, and that is the point
+    ///
+    /// It used to disconnect only when *this end* believed a client was
+    /// attached, which is a different fact from whether the kernel has one
+    /// attached — and the two come apart exactly when an accept is cancelled
+    /// after the kernel completed it. This pipe has **one** instance by
+    /// construction, so an instance nobody disconnects is a session that can
+    /// never be served again by any agent, for the life of the daemon.
+    /// `DisconnectNamedPipe` on a listening instance is harmless, so the safe
+    /// belief is no belief: ask the kernel every time.
     pub fn disconnect(&mut self) {
-        if self.connected {
-            unsafe { sys::DisconnectNamedPipe(self.handle.raw()) };
-            self.connected = false;
-        }
+        unsafe { sys::DisconnectNamedPipe(self.handle.raw()) };
+        self.connected = false;
     }
 
     /// An `OVERLAPPED` pointing at this pipe's own event.
@@ -341,7 +350,7 @@ impl AgentPipe {
                 let mut transferred: u32 = 0;
                 // `wait = TRUE`: this returns once the kernel has finished with
                 // the structure, which is the whole point of cancelling.
-                unsafe {
+                let completed = unsafe {
                     sys::GetOverlappedResult(
                         self.handle.raw(),
                         overlapped,
@@ -349,7 +358,18 @@ impl AgentPipe {
                         1,
                     )
                 };
-                Ok(false)
+                // **A cancellation that lost the race is a completion.** The
+                // wait timed out and the cancel was issued, but a client can
+                // connect in between, and then the kernel has already accepted
+                // it: `GetOverlappedResult` succeeds and the pipe instance is
+                // *connected* whatever this function returns. Reporting that as
+                // a timeout was the defect — the caller left `connected` false,
+                // so nothing ever disconnected the instance, the one instance
+                // this pipe has stayed occupied for ever, and every later agent
+                // met `ERROR_SEM_TIMEOUT` and exited. Observed on ALEX-DESKTOP as
+                // nine consecutive agents failing against a pipe that was
+                // present and permitted the whole time.
+                Ok(completed != 0)
             }
             _ => Err(Fault::last_os_error("WaitForSingleObject").noting(call)),
         }
@@ -715,10 +735,13 @@ impl DaemonLink {
                 let mut transferred: u32 = 0;
                 // `wait = TRUE`: returns once the kernel has finished with the
                 // structure, which is the whole point of cancelling.
-                unsafe {
+                let completed = unsafe {
                     sys::GetOverlappedResult(self.handle.raw(), overlapped, &mut transferred, 1)
                 };
-                Ok(false)
+                // A cancellation that lost the race is a completion; see the
+                // server side's copy of this function for the failure that
+                // taught us so.
+                Ok(completed != 0)
             }
             _ => Err(Fault::last_os_error("WaitForSingleObject")),
         }
