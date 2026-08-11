@@ -92,6 +92,26 @@ use crate::wire::{kind, Direction, Hello, Message, Monitor, Refusal, MAX_MONITOR
 /// a rounding error against the frames it is pacing.
 const CREDIT_BATCH: u64 = 64 * 1024;
 
+/// The window this end opens the conversation with.
+///
+/// # A refund cannot start a stream, and this is what that cost
+///
+/// The agent begins life with a window of its own and spends it on whatever it
+/// can see, whether or not anybody is watching — it has no idea a viewer exists.
+/// By the time the first session attaches, that window is gone, and a relay that
+/// only ever *refunds* what it forwards has nothing to refund: no bytes arrive,
+/// so no credit is returned, so no bytes arrive. On ALEX-DESKTOP that deadlock
+/// looked like a session that opened cleanly, announced a 2560x1440 display, and
+/// then sent twenty-eight bytes in six seconds.
+///
+/// So a session *opens* a window as well as refunding one, and this is not
+/// credit invented in the middle: it is the console socket's own initial
+/// headroom, the same [`DEFAULT_SEND_WINDOW`] the capture path's driver is
+/// bounded by, granted to the one producer now writing into it.
+///
+/// [`DEFAULT_SEND_WINDOW`]: crate::viewer::DEFAULT_SEND_WINDOW
+const OPENING_WINDOW: u32 = crate::viewer::DEFAULT_SEND_WINDOW;
+
 /// Where an agent's already-encoded messages come from, and where input goes.
 ///
 /// The seam between this crate and the process that owns the pipe. Async in
@@ -230,6 +250,9 @@ impl<'a> Relay<'a> {
         if let Err(ending) = self.greet(live, deadline).await {
             return self.finish(ending).await;
         }
+        if let Err(ending) = self.open_upstream(deadline).await {
+            return self.finish(ending).await;
+        }
 
         let mut next_revalidate = started + self.ceilings.revalidate_every;
         let mut next_pump = started;
@@ -306,6 +329,39 @@ impl<'a> Relay<'a> {
         });
         let bytes = encode(&hello)?;
         self.write(&bytes, deadline).await
+    }
+
+    /// Opens the conversation with the agent: a full picture, and a window to
+    /// send it in.
+    ///
+    /// Both halves are needed and neither is optional.
+    ///
+    /// **A full frame**, because the agent holds a model of the surface *a*
+    /// client is displaying and sends the difference against it — and this client
+    /// has never displayed anything. Without it the first thing this console
+    /// receives is the difference against somebody else's screen, which is a
+    /// picture of nothing.
+    ///
+    /// **A window**, because the agent spends its opening credit long before a
+    /// viewer arrives, and a relay that only refunds what it forwards can never
+    /// start: nothing arrives, so nothing is refunded, so nothing arrives. See
+    /// [`OPENING_WINDOW`].
+    ///
+    /// Refusals are not fatal here. An agent that has just died refuses
+    /// everything, and what a dead agent means is the state machine's to decide
+    /// on the next turn, not this function's.
+    async fn open_upstream(&mut self, deadline: tokio::time::Instant) -> Result<(), Ending> {
+        let opening = [
+            Message::Credit { bytes: OPENING_WINDOW },
+            Message::RequestFullFrame { monitor: 0 },
+        ];
+        for message in &opening {
+            match timeout_at(deadline, self.upstream.deliver(message)).await {
+                Err(_elapsed) => return Err(Ending::Deadline),
+                Ok(_) => {}
+            }
+        }
+        Ok(())
     }
 
     /// Re-reads the session's standing and reports what may still be done.
@@ -897,6 +953,14 @@ mod tests {
             .filter(|frame| frame.first() == Some(&kind::INPUT_REFUSED))
             .count();
         assert_eq!(refusals, 1, "the console is told why");
+        assert!(
+            handed
+                .lock()
+                .expect("not poisoned")
+                .iter()
+                .any(|message| matches!(message, Message::RequestFullFrame { .. })),
+            "and the stream still opened by asking for a whole picture"
+        );
         let keys = handed
             .lock()
             .expect("not poisoned")
@@ -1029,8 +1093,12 @@ mod tests {
                 _ => None,
             })
             .collect();
-        assert_eq!(grants.len(), 1, "one batch, once the batch was full");
-        assert!(grants[0] >= CREDIT_BATCH as u32, "and it returns what was written: {grants:?}");
+        // The first is the window this end opened the conversation with; the
+        // second is the refund, and only the refund is what this test is about.
+        assert_eq!(grants.first(), Some(&OPENING_WINDOW), "the opening window comes first");
+        let refunds = &grants[1..];
+        assert_eq!(refunds.len(), 1, "one batch, once the batch was full: {grants:?}");
+        assert!(refunds[0] >= CREDIT_BATCH as u32, "and it returns what was written: {grants:?}");
     }
 
     /// A console's own credit grant is not passed on.
@@ -1056,12 +1124,17 @@ mod tests {
         );
         let _ = relay.run(&mut FakeConsole::sends(vec![grant])).await;
 
-        let forwarded = handed
+        let grants: Vec<u32> = handed
             .lock()
             .expect("not poisoned")
             .iter()
-            .filter(|message| matches!(message, Message::Credit { .. }))
-            .count();
-        assert_eq!(forwarded, 0, "the console's claim never reaches the agent");
+            .filter_map(|message| match message {
+                Message::Credit { bytes } => Some(*bytes),
+                _ => None,
+            })
+            .collect();
+        // The opening window, and nothing else: the console claimed a megabyte
+        // and not one byte of that claim reached the agent.
+        assert_eq!(grants, vec![OPENING_WINDOW], "only this end's own window: {grants:?}");
     }
 }
