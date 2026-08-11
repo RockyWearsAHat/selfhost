@@ -162,7 +162,7 @@ pub const DEFAULT_SEND_WINDOW: u32 = 256 * 1024;
 /// would make the frame arm of the loop permanently ready, which starves the
 /// deadline and the input arms and pins a core. One millisecond is far below any
 /// frame interval and is therefore invisible in every legitimate configuration.
-const MIN_TICK: Duration = Duration::from_millis(1);
+pub(crate) const MIN_TICK: Duration = Duration::from_millis(1);
 
 /// A boxed future returned by one of the impure seams.
 ///
@@ -1765,7 +1765,7 @@ impl<'a> Viewer<'a> {
 /// clock. Under a paused test clock a real `Instant::now` would sit still while
 /// the deadline advanced, and the two would disagree about what "now" means —
 /// which is exactly the class of bug these tests exist to catch.
-fn moment() -> Instant {
+pub(crate) fn moment() -> Instant {
     tokio::time::Instant::now().into_std()
 }
 
@@ -1774,7 +1774,7 @@ fn moment() -> Instant {
 /// A failure here is a bug on this side rather than anything a peer did, so it
 /// ends the stream loudly instead of being dropped: silently omitting a tile
 /// leaves the client displaying pixels that are no longer there.
-fn encode(message: &Message) -> Result<Vec<u8>, Ending> {
+pub(crate) fn encode(message: &Message) -> Result<Vec<u8>, Ending> {
     message.encode().map_err(Ending::Encoding)
 }
 
@@ -1782,7 +1782,7 @@ fn encode(message: &Message) -> Result<Vec<u8>, Ending> {
 ///
 /// Empty for the phases whose notice already says everything. The console
 /// renders the notice code; this is only ever prose.
-fn notice_detail(phase: Phase) -> String {
+pub(crate) fn notice_detail(phase: Phase) -> String {
     match phase {
         Phase::Recovering { attempt } => format!("rebuild attempt {attempt}"),
         Phase::GaveUp(Surrender::TooManyReinitialisations) => "the screen source kept failing".into(),

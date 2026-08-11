@@ -80,6 +80,7 @@
 //! 80/443.
 
 use selfhost_desk::state::Notice;
+use selfhost_desk::wire::Monitor;
 use selfhost_screen::agent::InputPolicy;
 use selfhost_screen::supervisor::Limits;
 // The supervisor and its fault type are the driver's, and the driver is compiled
@@ -181,11 +182,101 @@ pub struct CaptureAgent {
     input: InputPolicy,
 }
 
-/// Everything the supervision thread and the daemon both touch.
+/// How many of the agent's messages may wait for the session that is relaying
+/// them.
+///
+/// Deep enough that one keyframe — about fifteen hundred tiles for a Retina
+/// panel — does not stall the pipe reader mid-frame, and no deeper: the queue is
+/// not the flow control. That is [`selfhost_desk::relay`]'s credit, which the
+/// agent honours by dropping and merging whole frames rather than by letting a
+/// backlog build here. A queue that could hold *two* keyframes would be a queue
+/// that can show the operator a picture two frames old, which is the outcome the
+/// whole drop-and-merge design exists to prevent.
+const RELAY_DEPTH: usize = 2048;
+
+/// How many input messages may wait for the pipe.
+///
+/// Small, and small on purpose: input is keystrokes and pointer samples, both
+/// worthless late. A deep queue here would deliver a burst of clicks to a
+/// desktop that has moved on. The one thing that must never be dropped is a key
+/// *release*, and the relay's close path sends
+/// [`selfhost_desk::wire::Message::ReleaseAll`] rather than replaying a queue,
+/// so a full queue cannot leave a modifier held.
+const INPUT_DEPTH: usize = 64;
+
+/// The two ends of one relayed session, as the supervision thread holds them.
+///
+/// Exactly one exists at a time — see [`CaptureAgent::attach`] — because the
+/// agent holds a model of *the* client's surface and diffs against it. Two
+/// sessions sharing one agent would each be sent the difference against the
+/// other's picture.
+//
+// Read by the supervision loop, which only Windows has. The type is not gated,
+// because [`AgentStream`] and [`CaptureAgent::attach`] are the seam a session
+// driver is written and tested against on any platform, and a slot that existed
+// only on Windows would make that seam untestable on the machine it is developed
+// on.
+#[cfg_attr(not(any(windows, test)), allow(dead_code))]
 #[derive(Debug)]
-struct Shared {
+struct Attachment {
+    /// The agent's messages, on their way to the console.
+    frames: tokio::sync::mpsc::Sender<Vec<u8>>,
+    /// Messages on their way to the agent, drained by the supervision thread.
+    input: tokio::sync::mpsc::Receiver<Vec<u8>>,
+}
+
+/// One relayed session's handle on the agent.
+///
+/// Held by the session driver; dropping it detaches, which is what frees the
+/// agent for the next session. The [`selfhost_desk::relay::Upstream`]
+/// implementation over it lives in [`crate::desk_task`], because what a missing
+/// message *means* — a still desktop, a dead agent, an engaged kill switch — is
+/// the daemon's knowledge and not this module's.
+#[derive(Debug)]
+pub struct AgentStream {
+    /// The agent's messages, whole and unparsed.
+    pub frames: tokio::sync::mpsc::Receiver<Vec<u8>>,
+    /// Where an input message goes.
+    pub input: tokio::sync::mpsc::Sender<Vec<u8>>,
+    /// Released on drop, so the next session can attach.
+    held: Arc<Shared>,
+}
+
+impl Drop for AgentStream {
+    fn drop(&mut self) {
+        detach(&self.held);
+    }
+}
+
+/// Clears the attachment slot.
+///
+/// A free function rather than a method on [`Shared`] so that [`AgentStream`]'s
+/// `Drop` and the supervision thread's own give-up path are visibly the same
+/// act.
+fn detach(shared: &Arc<Shared>) {
+    match shared.attached.lock() {
+        Ok(mut held) => *held = None,
+        Err(poisoned) => *poisoned.into_inner() = None,
+    }
+}
+
+/// Everything the supervision thread and the daemon both touch.
+///
+/// `pub(crate)` only because the driver's constructor takes one and the driver is
+/// `pub(crate)` for its tests; nothing outside this module builds or reads it.
+#[derive(Debug)]
+pub(crate) struct Shared {
     /// The published status, replaced whole on every turn.
     status: Mutex<AgentStatus>,
+    /// The displays the agent named in its `Hello`.
+    ///
+    /// Kept whole rather than counted, because a relayed session advertises this
+    /// list to the console verbatim: the ids in it are the ids the agent's own
+    /// frames and the console's pointer coordinates are expressed in, and a
+    /// count cannot carry them.
+    displays: Mutex<Vec<Monitor>>,
+    /// The one relayed session, when a session has attached.
+        attached: Mutex<Option<Attachment>>,
     /// Whether the operator's kill switch is in place, as the daemon last read
     /// it. A flag rather than a second filesystem check, so the streams and the
     /// agent can never hold different beliefs about a switch that exists
@@ -221,6 +312,14 @@ impl Shared {
         match self.status.lock() {
             Ok(mut held) => *held = status,
             Err(poisoned) => *poisoned.into_inner() = status,
+        }
+    }
+
+    /// The displays the agent last named.
+    fn displays(&self) -> Vec<Monitor> {
+        match self.displays.lock() {
+            Ok(held) => held.clone(),
+            Err(poisoned) => poisoned.into_inner().clone(),
         }
     }
 }
@@ -259,6 +358,38 @@ impl CaptureAgent {
     /// Tells the supervisor whether the operator's kill switch is in place.
     pub fn set_kill_switch(&self, present: bool) {
         self.shared.kill_switch.store(present, Ordering::Relaxed);
+    }
+
+    /// The displays the agent named in its `Hello`, empty until it has spoken.
+    pub fn displays(&self) -> Vec<Monitor> {
+        self.shared.displays()
+    }
+
+    /// Attaches one session to the agent's message stream, or refuses.
+    ///
+    /// `None` means **another session already holds it**, and it is a refusal
+    /// rather than a queue for a reason that is not a limitation: the agent holds
+    /// a model of the client's surface and sends the difference against it. Two
+    /// sessions on one agent would each be sent the difference against the
+    /// other's picture, so the second viewer would see a shredded desktop rather
+    /// than a slow one. A machine two people must watch at once needs one capture
+    /// broadcast to both, which is a change above this seam.
+    ///
+    /// Dropping the returned [`AgentStream`] frees the agent for the next
+    /// session.
+        pub fn attach(&self) -> Option<AgentStream> {
+        let (to_console, frames) = tokio::sync::mpsc::channel(RELAY_DEPTH);
+        let (input, from_console) = tokio::sync::mpsc::channel(INPUT_DEPTH);
+        let mut held = match self.shared.attached.lock() {
+            Ok(held) => held,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if held.is_some() {
+            return None;
+        }
+        *held = Some(Attachment { frames: to_console, input: from_console });
+        drop(held);
+        Some(AgentStream { frames, input, held: Arc::clone(&self.shared) })
     }
 
     /// Records that the operator asked for a fresh start.
@@ -313,6 +444,18 @@ pub(crate) trait AgentChannel {
     /// arrived inside this turn's short wait. It never means the agent is gone —
     /// only the supervisor knows that, because only it holds the process handle.
     fn pump(&mut self) -> Result<Option<Vec<u8>>, Fault>;
+
+    /// Hands one already-encoded protocol message to the agent.
+    ///
+    /// The framing is the channel's, which is why this takes a message and not a
+    /// frame: the relay above is forbidden to know how the pipe delimits things,
+    /// and this is where that boundary is drawn.
+    ///
+    /// A channel with no agent on it answers `Ok(())` and drops the message. That
+    /// is not swallowing an error — an input event for an agent that has just
+    /// died is an event with nowhere to go, and the state machine, which holds
+    /// the process handle, is the thing that decides what a dead agent means.
+    fn send(&mut self, message: &[u8]) -> Result<(), Fault>;
 }
 
 /// The supervision loop's state, with the platform behind two traits.
@@ -320,6 +463,8 @@ pub(crate) trait AgentChannel {
 pub(crate) struct Supervised<H: selfhost_screen::AgentHost, C: AgentChannel> {
     agent: Agent<H>,
     channel: C,
+    /// The cell the daemon reads status from and a session attaches through.
+    shared: Arc<Shared>,
     /// The phase the last turn ended in, so the channel can be readied *before*
     /// the tick that spawns rather than a turn behind it.
     phase: selfhost_screen::AgentPhase,
@@ -353,10 +498,11 @@ pub(crate) struct Orders {
 #[cfg(any(windows, test))]
 impl<H: selfhost_screen::AgentHost, C: AgentChannel> Supervised<H, C> {
     /// A loop that has observed nothing yet.
-    pub(crate) fn new(agent: Agent<H>, channel: C) -> Self {
+    pub(crate) fn new(agent: Agent<H>, channel: C, shared: Arc<Shared>) -> Self {
         Self {
             agent,
             channel,
+            shared,
             phase: selfhost_screen::AgentPhase::Waiting(
                 selfhost_screen::ConsoleSession::Attaching,
             ),
@@ -396,8 +542,60 @@ impl<H: selfhost_screen::AgentHost, C: AgentChannel> Supervised<H, C> {
         self.phase = phase;
         self.ready_channel();
 
+        self.forward_input();
         self.listen(now);
+        // An agent that is no longer running cannot serve the session that was
+        // relaying it. Detaching here rather than waiting for the session to
+        // notice is what lets the *next* session attach as soon as a replacement
+        // agent is up, instead of finding the slot held by a stream that is
+        // already ending.
+        if !self.connected {
+            detach(&self.shared);
+        }
         self.status(now)
+    }
+
+    /// Writes whatever the attached session has queued for the agent.
+    ///
+    /// Non-blocking, and bounded by what is already in the queue: this runs on
+    /// the supervision thread, between a spawn decision and a pipe read, and a
+    /// blocking drain here would delay both.
+    fn forward_input(&mut self) {
+        loop {
+            let next = {
+                let mut held = match self.shared.attached.lock() {
+                    Ok(held) => held,
+                    Err(poisoned) => poisoned.into_inner(),
+                };
+                match held.as_mut() {
+                    Some(attached) => attached.input.try_recv().ok(),
+                    None => return,
+                }
+            };
+            let Some(message) = next else { return };
+            if let Err(fault) = self.channel.send(&message) {
+                self.fault = Some(fault);
+                return;
+            }
+        }
+    }
+
+    /// Hands one of the agent's messages to the attached session, if any.
+    ///
+    /// A full queue detaches rather than blocks. The alternative — waiting for a
+    /// session to consume — would stall the pipe reader, and the pipe reader is
+    /// also the thing that keeps the supervisor's `connected` belief true; a
+    /// session that stopped reading would therefore get the agent killed as
+    /// `NeverConnected`.
+    fn relay(&mut self, payload: &[u8]) {
+        let mut held = match self.shared.attached.lock() {
+            Ok(held) => held,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let Some(attached) = held.as_ref() else { return };
+        if attached.frames.try_send(payload.to_vec()).is_err() {
+            *held = None;
+        }
     }
 
     /// Creates, recycles or drops the channel so it matches the phase.
@@ -480,12 +678,23 @@ impl<H: selfhost_screen::AgentHost, C: AgentChannel> Supervised<H, C> {
     /// only place the session, window station, desktop and integrity level are
     /// ever stated.
     fn absorb(&mut self, payload: &[u8]) {
+        // Forwarded first, and whole: a session relaying this agent must get the
+        // bytes whether or not this end finds anything in them worth reading.
+        self.relay(payload);
+
         let Ok(message) = selfhost_desk::wire::Message::decode(payload) else {
             return;
         };
         match message {
             selfhost_desk::wire::Message::Hello(hello) => {
                 self.monitors = u32::try_from(hello.monitors.len()).unwrap_or(u32::MAX);
+                // Kept whole as well as counted: a relayed session advertises this
+                // list to the console, and the ids in it are what the agent's
+                // frames and the console's pointer coordinates both mean.
+                match self.shared.displays.lock() {
+                    Ok(mut held) => *held = hello.monitors.clone(),
+                    Err(poisoned) => *poisoned.into_inner() = hello.monitors.clone(),
+                }
             }
             selfhost_desk::wire::Message::Status { detail, .. } if !detail.is_empty() => {
                 self.said = Some(detail);
@@ -618,6 +827,16 @@ const ACCEPT_WAIT: Duration = Duration::from_millis(50);
 #[cfg(windows)]
 const READ_WAIT: Duration = Duration::from_millis(50);
 
+/// How long a write to the agent may block the supervision thread.
+///
+/// The same short wait the read uses, and for the same reason: this thread also
+/// decides whether to spawn and whether the agent is alive, and a write that
+/// parked on a full pipe would stop it doing either. An agent that is not
+/// draining its pipe is an agent that has stopped, which the state machine
+/// discovers by holding the process handle rather than by waiting here.
+#[cfg(windows)]
+const WRITE_WAIT: Duration = Duration::from_millis(50);
+
 /// How much of the agent's stream one turn will take in.
 #[cfg(windows)]
 const READ_BUFFER: usize = 64 * 1024;
@@ -688,7 +907,8 @@ fn begin(input: InputPolicy, limits: Limits) -> Arc<Shared> {
     let host = WindowsHost::new(executable, input);
     let thread = Arc::clone(&shared);
     std::thread::spawn(move || {
-        let mut supervised = Supervised::new(Agent::new(host, limits), PipeChannel::default());
+        let mut supervised =
+            Supervised::new(Agent::new(host, limits), PipeChannel::default(), Arc::clone(&thread));
         loop {
             let orders = Orders {
                 kill_switch: thread.kill_switch.load(Ordering::Relaxed),
@@ -724,6 +944,8 @@ fn begin(input: InputPolicy, limits: Limits) -> Arc<Shared> {
 fn published(status: AgentStatus) -> Arc<Shared> {
     Arc::new(Shared {
         status: Mutex::new(status),
+        displays: Mutex::new(Vec::new()),
+        attached: Mutex::new(None),
         kill_switch: AtomicBool::new(false),
         operator_start: AtomicBool::new(false),
     })
@@ -780,6 +1002,21 @@ impl AgentChannel for PipeChannel {
         self.pipe = None;
         self.accepted = false;
         self.pending.clear();
+    }
+
+    fn send(&mut self, message: &[u8]) -> Result<(), Fault> {
+        use selfhost_screen::agent::{encode_link, LinkFrame};
+
+        // No pipe, or nobody on it: the message has nowhere to go and that is an
+        // ordinary state, not a fault. See the trait's contract.
+        let Some(pipe) = self.pipe.as_mut() else {
+            return Ok(());
+        };
+        if !self.accepted {
+            return Ok(());
+        }
+        let frame = encode_link(&LinkFrame::Message(message.to_vec()))?;
+        pipe.write_all(&frame, WRITE_WAIT)
     }
 
     fn pump(&mut self) -> Result<Option<Vec<u8>>, Fault> {
@@ -955,6 +1192,8 @@ mod tests {
         recycled: usize,
         /// Messages waiting to be handed over.
         inbox: Vec<Vec<u8>>,
+        /// Everything the driver wrote towards the agent, in order.
+        sent: Vec<Vec<u8>>,
     }
 
     impl AgentChannel for FakeChannel {
@@ -984,6 +1223,14 @@ mod tests {
             self.inbox.clear();
         }
 
+        fn send(&mut self, message: &[u8]) -> Result<(), Fault> {
+            if self.open_for.is_none() {
+                return Ok(());
+            }
+            self.sent.push(message.to_vec());
+            Ok(())
+        }
+
         fn pump(&mut self) -> Result<Option<Vec<u8>>, Fault> {
             if self.open_for.is_none() || self.inbox.is_empty() {
                 return Ok(None);
@@ -1004,9 +1251,11 @@ mod tests {
             open_for: None,
             recycled: 0,
             inbox: Vec::new(),
+            sent: Vec::new(),
         };
         let limits = Limits { spawns_per_hour: cap, ..Limits::default() };
-        (Supervised::new(Agent::new(host, limits), channel), machine)
+        let shared = published(AgentStatus::not_supervised("under test"));
+        (Supervised::new(Agent::new(host, limits), channel, shared), machine)
     }
 
     /// The orders of an ordinary turn: nothing revoked, nobody pressing anything.

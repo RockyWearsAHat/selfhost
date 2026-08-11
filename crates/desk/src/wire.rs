@@ -233,6 +233,23 @@ pub enum Direction {
     ToAgent,
 }
 
+impl Direction {
+    /// Which way a message travels, decided from its kind byte alone.
+    ///
+    /// The whole reason the kind space is split at `0x40`: a relay that forwards
+    /// an agent's messages without decoding them still has to refuse the ones
+    /// only a console may send, and this is the one byte it needs to do it. See
+    /// [`crate::relay`] for why decoding them instead would be a way to end the
+    /// daemon at somebody else's convenience.
+    ///
+    /// [`Message::direction`] is this function applied to
+    /// [`Message::kind`]; the two cannot disagree, and a test asserts it for
+    /// every variant.
+    pub const fn of_kind(kind: u8) -> Self {
+        if kind < 0x40 { Self::ToViewer } else { Self::ToAgent }
+    }
+}
+
 /// One display, in the coordinate space the agent advertises.
 ///
 /// Origins are signed because a virtual desktop's origin is negative whenever a
@@ -605,7 +622,11 @@ pub enum Message {
 
 /// Kind bytes. Grouped by direction: below `0x40` to the viewer, `0x40` and
 /// above to the agent.
-mod kind {
+///
+/// Public because [`crate::relay`] classifies an agent's messages by this byte
+/// alone and never decodes them; a relay that had to name a kind by decoding the
+/// message would be the parser that module exists to avoid.
+pub mod kind {
     /// [`super::Message::Hello`].
     pub const HELLO: u8 = 0x01;
     /// [`super::Message::Status`].
@@ -690,7 +711,7 @@ impl Message {
     /// A receiver checks this. It is cheap, and the alternative is a console
     /// that can be typed into by the machine it is displaying.
     pub const fn direction(&self) -> Direction {
-        if self.kind() < 0x40 { Direction::ToViewer } else { Direction::ToAgent }
+        Direction::of_kind(self.kind())
     }
 
     /// Encodes the message, or names what about it could not be written.

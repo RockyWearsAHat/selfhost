@@ -159,7 +159,7 @@ pub struct Desk {
     /// make an absent supervisor indistinguishable from a dead one. On every
     /// platform but a Windows service it publishes exactly that sentence and
     /// starts no thread.
-    agent: crate::desk_supervisor::CaptureAgent,
+    agent: Arc<crate::desk_supervisor::CaptureAgent>,
 }
 
 /// Builds the subsystem, or answers `None` because it was not asked for.
@@ -184,8 +184,10 @@ pub fn start(
     // exactly once and never re-derived downstream: `allow_input = false` must
     // mean an agent that holds no injector, and the way it means that is the
     // argument vector this policy produces.
-    let agent =
-        crate::desk_supervisor::CaptureAgent::start(desktop.allow_input, desktop.agent_respawn_cap);
+    let agent = Arc::new(crate::desk_supervisor::CaptureAgent::start(
+        desktop.allow_input,
+        desktop.agent_respawn_cap,
+    ));
     // The switch is handed over before the first turn rather than at the first
     // poll, so a daemon that starts with the desktop already revoked never starts
     // an agent at all — the case nobody is watching, and the one where a
@@ -432,6 +434,38 @@ impl Desk {
         // is missing precisely the entries an incident is about.
         self.audit.admitted(&identity, &redemption);
 
+        // Two drivers, one decision, made here because this is the only place
+        // that holds both the socket and the supervisor. A daemon that cannot
+        // capture but has an agent relays; everything else captures. The probe is
+        // live rather than cached: a Windows service does not become an
+        // interactive session while it runs, but a console session it is
+        // relaying can go away and come back, and the agent's own state machine
+        // is what handles that.
+        if crate::desk_local::Backend::here().relayed {
+            let outcome = self
+                .relay_session(&mut outbound, &mut inbound, &redemption, ceilings, seat)
+                .await;
+            if tokio::time::timeout(CLOSE_GRACE, &mut pump).await.is_err() {
+                pump.abort();
+            }
+            return match outcome {
+                Some(outcome) => format!(
+                    "{ending} · {who} · relayed · {frames} frame(s), {bytes} byte(s), \
+                     {refused} input(s) refused",
+                    ending = outcome.ending,
+                    who = identity,
+                    frames = outcome.stats.frames_sent,
+                    bytes = outcome.stats.bytes_sent,
+                    refused = outcome.stats.inputs_refused,
+                ),
+                None => format!(
+                    "refused: {identity} · this machine's screen is already being served to \
+                     another session. One agent holds the model of one client's picture, so a \
+                     second viewer would be sent the difference against somebody else's screen."
+                ),
+            };
+        }
+
         let Machine { mut screen, cursor, keys } =
             Machine::open(Arc::clone(&self.stopped), self.config.allow_input).await;
         // A machine whose pointer and keyboard could not be opened still
@@ -495,6 +529,44 @@ impl Desk {
             deferred = outcome.stats.tiles_deferred,
             refused = outcome.stats.inputs_refused,
         )
+    }
+}
+
+impl Desk {
+    /// Drives one session whose pixels come from the supervised agent.
+    ///
+    /// `None` means the agent is already serving another session — see
+    /// [`crate::desk_supervisor::CaptureAgent::attach`] for why that is a refusal
+    /// and not a queue.
+    ///
+    /// The seat is taken by value and dropped with the driver, exactly as the
+    /// capture path does, so `[desktop].max_viewers` is enforced by construction
+    /// on both paths.
+    async fn relay_session(
+        &self,
+        outbound: &mut dyn Outbound,
+        inbound: &mut dyn Inbound,
+        redemption: &selfhost_desk::grant::Redemption,
+        ceilings: selfhost_desk::viewer::Ceilings,
+        seat: selfhost_desk::viewer::Seat,
+    ) -> Option<selfhost_desk::viewer::Outcome> {
+        let stream = self.agent.attach()?;
+        let mut screen = AgentScreen {
+            stream: Some(stream),
+            agent: Arc::clone(&self.agent),
+            monitors: self.agent.displays(),
+            stopped: Arc::clone(&self.stopped),
+        };
+        let directory = TicketStanding::new(&redemption.session, ceilings.max_session);
+        let relay = selfhost_desk::relay::Relay::new(
+            outbound,
+            &mut screen,
+            &directory,
+            seat,
+            redemption,
+            ceilings,
+        );
+        Some(relay.run(inbound).await)
     }
 }
 
@@ -656,6 +728,112 @@ impl Machine {
 /// would map every click onto a desktop that was never read.
 fn injector_wanted(allow_input: bool, stopped: bool, screen_opened: bool) -> bool {
     allow_input && !stopped && screen_opened
+}
+
+/// The agent's message stream, as [`selfhost_desk::relay::Relay`] wants it.
+///
+/// # The one deployment this exists for
+///
+/// A Windows daemon installed as a service runs as `SYSTEM` in session 0 and
+/// cannot capture the console user's desktop by any method. The pixels come from
+/// an agent process in that session, over a named pipe whose access-control list
+/// is the authentication, and this is the daemon's end of that pipe wearing the
+/// shape a session driver can use.
+///
+/// It **decodes nothing**. What crosses is whole encoded messages the supervisor
+/// took off the pipe; the relay above reads one byte of each and copies the rest.
+/// See [`selfhost_desk::relay`] for why a parser here would be a way to take down
+/// the reverse proxy, the DNS authority and the mail server at once.
+///
+/// # What a missing message means is decided here
+///
+/// The relay asks for the next message and is told either a message or a
+/// [`Condition`]. Which condition is the daemon's knowledge and not the pipe's: a
+/// quiet pipe on a still desktop is [`Condition::Retry`] and costs nothing, a
+/// closed channel is [`Condition::AgentExited`] and starts the state machine's
+/// recovery, and an engaged kill switch outranks both — asked first, before
+/// anything is read, so an operator who stopped the subsystem is told *that* and
+/// not something about an agent.
+struct AgentScreen {
+    /// The live attachment, or `None` once the agent that owned it has gone.
+    stream: Option<crate::desk_supervisor::AgentStream>,
+    /// Where a replacement attachment comes from.
+    agent: Arc<crate::desk_supervisor::CaptureAgent>,
+    /// The displays the agent named, taken at the handshake.
+    monitors: Vec<Monitor>,
+    stopped: Arc<AtomicBool>,
+}
+
+impl AgentScreen {
+    /// The kill switch's answer, when it has one.
+    ///
+    /// Asked first on every path, for the same reason [`LocalScreen::halted`] is.
+    fn halted(&self) -> Option<Condition> {
+        self.stopped.load(Ordering::Relaxed).then_some(Condition::Stopped)
+    }
+}
+
+impl selfhost_desk::relay::Upstream for AgentScreen {
+    fn monitors(&self) -> &[Monitor] {
+        &self.monitors
+    }
+
+    fn next_message(&mut self, budget: Duration) -> Task<'_, Result<Vec<u8>, Condition>> {
+        if let Some(halted) = self.halted() {
+            return Box::pin(async move { Err(halted) });
+        }
+        Box::pin(async move {
+            let Some(stream) = self.stream.as_mut() else {
+                return Err(Condition::AgentExited);
+            };
+            match tokio::time::timeout(budget, stream.frames.recv()).await {
+                // The supervisor closed the attachment: the agent it belonged to
+                // is gone, and a new one needs a new attachment.
+                Ok(None) => {
+                    self.stream = None;
+                    Err(Condition::AgentExited)
+                }
+                Ok(Some(message)) => Ok(message),
+                // Nothing inside the budget. A still desktop sends nothing at
+                // all, by design, and this is what that looks like from here.
+                Err(_elapsed) => Err(Condition::Retry),
+            }
+        })
+    }
+
+    fn deliver<'a>(&'a mut self, message: &'a Message) -> Task<'a, Result<(), Refusal>> {
+        Box::pin(async move {
+            let Some(stream) = self.stream.as_ref() else {
+                return Err(Refusal::NotLive);
+            };
+            let encoded = message.encode().map_err(|_| Refusal::Unmappable)?;
+            // Never blocking. A full queue is an agent that has stopped draining
+            // its pipe, and holding a keystroke for it would only deliver that
+            // keystroke to a desktop that has moved on.
+            stream.input.try_send(encoded).map_err(|_| Refusal::NotLive)
+        })
+    }
+
+    fn restore(&mut self) -> Task<'_, Result<(), Condition>> {
+        Box::pin(async move {
+            if let Some(halted) = self.halted() {
+                return Err(halted);
+            }
+            // Dropped before the next is asked for: the slot holds one session,
+            // and asking for a second while still holding the first refuses
+            // itself.
+            self.stream = None;
+            let Some(stream) = self.agent.attach() else {
+                // The supervisor has not brought a replacement up yet. Not a
+                // failure — the state machine's backoff is what paces this — so
+                // the honest answer is the state the machine is in.
+                return Err(Condition::AgentExited);
+            };
+            self.monitors = self.agent.displays();
+            self.stream = Some(stream);
+            Ok(())
+        })
+    }
 }
 
 /// The screen of the machine this daemon runs on, as the session driver sees it.
