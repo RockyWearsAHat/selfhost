@@ -356,9 +356,11 @@ impl<'a> Relay<'a> {
             Message::RequestFullFrame { monitor: 0 },
         ];
         for message in &opening {
-            match timeout_at(deadline, self.upstream.deliver(message)).await {
-                Err(_elapsed) => return Err(Ending::Deadline),
-                Ok(_) => {}
+            // The refusal is discarded and the lapse is not: a refusal means the
+            // agent would not take it, which the state machine decides about on
+            // its next turn, and a lapse means the wall passed while trying.
+            if timeout_at(deadline, self.upstream.deliver(message)).await.is_err() {
+                return Err(Ending::Deadline);
             }
         }
         Ok(())
