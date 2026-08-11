@@ -1122,6 +1122,141 @@ pub fn decode_link(buffer: &[u8]) -> Result<Option<(LinkFrame, usize)>, Fault> {
 /// Spelled here rather than in the command-line crate because the daemon builds
 /// the whole argument vector with [`agent_arguments`], and the two halves of that
 /// contract — what is written and what is read — belong in one file or they drift.
+/// A stopped agent: which kind of stop, and the fault behind it.
+///
+/// Two fields because the exit code and the sentence answer different readers.
+/// The code is all a parent process can see and is therefore the whole of the
+/// diagnosis on the machine this ships to; the fault is what a person reads when
+/// the agent was run somewhere its output goes anywhere at all.
+#[derive(Debug)]
+pub struct AgentStop {
+    /// Which step fell over, and so which exit code this becomes.
+    pub departure: Departure,
+    /// What the platform said.
+    pub fault: Fault,
+}
+
+impl std::fmt::Display for AgentStop {
+    fn fmt(&self, out: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(out, "{}", self.fault.sentence())
+    }
+}
+
+impl From<Fault> for AgentStop {
+    /// Anything that is not classified at its own call site is a stream failure.
+    ///
+    /// Which is honest: by the time `?` is reached on an unclassified fault the
+    /// link is up — the one step before it is classified explicitly — so the
+    /// agent connected and then something else went wrong, and that is exactly
+    /// what [`Departure::StreamFailed`] says.
+    fn from(fault: Fault) -> Self {
+        Self { departure: Departure::StreamFailed, fault }
+    }
+}
+
+/// Why an agent process stopped, in the one thing a parent can read.
+///
+/// # Why this exists
+///
+/// The agent runs in another session with no console, no log file and no pipe
+/// to the daemon until it has already succeeded at the one thing most likely to
+/// fail. Everything it could say about a failure before that point is written to
+/// a stderr nobody is holding. So the *number* has to carry it.
+///
+/// This was not theoretical. On the first live deployment the supervisor
+/// reported `exited with code 1` nine times in a row, which is true, useless,
+/// and indistinguishable between "the console changed hands underneath me",
+/// "the daemon's pipe would not have me" and "the screen would not open" —
+/// three faults with three different remedies. Diagnosing it took a hand-driven
+/// pipe client and an afternoon; the sentence below would have taken a glance.
+///
+/// The vocabulary lives here, beside [`agent_arguments`], because the process
+/// that *chooses* a code and the supervisor that *reads* one must not hold two
+/// copies of it. `1` is deliberately absent: it is what every other failure in
+/// the binary exits with, so it has to keep meaning "something else".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Departure {
+    /// Nothing was wrong; the link closed and the agent stopped.
+    Done,
+    /// It was run by a person, or with an argv this build does not understand.
+    NotSpawned,
+    /// Windows would not say which session this process is in.
+    UnknownSession,
+    /// It started in a different session from the one it was aimed at.
+    WrongSession,
+    /// The daemon's pipe would not have it inside its connect deadline.
+    LinkRefused,
+    /// It ran, and the streaming loop stopped with a fault.
+    StreamFailed,
+}
+
+impl Departure {
+    /// The process exit code.
+    pub const fn code(self) -> u8 {
+        match self {
+            Self::Done => 0,
+            Self::NotSpawned => 2,
+            Self::UnknownSession => 3,
+            Self::WrongSession => 4,
+            Self::LinkRefused => 5,
+            Self::StreamFailed => 6,
+        }
+    }
+
+    /// What a given exit code meant, or `None` for one this build did not write.
+    ///
+    /// Total over every `i32` a process can exit with, because the supervisor
+    /// hands it whatever Windows reports — including the codes a crash produces,
+    /// which are none of these and must stay unnamed rather than be guessed at.
+    pub const fn from_code(code: i32) -> Option<Self> {
+        match code {
+            0 => Some(Self::Done),
+            2 => Some(Self::NotSpawned),
+            3 => Some(Self::UnknownSession),
+            4 => Some(Self::WrongSession),
+            5 => Some(Self::LinkRefused),
+            6 => Some(Self::StreamFailed),
+            _ => None,
+        }
+    }
+
+    /// What an operator should read, and what to do about it.
+    pub const fn sentence(self) -> &'static str {
+        match self {
+            Self::Done => "the agent stopped normally",
+            Self::NotSpawned => {
+                "the agent was started without the arguments the daemon gives it, so it refused \
+                 to run. Nothing spawned it, or this build and the daemon's disagree about the \
+                 argument vector"
+            }
+            Self::UnknownSession => {
+                "the agent could not read which session it was in, so it could not prove it \
+                 belonged in the one it was sent to, and refused to capture anything"
+            }
+            Self::WrongSession => {
+                "the agent started in a different session from the one it was aimed at \
+                 — the console changed hands while it was starting. Ordinary during a fast \
+                 user switch; the next attempt is aimed at wherever the console is now"
+            }
+            Self::LinkRefused => {
+                "the agent could not reach the daemon's pipe inside its connect deadline. The \
+                 pipe exists and permits this user, or the agent would have said something \
+                 else — this is the instance being busy, which means one is still held by an \
+                 agent that did not exit"
+            }
+            Self::StreamFailed => {
+                "the agent connected and then its streaming loop stopped with a fault; the \
+                 fault it reported is on the last status it sent"
+            }
+        }
+    }
+}
+
+/// The subcommand the daemon spawns the agent with.
+///
+/// Named here, beside [`agent_arguments`] which writes it and
+/// [`AgentOptions::from_arguments`] which reads it, so the daemon and the agent
+/// cannot come to disagree about the one word that starts the process.
 pub const AGENT_SUBCOMMAND: &str = "desk-agent";
 
 /// The flag naming the session the daemon aimed the agent at.
@@ -1270,8 +1405,8 @@ pub use self::windows_body::run;
 #[cfg(windows)]
 mod windows_body {
     use super::{
-        decode_link, encode_link, AgentOptions, AgentReport, CreditWindow, Delivery, FrameSink,
-        InputPolicy, LinkFrame, SendError, Streamer,
+        decode_link, encode_link, AgentOptions, AgentReport, AgentStop, CreditWindow, Delivery,
+        Departure, FrameSink, InputPolicy, LinkFrame, SendError, Streamer,
     };
     use crate::windows::{
         cursor::GdiCursor, gdi::GdiCapture, identity, inject::WinInjector, pipe::DaemonLink,
@@ -1312,7 +1447,7 @@ mod windows_body {
     ///
     /// A [`Fault`] naming the call that failed, for the exit code and the log. A
     /// closed link is **not** one: it is how the agent is asked to stop.
-    pub fn run(options: AgentOptions) -> Result<(), Fault> {
+    pub fn run(options: AgentOptions) -> Result<(), AgentStop> {
         // The first statement, before anything asks the size of anything. Without
         // it `GetSystemMetrics` reports virtualised extents while the captured
         // pixels are physical.
@@ -1332,7 +1467,13 @@ mod windows_body {
         let mut screen = Screen::open();
         let report = AgentReport { monitors: screen.monitors().to_vec(), ..report };
 
-        let mut link = DaemonLink::connect(options.session, CONNECT_DEADLINE)?;
+        // Classified here rather than by the caller inspecting the fault, because
+        // this is the only line that knows the failure was the *link*. A caller
+        // matching on a Win32 call name would be reading an implementation
+        // detail of the pipe, and would go quietly wrong the day the pipe used a
+        // different call.
+        let mut link = DaemonLink::connect(options.session, CONNECT_DEADLINE)
+            .map_err(|fault| AgentStop { departure: Departure::LinkRefused, fault })?;
         let mut cursor = GdiCursor::new();
         let mut streamer = Streamer::new(options.config);
         let mut sink = LinkSink { link: &mut link, window: CreditWindow::new(INITIAL_CREDIT) };
@@ -1390,7 +1531,7 @@ mod windows_body {
             let tick = match streamer.tick(&mut screen, &mut cursor, &mut sink, now) {
                 Ok(tick) => tick,
                 Err(SendError::Closed) => return Ok(()),
-                Err(SendError::Failed(fault)) => return Err(fault),
+                Err(SendError::Failed(fault)) => return Err(fault.into()),
             };
 
             // A rebuild and a suspension are the two answers that mean "the screen

@@ -152,7 +152,7 @@ pub mod macos;
 
 pub mod stub;
 
-pub use agent::{
+pub use agent::{AgentStop, Departure, 
     AgentOptions, AgentReport, AgentStats, CreditWindow, DamageHint, Delivery, DpiAwareness,
     FrameSink, InputPolicy, Integrity, SendError, StreamConfig, Streamer, Tick,
 };

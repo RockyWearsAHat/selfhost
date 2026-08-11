@@ -174,7 +174,18 @@ fn main() -> ExitCode {
         // Deliberately absent from USAGE: the daemon spawns this into the
         // console session, and there is nothing an operator can do with it.
         // See [`desk_agent`] for what stops it working when run by hand.
-        "desk-agent" => desk_agent::run(&arguments),
+        // The one command whose exit code is *read by another program*, so it
+        // does not go through the uniform success/failure below: the daemon's
+        // supervisor is the only thing that ever sees this process end, and on
+        // the machine this ships to there is no console, no log and no pipe yet
+        // for it to say anything else on. See `selfhost_screen::Departure`.
+        "desk-agent" => {
+            let (departure, result) = desk_agent::depart(&arguments);
+            if let Err(message) = result {
+                eprintln!("\n✗ {message}");
+            }
+            return ExitCode::from(departure.code());
+        }
         "teardown" => teardown_command(&arguments),
         "service" => service_command(&arguments),
         "mail" => mail_command(&arguments),

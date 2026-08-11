@@ -316,8 +316,20 @@ impl Supervision {
                 }
             }
             AgentEvent::Exited { code } => {
-                self.last_fault = code.map(|code| {
-                    Fault::refused("the desktop agent", format!("exited with code {code}"))
+                // A code this build wrote becomes the sentence it stands for.
+                // `exited with code 1` is true and useless: it cannot tell a
+                // console that changed hands from a pipe that would not have the
+                // agent from a screen that would not open, and those are three
+                // different remedies. See [`crate::agent::Departure`].
+                self.last_fault = code.map(|code| match crate::agent::Departure::from_code(code) {
+                    Some(departure) => Fault::refused("the desktop agent", departure.sentence()),
+                    None => Fault::refused(
+                        "the desktop agent",
+                        format!(
+                            "exited with code {code}, which this build never writes deliberately \
+                             — it is a crash or a kill rather than a refusal"
+                        ),
+                    ),
                 });
                 self.note_failure(now);
             }
