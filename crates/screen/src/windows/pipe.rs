@@ -69,6 +69,13 @@ pub struct AgentPipe {
     session: u32,
     expected_sid: String,
     connected: bool,
+    /// Whether the connected client has been proved to be [`Self::expected_sid`].
+    ///
+    /// Separate from `connected` because the two cannot happen at the same
+    /// moment: Windows refuses `ImpersonateNamedPipeClient` until data has been
+    /// read from the pipe (`ERROR_CANNOT_IMPERSONATE`, 1368), so a check made at
+    /// accept time is a check that always fails. See [`Self::read`].
+    verified: bool,
 }
 
 impl AgentPipe {
@@ -137,6 +144,7 @@ impl AgentPipe {
             session,
             expected_sid: user_sid.to_owned(),
             connected: false,
+            verified: false,
         })
     }
 
@@ -211,8 +219,18 @@ impl AgentPipe {
             }
         }
 
-        self.verify_client()?;
+        // **Not verified here, and it cannot be.** `ImpersonateNamedPipeClient`
+        // refuses with `ERROR_CANNOT_IMPERSONATE` until data has been read from
+        // the pipe, so a check at accept time fails every single time — which is
+        // exactly what it did on the first live deployment: the server errored
+        // out of the accept, disconnected the agent it had just accepted, and the
+        // agent's opening `Hello` write failed into a pipe that had been taken
+        // away. Four agents a minute, for the same reason, none of it visible.
+        //
+        // The proof is made in [`Self::read`], against the first bytes that
+        // arrive, and no unverified byte is ever handed to the caller.
         self.connected = true;
+        self.verified = false;
         Ok(true)
     }
 
@@ -241,7 +259,9 @@ impl AgentPipe {
             )
         };
         if ok != 0 {
-            return Ok(immediate as usize);
+            let read = immediate as usize;
+            self.prove_client(read)?;
+            return Ok(read);
         }
         let fault = Fault::last_os_error("ReadFile");
         if fault.code() != Some(sys::ERROR_IO_PENDING) {
@@ -250,7 +270,29 @@ impl AgentPipe {
         if !self.await_overlapped(&mut overlapped, timeout, "ReadFile")? {
             return Ok(0);
         }
-        Ok(self.transferred(&mut overlapped, "ReadFile")? as usize)
+        let read = self.transferred(&mut overlapped, "ReadFile")? as usize;
+        self.prove_client(read)?;
+        Ok(read)
+    }
+
+    /// Proves the client is who the descriptor admitted, once there is data to
+    /// prove it against.
+    ///
+    /// Called from [`Self::read`] with the number of bytes that just arrived, and
+    /// **before those bytes are returned to the caller**: a client that fails the
+    /// proof is disconnected and its bytes are never seen by anything above this
+    /// module. Once proved, it is not re-proved — the connection is the same
+    /// connection, and impersonating on every read would be a token open per
+    /// frame.
+    ///
+    /// A read that moved nothing proves nothing and is left alone.
+    fn prove_client(&mut self, read: usize) -> Result<(), Fault> {
+        if self.verified || read == 0 {
+            return Ok(());
+        }
+        self.verify_client()?;
+        self.verified = true;
+        Ok(())
     }
 
     /// Writes the whole buffer, or fails.
@@ -316,6 +358,8 @@ impl AgentPipe {
     pub fn disconnect(&mut self) {
         unsafe { sys::DisconnectNamedPipe(self.handle.raw()) };
         self.connected = false;
+        // The proof was about *that* client. The next one proves itself.
+        self.verified = false;
     }
 
     /// An `OVERLAPPED` pointing at this pipe's own event.
