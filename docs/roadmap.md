@@ -26,7 +26,7 @@ exercised against a running instance; anything else has not been written.
 | Remote-desktop protocol | `crates/desk` | 153 | total parsers on every attacker-influenced field; the session state machine driven through the secure desktop, a crash loop and a user logging out, with no display attached |
 | Screen capture and input injection | `crates/screen` | 189 | pure coordinate mapping, key tables and synthetic-event plans; macOS verified, **every Windows arm type-checked and unrun** |
 | Network storage | `crates/storage` | 321 | traversal, ADS, reserved names, 8.3 aliases and case collisions refused; a full SMB reconcile leaves this Mac's `sharing -l -f json` byte-identical |
-| Peer mesh transport | `crates/mesh` | 177 | fixed eight-byte header, credit that drops and merges, an HMAC proof bound to one handshake; **the owner has no route to accept a dial yet** |
+| Peer mesh transport | `crates/mesh` | 177 | fixed eight-byte header, credit that drops and merges, an HMAC proof bound to one handshake; `GET /api/mesh/link` is now wired on the owner (`crates/admin/src/mesh_api.rs`), **but nothing outside `crates/mesh` calls `splice`, so an admitted link carries no traffic yet** |
 
 Verified live: HTTPS 200 on a real trusted Let's Encrypt production certificate
 for the deployed domain and its `www`, HTTP→HTTPS 308, `206` + `Content-Range`
@@ -68,12 +68,14 @@ for exactly the deployments where direct delivery is blocked upstream.
 
 Three specific gaps, all small, all named at the code:
 
-- **Route `/api/mesh/link` on the owner.** `crates/mesh/src/accept.rs` is
-  written and tested; there is no route, so a worker's dial lands on a 404 and
-  the registry records the reason. Until then a second machine cannot join, and
-  the rule to preserve is the one that made the design safe: **the worker dials
-  the owner**, over the console site, so the link passes the same source-address
-  gate as every other console request and nothing binds.
+- **Call the mesh splice.** `crates/admin/src/mesh_api.rs` now answers
+  `GET /api/mesh/link` and admits or refuses a dial on its merits — the 404 is
+  gone. `crates/mesh/src/splice.rs` (joining two mesh channels — distinct from
+  the desktop-frame splice below) is written and tested, but nothing outside
+  `crates/mesh` calls it, so an admitted peer link still carries no traffic
+  anywhere. The rule to preserve is the one that made the design safe: **the
+  worker dials the owner**, over the console site, so the link passes the same
+  source-address gate as every other console request and nothing binds.
 - **Wire `Api::standings` into `crates/cli/src/desk_task.rs`.** The per-input
   re-check is real but the daemon feeds it the standing the *ticket* established,
   so a revocation mid-stream ends the session at its ceiling rather than at the
@@ -154,10 +156,12 @@ Written down so they are decisions rather than surprises.
   already compressed.
 - **No rate limiting.** The biggest remaining gap before public exposure.
 - **A relayed WebDAV `PUT` has no deadline after its head.** It streams
-  uncapped by design — quotas and the in-flight ceiling are storage's job — so a
-  client that declares an enormous length and then stalls holds one client and
-  one loopback connection. That is the slow-loris shape left behind until the
-  in-flight ceiling is enforced.
+  uncapped by design — quotas and the in-flight ceiling are storage's job, and
+  the in-flight ceiling *is* enforced (`crates/storage/src/quota.rs`, called on
+  every write) — so what is left is only the deadline: a client that declares an
+  enormous length and then stalls holds one client and one loopback connection
+  with nothing to time it out. That is the slow-loris shape still standing, and
+  it is a read deadline, not a ceiling.
 - **`/dav` has no configuration switch.** It is live wherever a console password
   and a `[[shares]]` block coexist. Authenticated, and behind the console site's
   source gate — but it is the only surface these two subsystems add that is not

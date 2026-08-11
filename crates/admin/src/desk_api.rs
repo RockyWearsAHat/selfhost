@@ -204,6 +204,26 @@ pub struct Handover {
     pub seat: Seat,
     /// Who is watching, for the audit line the daemon writes.
     pub identity: Identity,
+    /// What the holder may do on this machine, re-read on every input message.
+    ///
+    /// **This is what makes the third capability check live.** The mint decides
+    /// once and the handshake decides once; both are moments, and a desktop
+    /// stream lives for hours. Signing out of the console, or having a grant
+    /// taken away in PEOPLE, stops the *next keystroke* exactly when this is the
+    /// real directory — [`Standings::for_redemption`], over the store the login
+    /// route writes and the registry the people route edits.
+    ///
+    /// It is handed over rather than looked up in the daemon because the store
+    /// lives in this crate and the driver lives in the other one. A daemon that
+    /// built its own would be inventing an answer to a question only the session
+    /// store can answer, which is precisely what the stand-in it replaces did.
+    ///
+    /// `None` on a deployment with **no console password**: there is then no
+    /// session store to read, and the only credential that can open a stream is
+    /// the bearer token, whose standing needs none. The daemon falls back to a
+    /// ticket-shaped directory and says so, rather than refusing a stream the
+    /// operator is entitled to.
+    pub directory: Option<Arc<dyn SessionDirectory>>,
 }
 
 impl fmt::Debug for Handover {

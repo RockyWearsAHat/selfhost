@@ -422,7 +422,7 @@ impl Desk {
             );
         }
 
-        let Handover { io, redemption, ceilings, seat, identity } = handover;
+        let Handover { io, redemption, ceilings, seat, identity, directory } = handover;
         let limits = Limits { max_lifetime: ceilings.max_session, ..Limits::default() };
         let (mut outbound, mut inbound, pump) = split(Duplex::server(io, limits));
         let mut pump = tokio::spawn(pump);
@@ -441,9 +441,21 @@ impl Desk {
         // interactive session while it runs, but a console session it is
         // relaying can go away and come back, and the agent's own state machine
         // is what handles that.
+        // The real directory when the admin API had a session store to build one
+        // over, and the ticket-shaped stand-in when it did not. Chosen once, so
+        // both drivers are held to the same standing by construction.
+        let stand_in;
+        let directory: &dyn SessionDirectory = match directory.as_deref() {
+            Some(real) => real,
+            None => {
+                stand_in = TicketStanding::new(&redemption.session, ceilings.max_session);
+                &stand_in
+            }
+        };
+
         if crate::desk_local::Backend::here().relayed {
             let outcome = self
-                .relay_session(&mut outbound, &mut inbound, &redemption, ceilings, seat)
+                .relay_session(&mut outbound, &mut inbound, &redemption, ceilings, seat, directory)
                 .await;
             if tokio::time::timeout(CLOSE_GRACE, &mut pump).await.is_err() {
                 pump.abort();
@@ -482,8 +494,6 @@ impl Desk {
         });
         let mut no_pointer = NoPointer;
         let mut no_input = NoInput;
-        let directory = TicketStanding::new(&redemption.session, ceilings.max_session);
-
         let outcome = {
             let pointer: &mut dyn PointerSource = match cursor.as_mut() {
                 Some(cursor) => cursor,
@@ -495,7 +505,7 @@ impl Desk {
             };
             let viewer = Viewer::new(
                 Wiring { outbound: &mut outbound, frames: &mut screen, pointer, input },
-                &directory,
+                directory,
                 seat,
                 &redemption,
                 ceilings,
@@ -549,6 +559,7 @@ impl Desk {
         redemption: &selfhost_desk::grant::Redemption,
         ceilings: selfhost_desk::viewer::Ceilings,
         seat: selfhost_desk::viewer::Seat,
+        directory: &dyn SessionDirectory,
     ) -> Option<selfhost_desk::viewer::Outcome> {
         let stream = self.agent.attach()?;
         let mut screen = AgentScreen {
@@ -557,11 +568,10 @@ impl Desk {
             monitors: self.agent.displays(),
             stopped: Arc::clone(&self.stopped),
         };
-        let directory = TicketStanding::new(&redemption.session, ceilings.max_session);
         let relay = selfhost_desk::relay::Relay::new(
             outbound,
             &mut screen,
-            &directory,
+            directory,
             seat,
             redemption,
             ceilings,

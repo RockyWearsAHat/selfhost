@@ -1022,7 +1022,13 @@ where
                     break;
                 }
             }
-            Err(_) => {
+            Err(error) => {
+                // Named, not merely counted. A client that hung up mid-upload
+                // and a socket that faulted both abandon the write, and the
+                // operator reading the refusal needs to know which: the first is
+                // somebody closing a laptop, the second is a machine to go and
+                // look at.
+                eprintln!("admin: upload abandoned after {received} byte(s): {error}");
                 truncated = true;
                 break;
             }

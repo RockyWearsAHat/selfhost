@@ -253,12 +253,25 @@ fn refuse_a_token_on_the_command_line(arguments: &[String]) -> Result<(), String
 fn write_secret(path: &Path, contents: &str) -> Result<(), String> {
     match selfhost_identity::write_owner_only(path, contents) {
         Ok(()) => Ok(()),
-        Err(_) if cfg!(unix) => {
-            Err(format!("cannot write {} privately", path.display()))
+        // The reason is carried, not dropped. This is a *credential* failing to
+        // land, and "cannot write it privately" without the cause is what sends
+        // an operator to check permissions on a disk that is simply full.
+        Err(error) if cfg!(unix) => {
+            Err(format!("cannot write {} privately: {error}", path.display()))
         }
-        Err(_) => {
-            std::fs::write(path, contents)
-                .map_err(|error| format!("cannot write {}: {error}", path.display()))?;
+        Err(error) => {
+            // Kept for the same reason, and reported only if the fallback also
+            // fails: on Windows the private write is *expected* to be refused —
+            // there is one audited ACL implementation and it is not this one —
+            // so a first failure here is the ordinary path rather than news.
+            let private_write_refused = error;
+            std::fs::write(path, contents).map_err(|fallback| {
+                format!(
+                    "cannot write {}: {fallback} (the private write was refused first: \
+                     {private_write_refused})",
+                    path.display()
+                )
+            })?;
             match selfhost_admin::token::privacy_of(path) {
                 Ok(selfhost_admin::token::Privacy::Private(_)) => {}
                 Ok(selfhost_admin::token::Privacy::Exposed(detail)) => println!(

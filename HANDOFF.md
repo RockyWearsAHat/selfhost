@@ -180,11 +180,13 @@ serves one session and a second is refused, because the agent diffs against
 *the* client's surface. Nine tests cover it against a scripted agent; the pipe
 under it is Windows-only and unrun.
 
-**And one thing that reads stronger than it is:** the daemon drives sessions with
-`TicketStanding` (`crates/cli/src/desk_task.rs`), which reports the standing the
-*ticket* established, so a mid-stream revocation ends the stream at its ceiling
-rather than at the next keystroke. The real directory (`Api::standings`) exists
-and is not wired. Three lines in `crates/cli`, no interface change.
+**And the thing that used to read stronger than it was is now true.** The daemon
+drove sessions with a ticket-shaped stand-in, so a mid-stream revocation ended
+the stream at its ceiling rather than at the next keystroke; `Handover` now
+carries the real directory (`Standings::for_redemption`, over the console's
+session store and the people registry) and both drivers take it. The stand-in
+survives only where there is no console password at all — no store to read — and
+says so.
 
 **Network storage** (`nas-lab.dx`; `docs/SECURITY.md` §3.7 NAS-01…03). Shares,
 the confining resolver, the descriptor walk, quotas, the JSON API and its bulk
