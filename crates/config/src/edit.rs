@@ -22,6 +22,19 @@
 
 use crate::{Config, ConfigError, Health, Mailbox, Site};
 
+/// A refusal about the `sites` section, as the whole-document validator spells
+/// one.
+///
+/// The edits below refuse for reasons the parser cannot state — a site with no
+/// `domains` line, a removal that would leave a site unreachable — and a caller
+/// must not have to tell those apart from a genuine validation failure by their
+/// shape. So they arrive as the same [`ConfigError::Invalid`] carrying the same
+/// [`Problem`](crate::validate::Problem), and every console and CLI that already
+/// renders validation problems renders these unchanged.
+fn invalid_site(message: String) -> ConfigError {
+    ConfigError::Invalid(vec![crate::validate::Problem { field: "sites".to_owned(), message }])
+}
+
 /// Returns the config text with `site` appended as a new `[[sites]]` block.
 ///
 /// The current text must itself be a valid config: editing a file that does not
@@ -73,6 +86,225 @@ pub fn remove_site(source: &str, name: &str) -> Result<Option<String>, ConfigErr
 
     Config::parse(&edited)?;
     Ok(Some(edited))
+}
+
+/// Returns the config text with `hostname` added to the site named `name`.
+///
+/// The one edit that adding a subdomain actually needs on this side, and the
+/// reason it is its own function rather than a read-modify-write of the whole
+/// site: the proxy routes by exact hostname match
+/// (`crates/proxy/src/server.rs`), so a subdomain is not a new site and not a
+/// pattern — it is one more string in one existing site's `domains`. Rewriting
+/// the whole block to add it would re-render every other field from the parsed
+/// value and quietly normalise the operator's formatting, which is the thing
+/// this module exists to avoid.
+///
+/// Answers `None` when no site by that name is present, matching
+/// [`remove_site`]. An already-present hostname is *not* an error and not a
+/// second entry: the request "this name should reach this site" is already
+/// satisfied, and the text comes back unchanged.
+///
+/// # Errors
+///
+/// [`ConfigError::Invalid`] when the hostname is already claimed by a *different*
+/// site — the whole-document validation catches it, so the collision is refused
+/// rather than written. That check is the reason this returns the edited text
+/// instead of writing it.
+pub fn add_domain(
+    source: &str,
+    name: &str,
+    hostname: &str,
+) -> Result<Option<String>, ConfigError> {
+    let config = Config::parse(source)?;
+    let Some(index) = config.sites.iter().position(|site| site.name == name) else {
+        return Ok(None);
+    };
+
+    // Compared case-insensitively because the router lower-cases every hostname
+    // before it looks it up, so `WWW.example.com` and `www.example.com` are one
+    // name to the deployment and must be one entry here.
+    let site = &config.sites[index];
+    if site.domains.iter().any(|held| held.eq_ignore_ascii_case(hostname)) {
+        return Ok(Some(source.to_owned()));
+    }
+
+    let mut domains = site.domains.clone();
+    domains.push(hostname.to_owned());
+    let edited = replace_domains_in_nth_site(source, index, &domains)
+        .ok_or_else(|| invalid_site(format!(
+            "the site \"{name}\" has no `domains` line to add to — add the hostname by hand"
+        )))?;
+
+    Config::parse(&edited)?;
+    Ok(Some(edited))
+}
+
+/// Returns the config text with `hostname` removed from the site named `name`.
+///
+/// Answers `None` when there is no such site, and leaves the text unchanged when
+/// the site does not carry that hostname.
+///
+/// # Errors
+///
+/// [`ConfigError::Invalid`] when this would leave the site with no hostnames at
+/// all. A site nothing can reach is not a smaller site, it is a broken one, and
+/// the operator who wants that means [`remove_site`] — so the refusal names it.
+pub fn remove_domain(
+    source: &str,
+    name: &str,
+    hostname: &str,
+) -> Result<Option<String>, ConfigError> {
+    let config = Config::parse(source)?;
+    let Some(index) = config.sites.iter().position(|site| site.name == name) else {
+        return Ok(None);
+    };
+
+    let site = &config.sites[index];
+    let kept: Vec<String> = site
+        .domains
+        .iter()
+        .filter(|held| !held.eq_ignore_ascii_case(hostname))
+        .cloned()
+        .collect();
+    if kept.len() == site.domains.len() {
+        return Ok(Some(source.to_owned()));
+    }
+    if kept.is_empty() {
+        return Err(invalid_site(format!(
+            "removing \"{hostname}\" would leave the site \"{name}\" with no hostname, and a \
+             site nothing can reach is not a site — use `site remove {name}` to delete it"
+        )));
+    }
+
+    let edited = replace_domains_in_nth_site(source, index, &kept)
+        .ok_or_else(|| invalid_site(format!("the site \"{name}\" has no `domains` line to edit")))?;
+
+    Config::parse(&edited)?;
+    Ok(Some(edited))
+}
+
+/// Rewrites the `domains` array of the `target`-th `[[sites]]` block.
+///
+/// Every other byte of the document survives, including the rest of that block.
+/// The array may be written across several lines — `init` writes one line, a
+/// person may not — so the span runs from the `domains` key to the line whose
+/// brackets balance, and the replacement is a single line in the style
+/// [`render_site_block`] emits. That is the one formatting change this function
+/// makes, and it makes it only to the array it was asked to edit.
+///
+/// Returns `None` when the block has no top-level `domains` key, which is a
+/// document the caller must not guess about: `domains` is required, so its
+/// absence means the text and the parsed value disagree.
+fn replace_domains_in_nth_site(
+    source: &str,
+    target: usize,
+    domains: &[String],
+) -> Option<String> {
+    let parts: Vec<&str> = source.split('\n').collect();
+
+    let mut seen = 0usize;
+    let mut start = None;
+    for (i, line) in parts.iter().enumerate() {
+        if is_site_header(line) {
+            if seen == target {
+                start = Some(i);
+                break;
+            }
+            seen += 1;
+        }
+    }
+    let start = start?;
+
+    // The key is looked for only *before* the first sub-table header, so a
+    // `domains` key inside some future `[sites.something]` table can never be
+    // mistaken for the site's own.
+    let mut key_line = None;
+    for (offset, line) in parts.iter().enumerate().skip(start + 1) {
+        if is_site_header(line) || header_first_segment(line).is_some() {
+            break;
+        }
+        if is_domains_key(line) {
+            key_line = Some(offset);
+            break;
+        }
+    }
+    let first = key_line?;
+
+    // A TOML array may span lines. Brackets are counted rather than assuming one
+    // line, and only outside quoted strings, because a hostname is a string and
+    // a `]` inside one closes nothing.
+    let mut depth = 0isize;
+    let mut last = first;
+    for (offset, line) in parts.iter().enumerate().skip(first) {
+        depth += bracket_balance(line);
+        last = offset;
+        if depth <= 0 {
+            break;
+        }
+    }
+
+    let indent: String =
+        parts[first].chars().take_while(|character| character.is_whitespace()).collect();
+    let replacement = format!("{indent}domains = {}", quote_array(domains));
+
+    let kept: Vec<&str> = parts[..first]
+        .iter()
+        .copied()
+        .chain(std::iter::once(replacement.as_str()))
+        .chain(parts[last + 1..].iter().copied())
+        .collect();
+    let mut result = kept.join("\n");
+    if source.ends_with('\n') && !result.ends_with('\n') {
+        result.push('\n');
+    }
+    Some(result)
+}
+
+/// Whether `line` assigns the `domains` key.
+///
+/// Matches the key and the `=` rather than a bare prefix, so a key that merely
+/// starts with the same letters — `domains_note`, were anyone to add one — is
+/// not edited by accident.
+fn is_domains_key(line: &str) -> bool {
+    let trimmed = line.trim_start();
+    let Some(rest) = trimmed.strip_prefix("domains") else {
+        return false;
+    };
+    rest.trim_start().starts_with('=')
+}
+
+/// The net change in array-bracket depth across one line, ignoring brackets
+/// inside quoted strings.
+///
+/// Only basic strings and their backslash escapes are honoured, which is all a
+/// hostname can be: a literal `'…'` string cannot contain a `'`, so a bracket in
+/// one is still counted correctly by treating both quote characters as openers.
+fn bracket_balance(line: &str) -> isize {
+    let mut depth = 0isize;
+    let mut quote: Option<char> = None;
+    let mut escaped = false;
+    for character in line.chars() {
+        match quote {
+            Some(open) => {
+                if escaped {
+                    escaped = false;
+                } else if character == '\\' && open == '"' {
+                    escaped = true;
+                } else if character == open {
+                    quote = None;
+                }
+            }
+            None => match character {
+                '"' | '\'' => quote = Some(character),
+                '[' => depth += 1,
+                ']' => depth -= 1,
+                // A comment cannot contain anything that counts.
+                '#' => break,
+                _ => {}
+            },
+        }
+    }
+    depth
 }
 
 /// Renders one `[[sites]]` block, emitting only the fields that carry meaning.
@@ -572,5 +804,177 @@ domains = [\"example.com\"]
         let text = add_mailbox(WITH_MAIL, &box_).unwrap();
         let config = Config::parse(&text).unwrap();
         assert_eq!(config.mail.unwrap().mailboxes[0].aliases, vec!["postmaster@example.com"]);
+    }
+
+    /// Two sites, the second of which is the one every domain test edits, so a
+    /// test that edited the wrong block would be caught by the first surviving.
+    const TWO_SITES: &str = "\
+version = 1
+
+[server]
+acme_email = \"a@b.com\"
+acme = \"self-signed\"
+
+[[nodes]]
+name = \"home\"
+role = \"owner\"
+
+# the first site, which must not move
+[[sites]]
+name = \"first\"
+domains = [\"first.example.com\"]
+static_root = \"./sites/first\"
+
+# the second, with a comment of its own
+[[sites]]
+name = \"blog\"
+domains = [\"example.com\", \"www.example.com\"]
+static_root = \"./sites/blog\"
+spa = true
+
+[sites.health]
+path = \"/healthz\"
+interval_secs = 7
+timeout_secs = 2
+unhealthy_after = 3
+healthy_after = 2
+";
+
+    #[test]
+    fn adding_a_subdomain_adds_one_string_and_changes_nothing_else() {
+        // The whole promise of this module, asserted as bytes: the only
+        // difference between the two documents is the one line that was edited.
+        let text = add_domain(TWO_SITES, "blog", "shop.example.com").unwrap().unwrap();
+        let config = Config::parse(&text).unwrap();
+        assert_eq!(
+            config.sites[1].domains,
+            vec!["example.com", "www.example.com", "shop.example.com"]
+        );
+
+        let before: Vec<&str> = TWO_SITES.lines().collect();
+        let after: Vec<&str> = text.lines().collect();
+        assert_eq!(before.len(), after.len(), "no line was added or removed");
+        let differing: Vec<usize> =
+            (0..before.len()).filter(|i| before[*i] != after[*i]).collect();
+        assert_eq!(differing.len(), 1, "exactly one line changed: {differing:?}");
+        assert!(after[differing[0]].starts_with("domains = "), "{}", after[differing[0]]);
+
+        // The things a re-serialisation would have destroyed.
+        assert!(text.contains("# the first site, which must not move"), "{text}");
+        assert!(text.contains("# the second, with a comment of its own"), "{text}");
+        assert!(text.contains("interval_secs = 7"), "the health table survived: {text}");
+    }
+
+    #[test]
+    fn a_hostname_already_on_the_site_is_satisfied_rather_than_repeated() {
+        // "This name should reach this site" is already true, so the request has
+        // been met. Appending a second copy would be a config that says the same
+        // thing twice, and an error would be a failure to do nothing.
+        let text = add_domain(TWO_SITES, "blog", "www.example.com").unwrap().unwrap();
+        assert_eq!(text, TWO_SITES);
+    }
+
+    #[test]
+    fn a_hostname_differing_only_in_case_is_the_same_hostname() {
+        // The router lower-cases before it looks up, so these are one name to
+        // the deployment and must not become two entries.
+        let text = add_domain(TWO_SITES, "blog", "WWW.Example.COM").unwrap().unwrap();
+        assert_eq!(text, TWO_SITES);
+    }
+
+    #[test]
+    fn a_hostname_claimed_by_another_site_is_refused_and_never_written() {
+        // Two sites answering one hostname is a deployment whose behaviour
+        // depends on iteration order. The whole-document validation is what
+        // catches it, which is why these functions return text instead of
+        // writing it.
+        let refused = add_domain(TWO_SITES, "blog", "first.example.com");
+        assert!(matches!(refused, Err(ConfigError::Invalid(_))), "{refused:?}");
+    }
+
+    #[test]
+    fn adding_to_a_site_that_does_not_exist_reports_none() {
+        assert!(add_domain(TWO_SITES, "ghost", "x.example.com").unwrap().is_none());
+    }
+
+    #[test]
+    fn removing_a_subdomain_leaves_the_rest_of_the_document_alone() {
+        let text = remove_domain(TWO_SITES, "blog", "www.example.com").unwrap().unwrap();
+        let config = Config::parse(&text).unwrap();
+        assert_eq!(config.sites[1].domains, vec!["example.com"]);
+        assert_eq!(config.sites[0].domains, vec!["first.example.com"], "the first site is intact");
+        assert!(text.contains("# the second, with a comment of its own"), "{text}");
+    }
+
+    #[test]
+    fn removing_the_last_hostname_is_refused_and_names_the_command_that_means_it() {
+        // A site nothing can reach is not a smaller site; it is a broken one.
+        // The operator who wants that means `site remove`, so the refusal says so
+        // rather than leaving them to discover an unreachable site later.
+        let Err(ConfigError::Invalid(problems)) =
+            remove_domain(TWO_SITES, "first", "first.example.com")
+        else {
+            panic!("a site must not be left with no hostname");
+        };
+        assert!(problems[0].message.contains("site remove first"), "{:?}", problems[0]);
+    }
+
+    #[test]
+    fn removing_a_hostname_the_site_does_not_have_changes_nothing() {
+        let text = remove_domain(TWO_SITES, "blog", "absent.example.com").unwrap().unwrap();
+        assert_eq!(text, TWO_SITES);
+    }
+
+    #[test]
+    fn a_domains_array_written_across_several_lines_is_still_edited_whole() {
+        // `init` writes one line and a person may not. The span runs to the line
+        // whose brackets balance, so a multi-line array is replaced entirely
+        // rather than leaving its tail behind as stray text.
+        let spread = "\
+version = 1
+
+[server]
+acme_email = \"a@b.com\"
+acme = \"self-signed\"
+
+[[nodes]]
+name = \"home\"
+role = \"owner\"
+
+[[sites]]
+name = \"blog\"
+domains = [
+  \"example.com\",
+  \"www.example.com\",
+]
+static_root = \"./sites/blog\"
+";
+        let text = add_domain(spread, "blog", "shop.example.com").unwrap().unwrap();
+        let config = Config::parse(&text).unwrap();
+        assert_eq!(
+            config.sites[0].domains,
+            vec!["example.com", "www.example.com", "shop.example.com"]
+        );
+        assert!(text.contains("static_root = \"./sites/blog\""), "the next key survived: {text}");
+        assert!(!text.contains("  \"example.com\","), "the old lines are gone: {text}");
+    }
+
+    #[test]
+    fn a_bracket_inside_a_quoted_string_does_not_end_the_array() {
+        // The parser counts brackets to find the end of the array, and a `]`
+        // inside a string closes nothing. Hostnames cannot contain one, but the
+        // counter must not depend on that to be correct.
+        assert_eq!(bracket_balance("domains = [\"a]b\", \"c\"]"), 0);
+        assert_eq!(bracket_balance("domains = ["), 1);
+        assert_eq!(bracket_balance("]"), -1);
+        assert_eq!(bracket_balance("domains = [] # a comment with ] in it"), 0);
+    }
+
+    #[test]
+    fn only_the_domains_key_is_matched_and_not_one_that_merely_starts_with_it() {
+        assert!(is_domains_key("domains = [\"a\"]"));
+        assert!(is_domains_key("  domains=[\"a\"]"));
+        assert!(!is_domains_key("domains_note = \"x\""));
+        assert!(!is_domains_key("# domains = [\"a\"]"));
     }
 }

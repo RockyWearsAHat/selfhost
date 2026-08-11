@@ -10,9 +10,26 @@
 //!
 //! A site is a piece of the deployment a person owns, so it lives in the
 //! hand-authored config, next to the server and node settings — not in the
-//! daemon-owned `data/services.toml`. The daemon reads this file at startup and
-//! does not watch it, so a change here takes effect on the next `selfhost run`
-//! or daemon restart, and the command says so rather than implying a live edit.
+//! daemon-owned `data/services.toml`.
+//!
+//! A running daemon *does* pick these changes up: it compares the config file's
+//! modification time and calls `Server::reload`, so routing follows an edit
+//! within a few seconds and the commands say so. This paragraph used to say the
+//! opposite — that a change waited for the next `selfhost run` — which was true
+//! when it was written and stopped being true when the reload was added.
+//! **Routing is the part that reloads.** Health probing does not, and neither
+//! does anything outside the proxy: a mailbox added to `[mail]` is read at
+//! startup and waits for a restart. The distinction matters more than the
+//! general claim, because a command that promises a live edit and delivers half
+//! of one is worse than the honest older sentence.
+//!
+//! # A subdomain is a hostname, not a site
+//!
+//! The proxy matches hostnames exactly — there is no wildcard and no pattern —
+//! so a name reaches a site only by being listed in that site's `domains`.
+//! `add-domain` is therefore the whole of what a subdomain needs on this side,
+//! and it exists because the command an operator reaches for instead (`site add`
+//! again, with the subdomain) builds a second site that serves nothing.
 //!
 //! # What `remove` will and will not do
 //!
@@ -39,8 +56,11 @@ pub fn run(arguments: &[String], config_path: &Path) -> Result<(), String> {
         Some("show") => show(arguments, config_path),
         Some("add") => add(arguments, config_path),
         Some("remove") => remove(arguments, config_path, &project_dir),
+        Some("add-domain") => add_domain(arguments, config_path),
+        Some("remove-domain") => remove_domain(arguments, config_path),
         Some(other) => Err(format!(
-            "unknown site subcommand \"{other}\" — expected list, show, add, or remove\n\n{USAGE}"
+            "unknown site subcommand \"{other}\" — expected list, show, add, remove, add-domain, \
+             or remove-domain\n\n{USAGE}"
         )),
     }
 }
@@ -54,6 +74,8 @@ Usage
   selfhost site show <name>
   selfhost site add <name> --domain <d1[,d2…]> [options]
   selfhost site remove <name> [--delete-content] [--yes]
+  selfhost site add-domain <name> <hostname>
+  selfhost site remove-domain <name> <hostname>
 
 Add options
   --domain <list>         Hostnames for the site; repeatable and comma-separated.
@@ -67,7 +89,11 @@ Add options
                           static files; repeatable. Needs at least one instance.
   --no-canonical-redirect Do not redirect the other domains to the first one.
 
-A change takes effect on the next `selfhost run` or daemon restart.
+Adding a subdomain is `add-domain` on the site that should answer it, not a new
+site: the proxy matches hostnames exactly, so a name reaches a site only if it is
+listed on it.
+
+A running daemon picks routing changes up by itself, within a few seconds.
 ";
 
 /// Loads and validates the config at `path`.
@@ -229,8 +255,106 @@ fn add(arguments: &[String], config_path: &Path) -> Result<(), String> {
     write_atomically(config_path, &updated)?;
 
     println!("✓ added site \"{name}\" — {}", describe(&site));
-    println!("  takes effect on the next `selfhost run` or daemon restart");
+    println!("  a running daemon picks this up by itself, within a few seconds");
     Ok(())
+}
+
+/// Adds one hostname to an existing site.
+///
+/// The command a subdomain actually is. It exists because the alternative an
+/// operator reaches for — `site add` again, with the subdomain — produces a
+/// *second site* that shares the first one's content by accident or, more often,
+/// serves nothing at all. A hostname is not a site; it is a name a site answers
+/// to, and the proxy matches those exactly.
+///
+/// It prints what is left to do rather than pretending routing is the whole job:
+/// a hostname the world cannot resolve is not reachable however well it routes,
+/// and which of the two DNS paths applies is a property of the deployment.
+fn add_domain(arguments: &[String], config_path: &Path) -> Result<(), String> {
+    let (name, hostname) = two_positionals(arguments, "add-domain")?;
+    let source = read_source(config_path)?;
+    let edited = selfhost_config::edit::add_domain(&source, &name, &hostname)
+        .map_err(|error| format!("that hostname cannot be added:\n{error}"))?;
+    let updated = match edited {
+        Some(updated) => updated,
+        None => return Err(unknown_site(&name, &load(config_path)?)),
+    };
+
+    if updated == source {
+        println!("· site \"{name}\" already answers to {hostname} — nothing to do");
+        return Ok(());
+    }
+    write_atomically(config_path, &updated)?;
+
+    println!("✓ site \"{name}\" now answers to {hostname}");
+    println!("  a running daemon picks this up by itself, within a few seconds");
+    print_dns_next_step(config_path, &hostname);
+    Ok(())
+}
+
+/// Removes one hostname from a site, leaving the site itself in place.
+fn remove_domain(arguments: &[String], config_path: &Path) -> Result<(), String> {
+    let (name, hostname) = two_positionals(arguments, "remove-domain")?;
+    let source = read_source(config_path)?;
+    let edited = selfhost_config::edit::remove_domain(&source, &name, &hostname)
+        .map_err(|error| format!("that hostname cannot be removed:\n{error}"))?;
+    let updated = match edited {
+        Some(updated) => updated,
+        None => return Err(unknown_site(&name, &load(config_path)?)),
+    };
+
+    if updated == source {
+        println!("· site \"{name}\" does not answer to {hostname} — nothing to do");
+        return Ok(());
+    }
+    write_atomically(config_path, &updated)?;
+
+    println!("✓ site \"{name}\" no longer answers to {hostname}");
+    println!("  a running daemon picks this up by itself, within a few seconds");
+    Ok(())
+}
+
+/// Says what still has to happen before the new hostname resolves.
+///
+/// Routing is half of a subdomain and the half this command owns; the other half
+/// is a DNS record, and which door that goes through is a property of the
+/// deployment rather than of the request. Reading the config to answer it is the
+/// difference between a command that did its job and one that appears to have.
+fn print_dns_next_step(config_path: &Path, hostname: &str) {
+    let Ok(config) = load(config_path) else {
+        return;
+    };
+    // The registrar is named first because it is the one that reaches the public
+    // internet: a box that is authoritative for its own zone still needs the
+    // delegation to be true at the registrar.
+    if config.registrar.is_some() {
+        println!("  DNS: run `selfhost dns sync` to see the record for {hostname}, then");
+        println!("       `selfhost dns sync --apply` to push it");
+        return;
+    }
+    let serves_zone = config
+        .dns
+        .as_ref()
+        .is_some_and(|dns| dns.zones.iter().any(|zone| hostname.ends_with(&zone.domain)));
+    if serves_zone {
+        println!("  DNS: this box is authoritative for that zone — a bare zone derives the");
+        println!("       record for {hostname}; a zone with explicit records needs one adding");
+        return;
+    }
+    println!("  DNS: no [registrar] and no zone here covers {hostname} — add the record");
+    println!("       wherever this domain's DNS is hosted, pointing at this box");
+}
+
+/// Reads the two positional arguments a domain command takes.
+fn two_positionals(arguments: &[String], verb: &str) -> Result<(String, String), String> {
+    let mut positionals = arguments.iter().skip(2).filter(|word| !word.starts_with("--"));
+    let (Some(name), Some(hostname)) = (positionals.next(), positionals.next()) else {
+        return Err(format!(
+            "site {verb} needs a site and a hostname: \
+             `selfhost site {verb} <name> <hostname>`\n\n{USAGE}"
+        ));
+    };
+    Ok((name.clone(), hostname.clone()))
 }
 
 /// Removes a site's routing, and optionally its static content.

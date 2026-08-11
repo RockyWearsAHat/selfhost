@@ -67,8 +67,10 @@ Commands
   init [--email <address>]   Write a starter config into the current directory
   check                      Validate the config and report every problem
   routes                     Show which hostname maps to which site
-  site <list|show|add|remove>
-                             List, inspect, add, or unroute a website
+  site <list|show|add|remove|add-domain|remove-domain>
+                             List, inspect, add, or unroute a website; add or
+                             remove one hostname on an existing one, which is
+                             what a subdomain is
 
   doctor [--deep] [--scan-lan]
                              Diagnose, and chase the cause of anything broken
