@@ -292,6 +292,7 @@ dependencies = [
 name = "selfhost-cli"
 version = "0.1.0"
 dependencies = [
+ "ring",
  "rustls",
  "selfhost-acme",
  "selfhost-admin",
@@ -307,6 +308,7 @@ dependencies = [
  "selfhost-mesh",
  "selfhost-proxy",
  "selfhost-registrar",
+ "selfhost-reports",
  "selfhost-screen",
  "selfhost-storage",
  "selfhost-supervisor",
@@ -445,6 +447,17 @@ version = "0.1.0"
 dependencies = [
  "selfhost-config",
  "selfhost-json",
+]
+
+[[package]]
+name = "selfhost-reports"
+version = "0.1.0"
+dependencies = [
+ "ring",
+ "selfhost-http",
+ "selfhost-json",
+ "selfhost-mail",
+ "tokio",
 ]
 
 [[package]]

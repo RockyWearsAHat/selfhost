@@ -20,6 +20,7 @@ members = [
     "crates/storage",
     "crates/ws",
     "crates/registrar",
+    "crates/reports",
     "crates/supervisor",
     "crates/rui",
     "crates/console",
@@ -84,6 +85,7 @@ selfhost-mail = { path = "crates/mail" }
 selfhost-mesh = { path = "crates/mesh" }
 selfhost-proxy = { path = "crates/proxy" }
 selfhost-registrar = { path = "crates/registrar" }
+selfhost-reports = { path = "crates/reports" }
 selfhost-screen = { path = "crates/screen" }
 selfhost-storage = { path = "crates/storage" }
 selfhost-supervisor = { path = "crates/supervisor" }

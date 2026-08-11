@@ -1,0 +1,20 @@
+[package]
+name = "selfhost-reports"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "A public intake for bug reports: stored in the box's own database and delivered to the owner's mailbox."
+
+[dependencies]
+selfhost-http = { workspace = true }
+selfhost-json = { workspace = true }
+selfhost-mail = { workspace = true }
+# SHA-256 for the report fingerprint and for the one-way source hash. The same
+# `ring` the rest of the stack already links; no second implementation enters.
+ring = { workspace = true }
+tokio = { workspace = true }
+
+[lints.rust]
+unsafe_code = "forbid"
