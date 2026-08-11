@@ -103,6 +103,18 @@ pub enum Purpose {
     Register,
     /// Issued to a login page about to request an assertion.
     Login,
+    /// Issued to somebody redeeming an invitation, who has proved nothing yet
+    /// beyond holding a code.
+    ///
+    /// Its own purpose rather than a second use of [`Purpose::Register`], for
+    /// the reason this enum exists at all: the invite door is reachable without
+    /// a session and the registration door is owner-only, so a challenge minted
+    /// at one must not complete a ceremony at the other. Neither direction is a
+    /// privilege gain today — the owner-only route still demands the owner, and
+    /// the invite route still demands a code — but "the two doors cannot be
+    /// crossed" is a property worth holding structurally rather than re-deriving
+    /// from what each door happens to check.
+    Invite,
 }
 
 /// One outstanding challenge.
@@ -410,6 +422,22 @@ impl Webauthn {
         ]))
     }
 
+    /// Issues an invitation's challenge, as `{"challenge", "rpId", "name"}`.
+    ///
+    /// The extra field is the whole difference: an ordinary registration is
+    /// driven by a logged-in owner who already knows whose credential they are
+    /// making, while an invitee's browser must be *told* the name to put in the
+    /// passkey — and told it by the daemon, from the invitation, rather than
+    /// asked for it. Built here rather than assembled by the route so the
+    /// ceremony's wire shape stays in the module that defines the ceremony.
+    pub fn invite_challenge(&self, name: &str) -> io::Result<Json> {
+        Ok(Json::object([
+            ("challenge", Json::string(self.challenges.issue(Purpose::Invite)?)),
+            ("rpId", Json::string(&self.rp_id)),
+            ("name", Json::string(name)),
+        ]))
+    }
+
     /// Registers the credential described by a browser's registration body.
     ///
     /// The body carries what `navigator.credentials.create()` returned:
@@ -419,14 +447,42 @@ impl Webauthn {
     /// passkey this is; [`DEFAULT_USER`] when unnamed) and `label`. Every
     /// failure is one uninformative error: the caller is already
     /// authenticated, but a registration body is still attacker-shaped input.
+    ///
+    /// The name comes from the body because only the owner can reach this
+    /// route, and the owner may register a credential for anybody. The invite
+    /// door cannot afford that and does not use it — see [`Self::register_as`].
     pub fn register(&self, body: &Json) -> Result<Passkey, RefusedCeremony> {
+        self.register_as(body, Purpose::Register, None)
+    }
+
+    /// Registers a credential under a name this method is *given*, ignoring
+    /// whatever the body claims.
+    ///
+    /// This is the whole security difference between the owner's registration
+    /// route and the invite door. [`Self::register`] reads `user` out of the
+    /// posted body, which is correct when only the owner can reach it. At the
+    /// invite door the caller is a stranger holding a one-time code, and a name
+    /// taken from their request would let a code minted for `mom` produce a
+    /// passkey called anything they liked — including a name the operator had
+    /// already granted real power to. So the caller passes the name from
+    /// [`crate::invite::Invites::redeem`] and the body's own `user` field is
+    /// discarded, not merely defaulted.
+    ///
+    /// `purpose` is likewise a parameter so the challenge a ceremony redeems
+    /// must be one issued at the same door; see [`Purpose::Invite`].
+    pub fn register_as(
+        &self,
+        body: &Json,
+        purpose: Purpose,
+        user: Option<&str>,
+    ) -> Result<Passkey, RefusedCeremony> {
         let id = credential_id(body)?;
         if body.get("algorithm").and_then(Json::as_i64) != Some(COSE_ES256) {
             return Err(RefusedCeremony);
         }
         let client_data = body.get("clientDataJSON").and_then(Json::as_str).ok_or(RefusedCeremony)?;
         let client_data = b64url_decode(client_data).ok_or(RefusedCeremony)?;
-        self.check_client_data(&client_data, "webauthn.create", Purpose::Register)?;
+        self.check_client_data(&client_data, "webauthn.create", purpose)?;
 
         let auth_data = decoded_field(body, "authenticatorData")?;
         self.check_auth_data(&auth_data, FLAG_USER_PRESENT | FLAG_USER_VERIFIED | FLAG_ATTESTED_CREDENTIAL)?;
@@ -437,7 +493,10 @@ impl Webauthn {
         let passkey = Passkey {
             id,
             public_key,
-            user: named_field(body, "user", DEFAULT_USER, MAX_USER_CHARS),
+            user: match user {
+                Some(given) => given.to_owned(),
+                None => named_field(body, "user", DEFAULT_USER, MAX_USER_CHARS),
+            },
             // Bounded like every stored string: both names render in the
             // console and live in an owner-only file, but they are still input.
             label: named_field(body, "label", "passkey", 64),
@@ -710,7 +769,20 @@ mod tests {
         /// A complete registration body for a freshly issued challenge,
         /// registering `user`'s passkey on the device called `label`.
         fn register_body(&self, webauthn: &Webauthn, user: &str, label: &str) -> Json {
-            let challenge = challenge_of(webauthn.challenge(Purpose::Register).unwrap());
+            self.register_body_for(webauthn, Purpose::Register, user, label)
+        }
+
+        /// The same, at a named door — the seam the invite tests bend, so a
+        /// ceremony can be built with a challenge from one purpose and offered
+        /// at another.
+        fn register_body_for(
+            &self,
+            webauthn: &Webauthn,
+            purpose: Purpose,
+            user: &str,
+            label: &str,
+        ) -> Json {
+            let challenge = challenge_of(webauthn.challenge(purpose).unwrap());
             let client = Self::client_data("webauthn.create", &challenge, &format!("https://{RP}"));
             let flags = FLAG_USER_PRESENT | FLAG_USER_VERIFIED | FLAG_ATTESTED_CREDENTIAL;
             Json::object([
@@ -798,6 +870,51 @@ mod tests {
 
         let signer = webauthn.verify_login(&device.login_body(&webauthn)).expect("a real assertion verifies");
         assert_eq!(signer.user, "Alex", "the assertion answers who signed it");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_invitation_registers_under_its_own_name_and_never_the_bodys() {
+        // The property the whole invite door rests on. The caller there is a
+        // stranger holding a code, so a name taken from their request would let
+        // a code minted for one person mint a credential for another — including
+        // one the operator had already granted real power to.
+        let dir = scratch("invite-name");
+        let webauthn = webauthn(&dir);
+        let device = Authenticator::new("credential-invited");
+        let body = device.register_body_for(&webauthn, Purpose::Invite, "alex", "phone");
+
+        let stored = webauthn
+            .register_as(&body, Purpose::Invite, Some("mom"))
+            .expect("the ceremony is sound");
+        assert_eq!(stored.user, "mom", "the invitation's name wins over the body's claim");
+        // And it is the stored name, not merely the returned one, that a later
+        // login mints its session under.
+        assert_eq!(webauthn.verify_login(&device.login_body(&webauthn)).unwrap().user, "mom");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_challenge_from_one_door_cannot_complete_a_ceremony_at_the_other() {
+        // `Purpose::Invite` exists so the unauthenticated invite door and the
+        // owner-only registration door cannot be crossed. Neither direction is
+        // a privilege gain today; this keeps it structural rather than a
+        // property re-derived from what each door happens to check.
+        let dir = scratch("invite-purpose");
+        let webauthn = webauthn(&dir);
+        let device = Authenticator::new("credential-crossed");
+
+        let owners = device.register_body_for(&webauthn, Purpose::Register, "mom", "phone");
+        assert!(
+            webauthn.register_as(&owners, Purpose::Invite, Some("mom")).is_err(),
+            "a registration challenge does not open the invite door"
+        );
+
+        let invitees = device.register_body_for(&webauthn, Purpose::Invite, "mom", "phone");
+        assert!(
+            webauthn.register_as(&invitees, Purpose::Register, None).is_err(),
+            "and an invitation's challenge does not complete an owner's registration"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

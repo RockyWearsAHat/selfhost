@@ -40,6 +40,31 @@
   </div>
 </section>
 
+<!-- INVITE
+     Reached only by opening a link of the form /#invite=<code>. It is the one
+     screen somebody who has never had a credential can use: the code stands in
+     for the session, the daemon names the person it was minted for, and the
+     ceremony registers a passkey under *that* name — never one typed here. -->
+<section id="view-invite" hidden>
+  <div class="plate login-plate">
+    <header class="login-mast">
+      <span class="wordmark">SELFHOST</span>
+      <span class="designation">SET UP ACCESS</span>
+    </header>
+    <p id="invite-greeting" class="caption">Checking the invitation…</p>
+    <div class="login-submit-row">
+      <button type="button" class="btn primary" id="invite-start" hidden>SET&nbsp;UP&nbsp;PASSKEY</button>
+      <span id="invite-sweep" class="sweep" hidden></span>
+    </div>
+    <p id="invite-note" class="caption bad-ink" hidden></p>
+    <p id="invite-help" class="caption" hidden>
+      Your device will ask for a fingerprint, a face, or its PIN. That is what
+      logs you in from then on — there is no password to remember, and nothing
+      leaves this device.
+    </p>
+  </div>
+</section>
+
 <!-- CONSOLE -->
 <section id="view-console" hidden>
 

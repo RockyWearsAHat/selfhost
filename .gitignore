@@ -51,3 +51,7 @@ scripts/verify-hardening.zsh
 scripts/lockdown.sh
 scripts/verify-security.sh
 docs/SECURITY.md
+
+# Scratch deployments the dx labs build to prove a command works end to end.
+# The lab rebuilds it on every run; nothing in it is source.
+/gen/

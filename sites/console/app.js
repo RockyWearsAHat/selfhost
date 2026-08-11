@@ -2187,7 +2187,9 @@ function boot() {
 
   /** Everything the page knows. The DOM is a function of this and nothing else. */
   const state = {
-    view: "loading",            // "login" | "console"
+    view: "loading",            // "login" | "console" | "invite"
+    invite: null,               // the code from an /#invite= link, while redeeming
+    inviteName: null,           // who the daemon says that code was minted for
     link: "connecting",         // "connecting" | "connected" | "lost"
     services: [],
     selected: null,             // tracked by NAME, never by index
@@ -2272,12 +2274,173 @@ function boot() {
     return { status: response.status, body: payload };
   }
 
+  /* ── invitation ───────────────────────────────────────────────────── */
+
+  /** The code out of a `#invite=<code>` fragment, or "".
+   *
+   *  A fragment rather than a query string on purpose: the part after the `#`
+   *  is never sent to the server and never lands in an access log, and the code
+   *  is a credential. It is stripped from the address bar the moment it has
+   *  been read, so a shoulder-surfed URL bar and a shared screen do not hand it
+   *  to somebody else. */
+  function inviteCode() {
+    const match = /^#invite=([A-Za-z0-9_-]{1,128})$/.exec(location.hash || "");
+    return match ? match[1] : "";
+  }
+
+  /** Opens the set-up screen for a code and names the person it was minted for.
+   *
+   *  The name is asked of the daemon rather than typed here, which is the whole
+   *  security shape of this screen: the browser is *told* who it is registering
+   *  a credential for, so a code minted for one person cannot be turned into a
+   *  passkey for another by editing a field. */
+  async function showInvite(code) {
+    state.view = "invite";
+    state.invite = code;
+    $("view-login").hidden = true;
+    $("view-console").hidden = true;
+    $("view-invite").hidden = false;
+    // Read once, then gone: from here it lives in `state.invite` only.
+    history.replaceState(null, "", location.pathname + location.search);
+
+    let reply;
+    try { reply = await api("/api/invite/challenge", { method: "POST", body: { code } }); }
+    catch { inviteFailed("cannot reach the server"); return; }
+    if (reply.status !== 200 || !reply.body || typeof reply.body.name !== "string") {
+      // Every way of being wrong — unknown, expired, already used — comes back
+      // as one refusal, so the wording here has to cover all of them honestly
+      // rather than guess which one it was.
+      inviteFailed(reply.status === 429
+        ? "too many attempts, wait a minute"
+        : "this invitation is not valid any more — ask for a new link");
+      return;
+    }
+    state.inviteName = reply.body.name;
+    $("invite-greeting").textContent = `You have been invited as ${reply.body.name}.`;
+    $("invite-start").hidden = false;
+    $("invite-help").hidden = false;
+  }
+
+  /** Says why the invitation cannot be used, and offers the ordinary door. */
+  function inviteFailed(text) {
+    $("invite-greeting").textContent = "";
+    $("invite-start").hidden = true;
+    $("invite-help").hidden = true;
+    const line = $("invite-note");
+    line.textContent = text;
+    line.hidden = false;
+  }
+
+  /** Registers this device's passkey against the invitation.
+   *
+   *  A fresh challenge is taken here rather than reusing the one that named the
+   *  person: the first was issued when the page opened and the reader may have
+   *  taken a minute, and a ceremony that fails on a lapsed challenge would read
+   *  to them as a broken invitation. */
+  async function redeemInvite() {
+    const code = state.invite;
+    if (!code) return;
+    $("invite-start").disabled = true;
+    $("invite-note").hidden = true;
+    $("invite-sweep").hidden = false;
+    try {
+      let issued;
+      try { issued = await api("/api/invite/challenge", { method: "POST", body: { code } }); }
+      catch { inviteFailed("cannot reach the server"); return; }
+      const challenge = issued.status === 200 && issued.body
+        ? b64urlToBuf(issued.body.challenge) : null;
+      if (!challenge) {
+        inviteFailed(issued.status === 429
+          ? "too many attempts, wait a minute"
+          : "this invitation is not valid any more — ask for a new link");
+        return;
+      }
+      const who = issued.body.name;
+
+      let credential;
+      try {
+        credential = await navigator.credentials.create({
+          publicKey: {
+            challenge,
+            rp: { id: issued.body.rpId, name: "selfhost" },
+            // The same handle shape `registerPasskey` uses, so a person invited
+            // here and a person registered by the owner are one kind of
+            // credential and the login picker treats them alike.
+            user: {
+              id: new TextEncoder().encode(`selfhost-user:${who.toLowerCase()}`),
+              name: who,
+              displayName: who,
+            },
+            pubKeyCredParams: [{ type: "public-key", alg: -7 }],
+            authenticatorSelection: {
+              residentKey: "required",
+              userVerification: "required",
+            },
+            attestation: "none",
+            timeout: 60000,
+          },
+        });
+      } catch {
+        // Cancelled at the authenticator. The invitation is untouched — it is
+        // spent only by a registration that actually succeeded — so this is a
+        // retry, not a dead end, and it says so.
+        $("invite-note").textContent = "the prompt was dismissed — the invitation still works";
+        $("invite-note").hidden = false;
+        return;
+      }
+      if (!credential) return;
+      const made = credential.response;
+      if (typeof made.getPublicKey !== "function" || typeof made.getAuthenticatorData !== "function") {
+        inviteFailed("this browser cannot export the passkey's public key");
+        return;
+      }
+      let reply;
+      try {
+        reply = await api("/api/invite/register", {
+          method: "POST",
+          body: {
+            code,
+            id: credential.id,
+            algorithm: made.getPublicKeyAlgorithm(),
+            publicKey: bufToB64url(new Uint8Array(made.getPublicKey())),
+            clientDataJSON: bufToB64url(new Uint8Array(made.clientDataJSON)),
+            authenticatorData: bufToB64url(new Uint8Array(made.getAuthenticatorData())),
+            label: deviceLabel(navigator.userAgent),
+          },
+        });
+      } catch { inviteFailed("cannot reach the server"); return; }
+      if (reply.status < 200 || reply.status >= 300) {
+        inviteFailed(reply.status === 429
+          ? "too many attempts, wait a minute"
+          : "the registration was not accepted — ask for a new link");
+        return;
+      }
+      // Done. The invitation is spent; from here they are an ordinary person
+      // with a passkey, so they go through the ordinary door.
+      state.invite = null;
+      $("view-invite").hidden = true;
+      showLogin(`${who}: you are set up — use the passkey button to log in`);
+    } finally {
+      $("invite-start").disabled = false;
+      $("invite-sweep").hidden = true;
+    }
+  }
+
   /* ── session ──────────────────────────────────────────────────────── */
 
-  /** Decides which view to open from whether a session cookie is accepted.
+  /** Decides which view to open: an invitation link first, then whether a
+   *  session cookie is accepted.
+   *
+   *  The invitation is checked ahead of the session probe because the person
+   *  opening one has no session and never will until it is redeemed — asking
+   *  the daemon about a cookie that cannot exist would only put a login form in
+   *  front of somebody who has nothing to type into it.
+   *
    *  The probe rides a slow tunnel: anything typed into the password field
    *  while it was in flight must survive the view settling. */
   async function checkSession() {
+    const invitation = inviteCode();
+    if (invitation) { showInvite(invitation); return; }
     try {
       const reply = await api("/api/session");
       if (reply.status === 200) { rememberUser(reply); enterConsole(); }
@@ -2311,6 +2474,7 @@ function boot() {
     state.view = "login";
     clearTimeout(pollTimer);
     $("view-console").hidden = true;
+    $("view-invite").hidden = true;
     $("view-login").hidden = false;
     const line = $("login-note");
     line.textContent = note;
@@ -2356,6 +2520,7 @@ function boot() {
     state.view = "console";
     state.link = "connecting";
     $("view-login").hidden = true;
+    $("view-invite").hidden = true;
     $("view-console").hidden = false;
     showUser();
     render();
@@ -6648,6 +6813,8 @@ function boot() {
     if (!document.hidden && state.view === "console") poll();
     scheduleLogs();
   });
+
+  $("invite-start").addEventListener("click", redeemInvite);
 
   checkSession();
 }

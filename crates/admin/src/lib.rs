@@ -45,8 +45,10 @@
 pub mod audit_api;
 pub mod dav_api;
 pub mod desk_api;
+pub mod invite;
 pub mod mesh_api;
 pub mod passwd;
+pub mod people_api;
 pub mod session;
 pub mod storage_api;
 pub mod store;
@@ -58,7 +60,16 @@ pub mod webauthn;
 use selfhost_firewall::Manager;
 use selfhost_git::Watches;
 use selfhost_http::{Body, Method, Request, Response, Status};
-use selfhost_identity::{Caller, Capability, Opening, People, Policy};
+use selfhost_identity::{Caller, Capability, Opening, People, PersonName, Policy};
+
+/// What a deployment with no permission registry answers on every people route.
+///
+/// One sentence in one place, because four routes give it and a caller
+/// distinguishing them by wording would be reading a difference that is not
+/// there.
+const NO_REGISTRY: &str =
+    "this daemon holds no permission registry, so it can neither name people nor grant them \
+     anything; it was built without one";
 use selfhost_json::Json;
 use selfhost_supervisor::Supervisor;
 use selfhost_supervisor::state::{spec_from_json, spec_to_json};
@@ -123,6 +134,14 @@ pub struct Api {
     /// from this registry, and a person with no registry to be found in holds
     /// exactly what a person with an empty entry holds, which is nothing.
     people: Option<People>,
+    /// The outstanding invitations: one-time codes that let somebody who is not
+    /// the owner register a passkey under a name the owner chose.
+    ///
+    /// `None` until a data directory has been named, and `None` closes the
+    /// invite door completely rather than opening it unguarded — the redemption
+    /// routes answer as though the path were not served, which is the honest
+    /// report for a deployment that has invited nobody. See [`invite`].
+    invites: Option<invite::Invites>,
     /// The shares this daemon serves, opened once at startup.
     ///
     /// `None` when no `[[shares]]` block was declared, and `None` is not a
@@ -225,6 +244,16 @@ enum Demand {
     /// confer it. Until there is a capability that honestly describes it, these
     /// routes ask for the identity that cannot be granted to anybody.
     OwnerOnly,
+    /// Anyone the wall already admitted, holding anything or nothing.
+    ///
+    /// Exactly one route asks this: `GET /api/whoami`. A permission-shaped
+    /// interface cannot exist until a client can ask what the person in front of
+    /// it may do, and a person who holds nothing must get an honest empty answer
+    /// rather than the uniform `401` — otherwise "you were refused" and "you
+    /// hold nothing yet" are the same event to the only program that could
+    /// explain the difference. It discloses nothing the caller does not already
+    /// have: their own name, their own credential kind, their own capabilities.
+    Authenticated,
     /// Nobody, ever.
     ///
     /// The demand of a route whose target could not name anything this
@@ -293,6 +322,22 @@ enum Route<'a> {
     ListPasskeys,
     /// `DELETE /api/webauthn/credentials/<id>`
     RemovePasskey(&'a str),
+    /// `GET /api/whoami`
+    WhoAmI,
+    /// `GET /api/people`
+    ListPeople,
+    /// `GET /api/people/capabilities`
+    Vocabulary,
+    /// `PUT /api/people/<name>`
+    SetGrants(&'a str),
+    /// `DELETE /api/people/<name>`
+    ForgetPerson(&'a str),
+    /// `POST /api/people/<name>/invite`
+    MintInvite(&'a str),
+    /// `GET /api/people/invites`
+    ListInvites,
+    /// `DELETE /api/people/invites/<name>`
+    RevokeInvite(&'a str),
 }
 
 impl<'a> Route<'a> {
@@ -344,6 +389,25 @@ impl<'a> Route<'a> {
             (Method::Delete, ["api", "webauthn", "credentials", id]) => {
                 Some(Self::RemovePasskey(id))
             }
+            // What the caller is, answered to the caller themselves. See
+            // `Demand::Authenticated` for why this one is not owner-only.
+            (Method::Get, ["api", "whoami"]) => Some(Self::WhoAmI),
+            // Matched ahead of the per-person routes below: "capabilities" is
+            // the vocabulary, not somebody called `capabilities`. It cannot
+            // collide in practice either way — a person's name is validated by
+            // `PersonName` and the owner's name is refused — but the order is
+            // the guarantee rather than the argument.
+            (Method::Get, ["api", "people", "capabilities"]) => Some(Self::Vocabulary),
+            // Matched ahead of the per-person routes for the same reason
+            // "capabilities" is: "invites" is the pending list, never somebody
+            // called `invites`. The four-segment forms below cannot collide with
+            // the three-segment ones either way.
+            (Method::Get, ["api", "people", "invites"]) => Some(Self::ListInvites),
+            (Method::Delete, ["api", "people", "invites", name]) => Some(Self::RevokeInvite(name)),
+            (Method::Post, ["api", "people", name, "invite"]) => Some(Self::MintInvite(name)),
+            (Method::Get, ["api", "people"]) => Some(Self::ListPeople),
+            (Method::Put, ["api", "people", name]) => Some(Self::SetGrants(name)),
+            (Method::Delete, ["api", "people", name]) => Some(Self::ForgetPerson(name)),
             _ => None,
         }
     }
@@ -409,6 +473,28 @@ impl<'a> Route<'a> {
             | Self::Register
             | Self::ListPasskeys
             | Self::RemovePasskey(_) => Demand::OwnerOnly,
+            // Writing the permission registry is minting authority, exactly as
+            // registering a passkey is: a grant is a power somebody will hold
+            // until it is taken away, and the vocabulary has no word for "may
+            // grant" because no grant should ever confer it. So these ask for
+            // the identity that cannot be delegated. Reading the roster joins
+            // them because it is a list of who can reach what — a target list,
+            // as `crates/identity`'s registry says in its own header.
+            Self::ListPeople | Self::SetGrants(_) | Self::ForgetPerson(_) => Demand::OwnerOnly,
+            // Minting an invitation is the most concentrated form of the same
+            // act: it does not merely write down a power, it creates the means
+            // by which somebody will prove they are the person who holds it. If
+            // writing the registry is owner-only then handing out the way in
+            // must be, and by the same argument — the vocabulary has no word for
+            // "may create authority", because no grant should ever confer it.
+            // Reading and withdrawing the pending list join them because that
+            // list, like the roster, is a list of who is about to be able to
+            // reach this machine.
+            Self::MintInvite(_) | Self::ListInvites | Self::RevokeInvite(_) => Demand::OwnerOnly,
+            // The vocabulary is a constant of the build, not a fact about this
+            // deployment: it names the words that exist, never who holds one.
+            // A client needs it to render a grant editor at all.
+            Self::Vocabulary | Self::WhoAmI => Demand::Authenticated,
         }
     }
 }
@@ -508,6 +594,7 @@ impl Api {
             streams: Streams::new(),
             policy: Policy::locked_down(),
             people: None,
+            invites: None,
             storage: None,
             desktop: None,
             webdav: Webdav::new().ok().map(Arc::new),
@@ -587,8 +674,25 @@ impl Api {
     /// injected here, at the one place that already owns it.
     pub fn with_console_auth(self, dir: &Path) -> Self {
         self.with_console_auth_parts(ConsolePassword::load(dir), Sessions::new())
-            .with_people(People::with_writer(dir, token::write_private))
+            .with_people(people_registry(dir))
+            .with_invites(invite::Invites::load(dir))
             .with_audit(selfhost_identity::AuditLog::in_dir(dir))
+    }
+
+    /// Records the invitation store the invite door reads and the owner's mint
+    /// route writes.
+    ///
+    /// Wired from the data directory alongside the people registry, because an
+    /// invitation and the grant set it will eventually be paired with are two
+    /// halves of one act and there is nothing to decide about where either
+    /// lives. Separate from [`Api::with_console_auth`] on the same grounds as
+    /// [`Api::with_people`]: so a test can hand in a scratch store.
+    ///
+    /// Absent, every invite route answers `404` — a deployment that has invited
+    /// nobody should not advertise a door.
+    pub fn with_invites(mut self, invites: invite::Invites) -> Self {
+        self.invites = Some(invites);
+        self
     }
 
     /// Records the audit log this API reads the trail back out of.
@@ -728,6 +832,27 @@ impl Api {
             };
         }
 
+        // The invite door sits ahead of the wall by necessity rather than by
+        // analogy: everything else out here is how an *owner* gets authorised,
+        // and this is how somebody who has never had a credential gets their
+        // first one. What stands in for a session is the one-time code — checked
+        // against the store on both halves, feeding the same failure gate the
+        // login doors share, and carrying the same CSRF header for the same
+        // reason `POST /api/session` does. See [`invite`].
+        if path == "/api/invite/challenge" || path == "/api/invite/register" {
+            if request.method != Method::Post {
+                return problem(Status(404), "no such endpoint");
+            }
+            if !has_console_header(request) {
+                return problem(Status(401), "authorisation required");
+            }
+            return if path == "/api/invite/register" {
+                self.invite_register(body)
+            } else {
+                self.invite_challenge(body)
+            };
+        }
+
         // The passkey login pair sits ahead of the wall for the same reason
         // `POST /api/session` does: it is how a browser *gets* authorised.
         // Both are POSTs that carry the CSRF header — the challenge route
@@ -809,6 +934,275 @@ impl Api {
             Route::Register => self.webauthn_register(body),
             Route::ListPasskeys => self.webauthn_list(),
             Route::RemovePasskey(id) => self.webauthn_remove(id),
+            Route::WhoAmI => json(Status(200), people_api::whoami_json(&caller)),
+            Route::Vocabulary => json(Status(200), people_api::vocabulary_json()),
+            Route::ListPeople => self.list_people(),
+            Route::SetGrants(name) => self.set_grants(name, body),
+            Route::ForgetPerson(name) => self.forget_person(name),
+            Route::MintInvite(name) => self.mint_invite(name, body),
+            Route::ListInvites => self.list_invites(),
+            Route::RevokeInvite(name) => self.revoke_invite(name),
+        }
+    }
+
+    /// The permission registry, or the sentence explaining that there is none.
+    ///
+    /// A deployment whose daemon was built without [`Api::with_people`] has no
+    /// registry to read, and that is a `404` naming the cause rather than an
+    /// empty roster: "nobody is registered" and "this daemon cannot register
+    /// anybody" are different facts and only one of them is a configuration a
+    /// person can act on.
+    fn list_people(&self) -> Response {
+        match &self.people {
+            Some(people) => json(Status(200), people_api::roster_json(people)),
+            None => problem(Status(404), NO_REGISTRY),
+        }
+    }
+
+    /// Replaces everything one person holds.
+    ///
+    /// Creates the entry if this is the first grant they have been given, which
+    /// is what makes this route the way a second person comes to exist at all.
+    /// Their name still has to be a name — [`PersonName`] refuses the owner's
+    /// spelling in every casing, so no grant written here can touch the
+    /// operator's own authority.
+    fn set_grants(&self, name: &str, body: &[u8]) -> Response {
+        let Some(people) = &self.people else {
+            return problem(Status(404), NO_REGISTRY);
+        };
+        let Ok(person) = PersonName::parse(name) else {
+            return problem(
+                Status(400),
+                "not a usable person name: lower-case letters, digits and dashes, and never \
+                 the owner's own name",
+            );
+        };
+        let grants = match people_api::grants_from_body(body) {
+            Ok(grants) => grants,
+            Err(refusal) => return problem(Status(400), &refusal.message()),
+        };
+        match people.set_grants(&person, grants) {
+            Ok(()) => match people.find(&person) {
+                Some(entry) => json(Status(200), people_api::person_json(&entry)),
+                // The registry accepted the write and then could not find the
+                // entry it had just made. Nothing sane produces this; saying so
+                // is better than a 200 over a roster that disagrees with itself.
+                None => problem(Status(500), "the registry accepted the change and lost it"),
+            },
+            Err(error) => problem(Status(500), &format!("could not save the registry: {error}")),
+        }
+    }
+
+    /// Forgets a person entirely.
+    fn forget_person(&self, name: &str) -> Response {
+        let Some(people) = &self.people else {
+            return problem(Status(404), NO_REGISTRY);
+        };
+        let Ok(person) = PersonName::parse(name) else {
+            return problem(Status(400), "not a usable person name");
+        };
+        match people.remove(&person) {
+            Ok(true) => json(Status(200), Json::object([("forgot", Json::string(name))])),
+            Ok(false) => problem(Status(404), "nobody by that name holds anything here"),
+            Err(error) => problem(Status(500), &format!("could not save the registry: {error}")),
+        }
+    }
+
+    /// Mints a one-time invitation for `name` and returns the code once.
+    ///
+    /// The body may carry `{"hours": n}`; anything else, including no body at
+    /// all, means [`invite::DEFAULT_TTL_HOURS`]. A malformed body is not an
+    /// error here — the only field is an optional number with a safe default,
+    /// and refusing an invitation over a stray byte would be a worse failure
+    /// than quietly using the default the operator would have chosen anyway.
+    ///
+    /// The reply carries the code exactly once: it is not stored in a form this
+    /// daemon can reproduce (see [`invite`]), so an owner who loses it mints
+    /// another rather than looking the first one up.
+    ///
+    /// `holdsNothing` is reported alongside, because minting an invitation for
+    /// somebody with no entry in the registry is legal, occasionally deliberate,
+    /// and almost always a mistake — they would register a passkey, log in, and
+    /// find a console with nothing on it. Saying so is cheaper than the support
+    /// conversation.
+    fn mint_invite(&self, name: &str, body: &[u8]) -> Response {
+        let Some(invites) = &self.invites else {
+            return problem(Status(404), NO_REGISTRY);
+        };
+        let Ok(person) = PersonName::parse(name) else {
+            return problem(
+                Status(400),
+                "not a usable person name: lower-case letters, digits and dashes, and never \
+                 the owner's own name",
+            );
+        };
+        let hours = std::str::from_utf8(body)
+            .ok()
+            .and_then(|text| selfhost_json::parse(text).ok())
+            .and_then(|document| document.get("hours").and_then(Json::as_u64))
+            .unwrap_or(invite::DEFAULT_TTL_HOURS);
+
+        let code = match invites.mint(&person, hours) {
+            Ok(code) => code,
+            Err(error) => {
+                return problem(Status(500), &format!("could not save the invitation: {error}"));
+            }
+        };
+        let expires = invites
+            .outstanding()
+            .into_iter()
+            .find(|entry| entry.name == person)
+            .map(|entry| entry.expires_unix)
+            .unwrap_or(0);
+        let holds_nothing = self
+            .people
+            .as_ref()
+            .map(|people| people.find(&person).is_none_or(|entry| entry.grants.is_empty()))
+            .unwrap_or(true);
+
+        let mut fields = vec![
+            ("name", Json::string(person.as_str())),
+            ("code", Json::string(code.as_str())),
+            ("expiresUnix", Json::Number(expires as f64)),
+            ("holdsNothing", Json::Bool(holds_nothing)),
+        ];
+        // The one link an owner can send. Built from the console's own
+        // configured origin, never from a request header, for the same reason
+        // the WebAuthn relying party is: a hostname the caller could choose
+        // would be a hostname the caller could point the invitation at.
+        if let Some(origin) = self.console.as_ref().and_then(|console| console.origin.as_deref()) {
+            fields.push(("url", Json::string(format!("{origin}/#invite={code}"))));
+        }
+        json(Status(200), Json::object(fields))
+    }
+
+    /// Who has an invitation pending, and until when. Never a code.
+    fn list_invites(&self) -> Response {
+        let Some(invites) = &self.invites else {
+            return problem(Status(404), NO_REGISTRY);
+        };
+        let outstanding = invites.outstanding();
+        json(
+            Status(200),
+            Json::object([
+                (
+                    "invites",
+                    Json::array(outstanding.iter().map(|entry| {
+                        Json::object([
+                            ("name", Json::string(entry.name.as_str())),
+                            ("issuedUnix", Json::Number(entry.issued_unix as f64)),
+                            ("expiresUnix", Json::Number(entry.expires_unix as f64)),
+                        ])
+                    })),
+                ),
+                ("count", Json::Number(outstanding.len() as f64)),
+            ]),
+        )
+    }
+
+    /// Withdraws a pending invitation before anybody has used it.
+    fn revoke_invite(&self, name: &str) -> Response {
+        let Some(invites) = &self.invites else {
+            return problem(Status(404), NO_REGISTRY);
+        };
+        let Ok(person) = PersonName::parse(name) else {
+            return problem(Status(400), "not a usable person name");
+        };
+        match invites.revoke(&person) {
+            Ok(true) => json(Status(200), Json::object([("withdrew", Json::string(name))])),
+            Ok(false) => problem(Status(404), "nobody by that name has an invitation pending"),
+            Err(error) => {
+                problem(Status(500), &format!("could not save the invitations: {error}"))
+            }
+        }
+    }
+
+    /// The invite door's first half: a ceremony challenge, and the name the
+    /// credential must be made under.
+    ///
+    /// Answers only to a code this deployment really minted. That is not
+    /// avoidable secrecy — the browser has to be told which name to put in the
+    /// passkey it is about to create, and that name must come from the
+    /// invitation rather than from the person holding it — so the check is made
+    /// safe by rate limiting instead: every refusal feeds the same
+    /// [`FailureGate`] both login doors share, so guessing codes exhausts the
+    /// same small budget as guessing passwords.
+    fn invite_challenge(&self, body: &[u8]) -> Response {
+        let (Some(console), Some(invites)) = (&self.console, &self.invites) else {
+            return problem(Status(404), "no such endpoint");
+        };
+        let Some(webauthn) = &console.webauthn else {
+            return problem(Status(404), "no such endpoint");
+        };
+        if console.gate.locked() {
+            return problem(Status(429), "too many failed attempts; try again shortly");
+        }
+        let Some(name) = code_from_body(body).and_then(|code| invites.name_for(&code)) else {
+            console.gate.record_failure();
+            return problem(Status(401), "authorisation required");
+        };
+        match webauthn.invite_challenge(name.as_str()) {
+            Ok(challenge) => json(Status(200), challenge),
+            Err(error) => problem(Status(500), &format!("could not issue a challenge: {error}")),
+        }
+    }
+
+    /// The invite door's second half: the credential itself.
+    ///
+    /// The name is taken from the invitation and handed to
+    /// [`Webauthn::register_as`], so the body's own `user` field is discarded
+    /// rather than trusted — the one thing that keeps a code minted for one
+    /// person from producing a passkey for another. The invitation is spent only
+    /// once the authenticator has really produced a credential; see
+    /// [`invite::Invites::name_for`] for why that order and not the other.
+    ///
+    /// Success does not mint a session. The person has a credential now and logs
+    /// in with it through the door that already exists, which keeps exactly one
+    /// path in this crate that turns a passkey into a session.
+    fn invite_register(&self, body: &[u8]) -> Response {
+        let (Some(console), Some(invites)) = (&self.console, &self.invites) else {
+            return problem(Status(404), "no such endpoint");
+        };
+        let Some(webauthn) = &console.webauthn else {
+            return problem(Status(404), "no such endpoint");
+        };
+        if console.gate.locked() {
+            return problem(Status(429), "too many failed attempts; try again shortly");
+        }
+        let Ok(text) = std::str::from_utf8(body) else {
+            console.gate.record_failure();
+            return problem(Status(401), "authorisation required");
+        };
+        let Ok(document) = selfhost_json::parse(text) else {
+            console.gate.record_failure();
+            return problem(Status(401), "authorisation required");
+        };
+        let Some(code) = document.get("code").and_then(Json::as_str) else {
+            console.gate.record_failure();
+            return problem(Status(401), "authorisation required");
+        };
+        let Some(name) = invites.name_for(code) else {
+            console.gate.record_failure();
+            return problem(Status(401), "authorisation required");
+        };
+        match webauthn.register_as(&document, webauthn::Purpose::Invite, Some(name.as_str())) {
+            Ok(passkey) => {
+                // Spent only now, with a credential really in existence.
+                let _ = invites.redeem(code);
+                console.gate.reset();
+                json(
+                    Status(200),
+                    Json::object([
+                        ("registered", Json::Bool(true)),
+                        ("name", Json::string(name.as_str())),
+                        ("label", Json::string(passkey.label)),
+                    ]),
+                )
+            }
+            Err(_) => {
+                console.gate.record_failure();
+                problem(Status(401), "authorisation required")
+            }
         }
     }
 
@@ -917,6 +1311,8 @@ impl Api {
         match demand {
             Demand::Held(capability) => self.policy.decide(caller, capability).is_allowed(),
             Demand::OwnerOnly => caller.identity().is_owner(),
+            // The wall above already decided this, and reaching here proves it.
+            Demand::Authenticated => true,
             Demand::Unsatisfiable => false,
         }
     }
@@ -1957,6 +2353,20 @@ fn session_cookies(request: &Request) -> Vec<String> {
         .collect()
 }
 
+/// The invitation code out of a `{"code": "…"}` body.
+///
+/// One helper rather than the same three fallible steps written twice, and
+/// deliberately total: every way the body can fail to carry a code — not UTF-8,
+/// not JSON, no `code`, not a string — comes back as the same `None`, which the
+/// invite door turns into the same refusal an outright wrong code gets. A door
+/// that distinguished "malformed" from "wrong" would answer a question the
+/// caller has no business asking.
+fn code_from_body(body: &[u8]) -> Option<String> {
+    let text = std::str::from_utf8(body).ok()?;
+    let document = selfhost_json::parse(text).ok()?;
+    Some(document.get("code")?.as_str()?.to_owned())
+}
+
 /// Whether the request carries the CSRF header (see [`CONSOLE_HEADER`]).
 fn has_console_header(request: &Request) -> bool {
     request.headers.get_str(CONSOLE_HEADER).is_some_and(|value| value.trim() == "1")
@@ -1994,6 +2404,18 @@ fn query_value<'a>(query: &'a str, key: &str) -> Option<&'a str> {
         let (name, value) = pair.split_once('=')?;
         (name == key).then_some(value)
     })
+}
+
+/// The permission registry in `data_dir`, persisted the one correct way.
+///
+/// The single constructor for [`People`] outside this crate's tests, so the
+/// owner-only writer is chosen in one place rather than at each call site. The
+/// CLI needs it because `selfhost people` writes the registry directly — the
+/// command an operator reaches for is precisely the one that must not require a
+/// working console — and a second copy of "which writer" is how the Windows
+/// no-op survived four times in the security review.
+pub fn people_registry(data_dir: &Path) -> People {
+    People::with_writer(data_dir, token::write_private)
 }
 
 /// A JSON response.
