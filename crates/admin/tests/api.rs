@@ -2762,3 +2762,186 @@ async fn the_trail_is_the_owners_and_a_granted_person_cannot_read_it() {
     let (status, _) = send(&api, "GET", "/api/audit", "").await;
     assert_eq!(status, 200);
 }
+
+// ─── The people plane ─────────────────────────────────────────────────────────
+//
+// The seam that turns `crates/identity`'s permission model from a description
+// into something an operator can actually use: three owner-only routes that
+// read and write the registry, and one route that answers any admitted caller
+// the question a permission-shaped interface has to ask first.
+
+#[tokio::test]
+async fn whoami_answers_a_person_who_holds_nothing_rather_than_refusing_them() {
+    // The whole reason this route is not owner-only. A client cannot draw only
+    // the screens a person may use until it can ask what they may use, and a
+    // person holding nothing must get an honest empty answer — otherwise "you
+    // were refused" and "you hold nothing yet" are the same event to the one
+    // program that could tell them apart.
+    let sessions = Sessions::new();
+    let (api, dir) = console_api("whoami-empty", sessions.clone());
+    let people = People::load(dir.path());
+    people
+        .set_grants(&PersonName::parse("Mom").expect("a legal name"), Grants::none())
+        .expect("grants are written");
+    let api = api.with_people(people);
+    let id = sessions.create("Mom", Opening::Passkey).expect("a session");
+    let cookie = format!("selfhost_session={id}");
+
+    let answered = call_with(&api, "GET", "/api/whoami", &[("Cookie", &cookie)], "").await;
+    assert_eq!(answered.status.code(), 200);
+    let body = body_json(&answered);
+    assert_eq!(body.get("name").and_then(Json::as_str), Some("Mom"));
+    assert_eq!(body.get("owner").and_then(Json::as_bool), Some(false));
+    assert_eq!(body.get("grants").and_then(Json::as_array).map(<[Json]>::len), Some(0));
+
+    // And an anonymous caller still gets nothing at all: the route is behind
+    // the wall, it is only not behind a capability.
+    let anonymous = call_with(&api, "GET", "/api/whoami", &[], "").await;
+    assert_eq!(anonymous.status.code(), 401);
+}
+
+#[tokio::test]
+async fn whoami_names_what_a_person_holds_in_the_words_a_grant_editor_submits_back() {
+    let sessions = Sessions::new();
+    let (api, dir) = console_api("whoami-grants", sessions.clone());
+    let people = People::load(dir.path());
+    let mut grants = Grants::none();
+    grants.grant(Capability::ConsoleRead).expect("room for one grant");
+    grants
+        .grant(Capability::DesktopView(NodeName::parse("alex-desktop").expect("a legal node")))
+        .expect("room for one grant");
+    people.set_grants(&PersonName::parse("Mom").expect("a legal name"), grants).expect("written");
+    let api = api.with_people(people);
+    let id = sessions.create("Mom", Opening::Passkey).expect("a session");
+    let cookie = format!("selfhost_session={id}");
+
+    let answered = call_with(&api, "GET", "/api/whoami", &[("Cookie", &cookie)], "").await;
+    let answers = body_json(&answered);
+    let held: Vec<&str> = answers
+        .get("grants")
+        .and_then(Json::as_array)
+        .expect("a grants array")
+        .iter()
+        .filter_map(Json::as_str)
+        .collect();
+    assert!(held.contains(&"console.read"));
+    // The target travels with the word, because a client that dropped it would
+    // be showing a person a machine they may not watch.
+    assert!(held.contains(&"desktop.view:alex-desktop"), "{held:?}");
+}
+
+#[tokio::test]
+async fn the_owner_reads_the_roster_and_a_person_who_may_read_the_console_cannot() {
+    // Reading the roster is reading a list of who can reach what — a target
+    // list, as the registry says in its own header — so it is owner-only even
+    // for somebody the console otherwise admits.
+    let sessions = Sessions::new();
+    let (api, dir) = console_api("people-roster", sessions.clone());
+    let people = People::load(dir.path());
+    let mut grants = Grants::none();
+    grants.grant(Capability::ConsoleRead).expect("room for one grant");
+    people.set_grants(&PersonName::parse("Mom").expect("a legal name"), grants).expect("written");
+    let api = api.with_people(people);
+    let id = sessions.create("Mom", Opening::Passkey).expect("a session");
+    let cookie = format!("selfhost_session={id}");
+
+    let refused = call_with(&api, "GET", "/api/people", &[("Cookie", &cookie)], "").await;
+    let anonymous = call_with(&api, "GET", "/api/people", &[], "").await;
+    assert_eq!(refused.status.code(), 401);
+    assert_eq!(body_json(&refused).to_text(), body_json(&anonymous).to_text());
+
+    // The owner's own credential reads it, and sees the one entry.
+    let (status, body) = send(&api, "GET", "/api/people", "").await;
+    assert_eq!(status, 200);
+    let listed = body.get("people").and_then(Json::as_array).expect("a people array");
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0].get("name").and_then(Json::as_str), Some("Mom"));
+}
+
+#[tokio::test]
+async fn a_grant_written_through_the_api_is_the_grant_the_policy_then_enforces() {
+    // The end of the seam: a permission set through the route is not a record
+    // in a file, it is a power the next request actually has.
+    let sessions = Sessions::new();
+    let (api, dir) = console_api("people-write", sessions.clone());
+    let api = api.with_people(People::load(dir.path()));
+
+    let (status, body) =
+        send(&api, "PUT", "/api/people/mom", r#"{"grants":["console.read","mail.admin"]}"#).await;
+    assert_eq!(status, 200, "{body:?}");
+    assert_eq!(body.get("name").and_then(Json::as_str), Some("mom"));
+
+    // Read back through the person's own credential, which is the only proof
+    // that matters: the daemon resolved the session to those capabilities.
+    let id = sessions.create("mom", Opening::Passkey).expect("a session");
+    let cookie = format!("selfhost_session={id}");
+    let answered = call_with(&api, "GET", "/api/whoami", &[("Cookie", &cookie)], "").await;
+    let answers = body_json(&answered);
+    let held: Vec<&str> = answers
+        .get("grants")
+        .and_then(Json::as_array)
+        .expect("a grants array")
+        .iter()
+        .filter_map(Json::as_str)
+        .collect();
+    assert_eq!(held, ["console.read", "mail.admin"]);
+
+    // And it is a whole-set write: submitting a smaller set takes the rest away
+    // rather than adding to it.
+    let (status, _) = send(&api, "PUT", "/api/people/mom", r#"{"grants":["console.read"]}"#).await;
+    assert_eq!(status, 200);
+    let (status, body) = send(&api, "GET", "/api/people", "").await;
+    assert_eq!(status, 200);
+    let listed = body.get("people").and_then(Json::as_array).expect("a people array");
+    let grants = listed[0].get("grants").and_then(Json::as_array).expect("a grants array");
+    assert_eq!(grants.len(), 1, "the set was replaced, not merged");
+}
+
+#[tokio::test]
+async fn a_permission_change_that_does_not_parse_changes_nothing() {
+    let (api, dir) = api("people-atomic");
+    let api = api.with_people(People::load(dir.path()));
+    send(&api, "PUT", "/api/people/mom", r#"{"grants":["console.read"]}"#).await;
+
+    // One unknown word in an otherwise good set. The failure this prevents is a
+    // set applied minus the entry that did not parse.
+    let (status, body) =
+        send(&api, "PUT", "/api/people/mom", r#"{"grants":["service.control","files.read"]}"#).await;
+    assert_eq!(status, 400);
+    assert!(
+        body.get("error").and_then(Json::as_str).unwrap_or_default().contains("files.read"),
+        "the refusal names the word that was wrong: {body:?}"
+    );
+
+    let (_, body) = send(&api, "GET", "/api/people", "").await;
+    let listed = body.get("people").and_then(Json::as_array).expect("a people array");
+    let grants = listed[0].get("grants").and_then(Json::as_array).expect("a grants array");
+    assert_eq!(grants.len(), 1, "the previous set is untouched");
+    assert_eq!(grants[0].as_str(), Some("console.read"));
+}
+
+#[tokio::test]
+async fn the_owner_cannot_be_written_into_the_registry_as_a_person() {
+    // The property everything else rests on: no request to this API can create
+    // an entry that edits the operator's own authority, because the owner's
+    // authority is an identity and `PersonName` refuses that spelling.
+    let (api, dir) = api("people-owner");
+    let api = api.with_people(People::load(dir.path()));
+    for name in ["owner", "OWNER", "Owner"] {
+        let (status, _) =
+            send(&api, "PUT", &format!("/api/people/{name}"), r#"{"grants":[]}"#).await;
+        assert_eq!(status, 400, "{name} was accepted as a person");
+    }
+}
+
+#[tokio::test]
+async fn forgetting_a_person_is_reported_separately_from_never_having_known_them() {
+    let (api, dir) = api("people-forget");
+    let api = api.with_people(People::load(dir.path()));
+    send(&api, "PUT", "/api/people/mom", r#"{"grants":["console.read"]}"#).await;
+
+    let (status, _) = send(&api, "DELETE", "/api/people/mom", "").await;
+    assert_eq!(status, 200);
+    let (status, _) = send(&api, "DELETE", "/api/people/mom", "").await;
+    assert_eq!(status, 404, "gone and never-there are different facts");
+}

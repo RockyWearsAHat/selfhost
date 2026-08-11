@@ -22,6 +22,7 @@ mod mail_task;
 mod mesh_task;
 mod node_command;
 mod oui;
+mod people_command;
 mod proxyware;
 mod self_update;
 mod reports_command;
@@ -146,6 +147,21 @@ Commands
                              Add a mailbox; reads the password from stdin if
                              omitted. [mail] must already be configured.
   mail remove <address>      Remove a mailbox
+  people <list|show|grant|allow|deny|forget|capabilities>
+                             Who else may use this deployment, and exactly what
+                             each of them may do. `allow <name> <cap>[,<cap>]`
+                             creates an entry and adds to it; `grant` states the
+                             whole set at once; `capabilities` lists every word.
+                             The owner is never in this list — the owner's
+                             authority is an identity, not a grant, so nothing
+                             here can edit it away.
+  people invite <name> [<cap>,<cap>] [--hours N]
+                             Grant, then mint a one-time link that lets them
+                             register their own passkey under that name — with
+                             nobody present but them. The code is shown once and
+                             is not stored anywhere it can be read back.
+                             `invited` lists what is pending; `uninvite <name>`
+                             withdraws an invitation nobody has used.
   console-password [<password>]
                              Set the web console's login password; reads it
                              twice from stdin if omitted
@@ -200,6 +216,10 @@ fn main() -> ExitCode {
         "service" => service_command(&arguments),
         "reports" => load().and_then(|(config, project_dir)| {
             reports_command::run(&arguments, &config, &project_dir)
+        }),
+        "people" => load().and_then(|(config, project_dir)| {
+            let data_dir = teardown::data_dir(&config, &project_dir);
+            people_command::run(&arguments, &data_dir, &config)
         }),
         "mail" => mail_command(&arguments),
         "console-password" => console_password_command(&arguments),

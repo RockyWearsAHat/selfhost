@@ -282,7 +282,17 @@ impl People {
     }
 
     /// Writes the registry owner-only via a temporary file and a rename.
+    ///
+    /// Creates the data directory if it is not there yet, exactly as the token
+    /// and password stores this file was shaped on do. The first grant on a
+    /// deployment is routinely made *before* the daemon has ever run — that is
+    /// the whole point of the CLI's `people` command — and a permission tool
+    /// that fails with "No such file or directory" on a fresh box is one an
+    /// operator cannot use at the only moment they need it.
     fn persist(&self, entries: &[Person]) -> io::Result<()> {
+        if let Some(parent) = self.path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
         let text = people_to_json(entries).to_text();
         let temporary = self.path.with_extension("people.new");
         (self.write_private)(&temporary, &text)?;
