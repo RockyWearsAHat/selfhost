@@ -577,6 +577,25 @@ impl<H: selfhost_screen::AgentHost, C: AgentChannel> Supervised<H, C> {
         self.status(now)
     }
 
+    /// Moves bytes, and decides nothing.
+    ///
+    /// # Why this is separate from [`Supervised::turn`]
+    ///
+    /// Supervision is a once-a-second job: whether to spawn, whether the console
+    /// moved, whether the hour's budget is spent. Carrying a desktop stream is
+    /// not. Doing both on one clock made the *data path* run at the supervision
+    /// cadence — frames arrived in one-second bursts and credit reached the agent
+    /// once a second, which capped a local named pipe at about 110 kB/s and made
+    /// a 2560x1440 desktop fill in over half a minute.
+    ///
+    /// So a turn decides, and this carries, and the loop spends the rest of its
+    /// second here. It cannot spin: [`AgentChannel::pump`] blocks for its own
+    /// short wait when there is nothing to read.
+    pub(crate) fn carry(&mut self, now: std::time::Instant) {
+        self.forward_input();
+        self.listen(now);
+    }
+
     /// Writes whatever the attached session has queued for the agent.
     ///
     /// Non-blocking, and bounded by what is already in the queue: this runs on
@@ -959,8 +978,17 @@ fn begin(input: InputPolicy, limits: Limits) -> Arc<Shared> {
                 kill_switch: thread.kill_switch.load(Ordering::Relaxed),
                 operator_start: thread.operator_start.swap(false, Ordering::Relaxed),
             };
-            thread.publish(supervised.turn(std::time::Instant::now(), orders));
-            std::thread::sleep(TURN);
+            let started = std::time::Instant::now();
+            thread.publish(supervised.turn(started, orders));
+            // The rest of the second is spent carrying the stream rather than
+            // asleep. Deciding is a once-a-second job; a desktop is not, and
+            // running both on one clock is what made a local pipe deliver frames
+            // in one-second bursts. `carry` blocks on the pipe's own short wait
+            // when there is nothing there, so an idle agent costs no more here
+            // than the sleep it replaces.
+            while started.elapsed() < TURN {
+                supervised.carry(std::time::Instant::now());
+            }
         }
     });
     shared
@@ -1171,6 +1199,32 @@ mod tests {
     use std::cell::RefCell;
     use std::rc::Rc;
     use std::time::Instant;
+
+    /// Carrying moves bytes and starts nothing.
+    ///
+    /// The property that matters: `carry` runs hundreds of times between two
+    /// supervision decisions, so it must not *make* decisions — no spawn, no
+    /// kill, no channel opened or closed. The one transition it does make is the
+    /// one a message implies and that nothing else can observe: the first framed
+    /// message is the cue for `Agent::connected`, and a supervisor that pumped
+    /// without it would kill a working agent at its start deadline.
+    #[test]
+    fn carrying_moves_bytes_and_starts_nothing() {
+        let now = Instant::now();
+        let (mut supervised, machine) = driver(InputPolicy::ViewOnly, 5);
+        machine.borrow_mut().console = ConsoleSession::User(1);
+        supervised.turn(now, quiet());
+        let spawns_before = machine.borrow().spawned().len();
+        let opens_before = machine.borrow().opened().len();
+
+        supervised.channel.inbox.push(hello(2));
+        supervised.carry(now + Duration::from_millis(10));
+
+        assert_eq!(machine.borrow().spawned().len(), spawns_before, "carrying spawns nothing");
+        assert_eq!(machine.borrow().opened().len(), opens_before, "and opens no channel");
+        assert_eq!(supervised.monitors, 2, "but it did take the message off the pipe");
+        assert!(supervised.connected, "and the message is what marks the agent connected");
+    }
 
     /// A credit grant becomes the link's own credit frame; everything else does
     /// not.
