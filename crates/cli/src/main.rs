@@ -24,6 +24,7 @@ mod node_command;
 mod oui;
 mod proxyware;
 mod self_update;
+mod reports_command;
 mod service_install;
 mod share_command;
 mod site;
@@ -131,6 +132,13 @@ Commands
                              Register this daemon with the OS service manager
                              (launchd, systemd, or a Windows scheduled task) so it
                              starts on boot and restarts if it dies
+  reports <serve|projects|list|close|token>
+                             The public report intake: agents anywhere POST a
+                             defect, this box stores it and mails it to the
+                             owner, and a subscribed checkout folds the project's
+                             open reports into its own reports.dx. `serve` is
+                             what the supervised service runs.
+  reports project add <key>  Accept reports about a project, e.g. `dx`
   mail hash-password [<password>]
                              Hash a mailbox password for [[mail.mailboxes]] in
                              selfhost.config.toml; reads from stdin if omitted
@@ -190,6 +198,9 @@ fn main() -> ExitCode {
         }
         "teardown" => teardown_command(&arguments),
         "service" => service_command(&arguments),
+        "reports" => load().and_then(|(config, project_dir)| {
+            reports_command::run(&arguments, &config, &project_dir)
+        }),
         "mail" => mail_command(&arguments),
         "console-password" => console_password_command(&arguments),
         "help" | "--help" | "-h" => {

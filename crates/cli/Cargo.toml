@@ -31,6 +31,11 @@ selfhost-mail = { workspace = true }
 selfhost-mesh = { workspace = true }
 selfhost-proxy = { workspace = true }
 selfhost-registrar = { workspace = true }
+selfhost-reports = { workspace = true }
+# The system random source, for the one secret this binary mints itself: the
+# report feed's bearer token. The same `ring` rustls already links through
+# `selfhost-proxy`; naming it here adds nothing new to the tree.
+ring = { workspace = true }
 selfhost-http = { workspace = true }
 selfhost-supervisor = { workspace = true }
 tokio = { workspace = true }
