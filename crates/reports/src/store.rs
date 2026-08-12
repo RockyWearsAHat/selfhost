@@ -9,13 +9,18 @@
 //! object written to `<id>.json.tmp` and renamed over `<id>.json`, so a reader sees the record
 //! as it was or as it now is, never half of it.
 //!
-//! # A project is the unit a checkout subscribes to
+//! # A service is the unit a checkout subscribes to, and filing is how one is born
 //!
-//! `data/reports/<project>/` holds one project's defects. A project exists because an operator
-//! created it (`selfhost reports project add dx`), never because a request named it: an intake
-//! that created a directory per unknown key would let a stranger fill the disk with empty
-//! projects. That is also what makes subscribing cheap on the other end — a checkout asks for
-//! one key's open reports and folds them into its own `reports.dx`.
+//! `data/reports/<service>/` holds one service's defects. A service exists because a report was
+//! filed to `…/report?<service>` — that is the whole of registering one, and it is why the
+//! service is in the address rather than in a form somebody has to fill in first. An operator
+//! can still create one ahead of time (`selfhost reports project add dx`), which changes
+//! nothing except the order.
+//!
+//! Creating on demand is a door, so it is a bounded one: [`MAX_PROJECTS`] caps how many
+//! services this box will hold, and passing it refuses in a sentence rather than filling the
+//! disk with directories a stranger named. Within one service the record cap does the same job.
+//! A checkout still asks for one key's open reports and folds them into its own `reports.dx`.
 //!
 //! # One record per defect, however many times it is reported
 //!
@@ -43,6 +48,10 @@ use crate::report::{Kind, Report};
 /// How many distinct defects one project will hold. Reaching it refuses new reports and says
 /// so; sightings of defects already known keep working, because those cost no new file.
 pub const MAX_RECORDS: usize = 10_000;
+/// How many services this box will hold. Filing to an unknown service creates it, so this is
+/// the bound on that door: reaching it refuses the *new* service and says so, while every
+/// service already here keeps taking reports.
+pub const MAX_PROJECTS: usize = 100;
 /// How many sightings one record keeps in full. Older ones are dropped from the history.
 pub const MAX_SIGHTINGS_KEPT: usize = 50;
 /// How large one record file may be before its oldest history is shed.
@@ -196,21 +205,25 @@ impl Store {
         Ok(keys)
     }
 
-    /// Files `report`, creating its record or adding a sighting to the one that exists.
+    /// Files `report`, creating its record or adding a sighting to the one that exists — and
+    /// creating the service itself when this is the first report filed to it.
     ///
     /// # Errors
-    /// [`StoreError::NoProject`] when nothing has subscribed that key, [`StoreError::Full`] when
-    /// a *new* defect would pass [`MAX_RECORDS`], [`StoreError::Io`] when the record cannot be
-    /// written. A record that exists but cannot be read is replaced rather than refused — the
-    /// reporter is not made to pay for corruption here — and the unreadable bytes are kept
-    /// beside it as `<id>.json.broken`.
+    /// [`StoreError::Full`] when a new service would pass [`MAX_PROJECTS`] or a *new* defect
+    /// would pass [`MAX_RECORDS`], [`StoreError::Io`] when the record cannot be written. A
+    /// record that exists but cannot be read is replaced rather than refused — the reporter is
+    /// not made to pay for corruption here — and the unreadable bytes are kept beside it as
+    /// `<id>.json.broken`.
     pub fn record(&self, report: &Report) -> Result<Recorded, StoreError> {
         if !self.has_project(&report.project) {
-            return Err(StoreError::NoProject(format!(
-                "this box holds no reports for `{}` — an operator adds one with \
-                 `selfhost reports project add {}`",
-                report.project, report.project
-            )));
+            if self.projects()?.len() >= MAX_PROJECTS {
+                return Err(StoreError::Full(format!(
+                    "this box already holds {MAX_PROJECTS} services, so `{}` cannot be added — \
+                     file to one that exists, or ask the owner to retire an unused one",
+                    report.project
+                )));
+            }
+            self.add_project(&report.project)?;
         }
         let id = report.id();
         let path = self.record_path(&report.project, &id);
@@ -445,19 +458,27 @@ impl Store {
     }
 }
 
-/// The key with every character that is not `[a-z0-9-]` replaced, so it can only ever name a
-/// directory directly inside the store.
+/// The key with every character that is not `[a-z0-9._-]` replaced and every `..` broken, so it
+/// can only ever name a directory directly inside the store.
+///
+/// [`crate::report::project_key`] has already refused anything this would have to repair; this
+/// is the second lock on the same door, because the argument also arrives from a command line
+/// and a path built from an unchecked string is a write primitive.
 fn safe_key(key: &str) -> String {
     let cleaned: String = key
         .chars()
         .map(|character| match character {
-            'a'..='z' | '0'..='9' | '-' => character,
+            'a'..='z' | '0'..='9' | '-' | '_' | '.' => character,
             'A'..='Z' => character.to_ascii_lowercase(),
             _ => '-',
         })
         .take(crate::report::MAX_PROJECT)
         .collect();
-    let trimmed = cleaned.trim_matches('-').to_string();
+    let mut broken = cleaned;
+    while broken.contains("..") {
+        broken = broken.replace("..", "-");
+    }
+    let trimmed = broken.trim_matches(['-', '.']).to_string();
     if trimmed.is_empty() {
         "unnamed".to_string()
     } else {
@@ -626,14 +647,38 @@ mod tests {
         }
     }
 
+    /// Filing is registration: a service exists because a report named it.
     #[test]
-    fn a_report_about_a_project_nobody_subscribed_is_refused_with_the_command_that_fixes_it() {
+    fn a_report_about_a_service_nobody_declared_creates_that_service() {
         let store = scratch("unknown-project");
         let mut elsewhere = report("t", "d");
-        elsewhere.project = "not-a-project".to_string();
-        let error = store.record(&elsewhere).expect_err("refused");
-        assert!(matches!(error, StoreError::NoProject(_)));
-        assert!(error.to_string().contains("reports project add"), "{error}");
+        elsewhere.project = "billing".to_string();
+        let recorded = store.record(&elsewhere).expect("filed");
+        assert!(recorded.fresh);
+        assert!(store.has_project("billing"));
+        assert_eq!(store.list("billing").expect("list").len(), 1);
+    }
+
+    /// The bound on that door: a stranger may bring a service into existence, but not an
+    /// unbounded number of them, and the refusal says what to do.
+    #[test]
+    fn a_new_service_past_the_cap_is_refused_while_the_ones_here_keep_working() {
+        let store = scratch("project-cap");
+        for nth in 0..MAX_PROJECTS {
+            store.add_project(&format!("svc{nth}")).expect("project");
+        }
+        let mut fresh = report("t", "d");
+        fresh.project = "one-too-many".to_string();
+        let error = store.record(&fresh).expect_err("refused");
+        assert!(matches!(error, StoreError::Full(_)));
+        assert!(error.to_string().contains("services"), "{error}");
+        assert!(!store.has_project("one-too-many"));
+
+        let mut known = report("t", "d");
+        known.project = "svc0".to_string();
+        store
+            .record(&known)
+            .expect("a service that exists still takes reports");
     }
 
     #[test]

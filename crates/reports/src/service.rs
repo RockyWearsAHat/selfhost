@@ -1,11 +1,23 @@
 //! The HTTP surface: four routes, one of which is open to the internet.
 //!
 //! ```text
-//! POST <route>              file a report            open to anyone, rate limited
-//! GET  <route>/health       is the intake up         open, says nothing about content
-//! GET  <route>/feed?project=dx   every open report   owner token
-//! POST <route>/close        a report is fixed        owner token
+//! POST <route>?<service>        file a report        open to anyone, rate limited
+//! GET  <route>/health           is the intake up     open, says nothing about content
+//! GET  <route>/feed?<service>   every open report    owner token
+//! POST <route>/close?<service>  a report is fixed    owner token
 //! ```
+//!
+//! # The address is the base, and the service is the query
+//!
+//! One box holds every service's reports, and which database a call means is the **bare query
+//! key** — `…/report?dx` — never a path segment and never `project=`. A path segment would make
+//! the proxy's routing prefix depend on the tenant; a named parameter would invite a second
+//! spelling of the same thing. A bare word is also the whole of registering a service: the
+//! first report filed to `…/report?billing` creates it ([`crate::store`] bounds that door).
+//!
+//! The reporter's own repository holds the other half of this contract, written from the wire
+//! outward: `docs/intake.dx` in the dx workspace. What is stated there is stated here in code
+//! and in the tests below, and nowhere else twice.
 //!
 //! # Where this listens, and what stands in front of it
 //!
@@ -67,9 +79,9 @@ const DELIVERY_BATCH: usize = 5;
 /// How the intake is configured.
 #[derive(Debug, Clone)]
 pub struct Config {
-    /// The path the proxy forwards, without a trailing slash — `/api/reports`.
+    /// The path the proxy forwards, without a trailing slash — `/report`.
     pub route: String,
-    /// The project a report that names none is about.
+    /// The service a call that names none in its address is about.
     pub default_project: String,
     /// What one source may file.
     pub per_source: Rate,
@@ -89,7 +101,7 @@ pub struct Config {
 impl Default for Config {
     fn default() -> Self {
         Self {
-            route: "/api/reports".to_string(),
+            route: "/report".to_string(),
             default_project: "dx".to_string(),
             // Three at once, then one every twenty seconds: an agent writing up two related
             // reports is never refused, and a loop gets nowhere.
@@ -165,7 +177,7 @@ impl Service {
 
         if path == route {
             return match request.method {
-                Method::Post => self.file(body, client, now, wall),
+                Method::Post => self.file(body, query, client, now, wall),
                 Method::Options => refuse(Status::METHOD_NOT_ALLOWED, "this endpoint takes POST"),
                 _ => refuse(Status::METHOD_NOT_ALLOWED, "file a report with POST"),
             };
@@ -186,14 +198,21 @@ impl Service {
             return if path.ends_with("/feed") {
                 self.feed(request, query)
             } else {
-                self.close(request, body)
+                self.close(request, query, body)
             };
         }
         refuse(Status::NOT_FOUND, "no such endpoint")
     }
 
-    /// `POST <route>` — the one open door.
-    fn file(&self, body: &[u8], client: &str, now: Instant, wall: SystemTime) -> Response {
+    /// `POST <route>?<service>` — the one open door.
+    fn file(
+        &self,
+        body: &[u8],
+        query: &str,
+        client: &str,
+        now: Instant,
+        wall: SystemTime,
+    ) -> Response {
         if let Decision::Refuse(seconds) = self.admit(&self.filing, client, now) {
             return retry_after(seconds);
         }
@@ -203,9 +222,13 @@ impl Service {
         let Ok(value) = selfhost_json::parse(text) else {
             return refuse(Status::BAD_REQUEST, "the body is not JSON");
         };
+        let service = match self.service_of(query, Some(&value)) {
+            Ok(service) => service,
+            Err(refusal) => return refuse(Status::BAD_REQUEST, refusal.message()),
+        };
         let report = match Report::parse(
             &value,
-            &self.config.default_project,
+            &service,
             clock::iso8601(wall),
             crate::report::source_hash(client),
         ) {
@@ -251,7 +274,7 @@ impl Service {
         )
     }
 
-    /// `GET <route>/feed?project=dx` — what a subscribed checkout folds into its `reports.dx`.
+    /// `GET <route>/feed?<service>` — what a subscribed checkout folds into its `reports.dx`.
     fn feed(&self, request: &Request, query: &str) -> Response {
         if request.method != Method::Get {
             return refuse(Status::METHOD_NOT_ALLOWED, "this endpoint takes GET");
@@ -259,8 +282,7 @@ impl Service {
         if let Some(refused) = self.check_token(request) {
             return refused;
         }
-        let asked = query_value(query, "project").unwrap_or(&self.config.default_project);
-        let project = match project_key(asked) {
+        let project = match self.service_of(query, None) {
             Ok(project) => project,
             Err(refusal) => return refuse(Status::BAD_REQUEST, refusal.message()),
         };
@@ -280,9 +302,9 @@ impl Service {
         }
     }
 
-    /// `POST <route>/close` — a fixed report leaves the database, so a checkout that syncs
-    /// again does not fold it back in.
-    fn close(&self, request: &Request, body: &[u8]) -> Response {
+    /// `POST <route>/close?<service>` — a fixed report leaves the database, so a checkout that
+    /// syncs again does not fold it back in.
+    fn close(&self, request: &Request, query: &str, body: &[u8]) -> Response {
         if request.method != Method::Post {
             return refuse(Status::METHOD_NOT_ALLOWED, "this endpoint takes POST");
         }
@@ -295,12 +317,7 @@ impl Service {
         let Some(value) = asked else {
             return refuse(Status::BAD_REQUEST, "the body is not JSON");
         };
-        let project = match project_key(
-            value
-                .get("project")
-                .and_then(Json::as_str)
-                .unwrap_or(&self.config.default_project),
-        ) {
+        let project = match self.service_of(query, Some(&value)) {
             Ok(project) => project,
             Err(refusal) => return refuse(Status::BAD_REQUEST, refusal.message()),
         };
@@ -326,6 +343,31 @@ impl Service {
                 )
             }
         }
+    }
+
+    /// Which service this call is about: the address first, then the body, then this box's
+    /// default.
+    ///
+    /// The address wins over the body because the address is where the report was actually
+    /// sent — a body claiming `"project": "dx"` on a call to `…/report?billing` is a reporter
+    /// with a stale template, not an instruction. The body is consulted at all so that a caller
+    /// with no query still files somewhere sensible, and so a record is complete on its own.
+    ///
+    /// # Errors
+    /// The [`Refusal`] [`project_key`] gives, naming what a key may contain.
+    fn service_of(&self, query: &str, body: Option<&Json>) -> Result<String, Refusal> {
+        if let Some(named) = service_in_query(query) {
+            return project_key(named);
+        }
+        let stated = body
+            .and_then(|value| value.get("project"))
+            .and_then(Json::as_str)
+            .unwrap_or_default()
+            .trim();
+        if stated.is_empty() {
+            return Ok(self.config.default_project.clone());
+        }
+        project_key(stated)
     }
 
     /// Whether this request carries the owner's token.
@@ -600,12 +642,15 @@ fn split_target(target: &str) -> (&str, &str) {
     }
 }
 
-/// Reads one parameter out of a query string.
-fn query_value<'a>(query: &'a str, key: &str) -> Option<&'a str> {
-    query.split('&').find_map(|pair| {
-        let (name, value) = pair.split_once('=')?;
-        (name == key).then_some(value)
-    })
+/// The service a query names: its first **bare** key, the one with no `=` in it.
+///
+/// `?dx` names dx. `?dx&verbose=1` still names dx, so a query that grows a parameter one day
+/// does not change which database a call means. A query with no bare key names no service, and
+/// the caller falls back — deliberately, rather than inventing `project=` as a second spelling.
+fn service_in_query(query: &str) -> Option<&str> {
+    query
+        .split('&')
+        .find(|pair| !pair.is_empty() && !pair.contains('='))
 }
 
 /// A JSON answer with the headers `docs/SECURITY.md` requires of an app behind the proxy.
@@ -700,7 +745,7 @@ mod tests {
 
     fn post(body: &str) -> Request {
         request(&format!(
-            "POST /api/reports HTTP/1.1\r\nHost: x\r\nContent-Length: {}\r\n\r\n",
+            "POST /report HTTP/1.1\r\nHost: x\r\nContent-Length: {}\r\n\r\n",
             body.len()
         ))
     }
@@ -788,14 +833,14 @@ mod tests {
     #[test]
     fn the_client_is_the_last_forwarded_value_not_the_one_the_client_chose() {
         let request = request(
-            "POST /api/reports HTTP/1.1\r\nHost: x\r\nX-Forwarded-For: 1.2.3.4\r\n\
+            "POST /report HTTP/1.1\r\nHost: x\r\nX-Forwarded-For: 1.2.3.4\r\n\
              X-Forwarded-For: 203.0.113.9\r\nContent-Length: 0\r\n\r\n",
         );
         let peer: SocketAddr = "127.0.0.1:5000".parse().expect("peer");
         assert_eq!(client_address(&request, peer), "203.0.113.9");
 
         let direct =
-            Request::parse(b"POST /api/reports HTTP/1.1\r\nHost: x\r\nContent-Length: 0\r\n\r\n")
+            Request::parse(b"POST /report HTTP/1.1\r\nHost: x\r\nContent-Length: 0\r\n\r\n")
                 .expect("request parses")
                 .request;
         assert_eq!(client_address(&direct, peer), "127.0.0.1");
@@ -814,14 +859,75 @@ mod tests {
         assert_eq!(refused.status, Status::TOO_MANY_REQUESTS);
     }
 
+    /// The whole of registering a service: file one report to it.
     #[test]
-    fn a_project_nobody_subscribed_is_a_404_that_says_how_to_add_it() {
-        let service = service("no-project");
-        let body = r#"{"project":"stranger","kind":"bug","title":"t","detail":"d"}"#;
-        let response = file(&service, body, "203.0.113.9");
-        assert_eq!(response.status, Status::NOT_FOUND);
+    fn filing_to_a_service_nobody_declared_brings_it_into_existence() {
+        let service = service("new-service");
+        let body = r#"{"project":"billing","kind":"bug","title":"t","detail":"d"}"#;
+        let posted = request(&format!(
+            "POST /report?billing HTTP/1.1\r\nHost: x\r\nContent-Length: {}\r\n\r\n",
+            body.len()
+        ));
+        let response = service.answer(
+            &posted,
+            body.as_bytes(),
+            "203.0.113.9",
+            Instant::now(),
+            UNIX_EPOCH,
+        );
+        assert_eq!(response.status, Status::OK, "{}", text(&response));
         assert!(
-            text(&response).contains("reports project add"),
+            text(&response).contains("\"filed\":\"report-"),
+            "{}",
+            text(&response)
+        );
+        assert_eq!(service.store().list("billing").expect("list").len(), 1);
+        assert!(
+            service.store().list("dx").expect("list").is_empty(),
+            "a new service's reports do not land in the default one"
+        );
+    }
+
+    /// The address is where the report was actually sent, so it wins over a stale template.
+    #[test]
+    fn the_query_names_the_service_and_the_body_does_not_override_it() {
+        let service = service("query-wins");
+        let body = r#"{"project":"dx","kind":"bug","title":"t","detail":"d"}"#;
+        let posted = request(&format!(
+            "POST /report?billing&verbose=1 HTTP/1.1\r\nHost: x\r\nContent-Length: {}\r\n\r\n",
+            body.len()
+        ));
+        let response = service.answer(
+            &posted,
+            body.as_bytes(),
+            "203.0.113.9",
+            Instant::now(),
+            UNIX_EPOCH,
+        );
+        assert_eq!(response.status, Status::OK, "{}", text(&response));
+        assert_eq!(service.store().list("billing").expect("list").len(), 1);
+        assert!(service.store().list("dx").expect("list").is_empty());
+    }
+
+    /// A bare word, and nothing that could name a directory this store does not own.
+    #[test]
+    fn a_service_name_that_is_not_a_word_is_refused_in_a_sentence() {
+        let service = service("bad-service");
+        let body = r#"{"kind":"bug","title":"t","detail":"d"}"#;
+        let posted = request(&format!(
+            "POST /report?..%2f..%2fetc HTTP/1.1\r\nHost: x\r\nContent-Length: {}\r\n\r\n",
+            body.len()
+        ));
+        let response = service.answer(
+            &posted,
+            body.as_bytes(),
+            "203.0.113.9",
+            Instant::now(),
+            UNIX_EPOCH,
+        );
+        assert_eq!(response.status, Status::BAD_REQUEST);
+        assert!(
+            text(&response).contains("not a service key"),
             "{}",
             text(&response)
         );
@@ -867,12 +973,12 @@ mod tests {
             "203.0.113.9",
         );
 
-        let anonymous = request("GET /api/reports/feed?project=dx HTTP/1.1\r\nHost: x\r\n\r\n");
+        let anonymous = request("GET /report/feed?dx HTTP/1.1\r\nHost: x\r\n\r\n");
         let refused = service.answer(&anonymous, &[], "203.0.113.9", Instant::now(), UNIX_EPOCH);
         assert_eq!(refused.status, Status::UNAUTHORIZED);
 
         let owner = request(
-            "GET /api/reports/feed?project=dx HTTP/1.1\r\nHost: x\r\n\
+            "GET /report/feed?dx HTTP/1.1\r\nHost: x\r\n\
              Authorization: Bearer secret-token\r\n\r\n",
         );
         let answered = service.answer(&owner, &[], "127.0.0.1", Instant::now(), UNIX_EPOCH);
@@ -906,9 +1012,8 @@ mod tests {
             },
         );
         let now = Instant::now();
-        let wrong = request(
-            "GET /api/reports/feed HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer nope\r\n\r\n",
-        );
+        let wrong =
+            request("GET /report/feed HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer nope\r\n\r\n");
         for _ in 0..3 {
             assert_eq!(
                 service
@@ -926,7 +1031,7 @@ mod tests {
 
         // The health check is deliberately outside that allowance: it runs on the proxy's
         // own timer, and a site must not leave rotation because somebody else was rude.
-        let health = request("GET /api/reports/health HTTP/1.1\r\nHost: x\r\n\r\n");
+        let health = request("GET /report/health HTTP/1.1\r\nHost: x\r\n\r\n");
         for _ in 0..5 {
             assert_eq!(
                 service
@@ -951,9 +1056,8 @@ mod tests {
     #[test]
     fn a_wrong_token_is_refused_and_a_box_with_no_token_has_no_such_route() {
         let service = service("token");
-        let wrong = request(
-            "GET /api/reports/feed HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer nope\r\n\r\n",
-        );
+        let wrong =
+            request("GET /report/feed HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer nope\r\n\r\n");
         assert_eq!(
             service
                 .answer(&wrong, &[], "203.0.113.9", Instant::now(), UNIX_EPOCH)
@@ -966,7 +1070,7 @@ mod tests {
         let store = Store::open(&dir).expect("store");
         store.add_project("dx").expect("project");
         let tokenless = Service::new(store, Config::default());
-        let asked = request("GET /api/reports/feed HTTP/1.1\r\nHost: x\r\n\r\n");
+        let asked = request("GET /report/feed HTTP/1.1\r\nHost: x\r\n\r\n");
         assert_eq!(
             tokenless
                 .answer(&asked, &[], "203.0.113.9", Instant::now(), UNIX_EPOCH)
@@ -993,7 +1097,7 @@ mod tests {
 
         let body = format!(r#"{{"project":"dx","id":"{id}"}}"#);
         let closing = request(&format!(
-            "POST /api/reports/close HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer secret-token\r\n\
+            "POST /report/close?dx HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer secret-token\r\n\
              Content-Length: {}\r\n\r\n",
             body.len()
         ));
@@ -1016,7 +1120,7 @@ mod tests {
             r#"{"kind":"bug","title":"secret title","detail":"d"}"#,
             "203.0.113.9",
         );
-        let asked = request("GET /api/reports/health HTTP/1.1\r\nHost: x\r\n\r\n");
+        let asked = request("GET /report/health HTTP/1.1\r\nHost: x\r\n\r\n");
         let answered = service.answer(&asked, &[], "203.0.113.9", Instant::now(), UNIX_EPOCH);
         assert_eq!(answered.status, Status::OK);
         assert!(
@@ -1029,11 +1133,11 @@ mod tests {
     #[test]
     fn a_get_on_the_intake_says_to_post_and_an_unknown_path_is_a_404() {
         let service = service("methods");
-        let asked = request("GET /api/reports HTTP/1.1\r\nHost: x\r\n\r\n");
+        let asked = request("GET /report HTTP/1.1\r\nHost: x\r\n\r\n");
         let answered = service.answer(&asked, &[], "203.0.113.9", Instant::now(), UNIX_EPOCH);
         assert_eq!(answered.status, Status::METHOD_NOT_ALLOWED);
 
-        let elsewhere = request("GET /api/reports/../../etc/passwd HTTP/1.1\r\nHost: x\r\n\r\n");
+        let elsewhere = request("GET /report/../../etc/passwd HTTP/1.1\r\nHost: x\r\n\r\n");
         let refused = service.answer(&elsewhere, &[], "203.0.113.9", Instant::now(), UNIX_EPOCH);
         assert_eq!(refused.status, Status::NOT_FOUND);
     }
@@ -1073,7 +1177,7 @@ mod tests {
         stream
             .write_all(
                 format!(
-                    "POST /api/reports HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\n\
+                    "POST /report HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\n\
                      Content-Length: {}\r\n\r\n{body}",
                     body.len()
                 )
@@ -1093,7 +1197,7 @@ mod tests {
         stream
             .write_all(
                 format!(
-                    "POST /api/reports HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: {}\r\n\r\n",
+                    "POST /report HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: {}\r\n\r\n",
                     MAX_BODY + 1
                 )
                 .as_bytes(),

@@ -16,8 +16,9 @@
 //!   "title" is a mistake worth telling the reporter about; a long detail is a reporter being
 //!   thorough, and cutting it is better than losing the report.
 //! - **A report names the project it is about, not the machine it came from.** `project` is
-//!   the subscribable key — `dx` — and it must be one the box already knows; `workspace` is
-//!   the *name* of the folder the reporter was standing in, never its path.
+//!   the subscribable key — `dx` — and it is the service the *address* named, not whatever the
+//!   body claims; `workspace` is the *name* of the folder the reporter was standing in, never
+//!   its path.
 //!
 //! # The fingerprint is the identity, and it is computed here
 //!
@@ -159,9 +160,13 @@ impl Report {
     /// Reads one report out of a decoded JSON body, stamping it with `at` and `source`.
     ///
     /// `kind`, `title` and `detail` are required; everything else is optional and becomes an
-    /// empty string when missing, so a minimal reporter is still a reporter. A body with no
-    /// `project` is about `default_project`, which is what lets `curl` file a dx report with
-    /// three fields.
+    /// empty string when missing, so a minimal reporter is still a reporter.
+    ///
+    /// **`project` is decided before this is called and is not read from the body.**
+    /// [`crate::service`] takes it from the address — `…/report?dx` — falling back to the
+    /// body's own `project` and then to the box's default. The body repeats the service so a
+    /// stored record is complete on its own; when the two disagree the address wins, because
+    /// that is where the report was actually sent.
     ///
     /// **`workspace` is a name, not a path.** A reporter that sends
     /// `/Users/someone/code/App` has the value reduced to `App`: the intake is public, and an
@@ -171,13 +176,10 @@ impl Report {
     /// # Errors
     /// Returns a [`Refusal`] naming the field to fix: a body that is not an object, an unknown
     /// kind, an empty title or detail, a project key that is not a key, or an identity field
-    /// over its cap. Whether the project *exists* is decided by [`crate::store`], not here.
-    pub fn parse(
-        body: &Json,
-        default_project: &str,
-        at: String,
-        source: String,
-    ) -> Result<Self, Refusal> {
+    /// over its cap. Whether the project *exists* is decided by [`crate::store`], not here —
+    /// and under this contract a service that does not exist yet is created by the first report
+    /// filed to it.
+    pub fn parse(body: &Json, project: &str, at: String, source: String) -> Result<Self, Refusal> {
         if body.get("kind").is_none() && body.get("title").is_none() {
             return Err(Refusal(
                 "a report is a JSON object with at least `kind`, `title` and `detail`".to_string(),
@@ -185,12 +187,9 @@ impl Report {
         }
         let text = |key: &str| body.get(key).and_then(Json::as_str).unwrap_or_default();
 
-        let named = text("project").trim();
-        let project = if named.is_empty() {
-            default_project.to_string()
-        } else {
-            project_key(named)?
-        };
+        // Canonicalised here rather than trusted, so one function holds the rule however the
+        // caller arrived at the key.
+        let project = project_key(project)?;
 
         let kind = Kind::parse(text("kind")).map_err(Refusal)?;
         let title = one_line(text("title"));
@@ -249,12 +248,14 @@ impl Report {
     }
 }
 
-/// The canonical form of a project key: lowercase, `[a-z0-9-]`, no leading or trailing dash.
+/// The canonical form of a service key: lowercase, `[a-z0-9._-]`, beginning and ending with a
+/// letter or a digit.
 ///
-/// A key names a directory in the database and appears in a URL, so it is validated rather
-/// than escaped — an intake that accepted `../../` as a project name would be a write
-/// primitive, and one that accepted anything at all would let a stranger create directories
-/// until the disk filled.
+/// This is the word that appears in the address — `…/report?dx` — and it also names a directory
+/// in the database, so it is validated rather than escaped. Two rules carry the weight: no
+/// character that a path could be built out of, and no `..` anywhere, so a service name cannot
+/// name a directory this store does not own. Everything else is a courtesy — a space becomes a
+/// dash so a person typing a project name into a body gets a key rather than a refusal.
 ///
 /// # Errors
 /// Returns a [`Refusal`] naming what a key may contain.
@@ -262,27 +263,28 @@ pub fn project_key(value: &str) -> Result<String, Refusal> {
     let lowered = one_line(value).to_lowercase();
     let key: String = lowered
         .chars()
-        .map(|character| {
-            if character == '_' || character == ' ' {
-                '-'
-            } else {
-                character
-            }
-        })
+        .map(|character| if character == ' ' { '-' } else { character })
         .collect();
-    let trimmed = key.trim_matches('-');
-    let legal = !trimmed.is_empty()
-        && trimmed.chars().count() <= MAX_PROJECT
-        && trimmed.chars().all(|character| {
-            character.is_ascii_lowercase() || character.is_ascii_digit() || character == '-'
+    let legal = !key.is_empty()
+        && key.chars().count() <= MAX_PROJECT
+        && !key.contains("..")
+        && key.starts_with(|character: char| character.is_ascii_alphanumeric())
+        && key.ends_with(|character: char| character.is_ascii_alphanumeric())
+        && key.chars().all(|character| {
+            character.is_ascii_lowercase()
+                || character.is_ascii_digit()
+                || character == '-'
+                || character == '_'
+                || character == '.'
         });
     if !legal {
         return Err(Refusal(format!(
-            "`{}` is not a project key — a key is 1 to {MAX_PROJECT} characters of a-z, 0-9 and -",
-            trimmed.chars().take(40).collect::<String>()
+            "`{}` is not a service key — a key is 1 to {MAX_PROJECT} characters of a-z, 0-9, \
+             . _ and -, beginning and ending with a letter or a digit",
+            key.chars().take(40).collect::<String>()
         )));
     }
-    Ok(trimmed.to_string())
+    Ok(key)
 }
 
 /// A short, one-way hash of `address`, used as [`Report::source`].
@@ -404,9 +406,14 @@ mod tests {
     }
 
     fn filed(text: &str) -> Result<Report, Refusal> {
+        about("dx", text)
+    }
+
+    /// A report filed to `service` — which is the address's word, not the body's.
+    fn about(service: &str, text: &str) -> Result<Report, Refusal> {
         Report::parse(
             &body(text),
-            "dx",
+            service,
             "2026-08-11T00:00:00Z".to_string(),
             "abcd1234".to_string(),
         )
@@ -423,10 +430,15 @@ mod tests {
         assert!(report.route.is_empty());
     }
 
+    /// The service is the address's word, and the body's `project` is a copy for the record —
+    /// so a body that disagrees changes nothing about where the report lands.
     #[test]
-    fn a_report_may_name_the_project_it_is_about() {
-        let report = filed(r#"{"project":"Self-Host","kind":"bug","title":"t","detail":"d"}"#)
-            .expect("accepted");
+    fn the_service_is_the_one_the_address_named_however_the_body_words_it() {
+        let report = about(
+            "Self-Host",
+            r#"{"project":"dx","kind":"bug","title":"t","detail":"d"}"#,
+        )
+        .expect("accepted");
         assert_eq!(
             report.project, "self-host",
             "a key is canonical, not as typed"
@@ -434,11 +446,19 @@ mod tests {
     }
 
     #[test]
-    fn a_project_key_cannot_name_a_directory_elsewhere() {
+    fn a_service_key_cannot_name_a_directory_elsewhere() {
         let error = project_key("../../etc").expect_err("refused");
-        assert!(error.message().contains("not a project key"), "{error}");
+        assert!(error.message().contains("not a service key"), "{error}");
         assert!(project_key("").is_err());
+        assert!(project_key("-dx").is_err(), "a key begins with a word");
+        assert!(project_key("dx.").is_err(), "and ends with one");
+        assert!(project_key("a..b").is_err(), "no `..`, anywhere");
         assert!(project_key("dx").is_ok());
+        // The contract's word: letters, digits, dot, underscore, dash.
+        assert_eq!(
+            project_key("Blog.Example_1").expect("key"),
+            "blog.example_1"
+        );
         assert_eq!(project_key("My Project").expect("key"), "my-project");
     }
 
