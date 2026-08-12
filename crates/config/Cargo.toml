@@ -10,6 +10,11 @@ description = "Deployment config model and validation. The single source of trut
 [dependencies]
 serde = { workspace = true }
 toml = { workspace = true }
+# The PACC configuration document is JSON, and its digest is taken over the
+# exact bytes served — so those bytes are built by the workspace's own
+# dependency-free JSON crate rather than formatted by hand, where a stray comma
+# would silently invalidate every published digest.
+selfhost-json = { workspace = true }
 
 [lints.rust]
 unsafe_code = "forbid"

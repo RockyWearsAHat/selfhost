@@ -358,7 +358,12 @@ mod tests {
         assert_eq!(orders[0].canonical, "mail.example.com");
         assert_eq!(
             orders[0].domains,
-            vec!["mail.example.com", "imap.example.com", "smtp.example.com"]
+            vec![
+                "mail.example.com",
+                "imap.example.com",
+                "smtp.example.com",
+                "ua-auto-config.example.com",
+            ]
         );
     }
 }

@@ -20,6 +20,7 @@ pub mod home;
 pub mod mail;
 pub mod mesh;
 pub mod namecheap;
+pub mod pacc;
 pub mod psl;
 pub mod registrar;
 pub mod service;

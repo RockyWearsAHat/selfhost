@@ -122,7 +122,9 @@ async fn sync_domains<P: DnsProvider>(
     for domain in domains {
         println!("\n── {domain}");
 
-        let mut desired = plan::desired_records(config, domain, server_ip, dkim_txt);
+        let pacc = pacc_digest(config, domain);
+        let mut desired =
+            plan::desired_records(config, domain, server_ip, dkim_txt, pacc.as_deref());
         if srv_unsupported {
             let unwritable: Vec<Record> =
                 Namecheap::<HttpsTransport>::unwritable(&desired).into_iter().cloned().collect();
@@ -191,7 +193,9 @@ fn print_manual(
     println!("Records already there that this list does not mention can stay as they are.");
     for domain in domains {
         println!("\n── {domain}");
-        let records = plan::desired_records(config, domain, server_ip, dkim_txt);
+        let pacc = pacc_digest(config, domain);
+        let records =
+            plan::desired_records(config, domain, server_ip, dkim_txt, pacc.as_deref());
         if records.is_empty() {
             println!("  (nothing — no site or mail claims this domain)");
             continue;
@@ -321,6 +325,21 @@ fn config_apex_a(config: &Config) -> Option<Ipv4Addr> {
         .and_then(|record| record.value.parse().ok())
 }
 
+/// The digest of the PACC configuration document `domain` publishes, when
+/// `[mail]` covers that domain.
+///
+/// Pure: the document is derived from the config, not read back from the
+/// running proxy — the proxy derives it from the same config with the same
+/// function, so hashing it here cannot disagree with what is served unless the
+/// config itself changed, which changes both sides together.
+pub(crate) fn pacc_digest(config: &Config, domain: &str) -> Option<String> {
+    let mail = config.mail.as_ref()?;
+    mail.domains
+        .iter()
+        .any(|covered| covered.eq_ignore_ascii_case(domain))
+        .then(|| selfhost_mail::pacc::digest(&selfhost_config::pacc::document(domain)))
+}
+
 /// The DKIM public TXT value, when signing is configured and the key exists.
 ///
 /// Read-only on purpose: `selfhost run` generates the key; a sync must not
@@ -434,6 +453,39 @@ provider = "manual"
 "#,
         )
         .expect("a valid config")
+    }
+
+    #[test]
+    fn the_published_pacc_digest_hashes_exactly_what_the_proxy_serves() {
+        // The one thing that can silently break PACC: a digest in DNS taken
+        // over bytes other than the ones the proxy answers with. Both sides are
+        // derived here — the record from the reconcile engine, the document
+        // from a built proxy — and hashed against each other, so a change to
+        // either generator fails this test rather than a stranger's Mail.
+        let config = config();
+        let server = selfhost_proxy::Server::build(&config, std::path::Path::new("/tmp"));
+        let served = server
+            .pacc_document("ua-auto-config.example.com")
+            .expect("the proxy serves a document for the mail domain");
+
+        let digest = pacc_digest(&config, "example.com").expect("a digest for the mail domain");
+        assert_eq!(digest, selfhost_mail::pacc::digest(&served));
+
+        let records = plan::desired_records(
+            &config,
+            "example.com",
+            Ipv4Addr::new(203, 0, 113, 9),
+            None,
+            Some(&digest),
+        );
+        let record = records
+            .iter()
+            .find(|record| record.host == "_ua-auto-config" && record.rtype.kind() == "TXT")
+            .expect("a PACC digest record");
+        assert_eq!(record.value, selfhost_config::pacc::txt_value(&digest));
+
+        // A domain the config's `[mail]` does not cover publishes nothing.
+        assert!(pacc_digest(&config, "other.net").is_none());
     }
 
     #[test]

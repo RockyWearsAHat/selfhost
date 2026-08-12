@@ -322,6 +322,7 @@ dependencies = [
 name = "selfhost-config"
 version = "0.1.0"
 dependencies = [
+ "selfhost-json",
  "serde",
  "toml",
 ]

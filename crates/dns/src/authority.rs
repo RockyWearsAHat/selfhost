@@ -1064,7 +1064,7 @@ domains = ["example.com", "hand.example"]
         let mail_records: Vec<(String, Vec<RecordConfig>)> = mail
             .domains
             .iter()
-            .map(|domain| (domain.clone(), mail.dns_records(domain, None)))
+            .map(|domain| (domain.clone(), mail.dns_records(domain, None, None)))
             .collect();
 
         let authority = Authority::for_config_with_mail(&config, Some(PUBLIC), &mail_records);
