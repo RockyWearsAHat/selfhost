@@ -417,9 +417,12 @@ impl Authority {
 /// - an `A` for the `[mail]` hostname and each client-autoconfig host
 ///   (`mail.`/`imap.`/`smtp.` per mail domain) the zone contains;
 /// - when the zone's origin is a mail domain, `_imaps._tcp` → port 993 at
-///   `imap.<origin>` and `_submission._tcp` → port 587 at `smtp.<origin>` —
-///   the same records `registrar::desired_records` derives, so the served zone
-///   and a registrar push can never disagree about client discovery.
+///   `imap.<origin>`, `_submission._tcp` → port 587 at `smtp.<origin>`
+///   (RFC 6186 `STARTTLS` discovery), and `_submissions._tcp` → port 465 at
+///   `smtp.<origin>` (RFC 8314 implicit-TLS discovery, served alongside 587,
+///   never instead of it) — the same records `registrar::desired_records`
+///   derives, so the served zone and a registrar push can never disagree
+///   about client discovery.
 ///
 /// With no `public_ip` yet, only the SRVs are added: their targets are names,
 /// not addresses, and the updater fills the missing `A`s on its first tick.
@@ -449,6 +452,7 @@ fn populate_claimed_hosts(zone: &mut Zone, config: &Config, public_ip: Option<Ip
         for (service, port, target) in [
             ("_imaps._tcp", 993, format!("imap.{origin}")),
             ("_submission._tcp", 587, format!("smtp.{origin}")),
+            ("_submissions._tcp", 465, format!("smtp.{origin}")),
         ] {
             zone.records.push(Record {
                 name: format!("{service}.{origin}"),
@@ -1111,6 +1115,13 @@ domains = ["example.com", "hand.example"]
             answers.iter().any(|r| matches!(&r.data,
                 RecordData::Srv { port: 587, target, .. } if target == "smtp.example.com")),
             "the submission SRV names smtp.example.com:587, got {answers:?}"
+        );
+        let submissions = served("_submissions._tcp.example.com", RecordType::Srv).await;
+        let answers = wire::decode_response(&submissions).unwrap().answers;
+        assert!(
+            answers.iter().any(|r| matches!(&r.data,
+                RecordData::Srv { port: 465, target, .. } if target == "smtp.example.com")),
+            "the RFC 8314 implicit-TLS submission SRV names smtp.example.com:465, got {answers:?}"
         );
 
         // The hand zone is a mail domain but wrote its own records: no SRVs.

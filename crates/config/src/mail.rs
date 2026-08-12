@@ -71,7 +71,7 @@ pub struct Mail {
     pub relay: Option<Relay>,
 
     /// The listener binds. Every field defaults to the standard mail port on
-    /// `0.0.0.0`, so a bare `[mail]` binds all four correctly.
+    /// `0.0.0.0`, so a bare `[mail]` binds all five correctly.
     #[serde(default)]
     pub bind: MailBind,
 
@@ -133,6 +133,7 @@ impl Mail {
         for (label, bind) in [
             ("smtp", &self.bind.smtp),
             ("submission", &self.bind.submission),
+            ("submissions", &self.bind.submissions),
             ("imap", &self.bind.imap),
             ("imaps", &self.bind.imaps),
         ] {
@@ -160,7 +161,7 @@ impl Mail {
         }
     }
 
-    /// The four listener binds, parsed, for the firewall and the daemon.
+    /// The five listener binds, parsed, for the firewall and the daemon.
     ///
     /// Returns each successfully-parsed bind paired with its role. A bind that
     /// does not parse is omitted — [`Mail::check`] has already reported it — so a
@@ -169,6 +170,7 @@ impl Mail {
         [
             ("smtp", &self.bind.smtp),
             ("submission", &self.bind.submission),
+            ("submissions", &self.bind.submissions),
             ("imap", &self.bind.imap),
             ("imaps", &self.bind.imaps),
         ]
@@ -357,16 +359,24 @@ impl Relay {
     }
 }
 
-/// Where the four mail servers bind. Each defaults to its standard port on
+/// Where the five mail servers bind. Each defaults to its standard port on
 /// `0.0.0.0`, so a deployment writes a bind only to override one.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MailBind {
     /// Inbound SMTP from other mail servers. Standard `0.0.0.0:25`.
     #[serde(default = "default_smtp_bind")]
     pub smtp: String,
-    /// Authenticated submission from this deployment's own users. `0.0.0.0:587`.
+    /// Authenticated submission with STARTTLS (RFC 6186 `_submission._tcp`),
+    /// from this deployment's own users. `0.0.0.0:587`.
     #[serde(default = "default_submission_bind")]
     pub submission: String,
+    /// Authenticated submission with implicit TLS (RFC 8314 `_submissions._tcp`):
+    /// the same submission service as [`submission`](Self::submission), but TLS
+    /// begins immediately on connection rather than after `STARTTLS`. Served
+    /// alongside 587, never instead of it — RFC 8314 §3.3 has clients prefer
+    /// implicit TLS but keeps `587` for compatibility. `0.0.0.0:465`.
+    #[serde(default = "default_submissions_bind")]
+    pub submissions: String,
     /// IMAP with STARTTLS. `0.0.0.0:143`.
     #[serde(default = "default_imap_bind")]
     pub imap: String,
@@ -380,6 +390,7 @@ impl Default for MailBind {
         Self {
             smtp: default_smtp_bind(),
             submission: default_submission_bind(),
+            submissions: default_submissions_bind(),
             imap: default_imap_bind(),
             imaps: default_imaps_bind(),
         }
@@ -471,6 +482,10 @@ fn default_smtp_bind() -> String {
 
 fn default_submission_bind() -> String {
     "0.0.0.0:587".to_owned()
+}
+
+fn default_submissions_bind() -> String {
+    "0.0.0.0:465".to_owned()
 }
 
 fn default_imap_bind() -> String {

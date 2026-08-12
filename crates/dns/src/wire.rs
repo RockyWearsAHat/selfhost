@@ -216,8 +216,9 @@ pub enum RecordData {
         minimum: u32,
     },
     /// A service locator (RFC 2782): which host and port carry a service for
-    /// this name. Served for `_imaps._tcp` and `_submission._tcp` so a mail
-    /// client discovers its servers per RFC 6186 instead of guessing hostnames.
+    /// this name. Served for `_imaps._tcp` and `_submission._tcp` (RFC 6186) and
+    /// `_submissions._tcp` (RFC 8314) so a mail client discovers its servers
+    /// instead of guessing hostnames.
     Srv {
         /// Lower values are tried first.
         priority: u16,

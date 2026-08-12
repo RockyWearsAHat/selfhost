@@ -123,7 +123,7 @@ pub fn with_ssh(desired: &[AllowRule]) -> Vec<AllowRule> {
 
 /// The inbound allowances a deployment's public binds require under its scope.
 ///
-/// Covers the web binds always, and the four mail binds when `[mail]` is
+/// Covers the web binds always, and the five mail binds when `[mail]` is
 /// configured — a deployment that answers `MX` queries with its own name must
 /// keep `:25` open across router and firewall resets exactly as reliably as it
 /// keeps `:443`, so the two are derived by the one function.
@@ -251,10 +251,10 @@ mod tests {
     }
 
     #[test]
-    fn a_mail_section_opens_its_four_binds_alongside_the_web_ports() {
+    fn a_mail_section_opens_its_five_binds_alongside_the_web_ports() {
         let rules = desired_rules(&server(true, Scope::Internet), Some(&mail()));
         let ports: Vec<u16> = rules.iter().map(|rule| rule.port).collect();
-        assert_eq!(ports, vec![80, 443, 25, 587, 143, 993]);
+        assert_eq!(ports, vec![80, 443, 25, 587, 465, 143, 993]);
     }
 
     #[test]

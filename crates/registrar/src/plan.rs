@@ -27,9 +27,10 @@ use crate::{Record, RecordType};
 ///   reused, not re-derived, so this crate and the served zone can never
 ///   disagree — plus an `A` for each name the promise must resolve
 ///   (the MX target and the `mail`/`imap`/`smtp` client-autoconfig hosts that
-///   fall under `domain`), and the RFC 6186 client-discovery SRVs:
-///   `_imaps._tcp` → `0 1 993 imap.<domain>` and `_submission._tcp` →
-///   `0 1 587 smtp.<domain>`.
+///   fall under `domain`), and the client-discovery SRVs: `_imaps._tcp` →
+///   `0 1 993 imap.<domain>` and `_submission._tcp` → `0 1 587 smtp.<domain>`
+///   (RFC 6186), plus `_submissions._tcp` → `0 1 465 smtp.<domain>` (RFC 8314
+///   implicit TLS, published alongside `_submission._tcp`, never instead of it).
 ///
 /// `dkim_txt` is the value of `mail::dkim::Dkim::public_txt()`; the caller
 /// reads the key because this function performs no I/O. Pass `None` when
@@ -109,6 +110,14 @@ pub fn desired_records(
         records.push(Record {
             host: "_submission._tcp".into(),
             rtype: RecordType::Srv { priority: 0, weight: 1, port: 587 },
+            value: format!("smtp.{domain}"),
+            ttl: None,
+        });
+        // RFC 8314 §5.1: implicit-TLS submission discovery, published alongside
+        // (never instead of) the RFC 6186 STARTTLS SRV above.
+        records.push(Record {
+            host: "_submissions._tcp".into(),
+            rtype: RecordType::Srv { priority: 0, weight: 1, port: 465 },
             value: format!("smtp.{domain}"),
             ttl: None,
         });
@@ -436,6 +445,18 @@ private_key = "dkim/k.pem"
         let submission = find(&records, "_submission._tcp", "SRV").expect("a submission SRV");
         assert_eq!(submission.rtype, RecordType::Srv { priority: 0, weight: 1, port: 587 });
         assert_eq!(submission.value, "smtp.example.com");
+    }
+
+    #[test]
+    fn derives_the_rfc8314_implicit_tls_submission_srv_alongside_starttls() {
+        let records = desired_records(&deployment(), "example.com", IP, None);
+
+        let submissions = find(&records, "_submissions._tcp", "SRV").expect("an implicit-TLS submission SRV");
+        assert_eq!(submissions.rtype, RecordType::Srv { priority: 0, weight: 1, port: 465 });
+        assert_eq!(submissions.value, "smtp.example.com");
+
+        // Published alongside, not instead of, the RFC 6186 STARTTLS SRV.
+        assert!(find(&records, "_submission._tcp", "SRV").is_some(), "587 SRV must still be present");
     }
 
     #[test]
