@@ -103,3 +103,33 @@ codegen-units = 16
 incremental = true
 panic = "abort"
 strip = true
+# Nothing reads a backtrace off the deployed binary — it is stripped, and the
+# daemon reports faults in its own words — so debug info is pure build time and
+# disk. Stated rather than left to the default, because `strip` hides the cost
+# instead of removing it: the info is still generated, then thrown away.
+debug = false
+
+# Build scripts and proc macros run at *compile* time and their generated code
+# is never in the shipped binary, so optimising them is time spent making the
+# build slower. `ring`'s build script compiles C, and `serde`'s derive is a
+# proc macro every crate in the workspace pulls on; both are cold-build cost.
+# Many codegen units because these are compiled once and not linked into
+# anything whose runtime matters.
+[profile.release.build-override]
+opt-level = 0
+codegen-units = 256
+incremental = false
+debug = false
+
+# The same reasoning for the profile the tests run under: `cargo test` on this
+# workspace rebuilds the same proc macros, and nobody steps through a derive.
+[profile.dev.build-override]
+opt-level = 0
+codegen-units = 256
+debug = false
+
+[profile.dev]
+# Enough to name a frame in a panic, without the cost of full debug info for
+# every local in a 30,000-line workspace. Line tables are what a backtrace
+# actually reads.
+debug = "line-tables-only"

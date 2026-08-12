@@ -4,16 +4,28 @@
 //! working copy of this branch on disk, and when the branch moves, update the
 //! copy, run the build step, and restart the service.
 //!
-//! # Why polling is the mechanism, not a webhook
+//! # Two triggers, and why neither is allowed to be the only one
 //!
-//! A webhook is an event that has to arrive. It does not arrive when the network
-//! hiccups, when the hook was configured against a URL form the sender does not
-//! use, or when nobody configured one at all — and every one of those failures is
-//! silent, which is the worst property a deployment trigger can have. Polling a
-//! remote ref costs one small request per interval and cannot fail silently: a
-//! poll either answers with a commit or reports why it could not. A webhook can
-//! still be added later as a way to make a poll happen *sooner*, but it is not
-//! allowed to become the only path.
+//! **A webhook is the fast path.** A push reaches this box in the time one HTTP
+//! request takes, so a deployment starts within a second of the commit landing
+//! rather than up to a whole interval later.
+//!
+//! **A poll is the floor under it.** A webhook is an event that has to arrive,
+//! and it does not arrive when the network hiccups, when the hook was pointed at
+//! a URL form the sender does not use, or when nobody configured one at all.
+//! Every one of those failures is silent, which is the worst property a
+//! deployment trigger can have. A poll cannot fail silently: it either answers
+//! with a commit or reports why it could not.
+//!
+//! So both run, and the webhook is never permitted to become the only path — it
+//! makes a poll happen *sooner*, it does not replace one. That is also what
+//! makes the webhook safe to expose: the poll it triggers reads the real branch
+//! tip with `git ls-remote` before acting, so the request body is never trusted
+//! for *what* to deploy. A forged request can only make a legitimate deployment
+//! happen earlier; it can never deploy something that is not at the branch tip.
+//!
+//! Because the webhook carries the latency, the poll interval is a safety net
+//! rather than the mechanism, and [`DEFAULT_INTERVAL_SECS`] is set accordingly.
 //!
 //! # Why the working copy is separate from the service's directory
 //!
@@ -37,7 +49,14 @@ use crate::validate::Problem;
 pub const MIN_INTERVAL_SECS: u64 = 10;
 
 /// How often a branch is checked, when the config does not say.
-pub const DEFAULT_INTERVAL_SECS: u64 = 60;
+///
+/// Five minutes, not one: with a webhook configured the poll is the *safety
+/// net* under it, not the thing that notices a push, so its job is to catch a
+/// hook that never arrived rather than to keep latency down. A push with a
+/// working webhook deploys in about a second regardless of this number, and a
+/// deployment with no webhook still never sits more than this long behind its
+/// branch.
+pub const DEFAULT_INTERVAL_SECS: u64 = 300;
 
 /// The branch a watch follows when the config does not name one.
 pub const DEFAULT_BRANCH: &str = "main";
@@ -155,7 +174,28 @@ pub struct SelfUpdate {
     /// [`GitWatch::post_pull`] gives. Absent → [`DEFAULT_SELF_BUILD`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub build: Option<Vec<String>>,
+
+    /// A shared secret that lets a push update this deployment *now*, instead
+    /// of waiting out `interval_secs`.
+    ///
+    /// The same mechanism, guarantees and threat model as
+    /// [`GitWatch::webhook_secret`] — read that field's documentation, it is the
+    /// authority — pointed at this deployment's own repository rather than a
+    /// service's. The public path is `/.selfhost/webhook/self`, which is
+    /// reserved: it names this section, never a service, so a service called
+    /// `self` cannot claim it.
+    ///
+    /// `None` (the default) leaves self-update poll-only, and the reserved path
+    /// answers exactly as an unknown one does.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub webhook_secret: Option<String>,
 }
+
+/// The webhook path segment reserved for [`SelfUpdate`].
+///
+/// Held here, beside the field it authenticates, so the proxy route and the
+/// config cannot drift apart about which name is reserved.
+pub const SELF_UPDATE_WEBHOOK_NAME: &str = "self";
 
 impl SelfUpdate {
     /// A watch of `branch` in `repository`, with defaults.
@@ -166,6 +206,7 @@ impl SelfUpdate {
             interval_secs: DEFAULT_INTERVAL_SECS,
             enabled: true,
             build: None,
+            webhook_secret: None,
         }
     }
 
@@ -209,6 +250,13 @@ impl SelfUpdate {
             problems.push(Problem {
                 field: format!("{at}.build"),
                 message: "is present but empty; omit it entirely to use the default build".into(),
+            });
+        }
+        if self.webhook_secret.as_deref().is_some_and(str::is_empty) {
+            problems.push(Problem {
+                field: format!("{at}.webhook_secret"),
+                message: "is present but empty; omit it entirely to leave self-update poll-only"
+                    .into(),
             });
         }
     }

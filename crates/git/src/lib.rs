@@ -36,6 +36,7 @@
 #![warn(missing_docs)]
 
 pub mod deploy;
+pub mod nudge;
 pub mod plan;
 pub mod run;
 
@@ -48,6 +49,7 @@ use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
 
 pub use deploy::Outcome;
+pub use nudge::Nudge;
 pub use plan::Step;
 
 /// Every watch currently being polled, one task each.

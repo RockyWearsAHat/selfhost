@@ -553,8 +553,12 @@ mod tests {
         )
         .unwrap();
         let watch = spec_from_json(&value).and_then(|s| s.git).expect("a watch");
-        assert_eq!(watch.branch, "main");
-        assert_eq!(watch.interval_secs, 60);
+        assert_eq!(watch.branch, selfhost_config::git::DEFAULT_BRANCH);
+        // The constant, not the number it happens to hold: this asserts that an
+        // omitted field takes *the* default, which is the contract. Pinning the
+        // literal made this fail when the default moved for a reason that has
+        // nothing to do with JSON parsing.
+        assert_eq!(watch.interval_secs, selfhost_config::git::DEFAULT_INTERVAL_SECS);
         assert!(watch.enabled && watch.auto_update);
     }
 
