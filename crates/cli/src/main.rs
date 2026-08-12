@@ -604,7 +604,26 @@ async fn serve_everything(
     let token = Token::load_or_create(&data_dir).map_err(|e| e.to_string())?;
     let supervisor = Supervisor::new(&project_dir);
 
-    let listener = selfhost_admin::bind(address).await.map_err(|e| e.to_string())?;
+    // The admin API binds first, before anything public. That ordering is what
+    // makes a second copy of this process fail here — on loopback, harmlessly —
+    // rather than a moment later in a fight over :443 that the internet can see.
+    let listener = selfhost_admin::bind(address).await.map_err(|error| {
+        if error.kind() == std::io::ErrorKind::AddrInUse {
+            // The exact symptom of an upgraded box that still has the
+            // pre-merge service definitions: `run` and `daemon` are now the
+            // same whole deployment, so two registrations means two of it.
+            format!(
+                "{address} is already in use, which almost always means another selfhost is \
+                 already running.\n\n  `run` and `daemon` are now the same thing — the whole \
+                 deployment in one process — so a machine that still has separate service \
+                 entries for both will start two copies and they will fight over :80 and :443.\n\n\
+                 Fix it once with `selfhost service install`, which registers the single \
+                 service and removes the ones it supersedes."
+            )
+        } else {
+            error.to_string()
+        }
+    })?;
 
     println!("selfhost daemon");
     println!("  control api  http://{address}");
