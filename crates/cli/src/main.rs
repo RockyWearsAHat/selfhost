@@ -317,12 +317,17 @@ domains = ["localhost"]
 static_root = "./sites/hello"
 spa = false
 
-# Uncomment to let a push to your repository update selfhost itself: the daemon
-# polls the branch, rebuilds, and restarts. Needs this directory to be a clone
-# of that repository.
+# Uncomment to let a push to your repository update selfhost itself: fetch,
+# rebuild, restart. Needs this directory to be a clone of that repository.
+#
+# Set webhook_secret and add the same value to the repository's webhook
+# (pointed at https://<a site this box serves>/.selfhost/webhook/self) to deploy
+# within seconds of a push. Without it the branch is still checked on the timer
+# below — a webhook makes a check happen sooner, it never replaces one.
 # [self_update]
 # repository = "https://github.com/you/selfhost.git"
 # branch = "main"
+# webhook_secret = "<a long random string, kept only in this file>"
 
 {desktop}
 {shares}"#
@@ -577,11 +582,28 @@ async fn serve_daemon(
 
     // Stated for the same reason: a deployment that believes it self-updates
     // but does not is indistinguishable from one nobody has pushed to.
+    //
+    // The nudge is the webhook's end of the same watch: it is built here, given
+    // to the API below, and awaited by the watcher in the `select!` — one value,
+    // so a push cannot poke a signal nothing is listening to.
+    let self_update_nudge = selfhost_git::Nudge::new();
     if let Some(update) = config.self_update.as_ref().filter(|u| u.enabled) {
         println!(
-            "\nself-update: watching {} ({}) every {}s",
-            update.repository, update.branch, update.interval_secs
+            "\nself-update: watching {} ({})",
+            update.repository, update.branch
         );
+        match update.webhook_secret.is_some() {
+            true => println!(
+                "  push         https://<a site this box serves>/.selfhost/webhook/self \
+                 (deploys within seconds)"
+            ),
+            false => println!(
+                "  push         not configured — set self_update.webhook_secret and add the \
+                 same secret to the repository's webhook to deploy on push instead of \
+                 on the timer"
+            ),
+        }
+        println!("  safety net   re-checks every {}s regardless", update.interval_secs);
     }
 
     // The firewall the daemon drives for the public listeners. Built from config,
@@ -661,6 +683,11 @@ async fn serve_daemon(
     // effect at the next daemon restart.
     let mut api = Api::new(supervisor.clone(), store, token, watches.clone(), firewall.clone())
         .with_console_auth(&data_dir);
+    // Only when the section is live: a route that answers 202 and pokes a
+    // watcher that is not running would report a deployment nobody is doing.
+    if config.self_update.as_ref().is_some_and(|update| update.enabled) {
+        api = api.with_self_update(self_update_nudge.clone());
+    }
     // Passkey (biometric) login is scoped to the console site's canonical
     // hostname — the WebAuthn relying-party id. Config is the only honest
     // source for it: the proxy's console relay forwards no Host header, and an
@@ -773,7 +800,11 @@ async fn serve_daemon(
         // Watches this daemon's own repository; resolving means a new build is
         // fetched, compiled, and installed, and this process's job is to get
         // out of its way. Pends forever when `[self_update]` is absent or off.
-        commit = self_update::watch_own_repository(config.self_update.clone(), project_dir.clone()) => {
+        commit = self_update::watch_own_repository(
+            config.self_update.clone(),
+            project_dir.clone(),
+            self_update_nudge.clone(),
+        ) => {
             updated_to = Some(commit);
             Ok(())
         }

@@ -134,6 +134,15 @@ pub struct Server {
     /// the proxy's only use for this is the webhook relay — better to serve
     /// every site and answer a webhook with 502 than to refuse to start.
     admin_bind: Option<SocketAddr>,
+    /// The secret that authenticates a push to `/.selfhost/webhook/self`.
+    ///
+    /// Behind a lock and rebuilt by the same reload as `routes`, because it is
+    /// derived from the same config: a secret set or rotated by a config edit
+    /// has to take effect on the next push, not at the next restart — the
+    /// property [`lookup_webhook_secret`] gets for free by reading
+    /// `services.toml` fresh, and which this field has to be given deliberately
+    /// because `[self_update]` lives in the config rather than the catalogue.
+    self_update_secret: RwLock<Option<String>>,
 }
 
 impl Server {
@@ -150,7 +159,22 @@ impl Server {
             pacc: RwLock::new(Self::pacc_documents(config)),
             data_dir,
             admin_bind: config.server.admin_bind.parse().ok(),
+            self_update_secret: RwLock::new(Self::self_update_secret(config)),
         }
+    }
+
+    /// The configured self-update webhook secret, if this deployment has one.
+    ///
+    /// A disabled `[self_update]` yields `None` rather than the secret it still
+    /// holds: switching the section off during an incident must close the push
+    /// path too, or the one control an operator reaches for would leave the
+    /// fast trigger armed.
+    fn self_update_secret(config: &Config) -> Option<String> {
+        config
+            .self_update
+            .as_ref()
+            .filter(|update| update.enabled)
+            .and_then(|update| update.webhook_secret.clone())
     }
 
     /// Rebuilds the routing table from a freshly reloaded config and swaps it
@@ -170,6 +194,8 @@ impl Server {
         *self.sites.write().unwrap_or_else(|poisoned| poisoned.into_inner()) = sites;
         *self.pacc.write().unwrap_or_else(|poisoned| poisoned.into_inner()) =
             Self::pacc_documents(config);
+        *self.self_update_secret.write().unwrap_or_else(|poisoned| poisoned.into_inner()) =
+            Self::self_update_secret(config);
     }
 
     /// The automatic-configuration document each mail domain publishes, keyed
@@ -763,8 +789,9 @@ where
 
     // No such service, no active watch, or no secret configured for one all
     // answer the same way: a probe against this path learns nothing about
-    // which services are real.
-    let Some(secret) = lookup_webhook_secret(server, name) else {
+    // which services are real. The reserved self-update name resolves through
+    // the same `Option`, so it is equally opaque.
+    let Some(secret) = webhook_secret(server, name) else {
         write_response(stream, Response::error_page(Status::NOT_FOUND), false).await?;
         return Ok(Outcome::MustClose);
     };
@@ -802,6 +829,26 @@ fn valid_service_name(name: &str) -> bool {
     !name.is_empty()
         && name.len() <= 128
         && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+}
+
+/// The webhook secret that authenticates a push to `name`, if there is one.
+///
+/// One lookup for both kinds of target, so [`serve_webhook`] cannot treat them
+/// differently by accident: the reserved [`SELF_UPDATE_WEBHOOK_NAME`] resolves
+/// to this deployment's own secret, and every other name to a service's. The
+/// reserved name is checked *first* and unconditionally, so a service that
+/// happens to be called `self` can never claim the path — and, because both
+/// branches answer with the same `Option`, a caller cannot tell which kind of
+/// target a 404 came from.
+fn webhook_secret(server: &Server, name: &str) -> Option<String> {
+    if name == selfhost_config::git::SELF_UPDATE_WEBHOOK_NAME {
+        return server
+            .self_update_secret
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+    }
+    lookup_webhook_secret(server, name)
 }
 
 /// The webhook secret configured for a service's active git watch, if any.
@@ -843,8 +890,8 @@ fn hex_decode(text: &str) -> Option<Vec<u8>> {
     (0..text.len()).step_by(2).map(|i| u8::from_str_radix(&text[i..i + 2], 16).ok()).collect()
 }
 
-/// Calls the loopback admin API's deploy route for one service, returning the
-/// status it answered.
+/// Calls the loopback admin API's deploy route for `name`, returning the status
+/// it answered.
 ///
 /// One connection, `Connection: close`, mirroring [`forward`] and the ACME
 /// transport: this fires rarely enough that keep-alive would only add state.
@@ -854,9 +901,19 @@ async fn relay_deploy(server: &Server, name: &str) -> io::Result<Status> {
         .ok_or_else(|| io::Error::other("admin_bind is not configured or does not parse"))?;
     let token = selfhost_admin::Token::load_or_create(&server.data_dir)?;
 
+    // The reserved name is not a service, so it does not live under
+    // `/api/services/`. `name` reaches a raw request line either way, which is
+    // why `valid_service_name` has already refused anything outside its
+    // allow-list.
+    let target = if name == selfhost_config::git::SELF_UPDATE_WEBHOOK_NAME {
+        "/api/self-update/deploy".to_owned()
+    } else {
+        format!("/api/services/{name}/deploy")
+    };
+
     let mut upstream = TcpStream::connect(admin_bind).await?;
     let head = format!(
-        "POST /api/services/{name}/deploy HTTP/1.1\r\n\
+        "POST {target} HTTP/1.1\r\n\
          Host: 127.0.0.1\r\n\
          Authorization: Bearer {}\r\n\
          Content-Length: 0\r\n\
@@ -2111,6 +2168,24 @@ mod tests {
         Server::build(&config, data_dir)
     }
 
+    /// A `Server` like [`server_over`], with `[self_update]` present and its
+    /// webhook secret set — the config side of the reserved `self` name.
+    fn server_with_self_update(
+        data_dir: &std::path::Path,
+        admin_bind: &str,
+        secret: Option<&str>,
+        enabled: bool,
+    ) -> Server {
+        let mut config = config_with(vec![site("api", &["api.example.com"])]);
+        config.server.data_dir = PathBuf::from(".");
+        config.server.admin_bind = admin_bind.to_owned();
+        let mut update = selfhost_config::SelfUpdate::new("https://example.com/selfhost.git");
+        update.webhook_secret = secret.map(str::to_owned);
+        update.enabled = enabled;
+        config.self_update = Some(update);
+        Server::build(&config, data_dir)
+    }
+
     /// Writes a service whose git watch carries `secret`, into `dir`'s
     /// catalogue — the same file [`lookup_webhook_secret`] reads.
     async fn install_watched_service(dir: &std::path::Path, name: &str, secret: &str) {
@@ -2154,6 +2229,133 @@ mod tests {
         head.push_str("\r\n");
         let request = Request::parse(head.as_bytes()).expect("a well-formed head parses").request;
         (request, body.as_bytes().to_vec())
+    }
+
+    #[tokio::test]
+    async fn a_self_update_push_reaches_the_self_update_route_not_a_service_one() {
+        let dir = ScratchDataDir::new("selfupdate-relay");
+        selfhost_admin::Token::load_or_create(&dir.0).expect("plant a token to read back");
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind a fake admin port");
+        let admin_bind = listener.local_addr().expect("a bound address");
+        let accepted = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("one connection");
+            let mut buffer = Vec::new();
+            let mut chunk = [0u8; 512];
+            loop {
+                let read = stream.read(&mut chunk).await.expect("read the relayed request");
+                if read == 0 {
+                    break;
+                }
+                buffer.extend_from_slice(&chunk[..read]);
+                if buffer.ends_with(b"\r\n\r\n") {
+                    break;
+                }
+            }
+            stream
+                .write_all(b"HTTP/1.1 202 Accepted\r\nContent-Length: 2\r\n\r\n{}")
+                .await
+                .expect("answer the relay");
+            stream.flush().await.expect("flush the answer");
+            String::from_utf8_lossy(&buffer).into_owned()
+        });
+
+        let server =
+            server_with_self_update(&dir.0, &admin_bind.to_string(), Some("s3cret"), true);
+        let body = "{}";
+        let key = ring::hmac::Key::new(ring::hmac::HMAC_SHA256, b"s3cret");
+        let signature = hex_encode(ring::hmac::sign(&key, body.as_bytes()).as_ref());
+        let (request, body) = webhook_request("self", body, Some(&signature));
+
+        let response = webhook_response(&server, &request, &body).await;
+        assert!(response.starts_with("HTTP/1.1 202"), "{response}");
+
+        let relayed = accepted.await.expect("the fake admin task did not panic");
+        // The whole point of the reserved name: selfhost is not in the service
+        // catalogue, so this must never become /api/services/self/deploy.
+        assert!(relayed.starts_with("POST /api/self-update/deploy HTTP/1.1"), "{relayed}");
+        assert!(relayed.contains("Authorization: Bearer "), "{relayed}");
+    }
+
+    #[tokio::test]
+    async fn a_service_named_self_cannot_claim_the_reserved_push_path() {
+        // A catalogue entry called `self` with its own secret must not be
+        // reachable at /.selfhost/webhook/self: the reserved name is resolved
+        // first and unconditionally, so this deployment's *own* update path can
+        // never be taken over by installing a service with the right name.
+        let dir = ScratchDataDir::new("selfupdate-shadow");
+        install_watched_service(&dir.0, "self", "service-secret").await;
+        // No `[self_update]` at all, so the reserved name resolves to no secret.
+        let server = server_over(&dir.0, "127.0.0.1:1");
+
+        let body = "{}";
+        let key = ring::hmac::Key::new(ring::hmac::HMAC_SHA256, b"service-secret");
+        let signature = hex_encode(ring::hmac::sign(&key, body.as_bytes()).as_ref());
+        let (request, body) = webhook_request("self", body, Some(&signature));
+
+        let response = webhook_response(&server, &request, &body).await;
+        assert!(response.starts_with("HTTP/1.1 404"), "{response}");
+    }
+
+    #[tokio::test]
+    async fn a_self_update_push_without_a_configured_secret_is_a_404() {
+        let dir = ScratchDataDir::new("selfupdate-nosecret");
+        let server = server_with_self_update(&dir.0, "127.0.0.1:1", None, true);
+        let (request, body) = webhook_request("self", "{}", Some("00"));
+
+        let response = webhook_response(&server, &request, &body).await;
+        assert!(response.starts_with("HTTP/1.1 404"), "{response}");
+    }
+
+    #[tokio::test]
+    async fn disabling_self_update_closes_the_push_path_too() {
+        // The switch an operator reaches for during an incident has to shut the
+        // fast trigger, not just the timer — otherwise `enabled = false` leaves
+        // a live path that still deploys.
+        let dir = ScratchDataDir::new("selfupdate-disabled");
+        let server = server_with_self_update(&dir.0, "127.0.0.1:1", Some("s3cret"), false);
+
+        let body = "{}";
+        let key = ring::hmac::Key::new(ring::hmac::HMAC_SHA256, b"s3cret");
+        let signature = hex_encode(ring::hmac::sign(&key, body.as_bytes()).as_ref());
+        let (request, body) = webhook_request("self", body, Some(&signature));
+
+        let response = webhook_response(&server, &request, &body).await;
+        assert!(response.starts_with("HTTP/1.1 404"), "{response}");
+    }
+
+    #[tokio::test]
+    async fn a_self_update_push_with_a_bad_signature_is_refused() {
+        let dir = ScratchDataDir::new("selfupdate-badsig");
+        let server = server_with_self_update(&dir.0, "127.0.0.1:1", Some("s3cret"), true);
+        let (request, body) = webhook_request("self", "{}", Some("00"));
+
+        let response = webhook_response(&server, &request, &body).await;
+        assert!(response.starts_with("HTTP/1.1 404"), "{response}");
+    }
+
+    #[tokio::test]
+    async fn a_rotated_self_update_secret_takes_effect_without_a_restart() {
+        // The reload contract: a config edit changes which secret is accepted on
+        // the very next push, matching what `services.toml` gives the service
+        // path by being read fresh.
+        let dir = ScratchDataDir::new("selfupdate-rotate");
+        let server = server_with_self_update(&dir.0, "127.0.0.1:1", Some("old"), true);
+
+        let mut rotated = config_with(vec![site("api", &["api.example.com"])]);
+        rotated.server.data_dir = PathBuf::from(".");
+        rotated.server.admin_bind = "127.0.0.1:1".to_owned();
+        let mut update = selfhost_config::SelfUpdate::new("https://example.com/selfhost.git");
+        update.webhook_secret = Some("new".to_owned());
+        rotated.self_update = Some(update);
+        server.reload(&rotated, &dir.0);
+
+        let body = "{}";
+        let old_key = ring::hmac::Key::new(ring::hmac::HMAC_SHA256, b"old");
+        let stale = hex_encode(ring::hmac::sign(&old_key, body.as_bytes()).as_ref());
+        let (request, sent) = webhook_request("self", body, Some(&stale));
+        let response = webhook_response(&server, &request, &sent).await;
+        assert!(response.starts_with("HTTP/1.1 404"), "the old secret must stop working: {response}");
     }
 
     #[tokio::test]

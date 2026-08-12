@@ -58,7 +58,7 @@ pub mod upgrade;
 pub mod webauthn;
 
 use selfhost_firewall::Manager;
-use selfhost_git::Watches;
+use selfhost_git::{Nudge, Watches};
 use selfhost_http::{Body, Method, Request, Response, Status};
 use selfhost_identity::{Caller, Capability, Opening, People, PersonName, Policy};
 
@@ -108,6 +108,13 @@ pub struct Api {
     token: Token,
     watches: Watches,
     firewall: Manager,
+    /// The signal that asks the self-update watcher to check its branch now.
+    ///
+    /// `None` on a deployment with no `[self_update]` section, and `None` makes
+    /// `POST /api/self-update/deploy` answer exactly as a route this build does
+    /// not serve — a caller learns whether self-update is configured only if
+    /// they were already authorised to control services.
+    self_update: Option<Nudge>,
     console: Option<ConsoleAuth>,
     /// Single-use tickets that authorise an upgrade.
     ///
@@ -286,6 +293,8 @@ enum Route<'a> {
     Logs(&'a str),
     /// `POST /api/services/<name>/deploy`
     DeployNow(&'a str),
+    /// `POST /api/self-update/deploy`
+    SelfUpdateNow,
     /// `POST /api/services/<name>/<action>`
     Act(&'a str, &'a str),
     /// `POST /api/desktop/ticket`
@@ -354,6 +363,11 @@ impl<'a> Route<'a> {
             // supervisor action like start/stop/restart, it drives a git watch.
             (Method::Post, ["api", "services", name, "deploy"]) => Some(Self::DeployNow(name)),
             (Method::Post, ["api", "services", name, action]) => Some(Self::Act(name, action)),
+            // The same "a push landed" signal as `DeployNow`, aimed at this
+            // deployment's own repository rather than a service's. Not under
+            // `/api/services/` because selfhost is not in the service
+            // catalogue: it is the thing running the catalogue.
+            (Method::Post, ["api", "self-update", "deploy"]) => Some(Self::SelfUpdateNow),
             // The stream mint. A non-`GET`, so the CSRF header was already
             // demanded of a cookie caller by `authorised()` — by code that
             // predates streams and is not changed by them. That is the whole
@@ -460,6 +474,7 @@ impl<'a> Route<'a> {
             Self::Install(_)
             | Self::Uninstall(_)
             | Self::DeployNow(_)
+            | Self::SelfUpdateNow
             | Self::Act(_, _)
             | Self::FirewallReconcile => Demand::Held(Capability::ServiceControl),
             // Owner-only, with the passkey routes and for a related reason.
@@ -589,6 +604,7 @@ impl Api {
             token,
             watches,
             firewall,
+            self_update: None,
             console: None,
             tickets: Tickets::new(),
             streams: Streams::new(),
@@ -615,6 +631,22 @@ impl Api {
     /// has no workers.
     pub fn with_peers(mut self, peers: Peerage) -> Self {
         self.peers = Some(peers);
+        self
+    }
+
+    /// Opens `POST /api/self-update/deploy` onto the daemon's own update watcher.
+    ///
+    /// Takes the *same* [`Nudge`] the watcher is waiting on, for the reason
+    /// [`Api::with_peers`] takes an already-built `Peerage`: an `Api` that made
+    /// its own would be poking a signal nothing listens to, which fails by
+    /// answering `202` and doing nothing — the silent failure this whole path
+    /// exists to avoid.
+    ///
+    /// Without this call the route is indistinguishable from one this build
+    /// does not serve, which is the honest report for a deployment with no
+    /// `[self_update]` section.
+    pub fn with_self_update(mut self, nudge: Nudge) -> Self {
+        self.self_update = Some(nudge);
         self
     }
 
@@ -916,6 +948,7 @@ impl Api {
             Route::Uninstall(name) => self.uninstall(name).await,
             Route::Logs(name) => self.logs(name, query).await,
             Route::DeployNow(name) => self.deploy_now(name).await,
+            Route::SelfUpdateNow => self.self_update_now(),
             Route::Act(name, action) => self.act(name, action).await,
             Route::MintTicket => self.mint_ticket(request, &caller, body),
             Route::DesktopSettings => self.desktop_settings(),
@@ -2211,6 +2244,27 @@ impl Api {
             Status(202),
             Json::object([("accepted", Json::Bool(true)), ("service", Json::string(name))]),
         )
+    }
+
+    /// Asks the self-update watcher to check its branch immediately.
+    ///
+    /// Returns `202` without waiting for the answer, exactly as
+    /// [`deploy_now`](Self::deploy_now) does, because the check involves a
+    /// network round trip and may be followed by a build lasting minutes — a
+    /// webhook sender that is made to wait for that will time out and record
+    /// the delivery as failed.
+    ///
+    /// `202` promises only that the check was *asked for*. It cannot promise a
+    /// deployment: the branch may not have moved, the tree may be dirty, or the
+    /// build may fail. Those outcomes are the watcher's to report in the
+    /// daemon's own output, and none of them is something to tell an
+    /// unauthenticated pusher about.
+    fn self_update_now(&self) -> Response {
+        let Some(nudge) = self.self_update.as_ref() else {
+            return problem(Status(404), "this deployment does not self-update");
+        };
+        nudge.poke();
+        json(Status(202), Json::object([("accepted", Json::Bool(true))]))
     }
 
     /// The host firewall as the daemon last observed it.
