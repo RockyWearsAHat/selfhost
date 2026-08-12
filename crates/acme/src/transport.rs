@@ -196,9 +196,9 @@ impl HttpsClient {
 
     /// Issues a request of any method, carrying `extra_headers` verbatim.
     ///
-    /// The general entry point non-ACME callers use — `selfhost dns sync`
-    /// speaks registrar APIs whose requests need API-key headers and methods
-    /// (`PUT`, `PATCH`, `DELETE`) the two ACME shapes above never send.
+    /// The general entry point non-ACME callers use — the reachability probes
+    /// drive third-party services whose requests need their own headers and
+    /// methods (`PUT`, `PATCH`, `DELETE`) the two ACME shapes above never send.
     /// `extra_headers` ride after the standard head; the framing fields
     /// (`Host`, `Content-Length`, `Connection`) stay this client's alone, so a
     /// caller cannot make the declared length and the sent bytes disagree. An
@@ -469,10 +469,10 @@ mod request_tests {
 
     #[test]
     fn extra_headers_ride_after_the_standard_head() {
-        // The registrar path: an API-key header must arrive verbatim, and a
-        // body-bearing method must still declare its length even when empty —
+        // The third-party-API path: an API-key header must arrive verbatim, and
+        // a body-bearing method must still declare its length even when empty —
         // some APIs refuse a length-less POST outright.
-        let url = Url::parse("https://api.registrar.test/v1/records").unwrap();
+        let url = Url::parse("https://api.example.test/v1/records").unwrap();
         let headers = vec![("Authorization".to_owned(), "Bearer tok".to_owned())];
         let head = as_text(&build_request(&url, "PUT", &headers, b""));
         assert!(head.starts_with("PUT /v1/records HTTP/1.1\r\n"));

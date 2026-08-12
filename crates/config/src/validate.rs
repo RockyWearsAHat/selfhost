@@ -84,8 +84,6 @@ impl Config {
         self.check_firewall(&mut problems);
         self.check_dns(&mut problems);
         self.check_mail(&mut problems);
-        self.check_namecheap_ddns(&mut problems);
-        self.check_registrar(&mut problems);
         self.check_self_update(&mut problems);
         self.check_shares(&mut problems);
         self.check_desktop(&mut problems);
@@ -140,27 +138,6 @@ impl Config {
     fn check_mail(&self, problems: &mut Vec<Problem>) {
         if let Some(mail) = &self.mail {
             mail.check("mail", problems);
-        }
-    }
-
-    /// Each Namecheap Dynamic DNS entry, when present, must name a domain,
-    /// host, and password. Delegated to
-    /// [`crate::namecheap::NamecheapDdns::check`], exactly as DNS and mail
-    /// validate through their own schema modules. An empty list validates
-    /// nothing — this feature is opt-in, per entry.
-    fn check_namecheap_ddns(&self, problems: &mut Vec<Problem>) {
-        for (i, entry) in self.namecheap_ddns.iter().enumerate() {
-            entry.check(&format!("namecheap_ddns[{i}]"), problems);
-        }
-    }
-
-    /// The registrar section, when present, must carry its provider's
-    /// credentials. Delegated to [`crate::registrar::Registrar::check`],
-    /// exactly as DNS, mail, and Dynamic DNS validate through their own
-    /// schema modules. Absent `[registrar]` validates nothing — sync is opt-in.
-    fn check_registrar(&self, problems: &mut Vec<Problem>) {
-        if let Some(registrar) = &self.registrar {
-            registrar.check("registrar", problems);
         }
     }
 
@@ -645,8 +622,6 @@ mod tests {
             sites,
             dns: None,
             mail: None,
-            namecheap_ddns: vec![],
-            registrar: None,
             self_update: None,
             shares: vec![],
             desktop: None,

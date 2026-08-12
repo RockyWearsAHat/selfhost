@@ -351,8 +351,6 @@ mod tests {
             sites,
             dns: None,
             mail,
-            namecheap_ddns: vec![],
-            registrar: None,
             self_update: None,
             shares: vec![],
             desktop: None,

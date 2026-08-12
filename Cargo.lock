@@ -307,7 +307,6 @@ dependencies = [
  "selfhost-mail",
  "selfhost-mesh",
  "selfhost-proxy",
- "selfhost-registrar",
  "selfhost-reports",
  "selfhost-screen",
  "selfhost-storage",
@@ -355,7 +354,6 @@ dependencies = [
 name = "selfhost-dns"
 version = "0.1.0"
 dependencies = [
- "selfhost-acme",
  "selfhost-config",
  "selfhost-igd",
  "tokio",
@@ -440,14 +438,6 @@ dependencies = [
  "selfhost-ws",
  "tokio",
  "tokio-rustls",
-]
-
-[[package]]
-name = "selfhost-registrar"
-version = "0.1.0"
-dependencies = [
- "selfhost-config",
- "selfhost-json",
 ]
 
 [[package]]

@@ -246,7 +246,7 @@ pub enum Capability {
     /// and the console it is administered from is itself a site.
     SiteAdmin,
     /// Create, change and remove **DNS records** in the zones this deployment
-    /// serves, and push them to the registrar.
+    /// serves.
     ///
     /// Separate from [`Capability::SiteAdmin`] because the two fail differently:
     /// a wrong site is a page nobody can reach, and a wrong DNS record is a

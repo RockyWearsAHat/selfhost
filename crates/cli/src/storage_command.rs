@@ -12,7 +12,7 @@
 //!
 //! - **`storage smb plan|apply`** — is the machine exporting the shares the
 //!   config declares, and if not, what would it take? Dry-run by default, exactly
-//!   as `dns sync`: the plan is printed and nothing is touched until `apply`. The
+//!   as every other plan-then-apply command here: the plan is printed and nothing is touched until `apply`. The
 //!   whole diff, the ownership ledger and the four backends live in
 //!   `selfhost_storage::smb`; this module gathers the inputs and presents the
 //!   answer.

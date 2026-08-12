@@ -1,19 +1,19 @@
-//! The Public Suffix List: which part of a name a registrar actually sells.
+//! The Public Suffix List: where a registrable domain actually begins.
 //!
 //! `registrable("shop.example.co.uk")` must answer `example.co.uk`, and there is
 //! no shortcut that gets this right: the set of public suffixes is thousands of
 //! entries (`co.uk`, `com.au`, `surf`, `*.ck`, …) maintained by Mozilla at
 //! <https://publicsuffix.org>. A hand-kept shortlist silently mis-groups every
 //! domain under a suffix it forgot, and the failure lands far away — a zone
-//! derived for the wrong apex, or a registrar API call for a domain no account
-//! can own. So the real list is vendored at `data/public_suffix_list.dat`,
+//! derived for the wrong apex, or a certificate requested for a name that is
+//! not ours to claim. So the real list is vendored at `data/public_suffix_list.dat`,
 //! compiled in with `include_str!` (no runtime file, no network, no dependency),
 //! and matched with the list's own algorithm.
 //!
 //! Only the **ICANN section** is read. The private section (`github.io`,
 //! `s3.amazonaws.com`, …) marks operator-drawn boundaries, not registry ones,
-//! and this crate's question is always "what did the registrar sell" — for zone
-//! derivation and for registrar reconciliation both.
+//! and this crate's question is always "what is the registrable domain" — the
+//! apex a zone is derived for.
 //!
 //! Refresh the vendored file with `scripts/update-psl.sh`; the list changes a
 //! few times a year and a stale copy degrades exactly like the shortlist did,
