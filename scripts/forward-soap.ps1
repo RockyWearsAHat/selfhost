@@ -1,7 +1,8 @@
 # forward-soap.ps1 — the selfhost "edge backend" logic, prototyped in PowerShell.
 # Speaks UPnP-IGD SOAP directly to the router's known control URL, from THIS box.
 # No Windows COM, no SSDP multicast, plain outbound TCP -> works through default-deny.
-# Opens 80, 443, 25, 587, 143, and 993 to 192.168.1.8, and prints the router's exact answer.
+# Opens 80, 443, 25, 587, 143, 993, and 465 (RFC 8314 implicit-TLS submission) to
+# 192.168.1.8, and prints the router's exact answer.
 $ctrl = 'http://192.168.1.1:56688/ctl/IPConn'
 $svc  = 'urn:schemas-upnp-org:service:WANIPConnection:1'
 $self = '192.168.1.8'
@@ -45,3 +46,4 @@ Add-Map 25 25
 Add-Map 587 587
 Add-Map 143 143
 Add-Map 993 993
+Add-Map 465 465
