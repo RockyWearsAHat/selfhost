@@ -1,4 +1,5 @@
-//! Authenticated submission — port 587, where our own users send mail out.
+//! Authenticated submission — ports 587 (`STARTTLS`) and 465 (implicit TLS,
+//! RFC 8314), where our own users send mail out.
 //!
 //! Submission and reception are the *same* SMTP, driven by the *same*
 //! [`crate::smtp::Session`]; they differ only in policy and in what happens to an
@@ -230,6 +231,26 @@ pub async fn serve_submission(listener: TcpListener, submission: Submission) -> 
     }
 }
 
+/// Accepts implicit-TLS submission connections forever (RFC 8314
+/// `_submissions._tcp`, port 465), one task per connection.
+///
+/// Same [`Submission`] runtime as [`serve_submission`] — same policy, the same
+/// [`Authenticator`], the same outbound queue and store — so a mailbox reachable
+/// on 587 is reachable here under the identical credentials; only the transport
+/// differs. Run both listeners side by side, never one instead of the other:
+/// RFC 8314 §3.3 recommends implicit TLS but keeps `587` for clients that only
+/// know `STARTTLS`.
+pub async fn serve_submission_implicit_tls(listener: TcpListener, submission: Submission) -> io::Result<()> {
+    let submission = Arc::new(submission);
+    loop {
+        let (stream, peer) = listener.accept().await?;
+        let submission = Arc::clone(&submission);
+        tokio::spawn(async move {
+            let _ = handle_connection_implicit_tls(stream, peer, submission).await;
+        });
+    }
+}
+
 /// One `[submission]`-tagged line into the daemon's log stream.
 ///
 /// The same secrecy discipline as the IMAP driver's log: connection events,
@@ -269,22 +290,66 @@ async fn handle_connection(
             Ok(())
         }
         Flow::StartTls => {
-            let acceptor = TlsAcceptor::from(submission.tls.clone());
-            let mut tls = match acceptor.accept(stream).await {
-                Ok(tls) => tls,
-                Err(error) => {
-                    log_submission(peer, format!("STARTTLS handshake failed: {error}"));
-                    return Err(error);
-                }
-            };
-            session.tls_established();
-            let sni = tls.get_ref().1.server_name().unwrap_or("<none>").to_owned();
-            log_submission(peer, format!("TLS established via STARTTLS (sni={sni})"));
-            let _ = converse(&mut tls, peer, &mut session, &submission).await?;
-            log_submission(peer, "closed");
-            Ok(())
+            let mut tls = accept_tls(&submission, stream, peer, "STARTTLS handshake failed").await?;
+            finish_tls_conversation(&mut tls, peer, &mut session, &submission, "via STARTTLS").await
         }
     }
+}
+
+/// Drives one implicit-TLS connection (RFC 8314 `_submissions._tcp`, port 465):
+/// the handshake happens before any protocol byte crosses the socket, so —
+/// unlike [`handle_connection`] — there is no cleartext phase and no `STARTTLS`
+/// to offer or perform; the greeting itself is the first thing sent, over TLS.
+async fn handle_connection_implicit_tls(
+    stream: TcpStream,
+    peer: SocketAddr,
+    submission: Arc<Submission>,
+) -> io::Result<()> {
+    log_submission(peer, "connected (implicit TLS)");
+    let mut tls = accept_tls(&submission, stream, peer, "implicit TLS handshake failed").await?;
+    let mut session = Session::new(submission.policy.clone());
+    tls.write_all(session.greeting().to_wire().as_bytes()).await?;
+    finish_tls_conversation(&mut tls, peer, &mut session, &submission, "implicit").await
+}
+
+/// Performs the server-side TLS handshake on `stream`, logging and propagating
+/// failure under `error_label` so the two callers ([`handle_connection`]'s
+/// `STARTTLS` upgrade and [`handle_connection_implicit_tls`]'s upfront
+/// handshake) report distinctly in the log without duplicating the accept call.
+async fn accept_tls(
+    submission: &Submission,
+    stream: TcpStream,
+    peer: SocketAddr,
+    error_label: &str,
+) -> io::Result<tokio_rustls::server::TlsStream<TcpStream>> {
+    let acceptor = TlsAcceptor::from(submission.tls.clone());
+    match acceptor.accept(stream).await {
+        Ok(tls) => Ok(tls),
+        Err(error) => {
+            log_submission(peer, format!("{error_label}: {error}"));
+            Err(error)
+        }
+    }
+}
+
+/// Marks the session TLS-established, logs the upgrade, then runs the
+/// authenticated conversation until the client disconnects. Shared by the
+/// `STARTTLS` upgrade path and the implicit-TLS (port 465) entry point — they
+/// differ only in when the handshake happened and whether a fresh greeting was
+/// owed, both already handled by their callers.
+async fn finish_tls_conversation(
+    tls: &mut tokio_rustls::server::TlsStream<TcpStream>,
+    peer: SocketAddr,
+    session: &mut Session,
+    submission: &Submission,
+    how: &str,
+) -> io::Result<()> {
+    session.tls_established();
+    let sni = tls.get_ref().1.server_name().unwrap_or("<none>").to_owned();
+    log_submission(peer, format!("TLS established ({how}, sni={sni})"));
+    let _ = converse(tls, peer, session, submission).await?;
+    log_submission(peer, "closed");
+    Ok(())
 }
 
 /// How a conversation ended.

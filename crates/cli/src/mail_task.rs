@@ -19,7 +19,7 @@ use selfhost_dns::Resolver;
 use selfhost_mail::{
     deliver, Address, Authenticator, ConfigAuthenticator, Dkim, IConfig, ImapServer, Maildir,
     OutboundQueue, Policy, Receiver, SendContext, SigningIdentity, Submission, serve_imap,
-    serve_smtp, serve_submission,
+    serve_smtp, serve_submission, serve_submission_implicit_tls,
 };
 use selfhost_proxy::{CertificateStore, SniResolver};
 use tokio::net::TcpListener;
@@ -137,6 +137,22 @@ pub async fn run(config: Config, project_dir: PathBuf, store: CertificateStore, 
                 tokio::spawn(async move {
                     if let Err(error) = serve_submission(listener, submission).await {
                         log(format!("submission: listener stopped ({error})"));
+                    }
+                });
+            }
+            "submissions" => {
+                let Some(listener) = bind(role, address).await else { continue };
+                let submission = Submission::new(
+                    policy.clone(),
+                    Arc::clone(&tls_config),
+                    Arc::clone(&authenticator),
+                    queue.clone(),
+                    maildir.clone(),
+                );
+                log(format!("submissions (implicit TLS) listening on {address}"));
+                tokio::spawn(async move {
+                    if let Err(error) = serve_submission_implicit_tls(listener, submission).await {
+                        log(format!("submissions: listener stopped ({error})"));
                     }
                 });
             }

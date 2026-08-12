@@ -54,6 +54,6 @@ pub use receive::{serve_smtp, Greylist, Receiver};
 pub use smtp::{Action, Envelope, Policy, Reply, Session, State};
 pub use store::{Flags, Folder, Maildir, StoreError, StoredId, Uid};
 pub use submission::{
-    hash_password, serve_submission, Authenticator, ConfigAuthenticator, Submission,
-    SubmissionError,
+    hash_password, serve_submission, serve_submission_implicit_tls, Authenticator,
+    ConfigAuthenticator, Submission, SubmissionError,
 };
