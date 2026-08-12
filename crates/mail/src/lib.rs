@@ -23,8 +23,12 @@
 #![warn(missing_docs)]
 
 pub mod address;
+pub mod autodiscover;
 pub mod client;
+pub mod context;
 pub mod dkim;
+pub mod eas;
+pub mod ews;
 pub mod imap;
 pub mod imap_net;
 pub mod message;
@@ -36,6 +40,8 @@ pub mod smtp;
 pub mod store;
 pub mod submission;
 mod time;
+pub mod wbxml;
+mod xml;
 pub use time::stamp;
 
 pub use address::{Address, AddressError, Path};

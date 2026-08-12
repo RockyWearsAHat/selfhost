@@ -435,6 +435,7 @@ dependencies = [
  "selfhost-admin",
  "selfhost-config",
  "selfhost-http",
+ "selfhost-mail",
  "selfhost-ws",
  "tokio",
  "tokio-rustls",

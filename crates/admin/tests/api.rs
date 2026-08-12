@@ -1099,10 +1099,17 @@ async fn storage_routes_are_the_uniform_401_when_no_share_is_declared() {
     }
     // To the owner, who could list every share if there were any: an honest
     // answer, because there is nothing they could learn that they do not hold.
+    // `vault/list` still 404s — a specific id names a share that does not
+    // exist. The bare list route is different: it demands only `ConsoleRead`,
+    // which this caller already holds, so the honest answer to "what may I
+    // open" is an empty list, not a refusal that claims their session died —
+    // a 401 here used to send an authenticated console straight back to its
+    // login screen the instant it loaded (crates/admin/src/lib.rs, `shares`).
     let (status, body) = send(&api, "GET", "/api/storage/shares/vault/list?path=", "").await;
     assert_eq!(status, 404, "{body:?}");
     let (status, body) = send(&api, "GET", "/api/storage/shares", "").await;
-    assert_eq!(status, 401, "with no storage wired there is no set to answer with: {body:?}");
+    assert_eq!(status, 200, "{body:?}");
+    assert_eq!(body.get("shares").and_then(Json::as_array).map(<[Json]>::len), Some(0), "{body:?}");
 }
 
 #[tokio::test]

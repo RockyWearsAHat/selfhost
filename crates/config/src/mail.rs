@@ -180,23 +180,26 @@ impl Mail {
     }
 
     /// The hostnames a mail client's automatic account setup reaches for these
-    /// domains: `mail.`, `imap.`, `smtp.`, and `ua-auto-config.` under each,
-    /// deduplicated, in that order.
+    /// domains: `mail.`, `imap.`, `smtp.`, `ua-auto-config.`, and
+    /// `autodiscover.` under each, deduplicated, in that order.
     ///
     /// Apple Mail, Thunderbird, and most other clients guess the first three
-    /// when the user types only an address and a password. The fourth is not a
-    /// guess: it is the host [`crate::pacc`] serves the automatic-configuration
-    /// document from, which a PACC client fetches instead of guessing at all.
+    /// when the user types only an address and a password. The fourth is the
+    /// host [`crate::pacc`] serves its automatic-configuration document from,
+    /// which a PACC client fetches instead of guessing at all. The fifth is
+    /// [`crate::autodiscover`]'s host: Exchange Autodiscover, EWS, and
+    /// ActiveSync, which is what actually gets macOS/iOS Mail to zero-touch
+    /// configure and then drive the account (see `docs/CUTOVER-AND-MAIL.md`).
     /// Publishing them (an `A` record each) and serving a valid certificate for
     /// them — they join the ACME issuance set and the mail listeners' SNI
     /// resolver — is what makes account setup work with no server fields typed;
-    /// the PACC host in particular is useless without a certificate, since its
-    /// document is fetched over HTTPS or not at all. The first name is the
-    /// set's canonical host for certificate bookkeeping.
+    /// the PACC and Autodiscover hosts in particular are useless without a
+    /// certificate, since both are fetched over HTTPS or not at all. The first
+    /// name is the set's canonical host for certificate bookkeeping.
     pub fn client_hosts(&self) -> Vec<String> {
         let mut hosts = Vec::new();
         for domain in &self.domains {
-            for prefix in ["mail", "imap", "smtp", crate::pacc::HOST_PREFIX] {
+            for prefix in ["mail", "imap", "smtp", crate::pacc::HOST_PREFIX, crate::autodiscover::HOST_PREFIX] {
                 let host = format!("{prefix}.{domain}");
                 if !hosts.contains(&host) {
                     hosts.push(host);
@@ -604,10 +607,12 @@ domains = ["example.com"]
                 "imap.example.com",
                 "smtp.example.com",
                 "ua-auto-config.example.com",
+                "autodiscover.example.com",
                 "mail.other.net",
                 "imap.other.net",
                 "smtp.other.net",
                 "ua-auto-config.other.net",
+                "autodiscover.other.net",
             ]
         );
     }

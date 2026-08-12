@@ -221,16 +221,34 @@ struct ConsoleAuth {
     /// has been called. Absent when no console site is configured: without a
     /// hostname there is no relying-party identity to verify against.
     webauthn: Option<Webauthn>,
-    /// The console site's canonical origin — `https://<hostname>` — computed
-    /// from configuration and never from a request.
+    /// The console site's canonical origin — `https://<first declared domain>`
+    /// — computed from configuration and never from a request.
     ///
-    /// The value an upgrade's `Origin` must equal. It is the same string, from
-    /// the same source and for the same reason, as the WebAuthn relying-party
-    /// origin: the proxy's relay forwards no `Host`, and an identity the client
-    /// could choose would defeat the comparison entirely. Absent means no
-    /// console site is configured, and a browser is then refused a stream rather
-    /// than admitted unchecked — see [`upgrade::origin_permitted`].
+    /// The same string, from the same source and for the same reason, as the
+    /// WebAuthn relying-party origin: the proxy's relay forwards no `Host`, and
+    /// an identity the client could choose would defeat the comparison
+    /// entirely. Used where exactly one hostname is meaningful — the WebAuthn
+    /// relying-party id, the WebDAV `Destination` host check, and the one link
+    /// an invitation hands out. **Not** what an upgrade's `Origin` is checked
+    /// against; see `stream_origins` below.
     origin: Option<String>,
+    /// Every origin a browser's `Origin` header may equal on a stream upgrade —
+    /// `https://<domain>[:<port>]` for each of the console site's declared
+    /// `domains`, at the daemon's real `https_bind` port (omitted when it is
+    /// the browser-default 443). Computed from configuration and never from a
+    /// request, same as `origin`.
+    ///
+    /// A site legitimately answers to more than one hostname — a LAN IP beside
+    /// a public domain, `localhost` beside both — and a dev or LAN deployment
+    /// legitimately runs `https_bind` on something other than 443. Collapsing
+    /// the check to `origin` alone (one hostname, port always assumed 443)
+    /// refused every stream — the live-events feed and the desktop screen
+    /// share alike — on any deployment shaped that way; only the VPN-tunnelled
+    /// production path (one domain, always :443) ever happened to satisfy it.
+    /// Empty means no console site is configured, and a browser is then
+    /// refused a stream rather than admitted unchecked — see
+    /// [`upgrade::origin_permitted`].
+    stream_origins: Vec<String>,
 }
 
 /// What a route demands of the caller who reached it.
@@ -772,12 +790,15 @@ impl Api {
             gate: FailureGate::new(),
             webauthn: None,
             origin: None,
+            stream_origins: Vec::new(),
         });
         self
     }
 
-    /// Records the console site's canonical hostname, which fixes the origin an
-    /// upgrade's `Origin` header must equal.
+    /// Records the console site's canonical hostname, which fixes the origin
+    /// the WebAuthn ceremony, the WebDAV host check and invitation links use,
+    /// and — until/unless [`Api::with_console_stream_origins`] broadens it —
+    /// the only `Origin` a stream upgrade may present.
     ///
     /// Separate from [`Api::with_console_webauthn`] so a deployment can have a
     /// console site without passkeys and still get the origin check — but
@@ -787,7 +808,41 @@ impl Api {
     /// recorded, a browser cannot open a stream at all.
     pub fn with_console_origin(mut self, host: &str) -> Self {
         if let Some(console) = &mut self.console {
-            console.origin = Some(format!("https://{host}"));
+            let origin = format!("https://{host}");
+            console.stream_origins = vec![origin.clone()];
+            console.origin = Some(origin);
+        }
+        self
+    }
+
+    /// Broadens the set of `Origin`s a stream upgrade (`/api/events`,
+    /// `/api/desktop/session`) may present, to every hostname the console site
+    /// declares, at the daemon's real `https_bind` port.
+    ///
+    /// Layered on top of [`Api::with_console_origin`] rather than replacing
+    /// it: the WebAuthn relying-party id, the WebDAV `Destination` host check
+    /// and the one link an invitation hands out each want exactly one
+    /// hostname, so they keep using `console.origin` — the site's first
+    /// declared domain — unchanged. This call only ever grows the set an
+    /// upgrade's `Origin` may equal; a caller that skips it keeps today's
+    /// single-domain, port-443 behaviour.
+    ///
+    /// A site legitimately answers to more than one hostname — a LAN IP
+    /// beside a public domain, `localhost` beside both — and a dev or LAN
+    /// deployment legitimately runs `https_bind` on something other than 443.
+    /// Before this existed, every stream — the live-events feed and the
+    /// desktop screen share alike — was refused on any deployment shaped that
+    /// way; only the VPN-tunnelled production path (one domain, always :443)
+    /// ever happened to satisfy the single-origin check.
+    pub fn with_console_stream_origins(mut self, domains: &[String], port: u16) -> Self {
+        if let Some(console) = &mut self.console {
+            console.stream_origins = domains
+                .iter()
+                .map(|domain| match port {
+                    443 => format!("https://{domain}"),
+                    _ => format!("https://{domain}:{port}"),
+                })
+                .collect();
         }
         self
     }
@@ -1577,6 +1632,16 @@ impl Api {
         self.console.as_ref()?.origin.as_deref()
     }
 
+    /// Every origin a stream upgrade's `Origin` header may equal.
+    ///
+    /// Empty when no console site is configured — the same fail-closed
+    /// reading `console_origin` returning `None` gets. See
+    /// [`Api::with_console_stream_origins`] for why this can hold more than
+    /// one entry.
+    fn console_stream_origins(&self) -> &[String] {
+        self.console.as_ref().map_or(&[], |console| console.stream_origins.as_slice())
+    }
+
     /// The console site's configured hostname, without the scheme.
     ///
     /// The value a WebDAV `Destination` header's authority is compared against.
@@ -1862,7 +1927,7 @@ impl Api {
             self.holder_of(request),
             &Doorway {
                 policy: &self.policy,
-                expected_origin: self.console_origin(),
+                expected_origin: self.console_stream_origins(),
                 tickets: &self.tickets,
                 streams: &self.streams,
             },
@@ -1910,9 +1975,18 @@ impl Api {
     }
 
     /// Answers `GET /api/storage/shares`.
+    ///
+    /// A deployment with no `[[shares]]` block at all holds no `Volumes`, but
+    /// `Route::Shares`'s own demand already proved this caller holds
+    /// `ConsoleRead` before this method runs — the same floor every other
+    /// panel needs. Answering that caller `401` here claimed their session
+    /// had died, which sent an authenticated console straight back to the
+    /// login screen (and, mid-desktop-session, closed the stream with it).
+    /// [`storage_api::shares`]'s own contract is the honest one: the answer
+    /// to "what may this caller open" is an empty list, not a refusal.
     async fn shares(&self, caller: &Caller) -> Response {
         let Some(volumes) = &self.storage else {
-            return problem(Status(401), "authorisation required");
+            return json(Status(200), Json::object([("shares", Json::array(std::iter::empty()))]));
         };
         storage_api::shares(volumes, caller.identity(), &self.may(caller)).await
     }

@@ -17,7 +17,7 @@ use crate::files::{self, Resolution};
 use crate::health;
 use crate::upgrade;
 use crate::upstream::Pool;
-use selfhost_config::{Config, Site, pacc};
+use selfhost_config::{Config, Site, autodiscover, pacc};
 use selfhost_http::{Body, Method, ParseError, Request, Response, Status};
 use std::collections::BTreeMap;
 use std::io;
@@ -53,6 +53,14 @@ pub const WEBHOOK_PREFIX: &str = "/.selfhost/webhook/";
 /// onward byte for byte the way `forward` does — every byte is held in memory
 /// to compute a signature over it.
 const WEBHOOK_MAX_BODY: u64 = 1024 * 1024;
+
+/// The largest request body accepted by EWS/ActiveSync.
+///
+/// `[mail]` caps a message at 25 MiB (`Mail::max_message_bytes`'s default);
+/// EWS/ActiveSync carry it as base64 (`MimeContent`), which inflates that by
+/// roughly a third, plus SOAP/WBXML envelope overhead — 40 MiB comfortably
+/// covers the default without being unbounded.
+const MAIL_CLIENT_MAX_BODY: u64 = 40 * 1024 * 1024;
 
 /// How long the request head may take to arrive.
 ///
@@ -143,6 +151,52 @@ pub struct Server {
     /// `services.toml` fresh, and which this field has to be given deliberately
     /// because `[self_update]` lives in the config rather than the catalogue.
     self_update_secret: RwLock<Option<String>>,
+    /// The mail store and credential check, shared with `mail_task`'s own
+    /// SMTP/IMAP listeners rather than opened a second time here.
+    ///
+    /// `None` until [`Server::attach_mail`] runs (or forever, when `[mail]` is
+    /// absent or failed to open) — EWS/ActiveSync/Autodiscover are then
+    /// simply not offered, the same "opt-in, not a startup failure" posture
+    /// `mail_task::run` already has. Not part of [`Server::build`]/[`Server::reload`]:
+    /// unlike `routes` and `pacc`, which are pure functions of `Config`, the
+    /// `Maildir` handle must be the *one* instance `mail_task` also writes
+    /// through, or its per-folder UID allocator (`selfhost_mail::store`) would
+    /// have two independent, racing in-memory caches over the same on-disk
+    /// counters. So it is set once, from outside, by whichever caller also
+    /// hands the same handle to `mail_task::run`.
+    mail: RwLock<Option<Arc<MailHandles>>>,
+}
+
+/// The store and credential check EWS/ActiveSync need, bundled so
+/// [`Server::attach_mail`] and [`Server::mail_handles`] pass one thing rather
+/// than a pair that could get out of sync.
+#[derive(Clone)]
+pub struct MailHandles {
+    /// The shared Maildir — the same instance `mail_task`'s SMTP/IMAP
+    /// listeners write through.
+    pub maildir: selfhost_mail::Maildir,
+    /// The shared credential check — the same PBKDF2 verification
+    /// IMAP/submission already trust; EWS/ActiveSync create no second trust
+    /// boundary.
+    pub authenticator: Arc<dyn selfhost_mail::Authenticator>,
+    /// This deployment's SMTP identity — the `HELO` name a message composed
+    /// via EWS/ActiveSync (rather than submitted over SMTP) sends as.
+    pub hostname: String,
+    /// Domains `[mail]` delivers locally — what
+    /// `selfhost_mail::context::send` partitions a composed message's
+    /// recipients against, the same split `crate::submission` applies to a
+    /// client's own `MAIL`/`RCPT TO`.
+    pub local_domains: Vec<String>,
+}
+
+impl std::fmt::Debug for MailHandles {
+    // Neither `Maildir` nor `Arc<dyn Authenticator>` implement `Debug` (the
+    // latter can't — a trait object has no way to require it of every
+    // implementor), and there is nothing safe to print about a credential
+    // check regardless.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("MailHandles { .. }")
+    }
 }
 
 impl Server {
@@ -160,7 +214,29 @@ impl Server {
             data_dir,
             admin_bind: config.server.admin_bind.parse().ok(),
             self_update_secret: RwLock::new(Self::self_update_secret(config)),
+            mail: RwLock::new(None),
         }
+    }
+
+    /// Attaches the process's one shared `Maildir`/`Authenticator` so
+    /// EWS/ActiveSync/Autodiscover can start answering — called at most once,
+    /// from `main`'s `serve`, with the exact handles also passed to
+    /// `mail_task::run`. See the `mail` field's doc for why this is not part
+    /// of [`Server::build`].
+    pub fn attach_mail(
+        &self,
+        maildir: selfhost_mail::Maildir,
+        authenticator: Arc<dyn selfhost_mail::Authenticator>,
+        hostname: String,
+        local_domains: Vec<String>,
+    ) {
+        *self.mail.write().unwrap_or_else(|poisoned| poisoned.into_inner()) =
+            Some(Arc::new(MailHandles { maildir, authenticator, hostname, local_domains }));
+    }
+
+    /// The shared mail handles, if [`Server::attach_mail`] has run.
+    pub fn mail_handles(&self) -> Option<Arc<MailHandles>> {
+        self.mail.read().unwrap_or_else(|poisoned| poisoned.into_inner()).clone()
     }
 
     /// The configured self-update webhook secret, if this deployment has one.
@@ -512,6 +588,27 @@ where
         }
     }
 
+    // Autodiscover/EWS/ActiveSync, exempted from routing for the same reason
+    // PACC is above: `autodiscover.<domain>` (all three) and the bare mail
+    // domain (Autodiscover XML only — Apple Mail POSTs both, see
+    // `docs/CUTOVER-AND-MAIL.md`) are certificates and addresses without
+    // being sites the routing table has ever heard of. A no-op entirely when
+    // `[mail]` is absent or `Server::attach_mail` has not run yet.
+    if let Some(handles) = server.mail_handles() {
+        if let Some((domain, is_autodiscover_host)) = mail_client_domain(&host, &handles.local_domains) {
+            let path = request.path();
+            if path == autodiscover::XML_PATH {
+                return serve_autodiscover(domain, request, leftover, stream, keep_alive).await;
+            }
+            if is_autodiscover_host && path == autodiscover::EWS_PATH {
+                return serve_ews(server, &handles, request, leftover, stream, keep_alive).await;
+            }
+            if is_autodiscover_host && path == autodiscover::ACTIVESYNC_PATH {
+                return serve_activesync(server, &handles, request, leftover, stream, keep_alive).await;
+            }
+        }
+    }
+
     let Some(runtime) = server.route(&host) else {
         // An unknown Host is answered with 404 rather than a default site, so a
         // stray DNS record cannot quietly expose one site under another's name.
@@ -642,6 +739,176 @@ where
             .unwrap_or_else(|_| Response::error_page(Status::BAD_REQUEST))
     };
 
+    write_response(stream, response, keep_alive).await?;
+    Ok(Outcome::Reusable)
+}
+
+/// The mail domain `host` names for Autodiscover/EWS/ActiveSync, and
+/// whether `host` was the dedicated `autodiscover.<domain>` name — Mail
+/// POSTs Autodiscover's XML to *both* that host and the bare mail domain
+/// itself, but EWS and ActiveSync are only ever served from the dedicated
+/// host (their `ASUrl`/`Url` always name it — see
+/// `selfhost_mail::autodiscover::respond`), so a caller checks the second
+/// element before routing either of those two. `None` for a host that names
+/// neither.
+fn mail_client_domain<'a>(host: &str, local_domains: &'a [String]) -> Option<(&'a str, bool)> {
+    let prefix = format!("{}.", autodiscover::HOST_PREFIX);
+    if let Some(rest) = host.strip_prefix(&prefix) {
+        if let Some(domain) = local_domains.iter().find(|domain| domain.as_str() == rest) {
+            return Some((domain.as_str(), true));
+        }
+    }
+    local_domains.iter().find(|domain| domain.as_str() == host).map(|domain| (domain.as_str(), false))
+}
+
+/// Serves Microsoft Autodiscover's XML request/response — the one
+/// unauthenticated step in EWS/ActiveSync zero-touch setup, matching PACC's
+/// own posture: the response only names hostnames DNS and the certificate
+/// already publish, plus the email address the caller supplied back to it.
+///
+/// The response always names the canonical `autodiscover.<domain>` host for
+/// its EWS/ActiveSync URLs (via [`autodiscover::host`]) regardless of which
+/// of the two hosts this request arrived on, since EWS/ActiveSync are only
+/// ever served from that one — see [`mail_client_domain`].
+async fn serve_autodiscover<S>(
+    domain: &str,
+    request: &Request,
+    leftover: &mut Vec<u8>,
+    stream: &mut S,
+    keep_alive: bool,
+) -> io::Result<Outcome>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    if request.method != Method::Post {
+        write_response(stream, Response::error_page(Status::METHOD_NOT_ALLOWED), keep_alive).await?;
+        return Ok(Outcome::Reusable);
+    }
+    let length = match request.body_length() {
+        Ok(selfhost_http::BodyLength::Fixed(length)) if length <= MAIL_CLIENT_MAX_BODY => length,
+        _ => {
+            write_response(stream, Response::error_page(Status::BAD_REQUEST), false).await?;
+            return Ok(Outcome::MustClose);
+        }
+    };
+    let body = take_body(leftover, stream, length).await?;
+
+    let host = autodiscover::host(domain);
+    let xml = selfhost_mail::autodiscover::respond(&host, &body);
+    let response = Response::bytes(Status::OK, "text/xml; charset=utf-8", xml)
+        .unwrap_or_else(|_| Response::error_page(Status::INTERNAL_SERVER_ERROR));
+    write_response(stream, response, keep_alive).await?;
+    Ok(Outcome::Reusable)
+}
+
+/// Verifies the request's `Authorization: Basic` header and writes `401`
+/// (with `WWW-Authenticate`, per RFC 7235) if it is missing or wrong —
+/// shared by [`serve_ews`] and [`serve_activesync`], the two protocols that
+/// actually read or write the mailbox rather than only naming where it is.
+///
+/// `None` means the caller already wrote the response and must return its
+/// `Ok(Outcome)` immediately; `Some(mailbox)` is the authenticated identity
+/// every store operation below is then scoped to.
+async fn authenticate_mail_client<S>(
+    request: &Request,
+    handles: &MailHandles,
+    stream: &mut S,
+    keep_alive: bool,
+) -> io::Result<Option<selfhost_mail::Address>>
+where
+    S: AsyncWrite + Unpin,
+{
+    let header = request.headers.get_str("authorization");
+    if let Some(mailbox) = selfhost_mail::context::authenticate_basic(header, handles.authenticator.as_ref()) {
+        return Ok(Some(mailbox));
+    }
+    let mut response = Response::error_page(Status::UNAUTHORIZED);
+    let _ = response.headers.set("WWW-Authenticate", "Basic realm=\"mail\"");
+    write_response(stream, response, keep_alive).await?;
+    Ok(None)
+}
+
+/// Serves one Exchange Web Services SOAP request.
+async fn serve_ews<S>(
+    server: &Server,
+    handles: &MailHandles,
+    request: &Request,
+    leftover: &mut Vec<u8>,
+    stream: &mut S,
+    keep_alive: bool,
+) -> io::Result<Outcome>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    if request.method != Method::Post {
+        write_response(stream, Response::error_page(Status::METHOD_NOT_ALLOWED), keep_alive).await?;
+        return Ok(Outcome::Reusable);
+    }
+    let Some(mailbox) = authenticate_mail_client(request, handles, stream, keep_alive).await? else {
+        return Ok(Outcome::Reusable);
+    };
+    let length = match request.body_length() {
+        Ok(selfhost_http::BodyLength::Fixed(length)) if length <= MAIL_CLIENT_MAX_BODY => length,
+        _ => {
+            write_response(stream, Response::error_page(Status::BAD_REQUEST), false).await?;
+            return Ok(Outcome::MustClose);
+        }
+    };
+    let body = take_body(leftover, stream, length).await?;
+
+    let ctx = selfhost_mail::context::Context {
+        maildir: &handles.maildir,
+        data_dir: &server.data_dir,
+        hostname: &handles.hostname,
+        local_domains: &handles.local_domains,
+    };
+    let xml = selfhost_mail::ews::handle(&ctx, &mailbox, &body).await;
+    let response = Response::bytes(Status::OK, "text/xml; charset=utf-8", xml)
+        .unwrap_or_else(|_| Response::error_page(Status::INTERNAL_SERVER_ERROR));
+    write_response(stream, response, keep_alive).await?;
+    Ok(Outcome::Reusable)
+}
+
+/// Serves one Exchange ActiveSync WBXML request — same auth and body-reading
+/// shape as [`serve_ews`], differing only in the wire encoding
+/// (`application/vnd.ms-sync.wbxml`, per [MS-ASHTTP]) and which protocol
+/// module in `selfhost_mail` decodes it.
+async fn serve_activesync<S>(
+    server: &Server,
+    handles: &MailHandles,
+    request: &Request,
+    leftover: &mut Vec<u8>,
+    stream: &mut S,
+    keep_alive: bool,
+) -> io::Result<Outcome>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    if request.method != Method::Post {
+        write_response(stream, Response::error_page(Status::METHOD_NOT_ALLOWED), keep_alive).await?;
+        return Ok(Outcome::Reusable);
+    }
+    let Some(mailbox) = authenticate_mail_client(request, handles, stream, keep_alive).await? else {
+        return Ok(Outcome::Reusable);
+    };
+    let length = match request.body_length() {
+        Ok(selfhost_http::BodyLength::Fixed(length)) if length <= MAIL_CLIENT_MAX_BODY => length,
+        _ => {
+            write_response(stream, Response::error_page(Status::BAD_REQUEST), false).await?;
+            return Ok(Outcome::MustClose);
+        }
+    };
+    let body = take_body(leftover, stream, length).await?;
+
+    let ctx = selfhost_mail::context::Context {
+        maildir: &handles.maildir,
+        data_dir: &server.data_dir,
+        hostname: &handles.hostname,
+        local_domains: &handles.local_domains,
+    };
+    let wbxml = selfhost_mail::eas::handle(&ctx, &mailbox, &body).await;
+    let response = Response::bytes(Status::OK, "application/vnd.ms-sync.wbxml", wbxml)
+        .unwrap_or_else(|_| Response::error_page(Status::INTERNAL_SERVER_ERROR));
     write_response(stream, response, keep_alive).await?;
     Ok(Outcome::Reusable)
 }
@@ -2729,6 +2996,248 @@ mod tests {
             pacc::WELL_KNOWN_PATH
         );
         let response = dispatch_bytes(&server, &write, "203.0.113.9:5000", true, b"").await;
+        assert!(response.starts_with(b"HTTP/1.1 404"));
+    }
+
+    /// Attaches a single-mailbox `Maildir`/`Authenticator` to `server`, the
+    /// same way `main.rs`'s `serve()` does after `mail_task::build_handles`
+    /// — tests below need real handles attached before EWS/ActiveSync answer
+    /// anything but a no-op 404 fallthrough.
+    fn attach_test_mailbox(server: &Server, dir: &std::path::Path, domain: &str, password: &str) -> selfhost_mail::Address {
+        let mailbox = selfhost_mail::Address::parse(&format!("dave@{domain}")).unwrap();
+        let maildir = selfhost_mail::Maildir::open(dir, std::slice::from_ref(&mailbox), &[]).unwrap();
+        let authenticator: Arc<dyn selfhost_mail::Authenticator> =
+            Arc::new(selfhost_mail::ConfigAuthenticator::new(&[selfhost_config::Mailbox {
+                address: mailbox.to_string(),
+                password_hash: selfhost_mail::hash_password(password).unwrap(),
+                aliases: vec![],
+            }]));
+        server.attach_mail(maildir, authenticator, format!("mail.{domain}"), vec![domain.to_owned()]);
+        mailbox
+    }
+
+    /// A minimal base64 encoder for building test `Authorization: Basic`
+    /// headers — the production encoder (`selfhost_mail::dkim`'s) is crate-
+    /// private, and pulling in a crate for one test helper is not worth it.
+    fn basic_auth_header(user: &str, pass: &str) -> String {
+        const B64: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        let data = format!("{user}:{pass}").into_bytes();
+        let mut out = String::new();
+        for chunk in data.chunks(3) {
+            let b0 = chunk[0] as u32;
+            let b1 = *chunk.get(1).unwrap_or(&0) as u32;
+            let b2 = *chunk.get(2).unwrap_or(&0) as u32;
+            let bits = (b0 << 16) | (b1 << 8) | b2;
+            out.push(B64[(bits >> 18 & 0x3f) as usize] as char);
+            out.push(B64[(bits >> 12 & 0x3f) as usize] as char);
+            out.push(if chunk.len() > 1 { B64[(bits >> 6 & 0x3f) as usize] as char } else { '=' });
+            out.push(if chunk.len() > 2 { B64[(bits & 0x3f) as usize] as char } else { '=' });
+        }
+        format!("Basic {out}")
+    }
+
+    #[tokio::test]
+    async fn autodiscover_on_the_dedicated_host_names_the_ews_endpoint_for_an_outlook_style_request() {
+        let dir = ScratchDataDir::new("autodiscover-dedicated-host");
+        let server = Server::build(&config_with_mail("example.com"), &dir.0);
+        attach_test_mailbox(&server, &dir.0, "example.com", "s3cret");
+
+        let request_body = "<Autodiscover><Request><EMailAddress>dave@example.com</EMailAddress></Request></Autodiscover>";
+        let head = format!(
+            "POST {} HTTP/1.1\r\nHost: autodiscover.example.com\r\nContent-Length: {}\r\n\r\n",
+            autodiscover::XML_PATH,
+            request_body.len()
+        );
+        let response = dispatch_bytes(&server, &head, "203.0.113.9:5000", true, request_body.as_bytes()).await;
+        let text = String::from_utf8_lossy(&response);
+        assert!(text.starts_with("HTTP/1.1 200"), "{text}");
+        assert!(text.contains("<Type>EXCH</Type>"), "{text}");
+        assert!(text.contains(&format!("https://autodiscover.example.com{}", autodiscover::EWS_PATH)), "{text}");
+    }
+
+    #[tokio::test]
+    async fn autodiscover_names_the_activesync_endpoint_for_a_mobilesync_style_request() {
+        let dir = ScratchDataDir::new("autodiscover-mobilesync");
+        let server = Server::build(&config_with_mail("example.com"), &dir.0);
+        attach_test_mailbox(&server, &dir.0, "example.com", "s3cret");
+
+        let request_body = "<Autodiscover><Request><EMailAddress>dave@example.com</EMailAddress>\
+             <AcceptableResponseSchema>http://schemas.microsoft.com/exchange/autodiscover/mobilesync/requestschema/2006a</AcceptableResponseSchema>\
+             </Request></Autodiscover>";
+        let head = format!(
+            "POST {} HTTP/1.1\r\nHost: autodiscover.example.com\r\nContent-Length: {}\r\n\r\n",
+            autodiscover::XML_PATH,
+            request_body.len()
+        );
+        let response = dispatch_bytes(&server, &head, "203.0.113.9:5000", true, request_body.as_bytes()).await;
+        let text = String::from_utf8_lossy(&response);
+        assert!(text.starts_with("HTTP/1.1 200"), "{text}");
+        assert!(text.contains("<Type>MobileSync</Type>"), "{text}");
+        assert!(text.contains(&format!("https://autodiscover.example.com{}", autodiscover::ACTIVESYNC_PATH)), "{text}");
+    }
+
+    #[tokio::test]
+    async fn autodiscover_also_answers_on_the_bare_mail_domain() {
+        // Apple Mail POSTs to both hosts (docs/CUTOVER-AND-MAIL.md) — the bare
+        // domain here is already an ordinary routed site ("web"), so this also
+        // proves the exemption fires before the routing table gets a look.
+        let dir = ScratchDataDir::new("autodiscover-bare-domain");
+        let server = Server::build(&config_with_mail("example.com"), &dir.0);
+        attach_test_mailbox(&server, &dir.0, "example.com", "s3cret");
+
+        let request_body = "<Autodiscover><Request><EMailAddress>dave@example.com</EMailAddress></Request></Autodiscover>";
+        let head = format!(
+            "POST {} HTTP/1.1\r\nHost: example.com\r\nContent-Length: {}\r\n\r\n",
+            autodiscover::XML_PATH,
+            request_body.len()
+        );
+        let response = dispatch_bytes(&server, &head, "203.0.113.9:5000", true, request_body.as_bytes()).await;
+        let text = String::from_utf8_lossy(&response);
+        assert!(text.starts_with("HTTP/1.1 200"), "{text}");
+        assert!(text.contains("<Type>EXCH</Type>"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn ews_refuses_a_request_with_no_credentials() {
+        let dir = ScratchDataDir::new("ews-unauthenticated");
+        let server = Server::build(&config_with_mail("example.com"), &dir.0);
+        attach_test_mailbox(&server, &dir.0, "example.com", "s3cret");
+
+        let body = "<soap:Envelope><soap:Body><m:ResolveNames/></soap:Body></soap:Envelope>";
+        let head = format!(
+            "POST {} HTTP/1.1\r\nHost: autodiscover.example.com\r\nContent-Length: {}\r\n\r\n",
+            autodiscover::EWS_PATH,
+            body.len()
+        );
+        let response = dispatch_bytes(&server, &head, "203.0.113.9:5000", true, body.as_bytes()).await;
+        let text = String::from_utf8_lossy(&response);
+        assert!(text.starts_with("HTTP/1.1 401"), "{text}");
+        assert!(text.to_ascii_lowercase().contains("www-authenticate"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn ews_with_correct_credentials_resolves_the_authenticated_mailbox() {
+        let dir = ScratchDataDir::new("ews-authenticated");
+        let server = Server::build(&config_with_mail("example.com"), &dir.0);
+        attach_test_mailbox(&server, &dir.0, "example.com", "s3cret");
+
+        let body = "<soap:Envelope><soap:Body><m:ResolveNames/></soap:Body></soap:Envelope>";
+        let head = format!(
+            "POST {} HTTP/1.1\r\nHost: autodiscover.example.com\r\nAuthorization: {}\r\nContent-Length: {}\r\n\r\n",
+            autodiscover::EWS_PATH,
+            basic_auth_header("dave@example.com", "s3cret"),
+            body.len()
+        );
+        let response = dispatch_bytes(&server, &head, "203.0.113.9:5000", true, body.as_bytes()).await;
+        let text = String::from_utf8_lossy(&response);
+        assert!(text.starts_with("HTTP/1.1 200"), "{text}");
+        assert!(text.contains("dave@example.com"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn ews_refuses_a_wrong_password() {
+        let dir = ScratchDataDir::new("ews-wrong-password");
+        let server = Server::build(&config_with_mail("example.com"), &dir.0);
+        attach_test_mailbox(&server, &dir.0, "example.com", "s3cret");
+
+        let body = "<soap:Envelope><soap:Body><m:ResolveNames/></soap:Body></soap:Envelope>";
+        let head = format!(
+            "POST {} HTTP/1.1\r\nHost: autodiscover.example.com\r\nAuthorization: {}\r\nContent-Length: {}\r\n\r\n",
+            autodiscover::EWS_PATH,
+            basic_auth_header("dave@example.com", "wrong"),
+            body.len()
+        );
+        let response = dispatch_bytes(&server, &head, "203.0.113.9:5000", true, body.as_bytes()).await;
+        assert!(response.starts_with(b"HTTP/1.1 401"));
+    }
+
+    #[tokio::test]
+    async fn ews_is_not_served_from_the_bare_mail_domain() {
+        // Only the dedicated `autodiscover.<domain>` host serves EWS/ActiveSync
+        // — Autodiscover's own `ASUrl` always names that host, so a client
+        // never has a reason to ask the bare domain for it. The bare domain
+        // is an ordinary routed site ("web"), so the request falls through to
+        // its normal static-file handling — a `POST` there is `405`, not a
+        // SOAP response — rather than ever reaching `serve_ews`.
+        let dir = ScratchDataDir::new("ews-bare-domain-refused");
+        let server = Server::build(&config_with_mail("example.com"), &dir.0);
+        attach_test_mailbox(&server, &dir.0, "example.com", "s3cret");
+
+        let head = format!("POST {} HTTP/1.1\r\nHost: example.com\r\nContent-Length: 0\r\n\r\n", autodiscover::EWS_PATH);
+        let response = dispatch_bytes(&server, &head, "203.0.113.9:5000", true, b"").await;
+        let text = String::from_utf8_lossy(&response);
+        assert!(text.starts_with("HTTP/1.1 405"), "{text}");
+        assert!(!text.contains("soap"), "must never reach the EWS handler: {text}");
+    }
+
+    #[tokio::test]
+    async fn activesync_refuses_a_request_with_no_credentials() {
+        let dir = ScratchDataDir::new("activesync-unauthenticated");
+        let server = Server::build(&config_with_mail("example.com"), &dir.0);
+        attach_test_mailbox(&server, &dir.0, "example.com", "s3cret");
+
+        let head = format!(
+            "POST {} HTTP/1.1\r\nHost: autodiscover.example.com\r\nContent-Length: 0\r\n\r\n",
+            autodiscover::ACTIVESYNC_PATH
+        );
+        let response = dispatch_bytes(&server, &head, "203.0.113.9:5000", true, b"").await;
+        assert!(response.starts_with(b"HTTP/1.1 401"));
+    }
+
+    #[tokio::test]
+    async fn activesync_with_correct_credentials_answers_provision() {
+        let dir = ScratchDataDir::new("activesync-authenticated");
+        let server = Server::build(&config_with_mail("example.com"), &dir.0);
+        attach_test_mailbox(&server, &dir.0, "example.com", "s3cret");
+
+        let mut w = selfhost_mail::wbxml::Writer::new();
+        w.switch_page(14); // Provision code page
+        w.start_tag(0x05); // <Provision>
+        w.end_tag();
+        let body = w.finish();
+
+        let head = format!(
+            "POST {} HTTP/1.1\r\nHost: autodiscover.example.com\r\nAuthorization: {}\r\nContent-Length: {}\r\n\r\n",
+            autodiscover::ACTIVESYNC_PATH,
+            basic_auth_header("dave@example.com", "s3cret"),
+            body.len()
+        );
+        let response = dispatch_bytes(&server, &head, "203.0.113.9:5000", true, &body).await;
+        let split = find_subslice(&response, b"\r\n\r\n").expect("a head/body separator");
+        let head_text = String::from_utf8_lossy(&response[..split]);
+        assert!(head_text.contains("200"), "{head_text}");
+        assert!(head_text.to_ascii_lowercase().contains("application/vnd.ms-sync.wbxml"), "{head_text}");
+
+        let wbxml_body = &response[split + 4..];
+        // `<Status>1</Status>` on the wire is the inline string token (0x03),
+        // the ASCII byte '1', then the terminating NUL — present regardless
+        // of exactly how the surrounding tags nest, which is enough to prove
+        // the WBXML encoder actually ran rather than asserting its full byte
+        // layout (covered in `crate::eas`'s own unit tests, which decode the
+        // response properly instead of pattern-matching raw bytes).
+        assert!(
+            find_subslice(wbxml_body, &[0x03, b'1', 0x00]).is_some(),
+            "expected an inline Status(1) string in {wbxml_body:?}"
+        );
+    }
+
+    /// The offset of the first occurrence of `needle` in `haystack`, for
+    /// tests that need to split a raw response into head and body.
+    fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+        haystack.windows(needle.len()).position(|window| window == needle)
+    }
+
+    #[tokio::test]
+    async fn a_mail_client_request_to_an_unconfigured_domain_falls_through_to_404() {
+        let dir = ScratchDataDir::new("mail-client-unconfigured-domain");
+        let server = Server::build(&config_with_mail("example.com"), &dir.0);
+        attach_test_mailbox(&server, &dir.0, "example.com", "s3cret");
+
+        let head = format!(
+            "POST {} HTTP/1.1\r\nHost: autodiscover.elsewhere.net\r\nContent-Length: 0\r\n\r\n",
+            autodiscover::XML_PATH
+        );
+        let response = dispatch_bytes(&server, &head, "203.0.113.9:5000", true, b"").await;
         assert!(response.starts_with(b"HTTP/1.1 404"));
     }
 

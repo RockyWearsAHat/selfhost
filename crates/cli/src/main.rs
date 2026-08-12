@@ -777,10 +777,21 @@ async fn serve_everything(
     // source for it: the proxy's console relay forwards no Host header, and an
     // identity the client could pick would undo the origin binding. No console
     // site, no passkeys; the password and bearer paths are unchanged.
-    if let Some(host) = config.sites.iter().find(|site| site.console).and_then(|site| site.domains.first())
-    {
-        api = api.with_console_webauthn(host, &data_dir);
-        println!("\nconsole passkeys enabled for https://{host} (stored in console.passkeys)");
+    if let Some(console_site) = config.sites.iter().find(|site| site.console) {
+        if let Some(host) = console_site.domains.first() {
+            api = api.with_console_webauthn(host, &data_dir);
+            println!("\nconsole passkeys enabled for https://{host} (stored in console.passkeys)");
+        }
+        // A site legitimately answers to every hostname in `domains` (a LAN
+        // IP beside a public name, `localhost` beside both), and `https_bind`
+        // legitimately runs on something other than 443 on a dev or LAN
+        // deployment. `with_console_webauthn` above only ever wires the first
+        // domain at an assumed :443 as the origin a stream upgrade's `Origin`
+        // must equal — this widens that to what the site actually serves, so
+        // the live-events feed and the desktop screen share are not refused
+        // on every hostname and port except the one production happens to use.
+        let https_port = config.server.https_bind.parse::<SocketAddr>().map(|addr| addr.port()).unwrap_or(443);
+        api = api.with_console_stream_origins(&console_site.domains, https_port);
     }
 
     // Network storage. Absent `[[shares]]` means no `Volumes` at all, so every
@@ -905,13 +916,26 @@ async fn serve_everything(
     // Mail shares the certificate store and resolver above rather than opening
     // its own, so `imap.example.com` presents the same certificate the proxy
     // does and a renewal reaches both at once. A no-op when `[mail]` is absent.
-    mail_task::run(
-        config.clone(),
-        project_dir.clone(),
-        certificates.clone(),
-        Arc::clone(&resolver),
-    )
-    .await;
+    //
+    // The store and credential check are built exactly once here and handed
+    // to both the proxy (so EWS/ActiveSync/Autodiscover can answer) and
+    // `mail_task::run`'s own SMTP/IMAP listeners — never opened twice, or the
+    // store's per-folder UID allocator would have two independent, racing
+    // in-memory caches over the same on-disk counters (`selfhost_mail::store`).
+    if let Some((maildir, authenticator)) = mail_task::build_handles(&config, &project_dir).await {
+        if let Some(mail) = &config.mail {
+            server.attach_mail(maildir.clone(), Arc::clone(&authenticator), mail.hostname.clone(), mail.domains.clone());
+        }
+        mail_task::run(
+            maildir,
+            authenticator,
+            config.clone(),
+            project_dir.clone(),
+            certificates.clone(),
+            Arc::clone(&resolver),
+        )
+        .await;
+    }
 
     let tls_config = server_config_with_resolver(resolver).map_err(|e| e.to_string())?;
 
