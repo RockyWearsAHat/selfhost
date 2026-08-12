@@ -4837,6 +4837,20 @@ function boot() {
   /** Everything one desktop session knows. Reset wholesale on connect, so a
    *  second session cannot inherit a reading from the first. */
   const desk = freshDesk();
+  /** The off-screen composite every tile paints into.
+   *
+   *  `dv-screen` — the canvas the operator actually sees — used to be that
+   *  target: `paintTile` wrote straight to it, one `putImageData` per tile.
+   *  A keyframe can carry well over a thousand tiles, each landing in its own
+   *  task, so the visible canvas showed the picture assembling itself tile by
+   *  tile — a real frame arriving as a sequence of visible fragments, not one
+   *  atomic update. Every tile now paints here instead, and `endFrame` blits
+   *  the whole thing to `dv-screen` in one `drawImage` once the frame is
+   *  actually whole. Persists across frames rather than being cleared each
+   *  one, because a keyframe's untouched tiles (`encoding === 0x02`) are
+   *  "leave this alone", not "redraw this" — the buffer is the picture, and a
+   *  frame that touches ten tiles must not blank the other thousand. */
+  const deskBuffer = document.createElement("canvas");
   let deskTimer = null;
   let hopTimer = null;
   /* The plate ticks once a second while a session is up, so the two regions
@@ -5595,6 +5609,13 @@ function boot() {
     // mostly-empty one — a resolution change mid-session is ordinary.
     canvas.width = frame.width;
     canvas.height = frame.height;
+    // The buffer resizes — and clears — in step with the visible canvas. That
+    // is safe only because a size change always falls through to
+    // `askFullFrame()` below: the clear is answered by a fresh keyframe that
+    // repaints every tile, so the buffer is whole again before `endFrame`
+    // next blits it.
+    deskBuffer.width = frame.width;
+    deskBuffer.height = frame.height;
     // The far screen's shape, so the stylesheet can cap the viewport by height
     // as well as by width and keep the whole picture on one screenful. Written
     // through the CSSOM rather than into a `style` attribute for the reason
@@ -5617,7 +5638,9 @@ function boot() {
     if (!bounds) return;
     const pixels = expandTile(tile.encoding, tile.payload, bounds.w * bounds.h);
     if (!pixels) return;
-    const context = $("dv-screen").getContext("2d");
+    // Off-screen only — see `deskBuffer`'s own comment for why `dv-screen`
+    // itself is untouched until the frame this tile belongs to is whole.
+    const context = deskBuffer.getContext("2d");
     if (!context) return;
     context.putImageData(new ImageData(screenPixels(pixels), bounds.w, bounds.h), bounds.x, bounds.y);
     desk.tiles += 1;
@@ -5625,6 +5648,14 @@ function boot() {
 
   function endFrame() {
     const now = Date.now();
+    // The one point in the whole tile sequence where the operator's own
+    // canvas changes: every tile this frame carried is in `deskBuffer` by
+    // now, so this is a single atomic composite rather than the thousand
+    // partial ones `paintTile` used to leave on screen.
+    if (deskBuffer.width > 0 && deskBuffer.height > 0) {
+      const screen = $("dv-screen").getContext("2d");
+      if (screen) screen.drawImage(deskBuffer, 0, 0);
+    }
     desk.frames += 1;
     desk.lastFrameAt = now;
     desk.recent.push(now);

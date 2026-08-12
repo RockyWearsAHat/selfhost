@@ -416,8 +416,8 @@ impl Authority {
 /// - an `A` for each site domain the zone contains — a provisioned site
 ///   resolves without the operator writing a record for it;
 /// - an `A` for the `[mail]` hostname and each client-autoconfig host
-///   (`mail.`/`imap.`/`smtp.`/`ua-auto-config.` per mail domain) the zone
-///   contains;
+///   (`mail.`/`imap.`/`smtp.`/`ua-auto-config.`/`autodiscover.` per mail
+///   domain) the zone contains;
 /// - when the zone's origin is a mail domain, `_imaps._tcp` → port 993 at
 ///   `imap.<origin>`, `_submission._tcp` → port 587 at `smtp.<origin>`
 ///   (RFC 6186 `STARTTLS` discovery), and `_submissions._tcp` → port 465 at
@@ -1095,7 +1095,7 @@ domains = ["example.com", "hand.example"]
             let raw = wire::encode_query(9, name, qtype).unwrap();
             async move { authority.handle_query(&raw, false, WAN_PEER).await }
         };
-        for host in ["mail.example.com", "imap.example.com", "smtp.example.com"] {
+        for host in ["mail.example.com", "imap.example.com", "smtp.example.com", "autodiscover.example.com"] {
             let message = served(host, RecordType::A).await;
             assert_eq!(
                 wire::decode_response(&message).unwrap().first_a(),

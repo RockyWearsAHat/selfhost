@@ -50,11 +50,18 @@
 //!
 //! There is exactly one registration per machine, because there is exactly one
 //! process. Earlier installations registered the proxy and the daemon
-//! separately, and on Windows added further tasks for LAN DNS and the VPN;
-//! those are now subsystems inside the one process. Both [`plan`] and
-//! [`uninstall_plan`] remove the stale registrations by name — on *install*
-//! too, not only on removal, because an upgraded box that kept them would run a
-//! second proxy racing this one for `:443`.
+//! separately, and on Windows added a further task for LAN DNS; that is now a
+//! subsystem inside the one process. Both [`plan`] and [`uninstall_plan`]
+//! remove the stale registrations by name — on *install* too, not only on
+//! removal, because an upgraded box that kept them would run a second proxy
+//! racing this one for `:443`.
+//!
+//! The Secure-VPN bridge's `selfhost-vpn` task is deliberately **not** in that
+//! list. It runs `scripts/securevpn/server.py`, not this binary — the VPN is a
+//! documented trust-anchor exception (`docs/VPN.md`) that stays its own
+//! process rather than being reimplemented here, so it is never superseded and
+//! must never be torn down as a side effect of installing or removing the
+//! daemon's own registration.
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -73,7 +80,10 @@ const TASK_NAME: &str = "selfhost-daemon";
 /// nameserver racing it for :53 — the exact half-running state the merge into
 /// one process exists to make impossible. Removal tolerates absence, so this is
 /// a no-op on a machine that never had them.
-const SUPERSEDED_TASK_NAMES: &[&str] = &["selfhost", "selfhost-lan-dns", "selfhost-vpn"];
+///
+/// Deliberately excludes `selfhost-vpn` — see the module docs above for why
+/// that one is not superseded at all.
+const SUPERSEDED_TASK_NAMES: &[&str] = &["selfhost", "selfhost-lan-dns"];
 
 /// The launchd label an earlier version registered the proxy under, separately
 /// from the daemon. Removed for the reason [`SUPERSEDED_TASK_NAMES`] gives.
@@ -773,6 +783,19 @@ mod tests {
         }
         assert!(SUPERSEDED_TASK_NAMES.contains(&"selfhost"), "the old proxy task");
         assert!(SUPERSEDED_TASK_NAMES.contains(&"selfhost-lan-dns"), "the old LAN DNS task");
+    }
+
+    /// `selfhost-vpn` runs `scripts/securevpn/server.py` — a different program
+    /// entirely, never folded into this binary (`docs/VPN.md`). If this ever
+    /// starts asserting `true`, installing or uninstalling the daemon would
+    /// tear down the Secure-VPN bridge the admin console's only reachable
+    /// route depends on.
+    #[test]
+    fn installing_never_touches_the_separate_vpn_task() {
+        assert!(
+            !SUPERSEDED_TASK_NAMES.contains(&"selfhost-vpn"),
+            "selfhost-vpn is not this process and must survive install/uninstall"
+        );
     }
 
     #[test]

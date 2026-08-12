@@ -36,7 +36,7 @@ pub struct StoredId(pub String);
 
 /// A mailbox folder. `Inbox` is the Maildir root; the rest are Maildir++
 /// subfolders (`.Sent`, `.Drafts`, …), so one mailbox holds them all.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Folder {
     /// Newly delivered and read inbox mail.
     Inbox,
@@ -48,6 +48,44 @@ pub enum Folder {
     Trash,
     /// Suspected spam.
     Junk,
+}
+
+/// Every folder this store offers, in the fixed order [`crate::ews`] and
+/// [`crate::eas`] both report them — this deployment's folder set never
+/// grows or reorders, so both protocols' folder listings are stable across
+/// requests without either needing to remember an ordering of its own.
+pub const FOLDERS: [Folder; 5] = [Folder::Inbox, Folder::Drafts, Folder::Sent, Folder::Trash, Folder::Junk];
+
+/// The literal name [`crate::ews`] uses as an EWS `DistinguishedFolderId`
+/// and [`crate::eas`] mints as an ActiveSync `ServerId` — the same slug in
+/// both protocols is deliberate: it means "does this folder exist" is one
+/// function shared by both rather than two id schemes that could disagree.
+pub fn folder_slug(folder: Folder) -> &'static str {
+    match folder {
+        Folder::Inbox => "inbox",
+        Folder::Drafts => "drafts",
+        Folder::Sent => "sentitems",
+        Folder::Trash => "deleteditems",
+        Folder::Junk => "junkemail",
+    }
+}
+
+/// The reverse of [`folder_slug`]. `None` for anything this store did not
+/// itself mint — a stale id, a client typo, or a guess.
+pub fn folder_from_slug(slug: &str) -> Option<Folder> {
+    FOLDERS.into_iter().find(|folder| folder_slug(*folder) == slug)
+}
+
+/// The name a mail client should show a human for this folder — used by
+/// both [`crate::ews`]'s `DisplayName` and [`crate::eas`]'s.
+pub fn folder_display_name(folder: Folder) -> &'static str {
+    match folder {
+        Folder::Inbox => "Inbox",
+        Folder::Drafts => "Drafts",
+        Folder::Sent => "Sent Items",
+        Folder::Trash => "Deleted Items",
+        Folder::Junk => "Junk Email",
+    }
 }
 
 /// IMAP message flags, encoded in the Maildir filename's `:2,` suffix.
@@ -117,9 +155,10 @@ struct Inner {
     /// Alias → mailbox routes. Every target is one of `mailboxes` — `open`
     /// refuses anything else — so resolution can never dangle.
     aliases: Vec<(Address, Address)>,
-    /// Next UID to hand out, per mailbox, mirrored to `.uidnext` on disk so the
-    /// sequence stays monotonic across restarts.
-    uid_next: Mutex<HashMap<String, u32>>,
+    /// Next UID to hand out, per mailbox **and folder** — each folder is its
+    /// own UID namespace, same as IMAP requires — mirrored to that folder's
+    /// own `.uidnext` on disk so the sequence stays monotonic across restarts.
+    uid_next: Mutex<HashMap<(String, Folder), u32>>,
 }
 
 impl Maildir {
@@ -200,9 +239,66 @@ impl Maildir {
     pub async fn deliver(&self, mailbox: &Address, msg: &Message) -> Result<Uid, StoreError> {
         let target =
             self.resolve(mailbox).ok_or_else(|| StoreError::NoSuchMailbox(mailbox.clone()))?.clone();
-        let mailbox = &target;
-        let dir = mailbox_dir(&self.0.root, mailbox);
-        let uid = self.allocate_uid(mailbox, &dir).await?;
+        self.write_message(&target, Folder::Inbox, msg).await
+    }
+
+    /// Writes one message into an arbitrary folder of an existing mailbox and
+    /// returns its assigned UID — the folder-aware generalisation of
+    /// [`Maildir::deliver`], which only ever targets [`Folder::Inbox`].
+    ///
+    /// Used to save a sent copy or a draft (EWS `CreateItem`, ActiveSync
+    /// `SendMail`/`Sync` composing an item) — deliberately separate from
+    /// `deliver`, which is the one place inbound SMTP mail lands and must
+    /// stay the sole path a stranger's message can take.
+    pub async fn save(&self, mailbox: &Address, folder: Folder, msg: &Message) -> Result<Uid, StoreError> {
+        let target =
+            self.resolve(mailbox).ok_or_else(|| StoreError::NoSuchMailbox(mailbox.clone()))?.clone();
+        self.write_message(&target, folder, msg).await
+    }
+
+    /// Moves a message from one folder to another, allocating it a **new**
+    /// UID in the destination — IMAP `MOVE` semantics (RFC 6851 §4.3): a
+    /// moved message is a new message in its new mailbox, not a renamed one.
+    /// Used for EWS `UpdateItem`/`DeleteItem` and ActiveSync moving/deleting
+    /// an item (Deleted Items is a folder here, not a distinct mechanism).
+    pub async fn move_message(
+        &self,
+        mailbox: &Address,
+        from: Folder,
+        uid: Uid,
+        to: Folder,
+    ) -> Result<Uid, StoreError> {
+        let msg = self.fetch(mailbox, from, uid).await?;
+        let new_uid = self.save(mailbox, to, &msg).await?;
+        if let Some(path) = self.locate(mailbox, from, uid).await? {
+            tokio::fs::remove_file(&path).await?;
+        }
+        Ok(new_uid)
+    }
+
+    /// Permanently removes a message — real deletion, not a move to
+    /// [`Folder::Trash`]. Used for EWS `DeleteItem`'s `HardDelete`, and for
+    /// deleting a message that is already in Trash: moving Trash→Trash would
+    /// only assign it a new UID forever, so "delete something already
+    /// deleted" means remove it for good, the same as emptying Trash in an
+    /// ordinary mail client.
+    pub async fn purge(&self, mailbox: &Address, folder: Folder, uid: Uid) -> Result<(), StoreError> {
+        let path = self.locate(mailbox, folder, uid).await?.ok_or(StoreError::NotFound(uid))?;
+        tokio::fs::remove_file(&path).await?;
+        Ok(())
+    }
+
+    /// The tmp→fsync→rename write shared by [`Maildir::deliver`] and
+    /// [`Maildir::save`] — `mailbox` must already be resolved to a real
+    /// mailbox address (not an alias), and the folder's directories are
+    /// created on demand since only the mailbox root is guaranteed to exist
+    /// from [`Maildir::open`].
+    async fn write_message(&self, mailbox: &Address, folder: Folder, msg: &Message) -> Result<Uid, StoreError> {
+        let dir = self.folder_dir(mailbox, folder)?;
+        for sub in ["tmp", "new", "cur"] {
+            tokio::fs::create_dir_all(dir.join(sub)).await?;
+        }
+        let uid = self.allocate_uid(mailbox, folder, &dir).await?;
 
         let base = format!(
             "{}.P{}U{}.selfhost,S={}",
@@ -281,10 +377,13 @@ impl Maildir {
         Ok(())
     }
 
-    /// The mailbox's UID validity value — stable for the life of the mailbox, as
-    /// IMAP requires so a client can trust its cached UIDs.
-    pub async fn uid_validity(&self, mailbox: &Address) -> u32 {
-        let dir = mailbox_dir(&self.0.root, mailbox);
+    /// A folder's UID validity value — stable for the life of the folder, as
+    /// IMAP requires so a client can trust its cached UIDs. Each folder is its
+    /// own IMAP mailbox and so has its own validity stamp; `Folder::Inbox`'s
+    /// directory is the mailbox root, so this reads exactly the path the
+    /// single-folder version of this method always meant.
+    pub async fn uid_validity(&self, mailbox: &Address, folder: Folder) -> u32 {
+        let Ok(dir) = self.folder_dir(mailbox, folder) else { return 0 };
         tokio::fs::read_to_string(dir.join(".uidvalidity"))
             .await
             .ok()
@@ -292,15 +391,17 @@ impl Maildir {
             .unwrap_or(0)
     }
 
-    /// The UID the next delivered message will receive — `SELECT`/`STATUS`'s
-    /// `UIDNEXT`. Reads the same persisted counter [`Maildir::deliver`]
-    /// allocates from, without advancing it.
-    pub async fn uid_next(&self, mailbox: &Address) -> u32 {
-        let key = mailbox_key(mailbox);
+    /// The UID the next message written to `folder` will receive —
+    /// `SELECT`/`STATUS`'s `UIDNEXT`. Reads the same persisted counter
+    /// [`Maildir::deliver`]/[`Maildir::save`] allocate from, without
+    /// advancing it.
+    pub async fn uid_next(&self, mailbox: &Address, folder: Folder) -> u32 {
+        let Ok(dir) = self.folder_dir(mailbox, folder) else { return 1 };
+        let key = (mailbox_key(mailbox), folder);
         let map = self.0.uid_next.lock().await;
         match map.get(&key) {
             Some(next) => *next,
-            None => read_uid_next(&mailbox_dir(&self.0.root, mailbox)).await,
+            None => read_uid_next(&dir).await,
         }
     }
 
@@ -320,9 +421,9 @@ impl Maildir {
         Ok(tokio::fs::metadata(&path).await?.modified()?)
     }
 
-    /// Allocates the next UID for a mailbox and persists the counter.
-    async fn allocate_uid(&self, mailbox: &Address, dir: &Path) -> Result<Uid, StoreError> {
-        let key = mailbox_key(mailbox);
+    /// Allocates the next UID for a mailbox's folder and persists the counter.
+    async fn allocate_uid(&self, mailbox: &Address, folder: Folder, dir: &Path) -> Result<Uid, StoreError> {
+        let key = (mailbox_key(mailbox), folder);
         let mut map = self.0.uid_next.lock().await;
         let next = match map.get(&key) {
             Some(n) => *n,
@@ -559,9 +660,9 @@ mod tests {
         let root = temp_root();
         let dave = addr("dave@example.com");
         let a = Maildir::open(&root, std::slice::from_ref(&dave), &[]).unwrap();
-        let first = a.uid_validity(&dave).await;
+        let first = a.uid_validity(&dave, Folder::Inbox).await;
         let b = Maildir::open(&root, std::slice::from_ref(&dave), &[]).unwrap();
-        assert_eq!(first, b.uid_validity(&dave).await);
+        assert_eq!(first, b.uid_validity(&dave, Folder::Inbox).await);
     }
 
     #[tokio::test]
@@ -570,12 +671,84 @@ mod tests {
         let dave = addr("dave@example.com");
         let store = Maildir::open(&root, std::slice::from_ref(&dave), &[]).unwrap();
 
-        assert_eq!(store.uid_next(&dave).await, 1, "nothing delivered yet");
+        assert_eq!(store.uid_next(&dave, Folder::Inbox).await, 1, "nothing delivered yet");
         let uid = store.deliver(&dave, &msg("a")).await.unwrap();
         assert_eq!(uid, Uid(1));
-        assert_eq!(store.uid_next(&dave).await, 2, "advanced by exactly the one delivery");
+        assert_eq!(
+            store.uid_next(&dave, Folder::Inbox).await,
+            2,
+            "advanced by exactly the one delivery"
+        );
         // Reading it again must not itself advance the counter.
-        assert_eq!(store.uid_next(&dave).await, 2);
+        assert_eq!(store.uid_next(&dave, Folder::Inbox).await, 2);
+    }
+
+    #[tokio::test]
+    async fn each_folder_is_its_own_uid_namespace() {
+        // A folder's UIDNEXT must not be perturbed by writes to a different
+        // folder — each is a distinct IMAP mailbox with its own sequence.
+        let root = temp_root();
+        let dave = addr("dave@example.com");
+        let store = Maildir::open(&root, std::slice::from_ref(&dave), &[]).unwrap();
+
+        let inbox_uid = store.deliver(&dave, &msg("hello")).await.unwrap();
+        assert_eq!(inbox_uid, Uid(1));
+
+        let sent_uid = store.save(&dave, Folder::Sent, &msg("sent copy")).await.unwrap();
+        assert_eq!(sent_uid, Uid(1), "Sent's own namespace starts at 1, independent of Inbox");
+
+        let second_inbox = store.deliver(&dave, &msg("world")).await.unwrap();
+        assert_eq!(second_inbox, Uid(2), "Inbox's counter is unaffected by the Sent write");
+
+        assert_eq!(store.uid_next(&dave, Folder::Inbox).await, 3);
+        assert_eq!(store.uid_next(&dave, Folder::Sent).await, 2);
+    }
+
+    #[tokio::test]
+    async fn save_writes_into_the_named_folder_and_is_readable_back() {
+        let root = temp_root();
+        let dave = addr("dave@example.com");
+        let store = Maildir::open(&root, std::slice::from_ref(&dave), &[]).unwrap();
+
+        let uid = store.save(&dave, Folder::Drafts, &msg("a draft")).await.unwrap();
+        let fetched = store.fetch(&dave, Folder::Drafts, uid).await.unwrap();
+        assert_eq!(fetched.body(), b"a draft");
+        assert!(store.fetch(&dave, Folder::Inbox, uid).await.is_err(), "must land only in Drafts");
+    }
+
+    #[tokio::test]
+    async fn save_refuses_a_stranger_mailbox() {
+        let root = temp_root();
+        let dave = addr("dave@example.com");
+        let store = Maildir::open(&root, std::slice::from_ref(&dave), &[]).unwrap();
+
+        let err = store.save(&addr("nobody@example.com"), Folder::Sent, &msg("x")).await.unwrap_err();
+        assert!(matches!(err, StoreError::NoSuchMailbox(_)));
+    }
+
+    #[tokio::test]
+    async fn move_message_assigns_a_new_uid_in_the_destination_and_removes_the_original() {
+        let root = temp_root();
+        let dave = addr("dave@example.com");
+        let store = Maildir::open(&root, std::slice::from_ref(&dave), &[]).unwrap();
+
+        let inbox_uid = store.deliver(&dave, &msg("move me")).await.unwrap();
+        let trash_uid = store.move_message(&dave, Folder::Inbox, inbox_uid, Folder::Trash).await.unwrap();
+
+        assert_eq!(trash_uid, Uid(1), "Trash's own namespace, independent of the Inbox UID it came from");
+        assert!(store.fetch(&dave, Folder::Inbox, inbox_uid).await.is_err(), "gone from the source folder");
+        let fetched = store.fetch(&dave, Folder::Trash, trash_uid).await.unwrap();
+        assert_eq!(fetched.body(), b"move me");
+    }
+
+    #[tokio::test]
+    async fn move_message_reports_not_found_for_a_uid_absent_from_the_source_folder() {
+        let root = temp_root();
+        let dave = addr("dave@example.com");
+        let store = Maildir::open(&root, std::slice::from_ref(&dave), &[]).unwrap();
+
+        let err = store.move_message(&dave, Folder::Inbox, Uid(99), Folder::Trash).await.unwrap_err();
+        assert!(matches!(err, StoreError::NotFound(Uid(99))));
     }
 
     #[tokio::test]

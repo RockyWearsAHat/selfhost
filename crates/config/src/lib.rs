@@ -11,6 +11,7 @@
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
+pub mod autodiscover;
 pub mod cidr;
 pub mod desktop;
 pub mod dns;

@@ -462,6 +462,7 @@ mod tests {
                 "imap.example.com",
                 "smtp.example.com",
                 "ua-auto-config.example.com",
+                "autodiscover.example.com",
             ]
         );
     }

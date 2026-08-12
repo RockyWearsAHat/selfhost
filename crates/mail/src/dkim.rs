@@ -451,7 +451,12 @@ pub(crate) fn b64_encode(data: &[u8]) -> String {
 }
 
 /// Decodes padded (or unpadded) standard base64, ignoring embedded whitespace.
-fn b64_decode(text: &str) -> Result<Vec<u8>, DkimError> {
+///
+/// `pub(crate)` beyond this module's own PEM parsing: `crate::ews` reuses it
+/// for `MimeContent`, the one place EWS's XML carries base64 rather than
+/// text, and `DkimError::Pem`'s message is generic enough ("not base64") to
+/// serve there too rather than inventing a second base64 codec.
+pub(crate) fn b64_decode(text: &str) -> Result<Vec<u8>, DkimError> {
     fn value(byte: u8) -> Option<u32> {
         match byte {
             b'A'..=b'Z' => Some((byte - b'A') as u32),

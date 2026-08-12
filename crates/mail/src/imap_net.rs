@@ -314,8 +314,8 @@ async fn select_or_status_data(
 async fn enumerate(store: &Maildir, user: &Address, folder: Folder) -> Result<SelectData, StoreError> {
     let mut uids = store.list(user, folder).await?;
     uids.sort();
-    let uid_validity = store.uid_validity(user).await;
-    let uid_next = store.uid_next(user).await;
+    let uid_validity = store.uid_validity(user, folder).await;
+    let uid_next = store.uid_next(user, folder).await;
 
     let mut first_unseen = None;
     let mut unseen_count = 0u32;

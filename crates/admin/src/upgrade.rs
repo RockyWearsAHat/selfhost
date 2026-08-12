@@ -773,8 +773,9 @@ pub struct Doorway<'a> {
     /// The authorisation model, and the one place `[desktop].bearer_may_control`
     /// is honoured.
     pub policy: &'a Policy,
-    /// The console site's canonical origin, computed from configuration.
-    pub expected_origin: Option<&'a str>,
+    /// Every origin a stream upgrade's `Origin` header may equal, computed
+    /// from configuration. Empty means no console site is configured.
+    pub expected_origin: &'a [String],
     /// The single-use tickets minted by the CSRF-protected `POST`.
     pub tickets: &'a Tickets,
     /// The concurrency ceiling this stream must find a place in.
@@ -899,16 +900,20 @@ pub fn still_permitted(
 ///
 /// The rule, in full:
 ///
-/// - A present `Origin` must equal `expected` exactly. Not a suffix match, not a
-///   host comparison: `https://admin.example.com.attacker.net` ends with the
-///   right characters and is a different site, and every family of origin bug
-///   ever written began by comparing something less than the whole string.
+/// - A present `Origin` must equal one entry of `expected` exactly. Not a
+///   suffix match, not a host comparison: `https://admin.example.com.attacker.net`
+///   ends with the right characters and is a different site, and every family
+///   of origin bug ever written began by comparing something less than the
+///   whole string. `expected` holds more than one entry only when the
+///   deployment itself declares more than one hostname (or a non-default
+///   port) for the console site — it is never widened by anything a request
+///   carries.
 /// - An absent `Origin` is accepted only from a non-browser credential. A
 ///   browser always sends one on a handshake, so its absence from a cookie
 ///   caller is not an old client but something wearing a cookie without being
 ///   the browser that holds it.
-/// - When `expected` is `None` — no console site is configured, so there is no
-///   canonical origin to compute — a browser is refused outright. Failing closed
+/// - When `expected` is empty — no console site is configured, so there is no
+///   origin to compare against — a browser is refused outright. Failing closed
 ///   here costs a deployment that has no console site a feature it cannot reach
 ///   through a browser anyway.
 ///
@@ -918,14 +923,14 @@ pub fn still_permitted(
 /// the same reason, that `Webauthn::origin` already follows.
 pub fn origin_permitted(
     presented: Option<&str>,
-    expected: Option<&str>,
+    expected: &[String],
     is_browser: bool,
 ) -> Result<(), Denial> {
-    match (presented, expected) {
-        (Some(sent), Some(canonical)) if sent.trim() == canonical => Ok(()),
-        (Some(_), _) => Err(Denial::ForeignOrigin),
-        (None, _) if !is_browser => Ok(()),
-        (None, _) => Err(Denial::UnverifiableOrigin),
+    match presented {
+        Some(sent) if expected.iter().any(|origin| origin == sent.trim()) => Ok(()),
+        Some(_) => Err(Denial::ForeignOrigin),
+        None if !is_browser => Ok(()),
+        None => Err(Denial::UnverifiableOrigin),
     }
 }
 
@@ -1006,7 +1011,7 @@ mod tests {
         policy: &'a Policy,
         tickets: &'a Tickets,
         streams: &'a Streams,
-        expected_origin: Option<&'a str>,
+        expected_origin: &'a [String],
     ) -> Doorway<'a> {
         Doorway { policy, expected_origin, tickets, streams }
     }
@@ -1177,12 +1182,12 @@ mod tests {
     #[test]
     fn the_origin_rule_in_full() {
         const CANONICAL: &str = "https://admin.example.com";
-        let expected = Some(CANONICAL);
+        let expected = [CANONICAL.to_string()];
 
         // A browser with the right origin, which is the ordinary case.
-        assert!(origin_permitted(Some(CANONICAL), expected, true).is_ok());
+        assert!(origin_permitted(Some(CANONICAL), &expected, true).is_ok());
         // Whitespace a header may carry does not decide.
-        assert!(origin_permitted(Some(" https://admin.example.com "), expected, true).is_ok());
+        assert!(origin_permitted(Some(" https://admin.example.com "), &expected, true).is_ok());
 
         // Every near miss. Each one of these is a real family of origin bug:
         // a suffix match, a prefix match, a scheme downgrade, a port added, a
@@ -1198,21 +1203,52 @@ mod tests {
             "",
         ] {
             assert_eq!(
-                origin_permitted(Some(foreign), expected, true),
+                origin_permitted(Some(foreign), &expected, true),
                 Err(Denial::ForeignOrigin),
                 "{foreign} was accepted as the console's origin"
             );
         }
 
         // A browser must send one; a bearer caller need not.
-        assert_eq!(origin_permitted(None, expected, true), Err(Denial::UnverifiableOrigin));
-        assert!(origin_permitted(None, expected, false).is_ok());
+        assert_eq!(origin_permitted(None, &expected, true), Err(Denial::UnverifiableOrigin));
+        assert!(origin_permitted(None, &expected, false).is_ok());
 
         // With no console site configured there is nothing to compare against,
         // and a browser is refused rather than admitted unchecked.
-        assert_eq!(origin_permitted(Some(CANONICAL), None, true), Err(Denial::ForeignOrigin));
-        assert_eq!(origin_permitted(None, None, true), Err(Denial::UnverifiableOrigin));
-        assert!(origin_permitted(None, None, false).is_ok());
+        assert_eq!(origin_permitted(Some(CANONICAL), &[], true), Err(Denial::ForeignOrigin));
+        assert_eq!(origin_permitted(None, &[], true), Err(Denial::UnverifiableOrigin));
+        assert!(origin_permitted(None, &[], false).is_ok());
+    }
+
+    /// A site answering to more than one hostname — a LAN IP beside a public
+    /// domain, `localhost` beside both, or the same domain at a non-default
+    /// port — accepts an `Origin` matching any one of them, and still refuses
+    /// everything else. This is the behaviour `with_console_stream_origins`
+    /// exists for: the single-canonical-origin check above refused every
+    /// stream on a deployment shaped this way even though its `Origin` was
+    /// one the deployment itself declares.
+    #[test]
+    fn a_site_with_several_declared_origins_accepts_any_one_of_them() {
+        let expected = [
+            "https://admin.example.com".to_string(),
+            "https://192.168.1.31".to_string(),
+            "https://localhost:18453".to_string(),
+        ];
+
+        for accepted in &expected {
+            assert!(
+                origin_permitted(Some(accepted), &expected, true).is_ok(),
+                "{accepted} is one of the deployment's own declared origins"
+            );
+        }
+
+        for foreign in ["https://admin.example.com:443", "https://192.168.1.32", "https://localhost"] {
+            assert_eq!(
+                origin_permitted(Some(foreign), &expected, true),
+                Err(Denial::ForeignOrigin),
+                "{foreign} is not any of the declared origins, port included"
+            );
+        }
     }
 
     /// Turns a list of `&str` into the shape the handshake parser produces.
@@ -1454,7 +1490,7 @@ mod tests {
         let admitted = decide(
             &request,
             browser("aaaa"),
-            &doorway(&policy, &tickets, &streams, Some(CONSOLE)),
+            &doorway(&policy, &tickets, &streams, &[CONSOLE.to_string()]),
             Ability::Events,
         )
         .expect("an ordinary handshake");
@@ -1485,7 +1521,7 @@ mod tests {
         let admitted = decide(
             &request,
             Some((Holder::Bearer, Caller::bearer())),
-            &doorway(&policy, &tickets, &streams, Some(CONSOLE)),
+            &doorway(&policy, &tickets, &streams, &[CONSOLE.to_string()]),
             Ability::Events,
         )
         .expect("the native console");
@@ -1510,7 +1546,7 @@ mod tests {
             decide(
                 &request,
                 ungranted,
-                &doorway(&policy, &tickets, &streams, Some(CONSOLE)),
+                &doorway(&policy, &tickets, &streams, &[CONSOLE.to_string()]),
                 Ability::Events
             )
             .err(),
@@ -1527,7 +1563,7 @@ mod tests {
         let admitted = decide(
             &request,
             Some((holder("mom"), person_caller(granted))),
-            &doorway(&policy, &tickets, &streams, Some(CONSOLE)),
+            &doorway(&policy, &tickets, &streams, &[CONSOLE.to_string()]),
             Ability::Events,
         )
         .expect("a granted person");
@@ -1549,7 +1585,7 @@ mod tests {
             decide(
                 &request,
                 Some((holder("mom"), person_caller(Grants::none()))),
-                &doorway(&policy, &tickets, &streams, Some(CONSOLE)),
+                &doorway(&policy, &tickets, &streams, &[CONSOLE.to_string()]),
                 Ability::Events
             )
             .is_err(),
@@ -1574,7 +1610,7 @@ mod tests {
             decide(
                 &request,
                 browser("aaaa"),
-                &doorway(&policy, &tickets, &streams, Some(CONSOLE)),
+                &doorway(&policy, &tickets, &streams, &[CONSOLE.to_string()]),
                 Ability::Events
             )
             .err(),
@@ -1599,7 +1635,7 @@ mod tests {
             decide(
                 &request,
                 browser("aaaa"),
-                &doorway(&policy, &tickets, &streams, Some(CONSOLE)),
+                &doorway(&policy, &tickets, &streams, &[CONSOLE.to_string()]),
                 Ability::Events
             )
             .err(),
@@ -1612,7 +1648,7 @@ mod tests {
             decide(
                 &honest_origin,
                 browser("aaaa"),
-                &doorway(&policy, &tickets, &streams, Some(CONSOLE)),
+                &doorway(&policy, &tickets, &streams, &[CONSOLE.to_string()]),
                 Ability::Events
             )
             .err(),
@@ -1637,7 +1673,7 @@ mod tests {
             decide(
                 &request,
                 None,
-                &doorway(&policy, &tickets, &streams, Some(CONSOLE)),
+                &doorway(&policy, &tickets, &streams, &[CONSOLE.to_string()]),
                 Ability::Events
             )
             .err(),
@@ -1648,7 +1684,7 @@ mod tests {
             decide(
                 &request,
                 browser("aaaa"),
-                &doorway(&policy, &tickets, &streams, Some(CONSOLE)),
+                &doorway(&policy, &tickets, &streams, &[CONSOLE.to_string()]),
                 Ability::Events
             )
             .is_ok()
@@ -1671,7 +1707,7 @@ mod tests {
             decide(
                 &request,
                 browser("aaaa"),
-                &doorway(&policy, &tickets, &streams, Some(CONSOLE)),
+                &doorway(&policy, &tickets, &streams, &[CONSOLE.to_string()]),
                 Ability::Events
             )
             .err(),
@@ -1698,7 +1734,7 @@ mod tests {
             decide(
                 &request,
                 browser("aaaa"),
-                &doorway(&policy, &tickets, &streams, Some(CONSOLE)),
+                &doorway(&policy, &tickets, &streams, &[CONSOLE.to_string()]),
                 Ability::Events
             ),
             Err(Denial::Handshake(_))
@@ -1717,7 +1753,7 @@ mod tests {
             decide(
                 &request,
                 browser("bbbb"),
-                &doorway(&policy, &tickets, &streams, Some(CONSOLE)),
+                &doorway(&policy, &tickets, &streams, &[CONSOLE.to_string()]),
                 Ability::Events
             )
             .err(),
@@ -1736,7 +1772,7 @@ mod tests {
         let first = decide(
             &request,
             browser("aaaa"),
-            &doorway(&policy, &tickets, &streams, Some(CONSOLE)),
+            &doorway(&policy, &tickets, &streams, &[CONSOLE.to_string()]),
             Ability::Events,
         )
         .expect("the first handshake");
@@ -1744,7 +1780,7 @@ mod tests {
             decide(
                 &request,
                 browser("aaaa"),
-                &doorway(&policy, &tickets, &streams, Some(CONSOLE)),
+                &doorway(&policy, &tickets, &streams, &[CONSOLE.to_string()]),
                 Ability::Events
             )
             .err(),
@@ -1762,7 +1798,7 @@ mod tests {
         let value = tickets.mint(holder("aaaa"), vec![Ability::Events]).expect("entropy");
         let request = handshake(Some(&format!("tkt.{value}")), Some(CONSOLE));
         assert_eq!(
-            decide(&request, browser("aaaa"), &doorway(&policy, &tickets, &streams, None), Ability::Events)
+            decide(&request, browser("aaaa"), &doorway(&policy, &tickets, &streams, &[]), Ability::Events)
                 .err(),
             Some(Denial::ForeignOrigin)
         );

@@ -76,8 +76,11 @@ pub const HEALTHY_WINDOW: Duration = Duration::from_secs(30);
 pub enum Observation {
     /// A frame arrived.
     Frame,
-    /// Nothing new yet. Not a failure: a still desktop produces this
-    /// indefinitely and it must not be counted against any budget.
+    /// Nothing new yet — the platform call waited its own window and nothing
+    /// arrived. Not a failure: a still desktop produces this indefinitely, it
+    /// must not be counted against any budget, and it must not cost an extra
+    /// delay on top of the wait the platform call already did. See
+    /// [`Action::Capture`] on this observation, below.
     Retry,
     /// The capture object must be torn down and rebuilt before it will produce
     /// anything again.
@@ -418,7 +421,19 @@ impl Session {
             // Not a failure and not a state change: no counter moves, and the
             // phase is left exactly where it was so a suspended session polling
             // for its desktop to come back does not announce itself as live.
-            Observation::Retry => self.stay(Action::WaitThen(self.limits.base_delay)),
+            //
+            // `Action::Capture`, not `WaitThen(base_delay)`: the platform call
+            // already spent its own wait finding nothing, so tacking a further
+            // quarter-second on top does not make the loop calmer, it makes it
+            // four times slower than `max_fps` on any content whose changes
+            // don't land in every single poll window — which is most content,
+            // not just a genuinely still desktop. Each driver already paces
+            // `Action::Capture` at its own frame budget (`frame_interval` in
+            // `selfhost_screen::agent`, `budget` in this crate's `viewer` and
+            // `relay`), so retrying promptly here does not busy-spin: the next
+            // platform call blocks again for its own window before the loop is
+            // back here.
+            Observation::Retry => self.stay(Action::Capture),
 
             Observation::Reinitialise => {
                 self.live_since = None;
@@ -572,13 +587,16 @@ mod tests {
     }
 
     #[test]
-    fn a_still_desktop_waits_rather_than_spinning_and_counts_nothing() {
+    fn a_still_desktop_retries_at_capture_pace_and_counts_nothing() {
         let now = moment();
         let mut session = Session::new(Limits::default());
         session.observe(Observation::Frame, now);
         for tick in 0..500 {
             let step = session.observe(Observation::Retry, now + Duration::from_millis(tick));
-            assert_eq!(step.action, Action::WaitThen(BASE_DELAY));
+            // The state machine adds no delay of its own: the platform call
+            // already blocked for its own window before reporting nothing, and
+            // the caller paces the next `Action::Capture` at its frame budget.
+            assert_eq!(step.action, Action::Capture);
             assert_eq!(step.phase, Phase::Live, "a retry is not a state change");
             assert_eq!(step.notice, None);
         }

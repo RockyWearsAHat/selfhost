@@ -10,6 +10,10 @@ description = "TLS termination, static serving with byte ranges, reverse proxy, 
 [dependencies]
 selfhost-http = { workspace = true }
 selfhost-config = { workspace = true }
+# EWS/ActiveSync/Autodiscover need the same Maildir store and credential
+# check IMAP/submission already use — see `Server::attach_mail` for why this
+# is the one process's single shared handle rather than a second store.
+selfhost-mail = { workspace = true }
 # The webhook route reads the daemon's service catalogue (to find a watch's
 # secret) and calls its loopback control API (to trigger a deploy) — both
 # already-built, already-tested pieces of `selfhost-admin` rather than a

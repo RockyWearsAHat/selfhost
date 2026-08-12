@@ -1552,6 +1552,11 @@ mod windows_body {
                 Err(SendError::Closed) => return Ok(()),
                 Err(SendError::Failed(fault)) => return Err(fault.into()),
             };
+            // `tick` itself spent some of the frame budget capturing, diffing,
+            // encoding and writing to the pipe; sleeping the full interval on
+            // top of that is additive rather than paced and runs the loop
+            // slower than `max_fps` by exactly however long the tick took.
+            let spent = now.elapsed();
 
             // A rebuild and a suspension are the two answers that mean "the screen
             // source you have is not the one you need", and they are the only
@@ -1566,7 +1571,7 @@ mod windows_body {
             }
 
             let pause = match tick.action {
-                Action::Capture => streamer.frame_interval(),
+                Action::Capture => streamer.frame_interval().saturating_sub(spent),
                 Action::WaitThen(delay)
                 | Action::Reinitialise(delay)
                 | Action::RespawnAgent(delay) => delay,

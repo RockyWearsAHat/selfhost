@@ -66,14 +66,17 @@ rewrites the apex `A` in the zone this box already serves.
 
 ## Account setup without typing server names — what is published, and what works today
 
-Three mechanisms are published for a mail domain, in the order clients came to
-them. Nothing here needs a per-client profile, and none of it costs a port.
+Four mechanisms are published for a mail domain, in the order clients came to
+them. Nothing here needs a per-client profile, and none of it costs a port —
+Autodiscover/EWS/ActiveSync rides the existing proxy on 443 exactly as PACC
+does (`crates/proxy/src/server.rs`'s `dispatch`), not a listener of its own.
 
 | Mechanism | What is published | Who uses it |
 |-----------|-------------------|-------------|
 | Guessable hostnames | `A` records + certificate SANs for `mail.`, `imap.`, `smtp.` | Nearly every client, as a guess after discovery fails. This is why setup works today once the two hostnames are typed. |
 | RFC 6186 SRV | `_imaps._tcp` → `0 1 993 imap.<domain>`, `_submission._tcp` → `0 1 587 smtp.<domain>`, `_submissions._tcp` → `0 1 465 smtp.<domain>` | Thunderbird and others. **Not macOS/iOS Mail** — a sweep of the dyld shared cache on macOS 15.5 finds those service labels zero times (`discovery-lab.dx`). |
 | **PACC** (`draft-ietf-mailmaint-pacc`) | `A` + certificate for `ua-auto-config.<domain>`, the document served at `https://ua-auto-config.<domain>/.well-known/user-agent-configuration.json`, and a `_ua-auto-config` `TXT` carrying `v=UAAC1; a=sha256; d=<base64 SHA-256 of the document>` | Nothing shipping yet — Apple co-authors the draft and was implementing a client in July 2026. Published now because it is inert to clients that have never heard of it and is the only specified path that ends with an address and a password being enough. |
+| **Exchange Autodiscover, EWS, and ActiveSync** | `A` + certificate for `autodiscover.<domain>`; `POST /autodiscover/autodiscover.xml` on that host and on the bare mail domain (`selfhost_mail::autodiscover`); `POST /EWS/Exchange.asmx` (`selfhost_mail::ews`) and `POST /Microsoft-Server-ActiveSync` (`selfhost_mail::eas`), both Basic-auth gated against the same `Authenticator` IMAP/submission already trust | **This is the one macOS/iOS Mail actually act on.** Per the research behind this feature: Mail ignores RFC 6186 SRV and the IMAP/SMTP blocks of a plain Autodiscover response — the only server-driven path it follows is an `EXCH`/`ASUrl` block naming a working EWS endpoint, and it then drives the mailbox over EWS, not IMAP. iOS Mail's equivalent is ActiveSync, reached via the same Autodiscover response's `MobileSync` block. Both are real, working protocol servers here (folder listing, message fetch as raw MIME, send, flag, delete), backed by the same `Maildir` IMAP/submission use — not a stub that only answers discovery. **Needs a real device to close the loop**: Apple's client-side EWS/EAS subset is reverse-engineered, not documented, so the final proof is adding the account on an actual Mac/iPhone, not a test suite. |
 
 The document, the digest, and the hostname all come from one derivation
 (`crates/config/src/pacc.rs`), so the served zone after any config change
@@ -95,15 +98,17 @@ echo | openssl s_client -connect <box>:443 -servername ua-auto-config.<domain> \
   2>/dev/null | openssl x509 -noout -subject -issuer
 ```
 
-`ua-auto-config.` joins the existing mail certificate's SAN set rather than
-taking one of its own, and `crates/cli/src/acme_task.rs` reissues an order whose
-name set has grown — a certificate is not left uncovering a host it should name
-just because it is young. That rule exists because of what 2026-08-12 found:
-document, digest, and `A` record all correct, and the host still served the
-`rcgen` self-signed fallback, because the mail certificate was three days old
-and nothing compared its names to the order's. Resolved the same night — all six
-orders reissued, the mail certificate now naming
-`mail`/`imap`/`smtp`/`ua-auto-config` and valid to 2026-11-10.
+`ua-auto-config.` (and, since this feature, `autodiscover.`) joins the existing
+mail certificate's SAN set rather than taking one of its own, and
+`crates/cli/src/acme_task.rs` reissues an order whose name set has grown — a
+certificate is not left uncovering a host it should name just because it is
+young. That rule exists because of what 2026-08-12 found: document, digest, and
+`A` record all correct, and the host still served the `rcgen` self-signed
+fallback, because the mail certificate was three days old and nothing compared
+its names to the order's. Resolved the same night — all six orders reissued,
+the mail certificate now naming `mail`/`imap`/`smtp`/`ua-auto-config` and valid
+to 2026-11-10 (`autodiscover` joined the same set later, when EWS/ActiveSync
+shipped — same rule, same reissue path, no repeat of the gap).
 
 ## Port 25 (outbound) — rechecked, still blocked
 

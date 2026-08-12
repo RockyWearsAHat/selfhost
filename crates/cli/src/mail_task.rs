@@ -7,7 +7,7 @@
 //! opt-in (see [`selfhost_config::Mail`]); [`run`] does nothing when the
 //! config carries no `[mail]` section.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -28,16 +28,20 @@ use tokio_rustls::TlsConnector;
 /// How often the outbound queue is swept for messages to send.
 const QUEUE_INTERVAL: Duration = Duration::from_secs(15);
 
-/// Starts every mail listener `config.mail` asks for, and the outbound queue
-/// runner, then returns — each piece keeps running in its own spawned task.
+/// Opens the shared `Maildir` and builds the shared `Authenticator` —
+/// `[mail]`'s two handles, built exactly once so there is exactly one UID
+/// allocator for the whole process ([`selfhost_mail::store`]'s own
+/// invariant) rather than two independent `Maildir::open` instances racing
+/// over the same on-disk counters. The proxy's EWS/ActiveSync surface
+/// ([`selfhost_proxy::Server::attach_mail`]) and [`run`]'s own SMTP/IMAP
+/// listeners both receive the *same* values this returns — never call
+/// `Maildir::open` a second time for the same deployment.
 ///
-/// A listener that fails to bind is logged and skipped; the rest still start,
-/// since inbound and outbound mail are independently useful. Called once from
-/// `run`'s `serve`, after the certificate store is open, so a certificate for
-/// `mail.hostname` can be generated the same way the proxy generates one for
-/// a site on first start.
-pub async fn run(config: Config, project_dir: PathBuf, store: CertificateStore, resolver: Arc<SniResolver>) {
-    let Some(mail) = config.mail.clone() else { return };
+/// `None` when `[mail]` is absent, or when preparing the data directory or
+/// parsing the configured mailboxes/opening the store fails — logged here so
+/// callers can just skip mail entirely rather than repeat the diagnosis.
+pub async fn build_handles(config: &Config, project_dir: &Path) -> Option<(Maildir, Arc<dyn Authenticator>)> {
+    let mail = config.mail.as_ref()?;
 
     let data_dir = project_dir.join(&config.server.data_dir);
     // Mail's own reason for wanting this directory private: the maildir under
@@ -51,7 +55,7 @@ pub async fn run(config: Config, project_dir: PathBuf, store: CertificateStore, 
         }
         Err(error) => {
             log(format!("cannot create {}: {error} — mail is not running", data_dir.display()));
-            return;
+            return None;
         }
     }
 
@@ -65,7 +69,7 @@ pub async fn run(config: Config, project_dir: PathBuf, store: CertificateStore, 
             Ok(address) => address,
             Err(error) => {
                 log(format!("a configured mailbox address does not parse ({error:?}) — mail is not running"));
-                return;
+                return None;
             }
         };
         for alias in &mailbox.aliases {
@@ -73,7 +77,7 @@ pub async fn run(config: Config, project_dir: PathBuf, store: CertificateStore, 
                 Ok(alias) => aliases.push((alias, target.clone())),
                 Err(error) => {
                     log(format!("a configured alias does not parse ({error:?}) — mail is not running"));
-                    return;
+                    return None;
                 }
             }
         }
@@ -84,9 +88,35 @@ pub async fn run(config: Config, project_dir: PathBuf, store: CertificateStore, 
         Ok(maildir) => maildir,
         Err(error) => {
             log(format!("could not open the mail store ({error}) — mail is not running"));
-            return;
+            return None;
         }
     };
+
+    let authenticator: Arc<dyn Authenticator> = Arc::new(ConfigAuthenticator::new(&mail.mailboxes));
+    Some((maildir, authenticator))
+}
+
+/// Starts every mail listener `config.mail` asks for, and the outbound queue
+/// runner, then returns — each piece keeps running in its own spawned task.
+///
+/// `maildir`/`authenticator` are the handles [`build_handles`] already built
+/// (and the proxy has already been given, via `Server::attach_mail`, by the
+/// time this is called) — this function opens no store of its own. A
+/// listener that fails to bind is logged and skipped; the rest still start,
+/// since inbound and outbound mail are independently useful. Called once from
+/// `run`'s `serve`, after the certificate store is open, so a certificate for
+/// `mail.hostname` can be generated the same way the proxy generates one for
+/// a site on first start.
+pub async fn run(
+    maildir: Maildir,
+    authenticator: Arc<dyn Authenticator>,
+    config: Config,
+    project_dir: PathBuf,
+    store: CertificateStore,
+    resolver: Arc<SniResolver>,
+) {
+    let Some(mail) = config.mail.clone() else { return };
+    let data_dir = project_dir.join(&config.server.data_dir);
 
     let tls_config = match server_tls(&store, &mail.hostname, resolver) {
         Ok(config) => config,
@@ -103,7 +133,6 @@ pub async fn run(config: Config, project_dir: PathBuf, store: CertificateStore, 
         allow_auth_without_tls: !mail.require_tls_for_auth,
         max_message_bytes: mail.max_message_bytes,
     };
-    let authenticator: Arc<dyn Authenticator> = Arc::new(ConfigAuthenticator::new(&mail.mailboxes));
     let queue = match OutboundQueue::open(&data_dir) {
         Ok(queue) => queue,
         Err(error) => {
