@@ -43,8 +43,12 @@ explaining what it does and why the default is what it is.
 ## 3. Run it
 
 ```sh
-selfhost run
+selfhost daemon
 ```
+
+One command runs the whole deployment — websites, mail, DNS, supervised
+services and the control API — in one process. (`selfhost run` is a kept alias
+for the same thing; do not run both at once.)
 
 ```
 selfhost listening

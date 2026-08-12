@@ -84,12 +84,24 @@ public IP from your own LAN never leaves the building, so it proves nothing.
 
 Test it properly:
 
-1. Start `selfhost run`.
-2. On your phone, **turn Wi-Fi off** so you are on mobile data.
-3. Open `http://<your-public-ip>/`.
+1. Start `selfhost daemon`.
+2. Run `selfhost outside`.
+
+That asks public DNS resolvers to look up a name only this box can answer for,
+which makes a genuinely external party connect back to you — no second machine
+and no mobile data needed. It proves port 53 live, and reports what the
+certificate on disk already proves about 80 and 443.
+
+For a by-hand check of 80/443 specifically: on your phone, turn Wi-Fi **off** so
+you are on mobile data, and open `http://<your-public-ip>/`.
 
 Times out? Either the router is not forwarding 80 and 443 to this machine, or
 the ISP filters them. Both are outside this program.
+
+Want the public address to work from *inside* the network too — so a browser or
+a mail client here exercises the same address a stranger would? That is
+`selfhost hairpin`, which most home routers make necessary by refusing to
+hairpin NAT themselves.
 
 While you are in the router, give the machine a **static DHCP lease** — otherwise
 the port forward eventually points at whatever device took that address.
