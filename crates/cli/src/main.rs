@@ -13,7 +13,9 @@ mod desk_supervisor;
 mod desk_task;
 mod dns_status;
 mod doctor;
+mod hairpin;
 mod identify;
+mod outside;
 mod kill_switch;
 mod investigate;
 mod lan_dns;
@@ -40,7 +42,7 @@ use selfhost_supervisor::Supervisor;
 use selfhost_proxy::{
     CertificateStore, Server, SniResolver, serve_http, serve_https, server_config_with_resolver,
 };
-use std::net::SocketAddr;
+use std::net::{Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::{Arc, Mutex};
@@ -93,6 +95,21 @@ Commands
   run                        The same thing. Kept as an alias so an existing
                              service definition keeps working; do not run both
                              at once, they would each try to bind :443
+  outside                    Ask the internet what it can actually reach here.
+                             Nothing on this network can answer that, so each
+                             check makes a third party originate the connection:
+                             public resolvers witness port 53 live, and the
+                             certificate on disk is a dated receipt for 80/443.
+                             Ports nothing will witness are said to be
+                             unwitnessed rather than guessed at
+  hairpin [--client] [--apply] [--undo] [--public <ip>] [--lan <ip>]
+                             Make this deployment's public address reachable
+                             from inside its own network, for routers that do
+                             not hairpin: a /32 loopback alias on the box and a
+                             host route on each client. Lets a mail client or a
+                             browser here exercise the real public address, DNS,
+                             SNI and certificate. Dry-run by default; only
+                             --apply changes the machine
   services                   List the installed services and what they are doing
   share <list|usage|ls>      The shares this box serves, what each one holds,
                              and what is inside one
@@ -182,6 +199,8 @@ fn main() -> ExitCode {
         "lan-dns" => lan_dns_command(&arguments),
         "run" => run(),
         "daemon" => daemon_command(&arguments),
+        "outside" => outside_command(),
+        "hairpin" => hairpin_command(&arguments),
         "services" => services_command(),
         "share" => load().and_then(|(config, dir)| share_command::share(&arguments, &config, &dir)),
         "sync" => load().and_then(|(config, dir)| share_command::sync(&arguments, &config, &dir)),
@@ -1174,6 +1193,114 @@ fn dns_show_command() -> Result<(), String> {
         .map_err(|e| format!("could not start the async runtime: {e}"))?;
 
     runtime.block_on(dns_status::show(&config))
+}
+
+/// Asks the internet what it can actually reach here, using third parties as
+/// the witnesses.
+///
+/// See [`outside`] for why a third party is the only honest vantage point from
+/// a network with no hairpin and no machine outside it.
+fn outside_command() -> Result<(), String> {
+    let (config, project_dir) = load()?;
+
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| format!("could not start the async runtime: {e}"))?;
+
+    runtime.block_on(outside::report(&config, &project_dir))
+}
+
+/// Prints, and optionally applies, the routing changes that make this
+/// deployment's public address reachable from inside its own network.
+///
+/// Dry-run by default and applied only with `--apply`, the convention every
+/// machine-changing command here follows — doubly so for this one, since a
+/// wrong route is how a machine is made unreachable. `--client` asks for the
+/// other half of the arrangement, the part that runs on a laptop rather than on
+/// the box.
+fn hairpin_command(arguments: &[String]) -> Result<(), String> {
+    let (config, _project_dir) = load()?;
+    let apply = arguments.iter().any(|argument| argument == "--apply");
+    let undo = arguments.iter().any(|argument| argument == "--undo");
+    let side = if arguments.iter().any(|argument| argument == "--client") {
+        hairpin::Side::Client
+    } else {
+        hairpin::Side::Box
+    };
+
+    let public: Ipv4Addr = match value_of(arguments, "--public") {
+        Some(given) => given.parse().map_err(|e| format!("--public {given}: {e}"))?,
+        None => {
+            let runtime = tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+                .map_err(|e| format!("could not start the async runtime: {e}"))?;
+            runtime.block_on(doctor::discover_public_ip()).ok_or_else(|| {
+                "could not discover this network's public address; pass --public <ip>".to_owned()
+            })?
+        }
+    };
+    let lan: Ipv4Addr = match value_of(arguments, "--lan") {
+        Some(given) => given.parse().map_err(|e| format!("--lan {given}: {e}"))?,
+        None => config
+            .dns
+            .as_ref()
+            .and_then(|dns| dns.lan_ip.as_ref())
+            .and_then(|ip| ip.parse().ok())
+            .ok_or_else(|| {
+                "this config does not record the box's LAN address; pass --lan <ip>".to_owned()
+            })?,
+    };
+
+    let actions = if undo {
+        hairpin::undo_plan(side, public, lan)?
+    } else {
+        hairpin::plan(side, public, lan)?
+    };
+
+    let what = match side {
+        hairpin::Side::Box => "this box (the machine holding the LAN address)",
+        hairpin::Side::Client => "a LAN client (a laptop, a phone's tethered Mac)",
+    };
+    println!("Hairpin {} for {what}:\n", if undo { "removal" } else { "setup" });
+    println!("  public address  {public}");
+    println!("  box on the LAN  {lan}\n");
+    for action in &actions {
+        println!("  {}", action.argv.join(" "));
+        println!("      {}\n", action.because);
+    }
+
+    if !apply {
+        println!("Dry run — nothing was changed. Re-run with --apply to make it so.");
+        println!(
+            "\nRun this on the box, then with --client on every machine that should reach\n\
+             the public address. Undo either with --undo."
+        );
+        return Ok(());
+    }
+
+    for action in &actions {
+        let (program, rest) = action.argv.split_first().expect("an action names a program");
+        let status = std::process::Command::new(program)
+            .args(rest)
+            .status()
+            .map_err(|error| format!("cannot run {program}: {error}"))?;
+        if !status.success() {
+            return Err(format!(
+                "`{}` failed ({status}) — this usually means it needs administrator rights",
+                action.argv.join(" ")
+            ));
+        }
+        println!("  ran  {}", action.argv.join(" "));
+    }
+
+    println!("\n✓ applied. Confirm with: curl -sv https://{public}/ 2>&1 | head");
+    println!(
+        "  This proves the public address, DNS, SNI and certificate path. It does NOT\n\
+         prove the router forwards from the internet — run `selfhost outside` for that."
+    );
+    Ok(())
 }
 
 /// Serves authoritative DNS in the foreground, without the rest of the daemon.
