@@ -86,9 +86,13 @@ Commands
                              Serve split-horizon DNS for the LAN: configured
                              site domains answer with this machine's LAN
                              address, everything else forwards upstream
-  run                        Start the proxy in the foreground
-  daemon [--bind <addr>]     Run the services and the control API the console
-                             connects to
+  daemon [--bind <addr>]     Run the whole deployment in the foreground:
+                             websites, mail, DNS, the supervised services and
+                             the control API, in one process. This is what the
+                             installed service starts.
+  run                        The same thing. Kept as an alias so an existing
+                             service definition keeps working; do not run both
+                             at once, they would each try to bind :443
   services                   List the installed services and what they are doing
   share <list|usage|ls>      The shares this box serves, what each one holds,
                              and what is inside one
@@ -496,12 +500,19 @@ async fn watch_dns(bind: SocketAddr, upstream: SocketAddr) -> Result<(), String>
     outcome
 }
 
-/// Runs the supervised services and the control API the console drives.
+/// Runs the whole deployment: websites, mail, DNS, services, and the control
+/// API, in one process.
 ///
-/// Separate from `run` for now: `run` serves websites, this runs services. They
-/// merge once the console can drive both from one place.
+/// This and `run` are the same command now. They used to be two processes and
+/// two installed OS services — `run` served websites, `daemon` ran services —
+/// and that split had no upside and three costs: the box could come up half
+/// working with no single thing to look at, an update had to be choreographed
+/// across two independently-restarting units, and each was capable of
+/// outliving the other. `run` is kept as an alias so an existing installation
+/// keeps starting while its service definition is replaced.
 fn daemon_command(arguments: &[String]) -> Result<(), String> {
     let (config, project_dir) = load()?;
+    let config_path = project_dir.join(CONFIG_FILENAME);
     let bind = value_of(arguments, "--bind").unwrap_or_else(|| config.server.admin_bind.clone());
     let address: SocketAddr = bind.parse().map_err(|e| format!("--bind {bind}: {e}"))?;
 
@@ -510,15 +521,50 @@ fn daemon_command(arguments: &[String]) -> Result<(), String> {
         .build()
         .map_err(|e| format!("could not start the async runtime: {e}"))?;
 
-    runtime.block_on(serve_daemon(config, project_dir, address))
+    runtime.block_on(serve_everything(config, project_dir, config_path, address))
 }
 
-/// Loads the catalogue, starts everything automatic, and serves the API.
-async fn serve_daemon(
+/// Brings up every subsystem this deployment is configured for, and serves
+/// until something stops it.
+///
+/// # One process, deliberately
+///
+/// Every listener, every watcher and every supervised child lives here. That
+/// buys three things a two-process split could not:
+///
+/// - **One boot.** The machine starts one service and everything the config
+///   asks for comes up with it, in a known order. There is no arrangement in
+///   which the proxy is answering and the services behind it were never
+///   started.
+/// - **One restart.** A self-update exits this process, so *everything*
+///   restarts onto the new build together. The old split had the daemon build
+///   the binary and the proxy notice the file had changed and exit separately,
+///   which meant a window where two halves of the deployment were running
+///   different code.
+/// - **Children do not outlive it.** Supervised children are owned by a job
+///   object on Windows and a process group on Unix, and both a clean shutdown
+///   and an outright kill are covered on the platform this deploys to. The
+///   exact per-platform guarantee — and the one case that is *not* covered, a
+///   `kill -9` on macOS — is set out in [`selfhost_supervisor::child`] rather
+///   than summarised optimistically here.
+///
+/// The cost is stated rather than hidden: a fatal error in any subsystem stops
+/// all of them. That is the intended trade. A box that is half up looks healthy
+/// to everything that only checks one half, and the failure this is most likely
+/// to prevent — DNS silently not being served while the websites are fine — is
+/// exactly the kind that goes unnoticed for days.
+async fn serve_everything(
     config: Config,
     project_dir: PathBuf,
+    config_path: PathBuf,
     address: SocketAddr,
 ) -> Result<(), String> {
+    // Before any rustls configuration is built, by any subsystem: the proxy,
+    // the mail server and the ACME client all construct one, and the provider
+    // is process-wide.
+    let _ = rustls::crypto::ring::default_provider().install_default();
+
+
     let data_dir = project_dir.join(&config.server.data_dir);
     // Created before anything reads or writes in it, and created so that only
     // this account can: the bearer token minted a few lines below, the console
@@ -772,10 +818,94 @@ async fn serve_daemon(
         api = api.with_desktop(*desk.config(), Arc::clone(desk) as Arc<dyn Fleet>);
     }
 
+    // ---- the web tier -------------------------------------------------------
+    //
+    // Last, and on purpose: everything above either binds loopback or binds
+    // nothing, so by the time the public listeners come up the services behind
+    // them are already supervised and the zones they answer for are already
+    // loaded. Binding :443 first would open a window where the internet can
+    // reach a proxy whose backends have not been started.
+    let server = Arc::new(Server::build(&config, &project_dir));
+    server.spawn_health_tasks();
+    tokio::spawn(watch_config(Arc::clone(&server), config_path, project_dir.clone()));
+
+    let certificates = CertificateStore::open(&data_dir).map_err(|e| e.to_string())?;
+
+    // The fallback identity: served on :443 the instant the listener binds, and
+    // for any SNI that has no certificate of its own. A self-signed pair is
+    // generated once so the resolver always has something to answer with, even
+    // on a first start with nothing on disk and before any ACME exchange has
+    // completed.
+    let primary = config
+        .sites
+        .first()
+        .map(|s| s.canonical().to_owned())
+        .unwrap_or_else(|| "localhost".to_owned());
+    let alternates: Vec<String> = config.sites.iter().flat_map(|s| s.domains.clone()).collect();
+    certificates
+        .load_or_generate_self_signed(&primary, &alternates)
+        .map_err(|e| e.to_string())?;
+
+    // Per-host certificate selection via SNI. Rebuildable at runtime, so a
+    // freshly issued certificate takes effect without restarting.
+    let resolver =
+        SniResolver::new(&certificates, &certificates.hosts(), &primary).map_err(|e| e.to_string())?;
+
+    // For staging or production, fetch real certificates in the background. The
+    // task is spawned before the listeners bind so the HTTP-01 responder on :80
+    // is already answering when the CA calls back. Self-signed needs no CA, no
+    // network, and no task — the resolver already holds the generated pair.
+    if !matches!(config.server.acme, AcmeEnvironment::SelfSigned) {
+        tokio::spawn(acme_task::issue_and_renew(
+            config.clone(),
+            project_dir.clone(),
+            certificates.clone(),
+            Arc::clone(&resolver),
+        ));
+    }
+
+    // Mail shares the certificate store and resolver above rather than opening
+    // its own, so `imap.example.com` presents the same certificate the proxy
+    // does and a renewal reaches both at once. A no-op when `[mail]` is absent.
+    mail_task::run(
+        config.clone(),
+        project_dir.clone(),
+        certificates.clone(),
+        Arc::clone(&resolver),
+    )
+    .await;
+
+    let tls_config = server_config_with_resolver(resolver).map_err(|e| e.to_string())?;
+
+    let http = TcpListener::bind(&config.server.http_bind)
+        .await
+        .map_err(|e| format!("cannot bind {} — {e}", config.server.http_bind))?;
+    let https = TcpListener::bind(&config.server.https_bind)
+        .await
+        .map_err(|e| format!("cannot bind {} — {e}", config.server.https_bind))?;
+
+    println!("\nlistening");
+    println!("  http  {}  (redirects to https)", config.server.http_bind);
+    println!("  https {}", config.server.https_bind);
+    for site in &config.sites {
+        let instances = site.instances.len();
+        println!("  site  {} → {} ({instances} instance(s))", site.canonical(), site.name);
+    }
+    println!("\nCtrl-C to stop.");
+
     let mut updated_to: Option<String> = None;
     let outcome = tokio::select! {
         result = selfhost_admin::serve(listener, api) => {
             result.map_err(|e| format!("the control api stopped: {e}"))
+        }
+        // The public listeners. A bind failure has already been returned above;
+        // reaching here means one of them stopped accepting, which is fatal for
+        // the same reason the DNS arm is: the box is meant to be serving.
+        result = serve_http(http, Arc::clone(&server)) => {
+            result.map_err(|e| format!("http listener stopped: {e}"))
+        }
+        result = serve_https(https, Arc::clone(&server), tls_config) => {
+            result.map_err(|e| format!("https listener stopped: {e}"))
         }
         // Re-asserts the firewall on a slow timer so an out-of-band change is
         // noticed and repaired. Never returns; this arm only exists so the daemon
@@ -1552,14 +1682,27 @@ fn service_install_command(system: bool, assumed_yes: bool) -> Result<(), String
         .map_err(|error| format!("cannot find this executable to register it: {error}"))?;
     let plan = service_install::plan(&exe, &project_dir, system)?;
 
-    println!("This will register the selfhost daemon as a {} service:\n", plan.mechanism);
+    println!("This will register selfhost as a {} service:\n", plan.mechanism);
     println!("  name          {}", plan.label);
     println!("  runs          {}", plan.argv.join(" "));
     println!("  working dir   {}", plan.working_dir.display());
     println!("  unit file     {}", plan.path.display());
+    if let Some((path, _)) = &plan.companion {
+        println!("  wrapper       {}", path.display());
+    }
+    println!(
+        "\nOne service runs the whole deployment: websites, mail, DNS, the\n\
+         supervised services and the control API, in one process."
+    );
     println!("\nThe unit that will be written:\n");
     for line in plan.contents.lines() {
         println!("  {line}");
+    }
+    if let Some((path, contents)) = &plan.companion {
+        println!("\nAnd {}:\n", path.display());
+        for line in contents.lines() {
+            println!("  {line}");
+        }
     }
     println!("\nThen these commands register and start it:");
     for step in &plan.activate {
@@ -1632,17 +1775,25 @@ fn services_command() -> Result<(), String> {
     Ok(())
 }
 
-/// Starts the proxy and blocks until interrupted.
+/// Starts the whole deployment and blocks until interrupted.
+///
+/// The same thing [`daemon_command`] does, and kept only so an installation
+/// whose service definition still says `selfhost run` keeps working while that
+/// definition is replaced. Both names have to lead to one process: two of them
+/// would each try to bind :443.
 fn run() -> Result<(), String> {
     let (config, project_dir) = load()?;
     let config_path = project_dir.join(CONFIG_FILENAME);
+    let bind = config.server.admin_bind.clone();
+    let address: SocketAddr =
+        bind.parse().map_err(|e| format!("server.admin_bind {bind}: {e}"))?;
 
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
         .map_err(|e| format!("could not start the async runtime: {e}"))?;
 
-    runtime.block_on(serve(config, project_dir, config_path))
+    runtime.block_on(serve_everything(config, project_dir, config_path, address))
 }
 
 /// How often the config file is checked for changes to hot-reload.
@@ -1708,109 +1859,6 @@ fn check_and_reload(
              live",
             config_path.display()
         ),
-    }
-}
-
-/// Binds the listeners and serves until interrupted.
-async fn serve(config: Config, project_dir: PathBuf, config_path: PathBuf) -> Result<(), String> {
-    // A process-wide crypto provider must be installed before any rustls
-    // configuration is built.
-    let _ = rustls::crypto::ring::default_provider().install_default();
-
-    let server = Arc::new(Server::build(&config, &project_dir));
-    server.spawn_health_tasks();
-    tokio::spawn(watch_config(Arc::clone(&server), config_path, project_dir.clone()));
-
-    let data_dir = project_dir.join(&config.server.data_dir);
-    // Ahead of the certificate store, which would otherwise create this
-    // directory itself with whatever permissions it inherited — and the first
-    // thing it puts in it is a TLS private key.
-    let prepared = crate::data_dir::prepare(&data_dir)
-        .map_err(|e| format!("cannot create {}: {e}", data_dir.display()))?;
-    for note in prepared.notes(&data_dir) {
-        eprintln!("{note}");
-    }
-    let store = CertificateStore::open(&data_dir).map_err(|e| e.to_string())?;
-
-    // The fallback identity: served on :443 the instant the daemon binds, and for
-    // any SNI that has no certificate of its own. A self-signed pair is generated
-    // once so the resolver always has something to answer with, even on a first
-    // start with nothing on disk and before any ACME exchange has completed.
-    let primary = config
-        .sites
-        .first()
-        .map(|s| s.canonical().to_owned())
-        .unwrap_or_else(|| "localhost".to_owned());
-    let alternates: Vec<String> = config.sites.iter().flat_map(|s| s.domains.clone()).collect();
-    store
-        .load_or_generate_self_signed(&primary, &alternates)
-        .map_err(|e| e.to_string())?;
-
-    // Per-host certificate selection via SNI. Rebuildable at runtime, so a
-    // freshly issued certificate takes effect without restarting the daemon.
-    let resolver = SniResolver::new(&store, &store.hosts(), &primary).map_err(|e| e.to_string())?;
-
-    // For staging or production, fetch real certificates in the background. The
-    // task is spawned before the listeners bind so the HTTP-01 responder on :80
-    // is already answering when the CA calls back. Self-signed needs no CA, no
-    // network, and no task — the resolver already holds the generated pair.
-    //
-    // Staging is the safe default (config-enforced): a first run against a domain
-    // that does not yet resolve here cannot burn the production rate limit.
-    if !matches!(config.server.acme, AcmeEnvironment::SelfSigned) {
-        tokio::spawn(acme_task::issue_and_renew(
-            config.clone(),
-            project_dir.clone(),
-            store.clone(),
-            Arc::clone(&resolver),
-        ));
-    }
-
-    // Mail rides alongside the proxy rather than under `daemon`: it needs the
-    // certificate store above, and — like the proxy — is meant to be up for
-    // as long as `run` is. A no-op when `config.mail` is absent.
-    mail_task::run(config.clone(), project_dir.clone(), store.clone(), Arc::clone(&resolver)).await;
-
-    let tls_config = server_config_with_resolver(resolver).map_err(|e| e.to_string())?;
-
-    let http = TcpListener::bind(&config.server.http_bind)
-        .await
-        .map_err(|e| format!("cannot bind {} — {e}", config.server.http_bind))?;
-    let https = TcpListener::bind(&config.server.https_bind)
-        .await
-        .map_err(|e| format!("cannot bind {} — {e}", config.server.https_bind))?;
-
-    println!("selfhost listening");
-    println!("  http  {}  (redirects to https)", config.server.http_bind);
-    println!("  https {}", config.server.https_bind);
-    for site in &config.sites {
-        let instances = site.instances.len();
-        println!("  site  {} → {} ({instances} instance(s))", site.canonical(), site.name);
-    }
-    println!("\nCtrl-C to stop.");
-
-    tokio::select! {
-        result = serve_http(http, Arc::clone(&server)) => {
-            result.map_err(|e| format!("http listener stopped: {e}"))
-        }
-        result = serve_https(https, Arc::clone(&server), tls_config) => {
-            result.map_err(|e| format!("https listener stopped: {e}"))
-        }
-        // The daemon fetches and builds self-updates; this process only follows
-        // the binary on disk, exiting once a new build replaces it so the
-        // service manager restarts onto the new code. Pends forever when
-        // `[self_update]` is absent or off.
-        _ = self_update::watch_binary_replaced(
-            config.self_update.as_ref().is_some_and(|u| u.enabled),
-        ) => {
-            println!("\nself-update: a new selfhost binary is installed; exiting so the \
-                      service manager restarts it");
-            std::process::exit(self_update::RESTART_EXIT);
-        }
-        _ = tokio::signal::ctrl_c() => {
-            println!("\nstopping");
-            Ok(())
-        }
     }
 }
 

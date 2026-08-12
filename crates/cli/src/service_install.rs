@@ -36,13 +36,25 @@
 //!   One caveat, learned live: Task Scheduler's `RestartOnFailure` covers a
 //!   task that *fails to run* — it does **not** re-run a program that started
 //!   and then exited, whatever its exit code. A daemon that exits on purpose
-//!   (a self-update's restart, exit 75) therefore stays down under the XML
-//!   below. A deployment using `[self_update]` on Windows should point the
-//!   task at a keep-alive wrapper instead — a two-line batch loop that reruns
-//!   the program after a 5-second pause — which is what launchd's `KeepAlive`
-//!   and systemd's `Restart=` provide natively.
+//!   (a self-update's restart, exit 75) would therefore stay down. So the task
+//!   does not point at the daemon at all: it points at a generated keep-alive
+//!   wrapper ([`keep_alive_script`]), a batch loop that reruns the program
+//!   after a pause. That is what launchd's `KeepAlive` and systemd's
+//!   `Restart=` provide natively, written out on the one platform that has
+//!   no equivalent.
+//!
 //! - **Linux** — a systemd unit, a `--user` unit by default and a system unit
 //!   under `/etc/systemd/system` with `--system`.
+//!
+//! # One service, not several
+//!
+//! There is exactly one registration per machine, because there is exactly one
+//! process. Earlier installations registered the proxy and the daemon
+//! separately, and on Windows added further tasks for LAN DNS and the VPN;
+//! those are now subsystems inside the one process. Both [`plan`] and
+//! [`uninstall_plan`] remove the stale registrations by name — on *install*
+//! too, not only on removal, because an upgraded box that kept them would run a
+//! second proxy racing this one for `:443`.
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -51,9 +63,21 @@ use std::process::Command;
 /// The launchd label / systemd unit stem the daemon is registered under.
 const LABEL: &str = "com.selfhost.daemon";
 
-/// The Windows scheduled-task name. Distinct from the proxy's `selfhost` task
-/// so installing one never overwrites the other.
+/// The Windows scheduled-task name.
 const TASK_NAME: &str = "selfhost-daemon";
+
+/// Scheduled tasks earlier versions installed, now folded into [`TASK_NAME`].
+///
+/// Removed on both install and uninstall. An upgraded box that kept these would
+/// start a second proxy racing the unified process for :443, and a second
+/// nameserver racing it for :53 — the exact half-running state the merge into
+/// one process exists to make impossible. Removal tolerates absence, so this is
+/// a no-op on a machine that never had them.
+const SUPERSEDED_TASK_NAMES: &[&str] = &["selfhost", "selfhost-lan-dns", "selfhost-vpn"];
+
+/// The launchd label an earlier version registered the proxy under, separately
+/// from the daemon. Removed for the reason [`SUPERSEDED_TASK_NAMES`] gives.
+const SUPERSEDED_LAUNCHD_LABEL: &str = "com.selfhost.proxy";
 
 /// The systemd unit file name.
 const SYSTEMD_UNIT: &str = "selfhost-daemon.service";
@@ -124,6 +148,13 @@ pub struct Plan {
     pub contents: String,
     /// Whether the unit must be written as UTF-16 (the Windows task XML).
     pub wide: bool,
+    /// A second file the unit depends on, written alongside it.
+    ///
+    /// Only Windows has one — the keep-alive wrapper the task invokes. Carried
+    /// in the plan rather than written by [`carry_out`] directly so it is shown
+    /// to the operator before anything is created, which is the whole point of
+    /// this type: nothing appears on disk that the plan did not name.
+    pub companion: Option<(PathBuf, String)>,
     /// The command the unit runs: `selfhost daemon`.
     pub argv: Vec<String>,
     /// Where that command runs — the directory holding `selfhost.config.toml`.
@@ -164,6 +195,7 @@ pub fn plan(exe: &Path, project_dir: &Path, system: bool) -> Result<Plan, String
                 label: LABEL.to_string(),
                 contents: launchd_plist(exe, project_dir),
                 wide: false,
+                companion: None,
                 argv,
                 working_dir,
                 activate: vec![
@@ -171,6 +203,14 @@ pub fn plan(exe: &Path, project_dir: &Path, system: bool) -> Result<Plan, String
                         "launchctl".into(),
                         "bootout".into(),
                         format!("{domain}/{LABEL}"),
+                    ]),
+                    // The separately-registered proxy an earlier version
+                    // installed. Tolerated absent, so this is a no-op on a
+                    // machine that never had one.
+                    Step::ignoring(vec![
+                        "launchctl".into(),
+                        "bootout".into(),
+                        format!("{domain}/{SUPERSEDED_LAUNCHD_LABEL}"),
                     ]),
                     Step::required(vec![
                         "launchctl".into(),
@@ -188,22 +228,41 @@ pub fn plan(exe: &Path, project_dir: &Path, system: bool) -> Result<Plan, String
             // directory as flags, and those are exactly what makes this a server
             // rather than a program that ran once at boot.
             let path = project_dir.join("data").join("selfhost-daemon.task.xml");
+            let wrapper = project_dir.join("data").join("selfhost-keepalive.cmd");
+
+            // Delete first, register second. A superseded task left running
+            // would race this one for :443 and :53.
+            let mut activate: Vec<Step> = SUPERSEDED_TASK_NAMES
+                .iter()
+                .map(|name| {
+                    Step::ignoring(vec![
+                        "schtasks".into(),
+                        "/Delete".into(),
+                        "/TN".into(),
+                        (*name).into(),
+                        "/F".into(),
+                    ])
+                })
+                .collect();
+            activate.push(Step::required(vec![
+                "schtasks".into(),
+                "/Create".into(),
+                "/TN".into(),
+                TASK_NAME.into(),
+                "/XML".into(),
+                path.display().to_string(),
+                "/F".into(),
+            ]));
+
             Ok(Plan {
                 mechanism: "Windows scheduled task",
                 label: TASK_NAME.to_string(),
-                contents: scheduled_task_xml(exe, project_dir),
+                contents: scheduled_task_xml(project_dir),
                 wide: true,
+                companion: Some((wrapper, keep_alive_script(exe, project_dir))),
                 argv,
                 working_dir,
-                activate: vec![Step::required(vec![
-                    "schtasks".into(),
-                    "/Create".into(),
-                    "/TN".into(),
-                    TASK_NAME.into(),
-                    "/XML".into(),
-                    path.display().to_string(),
-                    "/F".into(),
-                ])],
+                activate,
                 path,
             })
         }
@@ -222,6 +281,7 @@ pub fn plan(exe: &Path, project_dir: &Path, system: bool) -> Result<Plan, String
                 label: SYSTEMD_UNIT.to_string(),
                 contents: systemd_unit(exe, project_dir, system),
                 wide: false,
+                companion: None,
                 argv,
                 working_dir,
                 activate: vec![Step::required(reload), Step::required(enable)],
@@ -246,25 +306,47 @@ pub fn uninstall_plan(system: bool) -> Result<UninstallPlan, String> {
                 mechanism: "launchd",
                 label: LABEL.to_string(),
                 path: Some(plist_path(system)?),
-                steps: vec![Step::ignoring(vec![
-                    "launchctl".into(),
-                    "bootout".into(),
-                    format!("{domain}/{LABEL}"),
-                ])],
+                steps: vec![
+                    Step::ignoring(vec![
+                        "launchctl".into(),
+                        "bootout".into(),
+                        format!("{domain}/{LABEL}"),
+                    ]),
+                    // "Uninstall" has to mean *nothing selfhost starts is left
+                    // registered*, so an earlier version's separate proxy job
+                    // goes too. Tolerated absent.
+                    Step::ignoring(vec![
+                        "launchctl".into(),
+                        "bootout".into(),
+                        format!("{domain}/{SUPERSEDED_LAUNCHD_LABEL}"),
+                    ]),
+                ],
             })
         }
-        Target::ScheduledTask => Ok(UninstallPlan {
-            mechanism: "Windows scheduled task",
-            label: TASK_NAME.to_string(),
-            path: None,
-            steps: vec![Step::required(vec![
+        Target::ScheduledTask => {
+            let mut steps = vec![Step::required(vec![
                 "schtasks".into(),
                 "/Delete".into(),
                 "/TN".into(),
                 TASK_NAME.into(),
                 "/F".into(),
-            ])],
-        }),
+            ])];
+            steps.extend(SUPERSEDED_TASK_NAMES.iter().map(|name| {
+                Step::ignoring(vec![
+                    "schtasks".into(),
+                    "/Delete".into(),
+                    "/TN".into(),
+                    (*name).into(),
+                    "/F".into(),
+                ])
+            }));
+            Ok(UninstallPlan {
+                mechanism: "Windows scheduled task",
+                label: TASK_NAME.to_string(),
+                path: None,
+                steps,
+            })
+        }
         Target::Systemd => {
             let mut disable = vec!["systemctl".to_string()];
             let mut reload = vec!["systemctl".to_string()];
@@ -296,6 +378,14 @@ pub fn carry_out(plan: &Plan) -> Result<(), String> {
     // The launchd job writes its log into data/; create it now so the first
     // start does not fail on a missing directory.
     let _ = std::fs::create_dir_all(plan.working_dir.join("data"));
+
+    // Before the unit, because the unit refers to it: a task registered while
+    // its wrapper is missing is one that fails at the next boot rather than at
+    // install time, when somebody is watching.
+    if let Some((path, contents)) = &plan.companion {
+        write_unit(path, contents, false)?;
+        println!("  wrote    {}", path.display());
+    }
 
     write_unit(&plan.path, &plan.contents, plan.wide)?;
     println!("  wrote    {}", plan.path.display());
@@ -409,15 +499,51 @@ fn launchd_plist(exe: &Path, working_dir: &Path) -> String {
     )
 }
 
-/// The Windows Task Scheduler XML for `selfhost daemon`.
+/// The keep-alive wrapper the Windows task actually runs.
+///
+/// Task Scheduler will not restart a program that exited, so this loop does it:
+/// run the daemon, and whatever it exits with, pause and run it again. That
+/// covers the deliberate exit (a self-update's `75`) and a crash with the same
+/// two lines, which is why it does not test the exit code — every way the
+/// daemon can stop is a way it should come back.
+///
+/// The pause matters. Without it a daemon that fails immediately — a port held,
+/// a config that stopped validating — becomes a spin that fills the log and
+/// pins a core. Five seconds is long enough to keep that harmless and short
+/// enough that a real restart is not noticed.
+///
+/// `>>` on the log rather than `>`: the reason a restart happened is in the
+/// output of the run *before* it, so truncating on each start would delete the
+/// evidence every time it mattered.
+fn keep_alive_script(exe: &Path, working_dir: &Path) -> String {
+    format!(
+        "@echo off\r\n\
+rem Generated by `selfhost service install`. Task Scheduler cannot restart a\r\n\
+rem program that exited, so this loop is what makes the daemon keep running.\r\n\
+rem Edit the config, not this file: reinstalling the service overwrites it.\r\n\
+cd /d \"{dir}\"\r\n\
+:loop\r\n\
+\"{exe}\" daemon >> \"{dir}\\data\\selfhost-daemon.log\" 2>&1\r\n\
+timeout /t 5 /nobreak > nul\r\n\
+goto loop\r\n",
+        exe = exe.display(),
+        dir = working_dir.display(),
+    )
+}
+
+/// The Windows Task Scheduler XML for the keep-alive wrapper.
 ///
 /// A boot trigger, the `SYSTEM` account at the highest run level, and the
 /// restart policy `scripts/install-service.ps1` sets: three retries a minute
 /// apart, no execution-time limit. Declared UTF-16 because that is how Task
 /// Scheduler stores and re-exports its XML, and [`write_unit`] writes it as
 /// UTF-16 to match.
-fn scheduled_task_xml(exe: &Path, working_dir: &Path) -> String {
-    let exe = xml_escape(&exe.display().to_string());
+///
+/// The command is [`keep_alive_script`], not the daemon: see the module docs
+/// for why `RestartOnFailure` is not enough on its own. `RestartOnFailure` is
+/// still set, because it covers the case the wrapper cannot — the wrapper
+/// itself failing to start.
+fn scheduled_task_xml(working_dir: &Path) -> String {
     let dir = xml_escape(&working_dir.display().to_string());
     format!(
         "<?xml version=\"1.0\" encoding=\"UTF-16\"?>\n\
@@ -447,8 +573,7 @@ fn scheduled_task_xml(exe: &Path, working_dir: &Path) -> String {
   </Settings>\n\
   <Actions Context=\"Author\">\n\
     <Exec>\n\
-      <Command>{exe}</Command>\n\
-      <Arguments>daemon</Arguments>\n\
+      <Command>{dir}\\data\\selfhost-keepalive.cmd</Command>\n\
       <WorkingDirectory>{dir}</WorkingDirectory>\n\
     </Exec>\n\
   </Actions>\n\
@@ -596,13 +721,58 @@ mod tests {
 
     #[test]
     fn the_task_xml_starts_at_boot_as_system_with_a_restart_policy() {
-        let xml = scheduled_task_xml(Path::new("C:\\selfhost\\selfhost.exe"), Path::new("C:\\site"));
+        let xml = scheduled_task_xml(Path::new("C:\\site"));
         assert!(xml.contains("<BootTrigger>"), "it starts at boot");
         assert!(xml.contains("<UserId>S-1-5-18</UserId>"), "it runs as SYSTEM");
         assert!(xml.contains("<RunLevel>HighestAvailable</RunLevel>"));
         assert!(xml.contains("<Count>3</Count>") && xml.contains("<Interval>PT1M</Interval>"));
-        assert!(xml.contains("<Arguments>daemon</Arguments>"));
-        assert!(xml.contains("C:\\selfhost\\selfhost.exe"));
+    }
+
+    #[test]
+    fn the_task_runs_the_keep_alive_wrapper_rather_than_the_daemon_directly() {
+        // The bug this encodes: Task Scheduler does not re-run a program that
+        // exited, so pointing the task straight at the daemon leaves the box
+        // down after every self-update (which exits 75 on purpose).
+        let xml = scheduled_task_xml(Path::new("C:\\site"));
+        assert!(
+            xml.contains("C:\\site\\data\\selfhost-keepalive.cmd"),
+            "the task must invoke the wrapper: {xml}"
+        );
+        assert!(
+            !xml.contains("<Arguments>daemon</Arguments>"),
+            "invoking the daemon directly is the bug: {xml}"
+        );
+    }
+
+    #[test]
+    fn the_keep_alive_wrapper_restarts_on_any_exit_and_pauses_between_tries() {
+        let script = keep_alive_script(
+            Path::new("C:\\selfhost\\selfhost.exe"),
+            Path::new("C:\\site"),
+        );
+        assert!(script.contains(":loop") && script.contains("goto loop"), "{script}");
+        assert!(script.contains("\"C:\\selfhost\\selfhost.exe\" daemon"), "{script}");
+        // No exit-code test anywhere: a deliberate exit and a crash are both
+        // reasons to come back, so branching on the code would be a way to
+        // stay down.
+        assert!(!script.contains("errorlevel"), "{script}");
+        // The pause is what keeps an immediate, repeating failure from becoming
+        // a spin that pins a core and floods the log.
+        assert!(script.contains("timeout /t 5"), "{script}");
+        // Appended, not truncated: the reason for a restart is in the previous
+        // run's output.
+        assert!(script.contains(">> "), "{script}");
+    }
+
+    #[test]
+    fn installing_removes_the_registrations_this_one_supersedes() {
+        // An upgraded box that kept the old proxy task would run a second
+        // process racing this one for :443.
+        for name in SUPERSEDED_TASK_NAMES {
+            assert_ne!(*name, TASK_NAME, "a superseded name must not be the live one");
+        }
+        assert!(SUPERSEDED_TASK_NAMES.contains(&"selfhost"), "the old proxy task");
+        assert!(SUPERSEDED_TASK_NAMES.contains(&"selfhost-lan-dns"), "the old LAN DNS task");
     }
 
     #[test]
