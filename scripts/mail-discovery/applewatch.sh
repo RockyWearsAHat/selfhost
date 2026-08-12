@@ -13,7 +13,13 @@
 # nothing seen", never "the watcher died".
 set -u
 HERE="$(cd "$(dirname "$0")" && pwd)"
-DISCOVERY='_imaps\._tcp|_submissions?\._tcp|autodiscover|autoconfig|Q .*(mail|imap|smtp)\.rockywearsahat'
+# Plain A/AAAA on the autoconfig hostnames is NOT in this pattern: hosted
+# scanners ask exactly that several times an hour (with MX and NS on a
+# hostname, which no mail client would), and a watcher that cries every time
+# teaches you to ignore it. What no scanner has ever asked for here is the
+# SRVs — so those, the autodiscover dialects, and Apple's own address space
+# are the questions worth waking for.
+DISCOVERY='_imaps\._tcp|_submissions?\._tcp|autodiscover|autoconfig'
 
 while true; do
   out=$("$HERE/verdict.sh" rockywearsahat 2>&1)
