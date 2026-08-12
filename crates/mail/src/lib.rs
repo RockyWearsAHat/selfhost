@@ -30,6 +30,7 @@ pub mod imap_net;
 pub mod message;
 pub mod mime;
 pub mod outbound;
+pub mod pacc;
 pub mod receive;
 pub mod smtp;
 pub mod store;

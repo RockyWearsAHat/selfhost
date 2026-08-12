@@ -51,7 +51,8 @@ selfhost dns sync --apply    # writes the plan
 For every registered domain the config serves (site domains and mail domains,
 grouped — `www.example.com` and `example.com` are one zone), the command derives
 the records the config implies (site A records, and the full mail set: MX, SPF,
-DMARC, DKIM once the key exists, CAA, autoconfig A records, RFC 6186 SRVs),
+DMARC, DKIM once the key exists, CAA, client-setup A records, RFC 6186 SRVs,
+and the `_ua-auto-config` PACC digest — see below),
 lists what the registrar currently serves, and prints the diff. Records point at
 the box's discovered public IP, falling back to the config's `[dns]` apex A if
 discovery fails. **Dry-run is the default; only `--apply` writes.**
@@ -79,6 +80,31 @@ api_user = "<account name>"
 api_key = "<from the API Access page>"
 client_ip = "172.83.6.109"
 ```
+
+## Account setup without typing server names — what is published, and what works today
+
+Three mechanisms are published for a mail domain, in the order clients came to
+them. Nothing here needs a per-client profile, and none of it costs a port.
+
+| Mechanism | What is published | Who uses it |
+|-----------|-------------------|-------------|
+| Guessable hostnames | `A` records + certificate SANs for `mail.`, `imap.`, `smtp.` | Nearly every client, as a guess after discovery fails. This is why setup works today once the two hostnames are typed. |
+| RFC 6186 SRV | `_imaps._tcp` → `0 1 993 imap.<domain>`, `_submission._tcp` → `0 1 587 smtp.<domain>`, `_submissions._tcp` → `0 1 465 smtp.<domain>` | Thunderbird and others. **Not macOS/iOS Mail** — a sweep of the dyld shared cache on macOS 15.5 finds those service labels zero times (`discovery-lab.dx`). |
+| **PACC** (`draft-ietf-mailmaint-pacc`) | `A` + certificate for `ua-auto-config.<domain>`, the document served at `https://ua-auto-config.<domain>/.well-known/user-agent-configuration.json`, and a `_ua-auto-config` `TXT` carrying `v=UAAC1; a=sha256; d=<base64 SHA-256 of the document>` | Nothing shipping yet — Apple co-authors the draft and was implementing a client in July 2026. Published now because it is inert to clients that have never heard of it and is the only specified path that ends with an address and a password being enough. |
+
+The document, the digest, and the hostname all come from one derivation
+(`crates/config/src/pacc.rs`), so a `selfhost dns sync` after any config change
+republishes a digest that matches the bytes the proxy serves. Check them against
+each other any time:
+
+```bash
+curl -s https://ua-auto-config.<domain>/.well-known/user-agent-configuration.json \
+  | openssl dgst -binary -sha256 | base64      # must equal the d= tag below
+dig +short TXT _ua-auto-config.<domain>
+```
+
+Namecheap's API cannot write SRV records (the sync says so per domain), but the
+PACC `TXT` and `A` records are ordinary records it writes without complaint.
 
 ## Port 25 (outbound) — rechecked, still blocked
 

@@ -179,20 +179,24 @@ impl Mail {
         .collect()
     }
 
-    /// The hostnames a mail client's automatic account setup tries for these
-    /// domains: `mail.`, `imap.`, and `smtp.` under each, deduplicated, in
-    /// that order.
+    /// The hostnames a mail client's automatic account setup reaches for these
+    /// domains: `mail.`, `imap.`, `smtp.`, and `ua-auto-config.` under each,
+    /// deduplicated, in that order.
     ///
-    /// Apple Mail, Thunderbird, and most other clients guess exactly these
-    /// names when the user types only an address and a password. Publishing
-    /// them (an `A` record each) and serving a valid certificate for them —
-    /// they join the ACME issuance set and the mail listeners' SNI resolver —
-    /// is what makes account setup work with no server fields typed. The
-    /// first name is the set's canonical host for certificate bookkeeping.
+    /// Apple Mail, Thunderbird, and most other clients guess the first three
+    /// when the user types only an address and a password. The fourth is not a
+    /// guess: it is the host [`crate::pacc`] serves the automatic-configuration
+    /// document from, which a PACC client fetches instead of guessing at all.
+    /// Publishing them (an `A` record each) and serving a valid certificate for
+    /// them — they join the ACME issuance set and the mail listeners' SNI
+    /// resolver — is what makes account setup work with no server fields typed;
+    /// the PACC host in particular is useless without a certificate, since its
+    /// document is fetched over HTTPS or not at all. The first name is the
+    /// set's canonical host for certificate bookkeeping.
     pub fn client_hosts(&self) -> Vec<String> {
         let mut hosts = Vec::new();
         for domain in &self.domains {
-            for prefix in ["mail", "imap", "smtp"] {
+            for prefix in ["mail", "imap", "smtp", crate::pacc::HOST_PREFIX] {
                 let host = format!("{prefix}.{domain}");
                 if !hosts.contains(&host) {
                     hosts.push(host);
@@ -216,12 +220,25 @@ impl Mail {
     /// - `TXT` `<selector>._domainkey` with `dkim_txt`, **only** when DKIM signing
     ///   is configured *and* the public key is supplied (a `_domainkey` record
     ///   with no live key behind it tells receivers to distrust our unsigned mail);
+    /// - `TXT` `_ua-auto-config` with `pacc_digest`, **only** when a digest is
+    ///   supplied — the record vouches for the automatic-configuration document
+    ///   (see [`crate::pacc`]), and a digest that does not match the bytes the
+    ///   proxy serves makes every PACC client reject the configuration, so it is
+    ///   published only when the caller has hashed the document it is serving;
     /// - `CAA` `@` `"0 issue letsencrypt.org"` — only Let's Encrypt may issue the
     ///   certificate the mail host serves for STARTTLS.
     ///
     /// `dkim_txt` is the value from `mail::dkim::Dkim::public_txt()`; pass `None`
     /// when signing is not configured or the key has not been generated yet.
-    pub fn dns_records(&self, domain: &str, dkim_txt: Option<&str>) -> Vec<RecordConfig> {
+    /// `pacc_digest` is the value from `mail::pacc::digest`, taken over
+    /// [`crate::pacc::document`] for this same `domain`; pass `None` to publish
+    /// no PACC record.
+    pub fn dns_records(
+        &self,
+        domain: &str,
+        dkim_txt: Option<&str>,
+        pacc_digest: Option<&str>,
+    ) -> Vec<RecordConfig> {
         let mut records = vec![
             RecordConfig {
                 name: "@".into(),
@@ -239,6 +256,13 @@ impl Mail {
         // is not keeping, and receivers penalise exactly that mismatch.
         if let (Some(dkim), Some(public)) = (&self.dkim, dkim_txt) {
             records.push(txt(&format!("{}._domainkey", dkim.selector), public));
+        }
+
+        // Same rule as DKIM, for the same reason: a digest record without the
+        // document it hashes behind it is worse than no record — a client that
+        // finds it and cannot verify the fetched bytes abandons discovery.
+        if let Some(digest) = pacc_digest {
+            records.push(txt(crate::pacc::TXT_NAME, &crate::pacc::txt_value(digest)));
         }
 
         records.push(RecordConfig {
@@ -579,9 +603,11 @@ domains = ["example.com"]
                 "mail.example.com",
                 "imap.example.com",
                 "smtp.example.com",
+                "ua-auto-config.example.com",
                 "mail.other.net",
                 "imap.other.net",
                 "smtp.other.net",
+                "ua-auto-config.other.net",
             ]
         );
     }
@@ -745,7 +771,7 @@ imap = "nope"
             max_message_bytes: default_max_message(),
             require_tls_for_auth: true,
         };
-        let records = mail.dns_records("example.com", Some("v=DKIM1; k=rsa; p=AAAA"));
+        let records = mail.dns_records("example.com", Some("v=DKIM1; k=rsa; p=AAAA"), Some("d1g3st"));
 
         let mx = records.iter().find(|r| r.record_type == "MX").expect("an MX");
         assert_eq!(mx.name, "@");
@@ -792,7 +818,7 @@ imap = "nope"
             max_message_bytes: default_max_message(),
             require_tls_for_auth: true,
         };
-        let records = mail.dns_records("example.com", None);
+        let records = mail.dns_records("example.com", None, None);
         assert!(
             !records.iter().any(|r| r.name.ends_with("._domainkey")),
             "no DKIM record without a key: {records:?}"
@@ -814,7 +840,7 @@ imap = "nope"
             max_message_bytes: default_max_message(),
             require_tls_for_auth: true,
         };
-        let text = toml_zone_with(mail.dns_records("example.com", Some("v=DKIM1; p=AAAA")));
+        let text = toml_zone_with(mail.dns_records("example.com", Some("v=DKIM1; p=AAAA"), Some("d1g3st")));
         assert!(Config::parse(&text).is_ok(), "generated records should validate:\n{text}");
     }
 

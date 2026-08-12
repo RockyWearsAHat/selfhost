@@ -362,7 +362,7 @@ fn compress_wsp(text: &str) -> String {
 }
 
 /// SHA-256 of `data`.
-fn sha256(data: &[u8]) -> Vec<u8> {
+pub(crate) fn sha256(data: &[u8]) -> Vec<u8> {
     ring::digest::digest(&ring::digest::SHA256, data).as_ref().to_vec()
 }
 
@@ -435,7 +435,7 @@ fn pem_to_der(pem: &str) -> Result<Vec<u8>, DkimError> {
 const B64: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 
 /// Encodes bytes as padded standard base64.
-fn b64_encode(data: &[u8]) -> String {
+pub(crate) fn b64_encode(data: &[u8]) -> String {
     let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
     for chunk in data.chunks(3) {
         let b0 = chunk[0] as u32;

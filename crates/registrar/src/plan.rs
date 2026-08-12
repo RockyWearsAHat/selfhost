@@ -23,11 +23,12 @@ use crate::{Record, RecordType};
 ///   subdomain (`www.example.com` → `www`) — the explicit records survive
 ///   registrars that ignore wildcards;
 /// - when `[mail]` covers `domain`: the records [`selfhost_config::Mail::dns_records`]
-///   generates (MX, SPF, DMARC, DKIM when `dkim_txt` is supplied, CAA) —
-///   reused, not re-derived, so this crate and the served zone can never
-///   disagree — plus an `A` for each name the promise must resolve
-///   (the MX target and the `mail`/`imap`/`smtp` client-autoconfig hosts that
-///   fall under `domain`), and the client-discovery SRVs: `_imaps._tcp` →
+///   generates (MX, SPF, DMARC, DKIM when `dkim_txt` is supplied, the
+///   `_ua-auto-config` digest when `pacc_digest` is supplied, CAA) — reused, not
+///   re-derived, so this crate and the served zone can never disagree — plus an
+///   `A` for each name the promise must resolve (the MX target and the
+///   `mail`/`imap`/`smtp`/`ua-auto-config` client-setup hosts that fall under
+///   `domain`), and the client-discovery SRVs: `_imaps._tcp` →
 ///   `0 1 993 imap.<domain>` and `_submission._tcp` → `0 1 587 smtp.<domain>`
 ///   (RFC 6186), plus `_submissions._tcp` → `0 1 465 smtp.<domain>` (RFC 8314
 ///   implicit TLS, published alongside `_submission._tcp`, never instead of it).
@@ -35,12 +36,15 @@ use crate::{Record, RecordType};
 /// `dkim_txt` is the value of `mail::dkim::Dkim::public_txt()`; the caller
 /// reads the key because this function performs no I/O. Pass `None` when
 /// signing is unconfigured or the key does not exist yet — the DKIM record is
-/// then omitted, exactly as `Mail::dns_records` omits it.
+/// then omitted, exactly as `Mail::dns_records` omits it. `pacc_digest` is the
+/// value of `mail::pacc::digest` over the document the proxy serves for this
+/// domain, hashed by the caller for the same reason; `None` omits the record.
 pub fn desired_records(
     config: &Config,
     domain: &str,
     server_ip: Ipv4Addr,
     dkim_txt: Option<&str>,
+    pacc_digest: Option<&str>,
 ) -> Vec<Record> {
     let mut records = Vec::new();
     let address = server_ip.to_string();
@@ -74,7 +78,7 @@ pub fn desired_records(
         .as_ref()
         .filter(|mail| mail.domains.iter().any(|d| d.eq_ignore_ascii_case(domain)));
     if let Some(mail) = covered_by_mail {
-        for generated in mail.dns_records(domain, dkim_txt) {
+        for generated in mail.dns_records(domain, dkim_txt, pacc_digest) {
             records.push(from_config_record(&generated));
         }
 
@@ -395,7 +399,7 @@ private_key = "dkim/k.pem"
 
     #[test]
     fn derives_site_a_records_apex_wildcard_and_each_subdomain() {
-        let records = desired_records(&deployment(), "example.com", IP, None);
+        let records = desired_records(&deployment(), "example.com", IP, None, None);
         for host in ["@", "*", "www", "app"] {
             let record = find(&records, host, "A").unwrap_or_else(|| panic!("A at {host}"));
             assert_eq!(record.value, "172.83.6.109");
@@ -409,7 +413,7 @@ private_key = "dkim/k.pem"
     #[test]
     fn derives_the_mail_records_from_the_one_config_generator() {
         let records =
-            desired_records(&deployment(), "example.com", IP, Some("v=DKIM1; k=rsa; p=AAAA"));
+            desired_records(&deployment(), "example.com", IP, Some("v=DKIM1; k=rsa; p=AAAA"), Some("d1g3st"));
 
         let mx = find(&records, "@", "MX").expect("an MX at the apex");
         assert_eq!(mx.value, "mail.example.com");
@@ -426,17 +430,33 @@ private_key = "dkim/k.pem"
 
     #[test]
     fn derives_a_records_for_the_names_mail_promises() {
-        // The MX target and the client-autoconfig hosts must resolve, or the
-        // published promise black-holes mail and breaks account setup.
-        let records = desired_records(&deployment(), "example.com", IP, None);
-        for host in ["mail", "imap", "smtp"] {
+        // The MX target and the client-setup hosts must resolve, or the
+        // published promise black-holes mail and breaks account setup. The
+        // PACC host is on that list for a sharper reason: its whole purpose is
+        // to be fetched, and a name that does not resolve is not fetched.
+        let records = desired_records(&deployment(), "example.com", IP, None, None);
+        for host in ["mail", "imap", "smtp", "ua-auto-config"] {
             assert!(find(&records, host, "A").is_some(), "A at {host}");
         }
     }
 
     #[test]
+    fn publishes_the_pacc_digest_record_only_when_a_digest_is_supplied() {
+        let with = desired_records(&deployment(), "example.com", IP, None, Some("d1g3st"));
+        assert_eq!(
+            find(&with, "_ua-auto-config", "TXT").expect("a PACC digest record").value,
+            "v=UAAC1; a=sha256; d=d1g3st"
+        );
+
+        // A record with no document behind it makes a PACC client abandon
+        // discovery, so an absent digest publishes nothing at all.
+        let without = desired_records(&deployment(), "example.com", IP, None, None);
+        assert!(find(&without, "_ua-auto-config", "TXT").is_none());
+    }
+
+    #[test]
     fn derives_the_rfc6186_client_discovery_srvs() {
-        let records = desired_records(&deployment(), "example.com", IP, None);
+        let records = desired_records(&deployment(), "example.com", IP, None, None);
 
         let imaps = find(&records, "_imaps._tcp", "SRV").expect("an IMAPS SRV");
         assert_eq!(imaps.rtype, RecordType::Srv { priority: 0, weight: 1, port: 993 });
@@ -449,7 +469,7 @@ private_key = "dkim/k.pem"
 
     #[test]
     fn derives_the_rfc8314_implicit_tls_submission_srv_alongside_starttls() {
-        let records = desired_records(&deployment(), "example.com", IP, None);
+        let records = desired_records(&deployment(), "example.com", IP, None, None);
 
         let submissions = find(&records, "_submissions._tcp", "SRV").expect("an implicit-TLS submission SRV");
         assert_eq!(submissions.rtype, RecordType::Srv { priority: 0, weight: 1, port: 465 });
@@ -461,14 +481,14 @@ private_key = "dkim/k.pem"
 
     #[test]
     fn omits_dkim_without_a_key_and_mail_records_off_the_mail_domain() {
-        let no_key = desired_records(&deployment(), "example.com", IP, None);
+        let no_key = desired_records(&deployment(), "example.com", IP, None, None);
         assert!(
             no_key.iter().all(|r| !r.host.ends_with("._domainkey")),
             "no DKIM record without a key to stand behind it"
         );
 
         // elsewhere.net has a site but is not a mail domain: A records only.
-        let foreign = desired_records(&deployment(), "elsewhere.net", IP, None);
+        let foreign = desired_records(&deployment(), "elsewhere.net", IP, None, None);
         assert!(find(&foreign, "@", "A").is_some(), "the site still gets its apex A");
         assert!(find(&foreign, "*", "A").is_some());
         assert!(
@@ -513,7 +533,7 @@ private_key = "dkim/k.pem"
 
     #[test]
     fn planning_the_desired_set_against_itself_is_all_keep() {
-        let desired = desired_records(&deployment(), "example.com", IP, Some("v=DKIM1; p=A"));
+        let desired = desired_records(&deployment(), "example.com", IP, Some("v=DKIM1; p=A"), Some("d1g3st"));
         let plan = plan(&desired, &desired);
         assert!(plan.is_settled(), "an already-correct zone plans no changes");
         assert_eq!(plan.keep.len(), desired.len());

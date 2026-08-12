@@ -43,10 +43,11 @@ use std::path::Path;
 ///
 /// One constructor for the daemon, `selfhost dns serve`, and `lan-dns`, so the
 /// three can never serve different zone content: zones from `[dns]` (bare ones
-/// expanded from `public_ip`), each mail domain's `MX`/SPF/DMARC/DKIM/CAA
+/// expanded from `public_ip`), each mail domain's `MX`/SPF/DMARC/DKIM/PACC/CAA
 /// records (the DKIM `TXT` only when the key on disk is readable — read-only
-/// here, `selfhost run` is what generates it), and the addresses and `SRV`s of
-/// every host the config claims. The split-horizon LAN view is *not* set here;
+/// here, `selfhost run` is what generates it; the `_ua-auto-config` digest is
+/// pure, so it is always published for a mail domain), and the addresses and
+/// `SRV`s of every host the config claims. The split-horizon LAN view is *not* set here;
 /// each caller decides that from its own configuration.
 pub fn build_authority(
     config: &Config,
@@ -58,7 +59,10 @@ pub fn build_authority(
             let dkim = dns_sync::dkim_public(config, project_dir);
             mail.domains
                 .iter()
-                .map(|domain| (domain.clone(), mail.dns_records(domain, dkim.as_deref())))
+                .map(|domain| {
+                    let pacc = dns_sync::pacc_digest(config, domain);
+                    (domain.clone(), mail.dns_records(domain, dkim.as_deref(), pacc.as_deref()))
+                })
                 .collect()
         }
         None => Vec::new(),

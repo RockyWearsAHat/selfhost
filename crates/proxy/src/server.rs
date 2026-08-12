@@ -17,7 +17,7 @@ use crate::files::{self, Resolution};
 use crate::health;
 use crate::upgrade;
 use crate::upstream::Pool;
-use selfhost_config::{Config, Site};
+use selfhost_config::{Config, Site, pacc};
 use selfhost_http::{Body, Method, ParseError, Request, Response, Status};
 use std::collections::BTreeMap;
 use std::io;
@@ -119,6 +119,14 @@ pub struct Server {
     /// token live. Same reasoning as `acme_challenge_dir`: fixed at startup,
     /// not re-derived on a reload.
     data_dir: PathBuf,
+    /// `ua-auto-config.<mail domain>` to the automatic-configuration document
+    /// that host serves, one per mail domain.
+    ///
+    /// Behind the same lock as `routes` and rebuilt by the same reload, because
+    /// it is derived from the same config: a mail domain added by a reload must
+    /// start answering with the document whose digest the next `dns sync`
+    /// publishes, not at the next restart.
+    pacc: RwLock<BTreeMap<String, Arc<String>>>,
     /// Where the loopback admin API listens, if `admin_bind` parses.
     ///
     /// `None` rather than a startup failure when it does not: a malformed
@@ -139,6 +147,7 @@ impl Server {
             routes: RwLock::new(routes),
             sites: RwLock::new(sites),
             acme_challenge_dir: Some(data_dir.join("acme-challenges")),
+            pacc: RwLock::new(Self::pacc_documents(config)),
             data_dir,
             admin_bind: config.server.admin_bind.parse().ok(),
         }
@@ -159,6 +168,34 @@ impl Server {
         let (routes, sites) = Self::routing(config, project_dir);
         *self.routes.write().unwrap_or_else(|poisoned| poisoned.into_inner()) = routes;
         *self.sites.write().unwrap_or_else(|poisoned| poisoned.into_inner()) = sites;
+        *self.pacc.write().unwrap_or_else(|poisoned| poisoned.into_inner()) =
+            Self::pacc_documents(config);
+    }
+
+    /// The automatic-configuration document each mail domain publishes, keyed
+    /// by the host it is fetched from.
+    ///
+    /// Derived from the config by [`selfhost_config::pacc::document`] — the same
+    /// function `selfhost dns sync` hashes for the `_ua-auto-config` record — so
+    /// the bytes served here and the digest that vouches for them come from one
+    /// generator and cannot drift apart.
+    fn pacc_documents(config: &Config) -> BTreeMap<String, Arc<String>> {
+        let Some(mail) = &config.mail else { return BTreeMap::new() };
+        mail.domains
+            .iter()
+            .map(|domain| {
+                (pacc::host(domain).to_ascii_lowercase(), Arc::new(pacc::document(domain)))
+            })
+            .collect()
+    }
+
+    /// The configuration document served at `host`, if it is a PACC host.
+    pub fn pacc_document(&self, host: &str) -> Option<Arc<String>> {
+        self.pacc
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(&host.to_ascii_lowercase())
+            .cloned()
     }
 
     /// The routing table and site list a config builds, shared by
@@ -437,6 +474,18 @@ where
         return serve_acme_challenge(server, request, stream, keep_alive).await;
     }
 
+    // The PACC exemption, for the same reason as the ACME one above: a mail
+    // domain's `ua-auto-config` host is a certificate and an address without
+    // being a site, so the routing table has never heard of it and the 404
+    // below would answer every discovery fetch. One path, one document, no
+    // authentication — the draft forbids requiring any — and nothing else at
+    // this hostname.
+    if request.path() == pacc::WELL_KNOWN_PATH {
+        if let Some(document) = server.pacc_document(&host) {
+            return serve_pacc(&document, &host, request, is_tls, stream, keep_alive).await;
+        }
+    }
+
     let Some(runtime) = server.route(&host) else {
         // An unknown Host is answered with 404 rather than a default site, so a
         // stray DNS record cannot quietly expose one site under another's name.
@@ -529,6 +578,46 @@ where
     }
 
     serve_static(&runtime, request, stream, keep_alive).await
+}
+
+/// Serves a mail domain's automatic-configuration document (PACC).
+///
+/// Answers `GET` and `HEAD` with the document as `application/json`, and
+/// nothing else: a write verb at this path is a caller misunderstanding a
+/// static document, not a request to be relayed anywhere.
+///
+/// Over cleartext it redirects instead of serving. The document must be
+/// fetched over HTTPS — a client that trusted a plaintext copy would take its
+/// server names from whoever answered port 80 — and `draft-ietf-mailmaint-pacc`
+/// has clients follow up to five redirects, all of which must be `https`, so
+/// the upgrade is the specified way to answer here rather than a refusal.
+async fn serve_pacc<S>(
+    document: &str,
+    host: &str,
+    request: &Request,
+    is_tls: bool,
+    stream: &mut S,
+    keep_alive: bool,
+) -> io::Result<Outcome>
+where
+    S: AsyncWrite + Unpin,
+{
+    if !matches!(request.method, Method::Get | Method::Head) {
+        write_response(stream, Response::error_page(Status::NOT_FOUND), keep_alive).await?;
+        return Ok(Outcome::Reusable);
+    }
+
+    let response = if is_tls {
+        Response::bytes(Status::OK, "application/json", document.as_bytes().to_vec())
+            .unwrap_or_else(|_| Response::error_page(Status::INTERNAL_SERVER_ERROR))
+    } else {
+        let target = format!("https://{host}{}", pacc::WELL_KNOWN_PATH);
+        Response::redirect(Status::PERMANENT_REDIRECT, &target)
+            .unwrap_or_else(|_| Response::error_page(Status::BAD_REQUEST))
+    };
+
+    write_response(stream, response, keep_alive).await?;
+    Ok(Outcome::Reusable)
 }
 
 /// Serves an ACME HTTP-01 challenge token.
@@ -2354,6 +2443,93 @@ mod tests {
         )
         .await;
         assert!(missing.starts_with(b"HTTP/1.1 404"));
+    }
+
+    /// A config whose `[mail]` covers one domain, so its PACC host exists.
+    fn config_with_mail(domain: &str) -> Config {
+        let mut config = config_with(vec![site("web", &["example.com"])]);
+        config.mail = Some(selfhost_config::Mail {
+            hostname: format!("mail.{domain}"),
+            domains: vec![domain.to_owned()],
+            mailboxes: vec![],
+            dkim: None,
+            relay: None,
+            bind: selfhost_config::MailBind::default(),
+            max_message_bytes: 25 * 1024 * 1024,
+            require_tls_for_auth: true,
+        });
+        config
+    }
+
+    #[tokio::test]
+    async fn the_pacc_host_serves_its_configuration_document_over_tls() {
+        // ua-auto-config.<domain> is a certificate and an address without being
+        // a site, so — exactly like the ACME exemption — the unknown-Host 404
+        // must not fire before the document is served.
+        let dir = ScratchDataDir::new("pacc-serve");
+        let server = Server::build(&config_with_mail("example.com"), &dir.0);
+
+        let head = format!(
+            "GET {} HTTP/1.1\r\nHost: ua-auto-config.example.com\r\n\r\n",
+            pacc::WELL_KNOWN_PATH
+        );
+        let response = dispatch_bytes(&server, &head, "203.0.113.9:5000", true, b"").await;
+        let text = String::from_utf8_lossy(&response);
+        assert!(text.starts_with("HTTP/1.1 200"), "{text}");
+        assert!(text.contains("application/json"), "{text}");
+        // Byte-for-byte the document the `_ua-auto-config` digest is taken
+        // over: anything else and every client rejects the configuration.
+        assert!(text.ends_with(&pacc::document("example.com")), "{text}");
+    }
+
+    #[tokio::test]
+    async fn a_cleartext_pacc_fetch_is_upgraded_rather_than_served() {
+        // The document names the servers an account will hand its password to,
+        // so it is never served to a caller who did not get it over TLS.
+        let dir = ScratchDataDir::new("pacc-cleartext");
+        let server = Server::build(&config_with_mail("example.com"), &dir.0);
+
+        let head = format!(
+            "GET {} HTTP/1.1\r\nHost: ua-auto-config.example.com\r\n\r\n",
+            pacc::WELL_KNOWN_PATH
+        );
+        let response = dispatch_bytes(&server, &head, "203.0.113.9:5000", false, b"").await;
+        let text = String::from_utf8_lossy(&response);
+        assert!(text.starts_with("HTTP/1.1 308"), "{text}");
+        assert!(
+            text.contains(&format!("https://ua-auto-config.example.com{}", pacc::WELL_KNOWN_PATH)),
+            "{text}"
+        );
+        assert!(!text.contains("imap.example.com"), "the document itself must not ride along");
+    }
+
+    #[tokio::test]
+    async fn the_pacc_path_is_only_the_document_and_only_for_a_mail_domain() {
+        let dir = ScratchDataDir::new("pacc-bounds");
+        let server = Server::build(&config_with_mail("example.com"), &dir.0);
+
+        // A domain with no `[mail]` of its own has no document to serve.
+        let stranger = format!(
+            "GET {} HTTP/1.1\r\nHost: ua-auto-config.elsewhere.net\r\n\r\n",
+            pacc::WELL_KNOWN_PATH
+        );
+        let response = dispatch_bytes(&server, &stranger, "203.0.113.9:5000", true, b"").await;
+        assert!(response.starts_with(b"HTTP/1.1 404"));
+
+        // The host answers one path and nothing else — it is a static document,
+        // not a site.
+        let other_path =
+            "GET /index.html HTTP/1.1\r\nHost: ua-auto-config.example.com\r\n\r\n".to_owned();
+        let response = dispatch_bytes(&server, &other_path, "203.0.113.9:5000", true, b"").await;
+        assert!(response.starts_with(b"HTTP/1.1 404"));
+
+        // And only reads it: a write verb at the document's path is refused.
+        let write = format!(
+            "POST {} HTTP/1.1\r\nHost: ua-auto-config.example.com\r\nContent-Length: 0\r\n\r\n",
+            pacc::WELL_KNOWN_PATH
+        );
+        let response = dispatch_bytes(&server, &write, "203.0.113.9:5000", true, b"").await;
+        assert!(response.starts_with(b"HTTP/1.1 404"));
     }
 
     #[tokio::test]
