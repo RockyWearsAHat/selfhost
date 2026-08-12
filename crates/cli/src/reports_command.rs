@@ -3,9 +3,9 @@
 //! Six words, one verb:
 //!
 //! ```text
-//! selfhost reports serve [--port N] [--route /api/reports] [--project dx] [--no-mail]
-//! selfhost reports project add <key>      make a project reports may be filed against
-//! selfhost reports projects               what this box accepts reports about
+//! selfhost reports serve [--port N] [--route /report] [--project dx] [--no-mail]
+//! selfhost reports project add <key>      make a service reports may be filed against
+//! selfhost reports projects               what this box holds reports for
 //! selfhost reports list [<project>]       the open reports, newest sighting first
 //! selfhost reports close <project> <id>   a fixed report leaves the database
 //! selfhost reports token [--new]          the token a subscribed checkout reads the feed with
@@ -15,6 +15,10 @@
 //! [`selfhost_reports`] is the authority on what the intake accepts and what it bounds — this
 //! module only turns arguments into that crate's values, and it deliberately holds no rules of
 //! its own.
+//!
+//! `project add` is now a convenience rather than a precondition: a service comes into
+//! existence when the first report is filed to `…/report?<service>`, which is what lets a tool
+//! nobody here has configured reach the people who fix it.
 
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
@@ -69,22 +73,21 @@ fn serve(
     // A supervised service is told its port through the environment, exactly as an app site's
     // backend is (`selfhost_app_deploy`), so the config's instance port and the port bound here
     // are one number that cannot drift.
-    let port: u16 = match crate::value_of(arguments, "--port")
-        .or_else(|| std::env::var("PORT").ok())
-    {
-        Some(given) => given
-            .trim()
-            .parse()
-            .map_err(|error| format!("--port {given}: {error}"))?,
-        None => DEFAULT_PORT,
-    };
+    let port: u16 =
+        match crate::value_of(arguments, "--port").or_else(|| std::env::var("PORT").ok()) {
+            Some(given) => given
+                .trim()
+                .parse()
+                .map_err(|error| format!("--port {given}: {error}"))?,
+            None => DEFAULT_PORT,
+        };
     let bind = crate::value_of(arguments, "--bind").unwrap_or_else(|| "127.0.0.1".to_string());
     let address: SocketAddr = format!("{bind}:{port}")
         .parse()
         .map_err(|error| format!("--bind {bind} --port {port}: {error}"))?;
 
     let mut settings = service::Config {
-        route: crate::value_of(arguments, "--route").unwrap_or_else(|| "/api/reports".to_string()),
+        route: crate::value_of(arguments, "--route").unwrap_or_else(|| "/report".to_string()),
         token: read_token(data_dir)?,
         ..service::Config::default()
     };
@@ -150,13 +153,10 @@ fn mailbox(arguments: &[String], config: &Config) -> Result<Option<Mailbox>, Str
         );
         return Ok(None);
     };
-    let hostname = configured.map_or_else(
-        || "localhost".to_string(),
-        |mail| mail.hostname.clone(),
-    );
+    let hostname = configured.map_or_else(|| "localhost".to_string(), |mail| mail.hostname.clone());
     let domain = to.rsplit('@').next().unwrap_or("localhost").to_string();
-    let from = crate::value_of(arguments, "--mail-from")
-        .unwrap_or_else(|| format!("reports@{domain}"));
+    let from =
+        crate::value_of(arguments, "--mail-from").unwrap_or_else(|| format!("reports@{domain}"));
     let smtp = crate::value_of(arguments, "--smtp").unwrap_or_else(|| "127.0.0.1:25".to_string());
     let (host, port) = match smtp.rsplit_once(':') {
         Some((host, port)) => (
@@ -173,9 +173,9 @@ fn mailbox(arguments: &[String], config: &Config) -> Result<Option<Mailbox>, Str
 fn project(arguments: &[String], store: &Store) -> Result<(), String> {
     match arguments.get(2).map(String::as_str) {
         Some("add") => {
-            let named = arguments
-                .get(3)
-                .ok_or("`reports project add` needs a key, e.g. `selfhost reports project add dx`")?;
+            let named = arguments.get(3).ok_or(
+                "`reports project add` needs a key, e.g. `selfhost reports project add dx`",
+            )?;
             let key = selfhost_reports::report::project_key(named)
                 .map_err(|refusal| refusal.message().to_string())?;
             store.add_project(&key).map_err(|error| error.to_string())?;
@@ -220,7 +220,11 @@ fn list(named: Option<&str>, store: &Store) -> Result<(), String> {
                 entry.title,
                 entry.sightings,
                 entry.last_at,
-                if entry.delivered { "" } else { " · not yet mailed" }
+                if entry.delivered {
+                    ""
+                } else {
+                    " · not yet mailed"
+                }
             );
         }
     }
@@ -258,7 +262,10 @@ fn token(arguments: &[String], data_dir: &Path) -> Result<(), String> {
             .map_err(|error| format!("could not write {}: {error}", path.display()))?;
         restrict(&path);
         println!("{token}");
-        eprintln!("stored in {} — restart the intake to load it", path.display());
+        eprintln!(
+            "stored in {} — restart the intake to load it",
+            path.display()
+        );
         return Ok(());
     }
     println!("{}", read_token(data_dir)?.unwrap_or_default());

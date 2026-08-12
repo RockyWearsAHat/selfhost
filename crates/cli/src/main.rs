@@ -139,7 +139,8 @@ Commands
                              owner, and a subscribed checkout folds the project's
                              open reports into its own reports.dx. `serve` is
                              what the supervised service runs.
-  reports project add <key>  Accept reports about a project, e.g. `dx`
+  reports project add <key>  Hold reports for a service ahead of time, e.g. `dx`
+                             — filing to /report?<service> creates one anyway
   mail hash-password [<password>]
                              Hash a mailbox password for [[mail.mailboxes]] in
                              selfhost.config.toml; reads from stdin if omitted
