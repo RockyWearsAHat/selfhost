@@ -50,18 +50,28 @@
 //!
 //! There is exactly one registration per machine, because there is exactly one
 //! process. Earlier installations registered the proxy and the daemon
-//! separately, and on Windows added a further task for LAN DNS; that is now a
-//! subsystem inside the one process. Both [`plan`] and [`uninstall_plan`]
-//! remove the stale registrations by name — on *install* too, not only on
-//! removal, because an upgraded box that kept them would run a second proxy
-//! racing this one for `:443`.
+//! separately; that duplication is what [`plan`] and [`uninstall_plan`] remove
+//! by name — on *install* too, not only on removal, because an upgraded box
+//! that kept both would run a second proxy racing this one for `:443`.
 //!
-//! The Secure-VPN bridge's `selfhost-vpn` task is deliberately **not** in that
-//! list. It runs `scripts/securevpn/server.py`, not this binary — the VPN is a
-//! documented trust-anchor exception (`docs/VPN.md`) that stays its own
-//! process rather than being reimplemented here, so it is never superseded and
-//! must never be torn down as a side effect of installing or removing the
-//! daemon's own registration.
+//! Two Windows tasks are deliberately **not** in that list, because neither is
+//! actually superseded by the daemon:
+//!
+//! - `selfhost-vpn` runs `scripts/securevpn/server.py`, not this binary — the
+//!   VPN is a documented trust-anchor exception (`docs/VPN.md`) that stays its
+//!   own process rather than being reimplemented here.
+//! - `selfhost-lan-dns` runs `selfhost lan-dns --lan-ip <ip>`, which serves DNS
+//!   with **zero `[dns]` configuration** by synthesising a zone per registrable
+//!   domain already claimed elsewhere in the config
+//!   (`crate::lan_dns::with_synthesised_zones`). The daemon's own DNS path does
+//!   not do this — it only serves a zone that `[dns].zone` names explicitly —
+//!   so a box with no `[dns]` section that loses this task loses DNS
+//!   entirely, for the LAN and for the public zone alike. Folding LAN DNS into
+//!   the daemon is real future work, not something this list may pretend has
+//!   already happened.
+//!
+//! Neither is touched by install or uninstall, so tearing either down as a
+//! side effect of registering the daemon is a regression, not a cleanup.
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -75,15 +85,15 @@ const TASK_NAME: &str = "selfhost-daemon";
 
 /// Scheduled tasks earlier versions installed, now folded into [`TASK_NAME`].
 ///
-/// Removed on both install and uninstall. An upgraded box that kept these would
-/// start a second proxy racing the unified process for :443, and a second
-/// nameserver racing it for :53 — the exact half-running state the merge into
-/// one process exists to make impossible. Removal tolerates absence, so this is
-/// a no-op on a machine that never had them.
+/// Removed on both install and uninstall. An upgraded box that kept `selfhost`
+/// registered would start a second proxy racing the unified process for
+/// `:443` — the exact half-running state the merge into one process exists to
+/// make impossible. Removal tolerates absence, so this is a no-op on a machine
+/// that never had it.
 ///
-/// Deliberately excludes `selfhost-vpn` — see the module docs above for why
-/// that one is not superseded at all.
-const SUPERSEDED_TASK_NAMES: &[&str] = &["selfhost", "selfhost-lan-dns"];
+/// Deliberately excludes `selfhost-vpn` and `selfhost-lan-dns` — see the
+/// module docs above for why neither is actually superseded.
+const SUPERSEDED_TASK_NAMES: &[&str] = &["selfhost"];
 
 /// The launchd label an earlier version registered the proxy under, separately
 /// from the daemon. Removed for the reason [`SUPERSEDED_TASK_NAMES`] gives.
@@ -782,20 +792,24 @@ mod tests {
             assert_ne!(*name, TASK_NAME, "a superseded name must not be the live one");
         }
         assert!(SUPERSEDED_TASK_NAMES.contains(&"selfhost"), "the old proxy task");
-        assert!(SUPERSEDED_TASK_NAMES.contains(&"selfhost-lan-dns"), "the old LAN DNS task");
     }
 
-    /// `selfhost-vpn` runs `scripts/securevpn/server.py` — a different program
-    /// entirely, never folded into this binary (`docs/VPN.md`). If this ever
-    /// starts asserting `true`, installing or uninstalling the daemon would
-    /// tear down the Secure-VPN bridge the admin console's only reachable
-    /// route depends on.
+    /// `selfhost-vpn` runs `scripts/securevpn/server.py`, and `selfhost-lan-dns`
+    /// runs `selfhost lan-dns --lan-ip <ip>` — the only thing that serves DNS
+    /// with no `[dns]` section written (`crate::lan_dns::with_synthesised_zones`).
+    /// Neither is folded into the daemon. If either of these ever starts
+    /// asserting `true`, installing or uninstalling the daemon would tear one
+    /// of them down: the VPN bridge the admin console's only reachable route
+    /// depends on, or the only thing serving DNS at all on a box with no
+    /// `[dns]` section.
     #[test]
-    fn installing_never_touches_the_separate_vpn_task() {
-        assert!(
-            !SUPERSEDED_TASK_NAMES.contains(&"selfhost-vpn"),
-            "selfhost-vpn is not this process and must survive install/uninstall"
-        );
+    fn installing_never_touches_the_separate_vpn_or_lan_dns_tasks() {
+        for name in ["selfhost-vpn", "selfhost-lan-dns"] {
+            assert!(
+                !SUPERSEDED_TASK_NAMES.contains(&name),
+                "{name} is not this process and must survive install/uninstall"
+            );
+        }
     }
 
     #[test]
