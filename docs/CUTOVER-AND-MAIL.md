@@ -103,6 +103,22 @@ curl -s https://ua-auto-config.<domain>/.well-known/user-agent-configuration.jso
 dig +short TXT _ua-auto-config.<domain>
 ```
 
+The digest matching is not the whole check: the document is fetched over HTTPS
+or not at all, so the PACC host also needs a certificate that names it. Confirm
+the issuer is Let's Encrypt and not the `rcgen` self-signed fallback:
+
+```bash
+echo | openssl s_client -connect <box>:443 -servername ua-auto-config.<domain> \
+  2>/dev/null | openssl x509 -noout -subject -issuer
+```
+
+`ua-auto-config.` joins the existing mail certificate's SAN set rather than
+taking one of its own, and `crates/cli/src/acme_task.rs` reissues an order whose
+name set has grown — a certificate is not left uncovering a host it should name
+just because it is young. Verified on 2026-08-11: document, digest, and `A`
+record all correct; the certificate was still the self-signed fallback because
+the old marker recorded no names, which is the gap that check now closes.
+
 Namecheap's API cannot write SRV records (the sync says so per domain), but the
 PACC `TXT` and `A` records are ordinary records it writes without complaint.
 

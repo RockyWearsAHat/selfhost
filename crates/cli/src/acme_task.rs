@@ -10,8 +10,9 @@
 //! only five duplicate certificates per week; a crash-loop or a domain that does
 //! not yet resolve here would exhaust that in minutes. Two things keep that from
 //! happening: the environment defaults to staging in the config, and a freshly
-//! issued certificate is stamped with its issue time (`<host>.issued`) so a real
-//! certificate is never re-requested until it is genuinely near expiry.
+//! issued certificate is stamped with its issue time and the names it covers
+//! (`<host>.issued`) so a real certificate is never re-requested until it is
+//! genuinely near expiry — or until the order asks for a name it does not hold.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -187,7 +188,8 @@ async fn issue_order(
         store.install(domain, &issued.chain_pem, &issued.key_pem).map_err(|e| e.to_string())?;
         resolver.refresh(store, domain).map_err(|e| format!("installed but resolver not refreshed: {e}"))?;
     }
-    stamp_issued(store, host).map_err(|e| format!("installed but could not record issue time: {e}"))?;
+    stamp_issued(store, host, &order.domains)
+        .map_err(|e| format!("installed but could not record issue time: {e}"))?;
 
     log(format!("{host}: certificate installed and live ({} domain(s))", order.domains.len()));
     Ok(())
@@ -196,13 +198,25 @@ async fn issue_order(
 /// Whether an order should be (re)issued this sweep.
 ///
 /// True when there is no pair at all, when the only pair is the self-signed
-/// fallback (no issue-time marker), or when a real certificate has passed the
-/// renewal threshold — all judged on the order's canonical host, whose stamp
-/// dates the whole SAN set. A fresh ACME certificate returns false, which is
-/// the guard that keeps a restart from re-requesting inside the rate limit.
+/// fallback (no issue-time marker), when the certificate on disk does not cover
+/// every name the order now asks for, or when a real certificate has passed the
+/// renewal threshold — all judged on the order's canonical host, whose marker
+/// dates and names the whole SAN set. A fresh ACME certificate covering the
+/// current name set returns false, which is the guard that keeps a restart from
+/// re-requesting inside the rate limit.
+///
+/// The coverage test is what makes a *widened* order take effect. Age alone
+/// cannot see it: adding a host to a set that already holds a young certificate
+/// (as `ua-auto-config.<domain>` was added to the mail order) would otherwise
+/// leave the new name on the self-signed fallback for the certificate's whole
+/// 60-day renewal window, and a PACC document served under a certificate no
+/// client trusts is a document no client reads.
 fn needs_certificate(store: &CertificateStore, order: &CertOrder) -> bool {
     let host = &order.canonical;
     if !store.has_pair(host) {
+        return true;
+    }
+    if !covers(&covered_domains(store, host), &order.domains) {
         return true;
     }
     match certificate_age(store, host) {
@@ -211,13 +225,30 @@ fn needs_certificate(store: &CertificateStore, order: &CertOrder) -> bool {
     }
 }
 
-/// Records the current time as a host certificate's issue time.
+/// Whether a marker's recorded name set accounts for every name in `wanted`.
+///
+/// A marker written before the set was recorded (`None`) proves nothing about
+/// coverage, so it does not count as covering anything: that order is reissued
+/// once, and the marker it writes carries its names from then on.
+fn covers(recorded: &Option<Vec<String>>, wanted: &[String]) -> bool {
+    let Some(recorded) = recorded else { return false };
+    wanted.iter().all(|name| recorded.iter().any(|had| had.eq_ignore_ascii_case(name)))
+}
+
+/// Records the current time and the covered names as a host certificate's
+/// issue marker: the issue time on the first line, one SAN per line after it.
 ///
 /// The marker distinguishes a real ACME certificate from the self-signed
-/// fallback and dates it for renewal, without parsing the certificate itself.
-fn stamp_issued(store: &CertificateStore, host: &str) -> std::io::Result<()> {
+/// fallback, dates it for renewal, and says which names it speaks for — all
+/// without parsing the certificate itself.
+fn stamp_issued(store: &CertificateStore, host: &str, domains: &[String]) -> std::io::Result<()> {
     let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
-    std::fs::write(issued_marker_path(store, host), now.to_string())
+    let mut marker = now.to_string();
+    for domain in domains {
+        marker.push('\n');
+        marker.push_str(domain);
+    }
+    std::fs::write(issued_marker_path(store, host), marker)
 }
 
 /// Age of a host's certificate from its issue-time marker.
@@ -226,9 +257,22 @@ fn stamp_issued(store: &CertificateStore, host: &str) -> std::io::Result<()> {
 /// all, or only the self-signed fallback, which is stamped with no marker.
 pub fn certificate_age(store: &CertificateStore, host: &str) -> Option<Duration> {
     let raw = std::fs::read_to_string(issued_marker_path(store, host)).ok()?;
-    let issued_secs: u64 = raw.trim().parse().ok()?;
+    let issued_secs: u64 = raw.lines().next()?.trim().parse().ok()?;
     let now = SystemTime::now().duration_since(UNIX_EPOCH).ok()?.as_secs();
     Some(Duration::from_secs(now.saturating_sub(issued_secs)))
+}
+
+/// The names a host's stored certificate was issued for, as recorded by
+/// [`stamp_issued`].
+///
+/// `None` for a certificate with no marker and for a marker that records only
+/// an issue time — the format before the names were written down — because
+/// neither can answer the question.
+fn covered_domains(store: &CertificateStore, host: &str) -> Option<Vec<String>> {
+    let raw = std::fs::read_to_string(issued_marker_path(store, host)).ok()?;
+    let names: Vec<String> =
+        raw.lines().skip(1).map(str::trim).filter(|line| !line.is_empty()).map(str::to_owned).collect();
+    (!names.is_empty()).then_some(names)
 }
 
 /// Days until a host's certificate expires, or `None` if it is not a real
@@ -347,6 +391,63 @@ mod tests {
         assert_eq!(orders.len(), 1);
         assert_eq!(orders[0].canonical, "example.com");
         assert_eq!(orders[0].domains, vec!["example.com", "www.example.com"]);
+    }
+
+    /// A store in a fresh temporary directory, with a certificate pair already
+    /// on disk for `host` — enough for the marker rules under test, which never
+    /// read the certificate's own bytes.
+    fn store_holding(label: &str, host: &str) -> CertificateStore {
+        let dir = std::env::temp_dir().join(format!("selfhost-acme-{label}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = CertificateStore::open(&dir).expect("a certificate store");
+        std::fs::write(store.certificate_path(host), "chain").expect("a chain on disk");
+        std::fs::write(store.key_path(host), "key").expect("a key on disk");
+        store
+    }
+
+    fn order(domains: &[&str]) -> CertOrder {
+        let domains: Vec<String> = domains.iter().map(|d| (*d).to_owned()).collect();
+        CertOrder { canonical: domains[0].clone(), domains }
+    }
+
+    #[test]
+    fn a_fresh_certificate_covering_every_name_is_left_alone() {
+        // The rate-limit guard: a sweep that re-requests what it already holds
+        // burns the CA's five-per-week allowance on nothing.
+        let wanted = order(&["mail.example.com", "ua-auto-config.example.com"]);
+        let store = store_holding("fresh", &wanted.canonical);
+        stamp_issued(&store, &wanted.canonical, &wanted.domains).expect("a marker");
+
+        assert!(!needs_certificate(&store, &wanted));
+    }
+
+    #[test]
+    fn a_name_added_to_an_order_reissues_a_certificate_that_does_not_name_it() {
+        // How `ua-auto-config.<domain>` reaches a real certificate: the mail
+        // order widened while its certificate was young, and age alone would
+        // have left the new host on the self-signed fallback for 60 days.
+        let held = order(&["mail.example.com", "imap.example.com"]);
+        let store = store_holding("widened", &held.canonical);
+        stamp_issued(&store, &held.canonical, &held.domains).expect("a marker");
+
+        let widened = order(&["mail.example.com", "imap.example.com", "ua-auto-config.example.com"]);
+        assert!(needs_certificate(&store, &widened));
+    }
+
+    #[test]
+    fn a_marker_that_records_no_names_cannot_prove_coverage_and_reissues_once() {
+        // The pre-existing marker format was a bare issue time. It says nothing
+        // about SANs, so the order is reissued once and stamped with its names.
+        let wanted = order(&["mail.example.com", "ua-auto-config.example.com"]);
+        let store = store_holding("legacy", &wanted.canonical);
+        std::fs::write(issued_marker_path(&store, &wanted.canonical), "1754000000")
+            .expect("a legacy marker");
+
+        assert!(certificate_age(&store, &wanted.canonical).is_some(), "the issue time still parses");
+        assert!(needs_certificate(&store, &wanted));
+
+        stamp_issued(&store, &wanted.canonical, &wanted.domains).expect("a marker");
+        assert!(!needs_certificate(&store, &wanted), "the rewritten marker settles it");
     }
 
     #[test]
