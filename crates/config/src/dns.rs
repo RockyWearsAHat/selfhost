@@ -364,8 +364,9 @@ fn name_problem(name: &str) -> Option<String> {
 /// This is the set of *zones* the deployment implies — `www.example.com` and
 /// `example.com` are one zone, not two. It feeds both sides of the DNS story
 /// from one definition: the authoritative server derives a zone per entry, and
-/// `selfhost dns sync` reconciles the same entries at a registrar, so the two
-/// can never disagree about which domains the deployment owns. Names without a
+/// every other reader of "which domains does this deployment own" — the
+/// certificate client, the mail server, the reachability probes — asks the same
+/// function, so none of them can disagree. Names without a
 /// dot (`localhost`) belong to no registry and are skipped. Grouping is by the
 /// vendored Public Suffix List ([`crate::psl::registrable`]), so `example.co.uk`
 /// and `waves.surf` both land on their real registered apex.

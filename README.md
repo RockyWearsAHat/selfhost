@@ -124,7 +124,7 @@ crates/
             the two loopback relays (/api/* and /dav).
   mail/     Addresses and the SMTP session state machine.
   dns/      DNS wire format, stub resolver, authoritative zones.
-  acme/     RFC 8555 certificate issuance. igd/ registrar/ app-deploy/ alongside.
+  acme/     RFC 8555 certificate issuance. igd/ app-deploy/ alongside.
   supervisor/ Runs services and keeps them running. firewall/ reconciles rules.
   storage/  Shares: the confining resolver, WebDAV, quotas, and the OS's own
             SMB server driven as a program.

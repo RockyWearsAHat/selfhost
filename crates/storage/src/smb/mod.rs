@@ -474,7 +474,7 @@ pub struct SyncReport {
 /// every call site remembering a step — which is the class of guarantee this
 /// project puts in a function rather than in a comment.
 ///
-/// Dry run is the default, matching `selfhost dns sync`: pass [`Apply::Write`]
+/// Dry run is the default, matching every other plan-then-apply command here: pass [`Apply::Write`]
 /// only when the operator has seen the plan and asked for it. A dry run writes
 /// nothing at all — not the host, and not the ledger.
 ///

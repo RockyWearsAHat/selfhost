@@ -1,7 +1,8 @@
 # DNS cutover, port 25, and mail — operational notes
 
-Snapshot: 2026-08-08. Box public IP **172.83.6.109** (dynamic — a DDNS updater
-keeps records current; see `crates/dns`). Box LAN IP 192.168.1.8.
+Snapshot: 2026-08-08. Box public IP **172.83.6.109** (dynamic — `dynamic_ip` in
+`[dns]` keeps the apex `A` current in the zone this box serves; see
+`crates/dns/src/updater.rs`). Box LAN IP 192.168.1.8.
 
 ## Moving a site from its temporary/old IP to the real IP
 
@@ -30,56 +31,38 @@ Do this per site, and only after confirming the box serves it (it does today):
 | lvlup | leveluplongboarding.surf | Namecheap (`registrar-servers.com`) | Netlify (75.2.60.5, 99.83.231.61) | In Namecheap → Advanced DNS: set `@` and `www` A records to `172.83.6.109`; delete the Netlify CNAME/ALIAS. |
 | mayr | mayrconsultingservices.com | **NS1 / nsone.net** (not Namecheap) | Netlify (52.52.192.191, 13.52.188.95) | DNS is managed at **NS1** (likely via Netlify DNS). Change the A records **where those nameservers are administered** — probably the Netlify dashboard for this domain — to `172.83.6.109`. If you'd rather manage it at Namecheap, repoint the domain's nameservers to Namecheap first, then set the A records. |
 
-Namecheap DDNS can keep these current automatically once pointed at the box —
-add a `[[namecheap_ddns]]` block per record (see `crates/config` docs) with the
-per-domain Dynamic-DNS password from Namecheap's Advanced DNS tab. NS1-managed
-`mayr` won't use Namecheap DDNS; if the public IP changes, its A record must be
-updated at NS1/Netlify (or move it to Namecheap to get automatic DDNS).
+## The end state: this box is the nameserver
 
-## Pushing the records automatically — `selfhost dns sync`
+The per-record edits above are the *interim* answer — what to type while a
+domain's DNS still lives in somebody else's panel. The end state is that no
+panel is involved at all: each domain's **`NS` delegation points at this box**,
+and this box answers every record for it authoritatively.
 
-Everything the tables above say to type into a DNS panel can be pushed over the
-registrar's API instead. Add a `[registrar]` section to `selfhost.config.toml`
-(secrets live only in that local, gitignored file — never anywhere committed),
-then run the sync:
+There is deliberately no registrar-API integration here, and no dynamic-DNS
+client pointed at a third party. Both were removed: they are a second copy of
+the zone that can silently disagree with the served one, and they need
+credentials for an account this deployment should not hold. One nameserver, one
+zone, one source of truth — `[dns]` in `selfhost.config.toml`.
 
-```bash
-selfhost dns sync            # dry-run: prints the plan per domain, writes nothing
-selfhost dns sync --apply    # writes the plan
-```
+**Cutting a domain over to this box:**
 
-For every registered domain the config serves (site domains and mail domains,
-grouped — `www.example.com` and `example.com` are one zone), the command derives
-the records the config implies (site A records, and the full mail set: MX, SPF,
-DMARC, DKIM once the key exists, CAA, client-setup A records, RFC 6186 SRVs,
-and the `_ua-auto-config` PACC digest — see below),
-lists what the registrar currently serves, and prints the diff. Records point at
-the box's discovered public IP, falling back to the config's `[dns]` apex A if
-discovery fails. **Dry-run is the default; only `--apply` writes.**
+1. Confirm the box already serves the zone: `selfhost dns` prints every zone and
+   its derived records, and probes whether port 53 is answering.
+2. Confirm the world can reach port 53 — the router/edge must forward **UDP and
+   TCP** 53 here. `selfhost outside` proves this with a real off-network query
+   (see below); `selfhost doctor` reports the edge.
+3. At the registrar — the company that sold the domain, which is the one thing
+   that stays external because it is what the TLD's registry reads — set the
+   domain's nameservers to this box's.
+4. Watch: `dig +short NS <domain> @1.1.1.1`, then `dig +short A <domain>
+   @<this box>`.
 
-**The safety law:** a record whose `(host, type)` the config does not claim is
-never deleted or modified — your own TXT verifications and elsewhere-pointing
-CNAMEs survive every sync verbatim, on every provider.
-
-One-time setup per provider (`selfhost check` names anything missing):
-
-| Provider | Config | Where the credential lives |
-|----------|--------|----------------------------|
-| `namecheap` | `api_user`, `api_key`, `client_ip` | Profile → Tools → API Access. **Eligibility gate:** Namecheap only enables the API for accounts with 20+ domains, or $50+ account balance, or $50+ spent in the last two years. **IP whitelist:** the API rejects calls from any address not whitelisted there — `client_ip` is that address (the box's public IP). The API also cannot write SRV records; the sync says so and prints them for the Advanced DNS panel. |
-| `cloudflare` | `api_key` | dash.cloudflare.com → My Profile → API Tokens: a token scoped to Zone:Read + DNS:Edit for the zones. |
-| `godaddy` | `api_key`, `api_secret` | developer.godaddy.com → API Keys: a **production** key pair. |
-| `porkbun` | `api_key`, `api_secret` | porkbun.com → Account → API Access, and enable API access per domain in its details panel. |
-| `manual` | *(nothing)* | No API at all — the sync prints every record in copy-pasteable panel form (type, host, value, TTL) for you to add by hand. This is the answer for every registrar without an API: Squarespace, NS1-managed `mayr`, and friends. |
-
-Example, for this deployment's Namecheap domains:
-
-```toml
-[registrar]
-provider = "namecheap"
-api_user = "<account name>"
-api_key = "<from the API Access page>"
-client_ip = "172.83.6.109"
-```
+Once delegated, every record in the tables above is derived from the config and
+served automatically: site `A` records, and the full mail set (MX, SPF, DMARC,
+DKIM once the key exists, CAA, client-setup `A` records, RFC 6186 SRVs, and the
+`_ua-auto-config` PACC digest — see below). Nothing is typed twice, so nothing
+can drift. A changing public IP is followed by `dynamic_ip` in `[dns]`, which
+rewrites the apex `A` in the zone this box already serves.
 
 ## Account setup without typing server names — what is published, and what works today
 
@@ -93,7 +76,7 @@ them. Nothing here needs a per-client profile, and none of it costs a port.
 | **PACC** (`draft-ietf-mailmaint-pacc`) | `A` + certificate for `ua-auto-config.<domain>`, the document served at `https://ua-auto-config.<domain>/.well-known/user-agent-configuration.json`, and a `_ua-auto-config` `TXT` carrying `v=UAAC1; a=sha256; d=<base64 SHA-256 of the document>` | Nothing shipping yet — Apple co-authors the draft and was implementing a client in July 2026. Published now because it is inert to clients that have never heard of it and is the only specified path that ends with an address and a password being enough. |
 
 The document, the digest, and the hostname all come from one derivation
-(`crates/config/src/pacc.rs`), so a `selfhost dns sync` after any config change
+(`crates/config/src/pacc.rs`), so the served zone after any config change
 republishes a digest that matches the bytes the proxy serves. Check them against
 each other any time:
 
@@ -121,9 +104,6 @@ document, digest, and `A` record all correct, and the host still served the
 and nothing compared its names to the order's. Resolved the same night — all six
 orders reissued, the mail certificate now naming
 `mail`/`imap`/`smtp`/`ua-auto-config` and valid to 2026-11-10.
-
-Namecheap's API cannot write SRV records (the sync says so per domain), but the
-PACC `TXT` and `A` records are ordinary records it writes without complaint.
 
 ## Port 25 (outbound) — rechecked, still blocked
 

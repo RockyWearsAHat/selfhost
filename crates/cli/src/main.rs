@@ -12,7 +12,6 @@ mod desk_local;
 mod desk_supervisor;
 mod desk_task;
 mod dns_status;
-mod dns_sync;
 mod doctor;
 mod identify;
 mod kill_switch;
@@ -81,14 +80,6 @@ Commands
                              asking for a residential proxy service
   dns                        Show the zone this machine serves and whether it
                              is answering on port 53
-  dns sync [--apply]         Reconcile every served domain's records at the
-                             registrar in [registrar]: derive what the config
-                             implies, list what the registrar serves, and print
-                             the plan. Dry-run by default; only --apply writes.
-                             Records point at this machine's discovered public
-                             IP (falling back to the config's [dns] apex A when
-                             discovery fails). provider = \"manual\" prints the
-                             records to add by hand instead
   serve-dns [--bind <addr>]  Serve authoritative DNS for the configured zones in
                              the foreground (the daemon serves them too)
   lan-dns --lan-ip <ip> [--bind <addr>]
@@ -666,13 +657,6 @@ async fn serve_daemon(
         println!("  reachability the router/edge must forward UDP+TCP 53 here (selfhost does not touch it)");
     }
 
-    if !config.namecheap_ddns.is_empty() {
-        println!("\nnamecheap dynamic dns");
-        for entry in &config.namecheap_ddns {
-            println!("  {}.{}", entry.host, entry.domain);
-        }
-    }
-
     // Console auth is read once here: a `selfhost console-password` run takes
     // effect at the next daemon restart.
     let mut api = Api::new(supervisor.clone(), store, token, watches.clone(), firewall.clone())
@@ -777,9 +761,6 @@ async fn serve_daemon(
         // Tracks the WAN IP and rewrites the apex A when it moves. Pends forever
         // when DNS or dynamic_ip is off, so it occupies an arm without firing.
         _ = track_wan_ip_if_enabled(dns.clone(), &config) => Ok(()),
-        // The same tracking, aimed at Namecheap's Dynamic DNS instead of this
-        // daemon's own authority. Pends forever when `namecheap_ddns` is empty.
-        _ = track_namecheap_ddns_if_configured(&config) => Ok(()),
         // Watches for the operator's `desktop.disabled` marker so an engaged
         // kill switch reaches every running stream without anything else having
         // to be working. Pends forever when there is no desktop subsystem, so
@@ -976,35 +957,6 @@ async fn track_wan_ip_if_enabled(dns: Option<Authority>, config: &Config) {
     .await;
 }
 
-/// Tracks the WAN IP and keeps every `[[namecheap_ddns]]` entry pointed at it,
-/// or pends forever.
-///
-/// Independent of `[dns]` entirely — a deployment can use Namecheap's own
-/// Dynamic DNS with no authoritative zone of its own, which is the smaller
-/// commitment [`selfhost_config::NamecheapDdns`]'s own doc comment recommends
-/// starting with. Building [`selfhost_dns::NamecheapClient`] can fail (no TLS
-/// roots, in practice never on a real build); that failure is logged once and
-/// this arm then pends forever rather than taking the whole daemon down for a
-/// feature that is, unlike DNS itself, never the only way a domain resolves.
-async fn track_namecheap_ddns_if_configured(config: &Config) {
-    if config.namecheap_ddns.is_empty() {
-        return std::future::pending().await;
-    }
-    let writer = match selfhost_dns::NamecheapClient::new() {
-        Ok(client) => client,
-        Err(reason) => {
-            eprintln!("namecheap-ddns: could not start ({reason}); this daemon's WAN IP will not be tracked for it");
-            return std::future::pending().await;
-        }
-    };
-    selfhost_dns::track_namecheap_ddns(
-        writer,
-        config.namecheap_ddns.clone(),
-        selfhost_dns::updater::DEFAULT_INTERVAL,
-    )
-    .await;
-}
-
 /// Turns a DNS bind failure into a message that says what to do about it.
 ///
 /// Port 53 is privileged and commonly already held by a stub resolver, so the
@@ -1033,15 +985,16 @@ fn dns_bind_error(bind: SocketAddr, error: DnsError) -> String {
     }
 }
 
-/// Dispatches `dns`'s subcommands: bare `dns` shows the served zone,
-/// `dns sync` reconciles the registrar-hosted records.
+/// Dispatches `dns`'s subcommands. Only the bare form remains: this machine is
+/// authoritative for every name it serves, so there is no third party holding a
+/// copy of the zone to reconcile against.
 fn dns_command(arguments: &[String]) -> Result<(), String> {
     match arguments.get(1).map(String::as_str) {
         None => dns_show_command(),
-        Some("sync") => dns_sync_command(arguments),
         Some(other) => Err(format!(
-            "unknown dns subcommand \"{other}\" — use bare `dns` to show the served zone, \
-             or `dns sync [--apply]` to reconcile the registrar\n\n{USAGE}"
+            "unknown dns subcommand \"{other}\" — use bare `dns` to show the served zone. \
+             This deployment is its own nameserver; there is no registrar to sync \
+             to\n\n{USAGE}"
         )),
     }
 }
@@ -1060,22 +1013,6 @@ fn dns_show_command() -> Result<(), String> {
         .map_err(|e| format!("could not start the async runtime: {e}"))?;
 
     runtime.block_on(dns_status::show(&config))
-}
-
-/// Reconciles every served domain's records at the configured registrar.
-///
-/// Dry-run unless `--apply` is passed — see [`dns_sync`] for the whole
-/// contract, including the safety law the engine enforces.
-fn dns_sync_command(arguments: &[String]) -> Result<(), String> {
-    let (config, project_dir) = load()?;
-    let apply = arguments.iter().any(|argument| argument == "--apply");
-
-    let runtime = tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()
-        .map_err(|e| format!("could not start the async runtime: {e}"))?;
-
-    runtime.block_on(dns_sync::run(&config, &project_dir, apply))
 }
 
 /// Serves authoritative DNS in the foreground, without the rest of the daemon.

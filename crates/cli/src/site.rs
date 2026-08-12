@@ -324,14 +324,6 @@ fn print_dns_next_step(config_path: &Path, hostname: &str) {
     let Ok(config) = load(config_path) else {
         return;
     };
-    // The registrar is named first because it is the one that reaches the public
-    // internet: a box that is authoritative for its own zone still needs the
-    // delegation to be true at the registrar.
-    if config.registrar.is_some() {
-        println!("  DNS: run `selfhost dns sync` to see the record for {hostname}, then");
-        println!("       `selfhost dns sync --apply` to push it");
-        return;
-    }
     let serves_zone = config
         .dns
         .as_ref()
@@ -341,8 +333,8 @@ fn print_dns_next_step(config_path: &Path, hostname: &str) {
         println!("       record for {hostname}; a zone with explicit records needs one adding");
         return;
     }
-    println!("  DNS: no [registrar] and no zone here covers {hostname} — add the record");
-    println!("       wherever this domain's DNS is hosted, pointing at this box");
+    println!("  DNS: no zone in [dns] covers {hostname} — add one, and make sure the");
+    println!("       domain's delegation points its NS at this box");
 }
 
 /// Reads the two positional arguments a domain command takes.

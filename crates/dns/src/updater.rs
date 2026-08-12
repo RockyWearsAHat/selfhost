@@ -229,9 +229,6 @@ pub async fn track_wan_ip(authority: impl ApexWriter, zones: Vec<String>, interv
 /// Logs `reason` only if it differs from the last complaint, so a persistent
 /// fault is one line rather than one per tick.
 ///
-/// `pub(crate)`: [`crate::namecheap`]'s tracking loop follows the same
-/// once-per-change-of-reason logging rule, one instance per configured entry
-/// rather than one for the whole daemon.
 pub(crate) fn complain(last: &mut Option<String>, reason: String) {
     if last.as_deref() != Some(reason.as_str()) {
         eprintln!("dynamic-ip: {reason}");

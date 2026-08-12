@@ -124,7 +124,7 @@ pub struct Server {
     ///
     /// Behind the same lock as `routes` and rebuilt by the same reload, because
     /// it is derived from the same config: a mail domain added by a reload must
-    /// start answering with the document whose digest the next `dns sync`
+    /// start answering with the document whose digest the served zone
     /// publishes, not at the next restart.
     pacc: RwLock<BTreeMap<String, Arc<String>>>,
     /// Where the loopback admin API listens, if `admin_bind` parses.
@@ -176,7 +176,7 @@ impl Server {
     /// by the host it is fetched from.
     ///
     /// Derived from the config by [`selfhost_config::pacc::document`] — the same
-    /// function `selfhost dns sync` hashes for the `_ua-auto-config` record — so
+    /// function the authoritative zone hashes for the `_ua-auto-config` record — so
     /// the bytes served here and the digest that vouches for them come from one
     /// generator and cannot drift apart.
     fn pacc_documents(config: &Config) -> BTreeMap<String, Arc<String>> {
@@ -1777,8 +1777,6 @@ mod tests {
             sites,
             dns: None,
             mail: None,
-            namecheap_ddns: vec![],
-            registrar: None,
             self_update: None,
             shares: vec![],
             desktop: None,

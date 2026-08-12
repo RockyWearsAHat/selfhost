@@ -26,7 +26,7 @@
 //! # Dry-run by default
 //!
 //! `sync` prints its plan and writes nothing unless `--apply` is passed, which
-//! is the convention `dns sync` set. A copy that silently overwrote a file
+//! is the convention every plan-then-apply command here follows. A copy that silently overwrote a file
 //! because the operator got an argument order wrong is exactly the mistake this
 //! costs one word to prevent.
 

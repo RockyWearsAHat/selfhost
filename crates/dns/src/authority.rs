@@ -334,8 +334,9 @@ impl Authority {
     /// always sees the change.
     ///
     /// Returns the new serial, or `None` when no served zone is authoritative for
-    /// `name`. That `None` is the signal a caller uses to decide the record must
-    /// be created at an external registrar instead. This generalises
+    /// `name`. That `None` is the signal a caller uses to report that this
+    /// deployment does not own the name, so no record can be written for it
+    /// here. This generalises
     /// [`set_apex_a`](Self::set_apex_a) to any owner name and record type — a
     /// freshly-provisioned subdomain's A record is the motivating case.
     pub async fn upsert_record(&self, name: &str, data: RecordData) -> Option<u32> {
@@ -381,7 +382,7 @@ impl Authority {
     /// A read-only companion to [`upsert_record`](Self::upsert_record): it tells a
     /// caller whether this machine's DNS owns a name *without* mutating anything,
     /// which is what a diagnostic (`doctor`) needs to say "served here" versus
-    /// "set this at your registrar".
+    /// "no zone here covers this name".
     pub async fn zone_for(&self, name: &str) -> Option<String> {
         let owner = normalize_name(name);
         let zones = self.0.zones.lock().await;
@@ -421,9 +422,8 @@ impl Authority {
 ///   `imap.<origin>`, `_submission._tcp` → port 587 at `smtp.<origin>`
 ///   (RFC 6186 `STARTTLS` discovery), and `_submissions._tcp` → port 465 at
 ///   `smtp.<origin>` (RFC 8314 implicit-TLS discovery, served alongside 587,
-///   never instead of it) — the same records `registrar::desired_records`
-///   derives, so the served zone and a registrar push can never disagree
-///   about client discovery.
+///   never instead of it). This zone is the only place those records exist, so
+///   there is no second copy of them to disagree with about client discovery.
 ///
 /// With no `public_ip` yet, only the SRVs are added: their targets are names,
 /// not addresses, and the updater fills the missing `A`s on its first tick.

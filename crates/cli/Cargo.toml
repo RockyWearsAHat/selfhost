@@ -30,7 +30,6 @@ selfhost-git = { workspace = true }
 selfhost-mail = { workspace = true }
 selfhost-mesh = { workspace = true }
 selfhost-proxy = { workspace = true }
-selfhost-registrar = { workspace = true }
 selfhost-reports = { workspace = true }
 # The system random source, for the one secret this binary mints itself: the
 # report feed's bearer token. The same `ring` rustls already links through

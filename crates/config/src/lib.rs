@@ -19,10 +19,8 @@ pub mod git;
 pub mod home;
 pub mod mail;
 pub mod mesh;
-pub mod namecheap;
 pub mod pacc;
 pub mod psl;
-pub mod registrar;
 pub mod service;
 pub mod storage;
 pub mod validate;
@@ -39,8 +37,6 @@ pub use dns::{Dns, RecordConfig, SoaConfig, ZoneConfig};
 pub use git::{GitWatch, SelfUpdate};
 pub use mail::{DkimConfig, Mail, MailBind, Mailbox, Relay};
 pub use mesh::Mesh;
-pub use namecheap::NamecheapDdns;
-pub use registrar::{Registrar, RegistrarProvider};
 pub use service::{RestartPolicy, ServiceCatalog, ServiceSpec, StartMode};
 pub use storage::{AccessConfig, AccessMode, ShareConfig, SmbConfig};
 pub use validate::{ConfigError, Problem};
@@ -64,16 +60,6 @@ pub struct Config {
     /// Mail, when this machine sends and receives for its domains. Absent → no mail.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mail: Option<Mail>,
-    /// Domains kept pointed at this machine via Namecheap's Dynamic DNS, for
-    /// one whose nameservers stay with Namecheap rather than moving to
-    /// [`Dns`]'s full authority. Empty means none are managed this way.
-    #[serde(default, skip_serializing_if = "Vec::is_empty", rename = "namecheap_ddns")]
-    pub namecheap_ddns: Vec<NamecheapDdns>,
-    /// The registrar hosting the domains' DNS, when `selfhost dns sync` pushes
-    /// records there over its API (or prints them, for `provider = "manual"`).
-    /// Absent → no registrar sync.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub registrar: Option<Registrar>,
     /// Selfhost's own repository, watched so a push updates this deployment
     /// itself — fetch, rebuild, restart. Absent → no self-update.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -599,8 +585,6 @@ mod tests {
             sites: vec![],
             dns: None,
             mail: None,
-            namecheap_ddns: vec![],
-            registrar: None,
             self_update: None,
             shares: vec![],
             desktop: None,
@@ -640,8 +624,6 @@ mod tests {
             }],
             dns: None,
             mail: None,
-            namecheap_ddns: vec![],
-            registrar: None,
             self_update: None,
             shares: vec![],
             desktop: None,

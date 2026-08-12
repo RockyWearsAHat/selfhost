@@ -12,8 +12,8 @@
 //! household's internet gets unplugged before it helps anyone. A peer on the
 //! public internet sees exactly the authoritative answers and is never
 //! forwarded for, so the public face cannot be used as an open resolver — and
-//! once the router forwards UDP+TCP 53 here and the registrar delegates a
-//! domain's `NS` to this box, the same process answers the world.
+//! once the router forwards UDP+TCP 53 here and a domain's `NS` delegation
+//! points at this box, the same process answers the world.
 //!
 //! # Deployment contract — do not rename the flags
 //!
@@ -32,9 +32,9 @@
 //! this box hosts with zero DNS configuration. A config that *did* write
 //! `[dns]` zones is served exactly those.
 
-use crate::dns_sync;
 use selfhost_config::{Config, Dns, RecordConfig, ZoneConfig, psl};
 use selfhost_dns::Resolver;
+use selfhost_mail::Dkim;
 use selfhost_dns::authority::{Authority, LanView};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::Path;
@@ -56,11 +56,11 @@ pub fn build_authority(
 ) -> Authority {
     let mail_records: Vec<(String, Vec<RecordConfig>)> = match &config.mail {
         Some(mail) => {
-            let dkim = dns_sync::dkim_public(config, project_dir);
+            let dkim = dkim_public(config, project_dir);
             mail.domains
                 .iter()
                 .map(|domain| {
-                    let pacc = dns_sync::pacc_digest(config, domain);
+                    let pacc = pacc_digest(config, domain);
                     (domain.clone(), mail.dns_records(domain, dkim.as_deref(), pacc.as_deref()))
                 })
                 .collect()
@@ -68,6 +68,45 @@ pub fn build_authority(
         None => Vec::new(),
     };
     Authority::for_config_with_mail(config, public_ip, &mail_records)
+}
+
+/// The digest of the PACC configuration document `domain` publishes, when
+/// `[mail]` covers that domain.
+///
+/// Pure: the document is derived from the config, not read back from the
+/// running proxy — the proxy derives it from the same config with the same
+/// function, so hashing it here cannot disagree with what is served unless the
+/// config itself changed, which changes both sides together.
+fn pacc_digest(config: &Config, domain: &str) -> Option<String> {
+    let mail = config.mail.as_ref()?;
+    mail.domains
+        .iter()
+        .any(|covered| covered.eq_ignore_ascii_case(domain))
+        .then(|| selfhost_mail::pacc::digest(&selfhost_config::pacc::document(domain)))
+}
+
+/// The DKIM public TXT value, when signing is configured and the key exists.
+///
+/// Read-only on purpose: the mail server generates the key on first start, and
+/// building the zone must not mint one as a side effect of describing it. A
+/// configured-but-absent key is stated and the record omitted, because a
+/// `_domainkey` with no live key behind it invites receivers to distrust our
+/// mail. The record appears at the next authority build once the key exists.
+fn dkim_public(config: &Config, project_dir: &Path) -> Option<String> {
+    let mail = config.mail.as_ref()?;
+    let dkim = mail.dkim.as_ref()?;
+    let key_path = project_dir.join(&config.server.data_dir).join(&dkim.private_key);
+    match Dkim::load(&key_path) {
+        Ok(key) => Some(key.public_txt()),
+        Err(error) => {
+            println!(
+                "note: DKIM key {} is not readable ({error}); the DKIM record is omitted \
+                 from the zone until the mail server has generated it.",
+                key_path.display()
+            );
+            None
+        }
+    }
 }
 
 /// The config as served by `lan-dns`: `[dns]` zones synthesised when absent.
@@ -264,8 +303,6 @@ mod tests {
             sites,
             dns,
             mail: None,
-            namecheap_ddns: vec![],
-            registrar: None,
             self_update: None,
             shares: vec![],
             desktop: None,

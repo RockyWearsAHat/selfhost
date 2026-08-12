@@ -306,10 +306,10 @@ fn name_only(name: &str) -> &str {
 /// grammar demands, and being stricter costs nothing here while removing any
 /// argument about whether a particular byte needed escaping.
 ///
-/// Written locally on purpose: `registrar/src/lib.rs:264` has an encoder but it
-/// is `pub(crate)` in another crate and escapes a different set. When
-/// `crates/http/src/uri.rs` lands with a shared encoder, this function should be
-/// deleted in favour of it — see the crate's follow-ups.
+/// Written locally on purpose: the other percent-encoder in this repository
+/// ([`crate::path::encode_segment`]) escapes a different set for a different
+/// grammar. When `crates/http/src/uri.rs` lands with a shared encoder, this
+/// function should be deleted in favour of it — see the crate's follow-ups.
 fn encode_rfc5987(name: &str) -> String {
     let mut out = String::with_capacity(name.len());
     for byte in name.bytes() {

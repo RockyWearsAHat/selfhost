@@ -499,7 +499,7 @@ impl Reconciliation {
 
 /// Whether a reconcile writes to the host or only reports what it would write.
 ///
-/// Dry run is the default everywhere it is offered, matching `selfhost dns sync`:
+/// Dry run is the default everywhere it is offered, matching every other plan-then-apply command here:
 /// the operator sees the plan, then asks for it. A subsystem that changes the
 /// machine on the strength of being invoked is a subsystem people stop invoking.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]

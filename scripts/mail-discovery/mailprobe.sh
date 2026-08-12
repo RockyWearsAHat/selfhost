@@ -33,15 +33,21 @@ PASS="not-a-real-password"
 HERE="$(cd "$(dirname "$0")" && pwd)"
 WORK="${TMPDIR:-/tmp}/mail-discovery"; mkdir -p "$WORK"
 
+# Everything this run prints is also kept, so the transcript can be read back
+# instead of copied out of a terminal.
+exec > >(tee "$WORK/lastrun.log") 2>&1
+
 echo "== trigger at $(date -u +%H:%M:%SZ) for $ADDR =="
 
 # Sensor 1: every socket Mail or accountsd opens, sampled fast enough to catch
-# a connection opened and dropped inside a second.
+# a connection opened and dropped inside a second. It writes raw and is sorted
+# at collection time: piping into `sort` would make $! the sorter's pid, and
+# killing the sorter leaves the sampler running.
 ( for _ in $(seq 1 160); do
     /usr/sbin/lsof -nP -i -a -c Mail -c accountsd 2>/dev/null \
       | awk 'NR>1 {print $1, $9}'
     sleep 0.25
-  done ) | sort -u > "$WORK/sockets.txt" &
+  done ) > "$WORK/sockets.raw" 2>/dev/null &
 SOCKETS=$!
 
 # Sensor 2: what the account machinery says about itself, protocol lines and all.
@@ -224,7 +230,12 @@ sleep 1
 osascript -e 'tell application "System Events" to tell process "Mail" to click (first button of sheet 1 of window 1 whose title is "Cancel")' 2>/dev/null
 fi
 
-sleep 2; kill $SOCKETS $LOGGER 2>/dev/null; wait 2>/dev/null
+# Stop the sensors. A bare `wait` here would block until the sampler's full
+# forty seconds elapsed — the run looks finished and the shell never returns.
+sleep 2
+pkill -P "$SOCKETS" 2>/dev/null
+kill "$SOCKETS" "$LOGGER" 2>/dev/null
+sort -u "$WORK/sockets.raw" > "$WORK/sockets.txt" 2>/dev/null
 
 echo
 echo "== sockets Mail/accountsd held (existing accounts filtered out) =="

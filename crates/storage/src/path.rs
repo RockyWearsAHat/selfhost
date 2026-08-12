@@ -125,9 +125,9 @@
 //! that is what breadcrumb labels, log lines and the API's `path` field want —
 //! and its documentation says which of the two a reader is holding.
 //!
-//! [`encode_segment`] is the third percent-encoder in this repository
-//! ([`crate::respond`]'s RFC 5987 one, and `registrar/src/lib.rs:264`). All
-//! three should collapse onto `crates/http/src/uri.rs` when the plan's shared
+//! [`encode_segment`] is the second percent-encoder in this repository
+//! ([`crate::respond`] holds the RFC 5987 one). Both
+//! should collapse onto `crates/http/src/uri.rs` when the plan's shared
 //! `uri` module lands; that is the encoder that must exist, and until it does
 //! this one is the storage crate's answer rather than a private convenience.
 
