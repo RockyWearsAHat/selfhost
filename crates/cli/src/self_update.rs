@@ -25,10 +25,13 @@
 //! [`RESTART_EXIT`], nonzero on purpose: launchd restarts any exit, but systemd
 //! and the Scheduled Task only restart a failure.
 //!
-//! The proxy (`selfhost run`) is a second process built from the same binary.
-//! It does not fetch or build — two builders racing over one tree would corrupt
-//! it — it only watches the binary on disk ([`watch_binary_replaced`]) and
-//! exits the same way once the daemon has installed a new one.
+//! There is exactly one process to restart. When the proxy ran separately it
+//! could not build (two builders racing over one tree would corrupt it), so it
+//! watched the binary on disk and exited once the daemon had replaced it —
+//! which meant a window where the two halves of the deployment were running
+//! different code. One process removes the window and the mechanism together:
+//! the process that builds the update is the process that exits, and
+//! everything it was running comes back on the new build with it.
 //!
 //! # Why the running binary is renamed aside before the build
 //!
@@ -62,9 +65,6 @@ use std::time::Duration;
 /// distinctive so a person reading an exit status can tell "installed an
 /// update" from a crash. 75 is BSD's `EX_TEMPFAIL`: try again.
 pub const RESTART_EXIT: i32 = 75;
-
-/// How often [`watch_binary_replaced`] compares the binary on disk.
-const BINARY_POLL_INTERVAL: Duration = Duration::from_secs(30);
 
 /// What one poll of the daemon's own repository concluded.
 enum Progress {
@@ -260,42 +260,6 @@ async fn roll_back(
     report
 }
 
-/// Resolves when the file behind this process's executable has been replaced.
-///
-/// This is how `selfhost run` follows an update the daemon installs: no
-/// fetching, no building — only the observation that a new binary sits where
-/// this process was started from. The caller exits with [`RESTART_EXIT`] and
-/// the service manager starts the new build.
-///
-/// Pends forever when self-update is off, so it can occupy a `select!` arm
-/// unconditionally. A change must hold for two consecutive polls before it
-/// counts, so a binary mid-write (the build lasts minutes; the final link is
-/// not atomic) is not executed half-linked.
-pub async fn watch_binary_replaced(enabled: bool) {
-    if !enabled {
-        return std::future::pending().await;
-    }
-    // Captured once, at startup: after an update renames the running image
-    // aside, the OS may answer `current_exe` with the renamed path, and the
-    // point is to watch the install path.
-    let Ok(exe) = std::env::current_exe() else { return std::future::pending().await };
-    let Some(original) = fingerprint(&exe) else { return std::future::pending().await };
-
-    let mut ticker = tokio::time::interval(BINARY_POLL_INTERVAL);
-    let mut seen_last_tick = None;
-    loop {
-        ticker.tick().await;
-        let now = fingerprint(&exe);
-        if let Some(current) = &now
-            && *current != original
-            && now == seen_last_tick
-        {
-            return;
-        }
-        seen_last_tick = now;
-    }
-}
-
 /// Whether moving the working copy from `local` to what was fetched only adds
 /// commits — `git merge-base --is-ancestor`'s three-way answer, made explicit.
 async fn fast_forwards(project_dir: &Path, local: &str) -> Result<bool, String> {
@@ -307,17 +271,6 @@ async fn fast_forwards(project_dir: &Path, local: &str) -> Result<bool, String> 
         Ok(ran) => Err(ran.complaint()),
         Err(error) => Err(error.to_string()),
     }
-}
-
-/// What identifies one build of the binary on disk, cheaply.
-///
-/// Modification time and length together: a rebuild changes the mtime always
-/// and usually the length, and neither requires reading the file. `None` while
-/// the file is absent — mid-swap, between the rename aside and the build's
-/// final link.
-fn fingerprint(path: &Path) -> Option<(std::time::SystemTime, u64)> {
-    let metadata = std::fs::metadata(path).ok()?;
-    Some((metadata.modified().ok()?, metadata.len()))
 }
 
 /// Where the leftover previous binary goes while its process still runs.
@@ -388,18 +341,6 @@ mod tests {
         let name = aside.file_name().expect("a file name").to_string_lossy().into_owned();
         assert!(name.starts_with("selfhost.exe.old."), "{name}");
         assert!(name.ends_with(&std::process::id().to_string()), "{name}");
-    }
-
-    #[test]
-    fn a_missing_binary_has_no_fingerprint_rather_than_a_default_one() {
-        assert!(fingerprint(Path::new("/nonexistent/selfhost")).is_none());
-    }
-
-    #[tokio::test]
-    async fn a_disabled_watcher_pends_rather_than_resolving() {
-        let watch = watch_binary_replaced(false);
-        let outcome = tokio::time::timeout(Duration::from_millis(50), watch).await;
-        assert!(outcome.is_err(), "disabled must never resolve");
     }
 
     #[tokio::test]

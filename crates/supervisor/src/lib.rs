@@ -35,6 +35,7 @@
 #![warn(missing_docs)]
 
 pub mod child;
+pub mod job;
 pub mod logs;
 pub mod policy;
 pub mod state;

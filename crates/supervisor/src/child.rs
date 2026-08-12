@@ -15,6 +15,37 @@
 //!    program, and it is the *only* rung a Windows database should ever need.
 //! 2. `SIGTERM` on Unix.
 //! 3. Kill, once `stop_timeout_secs` has passed with the process still alive.
+//!
+//! # Owning the tree, not the process
+//!
+//! Every rung above addresses a *tree*, because a service is rarely one
+//! process: `npm start` forks node, a script forks the program that binds the
+//! port. A process group (Unix) or a [`Job`](crate::job) object (Windows) makes
+//! the whole tree addressable as one thing.
+//!
+//! # What happens when the daemon is killed outright
+//!
+//! Stopping children tidily is not the same promise as children being unable to
+//! outlive us, and only the second one holds when the daemon dies without
+//! running any code — `kill -9`, `TerminateProcess`, a power cut. `kill_on_drop`
+//! and the shutdown path both need the daemon to still be alive to run, so
+//! neither covers that case. What does, per platform, and measured rather than
+//! assumed:
+//!
+//! - **Windows — covered.** The job object carries
+//!   `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`, and the kernel closes the handle when
+//!   the process ends however it ends. This is a guarantee, not a teardown path.
+//! - **Linux — covered.** [`die_with_parent`] arms `PR_SET_PDEATHSIG` in the
+//!   child between `fork` and `exec`, so the kernel signals it when its parent
+//!   goes. It reaches the direct child; a grandchild that has been reparented
+//!   away is out of its scope.
+//! - **macOS — not covered.** There is no `PDEATHSIG` and no job object. A
+//!   `kill -9` of the daemon leaves the tree running, verified by experiment,
+//!   and the next start then fails to bind a port that something invisible is
+//!   holding. The deployment target is Windows and macOS is the development
+//!   box, so this is stated rather than worked around: a watchdog process to
+//!   cover it would reintroduce the second process that unifying everything
+//!   into one just removed.
 
 use selfhost_config::ServiceSpec;
 use std::path::Path;
@@ -24,6 +55,7 @@ use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::{Child, Command};
 use tokio::sync::mpsc;
 
+use crate::job::Job;
 use crate::logs::Stream;
 
 /// A line of output read from a running service.
@@ -44,6 +76,13 @@ pub struct Running {
     pub pid: u32,
     /// When it was spawned, for uptime.
     pub started: Instant,
+    /// The job object owning this service's whole process tree, on Windows.
+    ///
+    /// Held here, beside the child, because dropping it is what kills the tree:
+    /// the guarantee is a property of *ownership*, so the value has to live
+    /// exactly as long as the service should. Inert on Unix, where the process
+    /// group set at spawn is the mechanism.
+    pub job: Job,
 }
 
 /// Why a service could not be started.
@@ -107,11 +146,29 @@ pub fn spawn(
     // that points at the wrong thing.
     command.kill_on_drop(true);
     isolate_process_group(&mut command);
+    die_with_parent(&mut command);
+
+    // Created before the spawn so the window between the process existing and
+    // being owned is as short as it can be without suspending it — see
+    // [`Job::adopt`] for why it is not zero.
+    let job = Job::kill_on_drop();
 
     let mut child = command.spawn().map_err(|source| SpawnError::Failed {
         program: spec.program.display().to_string(),
         source,
     })?;
+
+    // A child the job would not take still runs; it is just cleaned up by the
+    // process-group path alone. Said once, per service, rather than silently
+    // downgrading a guarantee the operator was told they had.
+    if job.is_active() && !job.adopt(&child) {
+        eprintln!(
+            "supervisor: {} could not be put in its job object ({}); it will be stopped \
+             directly, so a wrapper's grandchildren may survive",
+            spec.name,
+            std::io::Error::last_os_error()
+        );
+    }
 
     let pid = child.id().unwrap_or(0);
     let started = Instant::now();
@@ -123,7 +180,7 @@ pub fn spawn(
         pump(stderr, Stream::Stderr, sink);
     }
 
-    Ok(Running { child, pid, started })
+    Ok(Running { child, pid, started, job })
 }
 
 /// Forwards every line of one stream into the log sink until it closes.
@@ -178,11 +235,18 @@ pub async fn stop(running: &mut Running, spec: &ServiceSpec, base_dir: &Path) ->
         return StopOutcome::Signalled;
     }
 
-    // Kill the whole group before the direct child: `child.kill()` reaps only the
+    // Kill the whole tree before the direct child: `child.kill()` reaps only the
     // process we spawned, and for anything started through a wrapper — a shell
     // script, `npm start` — the program that actually holds the port is a
     // grandchild. Killing the parent alone reparents it to init, still listening,
     // so the next start fails to bind and blames the wrong thing.
+    //
+    // The job is tried first because on Windows it is the only thing that
+    // reaches a grandchild; `kill_process_group` is the Unix mechanism and a
+    // no-op there. Exactly one of the two does the work on any given platform,
+    // and neither is trusted to have worked — the direct kill below runs
+    // regardless.
+    running.job.terminate();
     kill_process_group(running.pid);
     let _ = running.child.kill().await;
     let _ = running.child.wait().await;
@@ -253,10 +317,11 @@ fn isolate_process_group(command: &mut Command) {
 
 /// Windows equivalent: a new process group, set at creation.
 ///
-/// Note this is weaker than the Unix path. Reliably killing a process tree on
-/// Windows requires a job object, which this does not yet create — so a wrapper's
-/// grandchildren can still survive. Recorded rather than papered over; it is the
-/// first thing to fix when the Windows machine exists to test against.
+/// This alone is weaker than the Unix path — a new process group on Windows
+/// scopes console control events, it does not make a tree killable — which is
+/// why the tree is owned by a [`Job`](crate::job) object instead. Both are set:
+/// the group keeps a Ctrl-C aimed at the daemon's console from reaching
+/// services that never asked for one, and the job is what actually ends them.
 #[cfg(windows)]
 fn isolate_process_group(command: &mut Command) {
     const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
@@ -265,6 +330,51 @@ fn isolate_process_group(command: &mut Command) {
 
 #[cfg(not(any(unix, windows)))]
 fn isolate_process_group(_command: &mut Command) {}
+
+/// Asks the kernel to kill this child when the daemon dies, on the one Unix
+/// that offers it.
+///
+/// `PR_SET_PDEATHSIG` is armed in the child itself, in the window between
+/// `fork` and `exec`, which is the only moment it can be set — it is a property
+/// of the process, not something a parent can confer from outside.
+///
+/// This covers what no shutdown path can: a daemon killed with `SIGKILL` runs
+/// no code, so anything relying on `Drop` or a stop sequence has already lost.
+/// It reaches the direct child only; a grandchild whose parent has already
+/// exited is not covered, which is why the process group above still exists for
+/// every stop that *does* get to run.
+///
+/// # Safety
+///
+/// The closure runs in the forked child, where only async-signal-safe calls are
+/// allowed. `prctl` is one syscall and allocates nothing, which is the whole
+/// reason this is expressed as a bare FFI call rather than anything friendlier.
+#[cfg(target_os = "linux")]
+fn die_with_parent(command: &mut Command) {
+    /// `PR_SET_PDEATHSIG` from `linux/prctl.h`.
+    const PR_SET_PDEATHSIG: i32 = 1;
+
+    #[allow(unsafe_code)]
+    unsafe extern "C" {
+        fn prctl(option: i32, arg2: u64, ...) -> i32;
+    }
+
+    #[allow(unsafe_code)]
+    unsafe {
+        command.pre_exec(|| {
+            // A failure here is not worth refusing to start the service over:
+            // it degrades to exactly the macOS behaviour, which is a documented
+            // and survivable state rather than a broken one.
+            prctl(PR_SET_PDEATHSIG, SIGKILL as u64);
+            Ok(())
+        });
+    }
+}
+
+/// No equivalent exists on macOS or the BSDs, and Windows uses a job object
+/// instead. See the module docs for what that leaves uncovered.
+#[cfg(not(target_os = "linux"))]
+fn die_with_parent(_command: &mut Command) {}
 
 /// Asks the operating system to deliver a polite termination request to the
 /// service and everything it started.
@@ -305,6 +415,7 @@ fn kill_process_group(pid: u32) {
     }
 }
 
-/// Not available on Windows without a job object; see [`isolate_process_group`].
+/// Off Unix the tree is owned by a [`Job`](crate::job), which [`stop`] has
+/// already terminated by the time this is reached. Nothing to do here.
 #[cfg(not(unix))]
 fn kill_process_group(_pid: u32) {}

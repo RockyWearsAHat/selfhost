@@ -16,8 +16,9 @@ tokio = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time"] }
 
 [lints.rust]
-# Not `forbid`: stopping a process gracefully means naming the platform's own
-# signal call, which is FFI. It is confined to child::stop_gracefully and every
-# use is individually allowed, so an accidental one still fails the build.
+# Not `forbid`: owning a process *tree* means naming the platform's own calls,
+# which is FFI — `kill` on Unix, job objects on Windows. It is confined to
+# `child` and `job`, and every use is individually allowed, so an accidental one
+# still fails the build.
 unsafe_code = "deny"
 missing_docs = "warn"
