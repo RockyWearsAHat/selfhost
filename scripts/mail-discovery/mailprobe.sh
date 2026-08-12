@@ -19,8 +19,15 @@
 # and `line` are properties, and a variable by either name will not compile.
 #
 # Usage: mailprobe.sh <address>            e.g. mailprobe.sh alex@rockywearsahat.com
+#
+# With --manual, the script drives nothing: it arms the same sensors, gives you
+# ninety seconds to walk the sheet by hand, and then correlates. UI scripting is
+# a convenience here, never the experiment — the measurement is what leaves this
+# Mac and what reaches the box, and a human finger produces that just as well.
 set -u
-ADDR="${1:?usage: mailprobe.sh <address>}"
+MANUAL=0
+if [ "${1:-}" = "--manual" ]; then MANUAL=1; shift; fi
+ADDR="${1:?usage: mailprobe.sh [--manual] <address>}"
 NAME="Discovery Probe"
 PASS="not-a-real-password"
 HERE="$(cd "$(dirname "$0")" && pwd)"
@@ -43,7 +50,69 @@ log stream --style compact --info \
     > "$WORK/logstream.txt" 2>/dev/null &
 LOGGER=$!
 
+if [ "$MANUAL" = "1" ]; then
+  echo
+  echo "  DO IT BY HAND NOW — 90 seconds, sensors are recording:"
+  echo "    Mail ▸ Add Account… ▸ Other Mail Account… ▸ Continue"
+  echo "    Name: anything   Email: $ADDR   Password: anything"
+  echo "    ▸ Sign In, wait for the error, then Cancel."
+  echo
+  for s in $(seq 90 -10 10); do printf "  %ss left\r" "$s"; sleep 10; done
+  echo "  time up — collecting                    "
+else
 osascript <<APPLESCRIPT 2>&1
+-- The sheet does not reliably hang off window 1 — Mail has several windows and
+-- the chooser attaches to whichever was front. Find the window that owns a
+-- sheet, and fall back to the front window only if none does.
+on findPane()
+    tell application "System Events" to tell process "Mail"
+        repeat with w in windows
+            try
+                return sheet 1 of w
+            end try
+        end repeat
+        try
+            return window 1
+        end try
+    end tell
+    return missing value
+end findPane
+
+-- A control's label can live in title, name, value or description depending on
+-- how the control was built; a radio button in this sheet is not reliably
+-- titled. Match across all four, and press rather than click: AXPress is what
+-- the control actually implements.
+on pressLabeled(uiRoot, wanted)
+    tell application "System Events"
+        repeat with e in (entire contents of uiRoot)
+            try
+                set label to ""
+                try
+                    set label to label & (title of e) & " "
+                end try
+                try
+                    set label to label & (name of e) & " "
+                end try
+                try
+                    set label to label & ((value of e) as text) & " "
+                end try
+                try
+                    set label to label & (description of e)
+                end try
+                if label contains wanted then
+                    try
+                        perform action "AXPress" of e
+                    on error
+                        click e
+                    end try
+                    return true
+                end if
+            end try
+        end repeat
+    end tell
+    return false
+end pressLabeled
+
 -- `entire contents`, `role`, `title` and friends are System Events terminology:
 -- outside a tell block for it they do not even compile, so the handler carries
 -- its own.
@@ -92,39 +161,20 @@ tell application "System Events" to tell process "Mail"
     if not opened then return "NO ADD-ACCOUNT MENU ITEM FOUND"
     delay 3
 
-    -- The chooser may be a sheet on the main window or a window of its own.
-    set pane to missing value
-    try
-        set pane to sheet 1 of window 1
-    end try
-    if pane is missing value then
-        try
-            set pane to window 1
-        end try
-    end if
+    set pane to my findPane()
     if pane is missing value then return "NO SHEET OR WINDOW APPEARED"
 
     set out to "---- CHOOSER ----" & linefeed & my dumpTree(pane)
 
-    -- Pick the manual provider, whatever kind of control it turned out to be.
-    repeat with e in (entire contents of pane)
-        try
-            if (title of e) starts with "Other Mail Account" then
-                click e
-                exit repeat
-            end if
-        end try
-    end repeat
+    set picked to my pressLabeled(pane, "Other Mail Account")
+    set out to out & "picked Other Mail Account: " & picked & linefeed
     delay 1
-    try
-        click (first button of pane whose title is "Continue")
-    end try
+    set went to my pressLabeled(pane, "Continue")
+    set out to out & "pressed Continue: " & went & linefeed
     delay 3
 
     -- Re-acquire: the sheet is replaced, not edited.
-    try
-        set pane to sheet 1 of window 1
-    end try
+    set pane to my findPane()
     set out to out & "---- CREDENTIAL SHEET ----" & linefeed & my dumpTree(pane)
 
     -- The fields sit inside groups, so a direct-child lookup finds none of
@@ -157,18 +207,12 @@ tell application "System Events" to tell process "Mail"
     delay 1
 
     -- Submit, and give discovery a generous eight seconds to happen.
-    try
-        click (first button of pane whose title is "Sign In")
-    on error
-        try
-            click (first button of pane whose title is "Continue")
-        end try
-    end try
+    set sent to my pressLabeled(pane, "Sign In")
+    if not sent then set sent to my pressLabeled(pane, "Continue")
+    set out to out & "pressed submit: " & sent & linefeed
     delay 8
 
-    try
-        set pane to sheet 1 of window 1
-    end try
+    set pane to my findPane()
     set out to out & "---- AFTER SUBMIT ----" & linefeed & my dumpTree(pane)
     return out
 end tell
@@ -178,6 +222,7 @@ echo "== cancelling: nothing is saved =="
 osascript -e 'tell application "System Events" to tell process "Mail" to keystroke (ASCII character 27)' 2>/dev/null
 sleep 1
 osascript -e 'tell application "System Events" to tell process "Mail" to click (first button of sheet 1 of window 1 whose title is "Cancel")' 2>/dev/null
+fi
 
 sleep 2; kill $SOCKETS $LOGGER 2>/dev/null; wait 2>/dev/null
 
