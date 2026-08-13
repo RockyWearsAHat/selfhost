@@ -1375,7 +1375,7 @@ fn check_certificates(report: &mut Report, config: &Config, project_dir: &Path) 
         }
     }
 
-    report_stored_certificates(section, &data_dir, &tls_dir, config.server.acme);
+    report_stored_certificates(section, config, &data_dir, &tls_dir, config.server.acme);
 }
 
 /// Reports each stored certificate: whether it is a real ACME certificate or the
@@ -1384,8 +1384,18 @@ fn check_certificates(report: &mut Report, config: &Config, project_dir: &Path) 
 /// A certificate under 30 days from expiry is a `Warn`: the renewal loop renews
 /// at 30 days remaining, so anything below that has either just been noticed or
 /// is failing to renew and deserves attention.
+///
+/// [`store.hosts()`](CertificateStore::hosts) lists every certificate file on
+/// disk by its own name, but the issue-time marker that proves one is a real
+/// ACME certificate is written only under its order's canonical host — `imap.`
+/// and `smtp.` share `mail.`'s certificate and marker, a site's `www.` shares
+/// its apex's. Each host is resolved to that canonical host via
+/// [`acme_task::canonical_host`] before its marker is read, or every alias
+/// would report the self-signed fallback regardless of what is actually
+/// installed and being served.
 fn report_stored_certificates(
     section: &mut Section,
+    config: &Config,
     data_dir: &Path,
     tls_dir: &Path,
     environment: AcmeEnvironment,
@@ -1419,7 +1429,8 @@ fn report_stored_certificates(
     };
 
     for host in hosts {
-        match acme_task::certificate_days_remaining(&store, &host) {
+        let canonical = acme_task::canonical_host(config, &host);
+        match acme_task::certificate_days_remaining(&store, &canonical) {
             Some(days) if days < 30 => section.checks.push(
                 Check::new(
                     format!("certificate {host}"),

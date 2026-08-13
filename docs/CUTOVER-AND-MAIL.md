@@ -122,8 +122,13 @@ one of them. The false WARN was a separate bug: `stamp_issued` recorded the
 canonical hostname, so `doctor`'s per-host report — which checks every stored
 hostname independently, not just canonical ones — found no marker for any
 alias and reported the self-signed fallback regardless of what was actually
-being served. Fixed by writing the marker under every domain in the order, the
-same way the certificate and key were already installed under every domain.
+being served. First fix attempt (writing the marker under every domain in the
+order) turned out to only help *future* issuances — it never runs unless a
+reissue happens, and the certs already on disk didn't need one. Actual fix:
+`doctor` now resolves each hostname to its order's canonical host
+(`acme_task::canonical_host`, built from the same order computation the ACME
+task itself uses) before reading the marker — correct immediately, no
+backfill and no waiting for the next renewal.
 
 ## Port 25 (outbound) — 2026-08-08: blocked; 2026-08-12: open, and mail is live
 

@@ -117,7 +117,7 @@ async fn run_sweep(
 
 /// One certificate to hold: a canonical host the store's bookkeeping keys on,
 /// and every domain the certificate must cover as a SAN.
-struct CertOrder {
+pub(crate) struct CertOrder {
     canonical: String,
     domains: Vec<String>,
 }
@@ -133,7 +133,7 @@ struct CertOrder {
 /// certificate at all, and a loopback-only site would fail every sweep forever.
 /// A site left with no certifiable name places no order and keeps serving the
 /// self-signed fallback, which is all a CA could ever give it anyway.
-fn certificate_orders(config: &Config) -> Vec<CertOrder> {
+pub(crate) fn certificate_orders(config: &Config) -> Vec<CertOrder> {
     let mut orders: Vec<CertOrder> = config
         .sites
         .iter()
@@ -151,6 +151,24 @@ fn certificate_orders(config: &Config) -> Vec<CertOrder> {
         }
     }
     orders
+}
+
+/// The canonical host whose certificate order covers `host`, per the current
+/// config — or `host` itself when it belongs to no computed order (a manually
+/// placed certificate, or `localhost`).
+///
+/// [`stamp_issued`] records the issue-time marker only under an order's
+/// canonical host: the certificate installed under every domain in the order
+/// is the same file, so there is one marker to write, not one per alias.
+/// `doctor`'s per-host report calls this first so it reads *that* marker
+/// instead of asking whether `imap.<domain>` — which never gets a marker of
+/// its own — happens to have one, which it never will.
+pub(crate) fn canonical_host(config: &Config, host: &str) -> String {
+    certificate_orders(config)
+        .into_iter()
+        .find(|order| order.domains.iter().any(|domain| domain.eq_ignore_ascii_case(host)))
+        .map(|order| order.canonical)
+        .unwrap_or_else(|| host.to_owned())
 }
 
 /// Whether a public CA can issue for this name: a real DNS name, not an IP
@@ -188,7 +206,7 @@ async fn issue_order(
         store.install(domain, &issued.chain_pem, &issued.key_pem).map_err(|e| e.to_string())?;
         resolver.refresh(store, domain).map_err(|e| format!("installed but resolver not refreshed: {e}"))?;
     }
-    stamp_issued(store, &order.domains)
+    stamp_issued(store, host, &order.domains)
         .map_err(|e| format!("installed but could not record issue time: {e}"))?;
 
     log(format!("{host}: certificate installed and live ({} domain(s))", order.domains.len()));
@@ -235,32 +253,24 @@ fn covers(recorded: &Option<Vec<String>>, wanted: &[String]) -> bool {
     wanted.iter().all(|name| recorded.iter().any(|had| had.eq_ignore_ascii_case(name)))
 }
 
-/// Records the current time and the covered names as every one of the order's
-/// domains' issue marker: the issue time on the first line, one SAN per line
-/// after it.
+/// Records the current time and the covered names as a host certificate's
+/// issue marker: the issue time on the first line, one SAN per line after it.
 ///
 /// The marker distinguishes a real ACME certificate from the self-signed
 /// fallback, dates it for renewal, and says which names it speaks for — all
-/// without parsing the certificate itself. [`needs_certificate`] only ever
-/// reads it back from the canonical host, but it is written under every
-/// domain in the order — the same file, same content, once per name — because
-/// [`certificate_age`] and [`certificate_days_remaining`] are also read
-/// per-host by `doctor`'s report over every name in [`CertificateStore::hosts`],
-/// not just canonical ones. A marker written only under the canonical host
-/// left every alias (`imap.`, `smtp.`, a site's `www.`, …) permanently
-/// unable to prove it held a real certificate, so doctor reported them as the
-/// self-signed fallback forever, even freshly issued.
-fn stamp_issued(store: &CertificateStore, domains: &[String]) -> std::io::Result<()> {
+/// without parsing the certificate itself. Written once, under the order's
+/// canonical host only — every other domain in the order shares the same
+/// certificate file, so a caller asking about one of them should resolve to
+/// the canonical host first (see [`canonical_host`]) rather than expect a
+/// marker of its own.
+fn stamp_issued(store: &CertificateStore, host: &str, domains: &[String]) -> std::io::Result<()> {
     let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
     let mut marker = now.to_string();
     for domain in domains {
         marker.push('\n');
         marker.push_str(domain);
     }
-    for domain in domains {
-        std::fs::write(issued_marker_path(store, domain), &marker)?;
-    }
-    Ok(())
+    std::fs::write(issued_marker_path(store, host), marker)
 }
 
 /// Age of a host's certificate from its issue-time marker.
@@ -426,7 +436,7 @@ mod tests {
         // burns the CA's five-per-week allowance on nothing.
         let wanted = order(&["mail.example.com", "ua-auto-config.example.com"]);
         let store = store_holding("fresh", &wanted.canonical);
-        stamp_issued(&store, &wanted.domains).expect("a marker");
+        stamp_issued(&store, &wanted.canonical, &wanted.domains).expect("a marker");
 
         assert!(!needs_certificate(&store, &wanted));
     }
@@ -438,7 +448,7 @@ mod tests {
         // have left the new host on the self-signed fallback for 60 days.
         let held = order(&["mail.example.com", "imap.example.com"]);
         let store = store_holding("widened", &held.canonical);
-        stamp_issued(&store, &held.domains).expect("a marker");
+        stamp_issued(&store, &held.canonical, &held.domains).expect("a marker");
 
         let widened = order(&["mail.example.com", "imap.example.com", "ua-auto-config.example.com"]);
         assert!(needs_certificate(&store, &widened));
@@ -456,28 +466,32 @@ mod tests {
         assert!(certificate_age(&store, &wanted.canonical).is_some(), "the issue time still parses");
         assert!(needs_certificate(&store, &wanted));
 
-        stamp_issued(&store, &wanted.domains).expect("a marker");
+        stamp_issued(&store, &wanted.canonical, &wanted.domains).expect("a marker");
         assert!(!needs_certificate(&store, &wanted), "the rewritten marker settles it");
     }
 
     #[test]
-    fn stamp_issued_writes_a_marker_under_every_domain_not_just_canonical() {
-        // Doctor reports each stored certificate by reading the marker at that
-        // host's own path (`certificate_days_remaining`), not the order's
-        // canonical host. A marker written only under `mail.example.com` left
-        // every alias — `imap.`, `smtp.`, an autodiscover host, a site's `www.`
-        // — permanently reporting "self-signed fallback" even with a real,
-        // freshly issued certificate on disk.
-        let wanted = order(&["mail.example.com", "imap.example.com", "autodiscover.example.com"]);
-        let store = store_holding("aliases", &wanted.canonical);
-        stamp_issued(&store, &wanted.domains).expect("a marker");
+    fn canonical_host_resolves_an_alias_to_its_orders_marker() {
+        // Doctor reports each stored certificate by resolving to the order's
+        // canonical host before reading its marker. Without this, every alias
+        // — `imap.`, `smtp.`, an autodiscover host, a site's `www.` — reads a
+        // marker that only ever exists under the canonical host and reports
+        // "self-signed fallback" forever, even with a real, freshly issued
+        // certificate on disk.
+        let config = config_with(vec![], Some(mail("example.com")));
 
-        for alias in &wanted.domains {
-            assert!(
-                certificate_age(&store, alias).is_some(),
-                "{alias} should have its own issue marker, not just the canonical host"
-            );
-        }
+        assert_eq!(canonical_host(&config, "imap.example.com"), "mail.example.com");
+        assert_eq!(canonical_host(&config, "autodiscover.example.com"), "mail.example.com");
+        assert_eq!(canonical_host(&config, "mail.example.com"), "mail.example.com");
+    }
+
+    #[test]
+    fn canonical_host_falls_back_to_itself_when_no_order_covers_it() {
+        // localhost and a manually placed certificate belong to no computed
+        // order; doctor should still ask about that exact name rather than
+        // silently resolving to something unrelated.
+        let config = config_with(vec![], None);
+        assert_eq!(canonical_host(&config, "localhost"), "localhost");
     }
 
     #[test]
