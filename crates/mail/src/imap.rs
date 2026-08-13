@@ -23,9 +23,15 @@
 //!
 //! # What is intentionally left out
 //!
-//! No `APPEND`, no `IDLE`, no server-side search, and no quota. `EXPUNGE` is
-//! accepted but performs no deletion, because the store interface this layer
-//! targets exposes no remove. Each such limit is noted where it bites.
+//! No `APPEND`, no `IDLE`, no server-side search, and no quota. `EXPUNGE`,
+//! `MOVE` (RFC 6851), and `COPY` are all real: they drive
+//! [`crate::store::Maildir::purge`]/[`crate::store::Maildir::move_message`]/
+//! [`crate::store::Maildir::save`], the same calls [`crate::ews`] and
+//! [`crate::eas`] use, so a message deleted or moved over IMAP is gone (or
+//! moved) on disk, not just flagged. `CLOSE` purges `\Deleted` messages the
+//! same way `EXPUNGE` does, per RFC 3501 §6.4.2, just without the untagged
+//! `EXPUNGE` responses (the mailbox is being deselected anyway). Each other
+//! limit is noted where it bites.
 //!
 //! Command literals (`{n}` synchronising and `{n+}` LITERAL+, RFC 7888) *are*
 //! supported: Apple Mail sends `LOGIN` credentials and mailbox names as
@@ -190,6 +196,28 @@ pub enum IAction {
     /// Apply the flag change to the named messages, read the resulting flags
     /// back, then call [`ISession::store_complete`].
     Store(StorePlan),
+    /// Purge every `\Deleted` message in the selected mailbox, then call
+    /// [`ISession::expunge_complete`] with the UIDs actually removed.
+    Expunge {
+        /// Command tag to answer.
+        tag: String,
+    },
+    /// Move the named messages into another mailbox, then call
+    /// [`ISession::move_complete`] with the UIDs actually moved.
+    Move(MovePlan),
+    /// Copy the named messages into another mailbox, then answer the tag
+    /// directly — the source mailbox's view never changes.
+    Copy(CopyPlan),
+    /// Deselecting `CLOSE`: purge `\Deleted` messages from the folder just
+    /// named (already deselected from session state by the time the driver
+    /// sees this), then answer the tag `OK` with no untagged responses.
+    CloseMailbox {
+        /// Command tag to answer.
+        tag: String,
+        /// The mailbox name just deselected, for the driver to resolve to a
+        /// folder — the session's own view of it is already gone.
+        mailbox: String,
+    },
     /// Write these responses, then close the connection.
     Close(Vec<IResponse>),
 }
@@ -322,6 +350,32 @@ pub struct StorePlan {
     pub flags: Vec<Flag>,
     /// `.SILENT` — apply the change but send no `FETCH` echo back.
     pub silent: bool,
+}
+
+/// A parsed `MOVE` (RFC 6851), resolved to concrete messages.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MovePlan {
+    /// Command tag to answer.
+    pub tag: String,
+    /// True for `UID MOVE`.
+    pub uid_mode: bool,
+    /// The messages to move.
+    pub messages: Vec<MessageRef>,
+    /// The destination mailbox name, canonicalised.
+    pub destination: String,
+}
+
+/// A parsed `COPY`, resolved to concrete messages.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CopyPlan {
+    /// Command tag to answer.
+    pub tag: String,
+    /// True for `UID COPY`.
+    pub uid_mode: bool,
+    /// The messages to copy.
+    pub messages: Vec<MessageRef>,
+    /// The destination mailbox name, canonicalised.
+    pub destination: String,
 }
 
 /// One item of a `FETCH` request.
@@ -575,7 +629,8 @@ impl ISession {
         // LITERAL+ (RFC 7888) is advertised unconditionally: literal handling
         // has no protocol state, and clients decide from the greeting whether
         // they may stream `{n+}` literals without waiting for continuations.
-        let mut caps = vec!["IMAP4rev1".to_string(), "ID".to_string(), "LITERAL+".to_string()];
+        let mut caps =
+            vec!["IMAP4rev1".to_string(), "ID".to_string(), "LITERAL+".to_string(), "MOVE".to_string()];
         if self.state == IState::NotAuthenticated {
             if self.config.tls_available && !self.tls_active {
                 caps.push("STARTTLS".into());
@@ -690,6 +745,8 @@ impl ISession {
             "STATUS" => self.status(tag, args),
             "FETCH" => self.fetch(tag, args, false),
             "STORE" => self.store(tag, args, false),
+            "MOVE" => self.move_cmd(tag, args, false),
+            "COPY" => self.copy_cmd(tag, args, false),
             "CHECK" => self.require_selected(tag).unwrap_or_else(|| {
                 respond(IResponse::tagged(tag, Status::Ok, "CHECK completed"))
             }),
@@ -1096,6 +1153,8 @@ impl ISession {
         match sub.to_ascii_uppercase().as_str() {
             "FETCH" => self.fetch(tag, rest, true),
             "STORE" => self.store(tag, rest, true),
+            "MOVE" => self.move_cmd(tag, rest, true),
+            "COPY" => self.copy_cmd(tag, rest, true),
             other => respond(IResponse::tagged(
                 tag,
                 Status::Bad,
@@ -1105,24 +1164,129 @@ impl ISession {
     }
 
     /// Handles `CLOSE` — leave the mailbox and return to the authenticated
-    /// state. No expunge is performed (see the module note on deletion).
+    /// state. On a read-write mailbox this also purges `\Deleted` messages,
+    /// same as `EXPUNGE`, but silently (RFC 3501 §6.4.2: no untagged
+    /// `EXPUNGE` responses — the client is about to lose the sequence-number
+    /// view they'd refer to anyway).
     fn close_mailbox(&mut self, tag: &str) -> IAction {
         if let Some(denied) = self.require_selected(tag) {
             return denied;
         }
-        self.mailbox = None;
+        let Some(mailbox) = self.mailbox.take() else {
+            return respond(IResponse::tagged(tag, Status::Ok, "CLOSE completed"));
+        };
         self.state = IState::Authenticated;
-        respond(IResponse::tagged(tag, Status::Ok, "CLOSE completed"))
+        if mailbox.read_only {
+            respond(IResponse::tagged(tag, Status::Ok, "CLOSE completed"))
+        } else {
+            IAction::CloseMailbox { tag: tag.to_owned(), mailbox: mailbox.name }
+        }
     }
 
-    /// Handles `EXPUNGE`. Accepted so clients do not error, but this server does
-    /// not delete: the store interface it targets exposes no removal, so
-    /// `\Deleted` messages remain. Reported honestly as a no-op completion.
+    /// Handles `EXPUNGE`: purges every `\Deleted` message from the selected
+    /// mailbox. Refused on a read-only mailbox (`EXAMINE`), same as `STORE`.
     fn expunge(&self, tag: &str) -> IAction {
-        if let Some(denied) = self.require_selected(tag) {
-            return denied;
+        let Some(mailbox) = self.mailbox.as_ref() else {
+            return self
+                .require_selected(tag)
+                .unwrap_or_else(|| respond(IResponse::tagged(tag, Status::Bad, "no mailbox")));
+        };
+        if mailbox.read_only {
+            return respond(IResponse::tagged(tag, Status::No, "mailbox is read-only"));
         }
-        respond(IResponse::tagged(tag, Status::Ok, "EXPUNGE completed (no deletion performed)"))
+        IAction::Expunge { tag: tag.to_owned() }
+    }
+
+    /// Completes an `EXPUNGE`: `removed` is every UID the driver actually
+    /// purged from the store, in ascending original-sequence order.
+    pub fn expunge_complete(&mut self, tag: &str, removed: &[u32]) -> Vec<IResponse> {
+        let mut out = self.expunge_uids(removed);
+        out.push(IResponse::tagged(tag, Status::Ok, "EXPUNGE completed"));
+        out
+    }
+
+    /// Handles `MOVE <set> <mailbox>` (RFC 6851) and, via [`Self::uid`],
+    /// `UID MOVE`. Refused on a read-only mailbox: a move removes the message
+    /// from the source, same as `STORE +FLAGS \Deleted` would.
+    fn move_cmd(&self, tag: &str, args: &str, uid_mode: bool) -> IAction {
+        let Some(mailbox) = self.mailbox.as_ref() else {
+            return self
+                .require_selected(tag)
+                .unwrap_or_else(|| respond(IResponse::tagged(tag, Status::Bad, "no mailbox")));
+        };
+        if mailbox.read_only {
+            return respond(IResponse::tagged(tag, Status::No, "mailbox is read-only"));
+        }
+        let Some((set, rest)) = split_first_token(args) else {
+            return respond(IResponse::tagged(tag, Status::Bad, "MOVE requires a set"));
+        };
+        let Some((raw_dest, _)) = next_arg(rest) else {
+            return respond(IResponse::tagged(tag, Status::Bad, "MOVE requires a destination mailbox"));
+        };
+        let Some(messages) = resolve_set(&set, &mailbox.uids, uid_mode) else {
+            return respond(IResponse::tagged(tag, Status::Bad, "malformed sequence set"));
+        };
+        IAction::Move(MovePlan {
+            tag: tag.to_owned(),
+            uid_mode,
+            messages,
+            destination: canonical_mailbox(&raw_dest),
+        })
+    }
+
+    /// Completes a `MOVE`: `moved` is every UID the driver actually moved out
+    /// of the source mailbox, in ascending original-sequence order. Reported
+    /// as untagged `EXPUNGE`s, same as a real `EXPUNGE` — RFC 6851 §3.3: a
+    /// client without the `UIDPLUS` extension this server does not advertise
+    /// sees a `MOVE` exactly as it would see `COPY` + `STORE \Deleted` +
+    /// `EXPUNGE`.
+    pub fn move_complete(&mut self, tag: &str, moved: &[u32]) -> Vec<IResponse> {
+        let mut out = self.expunge_uids(moved);
+        out.push(IResponse::tagged(tag, Status::Ok, "MOVE completed"));
+        out
+    }
+
+    /// Handles `COPY <set> <mailbox>` and, via [`Self::uid`], `UID COPY`.
+    /// Allowed on a read-only mailbox: the source is never modified.
+    fn copy_cmd(&self, tag: &str, args: &str, uid_mode: bool) -> IAction {
+        let Some(mailbox) = self.mailbox.as_ref() else {
+            return self
+                .require_selected(tag)
+                .unwrap_or_else(|| respond(IResponse::tagged(tag, Status::Bad, "no mailbox")));
+        };
+        let Some((set, rest)) = split_first_token(args) else {
+            return respond(IResponse::tagged(tag, Status::Bad, "COPY requires a set"));
+        };
+        let Some((raw_dest, _)) = next_arg(rest) else {
+            return respond(IResponse::tagged(tag, Status::Bad, "COPY requires a destination mailbox"));
+        };
+        let Some(messages) = resolve_set(&set, &mailbox.uids, uid_mode) else {
+            return respond(IResponse::tagged(tag, Status::Bad, "malformed sequence set"));
+        };
+        IAction::Copy(CopyPlan {
+            tag: tag.to_owned(),
+            uid_mode,
+            messages,
+            destination: canonical_mailbox(&raw_dest),
+        })
+    }
+
+    /// The untagged `EXPUNGE` lines shared by [`Self::expunge_complete`] and
+    /// [`Self::move_complete`]: each removed UID is reported at the sequence
+    /// number it holds *at the moment of its own removal*, because removing
+    /// it shifts every later message down by one — shrinking `mailbox.uids`
+    /// one entry at a time as we go makes that fall out for free.
+    fn expunge_uids(&mut self, removed: &[u32]) -> Vec<IResponse> {
+        let mut out = Vec::new();
+        if let Some(mailbox) = self.mailbox.as_mut() {
+            for &uid in removed {
+                if let Some(pos) = mailbox.uids.iter().position(|&u| u == uid) {
+                    out.push(IResponse::untagged(format!("{} EXPUNGE", pos + 1)));
+                    mailbox.uids.remove(pos);
+                }
+            }
+        }
+        out
     }
 
     /// Refuses a command that needs authentication, returning the refusal when
@@ -2609,6 +2773,162 @@ mod tests {
         assert!(responses[0].text().starts_with("a3 NO"));
     }
 
+    // ---- EXPUNGE / MOVE / COPY / CLOSE --------------------------------------
+
+    #[test]
+    fn expunge_is_refused_on_a_read_only_mailbox() {
+        let mut s = ISession::new(config());
+        s.tls_established();
+        s.login_result("a1", Some(Address::parse("dave@example.com").unwrap()));
+        s.select_result(
+            "a2",
+            "INBOX",
+            true,
+            SelectData {
+                uids: vec![5],
+                uid_validity: 1,
+                uid_next: 6,
+                recent: 0,
+                first_unseen: None,
+                unseen_count: 0,
+            },
+        );
+        let action = s.command("a3 EXPUNGE");
+        let IAction::Respond(responses) = action else { panic!("expected Respond") };
+        assert!(responses[0].text().starts_with("a3 NO"));
+    }
+
+    #[test]
+    fn expunge_asks_the_driver_to_purge() {
+        let mut s = selected_session();
+        let action = s.command("a4 EXPUNGE");
+        assert_eq!(action, IAction::Expunge { tag: "a4".into() });
+    }
+
+    #[test]
+    fn expunge_complete_renumbers_sequence_numbers_as_it_removes_them() {
+        // selected_session()'s mailbox holds UIDs 5, 6, 9 at sequence numbers
+        // 1, 2, 3. Removing 5 and 9 must report 5 at seq 1 (unchanged) and 9
+        // at seq 2 (shifted down by the earlier removal), not seq 3.
+        let mut s = selected_session();
+        let responses = s.expunge_complete("a4", &[5, 9]);
+        let texts: Vec<String> = responses.iter().map(|r| r.text().into_owned()).collect();
+        assert!(texts[0].starts_with("* 1 EXPUNGE"), "{texts:?}");
+        assert!(texts[1].starts_with("* 2 EXPUNGE"), "{texts:?}");
+        assert!(texts[2].starts_with("a4 OK"));
+    }
+
+    #[test]
+    fn move_parses_the_set_and_destination_and_is_refused_read_only() {
+        let mut s = selected_session();
+        match s.command("a4 MOVE 1 Trash") {
+            IAction::Move(plan) => {
+                assert_eq!(plan.destination, "Trash");
+                assert_eq!(plan.messages, vec![MessageRef { seq: 1, uid: 5 }]);
+                assert!(!plan.uid_mode);
+            }
+            other => panic!("expected Move, got {other:?}"),
+        }
+
+        let mut ro = ISession::new(config());
+        ro.tls_established();
+        ro.login_result("a1", Some(Address::parse("dave@example.com").unwrap()));
+        ro.select_result(
+            "a2",
+            "INBOX",
+            true,
+            SelectData {
+                uids: vec![5],
+                uid_validity: 1,
+                uid_next: 6,
+                recent: 0,
+                first_unseen: None,
+                unseen_count: 0,
+            },
+        );
+        let action = ro.command("a3 MOVE 1 Trash");
+        let IAction::Respond(responses) = action else { panic!("expected Respond") };
+        assert!(responses[0].text().starts_with("a3 NO"));
+    }
+
+    #[test]
+    fn uid_move_parses_with_uid_mode_set() {
+        let mut s = selected_session();
+        match s.command("a4 UID MOVE 5 Trash") {
+            IAction::Move(plan) => {
+                assert!(plan.uid_mode);
+                assert_eq!(plan.messages, vec![MessageRef { seq: 1, uid: 5 }]);
+            }
+            other => panic!("expected Move, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn move_complete_reports_expunges_like_a_real_expunge() {
+        let mut s = selected_session();
+        let responses = s.move_complete("a4", &[6]);
+        assert!(responses[0].text().starts_with("* 2 EXPUNGE"));
+        assert!(responses[1].text().starts_with("a4 OK MOVE completed"));
+    }
+
+    #[test]
+    fn copy_parses_the_set_and_destination_and_is_allowed_read_only() {
+        let mut ro = ISession::new(config());
+        ro.tls_established();
+        ro.login_result("a1", Some(Address::parse("dave@example.com").unwrap()));
+        ro.select_result(
+            "a2",
+            "INBOX",
+            true,
+            SelectData {
+                uids: vec![5],
+                uid_validity: 1,
+                uid_next: 6,
+                recent: 0,
+                first_unseen: None,
+                unseen_count: 0,
+            },
+        );
+        match ro.command("a3 COPY 1 Sent") {
+            IAction::Copy(plan) => {
+                assert_eq!(plan.destination, "Sent");
+                assert_eq!(plan.messages, vec![MessageRef { seq: 1, uid: 5 }]);
+            }
+            other => panic!("expected Copy on a read-only mailbox, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn close_on_a_read_write_mailbox_asks_the_driver_to_purge() {
+        let mut s = selected_session();
+        let action = s.command("a4 CLOSE");
+        assert_eq!(action, IAction::CloseMailbox { tag: "a4".into(), mailbox: "INBOX".into() });
+        assert_eq!(s.state(), IState::Authenticated, "CLOSE deselects immediately either way");
+    }
+
+    #[test]
+    fn close_on_a_read_only_mailbox_answers_directly_with_no_purge() {
+        let mut s = ISession::new(config());
+        s.tls_established();
+        s.login_result("a1", Some(Address::parse("dave@example.com").unwrap()));
+        s.select_result(
+            "a2",
+            "INBOX",
+            true,
+            SelectData {
+                uids: vec![5],
+                uid_validity: 1,
+                uid_next: 6,
+                recent: 0,
+                first_unseen: None,
+                unseen_count: 0,
+            },
+        );
+        let action = s.command("a3 CLOSE");
+        let IAction::Respond(responses) = action else { panic!("expected Respond, not a driver round-trip") };
+        assert!(responses[0].text().starts_with("a3 OK"));
+    }
+
     // ---- STATUS ------------------------------------------------------------
 
     #[test]
@@ -2670,10 +2990,13 @@ mod tests {
 
     #[test]
     fn a_close_leaves_the_selected_state() {
+        // A read-write mailbox's CLOSE is a driver round-trip (it may purge
+        // \Deleted messages) — see close_on_a_read_write_mailbox_asks_the_driver_to_purge.
+        // The state transition itself, though, happens immediately, before
+        // the driver ever runs.
         let mut s = selected_session();
         let action = s.command("a CLOSE");
-        let IAction::Respond(responses) = action else { panic!("expected Respond") };
-        assert!(responses[0].text().starts_with("a OK"));
+        assert_eq!(action, IAction::CloseMailbox { tag: "a".into(), mailbox: "INBOX".into() });
         assert_eq!(s.state(), IState::Authenticated);
     }
 

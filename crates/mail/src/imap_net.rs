@@ -19,6 +19,11 @@
 //!   store to check existence against itself.
 //! - **`\Seen` on a non-peek `FETCH`.** Set before the message is read, so
 //!   the flags returned alongside it are already current.
+//! - **`EXPUNGE`/`MOVE`/`COPY`/`CLOSE`'s actual store work.** `crate::imap`
+//!   only resolves *which* UIDs a command names and *which* untagged
+//!   responses their removal implies; this file is the one that calls
+//!   [`Maildir::purge`]/[`Maildir::move_message`]/[`Maildir::save`] and
+//!   decides which UIDs actually went through.
 //! - **STARTTLS.** The plaintext socket is upgraded in place using the same
 //!   certificate material the proxy serves, with the same injection defence
 //!   `submission.rs` uses: a command already pipelined ahead of the upgrade
@@ -34,8 +39,8 @@
 
 use crate::address::Address;
 use crate::imap::{
-    FetchPlan, Flag, IAction, IConfig, IResponse, ISession, MessageData, SelectData, Status,
-    StorePlan, StoreOp,
+    CopyPlan, FetchPlan, Flag, IAction, IConfig, IResponse, ISession, MessageData, MovePlan,
+    SelectData, Status, StoreOp, StorePlan,
 };
 use crate::store::{Flags as StoreFlags, Folder, Maildir, StoreError, Uid};
 use crate::submission::Authenticator;
@@ -283,6 +288,22 @@ where
                 let responses = apply_store(server, session, &plan).await;
                 send(peer, reader.get_mut(), &responses).await?;
             }
+            IAction::Expunge { tag } => {
+                let responses = apply_expunge(server, session, &tag).await;
+                send(peer, reader.get_mut(), &responses).await?;
+            }
+            IAction::Move(plan) => {
+                let responses = apply_move(server, session, &plan).await;
+                send(peer, reader.get_mut(), &responses).await?;
+            }
+            IAction::Copy(plan) => {
+                let responses = apply_copy(server, session, &plan).await;
+                send(peer, reader.get_mut(), &responses).await?;
+            }
+            IAction::CloseMailbox { tag, mailbox } => {
+                let responses = apply_close(server, session, &tag, &mailbox).await;
+                send(peer, reader.get_mut(), &responses).await?;
+            }
             IAction::Close(responses) => {
                 send(peer, reader.get_mut(), &responses).await?;
                 return Ok(Flow::Done);
@@ -388,6 +409,84 @@ async fn apply_store(server: &ImapServer, session: &ISession, plan: &StorePlan) 
         }
     }
     session.store_complete(plan, &updated)
+}
+
+/// Performs an `EXPUNGE`: purges every `\Deleted` message in the selected
+/// folder from the store, then reports the untagged `EXPUNGE`s and shrinks
+/// the session's sequence-number view.
+async fn apply_expunge(server: &ImapServer, session: &mut ISession, tag: &str) -> Vec<IResponse> {
+    let (Some(user), Some(folder)) = (session.user().cloned(), selected_folder(session)) else {
+        return vec![IResponse::tagged(tag, Status::No, "no mailbox selected")];
+    };
+    let removed = purge_deleted(server, &user, folder).await;
+    session.expunge_complete(tag, &removed)
+}
+
+/// Performs a `MOVE`: moves each named message into the destination folder
+/// (a new UID there, removed from the source — [`crate::store::Maildir`]'s
+/// own `MOVE` semantics), then reports the source-side removals the same way
+/// `EXPUNGE` does.
+async fn apply_move(server: &ImapServer, session: &mut ISession, plan: &MovePlan) -> Vec<IResponse> {
+    let (Some(user), Some(folder)) = (session.user().cloned(), selected_folder(session)) else {
+        return vec![IResponse::tagged(&plan.tag, Status::No, "no mailbox selected")];
+    };
+    let Some(dest) = folder_from_name(&plan.destination) else {
+        return vec![IResponse::tagged(&plan.tag, Status::No, "no such destination mailbox")];
+    };
+    if dest == folder {
+        return vec![IResponse::tagged(&plan.tag, Status::No, "source and destination are the same")];
+    }
+    let mut moved = Vec::new();
+    for target in &plan.messages {
+        if server.store.move_message(&user, folder, Uid(target.uid), dest).await.is_ok() {
+            moved.push(target.uid);
+        }
+    }
+    session.move_complete(&plan.tag, &moved)
+}
+
+/// Performs a `COPY`: writes a duplicate of each named message into the
+/// destination folder, leaving the source untouched — so, unlike `MOVE`, the
+/// session's own view of the selected mailbox never changes.
+async fn apply_copy(server: &ImapServer, session: &ISession, plan: &CopyPlan) -> Vec<IResponse> {
+    let (Some(user), Some(folder)) = (session.user().cloned(), selected_folder(session)) else {
+        return vec![IResponse::tagged(&plan.tag, Status::No, "no mailbox selected")];
+    };
+    let Some(dest) = folder_from_name(&plan.destination) else {
+        return vec![IResponse::tagged(&plan.tag, Status::No, "no such destination mailbox")];
+    };
+    for target in &plan.messages {
+        if let Ok(msg) = server.store.fetch(&user, folder, Uid(target.uid)).await {
+            let _ = server.store.save(&user, dest, &msg).await;
+        }
+    }
+    vec![IResponse::tagged(&plan.tag, Status::Ok, "COPY completed")]
+}
+
+/// Performs the purge half of `CLOSE`: same removal `EXPUNGE` performs, but
+/// the caller reports no untagged responses for it (RFC 3501 §6.4.2) — the
+/// session has already deselected the mailbox by the time this runs.
+async fn apply_close(server: &ImapServer, session: &ISession, tag: &str, mailbox: &str) -> Vec<IResponse> {
+    let (Some(user), Some(folder)) = (session.user().cloned(), folder_from_name(mailbox)) else {
+        return vec![IResponse::tagged(tag, Status::Ok, "CLOSE completed")];
+    };
+    purge_deleted(server, &user, folder).await;
+    vec![IResponse::tagged(tag, Status::Ok, "CLOSE completed")]
+}
+
+/// Purges every `\Deleted` message from one folder and returns the UIDs
+/// actually removed, in ascending order — the store operation `EXPUNGE` and
+/// `CLOSE` share, differing only in what they report about it afterward.
+async fn purge_deleted(server: &ImapServer, user: &Address, folder: Folder) -> Vec<u32> {
+    let Ok(uids) = server.store.list(user, folder).await else { return Vec::new() };
+    let mut removed = Vec::new();
+    for uid in uids {
+        let deleted = server.store.flags(user, folder, uid).await.map(|f| f.deleted).unwrap_or(false);
+        if deleted && server.store.purge(user, folder, uid).await.is_ok() {
+            removed.push(uid.0);
+        }
+    }
+    removed
 }
 
 /// The folder the session's selected mailbox name refers to, or `None` for
@@ -709,6 +808,101 @@ d LOGOUT\r\n";
 
         let flags = server.store.flags(&dave, Folder::Inbox, Uid(1)).await.unwrap();
         assert!(flags.flagged, "the flag must actually be persisted, not just echoed");
+    }
+
+    #[tokio::test]
+    async fn expunge_actually_removes_deleted_messages_from_disk() {
+        // Regression: EXPUNGE used to be an honest no-op, so a client that
+        // flagged \Deleted and expunged saw the message reappear on the next
+        // SELECT — it was never removed.
+        let root = temp_root("expunge");
+        let server = server_with(&root);
+        let dave = addr("dave@example.com");
+        server.store.deliver(&dave, &Message::parse(b"Subject: gone\r\n\r\nbye".to_vec()).unwrap()).await.unwrap();
+        server.store.deliver(&dave, &Message::parse(b"Subject: stays\r\n\r\nhi".to_vec()).unwrap()).await.unwrap();
+
+        let script = "\
+a LOGIN dave@example.com hunter2\r\n\
+b SELECT INBOX\r\n\
+c STORE 1 +FLAGS (\\Deleted)\r\n\
+d EXPUNGE\r\n\
+e LOGOUT\r\n";
+        let out = run_conversation(&server, script).await;
+
+        assert!(out.contains("* 1 EXPUNGE"), "{out}");
+        assert!(out.contains("d OK EXPUNGE completed"), "{out}");
+
+        let remaining = server.store.list(&dave, Folder::Inbox).await.unwrap();
+        assert_eq!(remaining, vec![Uid(2)], "only the non-deleted message must survive");
+    }
+
+    #[tokio::test]
+    async fn move_relocates_a_message_between_folders() {
+        // Regression: MOVE (and COPY) were not implemented at all, so Mail's
+        // drag-to-folder either errored outright or silently did nothing.
+        let root = temp_root("move");
+        let server = server_with(&root);
+        let dave = addr("dave@example.com");
+        server.store.deliver(&dave, &Message::parse(b"Subject: move me\r\n\r\nbody".to_vec()).unwrap()).await.unwrap();
+
+        let script = "\
+a LOGIN dave@example.com hunter2\r\n\
+b SELECT INBOX\r\n\
+c MOVE 1 Trash\r\n\
+d LOGOUT\r\n";
+        let out = run_conversation(&server, script).await;
+
+        assert!(out.contains("* 1 EXPUNGE"), "{out}");
+        assert!(out.contains("c OK MOVE completed"), "{out}");
+
+        assert!(server.store.list(&dave, Folder::Inbox).await.unwrap().is_empty(), "gone from the source");
+        let in_trash = server.store.list(&dave, Folder::Trash).await.unwrap();
+        assert_eq!(in_trash.len(), 1, "landed in the destination");
+        let moved = server.store.fetch(&dave, Folder::Trash, in_trash[0]).await.unwrap();
+        assert_eq!(moved.body(), b"body");
+    }
+
+    #[tokio::test]
+    async fn copy_duplicates_into_the_destination_and_leaves_the_source_alone() {
+        let root = temp_root("copy");
+        let server = server_with(&root);
+        let dave = addr("dave@example.com");
+        server.store.deliver(&dave, &Message::parse(b"Subject: dupe me\r\n\r\nbody".to_vec()).unwrap()).await.unwrap();
+
+        let script = "\
+a LOGIN dave@example.com hunter2\r\n\
+b SELECT INBOX\r\n\
+c COPY 1 Sent\r\n\
+d LOGOUT\r\n";
+        let out = run_conversation(&server, script).await;
+
+        assert!(out.contains("c OK COPY completed"), "{out}");
+        assert!(!out.contains("EXPUNGE"), "COPY must not touch the source mailbox's view:\n{out}");
+
+        assert_eq!(server.store.list(&dave, Folder::Inbox).await.unwrap(), vec![Uid(1)], "source untouched");
+        let in_sent = server.store.list(&dave, Folder::Sent).await.unwrap();
+        assert_eq!(in_sent.len(), 1, "a duplicate landed in Sent");
+    }
+
+    #[tokio::test]
+    async fn close_silently_purges_deleted_messages_with_no_untagged_expunge() {
+        let root = temp_root("close-purge");
+        let server = server_with(&root);
+        let dave = addr("dave@example.com");
+        server.store.deliver(&dave, &Message::parse(b"Subject: gone\r\n\r\nbye".to_vec()).unwrap()).await.unwrap();
+
+        let script = "\
+a LOGIN dave@example.com hunter2\r\n\
+b SELECT INBOX\r\n\
+c STORE 1 +FLAGS (\\Deleted)\r\n\
+d CLOSE\r\n\
+e LOGOUT\r\n";
+        let out = run_conversation(&server, script).await;
+
+        assert!(out.contains("d OK CLOSE completed"), "{out}");
+        assert!(!out.contains("EXPUNGE"), "CLOSE reports no untagged EXPUNGE per RFC 3501:\n{out}");
+
+        assert!(server.store.list(&dave, Folder::Inbox).await.unwrap().is_empty(), "purged on disk, not just flagged");
     }
 
     #[tokio::test]
