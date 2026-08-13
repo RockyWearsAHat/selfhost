@@ -1,0 +1,26 @@
+To: ipadmin@firstdigital.com
+Subject: Reverse DNS (PTR) for 172.83.6.109 — request forward A record or PTR delegation
+
+Hello,
+
+I'm the subscriber at IP address 172.83.6.109 (reverse zone 6.83.172.in-addr.arpa,
+nameservers ns1.firstdigital.com / ns2.firstdigital.com). I run a personal mail
+server on this connection and need forward-confirmed reverse DNS to work, which
+it currently does not:
+
+  PTR for 172.83.6.109 -> 172-83-6-109.ip.fdtnet.net
+  172-83-6-109.ip.fdtnet.net -> (no A record)
+
+Could you do one of the following, whichever is easier on your end?
+
+  1. Add a forward A record for 172-83-6-109.ip.fdtnet.net pointing at
+     172.83.6.109, so the PTR resolves forward-and-back, OR
+  2. Delegate the PTR for 172.83.6.109 to me so I can point it at my own
+     mail hostname (rockywearsahat.com).
+
+Separately: is a static IP available for this account? A residential lease
+that renumbers would make either fix above go stale, and any DNS records I
+publish that reference this address would need updating every time it moves.
+
+Thank you,
+Alex Waldmann

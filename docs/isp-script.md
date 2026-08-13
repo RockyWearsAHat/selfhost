@@ -9,9 +9,17 @@ Every fact below was measured, not assumed. Sources are in
 **Superseded 2026-08-08.** The double-NAT problem this script used to open
 with is gone — the ISP now terminates the public IP directly on the router,
 and inbound 80/443 (and, since, 25/587) are already forwarded and verified
-working. What is left, and what this call is now about, is outbound port 25
-and the PTR record. The old bridge-mode/second-router asks are kept below,
-struck through, in case that topology ever regresses.
+working. The old bridge-mode/second-router asks are kept below, struck
+through, in case that topology ever regresses.
+
+**Superseded 2026-08-12: outbound port 25 is no longer blocked.** `selfhost
+doctor --deep` now measures it open and gets a live SMTP handshake through to
+both `gmail-smtp-in.l.google.com` and `outlook-com.olc.protection.outlook.com`,
+each confirming the connecting address is `172.83.6.109`. Do not open the call
+with Ask 1 below — it is resolved. The live problem is the PTR record (Ask 2):
+mail passes SPF/DKIM/DMARC and still lands straight in Junk at Gmail/Outlook
+because the reverse DNS does not forward-confirm. That is the whole reason for
+this call now.
 
 ## Facts to have in front of you
 
@@ -20,23 +28,14 @@ struck through, in case that topology ever regresses.
 | Public IP | `172.83.6.109` |
 | Reverse DNS on it | `172-83-6-109.ip.fdtnet.net` |
 | Reverse zone | `6.83.172.in-addr.arpa`, served by `ns1/ns2.firstdigital.com` |
-| Symptom | outbound TCP 25 silently dropped (confirmed: ICMP to the same hosts succeeds, no local firewall rule blocks it, two unrelated destinations both hang ~85s rather than refuse instantly — see `constraints.md`) |
+| Symptom | mail from this address passes SPF, DKIM, and DMARC but is still junked by Gmail/Outlook, because the PTR name has no matching forward A record (forward-confirmed reverse DNS fails) |
 | Contact named by prior correspondence | `ipadmin@firstdigital.com` |
+| Draft of the same ask, in writing | `docs/isp-ptr-request-email.txt` — useful to read verbatim if the rep prefers something you can dictate, or to send after the call as a follow-up they can reference |
 
-**Open with the technical asks, not "I want to run a mail server."** Front-line
-support has a script for the second framing and it ends the call.
+**Open with the technical ask, not "I want to run a mail server."**
+Front-line support has a script for that framing and it ends the call.
 
-## Ask 1 — unblock outbound port 25
-
-> **"Outbound connections on TCP port 25 from my IP, 172.83.6.109, are being
-> silently dropped — not refused, dropped. I've confirmed it isn't my
-> equipment. Can you remove the outbound port 25 filter for this address?"**
-
-- If they say **residential lines don't get this**: ask about a business tier
-  or a static-IP add-on that doesn't filter it, and whether it can be handled
-  as a one-off exception tied to the account instead of a plan change.
-
-## Ask 2 — the reverse record has no forward record
+## Ask 1 — the reverse record has no forward record
 
 > **"The PTR on 172.83.6.109 is 172-83-6-109.ip.fdtnet.net, but that name has
 > no A record, so forward-confirmed reverse DNS fails. Can you either add the
@@ -54,12 +53,12 @@ changing hostnames later.
   or business line costs, and whether PTR delegation comes with it. Get the
   price rather than a yes/no — it turns a refusal into a decision you can make.
 
-## Ask 3 — confirm the IP is static
+## Ask 2 — confirm the IP is static
 
 > **"Is 172.83.6.109 a static assignment, or could it change on a lease
 > renewal? If it isn't already static, can you make it one?"**
 
-Worth asking while you have them — a lease that moves would undo both fixes
+Worth asking while you have them — a lease that moves would undo the PTR fix
 above, silently, at some later and less convenient time.
 
 ## Before you hang up

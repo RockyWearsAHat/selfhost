@@ -110,39 +110,109 @@ the mail certificate now naming `mail`/`imap`/`smtp`/`ua-auto-config` and valid
 to 2026-11-10 (`autodiscover` joined the same set later, when EWS/ActiveSync
 shipped — same rule, same reissue path, no repeat of the gap).
 
-## Port 25 (outbound) — rechecked, still blocked
+**2026-08-13 — `doctor --deep` kept reporting the same hosts as self-signed
+after that, and it was `doctor` that was wrong, not the certificate.** The
+renewal-trigger rule above (`needs_certificate`) worked correctly the whole
+time — a live loopback fetch of the actual served certificate for
+`imap.`/`smtp.`/`autodiscover.`/`ua-auto-config.` on both domains showed one
+real `Let's Encrypt production` cert, issued `2026-08-12`, valid to
+`2026-11-10`, naming all ten mail client hosts, and public DNS resolved every
+one of them. The false WARN was a separate bug: `stamp_issued` recorded the
+"this is a real, dated ACME certificate" marker only under an order's
+canonical hostname, so `doctor`'s per-host report — which checks every stored
+hostname independently, not just canonical ones — found no marker for any
+alias and reported the self-signed fallback regardless of what was actually
+being served. Fixed by writing the marker under every domain in the order, the
+same way the certificate and key were already installed under every domain.
+
+## Port 25 (outbound) — 2026-08-08: blocked; 2026-08-12: open, and mail is live
+
+Original finding, kept for the record — as of 2026-08-08 outbound 25 was
+blocked on both hosts:
 
 | From | :25 (SMTP delivery) | :587 (submission) |
 |------|--------------------|-------------------|
 | Box (ALEX-DESKTOP) | **BLOCKED** | open |
 | Mac | **BLOCKED** | open |
 
-Outbound TCP 25 is blocked by the network on both hosts; 587 works. This is the
-ISP/carrier blocking direct SMTP (common on residential lines, and consistent
-with the earlier CGNAT/Spamhaus history).
+**Superseded 2026-08-12.** Re-checked via `selfhost doctor` / `doctor --deep` on
+the box and `dig` from an external Mac: outbound 25 is now **open**, and the
+whole mail path from that older finding onward has moved. Concretely, as of
+2026-08-12:
+
+- `rockywearsahat.com` now resolves to the box (`172.83.6.109`) for the apex,
+  `www`, `admin`, and `blog` — the "no domain resolves here yet" state this doc
+  described earlier no longer holds.
+- MX (`10 rockywearsahat.com`), SPF (`v=spf1 mx -all`), DMARC
+  (`v=DMARC1; p=reject; rua=mailto:postmaster@rockywearsahat.com`), and DKIM
+  (selector `s1`, ed25519, published at `s1._domainkey.rockywearsahat.com`) are
+  all live, publicly resolving, and all PASS in `selfhost doctor`. Inbound MX
+  points at the box now, not Namecheap forwarding.
+- `doctor` reports outbound port 25 as **PASS — open, direct delivery is
+  possible from this network**, and live SMTP handshakes succeeded directly
+  against both `gmail-smtp-in.l.google.com` and
+  `outlook-com.olc.protection.outlook.com`, each confirming the connecting
+  address as `172.83.6.109`.
 
 ### What this means for mail
 
-- The self-host mail server **cannot deliver outbound mail directly**: recipient
-  mail servers accept delivery on port 25, which is blocked outbound here. It can
-  still *receive* on 25 (inbound 25 is forwarded to the box).
-- Inbound mail for `@rockywearsahat.com` currently does **not** reach the box:
-  the domain's `MX` still points at Namecheap email forwarding
-  (`eforward*.registrar-servers.com`), not `172.83.6.109`. Inbound self-hosted
-  mail would require changing the `MX` to the box **and** confirming inbound 25
-  works end to end.
+- The self-host mail server **can now deliver outbound mail directly**: MX,
+  SPF, DKIM, and DMARC are live and passing, and outbound 25 handshakes
+  successfully against both Gmail and Outlook. The "receive-capable-but-not-
+  send-capable" state below no longer applies.
+- **The remaining blocker is not SPF/DKIM/DMARC or port 25 — it's reverse DNS.**
+  `doctor --deep` found that mail passing every authentication check was still
+  landing straight in Junk, because forward-confirmed reverse DNS (FCrDNS)
+  fails for this IP: the PTR for `172.83.6.109` is
+  `172-83-6-109.ip.fdtnet.net`, but that hostname has no forward `A` record, so
+  it doesn't resolve back to `172.83.6.109`. Gmail and Outlook weight FCrDNS
+  heavily for inbox placement independent of SPF/DKIM/DMARC, so mail can pass
+  every published check and still get dumped to Junk purely because of this
+  one broken link.
+- **This is not fixable from this repo or this box.** The reverse zone
+  `6.83.172.in-addr.arpa` is controlled by the ISP (First Digital, nameservers
+  `ns1.firstdigital.com` / `ns2.firstdigital.com`), not by us — only they can
+  add the missing forward record or delegate the PTR. Contact:
+  **`ipadmin@firstdigital.com`**. Ask for either:
+  1. a forward `A` record for `172-83-6-109.ip.fdtnet.net` pointing at
+     `172.83.6.109` (so the PTR resolves forward-and-back), **or**
+  2. delegation of the PTR for `172.83.6.109`, so it can be pointed directly at
+     `rockywearsahat.com`.
+
+  Also worth asking in the same email: whether a **static IP** is available —
+  a residential lease renumbering would silently break whichever fix above
+  gets applied, along with every DNS record that references this address. A
+  ready-to-send draft of this request already lives at
+  `docs/isp-ptr-request-email.txt`.
+- Blocklist status could not be confirmed via public resolvers (1.1.1.1,
+  8.8.8.8) or the LAN router resolver — Spamhaus refuses all three and answers
+  `127.255.255.254`, which `crates/dns/src/resolver.rs::is_real_listing()`
+  correctly treats as "refused", not "listed". The prior IP (`172.83.7.210`)
+  *was* Spamhaus XBL+CSS listed (see `docs/constraints.md`); that's moot now
+  since the IP changed to `172.83.6.109`, and `doctor --deep`'s neighbour
+  sampling shows 0 of 8 sampled neighbours of the new IP are listed, so any
+  future listing here would be specific to this address, not a dirty ISP pool.
 
 ### Options for working outbound mail
 
-1. **Smart-host relay over 587** (recommended, no ISP change): relay outbound
-   mail through an authenticated submission server (a provider's 587 or a
-   transactional service). 587 is open from both hosts. This keeps deliverability
-   (SPF/DKIM/DMARC handled by the relay) without needing port 25.
-2. **Ask the ISP to unblock outbound 25** (FirstDigital). Even if unblocked, a
-   residential IP has poor sending reputation — a relay is still the better path
-   for deliverability.
-3. **Keep Namecheap email forwarding** for inbound and use a relay for outbound;
-   don't self-host the full mail path until 25 and reputation are sorted.
+1. **Wait on the ISP fix above (recommended, no new dependency)**: once First
+   Digital adds the forward record or delegates the PTR, FCrDNS passes and
+   direct delivery — which already works end-to-end for SPF/DKIM/DMARC/port 25
+   — should land in the inbox instead of Junk. This is the only known root-cause
+   fix; everything else below is a workaround for the wait.
+2. **Smart-host relay over 587, as a stopgap while waiting on the ISP**: relay
+   outbound mail through an authenticated submission server (587 is open and
+   confirmed working). A relay's own IP — not ours — is what the receiver
+   evaluates, so this sidesteps the FCrDNS problem entirely without waiting on
+   First Digital. This is a real option to reach for if the PTR fix is slow,
+   **not** something to set up speculatively: it needs a real relay account
+   (e.g. SendGrid/Mailgun/SES/Postmark) and credentials the operator supplies —
+   there's no `[mail.relay]` configured today, and none should be fabricated.
+3. **Ask the ISP to unblock outbound 25** — already done; see above. Kept here
+   only as a historical option, superseded by the 2026-08-12 finding that 25 is
+   open.
 
-Until one of these is in place, treat the mail server as receive-capable-but-not-
-send-capable, and keep the domain's `MX` on Namecheap forwarding.
+The domain's `MX` should stay pointed at the box (not reverted to Namecheap
+forwarding) — inbound and outbound both work today. The only open item is
+getting mail out of Junk, which is the FCrDNS fix above, optionally sped up by
+a relay while it's pending.
