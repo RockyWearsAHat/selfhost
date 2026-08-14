@@ -37,7 +37,7 @@ use selfhost_config::{Config, RecordConfig};
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::{Arc, OnceLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::sync::Mutex;
@@ -223,7 +223,13 @@ impl Authority {
             let socket = Arc::clone(&socket);
             tokio::spawn(async move {
                 let answer = authority.handle_query(&raw, false, from.ip()).await;
-                let _ = socket.send_to(&answer, from).await;
+                // Fire-and-forget looked identical in the log to a reply that
+                // actually left the box — an answer built here and never
+                // delivered is indistinguishable, from a client's side, from
+                // one we never received. Log the failure so that gap closes.
+                if let Err(error) = socket.send_to(&answer, from).await {
+                    eprintln!("{} [dns] {from}: reply send failed: {error}", crate::time::stamp());
+                }
             });
         }
     }
@@ -244,7 +250,10 @@ impl Authority {
         loop {
             let Some(raw) = read_message(&mut client).await? else { return Ok(()) };
             let answer = self.handle_query(&raw, true, peer).await;
-            write_message(&mut client, &answer).await?;
+            if let Err(error) = write_message(&mut client, &answer).await {
+                eprintln!("{} [dns] {peer}: reply write failed: {error}", crate::time::stamp());
+                return Err(error);
+            }
         }
     }
 
@@ -259,14 +268,17 @@ impl Authority {
     /// points at the public one, and its foreign questions are forwarded
     /// upstream; every other peer gets the pure authoritative behaviour.
     async fn handle_query(&self, raw: &[u8], over_tcp: bool, peer: IpAddr) -> Vec<u8> {
+        let started = Instant::now();
         let query = match wire::decode_query(raw) {
             Ok(query) => query,
             Err(_) => {
                 let answer = format_error(raw);
                 eprintln!(
-                    "{} [dns] {peer} malformed query ({} bytes): FORMERR",
+                    "{} [dns] {peer} malformed query ({} bytes, {}) FORMERR {}ms",
                     crate::time::stamp(),
-                    raw.len()
+                    raw.len(),
+                    transport_label(over_tcp),
+                    started.elapsed().as_millis()
                 );
                 return answer;
             }
@@ -301,7 +313,7 @@ impl Authority {
             },
             (None, None) => respond(&query, None, over_tcp),
         };
-        log_query(peer, &query.name, query.record_type, &answer);
+        log_query(peer, &query.name, query.record_type, over_tcp, started.elapsed(), &answer);
         answer
     }
 
@@ -645,16 +657,33 @@ fn glue(zone: &Zone, records: &[Record]) -> Vec<Record> {
 /// rather than threading the response code out through every branch of
 /// [`Authority::handle_query`], keeps this the one place that needs to know
 /// the wire format of what already went out on the socket.
-fn log_query(peer: IpAddr, name: &str, qtype: RecordType, answer: &[u8]) {
+///
+/// Carries `elapsed` (recv-to-reply-built) and the transport alongside the
+/// answer: a query this line calls answered can still have gone unheard by
+/// the peer, either because the send after this line failed (logged
+/// separately, see [`Authority::serve_udp`]/[`serve_connection`]) or because
+/// it simply took too long for a caller with a tight inline timeout — the
+/// live case this was added for was a DKIM lookup Gmail marked "no key" in
+/// the same second this line recorded a correct answer.
+fn log_query(peer: IpAddr, name: &str, qtype: RecordType, over_tcp: bool, elapsed: Duration, answer: &[u8]) {
+    let transport = transport_label(over_tcp);
+    let ms = elapsed.as_millis();
     match wire::decode_response(answer) {
         Ok(response) => eprintln!(
-            "{} [dns] {peer} {name} {qtype} {} answers={}",
+            "{} [dns] {peer} {name} {qtype} {transport} {} answers={} {ms}ms",
             crate::time::stamp(),
             response.code,
             response.answers.len()
         ),
-        Err(_) => eprintln!("{} [dns] {peer} {name} {qtype} ?", crate::time::stamp()),
+        Err(_) => eprintln!("{} [dns] {peer} {name} {qtype} {transport} ? {ms}ms", crate::time::stamp()),
     }
+}
+
+/// `"udp"`/`"tcp"`, for the log line — [`Authority::handle_query`]'s own
+/// `over_tcp` bool written out where a reader does not have to remember which
+/// way it points.
+fn transport_label(over_tcp: bool) -> &'static str {
+    if over_tcp { "tcp" } else { "udp" }
 }
 
 /// Flags for a reply that is not authoritative and not truncated (REFUSED, FORMERR).
