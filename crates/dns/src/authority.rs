@@ -261,7 +261,15 @@ impl Authority {
     async fn handle_query(&self, raw: &[u8], over_tcp: bool, peer: IpAddr) -> Vec<u8> {
         let query = match wire::decode_query(raw) {
             Ok(query) => query,
-            Err(_) => return format_error(raw),
+            Err(_) => {
+                let answer = format_error(raw);
+                eprintln!(
+                    "{} [dns] {peer} malformed query ({} bytes): FORMERR",
+                    crate::time::stamp(),
+                    raw.len()
+                );
+                return answer;
+            }
         };
         // Clone the matched zone out from under the lock so the response is built
         // without holding it — the updater must be able to write meanwhile.
@@ -271,7 +279,7 @@ impl Authority {
         };
         let lan = self.0.lan.get().copied().filter(|_| is_lan_peer(peer));
 
-        match (zone, lan) {
+        let answer = match (zone, lan) {
             (Some(zone), Some(view)) => {
                 let public = *self.0.public_ip.lock().await;
                 respond(&query, Some(&lan_horizon(zone, public, view.lan_ip)), over_tcp)
@@ -292,7 +300,9 @@ impl Authority {
                 ),
             },
             (None, None) => respond(&query, None, over_tcp),
-        }
+        };
+        log_query(peer, &query.name, query.record_type, &answer);
+        answer
     }
 
     /// Replaces the apex A of `origin` and bumps that zone's SOA serial in place.
@@ -623,6 +633,28 @@ fn glue(zone: &Zone, records: &[Record]) -> Vec<Record> {
         }
     }
     out
+}
+
+/// One `[dns]`-tagged line into the daemon's log stream, per query answered.
+///
+/// This is the server's only record of what it was asked and what it said
+/// back — every other subsystem (mail, IMAP, the HTTP proxy) logs each
+/// connection, and DNS was a blind spot: an intermittent bad answer (a
+/// resolver hitting this box at the wrong moment) left nothing to inspect
+/// after the fact. Decoding `answer` back into a [`wire::Response`] here,
+/// rather than threading the response code out through every branch of
+/// [`Authority::handle_query`], keeps this the one place that needs to know
+/// the wire format of what already went out on the socket.
+fn log_query(peer: IpAddr, name: &str, qtype: RecordType, answer: &[u8]) {
+    match wire::decode_response(answer) {
+        Ok(response) => eprintln!(
+            "{} [dns] {peer} {name} {qtype} {} answers={}",
+            crate::time::stamp(),
+            response.code,
+            response.answers.len()
+        ),
+        Err(_) => eprintln!("{} [dns] {peer} {name} {qtype} ?", crate::time::stamp()),
+    }
 }
 
 /// Flags for a reply that is not authoritative and not truncated (REFUSED, FORMERR).

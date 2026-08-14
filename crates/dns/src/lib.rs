@@ -24,6 +24,7 @@
 
 pub mod authority;
 pub mod resolver;
+mod time;
 pub mod updater;
 pub mod wire;
 pub mod zone;
