@@ -444,8 +444,9 @@ fn today_serial() -> u32 {
 ///
 /// Howard Hinnant's `civil_from_days`, used rather than a date crate so the DNS
 /// crate pulls in no dependency to stamp a serial. Valid across the whole range
-/// this project will ever see.
-fn civil_from_days(days: i64) -> (i64, u32, u32) {
+/// this project will ever see. `pub(crate)` because [`crate::time`] reuses it
+/// for the log timestamp rather than keeping a second copy in the same crate.
+pub(crate) fn civil_from_days(days: i64) -> (i64, u32, u32) {
     let z = days + 719_468;
     let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
     let doe = z - era * 146_097;
