@@ -457,6 +457,7 @@ dependencies = [
  "ring",
  "rustls",
  "selfhost-http",
+ "selfhost-identity",
  "selfhost-json",
  "selfhost-login",
  "selfhost-mail",
