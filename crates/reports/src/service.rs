@@ -15,9 +15,9 @@
 //! answers the same `404` an unknown path gets until it is set — the identical shape
 //! [`check_token`](Service::check_token) already gives the feed/close routes on a box with no
 //! token, so shipping this subsystem changes nothing about a deployment that has not opted in.
-//! `crate::accounts`, `crate::sessions`, `crate::webauthn` and `crate::oauth` are each the
-//! authority on their own piece; this module only wires their JSON in and out of HTTP and never
-//! re-implements a rule any of them already state.
+//! `crate::accounts`, `crate::sessions`, `crate::webauthn`, `crate::oauth` and `crate::invite`
+//! are each the authority on their own piece; this module only wires their JSON in and out of
+//! HTTP and never re-implements a rule any of them already state.
 //!
 //! ```text
 //! POST <route>/register                     email + password           rate limited
@@ -35,7 +35,22 @@
 //! POST <route>/passkey/login/finish          completes sign-in
 //! GET  <route>/oauth/<provider>/start        redirects to the provider  rate limited
 //! GET  <route>/oauth/<provider>/callback     completes sign-in
+//! POST <route>/invite/redeem                 links to a granted name    rate limited
+//! GET  <route>/download                      the source archive + grants  session required
+//! GET  <route>/                              the register/login/invite page   open
+//! GET  <route>/index.html                    the same page                    open
 //! ```
+//!
+//! # The one page this crate serves
+//!
+//! Every route above is pure JSON — reached by curl or a future client, never a browser
+//! address bar. `<route>/` and `<route>/index.html` are the one exception: a small static HTML
+//! page ([`Response`]-wrapped [`include_str!`] of `assets/index.html`), so "an invited person
+//! registers and downloads the application" is a link a non-technical human can click rather
+//! than an API only a developer could drive. It is open — no session, no rate limit, the same
+//! shape [`Self::health`] already gives a route nothing credential-checking happens on — but it
+//! still answers `404` when accounts are off, same as every route it exists to front: a login
+//! page has no reason to exist on a deployment with nowhere to log in to.
 //!
 //! # The address is the base, and the service is the query
 //!
@@ -90,6 +105,7 @@ use tokio::net::{TcpListener, TcpStream};
 
 use crate::accounts::{Account, AccountError, Accounts};
 use crate::clock;
+use crate::invite::Invites;
 use crate::limit::{Decision, Limiter, Meter, Rate};
 use crate::notify::{self, Mailbox};
 use crate::oauth::{self, OAuthError};
@@ -98,6 +114,7 @@ use crate::sessions::{self, Sessions};
 use crate::store::{self, Store, StoreError};
 use crate::verify::Verifications;
 use crate::webauthn::{self, Webauthn};
+use selfhost_identity::{Identity, People, PersonName};
 
 /// The largest request body accepted. A report is prose; sixteen kilobytes is a generous
 /// essay, and refusing more before reading it is what keeps an anonymous POST from choosing
@@ -112,6 +129,25 @@ pub const RETRY_INTERVAL: Duration = Duration::from_secs(60);
 
 /// How many reports one delivery pass will attempt.
 const DELIVERY_BATCH: usize = 5;
+
+/// The source archive GitHub serves for any branch of a public repository, no
+/// release-engineering required. This is genuinely the only download artifact this project
+/// has — see the module documentation on the one page this crate serves — so `<route>/download`
+/// hands this address out rather than inventing packaging that does not exist.
+const DOWNLOAD_URL: &str = "https://github.com/RockyWearsAHat/selfhost/archive/refs/heads/main.zip";
+
+/// This project's own repository, alongside [`DOWNLOAD_URL`].
+const REPOSITORY_URL: &str = "https://github.com/RockyWearsAHat/selfhost";
+
+/// The branch [`DOWNLOAD_URL`] archives — the one `crates/cli/src/self_update.rs`'s own fetch
+/// already tracks, and the one this box always builds.
+const DOWNLOAD_BRANCH: &str = "main";
+
+/// What running the download actually takes: the same clone-then-build recipe
+/// `crates/cli/src/self_update.rs` already runs, stated once so `<route>/download`'s answer and
+/// this doc comment can never drift from each other.
+const DOWNLOAD_SETUP: &str = "Clone the repository (or unzip the downloaded archive), then run \
+     `cargo build --release` from its root.";
 
 /// How the intake is configured.
 #[derive(Debug, Clone)]
@@ -201,6 +237,14 @@ pub struct AccountsConfig {
     /// stuffing attempt against this door can never spend a filer's or a reader's allowance,
     /// and cannot itself be starved by one either.
     pub per_action: Rate,
+    /// The box's own top-level data directory — **not** [`Self::data_dir`], which is already
+    /// this subsystem's own sibling directory. `POST <route>/invite/redeem` and `GET <route>/me`
+    /// need `selfhost_identity::People`, which lives at the data directory every other door on
+    /// this box shares (`<data_dir>/console.people`), so that a capability the owner granted
+    /// through `selfhost people allow` is the same grant this crate reads back — a second copy
+    /// of that registry, scoped to this subsystem's own directory, would just be a second place
+    /// the same name's capabilities could say two different things.
+    pub identity_data_dir: PathBuf,
 }
 
 /// The account subsystem's live state — every store [`AccountsConfig`] describes, opened once
@@ -220,6 +264,10 @@ struct AccountsRuntime {
     verify: Verifications,
     mail_queue: Option<OutboundQueue>,
     limiter: Mutex<Limiter>,
+    invites: Invites,
+    /// The box's own permission registry, read from [`AccountsConfig::identity_data_dir`] —
+    /// never this subsystem's own directory. See that field's documentation.
+    people: People,
 }
 
 impl AccountsRuntime {
@@ -253,6 +301,8 @@ impl AccountsRuntime {
                 }
             });
         let limiter = Mutex::new(Limiter::new(config.per_action, config.per_action));
+        let invites = Invites::load(&config.data_dir);
+        let people = People::load(&config.identity_data_dir);
         Self {
             oauth_client: oauth::HttpsClient::new().map_err(|error| error.to_string()),
             config,
@@ -264,6 +314,8 @@ impl AccountsRuntime {
             verify,
             mail_queue,
             limiter,
+            invites,
+            people,
         }
     }
 }
@@ -275,7 +327,7 @@ impl std::fmt::Debug for AccountsRuntime {
     fn fmt(&self, out: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             out,
-            "AccountsRuntime {{ accounts: {:?}, sessions: {:?}, webauthn: {}, oauth_providers: {}, verify: {:?} }}",
+            "AccountsRuntime {{ accounts: {:?}, sessions: {:?}, webauthn: {}, oauth_providers: {}, verify: {:?}, invites: {:?}, people: {:?} }}",
             self.accounts,
             self.sessions,
             if self.webauthn.is_some() {
@@ -285,6 +337,8 @@ impl std::fmt::Debug for AccountsRuntime {
             },
             self.oauth_providers.len(),
             self.verify,
+            self.invites,
+            self.people,
         )
     }
 }
@@ -570,6 +624,7 @@ impl Service {
                 | "verify/resend"
                 | "passkey/register/start"
                 | "passkey/login/start"
+                | "invite/redeem"
         ) || suffix.starts_with("oauth/")
         {
             if let Decision::Refuse(seconds) = self.admit(&runtime.limiter, client, now) {
@@ -607,6 +662,13 @@ impl Service {
             "passkey/login/finish" if request.method == Method::Post => {
                 self.passkey_login_finish(runtime, body)
             }
+            "invite/redeem" if request.method == Method::Post => {
+                self.invite_redeem(runtime, request, body, wall)
+            }
+            "download" if request.method == Method::Get => self.download(runtime, request),
+            // The landing page: no session, no rate limit (it is not in the `matches!` list
+            // above) — see the module documentation's "one page this crate serves".
+            "" | "index.html" if request.method == Method::Get => self.landing_page(),
             "register"
             | "login"
             | "logout"
@@ -616,10 +678,9 @@ impl Service {
             | "passkey/register/start"
             | "passkey/register/finish"
             | "passkey/login/start"
-            | "passkey/login/finish" => {
-                refuse(Status::METHOD_NOT_ALLOWED, "this endpoint takes POST")
-            }
-            "verify" | "me" | "mine" => {
+            | "passkey/login/finish"
+            | "invite/redeem" => refuse(Status::METHOD_NOT_ALLOWED, "this endpoint takes POST"),
+            "verify" | "me" | "mine" | "download" | "" | "index.html" => {
                 refuse(Status::METHOD_NOT_ALLOWED, "this endpoint takes GET")
             }
             _ if suffix.starts_with("oauth/") => self.oauth_route(runtime, suffix, request),
@@ -637,18 +698,35 @@ impl Service {
         let Some(value) = parse_json_body(body) else {
             return refuse(Status::BAD_REQUEST, "the body is not JSON");
         };
-        let email = text_field(&value, "email");
-        let password = text_field(&value, "password");
-        if email.is_empty() || password.is_empty() {
-            return refuse(Status::BAD_REQUEST, "`email` and `password` are required");
-        }
-        match runtime.accounts.create_with_password(email, password) {
+        match self.create_password_account(runtime, &value) {
             Ok(account) => {
                 self.send_verification(runtime, &account, wall);
                 self.session_response(runtime, &account.id)
             }
-            Err(error) => account_error_response(&error),
+            Err(response) => response,
         }
+    }
+
+    /// The email/password validation and account creation shared by [`Self::register_password`]
+    /// and the no-session half of [`Self::invite_redeem`] — one path, so the two doors cannot
+    /// drift into accepting different passwords or refusing a taken email differently.
+    fn create_password_account(
+        &self,
+        runtime: &AccountsRuntime,
+        value: &Json,
+    ) -> Result<Account, Response> {
+        let email = text_field(value, "email");
+        let password = text_field(value, "password");
+        if email.is_empty() || password.is_empty() {
+            return Err(refuse(
+                Status::BAD_REQUEST,
+                "`email` and `password` are required",
+            ));
+        }
+        runtime
+            .accounts
+            .create_with_password(email, password)
+            .map_err(|error| account_error_response(&error))
     }
 
     /// `POST <route>/login` — email and password. Every way of failing answers the same
@@ -760,41 +838,178 @@ impl Service {
         let Some(account) = self.caller(runtime, request) else {
             return refuse(Status::UNAUTHORIZED, "sign in first");
         };
+        answer(Status::OK, self.me_json(runtime, &account))
+    }
+
+    /// The `me`-shaped body [`Self::whoami`] answers with — factored out because the
+    /// with-session half of [`Self::invite_redeem`] answers the identical shape after linking,
+    /// rather than minting a fresh session, and the two must never describe an account
+    /// differently.
+    fn me_json(&self, runtime: &AccountsRuntime, account: &Account) -> Json {
         let passkeys = runtime
             .webauthn
             .as_ref()
             .map(|webauthn| webauthn.passkeys().list_for(&account.id))
             .unwrap_or_default();
+        Json::object([
+            ("id", Json::string(&account.id)),
+            ("email", Json::string(&account.email)),
+            ("emailVerified", Json::Bool(account.email_verified)),
+            ("plan", Json::string(&account.plan)),
+            ("hasPassword", Json::Bool(account.password.is_some())),
+            (
+                "oauthProviders",
+                Json::array(
+                    account
+                        .oauth_links
+                        .iter()
+                        .map(|link| Json::string(&link.provider)),
+                ),
+            ),
+            (
+                "passkeys",
+                Json::array(passkeys.iter().map(|passkey| {
+                    Json::object([
+                        ("id", Json::string(&passkey.id)),
+                        ("label", Json::string(&passkey.label)),
+                        ("createdUnix", Json::Number(passkey.created_unix as f64)),
+                    ])
+                })),
+            ),
+            ("createdUnix", Json::Number(account.created_unix as f64)),
+            ("linkedPerson", linked_person_json(account)),
+            (
+                "grants",
+                Json::array(self.grants_of(runtime, account).into_iter().map(Json::string)),
+            ),
+        ])
+    }
+
+    /// The capability wire-strings `account`'s linked person holds, from `People::grants_for`.
+    ///
+    /// Empty, and `People` never touched, for an account with no [`Account::linked_person`] —
+    /// most accounts, since redeeming an invite is opt-in. A name that fails to parse back into
+    /// a [`PersonName`] answers empty rather than panicking: it was validated once already, at
+    /// invite-mint time, so this should never happen, but a caller across two stores (the
+    /// account file and the identity registry) is exactly the seam where "should never happen"
+    /// is worth failing closed on rather than trusting.
+    fn grants_of(&self, runtime: &AccountsRuntime, account: &Account) -> Vec<String> {
+        let Some(name) = account.linked_person.as_deref() else {
+            return Vec::new();
+        };
+        let Ok(name) = PersonName::parse(name) else {
+            return Vec::new();
+        };
+        runtime
+            .people
+            .grants_for(&Identity::Person(name))
+            .iter()
+            .map(std::string::ToString::to_string)
+            .collect()
+    }
+
+    /// `GET <route>/download` — session required, the same shape [`Self::whoami`] uses: this
+    /// crate has no packaged installer or release artifact anywhere in this repository (see the
+    /// module documentation), so this answers exactly what exists — the GitHub source archive
+    /// `crates/cli/src/self_update.rs`'s own fetch-and-build recipe already runs against — next
+    /// to [`Self::me_json`]'s own `linkedPerson`/`grants` fields, via the exact same
+    /// [`linked_person_json`] and [`Self::grants_of`] helpers, so a client showing "you can
+    /// download this and here is what you're permitted to do with it" never risks the two
+    /// descriptions of the caller's account drifting apart.
+    fn download(&self, runtime: &AccountsRuntime, request: &Request) -> Response {
+        let Some(account) = self.caller(runtime, request) else {
+            return refuse(Status::UNAUTHORIZED, "sign in first");
+        };
         answer(
             Status::OK,
             Json::object([
-                ("id", Json::string(&account.id)),
-                ("email", Json::string(&account.email)),
-                ("emailVerified", Json::Bool(account.email_verified)),
-                ("plan", Json::string(&account.plan)),
-                ("hasPassword", Json::Bool(account.password.is_some())),
+                ("downloadUrl", Json::string(DOWNLOAD_URL)),
+                ("repository", Json::string(REPOSITORY_URL)),
+                ("branch", Json::string(DOWNLOAD_BRANCH)),
+                ("setup", Json::string(DOWNLOAD_SETUP)),
+                ("linkedPerson", linked_person_json(&account)),
                 (
-                    "oauthProviders",
+                    "grants",
                     Json::array(
-                        account
-                            .oauth_links
-                            .iter()
-                            .map(|link| Json::string(&link.provider)),
+                        self.grants_of(runtime, &account)
+                            .into_iter()
+                            .map(Json::string),
                     ),
                 ),
-                (
-                    "passkeys",
-                    Json::array(passkeys.iter().map(|passkey| {
-                        Json::object([
-                            ("id", Json::string(&passkey.id)),
-                            ("label", Json::string(&passkey.label)),
-                            ("createdUnix", Json::Number(passkey.created_unix as f64)),
-                        ])
-                    })),
-                ),
-                ("createdUnix", Json::Number(account.created_unix as f64)),
             ]),
         )
+    }
+
+    /// `GET <route>/` and `GET <route>/index.html` — the one page this crate serves. See the
+    /// module documentation's "one page this crate serves" for why it exists and what it is not:
+    /// no session, no rate limit, and — because it is dispatched through
+    /// [`Self::accounts_answer`] exactly like every other route below `<route>/` — the same
+    /// `404` every one of them answers when [`Config::accounts`] is `None`.
+    fn landing_page(&self) -> Response {
+        html_page(include_str!("../assets/index.html"))
+    }
+
+    /// `POST <route>/invite/redeem` — links a reports account to the [`PersonName`] the owner
+    /// minted `code` for (`selfhost reports invite <name>`), so `People::grants_for` is what
+    /// decides what that account may do elsewhere on this box.
+    ///
+    /// Two shapes, chosen by whether the request already carries a live session:
+    ///
+    /// - **No session**: `{"code", "email", "password"}` — creates a brand-new password account
+    ///   through the exact path [`Self::register_password`] uses, links it, and mints a session,
+    ///   the same as registering plain.
+    /// - **A live session**: `{"code"}` — links the already-signed-in account and answers the
+    ///   updated [`Self::me_json`] rather than minting a session there already is one.
+    ///
+    /// [`crate::invite::Invites::name_for`] is checked before anything is created or changed, and
+    /// [`crate::invite::Invites::redeem`] — which actually spends the code — is called only once
+    /// the link it names has actually happened: an account-creation failure, or a failure to
+    /// write the link, must leave the invitation exactly as live as it was, so the person it was
+    /// sent to can simply try again rather than needing a second code.
+    fn invite_redeem(
+        &self,
+        runtime: &AccountsRuntime,
+        request: &Request,
+        body: &[u8],
+        wall: SystemTime,
+    ) -> Response {
+        let Some(value) = parse_json_body(body) else {
+            return refuse(Status::BAD_REQUEST, "the body is not JSON");
+        };
+        let code = text_field(&value, "code");
+        if code.is_empty() {
+            return refuse(Status::BAD_REQUEST, "`code` is required");
+        }
+        let Some(name) = runtime.invites.name_for(code) else {
+            return refuse(Status::BAD_REQUEST, "invalid or expired invite code");
+        };
+
+        if let Some(account) = self.caller(runtime, request) {
+            if let Err(error) = runtime.accounts.set_linked_person(&account.id, name.as_str()) {
+                eprintln!("[{}] reports: {error}", selfhost_mail::stamp());
+                return refuse(Status::INTERNAL_SERVER_ERROR, "could not link this account");
+            }
+            let _ = runtime.invites.redeem(code);
+            let linked = runtime
+                .accounts
+                .find_by_id(&account.id)
+                .unwrap_or(account);
+            return answer(Status::OK, self.me_json(runtime, &linked));
+        }
+
+        match self.create_password_account(runtime, &value) {
+            Ok(account) => {
+                if let Err(error) = runtime.accounts.set_linked_person(&account.id, name.as_str())
+                {
+                    eprintln!("[{}] reports: {error}", selfhost_mail::stamp());
+                }
+                self.send_verification(runtime, &account, wall);
+                let response = self.session_response(runtime, &account.id);
+                let _ = runtime.invites.redeem(code);
+                response
+            }
+            Err(response) => response,
+        }
     }
 
     /// `POST <route>/me/password` — sets or replaces the account's password.
@@ -1589,6 +1804,45 @@ fn refuse(status: Status, message: &str) -> Response {
     answer(status, Json::object([("error", Json::string(message))]))
 }
 
+/// The `linkedPerson` field [`Service::me_json`] and [`Service::download`] both answer with —
+/// factored out here so the two descriptions of an account's link can never say something
+/// different from each other.
+fn linked_person_json(account: &Account) -> Json {
+    account
+        .linked_person
+        .as_ref()
+        .map_or(Json::Null, Json::string)
+}
+
+/// The landing page's own answer, carrying every header `docs/SECURITY.md` (PUB-06) requires
+/// *except* the JSON API's `Content-Security-Policy` — [`set_security_headers`]'s `default-src
+/// 'none'` would refuse to run this page's own inline `<script>` and inline `<style>`, and this
+/// page has no build step to move either one to an external file this box could serve with a
+/// tight policy instead. So this policy is loosened to exactly what an inline script and an
+/// inline style need and nothing further — no external host is ever allowed to load into this
+/// page. [`set_security_headers`] itself is untouched by this function, so every JSON route's
+/// policy stays exactly as tight as it already was.
+fn html_page(markup: &str) -> Response {
+    let mut response = match Response::bytes(
+        Status::OK,
+        "text/html; charset=utf-8",
+        markup.as_bytes().to_vec(),
+    ) {
+        Ok(response) => response,
+        Err(_) => return Response::empty(Status::INTERNAL_SERVER_ERROR),
+    };
+    let _ = response.headers.set("X-Content-Type-Options", "nosniff");
+    let _ = response.headers.set("X-Frame-Options", "DENY");
+    let _ = response.headers.set("Referrer-Policy", "no-referrer");
+    let _ = response.headers.set(
+        "Content-Security-Policy",
+        "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; \
+         connect-src 'self'; img-src 'self'; frame-ancestors 'none'; base-uri 'none'",
+    );
+    let _ = response.headers.set("Cache-Control", "no-store");
+    response
+}
+
 /// The refusal a rate-limited reporter gets, carrying the wait.
 fn retry_after(seconds: u64) -> Response {
     let mut response = refuse(
@@ -1776,10 +2030,62 @@ mod tests {
                     verify_helo: "example.com".to_string(),
                     mail_data_dir: Some(dir.join("mail")),
                     per_action: Rate::new(50, 3000.0),
+                    identity_data_dir: dir.join("identity"),
                 }),
                 ..Config::default()
             },
         )
+    }
+
+    /// A scratch service like [`service_with_accounts`], with one invite already minted for
+    /// `name` and `grant` already applied to the registry — both done *before* [`Service::new`]
+    /// builds the runtime that will read them.
+    ///
+    /// Order matters and is the entire point of this helper: every store in this crate
+    /// (`Accounts`, `Sessions`, `People`, `Invites`) is read once at `load` and held in memory
+    /// from then on, so a grant or an invite written to disk *after* the service's own runtime
+    /// has already loaded is invisible to it for the rest of that runtime's life — a test that
+    /// minted or granted through a second, freshly-opened handle after constructing the service
+    /// would be testing that second handle's file, not what the running service actually sees.
+    fn service_with_invite(
+        label: &str,
+        name: &str,
+        hours: u64,
+        grant: impl FnOnce(&selfhost_identity::People, &selfhost_identity::PersonName),
+    ) -> (Service, String) {
+        let dir = std::env::temp_dir().join(format!("selfhost-reports-service-accounts-{label}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = Store::open(&dir.join("store")).expect("store");
+        store.add_project("dx").expect("project");
+
+        let parsed = selfhost_identity::PersonName::parse(name).expect("a valid name");
+        grant(
+            &selfhost_identity::People::load(&dir.join("identity")),
+            &parsed,
+        );
+        let code = crate::invite::Invites::load(&dir.join("accounts"))
+            .mint(&parsed, hours)
+            .expect("mints");
+
+        let service = Service::new(
+            store,
+            Config {
+                accounts: Some(AccountsConfig {
+                    data_dir: dir.join("accounts"),
+                    site_name: "Test Reports".to_string(),
+                    public_base_url: "https://reports.example.com".to_string(),
+                    rp_id: Some(RP.to_string()),
+                    oauth_providers: Vec::new(),
+                    verify_from: "reports@example.com".to_string(),
+                    verify_helo: "example.com".to_string(),
+                    mail_data_dir: Some(dir.join("mail")),
+                    per_action: Rate::new(50, 3000.0),
+                    identity_data_dir: dir.join("identity"),
+                }),
+                ..Config::default()
+            },
+        );
+        (service, code)
     }
 
     fn json_post(target: &str, body: &str) -> Request {
@@ -1855,6 +2161,10 @@ mod tests {
             ("GET /report/mine", ""),
             ("POST /report/passkey/login/start", ""),
             ("GET /report/oauth/example/start", ""),
+            ("POST /report/invite/redeem", r#"{"code":"anything"}"#),
+            ("GET /report/download", ""),
+            ("GET /report/", ""),
+            ("GET /report/index.html", ""),
         ] {
             let (method, target) = method_target.split_once(' ').unwrap();
             let head = if method == "GET" {
@@ -1961,6 +2271,190 @@ mod tests {
             "{}",
             text(&mine)
         );
+        assert!(
+            text(&mine).contains("\"linkedPerson\":null"),
+            "unlinked until an invite is redeemed: {}",
+            text(&mine)
+        );
+        assert!(
+            text(&mine).contains("\"grants\":[]"),
+            "nothing to grant with no linked person: {}",
+            text(&mine)
+        );
+    }
+
+    /// Grants [`selfhost_identity::Capability::ConsoleRead`] — a stand-in for whatever the owner
+    /// actually granted, since these tests only need to prove the grant travels through, not
+    /// which one.
+    fn grant_console_read(people: &selfhost_identity::People, name: &selfhost_identity::PersonName) {
+        people
+            .set_grants(
+                name,
+                selfhost_identity::Grants::new([selfhost_identity::Capability::ConsoleRead])
+                    .unwrap(),
+            )
+            .expect("granted");
+    }
+
+    #[test]
+    fn redeeming_an_invite_with_no_session_creates_a_linked_account_and_signs_it_in() {
+        let (service, code) =
+            service_with_invite("invite-fresh", "mom", 1, grant_console_read);
+
+        let body = format!(r#"{{"code":"{code}","email":"mom@example.com","password":"hunter2fish"}}"#);
+        let response = call(&service, &json_post("/report/invite/redeem", &body), &body);
+        assert_eq!(response.status, Status::OK, "{}", text(&response));
+        let cookie = set_cookie(&response);
+
+        let me = call(&service, &get_with_cookie("/report/me", &cookie), "");
+        assert!(
+            text(&me).contains("\"linkedPerson\":\"mom\""),
+            "{}",
+            text(&me)
+        );
+        assert!(
+            text(&me).contains("console.read"),
+            "the linked name's grants come through: {}",
+            text(&me)
+        );
+
+        // Single-use: the same code cannot mint a second linked account.
+        let again_body = format!(
+            r#"{{"code":"{code}","email":"someoneelse@example.com","password":"hunter2fish"}}"#
+        );
+        let again = call(&service, &json_post("/report/invite/redeem", &again_body), &again_body);
+        assert_eq!(again.status, Status::BAD_REQUEST, "{}", text(&again));
+    }
+
+    #[test]
+    fn a_failed_account_creation_does_not_burn_the_invite_code() {
+        let (service, code) = service_with_invite("invite-retry", "mom", 1, |_, _| {});
+
+        // A password too short to be a password refuses account creation — and must leave the
+        // code exactly as live as it was.
+        let weak = format!(r#"{{"code":"{code}","email":"mom@example.com","password":"short"}}"#);
+        let refused = call(&service, &json_post("/report/invite/redeem", &weak), &weak);
+        assert_eq!(refused.status, Status::BAD_REQUEST, "{}", text(&refused));
+
+        let good = format!(r#"{{"code":"{code}","email":"mom@example.com","password":"hunter2fish"}}"#);
+        let response = call(&service, &json_post("/report/invite/redeem", &good), &good);
+        assert_eq!(
+            response.status,
+            Status::OK,
+            "the code the first, failed attempt did not spend still works: {}",
+            text(&response)
+        );
+    }
+
+    #[test]
+    fn redeeming_an_invite_with_a_live_session_links_the_signed_in_account_and_mints_no_new_session()
+    {
+        let (service, code) =
+            service_with_invite("invite-linked", "mom", 1, grant_console_read);
+
+        let cookie = set_cookie(&register(&service, "alex@example.com", "hunter2fish"));
+        let body = format!(r#"{{"code":"{code}"}}"#);
+        let response = call(
+            &service,
+            &json_post_with_cookie("/report/invite/redeem", &body, &cookie),
+            &body,
+        );
+        assert_eq!(response.status, Status::OK, "{}", text(&response));
+        assert!(
+            response.headers.get_str("set-cookie").is_none(),
+            "linking an already-signed-in account mints no new session"
+        );
+        assert!(
+            text(&response).contains("\"linkedPerson\":\"mom\""),
+            "{}",
+            text(&response)
+        );
+        assert!(text(&response).contains("console.read"), "{}", text(&response));
+
+        // The same cookie still works, and now carries the grant.
+        let me = call(&service, &get_with_cookie("/report/me", &cookie), "");
+        assert!(text(&me).contains("\"linkedPerson\":\"mom\""), "{}", text(&me));
+    }
+
+    #[test]
+    fn an_invalid_or_expired_invite_code_is_refused_by_name() {
+        let service = service_with_accounts("invite-bad-code");
+        let body = r#"{"code":"not-a-real-code","email":"a@example.com","password":"hunter2fish"}"#;
+        let response = call(&service, &json_post("/report/invite/redeem", body), body);
+        assert_eq!(response.status, Status::BAD_REQUEST, "{}", text(&response));
+        assert!(
+            text(&response).contains("invalid or expired"),
+            "{}",
+            text(&response)
+        );
+    }
+
+    #[test]
+    fn the_download_route_needs_a_session() {
+        let service = service_with_accounts("download-anon");
+        let response = call(&service, &get("/report/download"), "");
+        assert_eq!(response.status, Status::UNAUTHORIZED);
+    }
+
+    #[test]
+    fn the_download_route_answers_the_archive_and_an_unlinked_accounts_empty_grants() {
+        let service = service_with_accounts("download-unlinked");
+        let cookie = set_cookie(&register(&service, "alex@example.com", "hunter2fish"));
+
+        let response = call(&service, &get_with_cookie("/report/download", &cookie), "");
+        assert_eq!(response.status, Status::OK, "{}", text(&response));
+        let body = text(&response);
+        assert!(
+            body.contains(
+                "\"downloadUrl\":\"https://github.com/RockyWearsAHat/selfhost/archive/refs/heads/main.zip\""
+            ),
+            "{body}"
+        );
+        assert!(
+            body.contains("\"repository\":\"https://github.com/RockyWearsAHat/selfhost\""),
+            "{body}"
+        );
+        assert!(body.contains("\"branch\":\"main\""), "{body}");
+        assert!(body.contains("cargo build --release"), "{body}");
+        assert!(body.contains("\"linkedPerson\":null"), "{body}");
+        assert!(body.contains("\"grants\":[]"), "{body}");
+    }
+
+    #[test]
+    fn the_download_route_carries_a_linked_accounts_real_grants() {
+        let (service, code) =
+            service_with_invite("download-linked", "mom", 1, grant_console_read);
+        let body = format!(r#"{{"code":"{code}","email":"mom@example.com","password":"hunter2fish"}}"#);
+        let cookie = set_cookie(&call(
+            &service,
+            &json_post("/report/invite/redeem", &body),
+            &body,
+        ));
+
+        let response = call(&service, &get_with_cookie("/report/download", &cookie), "");
+        assert_eq!(response.status, Status::OK, "{}", text(&response));
+        let text = text(&response);
+        assert!(text.contains("\"linkedPerson\":\"mom\""), "{text}");
+        assert!(text.contains("console.read"), "{text}");
+    }
+
+    #[test]
+    fn the_landing_page_is_open_html_and_names_the_invite_flow() {
+        let service = service_with_accounts("landing-page");
+        for target in ["/report/", "/report/index.html"] {
+            let response = call(&service, &get(target), "");
+            assert_eq!(response.status, Status::OK, "{target}: {}", text(&response));
+            assert_eq!(
+                response.headers.get_str("content-type"),
+                Some("text/html; charset=utf-8"),
+                "{target}"
+            );
+            assert!(
+                text(&response).to_ascii_lowercase().contains("invite"),
+                "{target}: {}",
+                text(&response)
+            );
+        }
     }
 
     #[test]
@@ -2221,6 +2715,7 @@ mod tests {
                     verify_helo: "example.com".to_string(),
                     mail_data_dir: None,
                     per_action: Rate::new(2, 3.0),
+                    identity_data_dir: dir.join("identity"),
                 }),
                 ..Config::default()
             },

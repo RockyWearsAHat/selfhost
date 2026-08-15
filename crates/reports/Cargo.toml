@@ -9,6 +9,10 @@ description = "A public intake for bug reports: stored in the box's own database
 
 [dependencies]
 selfhost-http = { workspace = true }
+# A reports account can be *linked* to a `PersonName` — see `crates/reports/src/invite.rs`'s
+# module documentation — so that `People::grants_for` is what decides what that account may do
+# elsewhere, rather than this crate growing a second permission model of its own.
+selfhost-identity = { workspace = true }
 selfhost-json = { workspace = true }
 # Password hashing and session-cookie mechanics, shared with `selfhost-admin` rather than each
 # crate hand-rolling its own copy — see `selfhost_login`'s crate documentation.

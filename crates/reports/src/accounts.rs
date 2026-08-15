@@ -153,6 +153,12 @@ pub struct Account {
     /// A free-form, capped word naming what this account is entitled to. `"free"` until
     /// something else writes it — see the module documentation.
     pub plan: String,
+    /// The [`selfhost_identity::PersonName`] this account is linked to, stored as its own
+    /// validated string rather than the `PersonName` type — see `crate::invite`'s module
+    /// documentation for how a code produces this link. `None` until an invite is redeemed:
+    /// most accounts never link to a name at all, and one that has not is granted nothing by
+    /// `People::grants_for`, exactly as an unknown name is.
+    pub linked_person: Option<String>,
 }
 
 /// The durable account store: `<data_dir>/reports/accounts.json`, owner-only, JSON.
@@ -266,6 +272,7 @@ impl Accounts {
             filed: Vec::new(),
             created_unix: now_unix(),
             plan: "free".to_string(),
+            linked_person: None,
         })
     }
 
@@ -298,6 +305,7 @@ impl Accounts {
             filed: Vec::new(),
             created_unix: now_unix(),
             plan: "free".to_string(),
+            linked_person: None,
         })
     }
 
@@ -320,6 +328,7 @@ impl Accounts {
             filed: Vec::new(),
             created_unix: now_unix(),
             plan: "free".to_string(),
+            linked_person: None,
         })
     }
 
@@ -359,6 +368,20 @@ impl Accounts {
     pub fn mark_verified(&self, id: &str) -> Result<(), AccountError> {
         self.update(id, |account| {
             account.email_verified = true;
+            Ok(())
+        })
+    }
+
+    /// Links the account to `name` — the [`selfhost_identity::PersonName`] an invite code
+    /// (`crate::invite`) was minted for, stored as its own string. Replaces any previous link
+    /// rather than refusing a second redemption, the same "the latest write wins" shape
+    /// [`Self::set_password`] already gives a credential.
+    ///
+    /// # Errors
+    /// [`AccountError::NotFound`] or an [`AccountError::Io`].
+    pub fn set_linked_person(&self, id: &str, name: &str) -> Result<(), AccountError> {
+        self.update(id, |account| {
+            account.linked_person = Some(name.to_string());
             Ok(())
         })
     }
@@ -563,7 +586,7 @@ pub fn email_fingerprint(email: &str) -> String {
 }
 
 /// The stored file's JSON shape: `{"accounts": [{id, email, emailVerified, password,
-/// oauthLinks: [{provider, subject}], createdUnix, plan}]}`.
+/// oauthLinks: [{provider, subject}], createdUnix, plan, linkedPerson}]}`.
 fn accounts_to_json(entries: &[Account]) -> Json {
     Json::object([(
         "accounts",
@@ -596,6 +619,13 @@ fn accounts_to_json(entries: &[Account]) -> Json {
                 ),
                 ("createdUnix", Json::Number(account.created_unix as f64)),
                 ("plan", Json::string(&account.plan)),
+                (
+                    "linkedPerson",
+                    account
+                        .linked_person
+                        .as_ref()
+                        .map_or(Json::Null, Json::string),
+                ),
             ])
         })),
     )])
@@ -672,6 +702,10 @@ fn parse_accounts(text: &str) -> Option<Vec<Account>> {
                 .and_then(Json::as_str)
                 .unwrap_or("free")
                 .to_string(),
+            linked_person: item
+                .get("linkedPerson")
+                .and_then(Json::as_str)
+                .map(str::to_string),
         });
     }
     Some(entries)
@@ -892,6 +926,42 @@ mod tests {
     }
 
     #[test]
+    fn linking_a_person_persists_across_a_reload() {
+        let dir = scratch("linked-person");
+        let accounts = Accounts::load(&dir);
+        let account = accounts
+            .create_pending("alex@example.com")
+            .expect("registers");
+        assert_eq!(account.linked_person, None, "unlinked until an invite is redeemed");
+        accounts
+            .set_linked_person(&account.id, "mom")
+            .expect("linked");
+
+        let reloaded = Accounts::load(&dir);
+        let found = reloaded.find_by_id(&account.id).expect("found after reload");
+        assert_eq!(found.linked_person.as_deref(), Some("mom"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_account_file_written_before_linked_person_existed_still_parses() {
+        // `linkedPerson` did not exist when the account store's format was first written; a
+        // stored account with no such field must still load rather than being treated as
+        // corruption, and must load as unlinked rather than panicking on a missing key.
+        let dir = scratch("pre-linked-person");
+        std::fs::write(
+            Accounts::path_in(&dir),
+            r#"{"accounts":[
+                {"id":"acct-1","email":"a@example.com","emailVerified":false,"password":null,"oauthLinks":[],"createdUnix":1,"plan":"free"}
+            ]}"#,
+        )
+        .unwrap();
+        let found = Accounts::load(&dir).find_by_id("acct-1").expect("still parses");
+        assert_eq!(found.linked_person, None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn an_unknown_id_is_refused_by_name_rather_than_panicking() {
         let dir = scratch("not-found");
         let accounts = Accounts::load(&dir);
@@ -926,6 +996,7 @@ mod tests {
             filed: Vec::new(),
             created_unix: 0,
             plan: "free".to_string(),
+            linked_person: None,
         });
         accounts.lock().extend(seeded);
 

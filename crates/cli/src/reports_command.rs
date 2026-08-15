@@ -10,6 +10,10 @@
 //! selfhost reports close <project> <id>   a fixed report leaves the database
 //! selfhost reports token [--new]          the token a subscribed checkout reads the feed with
 //! selfhost reports oauth add|list|remove  the "sign in with…" providers accounts offers
+//! selfhost reports invite <name> [--hours N]   a one-time code linking a reports account to
+//!                                               a `PersonName` `selfhost people` already knows
+//! selfhost reports invited                who has one pending, until when
+//! selfhost reports uninvite <name>        withdraw an invitation nobody has redeemed
 //! ```
 //!
 //! `serve` is what a supervised service runs; everything else is an operator at a terminal.
@@ -31,6 +35,15 @@
 //! enables the passkey routes (unset, they answer the same `404` an unconfigured token route
 //! does); OAuth providers come from `selfhost reports oauth add`, not a flag, because a client
 //! secret does not belong on a command line a process list can see.
+//!
+//! # `reports invite` links an account to a name; it never grants anything
+//!
+//! `selfhost_reports::invite::Invites` is its own store, separate from `crates/admin/src/
+//! invite.rs`'s console invitations — a reports account and a console passkey are different
+//! credentials for possibly the same human. `selfhost reports invite <name>` only mints a code
+//! that a reports account can redeem (`POST <route>/invite/redeem`) to become linked to `name`;
+//! it never touches `selfhost people`'s grants, which stay exactly `selfhost people allow/grant/
+//! deny`'s job, made before or after this command runs in either order.
 
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
@@ -81,9 +94,12 @@ pub fn run(arguments: &[String], config: &Config, project_dir: &Path) -> Result<
         "close" => close(arguments, &store),
         "token" => token(arguments, &data_dir),
         "oauth" => oauth_command(arguments, &data_dir.join(ACCOUNTS_DIR)),
+        "invite" => invite(arguments, &data_dir.join(ACCOUNTS_DIR)),
+        "invited" => invited(&data_dir.join(ACCOUNTS_DIR)),
+        "uninvite" => uninvite(&data_dir.join(ACCOUNTS_DIR), invite_name_argument(arguments)?),
         other => Err(format!(
             "`{other}` is not a reports command — it is serve, project, projects, list, close, \
-             token, or oauth"
+             token, oauth, invite, invited, or uninvite"
         )),
     }
 }
@@ -220,6 +236,11 @@ fn accounts_config(arguments: &[String], data_dir: &Path) -> Result<AccountsConf
         // Five attempts, then one every twelve seconds: generous for a person mistyping a
         // password, a wall for a script trying many.
         per_action: selfhost_reports::Rate::new(5, 5.0),
+        // The box's own top-level data directory — *not* `accounts_dir` above, which is this
+        // subsystem's own sibling. `POST <route>/me` and `POST <route>/invite/redeem` read
+        // `selfhost_identity::People` from here, the same file `selfhost people` writes, so a
+        // grant made through that command is the grant this door reads back.
+        identity_data_dir: data_dir.to_path_buf(),
     })
 }
 
@@ -488,6 +509,121 @@ fn oauth_remove(arguments: &[String], accounts_dir: &Path) -> Result<(), String>
     save_oauth_providers(accounts_dir, &providers)?;
     println!("provider `{name}` removed");
     Ok(())
+}
+
+/// `selfhost reports invite <name> [--hours N]` — mints a one-time code that lets whoever holds
+/// it link a reports account to `name`.
+///
+/// Deliberately does not touch `selfhost people`'s registry: this command produces the
+/// *credential* a reports account proves the link with, and nothing here decides what `name`
+/// may do once linked — that stays `selfhost people allow/grant/deny`'s job entirely, run before
+/// or after this one in either order. See this module's own documentation for why the two are
+/// kept apart, the same reasoning `crates/admin/src/invite.rs` gives its own console invitation.
+fn invite(arguments: &[String], accounts_dir: &Path) -> Result<(), String> {
+    let name = invite_name_argument(arguments)?;
+    let hours = invite_hours_argument(arguments)?;
+    let code = selfhost_reports::invite::Invites::load(accounts_dir)
+        .mint(&name, hours)
+        .map_err(|error| format!("could not write the invitation: {error}"))?;
+
+    println!("an invitation for {name}, good for {hours} hours and usable once");
+    println!();
+    println!("  Their code is:");
+    println!();
+    println!("    {code}");
+    println!();
+    println!(
+        "  This crate has no web front end of its own yet, so there is no link to send — being \
+         honest about that gap rather than printing one that does not work: whoever holds the \
+         code has to POST it themselves, to `<this box's public address><route>/invite/redeem` \
+         (`<route>` is whatever `selfhost reports serve` was given as `--route` — `/report` \
+         unless it was changed)."
+    );
+    println!();
+    println!(
+        "  With no reports account yet, the body is {{\"code\":\"{code}\",\"email\":…,\
+         \"password\":…}} and it creates one, linked, and signed in. Already signed in to one, \
+         the body is just {{\"code\":\"{code}\"}} and it links the account that is already \
+         there."
+    );
+    println!();
+    println!(
+        "  The code works once and is not stored anywhere it can be read back, so send it now \
+         — if it is lost, run this again and the old one stops working."
+    );
+    Ok(())
+}
+
+/// `selfhost reports invited` — who has an invitation pending, and until when.
+fn invited(accounts_dir: &Path) -> Result<(), String> {
+    let outstanding = selfhost_reports::invite::Invites::load(accounts_dir).outstanding();
+    if outstanding.is_empty() {
+        println!("No invitation is pending.");
+        println!();
+        println!("  selfhost reports invite <name>");
+        println!();
+        println!("mints one, and prints the code to send.");
+        return Ok(());
+    }
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|since| since.as_secs())
+        .unwrap_or(0);
+    for entry in &outstanding {
+        let left = entry.expires_unix.saturating_sub(now);
+        println!();
+        println!("{}", entry.name);
+        println!("  expires in {} hours", left / 3_600);
+    }
+    println!();
+    println!(
+        "{} pending. The codes themselves are not stored and cannot be shown again.",
+        outstanding.len()
+    );
+    Ok(())
+}
+
+/// `selfhost reports uninvite <name>` — withdraws an invitation nobody has redeemed.
+fn uninvite(accounts_dir: &Path, name: selfhost_identity::PersonName) -> Result<(), String> {
+    match selfhost_reports::invite::Invites::load(accounts_dir).revoke(&name) {
+        Ok(true) => {
+            println!("the invitation for {name} is withdrawn and its code opens nothing");
+            Ok(())
+        }
+        Ok(false) => Err(format!("{name} has no invitation pending; nothing changed")),
+        Err(error) => Err(format!("could not write the invitations: {error}")),
+    }
+}
+
+/// The person named by the third argument to `reports invite`/`reports uninvite`, validated.
+fn invite_name_argument(arguments: &[String]) -> Result<selfhost_identity::PersonName, String> {
+    let text = arguments
+        .get(2)
+        .ok_or("which person? e.g. `selfhost reports invite mom`")?;
+    selfhost_identity::PersonName::parse(text).map_err(|_| {
+        format!(
+            "\"{text}\" is not a usable person name: lower-case letters, digits and dashes, and \
+             never the owner's own name, which names an authority that is not granted"
+        )
+    })
+}
+
+/// The `--hours N` pair on `reports invite`, or [`selfhost_reports::invite::DEFAULT_TTL_HOURS`]
+/// when it is not given.
+fn invite_hours_argument(arguments: &[String]) -> Result<u64, String> {
+    let Some(index) = arguments.iter().position(|word| word == "--hours") else {
+        return Ok(selfhost_reports::invite::DEFAULT_TTL_HOURS);
+    };
+    let text = arguments
+        .get(index + 1)
+        .ok_or_else(|| "--hours needs a number of hours after it".to_owned())?;
+    let hours: u64 = text
+        .parse()
+        .map_err(|_| format!("\"{text}\" is not a number of hours"))?;
+    if hours == 0 {
+        return Err("an invitation that lasts no time cannot be used".to_owned());
+    }
+    Ok(hours.min(selfhost_reports::invite::MAX_TTL_HOURS))
 }
 
 /// Where the OAuth provider file lives for a given accounts directory.

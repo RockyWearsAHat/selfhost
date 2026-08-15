@@ -1,0 +1,267 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Reports account</title>
+<!--
+  This markup is served by crates/reports/src/service.rs (GET <route>/ and
+  GET <route>/index.html), via include_str!, so it is the one page in this crate that is not
+  pure JSON. It has to run inline <script> and inline <style> to exist at all with no build
+  step and no external resource, so the response this page is served with carries a looser
+  Content-Security-Policy than every JSON route in this crate does — see html_page() in
+  service.rs. That policy is: this origin plus 'unsafe-inline' for script and style, nothing
+  else, no external host. Nothing on this page loads a font, a script, or an image from
+  anywhere but the box it was served from.
+-->
+<style>
+  :root { color-scheme: light dark; }
+  body {
+    font: 15px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    max-width: 32rem;
+    margin: 3rem auto;
+    padding: 0 1.25rem;
+  }
+  h1 { font-size: 1.15rem; margin: 0 0 .25rem; }
+  p.lede { color: #767676; margin-top: 0; }
+  fieldset { border: 1px solid #ccc; border-radius: 6px; padding: 1rem; margin: 0 0 1.25rem; }
+  legend { padding: 0 .35rem; font-weight: 600; }
+  label { display: block; margin: .6rem 0 .2rem; font-size: .85rem; }
+  input[type=email], input[type=password], input[type=text] {
+    width: 100%;
+    box-sizing: border-box;
+    padding: .4rem .5rem;
+    font-size: .95rem;
+  }
+  button {
+    margin-top: .85rem;
+    padding: .45rem .9rem;
+    font-size: .9rem;
+    cursor: pointer;
+  }
+  .hint { font-size: .8rem; color: #767676; margin: .3rem 0 0; }
+  .error { color: #b00020; font-size: .85rem; margin: .5rem 0 0; white-space: pre-wrap; }
+  .error:empty { display: none; }
+  dl { margin: 0 0 1.25rem; }
+  dt { font-weight: 600; margin-top: .6rem; }
+  dd { margin: .1rem 0 0; }
+  ul.grants { margin: .2rem 0 0; padding-left: 1.1rem; }
+  #signed-in { display: none; }
+  #download-box { border: 1px solid #ccc; border-radius: 6px; padding: 1rem; margin-top: 1rem; }
+  code { font-size: .85em; }
+</style>
+</head>
+<body>
+
+<h1>Reports account</h1>
+<p class="lede">Sign in to file, track, or withdraw reports under your own name, and to redeem an invite code.</p>
+
+<div id="anonymous">
+
+  <fieldset>
+    <legend>Register</legend>
+    <form id="register-form">
+      <label for="register-email">Email</label>
+      <input id="register-email" type="email" required autocomplete="email">
+      <label for="register-password">Password</label>
+      <input id="register-password" type="password" required autocomplete="new-password">
+      <label for="register-invite">Invite code (optional)</label>
+      <input id="register-invite" type="text" autocomplete="off" placeholder="leave blank for a plain account">
+      <p class="hint">Filling this in links the new account to whoever the code was minted for, instead of registering plain.</p>
+      <button type="submit">Register</button>
+      <p class="error" id="register-error"></p>
+    </form>
+  </fieldset>
+
+  <fieldset>
+    <legend>Log in</legend>
+    <form id="login-form">
+      <label for="login-email">Email</label>
+      <input id="login-email" type="email" required autocomplete="email">
+      <label for="login-password">Password</label>
+      <input id="login-password" type="password" required autocomplete="current-password">
+      <button type="submit">Log in</button>
+      <p class="error" id="login-error"></p>
+    </form>
+  </fieldset>
+
+</div>
+
+<div id="signed-in">
+
+  <dl>
+    <dt>Signed in as</dt>
+    <dd id="account-email"></dd>
+    <dt>Linked to</dt>
+    <dd id="account-linked"></dd>
+    <dt>Permissions</dt>
+    <dd id="account-grants"></dd>
+  </dl>
+
+  <div id="download-box">
+    <p id="download-line">Loading the download link&hellip;</p>
+  </div>
+
+  <fieldset>
+    <legend>Have an invite code?</legend>
+    <form id="redeem-form">
+      <label for="redeem-code">Invite code</label>
+      <input id="redeem-code" type="text" required autocomplete="off">
+      <button type="submit">Redeem</button>
+      <p class="error" id="redeem-error"></p>
+    </form>
+  </fieldset>
+
+  <button id="logout-button" type="button">Log out</button>
+
+</div>
+
+<script>
+(function () {
+  "use strict";
+
+  // The route this page itself was served under, derived from the address bar rather than
+  // hard-coded: crates/reports/src/service.rs mounts this whole crate at a configurable
+  // <route> (the deployed box uses "/report"), and the page must call the same prefix it was
+  // served from rather than assuming one.
+  var routeBase = location.pathname.replace(/\/index\.html$/, "").replace(/\/$/, "");
+
+  function api(path, options) {
+    options = options || {};
+    options.credentials = "same-origin";
+    return fetch(routeBase + path, options).then(function (response) {
+      return response.json().catch(function () { return {}; }).then(function (body) {
+        return { ok: response.ok, status: response.status, body: body };
+      });
+    });
+  }
+
+  function jsonPost(path, payload) {
+    return api(path, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload)
+    });
+  }
+
+  function showError(id, message) {
+    document.getElementById(id).textContent = message || "";
+  }
+
+  function el(id) { return document.getElementById(id); }
+
+  function showSignedIn(me) {
+    el("anonymous").style.display = "none";
+    el("signed-in").style.display = "block";
+    el("account-email").textContent = me.email;
+    el("account-linked").textContent = me.linkedPerson || "not linked to anyone yet";
+    var grants = el("account-grants");
+    grants.textContent = "";
+    if (!me.grants || me.grants.length === 0) {
+      grants.textContent = "no permissions granted yet";
+    } else {
+      var list = document.createElement("ul");
+      list.className = "grants";
+      me.grants.forEach(function (grant) {
+        var item = document.createElement("li");
+        item.textContent = grant;
+        list.appendChild(item);
+      });
+      grants.appendChild(list);
+    }
+    loadDownload();
+  }
+
+  function showAnonymous() {
+    el("signed-in").style.display = "none";
+    el("anonymous").style.display = "block";
+  }
+
+  function loadDownload() {
+    api("/download", { method: "GET" }).then(function (result) {
+      var line = el("download-line");
+      if (!result.ok) {
+        line.textContent = "the download link is not available right now";
+        return;
+      }
+      line.textContent = "";
+      var link = document.createElement("a");
+      link.href = result.body.downloadUrl;
+      link.textContent = "Download the latest version";
+      line.appendChild(link);
+      var setup = document.createElement("p");
+      setup.className = "hint";
+      setup.textContent = result.body.setup;
+      line.appendChild(setup);
+    });
+  }
+
+  function refreshMe() {
+    return api("/me", { method: "GET" }).then(function (result) {
+      if (result.ok) {
+        showSignedIn(result.body);
+      } else {
+        showAnonymous();
+      }
+      return result;
+    });
+  }
+
+  el("register-form").addEventListener("submit", function (event) {
+    event.preventDefault();
+    showError("register-error", "");
+    var email = el("register-email").value;
+    var password = el("register-password").value;
+    var code = el("register-invite").value.trim();
+    var call = code
+      ? jsonPost("/invite/redeem", { code: code, email: email, password: password })
+      : jsonPost("/register", { email: email, password: password });
+    call.then(function (result) {
+      if (!result.ok) {
+        showError("register-error", result.body.error || "registration failed");
+        return;
+      }
+      refreshMe();
+    });
+  });
+
+  el("login-form").addEventListener("submit", function (event) {
+    event.preventDefault();
+    showError("login-error", "");
+    var email = el("login-email").value;
+    var password = el("login-password").value;
+    jsonPost("/login", { email: email, password: password }).then(function (result) {
+      if (!result.ok) {
+        showError("login-error", result.body.error || "sign-in failed");
+        return;
+      }
+      refreshMe();
+    });
+  });
+
+  el("redeem-form").addEventListener("submit", function (event) {
+    event.preventDefault();
+    showError("redeem-error", "");
+    var code = el("redeem-code").value.trim();
+    jsonPost("/invite/redeem", { code: code }).then(function (result) {
+      if (!result.ok) {
+        showError("redeem-error", result.body.error || "could not redeem this code");
+        return;
+      }
+      el("redeem-code").value = "";
+      refreshMe();
+    });
+  });
+
+  el("logout-button").addEventListener("click", function () {
+    api("/logout", { method: "POST" }).then(function () {
+      showAnonymous();
+    });
+  });
+
+  refreshMe();
+})();
+</script>
+
+</body>
+</html>

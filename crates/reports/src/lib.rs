@@ -43,6 +43,9 @@
 //!   hand-rolled outbound HTTPS client mirrored from `crates/acme/src/transport.rs`.
 //! - [`verify`] — confirming an account's email is reachable, and spooling that message into
 //!   this box's own outbound mail queue.
+//! - [`invite`] — the one-time code that links a reports account to a `PersonName`
+//!   `crates/identity` already knows, so `People::grants_for` decides what it may do elsewhere
+//!   on this box.
 //!
 //! # What this crate never does
 //!
@@ -58,6 +61,7 @@
 
 pub mod accounts;
 pub mod clock;
+pub mod invite;
 pub mod limit;
 pub mod notify;
 pub mod oauth;
