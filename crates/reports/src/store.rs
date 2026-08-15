@@ -656,8 +656,20 @@ fn entry(project: &str, id: &str, value: &Json) -> Option<Entry> {
 mod tests {
     use super::*;
 
+    /// A store in a directory no other run of these tests can be using.
+    ///
+    /// The process id *and* a counter, not just the label: the label alone made every scratch
+    /// path a fixed name under the system temp directory, and `remove_dir_all` at setup then
+    /// meant two concurrent `cargo test` runs of this crate deleted each other's fixtures
+    /// mid-test. "The tests are green" has to be a claim about the code, not about whether
+    /// anybody else happened to be running them at the time.
     fn scratch(label: &str) -> Store {
-        let dir = std::env::temp_dir().join(format!("selfhost-reports-{label}"));
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let nonce = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!(
+            "selfhost-reports-{}-{nonce}-{label}",
+            std::process::id()
+        ));
         let _ = fs::remove_dir_all(&dir);
         let store = Store::open(&dir).expect("store");
         store.add_project("dx").expect("project");

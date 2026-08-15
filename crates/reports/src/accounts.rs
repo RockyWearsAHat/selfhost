@@ -84,7 +84,15 @@ pub enum AccountError {
     Full,
     /// The password is shorter than [`MIN_PASSWORD`] or longer than [`MAX_PASSWORD`].
     WeakPassword,
-    /// The email did not parse as one.
+    /// The email did not parse as one, named with the *reason* it did not.
+    ///
+    /// Deliberately never the address itself. `crate::service`'s module documentation states
+    /// that a refusal from this box "names the field that was wrong, never the value", and this
+    /// message is rendered straight into the register page's error line — an earlier draft
+    /// interpolated the caller's own text here, which handed an anonymous `POST` a way to put
+    /// bytes of its choosing in front of somebody else's browser. The parse reason
+    /// ([`selfhost_mail::AddressError`]) is a fixed sentence from a fixed set, so it carries
+    /// everything a person mistyping their address needs and nothing an attacker chose.
     BadEmail(String),
     /// No account carries this id.
     NotFound,
@@ -153,12 +161,28 @@ pub struct Account {
     /// A free-form, capped word naming what this account is entitled to. `"free"` until
     /// something else writes it — see the module documentation.
     pub plan: String,
-    /// The [`selfhost_identity::PersonName`] this account is linked to, stored as its own
-    /// validated string rather than the `PersonName` type — see `crate::invite`'s module
-    /// documentation for how a code produces this link. `None` until an invite is redeemed:
-    /// most accounts never link to a name at all, and one that has not is granted nothing by
-    /// `People::grants_for`, exactly as an unknown name is.
-    pub linked_person: Option<String>,
+}
+
+impl Account {
+    /// Whether anybody ever *proved* that whoever holds this account also holds the address on
+    /// it — as opposed to merely having typed that address in.
+    ///
+    /// This is the question [`crate::service::Service::oauth_account`] must ask before it lets a
+    /// sign-in provider merge a new identity into an account it found **by email address alone**,
+    /// and it is a different question from "does this account have a credential". Every door
+    /// into this store — [`Accounts::create_with_password`], [`Accounts::create_pending`], an
+    /// [`Accounts::create_with_oauth`] from a provider that does not vouch — lets a stranger name
+    /// any address at all, including one that is not theirs, and hang their own password or
+    /// passkey off it. Exactly two things write [`Account::email_verified`], and both are proof:
+    /// [`Accounts::mark_verified`], reached only by clicking a link this box mailed *to that
+    /// address*, and [`Accounts::create_with_oauth`] with a provider's own verified-email claim.
+    ///
+    /// So the flag is the whole answer, and this method exists to say so by name at the one call
+    /// site where being wrong is an account takeover rather than a cosmetic bug.
+    #[must_use]
+    pub fn email_proven(&self) -> bool {
+        self.email_verified
+    }
 }
 
 /// The durable account store: `<data_dir>/reports/accounts.json`, owner-only, JSON.
@@ -255,7 +279,7 @@ impl Accounts {
         password: &str,
     ) -> Result<Account, AccountError> {
         let address = Address::parse(email.trim()).map_err(|error| {
-            AccountError::BadEmail(format!("`{email}` is not an address: {error}"))
+            AccountError::BadEmail(format!("`email` is not an address: {error}"))
         })?;
         let characters = password.chars().count();
         if !(MIN_PASSWORD..=MAX_PASSWORD).contains(&characters) {
@@ -272,7 +296,6 @@ impl Accounts {
             filed: Vec::new(),
             created_unix: now_unix(),
             plan: "free".to_string(),
-            linked_person: None,
         })
     }
 
@@ -291,7 +314,7 @@ impl Accounts {
         subject: &str,
     ) -> Result<Account, AccountError> {
         let address = Address::parse(email.trim()).map_err(|error| {
-            AccountError::BadEmail(format!("`{email}` is not an address: {error}"))
+            AccountError::BadEmail(format!("`email` is not an address: {error}"))
         })?;
         self.insert(Account {
             id: String::new(),
@@ -305,7 +328,6 @@ impl Accounts {
             filed: Vec::new(),
             created_unix: now_unix(),
             plan: "free".to_string(),
-            linked_person: None,
         })
     }
 
@@ -317,7 +339,7 @@ impl Accounts {
     /// The same as [`Self::create_with_password`], minus the password checks.
     pub fn create_pending(&self, email: &str) -> Result<Account, AccountError> {
         let address = Address::parse(email.trim()).map_err(|error| {
-            AccountError::BadEmail(format!("`{email}` is not an address: {error}"))
+            AccountError::BadEmail(format!("`email` is not an address: {error}"))
         })?;
         self.insert(Account {
             id: String::new(),
@@ -328,7 +350,6 @@ impl Accounts {
             filed: Vec::new(),
             created_unix: now_unix(),
             plan: "free".to_string(),
-            linked_person: None,
         })
     }
 
@@ -368,20 +389,6 @@ impl Accounts {
     pub fn mark_verified(&self, id: &str) -> Result<(), AccountError> {
         self.update(id, |account| {
             account.email_verified = true;
-            Ok(())
-        })
-    }
-
-    /// Links the account to `name` — the [`selfhost_identity::PersonName`] an invite code
-    /// (`crate::invite`) was minted for, stored as its own string. Replaces any previous link
-    /// rather than refusing a second redemption, the same "the latest write wins" shape
-    /// [`Self::set_password`] already gives a credential.
-    ///
-    /// # Errors
-    /// [`AccountError::NotFound`] or an [`AccountError::Io`].
-    pub fn set_linked_person(&self, id: &str, name: &str) -> Result<(), AccountError> {
-        self.update(id, |account| {
-            account.linked_person = Some(name.to_string());
             Ok(())
         })
     }
@@ -586,7 +593,7 @@ pub fn email_fingerprint(email: &str) -> String {
 }
 
 /// The stored file's JSON shape: `{"accounts": [{id, email, emailVerified, password,
-/// oauthLinks: [{provider, subject}], createdUnix, plan, linkedPerson}]}`.
+/// oauthLinks: [{provider, subject}], createdUnix, plan}]}`.
 fn accounts_to_json(entries: &[Account]) -> Json {
     Json::object([(
         "accounts",
@@ -619,13 +626,6 @@ fn accounts_to_json(entries: &[Account]) -> Json {
                 ),
                 ("createdUnix", Json::Number(account.created_unix as f64)),
                 ("plan", Json::string(&account.plan)),
-                (
-                    "linkedPerson",
-                    account
-                        .linked_person
-                        .as_ref()
-                        .map_or(Json::Null, Json::string),
-                ),
             ])
         })),
     )])
@@ -702,10 +702,6 @@ fn parse_accounts(text: &str) -> Option<Vec<Account>> {
                 .and_then(Json::as_str)
                 .unwrap_or("free")
                 .to_string(),
-            linked_person: item
-                .get("linkedPerson")
-                .and_then(Json::as_str)
-                .map(str::to_string),
         });
     }
     Some(entries)
@@ -814,6 +810,82 @@ mod tests {
             .create_with_password("not an address", "hunter2fish")
             .expect_err("refused");
         assert!(matches!(error, AccountError::BadEmail(_)), "{error}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `crate::service`'s module documentation promises a refusal "names the field that was
+    /// wrong, never the value". Every door that parses an address must keep that promise, or an
+    /// anonymous `POST` gets to choose bytes that land in somebody else's browser.
+    #[test]
+    fn a_refused_address_names_the_field_and_never_repeats_what_was_sent() {
+        let dir = scratch("bad-email-not-echoed");
+        let accounts = Accounts::load(&dir);
+        let payload = "<script>alert(1)</script>";
+        let refusals = [
+            accounts
+                .create_with_password(payload, "hunter2fish")
+                .expect_err("refused"),
+            accounts
+                .create_with_oauth(payload, true, "google", "sub-1")
+                .expect_err("refused"),
+            accounts.create_pending(payload).expect_err("refused"),
+        ];
+        for error in refusals {
+            let message = error.to_string();
+            assert!(
+                !message.contains(payload),
+                "the refusal echoed what was sent: {message}"
+            );
+            assert!(
+                message.starts_with("`email` is not an address"),
+                "{message}"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The seam an account takeover ran through: "this account has a credential" is not
+    /// "somebody proved this address is theirs", and only the second may be merged into by
+    /// address alone.
+    #[test]
+    fn an_address_counts_as_proven_only_once_something_actually_proved_it() {
+        let dir = scratch("email-proven");
+        let accounts = Accounts::load(&dir);
+
+        let squatted = accounts
+            .create_pending("victim@example.com")
+            .expect("registers");
+        assert!(
+            !squatted.email_proven(),
+            "naming an address is not proving it"
+        );
+
+        let with_password = accounts
+            .create_with_password("typed-it-in@example.com", "hunter2fish")
+            .expect("registers");
+        assert!(
+            !with_password.email_proven(),
+            "a password proves a password, not an address"
+        );
+
+        let unvouched = accounts
+            .create_with_oauth("unvouched@example.com", false, "example", "sub-1")
+            .expect("registers");
+        assert!(!unvouched.email_proven());
+
+        let vouched = accounts
+            .create_with_oauth("vouched@example.com", true, "example", "sub-2")
+            .expect("registers");
+        assert!(vouched.email_proven(), "the provider checked");
+
+        accounts.mark_verified(&squatted.id).expect("verified");
+        assert!(
+            accounts
+                .find_by_id(&squatted.id)
+                .expect("still there")
+                .email_proven(),
+            "a clicked verification link is the other proof"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -926,38 +998,21 @@ mod tests {
     }
 
     #[test]
-    fn linking_a_person_persists_across_a_reload() {
-        let dir = scratch("linked-person");
-        let accounts = Accounts::load(&dir);
-        let account = accounts
-            .create_pending("alex@example.com")
-            .expect("registers");
-        assert_eq!(account.linked_person, None, "unlinked until an invite is redeemed");
-        accounts
-            .set_linked_person(&account.id, "mom")
-            .expect("linked");
-
-        let reloaded = Accounts::load(&dir);
-        let found = reloaded.find_by_id(&account.id).expect("found after reload");
-        assert_eq!(found.linked_person.as_deref(), Some("mom"));
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn an_account_file_written_before_linked_person_existed_still_parses() {
-        // `linkedPerson` did not exist when the account store's format was first written; a
-        // stored account with no such field must still load rather than being treated as
-        // corruption, and must load as unlinked rather than panicking on a missing key.
-        let dir = scratch("pre-linked-person");
+    fn an_account_file_written_before_the_plan_field_existed_still_parses() {
+        // `plan` did not exist when the account store's format was first written; a stored
+        // account with no such field must still load rather than being treated as corruption.
+        let dir = scratch("pre-plan");
         std::fs::write(
             Accounts::path_in(&dir),
             r#"{"accounts":[
-                {"id":"acct-1","email":"a@example.com","emailVerified":false,"password":null,"oauthLinks":[],"createdUnix":1,"plan":"free"}
+                {"id":"acct-1","email":"a@example.com","emailVerified":false,"password":null,"oauthLinks":[],"createdUnix":1}
             ]}"#,
         )
         .unwrap();
-        let found = Accounts::load(&dir).find_by_id("acct-1").expect("still parses");
-        assert_eq!(found.linked_person, None);
+        let found = Accounts::load(&dir)
+            .find_by_id("acct-1")
+            .expect("still parses");
+        assert_eq!(found.plan, "free");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -996,7 +1051,6 @@ mod tests {
             filed: Vec::new(),
             created_unix: 0,
             plan: "free".to_string(),
-            linked_person: None,
         });
         accounts.lock().extend(seeded);
 
@@ -1058,14 +1112,22 @@ mod tests {
         assert_eq!(parts[0], "pbkdf2-sha256");
         assert_eq!(parts[1], selfhost_login::password::ITERATIONS.to_string());
         assert_eq!(
-            selfhost_login::password::b64_decode(parts[3]).unwrap().len(),
+            selfhost_login::password::b64_decode(parts[3])
+                .unwrap()
+                .len(),
             selfhost_login::password::KEY_LEN
         );
     }
 
     #[test]
     fn an_unrecognised_hash_format_fails_closed() {
-        assert!(!selfhost_login::password::verify("plaintextpassword", "plaintextpassword"));
-        assert!(!selfhost_login::password::verify("md5$deadbeef", "anything"));
+        assert!(!selfhost_login::password::verify(
+            "plaintextpassword",
+            "plaintextpassword"
+        ));
+        assert!(!selfhost_login::password::verify(
+            "md5$deadbeef",
+            "anything"
+        ));
     }
 }

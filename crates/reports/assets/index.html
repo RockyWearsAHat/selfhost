@@ -1,267 +1,365 @@
 <!doctype html>
-<html lang="en">
+<html lang="en" data-view="checking">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Reports account</title>
+<meta name="color-scheme" content="light dark">
+<meta name="theme-color" content="#fbfaf7" media="(prefers-color-scheme: light)">
+<meta name="theme-color" content="#0e0f12" media="(prefers-color-scheme: dark)">
+<meta name="referrer" content="no-referrer">
+<meta name="description" content="File, track, and withdraw reports under your own account, served from this box.">
 <!--
-  This markup is served by crates/reports/src/service.rs (GET <route>/ and
-  GET <route>/index.html), via include_str!, so it is the one page in this crate that is not
-  pure JSON. It has to run inline <script> and inline <style> to exist at all with no build
-  step and no external resource, so the response this page is served with carries a looser
-  Content-Security-Policy than every JSON route in this crate does — see html_page() in
-  service.rs. That policy is: this origin plus 'unsafe-inline' for script and style, nothing
-  else, no external host. Nothing on this page loads a font, a script, or an image from
-  anywhere but the box it was served from.
+  This is the whole frontend of crates/reports: one shell, served by
+  crates/reports/src/service.rs for GET <route>/, GET <route>/index.html, and (for a browser
+  Accept) GET <route>/verify. It carries no inline <style> and no inline <script>, which is
+  what lets the response's Content-Security-Policy refuse 'unsafe-inline' entirely: the
+  stylesheet and the script are their own routes, app.css and app.js, served from this same
+  origin and from nowhere else. Every asset below is referenced RELATIVELY, because <route>
+  is configurable and this page must work wherever the crate is mounted.
+
+  Nothing here loads a font, a script, an image, or a stylesheet from another host, and the
+  page never renders a value the server sent as markup — app.js writes text through
+  textContent and passes URLs through a scheme allowlist. See docs/SECURITY.md §3.10.
 -->
-<style>
-  :root { color-scheme: light dark; }
-  body {
-    font: 15px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-    max-width: 32rem;
-    margin: 3rem auto;
-    padding: 0 1.25rem;
-  }
-  h1 { font-size: 1.15rem; margin: 0 0 .25rem; }
-  p.lede { color: #767676; margin-top: 0; }
-  fieldset { border: 1px solid #ccc; border-radius: 6px; padding: 1rem; margin: 0 0 1.25rem; }
-  legend { padding: 0 .35rem; font-weight: 600; }
-  label { display: block; margin: .6rem 0 .2rem; font-size: .85rem; }
-  input[type=email], input[type=password], input[type=text] {
-    width: 100%;
-    box-sizing: border-box;
-    padding: .4rem .5rem;
-    font-size: .95rem;
-  }
-  button {
-    margin-top: .85rem;
-    padding: .45rem .9rem;
-    font-size: .9rem;
-    cursor: pointer;
-  }
-  .hint { font-size: .8rem; color: #767676; margin: .3rem 0 0; }
-  .error { color: #b00020; font-size: .85rem; margin: .5rem 0 0; white-space: pre-wrap; }
-  .error:empty { display: none; }
-  dl { margin: 0 0 1.25rem; }
-  dt { font-weight: 600; margin-top: .6rem; }
-  dd { margin: .1rem 0 0; }
-  ul.grants { margin: .2rem 0 0; padding-left: 1.1rem; }
-  #signed-in { display: none; }
-  #download-box { border: 1px solid #ccc; border-radius: 6px; padding: 1rem; margin-top: 1rem; }
-  code { font-size: .85em; }
-</style>
+<link rel="stylesheet" href="app.css">
+<link rel="icon" href="favicon.svg" type="image/svg+xml">
+<script src="app.js" defer></script>
 </head>
 <body>
 
-<h1>Reports account</h1>
-<p class="lede">Sign in to file, track, or withdraw reports under your own name, and to redeem an invite code.</p>
+<a class="skip" href="#main">Skip to content</a>
 
-<div id="anonymous">
+<div class="wrap">
 
-  <fieldset>
-    <legend>Register</legend>
-    <form id="register-form">
-      <label for="register-email">Email</label>
-      <input id="register-email" type="email" required autocomplete="email">
-      <label for="register-password">Password</label>
-      <input id="register-password" type="password" required autocomplete="new-password">
-      <label for="register-invite">Invite code (optional)</label>
-      <input id="register-invite" type="text" autocomplete="off" placeholder="leave blank for a plain account">
-      <p class="hint">Filling this in links the new account to whoever the code was minted for, instead of registering plain.</p>
-      <button type="submit">Register</button>
-      <p class="error" id="register-error"></p>
-    </form>
-  </fieldset>
+  <header class="masthead">
+    <p class="mark">Reports</p>
+    <span class="host" id="who"></span>
+  </header>
 
-  <fieldset>
-    <legend>Log in</legend>
-    <form id="login-form">
-      <label for="login-email">Email</label>
-      <input id="login-email" type="email" required autocomplete="email">
-      <label for="login-password">Password</label>
-      <input id="login-password" type="password" required autocomplete="current-password">
-      <button type="submit">Log in</button>
-      <p class="error" id="login-error"></p>
-    </form>
-  </fieldset>
+  <noscript>
+    <div class="banner bad">
+      <p><strong>This page needs JavaScript.</strong> The account API is plain JSON, though —
+        <code class="mono">POST</code> to <code class="mono">register</code>,
+        <code class="mono">login</code>, and <code class="mono">mine</code> under this same
+        path works from any HTTP client.</p>
+    </div>
+  </noscript>
+
+  <main id="main">
+
+    <!-- ── boot ─────────────────────────────────────────────────────────── -->
+    <section class="view view-checking" aria-busy="true" aria-label="Loading">
+      <div class="block">
+        <div class="skeleton"><span></span><span></span><span></span><span></span></div>
+      </div>
+    </section>
+
+    <!-- ── signed out ───────────────────────────────────────────────────── -->
+    <section class="view view-anon" aria-labelledby="anon-title">
+      <h1 id="anon-title" tabindex="-1">Your reports, under your own name</h1>
+      <p class="lede">Sign in to file a report, watch what happens to it, and withdraw it if
+        you change your mind. Accounts live on this box and nowhere else.</p>
+
+      <div id="anon-banner"></div>
+
+      <div class="block primary">
+        <h2 id="signin-title">Sign in</h2>
+        <form id="login-form" action="#" novalidate>
+          <div class="field">
+            <label for="login-email">Email</label>
+            <input id="login-email" name="email" type="email" required autocomplete="username"
+              inputmode="email" autocapitalize="none" autocorrect="off" spellcheck="false"
+              aria-describedby="login-error">
+          </div>
+          <div class="field">
+            <label for="login-password">Password</label>
+            <input id="login-password" name="password" type="password" required
+              autocomplete="current-password" aria-describedby="login-error">
+          </div>
+          <div class="actions">
+            <button type="submit" class="btn-primary" id="login-submit">Sign in</button>
+            <button type="button" class="btn" id="passkey-login" hidden>Use a passkey</button>
+          </div>
+          <p class="error" id="login-error" role="alert"></p>
+        </form>
+
+        <div id="oauth-row" hidden>
+          <hr class="rule">
+          <h3>Or continue with</h3>
+          <div class="actions" id="oauth-buttons"></div>
+          <p class="hint">This hands you off to the provider and brings you straight back
+            here. This box never sees your password there.</p>
+        </div>
+      </div>
+
+      <div class="block">
+        <h2 id="register-title">Register a new account</h2>
+        <p class="note tight">Nothing but an email address and a password. No name, no
+          profile, no third party.</p>
+        <form id="register-form" action="#" novalidate>
+          <div class="field">
+            <label for="register-email">Email</label>
+            <input id="register-email" name="email" type="email" required autocomplete="email"
+              inputmode="email" autocapitalize="none" autocorrect="off" spellcheck="false"
+              aria-describedby="register-error register-email-hint">
+            <p class="hint" id="register-email-hint">Used to confirm the account and to reach
+              you about your own reports. Nothing else.</p>
+          </div>
+          <div class="field">
+            <label for="register-password">Password</label>
+            <input id="register-password" name="password" type="password" required
+              autocomplete="new-password" minlength="8" maxlength="200"
+              aria-describedby="register-error register-password-hint">
+            <p class="hint" id="register-password-hint">At least 8 characters. Length beats
+              symbols.</p>
+          </div>
+          <div class="actions">
+            <button type="submit" class="btn" id="register-submit">Register</button>
+            <button type="button" class="btn" id="passkey-register" hidden>Register with a
+              passkey instead</button>
+          </div>
+          <p class="error" id="register-error" role="alert"></p>
+        </form>
+      </div>
+    </section>
+
+    <!-- ── signed in ────────────────────────────────────────────────────── -->
+    <section class="view view-in" aria-labelledby="in-title">
+      <h1 id="in-title" tabindex="-1">Your account</h1>
+      <div id="in-banner"></div>
+
+      <div class="shell">
+        <nav class="rail" aria-label="Sections">
+          <ul>
+            <li><button type="button" data-pane="file">File a report</button></li>
+            <li><button type="button" data-pane="mine">Your reports</button></li>
+            <li><button type="button" data-pane="account">Account</button></li>
+            <li><button type="button" data-pane="download">Download</button></li>
+          </ul>
+        </nav>
+
+        <div>
+          <!-- file a report -->
+          <section class="pane" id="pane-file" aria-labelledby="file-title">
+            <div class="block primary">
+              <h2 id="file-title" tabindex="-1">File a report</h2>
+              <p class="note tight">One report per defect. If the same thing has been filed
+                before, this becomes another sighting of it rather than a duplicate.</p>
+              <form id="file-form" action="#" novalidate>
+                <div class="field">
+                  <label for="file-project">Project</label>
+                  <select id="file-project" name="project" aria-describedby="file-project-hint">
+                  </select>
+                  <p class="hint" id="file-project-hint">Which service this is about.</p>
+                </div>
+                <div class="field" id="file-newproject-field" hidden>
+                  <label for="file-newproject">New project key</label>
+                  <input id="file-newproject" name="newproject" type="text" maxlength="40"
+                    autocapitalize="none" autocorrect="off" spellcheck="false"
+                    aria-describedby="file-newproject-hint">
+                  <p class="hint" id="file-newproject-hint">1–40 characters of a–z, 0–9, dot,
+                    underscore or dash, starting and ending with a letter or digit.</p>
+                </div>
+                <div class="field">
+                  <span class="field-label" id="kind-label">Kind</span>
+                  <div class="choices" role="radiogroup" aria-labelledby="kind-label">
+                    <label class="choice"><input type="radio" name="kind" value="bug" checked>
+                      <span>Bug — something is wrong</span></label>
+                    <label class="choice"><input type="radio" name="kind" value="suggestion">
+                      <span>Suggestion — could be better</span></label>
+                    <label class="choice"><input type="radio" name="kind" value="observation">
+                      <span>Observation — just what happened</span></label>
+                  </div>
+                </div>
+                <div class="field">
+                  <label for="file-title-input">Title <span class="counter"
+                    id="file-title-counter"></span></label>
+                  <input id="file-title-input" name="title" type="text" required maxlength="200"
+                    aria-describedby="file-error file-title-hint">
+                  <p class="hint" id="file-title-hint">One line naming what went wrong.</p>
+                </div>
+                <div class="field">
+                  <label for="file-detail">Detail <span class="counter"
+                    id="file-detail-counter"></span></label>
+                  <textarea id="file-detail" name="detail" required maxlength="8000"
+                    aria-describedby="file-error file-detail-hint"></textarea>
+                  <p class="hint" id="file-detail-hint">What you did, what you expected, what
+                    happened instead.</p>
+                </div>
+                <div class="field">
+                  <label for="file-repro">Smallest way to reproduce it <span class="counter"
+                    id="file-repro-counter"></span></label>
+                  <textarea id="file-repro" name="repro" maxlength="2000"
+                    aria-describedby="file-repro-hint"></textarea>
+                  <p class="hint" id="file-repro-hint">Optional, and the single most useful
+                    field when you have one.</p>
+                </div>
+                <details class="field">
+                  <summary>Context (optional)</summary>
+                  <div class="field">
+                    <label for="file-route">Route — the command, tool or surface involved</label>
+                    <input id="file-route" name="route" type="text" maxlength="120">
+                  </div>
+                  <div class="field">
+                    <label for="file-tool">Tool</label>
+                    <input id="file-tool" name="tool" type="text" maxlength="60">
+                  </div>
+                  <div class="field">
+                    <label for="file-platform">Platform</label>
+                    <input id="file-platform" name="platform" type="text" maxlength="40">
+                  </div>
+                  <div class="field">
+                    <label for="file-workspace">Workspace</label>
+                    <input id="file-workspace" name="workspace" type="text" maxlength="120">
+                  </div>
+                </details>
+                <div class="actions">
+                  <button type="submit" class="btn-primary" id="file-submit">File it</button>
+                </div>
+                <p class="error" id="file-error" role="alert"></p>
+              </form>
+            </div>
+            <div class="block" id="file-result" hidden>
+              <h3 id="file-result-title"></h3>
+              <p class="note tight" id="file-result-note"></p>
+              <div class="actions">
+                <button type="button" class="btn" id="file-result-see">See it in your reports</button>
+                <button type="button" class="btn-quiet" id="file-result-again">File another</button>
+              </div>
+            </div>
+          </section>
+
+          <!-- your reports -->
+          <section class="pane" id="pane-mine" aria-labelledby="mine-title">
+            <div class="block">
+              <div class="block-head">
+                <h2 id="mine-title" tabindex="-1">Your reports</h2>
+                <button type="button" class="btn-quiet" id="mine-refresh">Refresh</button>
+              </div>
+              <p class="note" id="mine-note"></p>
+              <ul class="ledger" id="mine-list"></ul>
+              <p class="error" id="mine-error" role="alert"></p>
+            </div>
+          </section>
+
+          <!-- account -->
+          <section class="pane" id="pane-account" aria-labelledby="account-title">
+            <h2 id="account-title" tabindex="-1">Account</h2>
+
+            <div class="block">
+              <h3>Identity</h3>
+              <dl class="facts">
+                <dt>Email</dt><dd><span class="mono" id="account-email"></span>
+                  <span id="account-verified"></span></dd>
+                <dt>Account id</dt><dd><span class="mono id" id="account-id"></span>
+                  <button type="button" class="btn-quiet" id="account-id-copy">Copy</button></dd>
+                <dt>Plan</dt><dd id="account-plan"></dd>
+                <dt>Member since</dt><dd id="account-created"></dd>
+              </dl>
+            </div>
+
+            <div class="block">
+              <h3 id="password-title">Password</h3>
+              <p class="note tight" id="password-note"></p>
+              <form id="password-form" action="#" novalidate>
+                <div class="field">
+                  <label for="password-new">New password</label>
+                  <input id="password-new" name="password" type="password" required
+                    autocomplete="new-password" minlength="8" maxlength="200"
+                    aria-describedby="password-error password-consequence">
+                  <p class="hint" id="password-consequence">This signs out every other device.
+                    You stay signed in here on a fresh session.</p>
+                </div>
+                <div class="actions">
+                  <button type="submit" class="btn" id="password-submit">Set password</button>
+                </div>
+                <p class="error" id="password-error" role="alert"></p>
+              </form>
+            </div>
+
+            <div class="block" id="passkeys-block" hidden>
+              <div class="block-head">
+                <h3>Passkeys</h3>
+                <span class="chip count" id="passkeys-count"></span>
+              </div>
+              <ul class="ledger" id="passkeys-list"></ul>
+              <div class="actions">
+                <button type="button" class="btn" id="passkey-add">Add a passkey</button>
+              </div>
+              <p class="note">Passkeys cannot be removed from this page — there is no route
+                for it yet. The CLI is the way.</p>
+              <p class="error" id="passkey-error" role="alert"></p>
+            </div>
+
+            <div class="block" id="linked-block" hidden>
+              <h3>Linked sign-ins</h3>
+              <div class="actions" id="linked-list"></div>
+            </div>
+
+            <div class="block">
+              <h3>Session</h3>
+              <p class="note tight">Signing out clears the cookie for this browser only.</p>
+              <div class="actions">
+                <button type="button" class="btn" id="logout-button">Sign out</button>
+              </div>
+            </div>
+          </section>
+
+          <!-- download -->
+          <section class="pane" id="pane-download" aria-labelledby="download-title">
+            <div class="block primary">
+              <h2 id="download-title" tabindex="-1">Download selfhost</h2>
+              <p class="note tight" id="download-note">Fetching the current link…</p>
+              <div class="actions" id="download-actions"></div>
+              <div id="download-clone"></div>
+              <p class="hint" id="download-setup"></p>
+              <p class="error" id="download-error" role="alert"></p>
+            </div>
+            <div class="block">
+              <h3>What this does not give you</h3>
+              <p class="note tight">The source, and nothing else. Downloading it is not access
+                to this box: joining a machine's peer network always needs that machine
+                owner's own invitation.</p>
+            </div>
+          </section>
+        </div>
+      </div>
+    </section>
+
+    <!-- ── confirm an email address ─────────────────────────────────────── -->
+    <section class="view view-verify" aria-labelledby="verify-title">
+      <div class="block primary">
+        <h1 id="verify-title" tabindex="-1">Confirm your email address</h1>
+        <p class="note tight" id="verify-note">Press confirm and this address is marked as
+          reachable. The link works once.</p>
+        <div class="actions" id="verify-actions">
+          <button type="button" class="btn-primary" id="verify-confirm">Confirm</button>
+        </div>
+        <p class="error" id="verify-error" role="alert"></p>
+      </div>
+    </section>
+
+    <!-- ── accounts are off ─────────────────────────────────────────────── -->
+    <section class="view view-unavailable" aria-labelledby="off-title">
+      <div class="block">
+        <h1 id="off-title" tabindex="-1">Accounts aren't turned on for this box</h1>
+        <p class="note tight">Reports can still be filed without an account — the filing
+          endpoint is open. There is nothing to sign in to here until the operator runs
+          <code class="mono">selfhost reports serve --accounts</code>.</p>
+      </div>
+    </section>
+
+  </main>
+
+  <p class="sr-only" id="status" role="status" aria-live="polite"></p>
+
+  <footer class="tag">
+    <span>Served from this box</span>
+    <span id="foot-route"></span>
+  </footer>
 
 </div>
-
-<div id="signed-in">
-
-  <dl>
-    <dt>Signed in as</dt>
-    <dd id="account-email"></dd>
-    <dt>Linked to</dt>
-    <dd id="account-linked"></dd>
-    <dt>Permissions</dt>
-    <dd id="account-grants"></dd>
-  </dl>
-
-  <div id="download-box">
-    <p id="download-line">Loading the download link&hellip;</p>
-  </div>
-
-  <fieldset>
-    <legend>Have an invite code?</legend>
-    <form id="redeem-form">
-      <label for="redeem-code">Invite code</label>
-      <input id="redeem-code" type="text" required autocomplete="off">
-      <button type="submit">Redeem</button>
-      <p class="error" id="redeem-error"></p>
-    </form>
-  </fieldset>
-
-  <button id="logout-button" type="button">Log out</button>
-
-</div>
-
-<script>
-(function () {
-  "use strict";
-
-  // The route this page itself was served under, derived from the address bar rather than
-  // hard-coded: crates/reports/src/service.rs mounts this whole crate at a configurable
-  // <route> (the deployed box uses "/report"), and the page must call the same prefix it was
-  // served from rather than assuming one.
-  var routeBase = location.pathname.replace(/\/index\.html$/, "").replace(/\/$/, "");
-
-  function api(path, options) {
-    options = options || {};
-    options.credentials = "same-origin";
-    return fetch(routeBase + path, options).then(function (response) {
-      return response.json().catch(function () { return {}; }).then(function (body) {
-        return { ok: response.ok, status: response.status, body: body };
-      });
-    });
-  }
-
-  function jsonPost(path, payload) {
-    return api(path, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(payload)
-    });
-  }
-
-  function showError(id, message) {
-    document.getElementById(id).textContent = message || "";
-  }
-
-  function el(id) { return document.getElementById(id); }
-
-  function showSignedIn(me) {
-    el("anonymous").style.display = "none";
-    el("signed-in").style.display = "block";
-    el("account-email").textContent = me.email;
-    el("account-linked").textContent = me.linkedPerson || "not linked to anyone yet";
-    var grants = el("account-grants");
-    grants.textContent = "";
-    if (!me.grants || me.grants.length === 0) {
-      grants.textContent = "no permissions granted yet";
-    } else {
-      var list = document.createElement("ul");
-      list.className = "grants";
-      me.grants.forEach(function (grant) {
-        var item = document.createElement("li");
-        item.textContent = grant;
-        list.appendChild(item);
-      });
-      grants.appendChild(list);
-    }
-    loadDownload();
-  }
-
-  function showAnonymous() {
-    el("signed-in").style.display = "none";
-    el("anonymous").style.display = "block";
-  }
-
-  function loadDownload() {
-    api("/download", { method: "GET" }).then(function (result) {
-      var line = el("download-line");
-      if (!result.ok) {
-        line.textContent = "the download link is not available right now";
-        return;
-      }
-      line.textContent = "";
-      var link = document.createElement("a");
-      link.href = result.body.downloadUrl;
-      link.textContent = "Download the latest version";
-      line.appendChild(link);
-      var setup = document.createElement("p");
-      setup.className = "hint";
-      setup.textContent = result.body.setup;
-      line.appendChild(setup);
-    });
-  }
-
-  function refreshMe() {
-    return api("/me", { method: "GET" }).then(function (result) {
-      if (result.ok) {
-        showSignedIn(result.body);
-      } else {
-        showAnonymous();
-      }
-      return result;
-    });
-  }
-
-  el("register-form").addEventListener("submit", function (event) {
-    event.preventDefault();
-    showError("register-error", "");
-    var email = el("register-email").value;
-    var password = el("register-password").value;
-    var code = el("register-invite").value.trim();
-    var call = code
-      ? jsonPost("/invite/redeem", { code: code, email: email, password: password })
-      : jsonPost("/register", { email: email, password: password });
-    call.then(function (result) {
-      if (!result.ok) {
-        showError("register-error", result.body.error || "registration failed");
-        return;
-      }
-      refreshMe();
-    });
-  });
-
-  el("login-form").addEventListener("submit", function (event) {
-    event.preventDefault();
-    showError("login-error", "");
-    var email = el("login-email").value;
-    var password = el("login-password").value;
-    jsonPost("/login", { email: email, password: password }).then(function (result) {
-      if (!result.ok) {
-        showError("login-error", result.body.error || "sign-in failed");
-        return;
-      }
-      refreshMe();
-    });
-  });
-
-  el("redeem-form").addEventListener("submit", function (event) {
-    event.preventDefault();
-    showError("redeem-error", "");
-    var code = el("redeem-code").value.trim();
-    jsonPost("/invite/redeem", { code: code }).then(function (result) {
-      if (!result.ok) {
-        showError("redeem-error", result.body.error || "could not redeem this code");
-        return;
-      }
-      el("redeem-code").value = "";
-      refreshMe();
-    });
-  });
-
-  el("logout-button").addEventListener("click", function () {
-    api("/logout", { method: "POST" }).then(function () {
-      showAnonymous();
-    });
-  });
-
-  refreshMe();
-})();
-</script>
 
 </body>
 </html>

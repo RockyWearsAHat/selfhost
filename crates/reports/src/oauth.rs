@@ -28,8 +28,25 @@
 //! intercepted between the provider's redirect and this box's callback (a malicious app on the
 //! same device registering the same custom scheme, a proxy in the path) could be redeemed by
 //! whoever intercepted it; PKCE binds the code to the party that started the request. The
-//! verifier lives in [`Pending`], server-side, keyed by the `state` value — never in a cookie —
-//! so the flow needs no cookie at all until a session is actually minted at the end of it.
+//! verifier lives in [`Pending`], server-side, keyed by the `state` value — never in a cookie.
+//!
+//! # `state` says the attempt is live; the nonce cookie says it is *this browser's*
+//!
+//! PKCE binds the authorization code to this box. It does not bind the attempt to the browser
+//! that started it, and `state` on its own does not either: it is a value that travels through a
+//! redirect chain, so it can be lifted out of a `Referer`, a proxy log, or a shoulder — or simply
+//! *planted*, by an attacker who starts a sign-in as themselves and then walks a victim into the
+//! resulting callback URL. Either way the victim's browser redeems an attempt somebody else
+//! owns, and this box mints them a session on the attacker's account: login CSRF, and every
+//! report the victim files afterwards lands somewhere the attacker can read it.
+//!
+//! So [`authorize_url`] also mints a **nonce**, hands it back for the caller to set as a
+//! short-lived `HttpOnly` cookie on the redirect, and stores only its SHA-256 in the [`Attempt`].
+//! [`complete`] refuses — with the same [`OAuthError::ExpiredState`] an unknown `state` gets, so
+//! the two are indistinguishable — unless the callback presents a cookie hashing to what the
+//! attempt recorded. A stolen or planted `state` is now worth nothing without the browser that
+//! started the flow, and the digest means the pool of outstanding attempts is not itself a list
+//! of live credentials.
 //!
 //! # What this box requires before it trusts an email
 //!
@@ -60,8 +77,14 @@ const READ_CHUNK: usize = 8 * 1024;
 /// The default port for `https`.
 const HTTPS_PORT: u16 = 443;
 
-/// Bytes of entropy in a PKCE code verifier and in the `state` parameter.
+/// Bytes of entropy in a PKCE code verifier, in the `state` parameter, and in the browser nonce.
 const VERIFIER_BYTES: usize = 32;
+
+/// The cookie that ties an outstanding sign-in attempt to the browser that started it.
+///
+/// Named alongside `crate::sessions::COOKIE_NAME` and set with the identical attribute string —
+/// see [`nonce_cookie_header`].
+pub const NONCE_COOKIE_NAME: &str = "report_oauth_nonce";
 
 /// How long a start/callback round trip has before its state expires. Five minutes: generous
 /// for a person to authenticate at the provider, short enough that an abandoned attempt does not
@@ -84,9 +107,11 @@ pub enum OAuthError {
     ExpiredState,
     /// The provider's token or userinfo answer did not carry what was needed.
     Incomplete(String),
-    /// The provider did not vouch for the email as verified, and it already belongs to a
-    /// different, distinct account — refused rather than silently merged. See the module
-    /// documentation.
+    /// The address already belongs to a different, distinct account and the two sides of it were
+    /// not both proven — either this provider did not vouch for the address, or the account
+    /// standing there never proved it was theirs. Refused rather than silently merged, in one
+    /// sentence for both cases so the refusal cannot be used to tell them apart. See the module
+    /// documentation here and `crate::service::Service::oauth_account`'s.
     UnverifiedEmailConflict,
 }
 
@@ -138,6 +163,10 @@ struct Attempt {
     provider: String,
     code_verifier: String,
     redirect_uri: String,
+    /// The SHA-256 of the nonce handed to the browser that started this attempt, base64url —
+    /// the digest rather than the nonce itself, so this pool is not a list of values that would
+    /// redeem an attempt if it were ever read out of a core dump or a debug print.
+    nonce_digest: String,
     issued: Instant,
 }
 
@@ -157,13 +186,17 @@ impl Pending {
         }
     }
 
-    /// Starts one attempt for `provider`, returning `(state, code_verifier)`.
+    /// Starts one attempt for `provider`, returning `(state, code_verifier, nonce)`.
+    ///
+    /// The `nonce` is the browser's half of the binding: the caller sets it as a cookie (see
+    /// [`nonce_cookie_header`]) and only its digest is kept here.
     ///
     /// # Errors
     /// An [`io::Error`] naming what the system's random source refused.
-    fn start(&self, provider: &str, redirect_uri: &str) -> io::Result<(String, String)> {
+    fn start(&self, provider: &str, redirect_uri: &str) -> io::Result<(String, String, String)> {
         let state = b64url_encode(&random_bytes(VERIFIER_BYTES)?);
         let code_verifier = b64url_encode(&random_bytes(VERIFIER_BYTES)?);
+        let nonce = b64url_encode(&random_bytes(VERIFIER_BYTES)?);
         let now = Instant::now();
         let mut entries = self.lock();
         entries.retain(|entry| now.duration_since(entry.issued) < PENDING_LIFETIME);
@@ -175,28 +208,37 @@ impl Pending {
             provider: provider.to_string(),
             code_verifier: code_verifier.clone(),
             redirect_uri: redirect_uri.to_string(),
+            nonce_digest: nonce_digest(&nonce),
             issued: now,
         });
-        Ok((state, code_verifier))
+        Ok((state, code_verifier, nonce))
     }
 
     /// Redeems `state`, returning `(code_verifier, redirect_uri)` when it names a live attempt
-    /// for `provider`. Single-use: a callback replayed with the same `state` finds nothing the
-    /// second time.
-    fn take(&self, provider: &str, state: &str) -> Option<(String, String)> {
+    /// for `provider` **and** `nonce` is the one handed to the browser that started it. Single-
+    /// use: a callback replayed with the same `state` finds nothing the second time.
+    ///
+    /// A missing or wrong `nonce` answers `None`, exactly as an unknown `state` does — the
+    /// caller turns both into the one "this sign-in attempt has expired" sentence, so a client
+    /// holding a `state` it did not start learns nothing about whether that `state` was real.
+    /// The attempt is *not* consumed in that case: refusing a stranger's guess must not cancel
+    /// the sign-in the real browser is still in the middle of.
+    fn take(&self, provider: &str, state: &str, nonce: Option<&str>) -> Option<(String, String)> {
         let now = Instant::now();
         let mut entries = self.lock();
         entries.retain(|entry| now.duration_since(entry.issued) < PENDING_LIFETIME);
-        let mut found = None;
-        entries.retain(|entry| {
-            let hit = entry.provider == provider
-                && constant_time_eq(entry.state.as_bytes(), state.as_bytes());
-            if hit {
-                found = Some((entry.code_verifier.clone(), entry.redirect_uri.clone()));
-            }
-            !hit
+        let presented = nonce.map(nonce_digest);
+        let position = entries.iter().position(|entry| {
+            entry.provider == provider && constant_time_eq(entry.state.as_bytes(), state.as_bytes())
+        })?;
+        let matches_browser = presented.is_some_and(|digest| {
+            constant_time_eq(entries[position].nonce_digest.as_bytes(), digest.as_bytes())
         });
-        found
+        if !matches_browser {
+            return None;
+        }
+        let attempt = entries.remove(position);
+        Some((attempt.code_verifier, attempt.redirect_uri))
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, Vec<Attempt>> {
@@ -229,21 +271,25 @@ pub struct Identity {
 /// `redirect_uri` is the exact `…/report/oauth/<provider>/callback` address this box answers on
 /// — carried through to the token exchange because providers require the two to match exactly.
 ///
+/// Answers `(location, nonce)`. The caller **must** put `nonce` on the redirect as
+/// [`nonce_cookie_header`] builds it, or its own callback will refuse every attempt this call
+/// started — see the module documentation on what that cookie is for.
+///
 /// # Errors
 /// An [`io::Error`] naming what the system's random source refused.
 pub fn authorize_url(
     provider: &Provider,
     pending: &Pending,
     redirect_uri: &str,
-) -> io::Result<String> {
-    let (state, verifier) = pending.start(&provider.name, redirect_uri)?;
+) -> io::Result<(String, String)> {
+    let (state, verifier, nonce) = pending.start(&provider.name, redirect_uri)?;
     let challenge = b64url_encode(digest(&SHA256, verifier.as_bytes()).as_ref());
     let separator = if provider.authorize_url.contains('?') {
         '&'
     } else {
         '?'
     };
-    Ok(format!(
+    let location = format!(
         "{}{separator}response_type=code&client_id={}&redirect_uri={}&scope={}&state={}&code_challenge={}&code_challenge_method=S256",
         provider.authorize_url,
         percent_encode(&provider.client_id),
@@ -251,25 +297,77 @@ pub fn authorize_url(
         percent_encode(&provider.scope),
         percent_encode(&state),
         percent_encode(&challenge),
-    ))
+    );
+    Ok((location, nonce))
 }
 
-/// Completes the exchange: verifies `state`, trades `code` for a token, and reads the person's
-/// profile from the userinfo endpoint.
+/// The `Set-Cookie` line binding an outstanding attempt to the browser that started it.
+///
+/// Byte-for-byte the shape `selfhost_login::session::set_cookie_header` writes — it *is* that
+/// function, applied to this cookie's own name and lifetime — so this box has exactly one
+/// spelling of "HttpOnly, Secure when the deployment is https, SameSite=Lax, scoped to the
+/// route". `SameSite=Lax` is load-bearing rather than incidental: the callback arrives as a
+/// top-level `GET` navigation from the provider, which `Lax` allows and `Strict` would drop,
+/// taking every OAuth sign-in with it. `secure` comes from the caller's configured public base
+/// URL, exactly as the session cookie's does, because this service binds loopback and can never
+/// tell from the connection itself whether the browser reached the proxy over TLS.
+///
+/// Not cleared on the callback: the attempt it names is consumed server-side the moment it is
+/// redeemed, so what is left in the browser for the remaining few minutes names nothing.
+#[must_use]
+pub fn nonce_cookie_header(nonce: &str, route: &str, secure: bool) -> String {
+    selfhost_login::session::set_cookie_header(&NONCE_COOKIE_CONFIG, nonce, route, secure)
+}
+
+/// Reads the nonce cookie's value out of a request's `Cookie` header, if present.
+#[must_use]
+pub fn nonce_cookie_value(header: Option<&str>) -> Option<String> {
+    selfhost_login::session::cookie_value(&NONCE_COOKIE_CONFIG, header)
+}
+
+/// The cookie shape [`nonce_cookie_header`] and [`nonce_cookie_value`] share.
+///
+/// A [`selfhost_login::session::SessionConfig`] for something that is not a session: only its
+/// `cookie_name` and `lifetime_secs` are read by the two cookie functions above, and borrowing
+/// the type is what guarantees this cookie's attribute string can never drift from the session
+/// cookie's. The store fields are named so an accidental future call that *did* read them would
+/// be obviously wrong rather than quietly wrong.
+const NONCE_COOKIE_CONFIG: selfhost_login::session::SessionConfig =
+    selfhost_login::session::SessionConfig {
+        cookie_name: NONCE_COOKIE_NAME,
+        filename: "there-is-no-store-for-this-cookie.json",
+        // The cookie outlives nothing: `PENDING_LIFETIME` is when the attempt it names expires.
+        lifetime_secs: PENDING_LIFETIME.as_secs(),
+        idle_secs: 0,
+        max_sessions: 0,
+    };
+
+/// The base64url SHA-256 of a nonce — what [`Attempt`] stores instead of the nonce itself.
+fn nonce_digest(nonce: &str) -> String {
+    b64url_encode(digest(&SHA256, nonce.as_bytes()).as_ref())
+}
+
+/// Completes the exchange: verifies `state` *and* the browser nonce, trades `code` for a token,
+/// and reads the person's profile from the userinfo endpoint.
+///
+/// `nonce` is whatever the callback request's own [`NONCE_COOKIE_NAME`] cookie carried, or
+/// `None` when it carried none — both a missing and a wrong one refuse.
 ///
 /// # Errors
-/// [`OAuthError::ExpiredState`] when `state` names no live attempt for this provider,
-/// [`OAuthError::Transport`]/[`OAuthError::Tls`] for a network or TLS failure,
-/// [`OAuthError::Incomplete`] when the provider's answer is missing what was asked for.
+/// [`OAuthError::ExpiredState`] when `state` names no live attempt for this provider *or* the
+/// browser does not hold that attempt's nonce, [`OAuthError::Transport`]/[`OAuthError::Tls`] for
+/// a network or TLS failure, [`OAuthError::Incomplete`] when the provider's answer is missing
+/// what was asked for.
 pub async fn complete(
     provider: &Provider,
     pending: &Pending,
     client: &HttpsClient,
     code: &str,
     state: &str,
+    nonce: Option<&str>,
 ) -> Result<Identity, OAuthError> {
     let (verifier, redirect_uri) = pending
-        .take(&provider.name, state)
+        .take(&provider.name, state, nonce)
         .ok_or(OAuthError::ExpiredState)?;
 
     let body = format!(
@@ -751,40 +849,110 @@ mod tests {
     fn the_authorize_url_carries_pkce_and_records_the_attempt() {
         let provider = provider();
         let pending = Pending::new();
-        let url = authorize_url(
+        let (url, nonce) = authorize_url(
             &provider,
             &pending,
             "https://box.example/report/oauth/example/callback",
         )
         .expect("built");
+        assert!(
+            !nonce.is_empty(),
+            "a nonce comes back for the caller to set"
+        );
         assert!(url.starts_with("https://provider.example/authorize?"));
         assert!(url.contains("response_type=code"));
         assert!(url.contains("client_id=client-123"));
         assert!(url.contains("code_challenge_method=S256"));
         assert!(url.contains("state="));
         assert!(url.contains("code_challenge="));
-        // Two calls never reuse a state or a verifier.
-        let second = authorize_url(
+        // Two calls never reuse a state, a verifier, or a nonce.
+        let (second, second_nonce) = authorize_url(
             &provider,
             &pending,
             "https://box.example/report/oauth/example/callback",
         )
         .expect("built");
         assert_ne!(url, second);
+        assert_ne!(nonce, second_nonce);
     }
 
     #[test]
     fn a_state_redeems_exactly_once_and_only_for_its_provider() {
         let pending = Pending::new();
-        let (state, verifier) = pending.start("google", "https://cb").expect("started");
+        let (state, verifier, nonce) = pending.start("google", "https://cb").expect("started");
         assert!(
-            pending.take("github", &state).is_none(),
+            pending.take("github", &state, Some(&nonce)).is_none(),
             "the provider must match"
         );
-        let (found_verifier, redirect) = pending.take("google", &state).expect("redeems");
+        let (found_verifier, redirect) = pending
+            .take("google", &state, Some(&nonce))
+            .expect("redeems");
         assert_eq!(found_verifier, verifier);
         assert_eq!(redirect, "https://cb");
-        assert!(pending.take("google", &state).is_none(), "single-use");
+        assert!(
+            pending.take("google", &state, Some(&nonce)).is_none(),
+            "single-use"
+        );
+    }
+
+    /// The login-CSRF fix, at the layer that decides it: `state` alone is not enough, and a
+    /// stranger's guess at one must not cancel the attempt the real browser is still running.
+    #[test]
+    fn a_state_without_the_browser_that_started_it_redeems_nothing() {
+        let pending = Pending::new();
+        let (state, _, nonce) = pending.start("google", "https://cb").expect("started");
+        let (_, _, other_nonce) = pending
+            .start("google", "https://cb")
+            .expect("a second, unrelated attempt");
+
+        assert!(
+            pending.take("google", &state, None).is_none(),
+            "a callback carrying no cookie at all"
+        );
+        assert!(
+            pending.take("google", &state, Some(&other_nonce)).is_none(),
+            "a callback carrying somebody else's cookie"
+        );
+        assert!(
+            pending.take("google", &state, Some("")).is_none(),
+            "a callback carrying an empty cookie"
+        );
+        assert!(
+            pending.take("google", &state, Some(&nonce)).is_some(),
+            "the real browser is still able to finish"
+        );
+    }
+
+    #[test]
+    fn the_nonce_cookie_is_written_and_read_in_the_session_cookies_own_shape() {
+        let header = nonce_cookie_header("the-nonce", "/report", true);
+        assert!(header.starts_with(&format!("{NONCE_COOKIE_NAME}=the-nonce;")));
+        assert!(header.contains("HttpOnly"));
+        assert!(header.contains("Secure"));
+        assert!(header.contains("SameSite=Lax"));
+        assert!(header.contains("Path=/report"));
+        assert!(header.contains(&format!("Max-Age={}", PENDING_LIFETIME.as_secs())));
+        assert!(
+            !nonce_cookie_header("the-nonce", "/report", false).contains("Secure"),
+            "Secure follows the deployment, exactly as the session cookie's does"
+        );
+
+        let presented = format!("report_session=abc; {NONCE_COOKIE_NAME}=the-nonce; other=1");
+        assert_eq!(
+            nonce_cookie_value(Some(&presented)),
+            Some("the-nonce".to_string())
+        );
+        assert_eq!(nonce_cookie_value(Some("report_session=abc")), None);
+        assert_eq!(nonce_cookie_value(None), None);
+    }
+
+    #[test]
+    fn only_the_nonces_digest_is_kept_where_the_attempt_lives() {
+        let pending = Pending::new();
+        let (_, _, nonce) = pending.start("google", "https://cb").expect("started");
+        let stored = pending.lock()[0].nonce_digest.clone();
+        assert_ne!(stored, nonce, "the pool holds no redeemable value");
+        assert_eq!(stored, nonce_digest(&nonce));
     }
 
     #[test]

@@ -10,10 +10,6 @@
 //! selfhost reports close <project> <id>   a fixed report leaves the database
 //! selfhost reports token [--new]          the token a subscribed checkout reads the feed with
 //! selfhost reports oauth add|list|remove  the "sign in with…" providers accounts offers
-//! selfhost reports invite <name> [--hours N]   a one-time code linking a reports account to
-//!                                               a `PersonName` `selfhost people` already knows
-//! selfhost reports invited                who has one pending, until when
-//! selfhost reports uninvite <name>        withdraw an invitation nobody has redeemed
 //! ```
 //!
 //! `serve` is what a supervised service runs; everything else is an operator at a terminal.
@@ -31,19 +27,23 @@
 //! when `--accounts` is on the command line — so a deployment that has never touched this flag
 //! keeps behaving exactly as it did before this subsystem existed, on every redeploy. Turning it
 //! on needs `--public-base-url` (this box's own address — the flag exists because nothing this
-//! service sees tells it whether the proxy in front of it terminated TLS); `--rp-id` additionally
-//! enables the passkey routes (unset, they answer the same `404` an unconfigured token route
-//! does); OAuth providers come from `selfhost reports oauth add`, not a flag, because a client
-//! secret does not belong on a command line a process list can see.
+//! service sees tells it whether the proxy in front of it terminated TLS). The passkey routes
+//! need no flag of their own: `--rp-id` is *derived* from `--public-base-url`'s host, because
+//! that host is the only value a ceremony could ever verify against — see [`relying_party_id`],
+//! which refuses a mismatch and declines to derive one from an address literal (`127.0.0.1`,
+//! `[::1]`), since a relying party id must be a domain name. The ceremony's expected **origin**
+//! is a different value and comes from the whole of `--public-base-url` — scheme, host and port
+//! — so a box served at `http://localhost:8080` works. OAuth providers come from `selfhost
+//! reports oauth add`, not a flag, because a client secret does not belong on a command line a
+//! process list can see.
 //!
-//! # `reports invite` links an account to a name; it never grants anything
+//! # No invite code — see `crates/reports/src/service.rs`'s module documentation
 //!
-//! `selfhost_reports::invite::Invites` is its own store, separate from `crates/admin/src/
-//! invite.rs`'s console invitations — a reports account and a console passkey are different
-//! credentials for possibly the same human. `selfhost reports invite <name>` only mints a code
-//! that a reports account can redeem (`POST <route>/invite/redeem`) to become linked to `name`;
-//! it never touches `selfhost people`'s grants, which stay exactly `selfhost people allow/grant/
-//! deny`'s job, made before or after this command runs in either order.
+//! A reports account is never linked to a `selfhost_identity::PersonName` and never carries any
+//! grant. Nothing this subsystem shows an account is visible to anyone but that account, so
+//! there is nothing an invite would need to gate. Invite codes exist only for *direct server
+//! access* — the NAS, the VPN, the admin console, the mesh — through `selfhost people invite`,
+//! entirely separate from this command.
 
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
@@ -94,12 +94,9 @@ pub fn run(arguments: &[String], config: &Config, project_dir: &Path) -> Result<
         "close" => close(arguments, &store),
         "token" => token(arguments, &data_dir),
         "oauth" => oauth_command(arguments, &data_dir.join(ACCOUNTS_DIR)),
-        "invite" => invite(arguments, &data_dir.join(ACCOUNTS_DIR)),
-        "invited" => invited(&data_dir.join(ACCOUNTS_DIR)),
-        "uninvite" => uninvite(&data_dir.join(ACCOUNTS_DIR), invite_name_argument(arguments)?),
         other => Err(format!(
             "`{other}` is not a reports command — it is serve, project, projects, list, close, \
-             token, oauth, invite, invited, or uninvite"
+             token, or oauth"
         )),
     }
 }
@@ -195,17 +192,25 @@ fn serve(
 ///
 /// # Errors
 /// A sentence naming the missing or malformed flag: `--accounts` needs `--public-base-url` at
-/// minimum, and it must be an absolute `http(s)://` address with no trailing slash.
+/// minimum, and it must be an absolute `http(s)://` address with no trailing slash. See
+/// [`check_public_base_url`] and [`relying_party_id`] for the two refusals that are about
+/// security rather than spelling.
 fn accounts_config(arguments: &[String], data_dir: &Path) -> Result<AccountsConfig, String> {
     let public_base_url = crate::value_of(arguments, "--public-base-url").ok_or(
         "`--accounts` needs `--public-base-url https://your.domain` — this box's own public \
          address, used to build verification links and OAuth redirects",
     )?;
     let public_base_url = public_base_url.trim_end_matches('/').to_string();
-    if !public_base_url.starts_with("http://") && !public_base_url.starts_with("https://") {
-        return Err(format!(
-            "--public-base-url {public_base_url}: must start with http:// or https://"
-        ));
+    let host = check_public_base_url(&public_base_url)?;
+    let rp_id = relying_party_id(arguments, host)?;
+    if rp_id.is_none() {
+        // The only way to get here is an address literal — see `relying_party_id`. Said out
+        // loud rather than left to the banner's "passkeys off", because "off" is the answer to
+        // a question the operator did not ask and the reason is not guessable from it.
+        eprintln!(
+            "reports: passkeys are off — {host} is an IP address and a WebAuthn relying party \
+             id must be a domain name. Reach this box by a name to turn them on."
+        );
     }
     let accounts_dir = data_dir.join(ACCOUNTS_DIR);
     let verify_from = crate::value_of(arguments, "--verify-from").ok_or(
@@ -217,7 +222,7 @@ fn accounts_config(arguments: &[String], data_dir: &Path) -> Result<AccountsConf
         site_name: crate::value_of(arguments, "--site-name")
             .unwrap_or_else(|| "this box's reports".to_string()),
         public_base_url,
-        rp_id: crate::value_of(arguments, "--rp-id"),
+        rp_id,
         oauth_providers: load_oauth_providers(&accounts_dir)?,
         verify_helo: crate::value_of(arguments, "--verify-helo").unwrap_or_else(|| {
             verify_from
@@ -235,13 +240,167 @@ fn accounts_config(arguments: &[String], data_dir: &Path) -> Result<AccountsConf
         mail_data_dir: Some(data_dir.to_path_buf()),
         // Five attempts, then one every twelve seconds: generous for a person mistyping a
         // password, a wall for a script trying many.
+        //
+        // Five is only survivable because nothing at page-load frequency spends it — a signed-in
+        // person's `me`/`mine`/`download` are on the page-visit budget, deliberately, so that
+        // reloading an account page can never lock somebody out of signing in. The two
+        // state-changing `POST`s a session makes (`me/password`, `mine/withdraw`) *are* on this
+        // bucket, because replacing a credential and destroying a record are attempts at the
+        // account door whatever cookie they carry. See the reports crate's "Four budgets".
         per_action: selfhost_reports::Rate::new(5, 5.0),
-        // The box's own top-level data directory — *not* `accounts_dir` above, which is this
-        // subsystem's own sibling. `POST <route>/me` and `POST <route>/invite/redeem` read
-        // `selfhost_identity::People` from here, the same file `selfhost people` writes, so a
-        // grant made through that command is the grant this door reads back.
-        identity_data_dir: data_dir.to_path_buf(),
+        // And what everybody together may attempt: two hundred at once, then two a second.
+        // Deliberately far wider than one source's allowance — it is the wall against a
+        // thousand sources each staying inside theirs, not a second copy of that wall, and a
+        // shared bucket the size of one visitor's would refuse the third person to sign in this
+        // minute.
+        global_action: selfhost_reports::Rate::new(200, 120.0),
     })
+}
+
+/// Checks `--public-base-url` and answers the host inside it.
+///
+/// # `http://` is refused on anything but loopback
+///
+/// This box has a real public IP, and `docs/SECURITY.md` §3.2 is the rule this enforces: the
+/// session cookie's `Secure` attribute is derived from exactly this URL (see
+/// `selfhost_reports::service::Service::cookies_secure`), so `--accounts --public-base-url
+/// http://reports.example.com` ships every account's session cookie with no `Secure` at all,
+/// over a scheme that carries it in clear text to anyone on the path. Nothing in the running
+/// service can notice — it binds loopback and never sees TLS either way — so the only place this
+/// can be caught is here, before the door opens. `http://localhost` and `http://127.0.0.1` stay
+/// allowed because a cookie that never leaves the machine has nothing to be stolen off of, and
+/// developing against this subsystem otherwise needs a certificate.
+///
+/// # Errors
+/// A sentence naming the flag and why the value cannot be used.
+fn check_public_base_url(public_base_url: &str) -> Result<&str, String> {
+    let (scheme, rest) = public_base_url
+        .split_once("://")
+        .filter(|(scheme, _)| *scheme == "http" || *scheme == "https")
+        .ok_or_else(|| {
+            format!("--public-base-url {public_base_url}: must start with http:// or https://")
+        })?;
+    let host = host_of_authority(rest.split('/').next().unwrap_or_default());
+    if host.is_empty() {
+        return Err(format!(
+            "--public-base-url {public_base_url}: names no host"
+        ));
+    }
+    if scheme == "http" && !is_loopback_host(host) {
+        return Err(format!(
+            "--public-base-url {public_base_url}: refusing to run `--accounts` over plain \
+             http:// on {host}. This box has a real public IP, and the session cookie's \
+             `Secure` attribute is taken from this URL — over http:// every account's cookie \
+             would be sent in clear text and stealable by anyone on the path. Use https:// \
+             (the reverse proxy terminates TLS on 443), or http://localhost for local \
+             development."
+        ));
+    }
+    Ok(host)
+}
+
+/// The host out of a URL authority, dropping a `:port` — and never mistaking an IPv6 literal's
+/// own colons for one, which is why this is not a bare `rsplit_once(':')`.
+fn host_of_authority(authority: &str) -> &str {
+    if let Some(end) = authority.find(']') {
+        return &authority[..=end];
+    }
+    match authority.rsplit_once(':') {
+        Some((host, port))
+            if !port.is_empty() && port.bytes().all(|byte| byte.is_ascii_digit()) =>
+        {
+            host
+        }
+        _ => authority,
+    }
+}
+
+/// Whether `host` is this machine talking to itself, which is the one place a cookie with no
+/// `Secure` attribute has nothing to be stolen off of.
+fn is_loopback_host(host: &str) -> bool {
+    matches!(host, "localhost" | "127.0.0.1" | "[::1]" | "::1")
+        || host.ends_with(".localhost")
+        || host.starts_with("127.")
+}
+
+/// The WebAuthn relying party id: `--rp-id` when given, otherwise `--public-base-url`'s own
+/// host — and `None`, meaning the passkey routes stay off, when that host cannot be one.
+///
+/// # These two are one value, and disagreeing is unexplainable at runtime
+///
+/// The browser sends the relying party id back inside the authenticator data, as a hash, and
+/// `selfhost_reports::webauthn::Webauthn` compares it against exactly this value. It is a
+/// **bare host** — the specification's RP ID is a domain string, so it carries no scheme and no
+/// port — and the page it runs on is `--public-base-url`, because that is the address this box
+/// hands out. When the two disagree, *every* passkey ceremony fails, and it fails inside the
+/// uniform "the passkey ceremony could not be verified" refusal that a forged assertion also
+/// gets, because that refusal is deliberately the same for every cause. There is no log line to
+/// find and no difference to observe: the door is simply, permanently shut. So a mismatch is
+/// refused here, where the two values are both in hand and a sentence can say which one to
+/// change.
+///
+/// The ceremony's expected **origin** is a different value and is no longer derived from this
+/// one: `selfhost_reports` reads it whole out of `--public-base-url` (scheme, host and port).
+/// Rebuilding it as `https://<rp_id>` is what broke `http://localhost:8080` — the address this
+/// file's own `check_public_base_url` recommends for development — and it broke it in the
+/// silent way described above.
+///
+/// # An IP literal is not a relying party id, and pretending otherwise switches on a dead door
+///
+/// WebAuthn's RP ID must be a valid domain string. `127.0.0.1`, `[::1]` and any other address
+/// literal are not, and a browser refuses the ceremony before this box is ever asked — so
+/// deriving one from `--public-base-url http://127.0.0.1:8080` would turn the passkey routes on
+/// with a value that can never work, which is strictly worse than the clean `404` they give
+/// when they are off. Derived from an IP literal, the answer is therefore `None` (and
+/// [`accounts_config`] says so on the way past). Asked for *explicitly* as `--rp-id 127.0.0.1`,
+/// it is an error: the operator named a value that cannot work, and silently ignoring a flag
+/// somebody typed is its own kind of lie. `localhost` is a domain string, is what browsers
+/// special-case as a secure context, and keeps working.
+///
+/// The one thing this refuses that WebAuthn itself permits is a registrable-suffix relying party
+/// (`--rp-id example.com` for a page on `reports.example.com`). That is legal in the standard,
+/// but this crate's RP-ID check is an exact compare, so accepting it here would produce
+/// the very failure this function exists to prevent.
+///
+/// # Errors
+/// A sentence naming both values when `--rp-id` disagrees with the public base URL's host, or
+/// naming the literal when `--rp-id` is an IP address.
+fn relying_party_id(arguments: &[String], host: &str) -> Result<Option<String>, String> {
+    match crate::value_of(arguments, "--rp-id") {
+        Some(rp_id) if rp_id != host => Err(format!(
+            "--rp-id {rp_id} does not match --public-base-url's host {host}. A passkey ceremony \
+             is bound to the relying party id and the browser reports the host the page was \
+             served from, so these two disagreeing makes every passkey sign-in fail with an \
+             error nobody can explain. Pass --rp-id {host}, or leave it off — it is derived \
+             from --public-base-url."
+        )),
+        Some(rp_id) if !is_domain_string(&rp_id) => Err(format!(
+            "--rp-id {rp_id} is an IP address, and a WebAuthn relying party id must be a domain \
+             name. A browser refuses the ceremony before this box is ever asked, so turning the \
+             passkey routes on with this value would give you a door that can never open. Reach \
+             this box by a name (http://localhost for development), or drop --rp-id and \
+             --public-base-url's host will be used when it is a name."
+        )),
+        Some(rp_id) => Ok(Some(rp_id)),
+        None if !is_domain_string(host) => Ok(None),
+        None => Ok(Some(host.to_string())),
+    }
+}
+
+/// Whether `host` can be a WebAuthn relying party id — that is, whether it is a name rather than
+/// an address literal.
+///
+/// Deliberately a *shape* test and not a resolvability test: this runs at startup with no
+/// network, and the question is only whether a browser will accept the value as a domain string.
+/// A bracketed IPv6 literal and anything made entirely of digits and dots are the two forms that
+/// are not.
+fn is_domain_string(host: &str) -> bool {
+    if host.starts_with('[') {
+        return false;
+    }
+    !host
+        .bytes()
+        .all(|byte| byte.is_ascii_digit() || byte == b'.')
 }
 
 /// The mailbox notifications go to, from the flags or from `[mail]` in the config.
@@ -511,127 +670,6 @@ fn oauth_remove(arguments: &[String], accounts_dir: &Path) -> Result<(), String>
     Ok(())
 }
 
-/// `selfhost reports invite <name> [--hours N]` — mints a one-time code that lets whoever holds
-/// it link a reports account to `name`.
-///
-/// Deliberately does not touch `selfhost people`'s registry: this command produces the
-/// *credential* a reports account proves the link with, and nothing here decides what `name`
-/// may do once linked — that stays `selfhost people allow/grant/deny`'s job entirely, run before
-/// or after this one in either order. See this module's own documentation for why the two are
-/// kept apart, the same reasoning `crates/admin/src/invite.rs` gives its own console invitation.
-fn invite(arguments: &[String], accounts_dir: &Path) -> Result<(), String> {
-    let name = invite_name_argument(arguments)?;
-    let hours = invite_hours_argument(arguments)?;
-    let code = selfhost_reports::invite::Invites::load(accounts_dir)
-        .mint(&name, hours)
-        .map_err(|error| format!("could not write the invitation: {error}"))?;
-
-    println!("an invitation for {name}, good for {hours} hours and usable once");
-    println!();
-    println!("  Their code is:");
-    println!();
-    println!("    {code}");
-    println!();
-    println!(
-        "  Send them <this box's public address><route>/ (`<route>` is whatever `selfhost \
-         reports serve` was given as `--route` — `/report` unless it was changed) — that page \
-         has a \"have an invite code?\" field that POSTs it for them. No account for them yet? \
-         They paste the code alongside a fresh email and password; already have one? They sign \
-         in first and paste the code alone."
-    );
-    println!();
-    println!(
-        "  Driving it by hand instead: with no reports account yet, POST \
-         `<route>/invite/redeem` with {{\"code\":\"{code}\",\"email\":…,\"password\":…}} and it \
-         creates one, linked, and signed in. Already signed in to one, the body is just \
-         {{\"code\":\"{code}\"}} and it links the account that is already there."
-    );
-    println!();
-    println!(
-        "  The code works once and is not stored anywhere it can be read back, so send it now \
-         — if it is lost, run this again and the old one stops working."
-    );
-    println!();
-    println!(
-        "  A running `selfhost reports serve --accounts …` loaded its invitations once, at \
-         startup, and does not watch this file — this code is invisible to it until it \
-         restarts, the same as a freshly added `reports oauth` provider."
-    );
-    Ok(())
-}
-
-/// `selfhost reports invited` — who has an invitation pending, and until when.
-fn invited(accounts_dir: &Path) -> Result<(), String> {
-    let outstanding = selfhost_reports::invite::Invites::load(accounts_dir).outstanding();
-    if outstanding.is_empty() {
-        println!("No invitation is pending.");
-        println!();
-        println!("  selfhost reports invite <name>");
-        println!();
-        println!("mints one, and prints the code to send.");
-        return Ok(());
-    }
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|since| since.as_secs())
-        .unwrap_or(0);
-    for entry in &outstanding {
-        let left = entry.expires_unix.saturating_sub(now);
-        println!();
-        println!("{}", entry.name);
-        println!("  expires in {} hours", left / 3_600);
-    }
-    println!();
-    println!(
-        "{} pending. The codes themselves are not stored and cannot be shown again.",
-        outstanding.len()
-    );
-    Ok(())
-}
-
-/// `selfhost reports uninvite <name>` — withdraws an invitation nobody has redeemed.
-fn uninvite(accounts_dir: &Path, name: selfhost_identity::PersonName) -> Result<(), String> {
-    match selfhost_reports::invite::Invites::load(accounts_dir).revoke(&name) {
-        Ok(true) => {
-            println!("the invitation for {name} is withdrawn and its code opens nothing");
-            Ok(())
-        }
-        Ok(false) => Err(format!("{name} has no invitation pending; nothing changed")),
-        Err(error) => Err(format!("could not write the invitations: {error}")),
-    }
-}
-
-/// The person named by the third argument to `reports invite`/`reports uninvite`, validated.
-fn invite_name_argument(arguments: &[String]) -> Result<selfhost_identity::PersonName, String> {
-    let text = arguments
-        .get(2)
-        .ok_or("which person? e.g. `selfhost reports invite mom`")?;
-    selfhost_identity::PersonName::parse(text).map_err(|_| {
-        format!(
-            "\"{text}\" is not a usable person name: lower-case letters, digits and dashes, and \
-             never the owner's own name, which names an authority that is not granted"
-        )
-    })
-}
-
-/// The `--hours N` pair on `reports invite`, or [`selfhost_reports::invite::DEFAULT_TTL_HOURS`]
-/// when it is not given.
-fn invite_hours_argument(arguments: &[String]) -> Result<u64, String> {
-    let Some(index) = arguments.iter().position(|word| word == "--hours") else {
-        return Ok(selfhost_reports::invite::DEFAULT_TTL_HOURS);
-    };
-    let text = arguments
-        .get(index + 1)
-        .ok_or_else(|| "--hours needs a number of hours after it".to_owned())?;
-    let hours: u64 = text
-        .parse()
-        .map_err(|_| format!("\"{text}\" is not a number of hours"))?;
-    if hours == 0 {
-        return Err("an invitation that lasts no time cannot be used".to_owned());
-    }
-    Ok(hours.min(selfhost_reports::invite::MAX_TTL_HOURS))
-}
-
 /// Where the OAuth provider file lives for a given accounts directory.
 fn oauth_providers_path(accounts_dir: &Path) -> PathBuf {
     accounts_dir.join(OAUTH_PROVIDERS_FILE)
@@ -736,6 +774,158 @@ mod tests {
         ));
         let _ = std::fs::remove_dir_all(&path);
         path
+    }
+
+    /// `serve --accounts` derives the session cookie's `Secure` attribute from this URL, so a
+    /// plain-`http://` public address on a box with a real public IP ships every account's
+    /// cookie in the clear. Nothing downstream can notice; this is the only place it can be
+    /// refused.
+    #[test]
+    fn plain_http_is_refused_as_a_public_address_but_allowed_on_loopback() {
+        let refused = check_public_base_url("http://reports.example.com").expect_err("refused");
+        assert!(refused.contains("--public-base-url"), "{refused}");
+        assert!(refused.contains("Secure"), "{refused}");
+        assert!(refused.contains("clear text"), "{refused}");
+
+        assert_eq!(
+            check_public_base_url("https://reports.example.com"),
+            Ok("reports.example.com")
+        );
+        assert_eq!(
+            check_public_base_url("http://localhost:8080"),
+            Ok("localhost")
+        );
+        assert_eq!(
+            check_public_base_url("http://127.0.0.1:8080"),
+            Ok("127.0.0.1")
+        );
+        assert_eq!(check_public_base_url("http://[::1]:8080"), Ok("[::1]"));
+
+        assert!(
+            check_public_base_url("reports.example.com").is_err(),
+            "no scheme"
+        );
+        assert!(check_public_base_url("ftp://reports.example.com").is_err());
+        assert!(check_public_base_url("https://").is_err(), "no host");
+    }
+
+    /// A relying party id that disagrees with the address the page is served from fails every
+    /// passkey ceremony, inside a refusal that is deliberately the same for every cause — so
+    /// there is nothing to debug at runtime and it has to be caught here.
+    #[test]
+    fn the_relying_party_id_is_the_public_hosts_or_it_is_refused() {
+        let none: Vec<String> = Vec::new();
+        assert_eq!(
+            relying_party_id(&none, "reports.example.com"),
+            Ok(Some("reports.example.com".to_string())),
+            "derived rather than left off, which used to turn passkeys silently off"
+        );
+
+        let agreeing = vec!["--rp-id".to_string(), "reports.example.com".to_string()];
+        assert_eq!(
+            relying_party_id(&agreeing, "reports.example.com"),
+            Ok(Some("reports.example.com".to_string()))
+        );
+
+        let disagreeing = vec!["--rp-id".to_string(), "example.com".to_string()];
+        let error = relying_party_id(&disagreeing, "reports.example.com").expect_err("refused");
+        assert!(error.contains("example.com"), "{error}");
+        assert!(error.contains("reports.example.com"), "{error}");
+        assert!(error.contains("--rp-id reports.example.com"), "{error}");
+    }
+
+    /// A relying party id must be a domain string. Derived from an address literal it is left
+    /// off — the clean `404` the passkey routes give when they are not configured — rather than
+    /// switched on with a value no browser will accept, which is a door that cannot open and
+    /// says nothing about why. Named explicitly it is an error, because silently ignoring a
+    /// flag somebody typed is its own kind of lie.
+    #[test]
+    fn an_address_literal_is_not_a_relying_party_id() {
+        let none: Vec<String> = Vec::new();
+        for literal in ["127.0.0.1", "[::1]", "192.168.1.8"] {
+            assert_eq!(
+                relying_party_id(&none, literal),
+                Ok(None),
+                "{literal} derived a relying party id a browser will refuse"
+            );
+        }
+
+        for literal in ["127.0.0.1", "[::1]"] {
+            let asked = vec!["--rp-id".to_string(), literal.to_string()];
+            let error = relying_party_id(&asked, literal).expect_err("refused");
+            assert!(error.contains(literal), "{error}");
+            assert!(error.contains("domain name"), "{error}");
+        }
+
+        // `localhost` is a domain string, is what browsers special-case as a secure context,
+        // and is the address this file's own `check_public_base_url` recommends for
+        // development. It keeps working, port or no port.
+        assert_eq!(
+            relying_party_id(&none, "localhost"),
+            Ok(Some("localhost".to_string()))
+        );
+    }
+
+    /// The relying party id is a bare host and the WebAuthn origin is a whole origin, and
+    /// deriving the second from the first is what shut the passkey door on every deployment not
+    /// served on 443. `crates/reports` reads the origin out of `public_base_url`; these are the
+    /// values it gets, from the exact flags a person would type.
+    #[test]
+    fn the_ceremony_origin_carries_the_scheme_and_port_the_relying_party_id_drops() {
+        let dir = scratch("origin-derivation");
+        for (base, host, origin) in [
+            (
+                "https://reports.example.com",
+                "reports.example.com",
+                "https://reports.example.com",
+            ),
+            // The development address `check_public_base_url` itself recommends: a different
+            // scheme *and* a port, both of which `https://<rp_id>` threw away.
+            (
+                "http://localhost:8080",
+                "localhost",
+                "http://localhost:8080",
+            ),
+            (
+                "https://localhost:8443",
+                "localhost",
+                "https://localhost:8443",
+            ),
+        ] {
+            let arguments = vec!["--public-base-url".to_string(), base.to_string()];
+            let config = accounts_config(&arguments_with_from(&arguments), &dir).expect("config");
+            assert_eq!(config.rp_id.as_deref(), Some(host), "{base}: relying party");
+            assert_eq!(
+                selfhost_reports::service::origin_of(&config.public_base_url).as_deref(),
+                Some(origin),
+                "{base}: ceremony origin"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `--verify-from` is required by `accounts_config` and is not what the test above is
+    /// about, so it is appended rather than repeated at every call.
+    fn arguments_with_from(arguments: &[String]) -> Vec<String> {
+        let mut out = arguments.to_vec();
+        out.push("--verify-from".to_string());
+        out.push("reports@example.com".to_string());
+        out
+    }
+
+    #[test]
+    fn a_port_is_not_part_of_the_host_and_an_ipv6_literals_colons_are_not_a_port() {
+        assert_eq!(
+            host_of_authority("reports.example.com"),
+            "reports.example.com"
+        );
+        assert_eq!(
+            host_of_authority("reports.example.com:8443"),
+            "reports.example.com"
+        );
+        assert_eq!(host_of_authority("[::1]"), "[::1]");
+        assert_eq!(host_of_authority("[::1]:8080"), "[::1]");
+        assert_eq!(host_of_authority("host:notaport"), "host:notaport");
     }
 
     #[test]
