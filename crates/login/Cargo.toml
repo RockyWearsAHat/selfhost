@@ -1,0 +1,17 @@
+[package]
+name = "selfhost-login"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Password hashing and session-cookie primitives shared by every login door in this workspace."
+
+[dependencies]
+# PBKDF2-HMAC-SHA256 and the session id's entropy. The same single crypto provider every other
+# crate in this workspace links; no second implementation is added.
+ring = { workspace = true }
+selfhost-json = { workspace = true }
+
+[lints.rust]
+unsafe_code = "forbid"

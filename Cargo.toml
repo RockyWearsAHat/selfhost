@@ -9,6 +9,7 @@ members = [
     "crates/dns",
     "crates/identity",
     "crates/igd",
+    "crates/login",
     "crates/firewall",
     "crates/git",
     "crates/http",
@@ -80,6 +81,7 @@ selfhost-firewall = { path = "crates/firewall" }
 selfhost-git = { path = "crates/git" }
 selfhost-http = { path = "crates/http" }
 selfhost-json = { path = "crates/json" }
+selfhost-login = { path = "crates/login" }
 selfhost-mail = { path = "crates/mail" }
 selfhost-mesh = { path = "crates/mesh" }
 selfhost-proxy = { path = "crates/proxy" }

@@ -28,6 +28,9 @@ impl Status {
     pub const PARTIAL_CONTENT: Self = Self(206);
     /// Permanent redirect preserving the method.
     pub const MOVED_PERMANENTLY: Self = Self(301);
+    /// A temporary redirect to `Location` — the OAuth authorization-code dance's own status,
+    /// which every browser follows as a `GET` regardless of the method that reached it.
+    pub const FOUND: Self = Self(302);
     /// The client's cached representation is still fresh.
     pub const NOT_MODIFIED: Self = Self(304);
     /// Permanent redirect that must not change the method.
@@ -81,6 +84,7 @@ impl Status {
             206 => "Partial Content",
             207 => "Multi-Status",
             301 => "Moved Permanently",
+            302 => "Found",
             304 => "Not Modified",
             308 => "Permanent Redirect",
             400 => "Bad Request",
@@ -157,19 +161,31 @@ pub struct Response {
 impl Response {
     /// A response with no body.
     pub fn empty(status: Status) -> Self {
-        Self { status, headers: Headers::new(), body: Body::Empty }
+        Self {
+            status,
+            headers: Headers::new(),
+            body: Body::Empty,
+        }
     }
 
     /// A response carrying an in-memory body of the given content type.
     pub fn bytes(status: Status, content_type: &str, bytes: Vec<u8>) -> Result<Self, HeaderError> {
         let mut headers = Headers::new();
         headers.set("Content-Type", content_type)?;
-        Ok(Self { status, headers, body: Body::Bytes(bytes) })
+        Ok(Self {
+            status,
+            headers,
+            body: Body::Bytes(bytes),
+        })
     }
 
     /// A `text/html` response.
     pub fn html(status: Status, markup: impl Into<String>) -> Result<Self, HeaderError> {
-        Self::bytes(status, "text/html; charset=utf-8", markup.into().into_bytes())
+        Self::bytes(
+            status,
+            "text/html; charset=utf-8",
+            markup.into().into_bytes(),
+        )
     }
 
     /// A minimal styled error page.
@@ -238,7 +254,10 @@ impl Response {
         if self.status == Status::SWITCHING_PROTOCOLS {
             headers.set("Connection", "Upgrade")?;
         } else {
-            headers.set("Connection", if keep_alive { "keep-alive" } else { "close" })?;
+            headers.set(
+                "Connection",
+                if keep_alive { "keep-alive" } else { "close" },
+            )?;
         }
         headers.write_to(out);
         out.extend_from_slice(b"\r\n");
@@ -300,7 +319,11 @@ impl IncomingResponse {
     /// can be made to read the *next* response as part of this one.
     pub fn parse(input: &[u8]) -> Result<ParsedResponse, ParseError> {
         let head_end = crate::request::find_head_end(input).ok_or({
-            if input.len() > MAX_HEAD_BYTES { ParseError::HeadTooLarge } else { ParseError::Incomplete }
+            if input.len() > MAX_HEAD_BYTES {
+                ParseError::HeadTooLarge
+            } else {
+                ParseError::Incomplete
+            }
         })?;
         if head_end > MAX_HEAD_BYTES {
             return Err(ParseError::HeadTooLarge);
@@ -325,7 +348,12 @@ impl IncomingResponse {
 
         let framing = framing_of(status, &headers)?;
         Ok(ParsedResponse {
-            response: IncomingResponse { status, minor_version, headers, framing },
+            response: IncomingResponse {
+                status,
+                minor_version,
+                headers,
+                framing,
+            },
             consumed: head_end,
         })
     }
@@ -378,10 +406,16 @@ fn framing_of(status: Status, headers: &Headers) -> Result<ResponseFraming, Pars
         let value = headers
             .get_str("transfer-encoding")
             .ok_or(ParseError::AmbiguousFraming("non-UTF-8 Transfer-Encoding"))?;
-        let final_coding =
-            value.rsplit(',').next().map(str::trim).unwrap_or_default().to_ascii_lowercase();
+        let final_coding = value
+            .rsplit(',')
+            .next()
+            .map(str::trim)
+            .unwrap_or_default()
+            .to_ascii_lowercase();
         if final_coding != "chunked" {
-            return Err(ParseError::AmbiguousFraming("Transfer-Encoding does not end with chunked"));
+            return Err(ParseError::AmbiguousFraming(
+                "Transfer-Encoding does not end with chunked",
+            ));
         }
         return Ok(ResponseFraming::Chunked);
     }
@@ -400,7 +434,9 @@ fn framing_of(status: Status, headers: &Headers) -> Result<ResponseFraming, Pars
             .ok_or(ParseError::AmbiguousFraming("non-UTF-8 Content-Length"))?
             .trim();
         if text.is_empty() || !text.bytes().all(|byte| byte.is_ascii_digit()) {
-            return Err(ParseError::AmbiguousFraming("Content-Length is not a bare integer"));
+            return Err(ParseError::AmbiguousFraming(
+                "Content-Length is not a bare integer",
+            ));
         }
         let parsed: u64 = text
             .parse()
@@ -409,7 +445,9 @@ fn framing_of(status: Status, headers: &Headers) -> Result<ResponseFraming, Pars
             None => agreed = Some(parsed),
             Some(existing) if existing == parsed => {}
             Some(_) => {
-                return Err(ParseError::AmbiguousFraming("conflicting Content-Length values"));
+                return Err(ParseError::AmbiguousFraming(
+                    "conflicting Content-Length values",
+                ));
             }
         }
     }
@@ -430,12 +468,18 @@ mod incoming_tests {
         assert_eq!(parsed.response.status, Status(200));
         assert_eq!(parsed.response.minor_version, 1);
         assert_eq!(parsed.response.framing, ResponseFraming::Fixed(3));
-        assert_eq!(&"HTTP/1.1 200 OK\r\nContent-Length: 3\r\n\r\nabc"[parsed.consumed..], "abc");
+        assert_eq!(
+            &"HTTP/1.1 200 OK\r\nContent-Length: 3\r\n\r\nabc"[parsed.consumed..],
+            "abc"
+        );
     }
 
     #[test]
     fn an_unfinished_head_asks_for_more() {
-        assert!(matches!(parse("HTTP/1.1 200 OK\r\n"), Err(ParseError::Incomplete)));
+        assert!(matches!(
+            parse("HTTP/1.1 200 OK\r\n"),
+            Err(ParseError::Incomplete)
+        ));
     }
 
     #[test]
@@ -487,8 +531,8 @@ mod incoming_tests {
             parse("HTTP/1.1 200 OK\r\nContent-Length: 4\r\nContent-Length: 5\r\n\r\n"),
             Err(ParseError::AmbiguousFraming(_))
         ));
-        let parsed =
-            parse("HTTP/1.1 200 OK\r\nContent-Length: 4\r\nContent-Length: 4\r\n\r\n").expect("parse");
+        let parsed = parse("HTTP/1.1 200 OK\r\nContent-Length: 4\r\nContent-Length: 4\r\n\r\n")
+            .expect("parse");
         assert_eq!(parsed.response.framing, ResponseFraming::Fixed(4));
     }
 
@@ -513,7 +557,13 @@ mod incoming_tests {
 
     #[test]
     fn a_malformed_status_line_is_refused() {
-        for line in ["HTTP/1.1 20 OK", "HTTP/1.1 abc OK", "HTTP/2 200 OK", "200 OK", "HTTP/1.1"] {
+        for line in [
+            "HTTP/1.1 20 OK",
+            "HTTP/1.1 abc OK",
+            "HTTP/2 200 OK",
+            "200 OK",
+            "HTTP/1.1",
+        ] {
             let raw = format!("{line}\r\n\r\n");
             assert!(parse(&raw).is_err(), "accepted status line {line:?}");
         }
@@ -521,8 +571,10 @@ mod incoming_tests {
 
     #[test]
     fn a_head_that_is_too_large_is_refused_rather_than_buffered() {
-        let raw =
-            format!("HTTP/1.1 200 OK\r\nX-Pad: {}\r\n\r\n", "a".repeat(MAX_HEAD_BYTES));
+        let raw = format!(
+            "HTTP/1.1 200 OK\r\nX-Pad: {}\r\n\r\n",
+            "a".repeat(MAX_HEAD_BYTES)
+        );
         assert!(matches!(parse(&raw), Err(ParseError::HeadTooLarge)));
     }
 }
@@ -549,7 +601,10 @@ mod tests {
         // bytes written — that desynchronises the connection.
         let mut response = Response::bytes(Status::OK, "text/plain", b"hello".to_vec()).unwrap();
         response.headers.push("Content-Length", "999").unwrap();
-        response.headers.push("Transfer-Encoding", "chunked").unwrap();
+        response
+            .headers
+            .push("Transfer-Encoding", "chunked")
+            .unwrap();
 
         let head = head_of(&response, true);
         assert!(head.contains("Content-Length: 5\r\n"));
@@ -561,7 +616,10 @@ mod tests {
     fn bodiless_statuses_carry_no_content_length() {
         for status in [Status::NOT_MODIFIED, Status(204)] {
             let head = head_of(&Response::empty(status), true);
-            assert!(!head.contains("Content-Length"), "status {status} emitted a length");
+            assert!(
+                !head.contains("Content-Length"),
+                "status {status} emitted a length"
+            );
         }
     }
 
@@ -580,11 +638,17 @@ mod tests {
         // begins.
         for keep_alive in [true, false] {
             let head = head_of(&Response::empty(Status::SWITCHING_PROTOCOLS), keep_alive);
-            assert!(head.starts_with("HTTP/1.1 101 Switching Protocols\r\n"), "{head}");
+            assert!(
+                head.starts_with("HTTP/1.1 101 Switching Protocols\r\n"),
+                "{head}"
+            );
             assert!(head.contains("Connection: Upgrade\r\n"), "{head}");
             assert!(!head.contains("Content-Length"), "{head}");
             assert!(!head.to_ascii_lowercase().contains("keep-alive"), "{head}");
-            assert!(!head.to_ascii_lowercase().contains("connection: close"), "{head}");
+            assert!(
+                !head.to_ascii_lowercase().contains("connection: close"),
+                "{head}"
+            );
         }
     }
 
@@ -611,12 +675,19 @@ mod tests {
 
     #[test]
     fn status_line_is_well_formed() {
-        assert!(head_of(&Response::empty(Status::NOT_FOUND), true).starts_with("HTTP/1.1 404 Not Found\r\n"));
+        assert!(
+            head_of(&Response::empty(Status::NOT_FOUND), true)
+                .starts_with("HTTP/1.1 404 Not Found\r\n")
+        );
     }
 
     #[test]
     fn streamed_body_declares_its_length() {
-        let response = Response { status: Status::OK, headers: Headers::new(), body: Body::Streamed(1_048_576) };
+        let response = Response {
+            status: Status::OK,
+            headers: Headers::new(),
+            body: Body::Streamed(1_048_576),
+        };
         assert!(head_of(&response, true).contains("Content-Length: 1048576\r\n"));
     }
 
@@ -629,7 +700,9 @@ mod tests {
     fn error_page_is_self_describing() {
         let page = Response::error_page(Status::BAD_GATEWAY);
         assert_eq!(page.status, Status::BAD_GATEWAY);
-        let Body::Bytes(bytes) = &page.body else { panic!("expected an in-memory body") };
+        let Body::Bytes(bytes) = &page.body else {
+            panic!("expected an in-memory body")
+        };
         assert!(String::from_utf8_lossy(bytes).contains("502 Bad Gateway"));
     }
 }

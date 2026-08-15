@@ -10,11 +10,23 @@ description = "A public intake for bug reports: stored in the box's own database
 [dependencies]
 selfhost-http = { workspace = true }
 selfhost-json = { workspace = true }
+# Password hashing and session-cookie mechanics, shared with `selfhost-admin` rather than each
+# crate hand-rolling its own copy — see `selfhost_login`'s crate documentation.
+selfhost-login = { workspace = true }
 selfhost-mail = { workspace = true }
-# SHA-256 for the report fingerprint and for the one-way source hash. The same
-# `ring` the rest of the stack already links; no second implementation enters.
+# SHA-256 for the report fingerprint, the one-way source hash, and the accounts subsystem's
+# PBKDF2 password hashing and WebAuthn signature verification. The same `ring` the rest of the
+# stack already links; no second implementation enters.
 ring = { workspace = true }
 tokio = { workspace = true }
+# The OAuth "sign in with…" door dials exactly the provider an operator configured, over TLS it
+# verifies itself — the same three foundations `crates/acme` already links for the same reason
+# (an outbound HTTPS client this workspace's dependency policy has no third-party crate for).
+# `crates/reports/src/oauth.rs`'s module doc says why this is a mirror of `crates/acme`'s
+# transport rather than a dependency on that crate.
+tokio-rustls = { workspace = true }
+rustls = { workspace = true }
+webpki-roots = { workspace = true }
 
 [lints.rust]
 unsafe_code = "forbid"

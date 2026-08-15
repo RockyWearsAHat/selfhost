@@ -32,27 +32,46 @@
 //! - [`limit`] — token buckets, per source and global, with a bounded table of sources.
 //! - [`notify`] — the message that puts a report in the owner's mailbox, submitted to this
 //!   box's own SMTP server on loopback.
-//! - [`service`] — the four HTTP routes and what stands in front of them.
+//! - [`service`] — the HTTP routes and what stands in front of them.
 //! - [`clock`] — the two time formats the others write.
+//! - [`accounts`] — who filed a report and how they prove it later: email/password, an optional
+//!   passkey, an optional linked OAuth identity, all additive to the anonymous door above.
+//! - [`sessions`] — the cookie that keeps an account signed in across visits.
+//! - [`webauthn`] — passkey registration and login for an account, mirrored from
+//!   `crates/admin/src/webauthn.rs`.
+//! - [`oauth`] — "sign in with…" against a configured provider, PKCE-protected, with its own
+//!   hand-rolled outbound HTTPS client mirrored from `crates/acme/src/transport.rs`.
+//! - [`verify`] — confirming an account's email is reachable, and spooling that message into
+//!   this box's own outbound mail queue.
 //!
 //! # What this crate never does
 //!
-//! It does not execute anything, render anything, or fetch anything. It reads a JSON body,
-//! writes a file, and hands one message to a mail server on loopback. A report is text about
-//! a defect; nothing in this crate gives that text any power.
+//! It does not execute anything, render anything, or resolve a name for itself over DNS. It
+//! reads a JSON body, writes a file, and hands messages to a mail server on loopback or spools
+//! them for the daemon's own outbound sweep — and, now, dials exactly the identity provider an
+//! operator configured, over TLS it verifies itself. A report is text about a defect and an
+//! account is a credential to see one's own; nothing in this crate gives either any power over
+//! the box itself.
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
+pub mod accounts;
 pub mod clock;
 pub mod limit;
 pub mod notify;
+pub mod oauth;
 pub mod report;
 pub mod service;
+pub mod sessions;
 pub mod store;
+pub mod verify;
+pub mod webauthn;
 
+pub use accounts::{Account, Accounts};
 pub use limit::{Limiter, Rate};
 pub use notify::Mailbox;
 pub use report::{Kind, Refusal, Report};
 pub use service::{Config, Service, bind, serve};
+pub use sessions::Sessions;
 pub use store::{Entry, Recorded, Store, StoreError};

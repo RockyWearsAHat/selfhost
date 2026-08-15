@@ -306,6 +306,7 @@ mod tests {
                 detail: "…".to_string(),
             }],
             delivered: false,
+            account_id: None,
         }
     }
 

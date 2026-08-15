@@ -271,6 +271,7 @@ dependencies = [
  "selfhost-http",
  "selfhost-identity",
  "selfhost-json",
+ "selfhost-login",
  "selfhost-mesh",
  "selfhost-storage",
  "selfhost-supervisor",
@@ -401,6 +402,14 @@ name = "selfhost-json"
 version = "0.1.0"
 
 [[package]]
+name = "selfhost-login"
+version = "0.1.0"
+dependencies = [
+ "ring",
+ "selfhost-json",
+]
+
+[[package]]
 name = "selfhost-mail"
 version = "0.1.0"
 dependencies = [
@@ -446,10 +455,14 @@ name = "selfhost-reports"
 version = "0.1.0"
 dependencies = [
  "ring",
+ "rustls",
  "selfhost-http",
  "selfhost-json",
+ "selfhost-login",
  "selfhost-mail",
  "tokio",
+ "tokio-rustls",
+ "webpki-roots",
 ]
 
 [[package]]
