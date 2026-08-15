@@ -287,6 +287,11 @@ fn watch_to_json(watch: &selfhost_config::GitWatch) -> Json {
                 .map(|c| Json::array(c.iter().map(Json::string)))
                 .unwrap_or(Json::Null),
         ),
+        // Never the value itself: a webhook secret is a credential, and this codebase's
+        // convention (the OAuth client secret's own `oauth list`, the console password) is that
+        // a credential is write-only once set — a caller learns *whether* one is configured,
+        // never what it is, even over the loopback admin API.
+        ("webhookSecretSet", Json::Bool(watch.webhook_secret.is_some())),
     ])
 }
 
@@ -318,6 +323,17 @@ fn watch_from_json(value: &Json) -> Option<selfhost_config::GitWatch> {
     if let Some(command) = value.get("postPull").and_then(Json::as_array) {
         watch.post_pull =
             Some(command.iter().filter_map(Json::as_str).map(str::to_owned).collect());
+    }
+    // Read-only asymmetric with `watch_to_json`'s `webhookSecretSet`: a caller sets or rotates
+    // the secret by supplying `webhookSecret` (the plaintext value, once, the same "add it again
+    // to rotate it" shape `reports oauth add` and `console-password` already use); omitting it
+    // — like every other field here — takes `GitWatch::new`'s default of `None`, so a caller
+    // resupplies the whole watch on every change, exactly as it already must for `branch` or
+    // `intervalSecs`.
+    if let Some(secret) = value.get("webhookSecret").and_then(Json::as_str)
+        && !secret.is_empty()
+    {
+        watch.webhook_secret = Some(secret.to_owned());
     }
     Some(watch)
 }
@@ -560,6 +576,42 @@ mod tests {
         // nothing to do with JSON parsing.
         assert_eq!(watch.interval_secs, selfhost_config::git::DEFAULT_INTERVAL_SECS);
         assert!(watch.enabled && watch.auto_update);
+    }
+
+    #[test]
+    fn a_webhook_secret_is_set_by_supplying_it_and_never_echoed_back() {
+        let mut spec = selfhost_config::ServiceSpec::new("site", "/usr/bin/node");
+        let mut watch = selfhost_config::GitWatch::new("git@github.com:owner/repo.git", "checkouts/site");
+        watch.webhook_secret = Some("s3cr3t".into());
+        spec.git = Some(watch);
+
+        let text = spec_to_json(&spec).to_text();
+        assert!(!text.contains("s3cr3t"), "the secret itself must never appear on the wire: {text}");
+        assert!(text.contains(r#""webhookSecretSet":true"#), "{text}");
+
+        // Round-tripping the *output* (as a caller preserving every other field would) does not
+        // resurrect the secret — it was never sent, so it comes back `None`, exactly like every
+        // other field this module does not merge with a previous state.
+        let parsed = selfhost_json::parse(&text).unwrap();
+        assert_eq!(spec_from_json(&parsed).and_then(|s| s.git).and_then(|g| g.webhook_secret), None);
+    }
+
+    #[test]
+    fn a_webhook_secret_supplied_on_input_is_stored_and_an_empty_one_is_not() {
+        let with = selfhost_json::parse(
+            r#"{"name":"s","program":"/bin/s","git":{"repository":"r","path":"p","webhookSecret":"abc"}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            spec_from_json(&with).and_then(|s| s.git).and_then(|g| g.webhook_secret),
+            Some("abc".to_string())
+        );
+
+        let empty = selfhost_json::parse(
+            r#"{"name":"s","program":"/bin/s","git":{"repository":"r","path":"p","webhookSecret":""}}"#,
+        )
+        .unwrap();
+        assert_eq!(spec_from_json(&empty).and_then(|s| s.git).and_then(|g| g.webhook_secret), None);
     }
 
     #[test]
