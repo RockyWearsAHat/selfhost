@@ -533,23 +533,29 @@ fn invite(arguments: &[String], accounts_dir: &Path) -> Result<(), String> {
     println!("    {code}");
     println!();
     println!(
-        "  This crate has no web front end of its own yet, so there is no link to send — being \
-         honest about that gap rather than printing one that does not work: whoever holds the \
-         code has to POST it themselves, to `<this box's public address><route>/invite/redeem` \
-         (`<route>` is whatever `selfhost reports serve` was given as `--route` — `/report` \
-         unless it was changed)."
+        "  Send them <this box's public address><route>/ (`<route>` is whatever `selfhost \
+         reports serve` was given as `--route` — `/report` unless it was changed) — that page \
+         has a \"have an invite code?\" field that POSTs it for them. No account for them yet? \
+         They paste the code alongside a fresh email and password; already have one? They sign \
+         in first and paste the code alone."
     );
     println!();
     println!(
-        "  With no reports account yet, the body is {{\"code\":\"{code}\",\"email\":…,\
-         \"password\":…}} and it creates one, linked, and signed in. Already signed in to one, \
-         the body is just {{\"code\":\"{code}\"}} and it links the account that is already \
-         there."
+        "  Driving it by hand instead: with no reports account yet, POST \
+         `<route>/invite/redeem` with {{\"code\":\"{code}\",\"email\":…,\"password\":…}} and it \
+         creates one, linked, and signed in. Already signed in to one, the body is just \
+         {{\"code\":\"{code}\"}} and it links the account that is already there."
     );
     println!();
     println!(
         "  The code works once and is not stored anywhere it can be read back, so send it now \
          — if it is lost, run this again and the old one stops working."
+    );
+    println!();
+    println!(
+        "  A running `selfhost reports serve --accounts …` loaded its invitations once, at \
+         startup, and does not watch this file — this code is invisible to it until it \
+         restarts, the same as a freshly added `reports oauth` provider."
     );
     Ok(())
 }
