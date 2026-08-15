@@ -18,7 +18,10 @@
 //! Everything else — the discoverable-credential login shape, ES256-only, the SPKI point
 //! extraction, the origin and relying-party-id binding, the single-use challenge pool — is the
 //! same verified shape; see that module's documentation for the cryptographic reasoning, which
-//! is not repeated here.
+//! is not repeated here. The one place this door's shape genuinely differs is that its expected
+//! origin is a configured value rather than one built out of the relying party id: the admin
+//! console is only ever reached at `https://<host>`, and this subsystem is developed against
+//! `http://localhost:8080`. See [`Webauthn`] for what that assumption cost.
 
 use ring::digest;
 use ring::signature::{ECDSA_P256_SHA256_ASN1, UnparsedPublicKey};
@@ -333,9 +336,25 @@ fn parse_passkeys(text: &str) -> Option<Vec<Passkey>> {
 
 /// Passkey sign-in for one relying party.
 ///
-/// The relying party id and origin come from configuration — the public site's own hostname —
-/// never from a request header, for the same reason `crates/admin/src/webauthn.rs::Webauthn`
-/// gives: a client-supplied identity would let it sign for a relying party of its own invention.
+/// The relying party id and origin come from configuration — the public site's own hostname
+/// and the public site's own address — never from a request header, for the same reason
+/// `crates/admin/src/webauthn.rs::Webauthn` gives: a client-supplied identity would let it sign
+/// for a relying party of its own invention.
+///
+/// # The origin is *not* `https://<rp_id>`, and assuming it was shut the door
+///
+/// These two values look like one value with a prefix on it, and an earlier draft built the
+/// origin by writing `format!("https://{rp_id}")`. They are not one value. WebAuthn's relying
+/// party id is a **bare host** — no scheme, no port, because the specification's RP ID is a
+/// domain string — while the origin the browser stamps into `clientDataJSON` is a full origin:
+/// scheme, host *and port*. On the only address this subsystem is developed against —
+/// `http://localhost:8080`, which `crates/cli`'s own `check_public_base_url` recommends —
+/// reconstructing gave `https://localhost` and the browser sent `http://localhost:8080`, so
+/// [`Self::check_client_data`]'s exact string compare refused every ceremony, and refused it
+/// inside the deliberately uniform [`RefusedCeremony`] that a forged assertion also gets. The
+/// door was on, and could never open, and said nothing about why. So the origin is passed in
+/// whole, from the deployment's own `public_base_url`, and only the RP-ID *hash* check
+/// ([`Self::check_auth_data`]) uses the bare host.
 #[derive(Clone)]
 pub struct Webauthn {
     rp_id: String,
@@ -360,18 +379,27 @@ struct BoundChallenge {
 }
 
 impl Webauthn {
-    /// Builds passkey sign-in for `rp_id`, loading credentials from `data_dir`.
-    pub fn load(rp_id: &str, data_dir: &Path) -> Self {
-        Self::with_parts(rp_id, Passkeys::load(data_dir), Challenges::new())
+    /// Builds passkey sign-in for `rp_id` at `origin`, loading credentials from `data_dir`.
+    ///
+    /// `origin` is the full origin of the page the ceremony will run on — scheme, host and
+    /// port, exactly as a browser writes it into `clientDataJSON`. See the type's own
+    /// documentation for why it is a parameter rather than `https://{rp_id}`.
+    pub fn load(rp_id: &str, origin: &str, data_dir: &Path) -> Self {
+        Self::with_parts(rp_id, origin, Passkeys::load(data_dir), Challenges::new())
     }
 
     /// Builds from already-made parts — the seam tests use to inject a scratch store or a
     /// zero-lifetime challenge pool.
     #[must_use]
-    pub fn with_parts(rp_id: &str, passkeys: Passkeys, challenges: Challenges) -> Self {
+    pub fn with_parts(
+        rp_id: &str,
+        origin: &str,
+        passkeys: Passkeys,
+        challenges: Challenges,
+    ) -> Self {
         Self {
             rp_id: rp_id.to_owned(),
-            origin: format!("https://{rp_id}"),
+            origin: origin.to_owned(),
             passkeys,
             challenges,
             registrations: Arc::new(Mutex::new(Vec::new())),
@@ -674,6 +702,12 @@ mod tests {
 
     const RP: &str = "reports.example.com";
 
+    /// The full origin the page runs on, which on a production deployment is `https://` plus
+    /// the relying party id and nothing else — the case that always worked, kept as the
+    /// default so the port-carrying cases below are visibly the *other* shape rather than the
+    /// only shape ever exercised.
+    const ORIGIN: &str = "https://reports.example.com";
+
     struct Authenticator {
         keys: EcdsaKeyPair,
         id: String,
@@ -700,7 +734,14 @@ mod tests {
         }
 
         fn auth_data(flags: u8) -> Vec<u8> {
-            let mut out = digest::digest(&digest::SHA256, RP.as_bytes())
+            Self::auth_data_for(RP, flags)
+        }
+
+        /// The same, for a relying party id other than [`RP`] — the authenticator hashes the
+        /// *bare host*, which is exactly the value that does not change when the page moves to
+        /// a different scheme or port.
+        fn auth_data_for(rp_id: &str, flags: u8) -> Vec<u8> {
+            let mut out = digest::digest(&digest::SHA256, rp_id.as_bytes())
                 .as_ref()
                 .to_vec();
             out.push(flags);
@@ -720,11 +761,28 @@ mod tests {
 
         fn register_body(&self, webauthn: &Webauthn, label: &str) -> Json {
             let challenge = challenge_of(webauthn.challenge(Purpose::Register).unwrap());
-            self.register_body_with_challenge(&challenge, label)
+            self.register_body_at(&challenge, label, ORIGIN)
         }
 
         fn register_body_with_challenge(&self, challenge: &str, label: &str) -> Json {
-            let client = Self::client_data("webauthn.create", challenge, &format!("https://{RP}"));
+            self.register_body_at(challenge, label, ORIGIN)
+        }
+
+        fn register_body_at(&self, challenge: &str, label: &str, origin: &str) -> Json {
+            self.register_body_bound(challenge, label, RP, origin)
+        }
+
+        /// A registration body from an authenticator that believes it is talking to `rp_id` on
+        /// a page served from `origin` — the two values a browser reports separately, so a
+        /// test can move one without moving the other.
+        fn register_body_bound(
+            &self,
+            challenge: &str,
+            label: &str,
+            rp_id: &str,
+            origin: &str,
+        ) -> Json {
+            let client = Self::client_data("webauthn.create", challenge, origin);
             let flags = FLAG_USER_PRESENT | FLAG_USER_VERIFIED | FLAG_ATTESTED_CREDENTIAL;
             Json::object([
                 ("id", Json::string(&self.id)),
@@ -739,7 +797,9 @@ mod tests {
                 ),
                 (
                     "authenticatorData",
-                    Json::string(crate::oauth::b64url_encode(&Self::auth_data(flags))),
+                    Json::string(crate::oauth::b64url_encode(&Self::auth_data_for(
+                        rp_id, flags,
+                    ))),
                 ),
                 ("label", Json::string(label)),
             ])
@@ -751,7 +811,7 @@ mod tests {
 
         fn login_body_with(&self, webauthn: &Webauthn, flags: u8, origin: Option<&str>) -> Json {
             let challenge = challenge_of(webauthn.challenge(Purpose::Login).unwrap());
-            let origin = origin.map(str::to_owned).unwrap_or(format!("https://{RP}"));
+            let origin = origin.map_or_else(|| ORIGIN.to_owned(), str::to_owned);
             let client = Self::client_data("webauthn.get", &challenge, &origin);
             let auth = Self::auth_data(flags);
             let mut message = auth.clone();
@@ -787,7 +847,7 @@ mod tests {
     }
 
     fn webauthn(dir: &Path) -> Webauthn {
-        Webauthn::with_parts(RP, Passkeys::load(dir), Challenges::new())
+        Webauthn::with_parts(RP, ORIGIN, Passkeys::load(dir), Challenges::new())
     }
 
     #[test]
@@ -915,6 +975,71 @@ mod tests {
                 .account_id,
             "acct-b"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The regression the origin parameter exists for. A deployment reached at
+    /// `http://localhost:8080` has relying party id `localhost` and origin
+    /// `http://localhost:8080`, and the two differ in both scheme and port. Reconstructing the
+    /// origin as `https://<rp_id>` produced `https://localhost`, which no browser ever sends,
+    /// so every ceremony was refused — the door was on and could not open. Registering and
+    /// signing in must both work here, and the RP-ID hash must still be over the bare host.
+    #[test]
+    fn a_page_served_on_a_port_completes_a_ceremony_the_reconstructed_origin_refused() {
+        let dir = scratch("ported-origin");
+        let webauthn = Webauthn::with_parts(
+            "localhost",
+            "http://localhost:8080",
+            Passkeys::load(&dir),
+            Challenges::new(),
+        );
+        let device = Authenticator::new("credential-1");
+
+        let challenge = challenge_of(webauthn.challenge(Purpose::Register).unwrap());
+        let body =
+            device.register_body_bound(&challenge, "laptop", "localhost", "http://localhost:8080");
+        webauthn.register("acct-1", &body).expect("registers");
+
+        let challenge = challenge_of(webauthn.challenge(Purpose::Login).unwrap());
+        let client =
+            Authenticator::client_data("webauthn.get", &challenge, "http://localhost:8080");
+        let auth =
+            Authenticator::auth_data_for("localhost", FLAG_USER_PRESENT | FLAG_USER_VERIFIED);
+        let mut message = auth.clone();
+        message.extend_from_slice(digest::digest(&digest::SHA256, &client).as_ref());
+        let signature = device
+            .keys
+            .sign(&SystemRandom::new(), &message)
+            .expect("signs");
+        let assertion = Json::object([
+            ("id", Json::string(&device.id)),
+            (
+                "clientDataJSON",
+                Json::string(crate::oauth::b64url_encode(&client)),
+            ),
+            (
+                "authenticatorData",
+                Json::string(crate::oauth::b64url_encode(&auth)),
+            ),
+            (
+                "signature",
+                Json::string(crate::oauth::b64url_encode(signature.as_ref())),
+            ),
+        ]);
+        assert_eq!(
+            webauthn.verify_login(&assertion).unwrap().account_id,
+            "acct-1",
+            "a page on a non-default port and plain http still completes a ceremony"
+        );
+
+        // And the challenge still carries the *bare* host as `rpId`, never the origin: a
+        // browser handed `localhost:8080` as a relying party id refuses the ceremony outright.
+        let advertised = webauthn.challenge(Purpose::Login).unwrap();
+        assert_eq!(
+            advertised.get("rpId").and_then(Json::as_str),
+            Some("localhost")
+        );
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 

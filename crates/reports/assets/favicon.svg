@@ -1,0 +1,10 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32" role="img"
+     aria-label="A ruled page with an accent rule">
+  <!-- The page mark: a ruled sheet with the accent rule along its head, the same idea the
+       stylesheet uses — a ledger, not a dashboard. Drawn with plain attributes and no
+       embedded stylesheet, so it renders identically wherever it is fetched. -->
+  <rect width="32" height="32" rx="7" fill="#16181d"/>
+  <rect x="7" y="8" width="18" height="3" rx="1.5" fill="#f2a03d"/>
+  <rect x="7" y="15" width="18" height="2" rx="1" fill="#a6adba"/>
+  <rect x="7" y="20" width="13" height="2" rx="1" fill="#5a606b"/>
+</svg>
