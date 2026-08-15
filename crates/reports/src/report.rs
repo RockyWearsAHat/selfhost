@@ -125,6 +125,12 @@ pub struct Report {
     /// A one-way, truncated hash of the source address — enough to see that fifty reports came
     /// from one place, not enough to be a record of who filed what.
     pub source: String,
+    /// The account that filed this, when the request carried a live session. `None` for the
+    /// ordinary anonymous case this door has always accepted — accounts are additive, never a
+    /// precondition. Never read from the request body: [`crate::service`] sets this from the
+    /// session cookie, after everything above has already been validated, exactly as `project`
+    /// is decided by the address rather than trusted from the body.
+    pub account_id: Option<String>,
 }
 
 /// Why a request was not accepted as a report.
@@ -227,6 +233,7 @@ impl Report {
             workspace,
             at,
             source,
+            account_id: None,
         })
     }
 
@@ -394,6 +401,10 @@ pub fn to_json(report: &Report) -> Json {
         ("workspace", Json::string(&report.workspace)),
         ("at", Json::string(&report.at)),
         ("source", Json::string(&report.source)),
+        (
+            "account_id",
+            report.account_id.as_ref().map_or(Json::Null, Json::string),
+        ),
     ])
 }
 

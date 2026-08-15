@@ -129,6 +129,12 @@ pub struct Entry {
     pub seen: Vec<Sighting>,
     /// Whether the owner's mailbox has been told about the latest sighting.
     pub delivered: bool,
+    /// The account that filed this defect *first*, when one was signed in. Never changed by a
+    /// later sighting — the same "first reporter's words win" rule [`Entry::title`] and
+    /// [`Entry::detail`] already follow, so a stranger re-filing a known bug can never claim an
+    /// account's report, and an account's own bug reported anonymously by someone else later
+    /// stays theirs.
+    pub account_id: Option<String>,
 }
 
 /// What one [`Store::record`] did.
@@ -281,6 +287,7 @@ impl Store {
                 sightings: 1,
                 seen: vec![sighting],
                 delivered: false,
+                account_id: report.account_id.clone(),
             },
         };
 
@@ -369,6 +376,24 @@ impl Store {
     /// [`StoreError::Io`] when the directory cannot be listed.
     pub fn count(&self, project: &str) -> Result<usize, StoreError> {
         Ok(self.records(project)?.len())
+    }
+
+    /// Reads one record by its project and id — the accessor `crate::service`'s account routes
+    /// use to check who filed a report before letting its own account withdraw it, without
+    /// reading every record in the project the way [`Self::list`] does.
+    ///
+    /// # Errors
+    /// [`StoreError::Unreadable`] when no such record exists, [`StoreError::Io`] when it exists
+    /// but cannot be read.
+    pub fn get(&self, project: &str, id: &str) -> Result<Entry, StoreError> {
+        let path = self.record_path(project, id);
+        if !path.exists() {
+            return Err(StoreError::Unreadable(format!(
+                "`{project}` holds no report `{}`",
+                safe_id(id)
+            )));
+        }
+        self.read(project, &path)
     }
 
     /// Reads one record.
@@ -546,6 +571,10 @@ pub fn to_json(entry: &Entry) -> Json {
         ("sightings", Json::Number(entry.sightings as f64)),
         ("delivered", Json::Bool(entry.delivered)),
         (
+            "account_id",
+            entry.account_id.as_ref().map_or(Json::Null, Json::string),
+        ),
+        (
             "seen",
             Json::array(entry.seen.iter().map(|sighting| {
                 Json::object([
@@ -616,6 +645,10 @@ fn entry(project: &str, id: &str, value: &Json) -> Option<Entry> {
             .get("delivered")
             .and_then(Json::as_bool)
             .unwrap_or(false),
+        account_id: value
+            .get("account_id")
+            .and_then(Json::as_str)
+            .map(str::to_string),
     })
 }
 
@@ -644,6 +677,7 @@ mod tests {
             workspace: "DOC".to_string(),
             at: "2026-08-11T00:00:00Z".to_string(),
             source: "abcd1234".to_string(),
+            account_id: None,
         }
     }
 
@@ -828,6 +862,42 @@ mod tests {
                 .expect("record");
         }
         assert_eq!(store.list("dx").expect("list").len(), MAX_FEED);
+    }
+
+    #[test]
+    fn the_first_reporters_account_owns_a_record_and_a_later_anonymous_sighting_does_not_change_that()
+     {
+        let store = scratch("account-ownership");
+        let mut first = report("owned bug", "d");
+        first.account_id = Some("acct-1".to_string());
+        let recorded = store.record(&first).expect("filed");
+        assert_eq!(recorded.entry.account_id, Some("acct-1".to_string()));
+
+        // Somebody else — anonymous, or a different account — reports the same defect. The
+        // record still belongs to whoever filed it first.
+        let mut again = report("owned bug", "and again");
+        again.account_id = None;
+        let second = store.record(&again).expect("second sighting");
+        assert_eq!(
+            second.entry.account_id,
+            Some("acct-1".to_string()),
+            "ownership does not move"
+        );
+        let _ = std::fs::remove_dir_all(store.directory());
+    }
+
+    #[test]
+    fn get_reads_one_record_by_id_and_names_a_missing_one() {
+        let store = scratch("get-one");
+        let recorded = store.record(&report("gettable", "d")).expect("filed");
+        let found = store.get("dx", &recorded.entry.id).expect("found");
+        assert_eq!(found.title, "gettable");
+
+        let error = store
+            .get("dx", "report-deadbeef")
+            .expect_err("no such report");
+        assert!(matches!(error, StoreError::Unreadable(_)));
+        let _ = std::fs::remove_dir_all(store.directory());
     }
 
     #[test]

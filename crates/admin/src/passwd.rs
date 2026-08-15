@@ -1,11 +1,9 @@
 //! The console login password, stored as a PBKDF2 hash on disk.
 //!
-//! The stored format is `pbkdf2-sha256$<iterations>$<salt>$<derived>` (base64),
-//! deliberately identical to the mailbox password format in
-//! `selfhost-mail`'s submission module. The logic is mirrored rather than
-//! imported: the admin API must not pull the whole mail stack — SMTP, TLS,
-//! queues — into its dependency graph to verify one password, and the format is
-//! small enough that the duplication is a dozen lines against an entire crate.
+//! The stored format is `pbkdf2-sha256$<iterations>$<salt>$<derived>` (base64), the same format
+//! `selfhost-reports`' accounts subsystem uses. Both crates hash and verify through
+//! `selfhost_login::password` rather than each carrying its own copy — see that crate's
+//! documentation for why the two were mirrored by hand until now.
 //!
 //! A missing or empty password file is not an error: it means nobody has run
 //! `selfhost console-password` yet, so console login simply always fails —
@@ -13,21 +11,8 @@
 //! working. Failing closed here is what makes shipping the feature safe before
 //! every deployment has set a password.
 
-use ring::pbkdf2;
-use ring::rand::{SecureRandom, SystemRandom};
 use std::io;
-use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
-
-/// The PBKDF2 iteration count for newly hashed passwords.
-///
-/// High enough to make offline guessing expensive, low enough to verify a login
-/// without a perceptible delay. The stored hash records the count it was made
-/// with, so this can be raised later without invalidating existing hashes.
-const PBKDF2_ITERATIONS: u32 = 600_000;
-
-/// The derived-key length, in bytes (SHA-256 output).
-const PBKDF2_KEY_LEN: usize = 32;
 
 /// The name of the console password file inside the data directory.
 pub const CONSOLE_PASSWORD_FILENAME: &str = "console.passwd";
@@ -85,12 +70,12 @@ impl ConsolePassword {
 
     /// Whether a presented password matches the stored hash.
     ///
-    /// Constant-time in the comparison (ring's `pbkdf2::verify`). With no
-    /// password set this is always `false` — never a panic, never an error a
-    /// caller could accidentally treat as a success.
+    /// Constant-time in the comparison (`selfhost_login::password::verify`). With no password
+    /// set this is always `false` — never a panic, never an error a caller could accidentally
+    /// treat as a success.
     pub fn verify(&self, password: &str) -> bool {
         match &self.stored {
-            Some(stored) => verify_pbkdf2(stored, password),
+            Some(stored) => selfhost_login::password::verify(stored, password),
             None => false,
         }
     }
@@ -101,25 +86,7 @@ impl ConsolePassword {
     /// salt is random per call, so two deployments with the same password store
     /// different hashes. Errors only if the system's random source refuses.
     pub fn hash(password: &str) -> io::Result<String> {
-        let rng = SystemRandom::new();
-        let mut salt = [0u8; 16];
-        rng.fill(&mut salt)
-            .map_err(|_| io::Error::other("the system random source was unavailable"))?;
-        let iterations = NonZeroU32::new(PBKDF2_ITERATIONS).expect("iteration count is non-zero");
-
-        let mut derived = [0u8; PBKDF2_KEY_LEN];
-        pbkdf2::derive(
-            pbkdf2::PBKDF2_HMAC_SHA256,
-            iterations,
-            &salt,
-            password.as_bytes(),
-            &mut derived,
-        );
-        Ok(format!(
-            "pbkdf2-sha256${PBKDF2_ITERATIONS}${}${}",
-            b64_encode(&salt),
-            b64_encode(&derived)
-        ))
+        selfhost_login::password::hash(password)
     }
 
     /// Hashes `password` and writes it to `<data_dir>/console.passwd`.
@@ -144,92 +111,6 @@ impl std::fmt::Debug for ConsolePassword {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "ConsolePassword(<redacted>)")
     }
-}
-
-/// Verifies a password against a stored `pbkdf2-sha256$...` hash, constant-time.
-///
-/// A hash in any other format returns `false` rather than erroring: an
-/// unverifiable stored value must fail closed, never be treated as a match.
-fn verify_pbkdf2(stored: &str, password: &str) -> bool {
-    let mut parts = stored.split('$');
-    if parts.next() != Some("pbkdf2-sha256") {
-        return false;
-    }
-    let (Some(iterations), Some(salt_b64), Some(derived_b64), None) =
-        (parts.next(), parts.next(), parts.next(), parts.next())
-    else {
-        return false;
-    };
-    let (Ok(iterations), Ok(salt), Ok(derived)) =
-        (iterations.parse::<u32>(), b64_decode(salt_b64), b64_decode(derived_b64))
-    else {
-        return false;
-    };
-    let Some(iterations) = NonZeroU32::new(iterations) else {
-        return false;
-    };
-    // ring's verify is constant-time in the comparison.
-    pbkdf2::verify(pbkdf2::PBKDF2_HMAC_SHA256, iterations, &salt, password.as_bytes(), &derived)
-        .is_ok()
-}
-
-/// Encodes bytes as padded standard base64.
-///
-/// Mirrored from the mail crate for the same hash format; see the module
-/// documentation for why it is copied rather than imported.
-fn b64_encode(data: &[u8]) -> String {
-    const B64: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
-    for chunk in data.chunks(3) {
-        let b0 = chunk[0] as u32;
-        let b1 = *chunk.get(1).unwrap_or(&0) as u32;
-        let b2 = *chunk.get(2).unwrap_or(&0) as u32;
-        let bits = (b0 << 16) | (b1 << 8) | b2;
-        out.push(B64[(bits >> 18 & 0x3f) as usize] as char);
-        out.push(B64[(bits >> 12 & 0x3f) as usize] as char);
-        out.push(if chunk.len() > 1 { B64[(bits >> 6 & 0x3f) as usize] as char } else { '=' });
-        out.push(if chunk.len() > 2 { B64[(bits & 0x3f) as usize] as char } else { '=' });
-    }
-    out
-}
-
-/// Decodes padded or unpadded standard base64.
-///
-/// The decode counterpart to [`b64_encode`], accepting hashes written by hand
-/// or by other tools that omit padding.
-fn b64_decode(text: &str) -> Result<Vec<u8>, ()> {
-    fn value(byte: u8) -> Option<u32> {
-        match byte {
-            b'A'..=b'Z' => Some((byte - b'A') as u32),
-            b'a'..=b'z' => Some((byte - b'a' + 26) as u32),
-            b'0'..=b'9' => Some((byte - b'0' + 52) as u32),
-            b'+' => Some(62),
-            b'/' => Some(63),
-            _ => None,
-        }
-    }
-    let mut symbols = Vec::new();
-    for byte in text.bytes() {
-        match byte {
-            b'=' => {}
-            other => symbols.push(value(other).ok_or(())?),
-        }
-    }
-    let mut out = Vec::with_capacity(symbols.len() / 4 * 3);
-    for group in symbols.chunks(4) {
-        if group.len() == 1 {
-            return Err(()); // a lone symbol cannot encode any byte
-        }
-        let bits = group.iter().enumerate().fold(0u32, |acc, (i, s)| acc | (s << (18 - 6 * i)));
-        out.push((bits >> 16) as u8);
-        if group.len() > 2 {
-            out.push((bits >> 8) as u8);
-        }
-        if group.len() > 3 {
-            out.push(bits as u8);
-        }
-    }
-    Ok(out)
 }
 
 #[cfg(test)]
@@ -273,32 +154,19 @@ mod tests {
     }
 
     #[test]
-    fn an_unrecognised_hash_format_fails_closed() {
-        // A stored value that is not a pbkdf2-sha256 hash must never match.
-        assert!(!verify_pbkdf2("plaintextpassword", "plaintextpassword"));
-        assert!(!verify_pbkdf2("md5$deadbeef", "anything"));
-        assert!(!verify_pbkdf2("pbkdf2-sha256$notanumber$AA==$AA==", "anything"));
-    }
-
-    #[test]
-    fn the_same_password_hashes_differently_each_time() {
-        // A per-call random salt means identical passwords never share a hash.
-        let a = ConsolePassword::hash("secret").unwrap();
-        let b = ConsolePassword::hash("secret").unwrap();
-        assert_ne!(a, b);
-        assert!(verify_pbkdf2(&a, "secret") && verify_pbkdf2(&b, "secret"));
-    }
-
-    #[test]
-    fn the_hash_matches_the_mail_crates_stored_format() {
-        // The contract this module mirrors: four `$`-separated fields with a
-        // fixed algorithm tag, so a hash set by either tool verifies in both.
+    fn the_stored_format_matches_selfhost_login() {
+        // The contract this module now delegates to entirely: four `$`-separated fields with a
+        // fixed algorithm tag, so a hash set by either `selfhost-admin` or `selfhost-reports`
+        // verifies in both.
         let hashed = ConsolePassword::hash("pw").unwrap();
         let parts: Vec<&str> = hashed.split('$').collect();
         assert_eq!(parts.len(), 4, "{hashed}");
         assert_eq!(parts[0], "pbkdf2-sha256");
-        assert_eq!(parts[1], PBKDF2_ITERATIONS.to_string());
-        assert_eq!(b64_decode(parts[3]).unwrap().len(), PBKDF2_KEY_LEN);
+        assert_eq!(parts[1], selfhost_login::password::ITERATIONS.to_string());
+        assert_eq!(
+            selfhost_login::password::b64_decode(parts[3]).unwrap().len(),
+            selfhost_login::password::KEY_LEN
+        );
     }
 
     #[cfg(unix)]

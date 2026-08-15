@@ -1,14 +1,15 @@
 //! `selfhost reports` — the public report intake, and the database behind it.
 //!
-//! Six words, one verb:
-//!
 //! ```text
 //! selfhost reports serve [--port N] [--route /report] [--project dx] [--no-mail]
+//!                         [--accounts --public-base-url URL [--rp-id HOST] [--site-name NAME]
+//!                          --verify-from ADDR]
 //! selfhost reports project add <key>      make a service reports may be filed against
 //! selfhost reports projects               what this box holds reports for
 //! selfhost reports list [<project>]       the open reports, newest sighting first
 //! selfhost reports close <project> <id>   a fixed report leaves the database
 //! selfhost reports token [--new]          the token a subscribed checkout reads the feed with
+//! selfhost reports oauth add|list|remove  the "sign in with…" providers accounts offers
 //! ```
 //!
 //! `serve` is what a supervised service runs; everything else is an operator at a terminal.
@@ -19,13 +20,26 @@
 //! `project add` is now a convenience rather than a precondition: a service comes into
 //! existence when the first report is filed to `…/report?<service>`, which is what lets a tool
 //! nobody here has configured reach the people who fix it.
+//!
+//! # The account subsystem is off unless `--accounts` says otherwise
+//!
+//! `selfhost_reports::service::Config::accounts` defaults to `None`, and `serve` only builds one
+//! when `--accounts` is on the command line — so a deployment that has never touched this flag
+//! keeps behaving exactly as it did before this subsystem existed, on every redeploy. Turning it
+//! on needs `--public-base-url` (this box's own address — the flag exists because nothing this
+//! service sees tells it whether the proxy in front of it terminated TLS); `--rp-id` additionally
+//! enables the passkey routes (unset, they answer the same `404` an unconfigured token route
+//! does); OAuth providers come from `selfhost reports oauth add`, not a flag, because a client
+//! secret does not belong on a command line a process list can see.
 
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use selfhost_config::Config;
-use selfhost_reports::service::{self, Service};
+use selfhost_json::Json;
+use selfhost_reports::oauth::Provider;
+use selfhost_reports::service::{self, AccountsConfig, Service};
 use selfhost_reports::{Mailbox, Store};
 
 /// Where the intake listens when nothing says otherwise.
@@ -39,6 +53,16 @@ const TOKEN_FILE: &str = "reports.token";
 
 /// The directory the database lives in, inside the data directory.
 const STORE_DIR: &str = "reports";
+
+/// The directory the account subsystem's own stores live in, inside the data directory —
+/// deliberately a sibling of [`STORE_DIR`] rather than inside it; see
+/// `selfhost_reports::service::AccountsConfig::data_dir` for why.
+const ACCOUNTS_DIR: &str = "reports-accounts";
+
+/// The file the configured OAuth providers live in, inside [`ACCOUNTS_DIR`]. CLI-managed like
+/// `TOKEN_FILE`, and for the same reason: a client secret does not belong in
+/// `selfhost.config.toml`, which this repository's own convention keeps free of credentials.
+const OAUTH_PROVIDERS_FILE: &str = "oauth-providers.json";
 
 /// Runs `selfhost reports …`.
 ///
@@ -56,9 +80,10 @@ pub fn run(arguments: &[String], config: &Config, project_dir: &Path) -> Result<
         "list" => list(arguments.get(2).map(String::as_str), &store),
         "close" => close(arguments, &store),
         "token" => token(arguments, &data_dir),
+        "oauth" => oauth_command(arguments, &data_dir.join(ACCOUNTS_DIR)),
         other => Err(format!(
             "`{other}` is not a reports command — it is serve, project, projects, list, close, \
-             or token"
+             token, or oauth"
         )),
     }
 }
@@ -107,6 +132,13 @@ fn serve(
         mailbox(arguments, config)?
     };
 
+    let accounts_on = arguments.iter().any(|argument| argument == "--accounts");
+    settings.accounts = if accounts_on {
+        Some(accounts_config(arguments, data_dir)?)
+    } else {
+        None
+    };
+
     let store_dir = store.directory().to_path_buf();
     let intake = Arc::new(Service::new(store, settings.clone()));
     let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -119,18 +151,75 @@ fn serve(
             .await
             .map_err(|error| format!("could not bind {address}: {error}"))?;
         println!(
-            "report intake listening\n  http  {address}{}\n  store {}\n  mail  {}",
+            "report intake listening\n  http     {address}{}\n  store    {}\n  mail     {}\n  accounts {}",
             settings.route,
             store_dir.display(),
             settings
                 .mail
                 .as_ref()
-                .map_or_else(|| "off".to_string(), |mailbox| mailbox.to.clone())
+                .map_or_else(|| "off".to_string(), |mailbox| mailbox.to.clone()),
+            settings.accounts.as_ref().map_or_else(
+                || "off".to_string(),
+                |accounts| format!(
+                    "on — {} ({} provider(s), passkeys {})",
+                    accounts.public_base_url,
+                    accounts.oauth_providers.len(),
+                    if accounts.rp_id.is_some() { "on" } else { "off" }
+                )
+            )
         );
         tokio::spawn(service::retry_forever(Arc::clone(&intake)));
         service::serve(listener, intake)
             .await
             .map_err(|error| format!("the intake stopped: {error}"))
+    })
+}
+
+/// Builds [`AccountsConfig`] from `serve`'s flags and this box's persisted OAuth providers.
+///
+/// # Errors
+/// A sentence naming the missing or malformed flag: `--accounts` needs `--public-base-url` at
+/// minimum, and it must be an absolute `http(s)://` address with no trailing slash.
+fn accounts_config(arguments: &[String], data_dir: &Path) -> Result<AccountsConfig, String> {
+    let public_base_url = crate::value_of(arguments, "--public-base-url").ok_or(
+        "`--accounts` needs `--public-base-url https://your.domain` — this box's own public \
+         address, used to build verification links and OAuth redirects",
+    )?;
+    let public_base_url = public_base_url.trim_end_matches('/').to_string();
+    if !public_base_url.starts_with("http://") && !public_base_url.starts_with("https://") {
+        return Err(format!(
+            "--public-base-url {public_base_url}: must start with http:// or https://"
+        ));
+    }
+    let accounts_dir = data_dir.join(ACCOUNTS_DIR);
+    let verify_from = crate::value_of(arguments, "--verify-from").ok_or(
+        "`--accounts` needs `--verify-from reports@your.domain` — the sender address on a \
+         verification email",
+    )?;
+    Ok(AccountsConfig {
+        data_dir: accounts_dir.clone(),
+        site_name: crate::value_of(arguments, "--site-name")
+            .unwrap_or_else(|| "this box's reports".to_string()),
+        public_base_url,
+        rp_id: crate::value_of(arguments, "--rp-id"),
+        oauth_providers: load_oauth_providers(&accounts_dir)?,
+        verify_helo: crate::value_of(arguments, "--verify-helo").unwrap_or_else(|| {
+            verify_from
+                .rsplit('@')
+                .next()
+                .unwrap_or("localhost")
+                .to_string()
+        }),
+        verify_from,
+        // The daemon's own data directory — the same tree its outbound mail sweep already
+        // drains. Set unconditionally: harmless if this box's `[mail]` is never configured
+        // (nothing ever drains the spool, so accounts still work, just never send a
+        // verification email — the same degraded shape `--no-mail` gives report notifications)
+        // and correct the moment it is, with no restart-order dependency to get right.
+        mail_data_dir: Some(data_dir.to_path_buf()),
+        // Five attempts, then one every twelve seconds: generous for a person mistyping a
+        // password, a wall for a script trying many.
+        per_action: selfhost_reports::Rate::new(5, 5.0),
     })
 }
 
@@ -305,5 +394,292 @@ fn restrict(path: &PathBuf) {
     #[cfg(not(unix))]
     {
         let _ = path;
+    }
+}
+
+/// `selfhost reports oauth add|list|remove` — the "sign in with…" providers `serve --accounts`
+/// offers. Its own subcommand rather than flags on `serve`, because a client secret is a
+/// credential and a credential does not belong on a command line a process list can see, or in
+/// `selfhost.config.toml`, which this repository keeps free of them by the same convention
+/// `[mail]`'s own secrets follow.
+fn oauth_command(arguments: &[String], accounts_dir: &Path) -> Result<(), String> {
+    match arguments.get(2).map(String::as_str) {
+        Some("add") => oauth_add(arguments, accounts_dir),
+        Some("list") | None => oauth_list(accounts_dir),
+        Some("remove") => oauth_remove(arguments, accounts_dir),
+        Some(other) => Err(format!(
+            "`reports oauth {other}` — it is add, list, or remove"
+        )),
+    }
+}
+
+/// `selfhost reports oauth add <provider> --authorize-url U --token-url U --userinfo-url U
+/// --client-id X --client-secret Y [--scope S] [--subject-field F] [--email-field F]
+/// [--email-verified-field F]`.
+///
+/// Adding a provider that already exists replaces it — an operator rotating a client secret
+/// runs this again rather than removing and re-adding, the same "mint again supersedes" shape
+/// `crates/admin/src/invite.rs` gives an invitation.
+fn oauth_add(arguments: &[String], accounts_dir: &Path) -> Result<(), String> {
+    let name = arguments
+        .get(3)
+        .filter(|name| !name.starts_with("--"))
+        .ok_or("`reports oauth add` needs a provider name, e.g. `… add google`")?
+        .to_string();
+    let need = |flag: &str| -> Result<String, String> {
+        crate::value_of(arguments, flag).ok_or_else(|| format!("`reports oauth add` needs {flag}"))
+    };
+    let provider = Provider {
+        name: name.clone(),
+        authorize_url: need("--authorize-url")?,
+        token_url: need("--token-url")?,
+        userinfo_url: need("--userinfo-url")?,
+        client_id: need("--client-id")?,
+        client_secret: need("--client-secret")?,
+        scope: crate::value_of(arguments, "--scope").unwrap_or_else(|| "openid email".to_string()),
+        subject_field: crate::value_of(arguments, "--subject-field")
+            .unwrap_or_else(|| "sub".to_string()),
+        email_field: crate::value_of(arguments, "--email-field")
+            .unwrap_or_else(|| "email".to_string()),
+        email_verified_field: crate::value_of(arguments, "--email-verified-field"),
+    };
+    let mut providers = load_oauth_providers(accounts_dir)?;
+    providers.retain(|existing| existing.name != name);
+    providers.push(provider);
+    save_oauth_providers(accounts_dir, &providers)?;
+    println!("provider `{name}` saved — restart `selfhost reports serve --accounts …` to load it");
+    Ok(())
+}
+
+/// `selfhost reports oauth list` — names and URLs only; a client secret is never printed once
+/// it has been written, the same write-only shape the console password and every credential
+/// file in `crates/admin` already take.
+fn oauth_list(accounts_dir: &Path) -> Result<(), String> {
+    let providers = load_oauth_providers(accounts_dir)?;
+    if providers.is_empty() {
+        println!("no sign-in provider is configured — `selfhost reports oauth add <name> …`");
+        return Ok(());
+    }
+    for provider in providers {
+        println!(
+            "{:<12} authorize {}\n{:<12} token     {}\n{:<12} userinfo  {}",
+            provider.name,
+            provider.authorize_url,
+            "",
+            provider.token_url,
+            "",
+            provider.userinfo_url
+        );
+    }
+    Ok(())
+}
+
+/// `selfhost reports oauth remove <provider>`.
+fn oauth_remove(arguments: &[String], accounts_dir: &Path) -> Result<(), String> {
+    let name = arguments
+        .get(3)
+        .ok_or("`reports oauth remove` needs a provider name")?;
+    let mut providers = load_oauth_providers(accounts_dir)?;
+    let before = providers.len();
+    providers.retain(|provider| &provider.name != name);
+    if providers.len() == before {
+        return Err(format!("no such provider `{name}`"));
+    }
+    save_oauth_providers(accounts_dir, &providers)?;
+    println!("provider `{name}` removed");
+    Ok(())
+}
+
+/// Where the OAuth provider file lives for a given accounts directory.
+fn oauth_providers_path(accounts_dir: &Path) -> PathBuf {
+    accounts_dir.join(OAUTH_PROVIDERS_FILE)
+}
+
+/// Loads every configured provider. A missing file is an empty list; a malformed one is an
+/// error naming the file, rather than silently discarding an operator's configuration — unlike
+/// the daemon's own credential stores, this file is never written by anything but this command,
+/// so a malformed one is this operator's own typo to fix, not a stranger's input to fail closed
+/// against.
+///
+/// # Errors
+/// A sentence naming the file and what could not be read or parsed.
+fn load_oauth_providers(accounts_dir: &Path) -> Result<Vec<Provider>, String> {
+    let path = oauth_providers_path(accounts_dir);
+    let text = match std::fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(format!("could not read {}: {error}", path.display())),
+    };
+    let value =
+        selfhost_json::parse(&text).map_err(|error| format!("{}: {error}", path.display()))?;
+    let items = value
+        .get("providers")
+        .and_then(Json::as_array)
+        .ok_or_else(|| format!("{}: expected a `providers` array", path.display()))?;
+    let field = |item: &Json, key: &str| -> Result<String, String> {
+        item.get(key)
+            .and_then(Json::as_str)
+            .map(str::to_string)
+            .ok_or_else(|| format!("{}: `{key}` is missing on a provider", path.display()))
+    };
+    let mut providers = Vec::new();
+    for item in items {
+        providers.push(Provider {
+            name: field(item, "name")?,
+            authorize_url: field(item, "authorizeUrl")?,
+            token_url: field(item, "tokenUrl")?,
+            userinfo_url: field(item, "userinfoUrl")?,
+            client_id: field(item, "clientId")?,
+            client_secret: field(item, "clientSecret")?,
+            scope: field(item, "scope")?,
+            subject_field: field(item, "subjectField")?,
+            email_field: field(item, "emailField")?,
+            email_verified_field: item
+                .get("emailVerifiedField")
+                .and_then(Json::as_str)
+                .map(str::to_string),
+        });
+    }
+    Ok(providers)
+}
+
+/// Writes every configured provider, owner-only, via a temporary file and rename — the same
+/// atomic-replace shape every credential file in this workspace uses.
+///
+/// # Errors
+/// A sentence naming the directory or file that could not be written.
+fn save_oauth_providers(accounts_dir: &Path, providers: &[Provider]) -> Result<(), String> {
+    std::fs::create_dir_all(accounts_dir)
+        .map_err(|error| format!("could not create {}: {error}", accounts_dir.display()))?;
+    let value = Json::object([(
+        "providers",
+        Json::array(providers.iter().map(|provider| {
+            Json::object([
+                ("name", Json::string(&provider.name)),
+                ("authorizeUrl", Json::string(&provider.authorize_url)),
+                ("tokenUrl", Json::string(&provider.token_url)),
+                ("userinfoUrl", Json::string(&provider.userinfo_url)),
+                ("clientId", Json::string(&provider.client_id)),
+                ("clientSecret", Json::string(&provider.client_secret)),
+                ("scope", Json::string(&provider.scope)),
+                ("subjectField", Json::string(&provider.subject_field)),
+                ("emailField", Json::string(&provider.email_field)),
+                (
+                    "emailVerifiedField",
+                    provider
+                        .email_verified_field
+                        .as_ref()
+                        .map_or(Json::Null, Json::string),
+                ),
+            ])
+        })),
+    )]);
+    let path = oauth_providers_path(accounts_dir);
+    let temporary = path.with_extension("json.tmp");
+    std::fs::write(&temporary, value.to_text())
+        .map_err(|error| format!("could not write {}: {error}", temporary.display()))?;
+    restrict(&temporary);
+    std::fs::rename(&temporary, &path)
+        .map_err(|error| format!("could not store {}: {error}", path.display()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn scratch(name: &str) -> PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "selfhost-cli-reports-oauth-{}-{name}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&path);
+        path
+    }
+
+    #[test]
+    fn a_provider_with_no_secrets_file_is_an_empty_list() {
+        let dir = scratch("empty");
+        assert!(load_oauth_providers(&dir).expect("empty list").is_empty());
+    }
+
+    #[test]
+    fn adding_and_listing_a_provider_round_trips_every_field() {
+        let dir = scratch("roundtrip");
+        let provider = Provider {
+            name: "google".to_string(),
+            authorize_url: "https://accounts.google.com/o/oauth2/v2/auth".to_string(),
+            token_url: "https://oauth2.googleapis.com/token".to_string(),
+            userinfo_url: "https://openidconnect.googleapis.com/v1/userinfo".to_string(),
+            client_id: "client-123".to_string(),
+            client_secret: "secret-456".to_string(),
+            scope: "openid email".to_string(),
+            subject_field: "sub".to_string(),
+            email_field: "email".to_string(),
+            email_verified_field: Some("email_verified".to_string()),
+        };
+        save_oauth_providers(&dir, std::slice::from_ref(&provider)).expect("saved");
+        let loaded = load_oauth_providers(&dir).expect("loaded");
+        assert_eq!(loaded, vec![provider]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn saving_the_same_name_twice_replaces_rather_than_duplicates() {
+        let dir = scratch("replace");
+        let arguments = |secret: &str| {
+            vec![
+                "reports".to_string(),
+                "oauth".to_string(),
+                "add".to_string(),
+                "google".to_string(),
+                "--authorize-url".to_string(),
+                "https://a".to_string(),
+                "--token-url".to_string(),
+                "https://t".to_string(),
+                "--userinfo-url".to_string(),
+                "https://u".to_string(),
+                "--client-id".to_string(),
+                "id".to_string(),
+                "--client-secret".to_string(),
+                secret.to_string(),
+            ]
+        };
+        oauth_add(&arguments("first-secret"), &dir).expect("added");
+        oauth_add(&arguments("rotated-secret"), &dir).expect("added again");
+        let loaded = load_oauth_providers(&dir).expect("loaded");
+        assert_eq!(loaded.len(), 1, "one provider, not two");
+        assert_eq!(loaded[0].client_secret, "rotated-secret");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn removing_an_unknown_provider_is_refused_by_name() {
+        let dir = scratch("remove-unknown");
+        let error = oauth_remove(
+            &[
+                "reports".to_string(),
+                "oauth".to_string(),
+                "remove".to_string(),
+                "nope".to_string(),
+            ],
+            &dir,
+        )
+        .expect_err("refused");
+        assert!(error.contains("no such provider"), "{error}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_oauth_provider_file_is_readable_only_by_its_owner() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = scratch("perms");
+        save_oauth_providers(&dir, &[]).expect("saved");
+        let mode = std::fs::metadata(oauth_providers_path(&dir))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o077, 0, "no group or world access: mode {mode:o}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

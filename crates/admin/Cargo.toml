@@ -25,6 +25,9 @@ selfhost-http = { workspace = true }
 # ask it without depending on the crate that routes to them.
 selfhost-identity = { workspace = true }
 selfhost-json = { workspace = true }
+# PBKDF2-HMAC-SHA256 password hashing, shared with `selfhost-reports` rather than each crate
+# hand-rolling its own copy — see `selfhost_login`'s crate documentation.
+selfhost-login = { workspace = true }
 # The owner's half of a peer link. `GET /api/mesh/link` is the one route on this
 # API whose credential arrives *after* the handshake — a worker proves its
 # enrolment in the first frame — so the admission, the replay ledger and the mux

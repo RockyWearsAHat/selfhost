@@ -76,7 +76,26 @@ does (`crates/proxy/src/server.rs`'s `dispatch`), not a listener of its own.
 | Guessable hostnames | `A` records + certificate SANs for `mail.`, `imap.`, `smtp.` | Nearly every client, as a guess after discovery fails. This is why setup works today once the two hostnames are typed. |
 | RFC 6186 SRV | `_imaps._tcp` → `0 1 993 imap.<domain>`, `_submission._tcp` → `0 1 587 smtp.<domain>`, `_submissions._tcp` → `0 1 465 smtp.<domain>` | Thunderbird and others. **Not macOS/iOS Mail** — a sweep of the dyld shared cache on macOS 15.5 finds those service labels zero times (`discovery-lab.dx`). |
 | **PACC** (`draft-ietf-mailmaint-pacc`) | `A` + certificate for `ua-auto-config.<domain>`, the document served at `https://ua-auto-config.<domain>/.well-known/user-agent-configuration.json`, and a `_ua-auto-config` `TXT` carrying `v=UAAC1; a=sha256; d=<base64 SHA-256 of the document>` | Nothing shipping yet — Apple co-authors the draft and was implementing a client in July 2026. Published now because it is inert to clients that have never heard of it and is the only specified path that ends with an address and a password being enough. |
-| **Exchange Autodiscover, EWS, and ActiveSync** | `A` + certificate for `autodiscover.<domain>`; `POST /autodiscover/autodiscover.xml` on that host and on the bare mail domain (`selfhost_mail::autodiscover`); `POST /EWS/Exchange.asmx` (`selfhost_mail::ews`) and `POST /Microsoft-Server-ActiveSync` (`selfhost_mail::eas`), both Basic-auth gated against the same `Authenticator` IMAP/submission already trust | **This is the one macOS/iOS Mail actually act on.** Per the research behind this feature: Mail ignores RFC 6186 SRV and the IMAP/SMTP blocks of a plain Autodiscover response — the only server-driven path it follows is an `EXCH`/`ASUrl` block naming a working EWS endpoint, and it then drives the mailbox over EWS, not IMAP. iOS Mail's equivalent is ActiveSync, reached via the same Autodiscover response's `MobileSync` block. Both are real, working protocol servers here (folder listing, message fetch as raw MIME, send, flag, delete), backed by the same `Maildir` IMAP/submission use — not a stub that only answers discovery. **Needs a real device to close the loop**: Apple's client-side EWS/EAS subset is reverse-engineered, not documented, so the final proof is adding the account on an actual Mac/iPhone, not a test suite. |
+| **Exchange Autodiscover, EWS, and ActiveSync** | `A` + certificate for `autodiscover.<domain>`; `POST /autodiscover/autodiscover.xml` on that host and on the bare mail domain (`selfhost_mail::autodiscover`); `POST /EWS/Exchange.asmx` (`selfhost_mail::ews`) and `POST /Microsoft-Server-ActiveSync` (`selfhost_mail::eas`), both Basic-auth gated against the same `Authenticator` IMAP/submission already trust | **This is the one macOS/iOS Mail actually act on — once the user picks "Microsoft Exchange" as the account type.** Confirmed live 2026-08-13 (see below): Mail ignores RFC 6186 SRV and the IMAP/SMTP blocks of a plain Autodiscover response — the only server-driven path it follows is an `EXCH`/`ASUrl` block naming a working EWS endpoint, and it then drives the mailbox over EWS, not IMAP. iOS Mail's equivalent is ActiveSync, reached via the same Autodiscover response's `MobileSync` block. Both are real, working protocol servers here (folder listing, message fetch as raw MIME, send, flag, delete), backed by the same `Maildir` IMAP/submission use — not a stub that only answers discovery. |
+
+**2026-08-13 — real-device test, and a correction.** Added `alex@rockywearsahat.com`
+on an actual Mac. Typing only the address and clicking Continue produced *no*
+server-side activity at all — that path is "Other Mail Account," a manual-IMAP-only
+flow that never invokes discovery, confirmed by watching the daemon's access log live.
+Explicitly picking **Microsoft Exchange** as the account type produced the full expected
+sequence: `GET /autodiscover/autodiscover.json/v1.0/<address>?Protocol=EWS`,
+`POST /autodiscover/autodiscover.xml`, two `POST /EWS/Exchange.asmx` calls, all against
+`autodiscover.rockywearsahat.com`, all succeeding — account confirmed working end to end.
+
+This corrects an assumption baked into the row above and into how this feature was
+originally framed: macOS/iOS never attempt Exchange-style discovery against an arbitrary
+typed domain without the user first selecting the Exchange account type — that is not a
+gap in this deployment, it is how every non-Google/iCloud/Yahoo custom domain has always
+worked on Apple's mail clients. The literal "type an address, nothing else, no account-type
+click" experience is what **PACC** (the row above this one) is for, and it is not yet
+implemented client-side by any shipping Apple Mail build. "Zero-touch" for this feature,
+accurately: no server hostnames are ever typed — address, password, and (until PACC ships
+client-side) one account-type selection.
 
 The document, the digest, and the hostname all come from one derivation
 (`crates/config/src/pacc.rs`), so the served zone after any config change
