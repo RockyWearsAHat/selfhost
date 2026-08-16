@@ -38,6 +38,7 @@
 //! a number this driver cannot actually measure.
 
 use crate::address::Address;
+use crate::message::Message;
 use crate::imap::{
     CopyPlan, FetchPlan, Flag, IAction, IConfig, IResponse, ISession, MessageData, MovePlan,
     SelectData, Status, StoreOp, StorePlan,
@@ -209,6 +210,31 @@ where
     let mut line = String::new();
 
     loop {
+        // An `APPEND` in flight owns the next N octets, and they are a message,
+        // not a command. Read them as bytes and hand them straight back — the
+        // command parser must never see them. Before this existed the session
+        // answered `BAD` and left the message in the stream, so every one of its
+        // lines was then parsed as its own command.
+        if let Some(expected) = session.awaiting_message() {
+            let mut message = vec![0u8; expected];
+            reader.read_exact(&mut message).await?;
+            // The literal is followed by the CRLF that ends the command line;
+            // consume it so the next read starts on a command boundary.
+            let mut trailing = String::new();
+            let _ = read_command_line(&mut reader, &mut trailing).await?;
+            log_imap(peer, format!(">> <message octets: {expected}>"));
+
+            match session.message_octets(message) {
+                IAction::Append { tag, mailbox, flags, message } => {
+                    let responses = apply_append(server, session, &tag, &mailbox, &flags, message).await;
+                    send(peer, reader.get_mut(), &responses).await?;
+                }
+                IAction::Respond(responses) => send(peer, reader.get_mut(), &responses).await?,
+                _ => {}
+            }
+            continue;
+        }
+
         line.clear();
         let read = read_command_line(&mut reader, &mut line).await?;
         if read == 0 {
@@ -302,6 +328,12 @@ where
             }
             IAction::CloseMailbox { tag, mailbox } => {
                 let responses = apply_close(server, session, &tag, &mailbox).await;
+                send(peer, reader.get_mut(), &responses).await?;
+            }
+            IAction::Append { tag, mailbox, flags, message } => {
+                // Reachable only if a session ever emits this without going
+                // through the octet path above; handled the same way regardless.
+                let responses = apply_append(server, session, &tag, &mailbox, &flags, message).await;
                 send(peer, reader.get_mut(), &responses).await?;
             }
             IAction::Close(responses) => {
@@ -461,6 +493,68 @@ async fn apply_copy(server: &ImapServer, session: &ISession, plan: &CopyPlan) ->
         }
     }
     vec![IResponse::tagged(&plan.tag, Status::Ok, "COPY completed")]
+}
+
+/// Stores an appended message and answers the tag.
+///
+/// This is what makes a client's Sent folder work: Apple Mail sends every
+/// message twice — once out through submission, and once here to file its own
+/// copy. Until `APPEND` existed the second one was refused, so nothing the user
+/// sent was ever saved.
+///
+/// The message is parsed rather than written blind, because the store indexes
+/// what it holds; a body that will not parse is refused with a `NO` naming that,
+/// which is a better answer than a mailbox that silently swallows it.
+async fn apply_append(
+    server: &ImapServer,
+    session: &ISession,
+    tag: &str,
+    mailbox: &str,
+    flags: &[Flag],
+    message: Vec<u8>,
+) -> Vec<IResponse> {
+    let Some(user) = session.user().cloned() else {
+        return vec![IResponse::tagged(tag, Status::No, "not authenticated")];
+    };
+    let Some(folder) = folder_from_name(mailbox) else {
+        // RFC 3501 §6.3.11 asks for `[TRYCREATE]` here so a client knows the
+        // append would succeed against a mailbox it may create. This server's
+        // folder set is fixed, so it would be a lie: no CREATE will help.
+        return vec![IResponse::tagged(tag, Status::No, "no such mailbox")];
+    };
+    let Ok(parsed) = Message::parse(message) else {
+        return vec![IResponse::tagged(tag, Status::No, "message could not be parsed")];
+    };
+
+    let uid = match server.store.save(&user, folder, &parsed).await {
+        Ok(uid) => uid,
+        Err(_) => return vec![IResponse::tagged(tag, Status::No, "could not store the message")],
+    };
+
+    // Flags are applied after the write, so a message is never left unstored
+    // because a flag could not be set. A client that asked for `\Seen` on its
+    // own sent copy and did not get it is a cosmetic loss; losing the copy is
+    // not.
+    if !flags.is_empty() {
+        let mut wanted = StoreFlags::default();
+        for flag in flags {
+            match flag {
+                Flag::Seen => wanted.seen = true,
+                Flag::Answered => wanted.answered = true,
+                Flag::Flagged => wanted.flagged = true,
+                Flag::Deleted => wanted.deleted = true,
+                Flag::Draft => wanted.draft = true,
+            }
+        }
+        let _ = server.store.set_flags(&user, folder, uid, wanted).await;
+    }
+
+    let validity = server.store.uid_validity(&user, folder).await;
+    vec![IResponse::tagged(
+        tag,
+        Status::Ok,
+        format!("[APPENDUID {validity} {}] APPEND completed", uid.0),
+    )]
 }
 
 /// Performs the purge half of `CLOSE`: same removal `EXPUNGE` performs, but
