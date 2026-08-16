@@ -126,35 +126,30 @@ impl Invite {
 #[derive(Clone)]
 pub struct Invites {
     path: PathBuf,
-    entries: Arc<Mutex<Vec<Invite>>>,
+    state: Arc<Mutex<Stored>>,
+}
+
+/// What the store holds in memory: the entries, and enough about the file they
+/// were read from to notice somebody else rewriting it.
+struct Stored {
+    /// The invitations as last read or written.
+    entries: Vec<Invite>,
+    /// The modified time and length of the file those entries came from, or
+    /// `None` when the file was absent or unreadable. Compared before every
+    /// operation; a difference means re-read.
+    seen: Option<(SystemTime, u64)>,
 }
 
 impl Invites {
     /// Loads the store from `<data_dir>/console.invites`.
+    ///
+    /// The entries this reads are a starting point, not a snapshot the handle
+    /// keeps: see [`Self::refreshed`] for why every operation re-reads a file
+    /// that has changed underneath it.
     pub fn load(data_dir: &Path) -> Self {
         let path = Self::path_in(data_dir);
-        let entries = match std::fs::read_to_string(&path) {
-            Ok(text) => match parse_invites(&text) {
-                Some(entries) => entries,
-                None => {
-                    eprintln!(
-                        "admin: {} is not a valid invite file; no invitation can be \
-                         redeemed until it is repaired or removed",
-                        path.display()
-                    );
-                    Vec::new()
-                }
-            },
-            Err(error) if error.kind() == io::ErrorKind::NotFound => Vec::new(),
-            Err(error) => {
-                eprintln!(
-                    "admin: could not read {}: {error}; no invitation can be redeemed",
-                    path.display()
-                );
-                Vec::new()
-            }
-        };
-        Self { path, entries: Arc::new(Mutex::new(entries)) }
+        let (entries, seen) = read_entries(&path, true);
+        Self { path, state: Arc::new(Mutex::new(Stored { entries, seen })) }
     }
 
     /// Where the invite file lives for a given data directory.
@@ -186,17 +181,18 @@ impl Invites {
             expires_unix: now.saturating_add(hours.saturating_mul(3_600)),
         };
 
-        let mut entries = self.lock();
+        let mut state = self.refreshed();
         // Drop this person's previous invitation and anything already expired,
         // so the cap is a bound on *live* invitations rather than on history.
-        entries.retain(|entry| entry.name != invite.name && entry.live_at(now));
-        if entries.len() >= MAX_INVITES {
+        state.entries.retain(|entry| entry.name != invite.name && entry.live_at(now));
+        if state.entries.len() >= MAX_INVITES {
             return Err(io::Error::other(format!(
                 "at most {MAX_INVITES} invitations may be outstanding at once"
             )));
         }
-        entries.push(invite);
-        self.persist(&entries)?;
+        state.entries.push(invite);
+        self.persist(&state.entries)?;
+        self.mark_written(&mut state);
         Ok(code)
     }
 
@@ -224,7 +220,7 @@ impl Invites {
         let presented = sha256(code);
         let now = now_unix();
         let mut found = None;
-        for entry in self.lock().iter() {
+        for entry in self.refreshed().entries.iter() {
             if entry.live_at(now) && constant_time_eq(&entry.digest, &presented) {
                 found = Some(entry.name.clone());
             }
@@ -245,9 +241,9 @@ impl Invites {
     pub fn redeem(&self, code: &str) -> Option<PersonName> {
         let presented = sha256(code);
         let now = now_unix();
-        let mut entries = self.lock();
+        let mut state = self.refreshed();
         let mut redeemed: Option<PersonName> = None;
-        entries.retain(|entry| {
+        state.entries.retain(|entry| {
             let hit = entry.live_at(now) && constant_time_eq(&entry.digest, &presented);
             if hit {
                 redeemed = Some(entry.name.clone());
@@ -259,9 +255,10 @@ impl Invites {
         // though it changed no decision; a failed write must not, however, turn
         // a successful redemption into a refusal the caller cannot retry — the
         // credential is already minted by the time this matters.
-        if let Err(error) = self.persist(&entries) {
+        if let Err(error) = self.persist(&state.entries) {
             eprintln!("admin: could not update {}: {error}", self.path.display());
         }
+        self.mark_written(&mut state);
         Some(redeemed)
     }
 
@@ -272,18 +269,19 @@ impl Invites {
     /// when, never a credential.
     pub fn outstanding(&self) -> Vec<Invite> {
         let now = now_unix();
-        self.lock().iter().filter(|entry| entry.live_at(now)).cloned().collect()
+        self.refreshed().entries.iter().filter(|entry| entry.live_at(now)).cloned().collect()
     }
 
     /// Withdraws the invitation for `name`, persisting; false if there was none.
     pub fn revoke(&self, name: &PersonName) -> io::Result<bool> {
-        let mut entries = self.lock();
-        let before = entries.len();
-        entries.retain(|entry| &entry.name != name);
-        if entries.len() == before {
+        let mut state = self.refreshed();
+        let before = state.entries.len();
+        state.entries.retain(|entry| &entry.name != name);
+        if state.entries.len() == before {
             return Ok(false);
         }
-        self.persist(&entries)?;
+        self.persist(&state.entries)?;
+        self.mark_written(&mut state);
         Ok(true)
     }
 
@@ -303,12 +301,103 @@ impl Invites {
         std::fs::rename(&temporary, &self.path)
     }
 
-    /// The entries, with lock poisoning treated as fatal, as in the sibling
-    /// stores: a panic while invitations were held leaves them in an unknown
-    /// state, and limping on is worse than stopping.
-    fn lock(&self) -> std::sync::MutexGuard<'_, Vec<Invite>> {
-        self.entries.lock().expect("the invite store lock was poisoned")
+    /// The entries, re-read first if the file changed since this handle last
+    /// looked at it.
+    ///
+    /// # Why this re-reads instead of trusting what it loaded
+    ///
+    /// **This store has two writers in two different processes.** The daemon
+    /// holds one handle for the lifetime of the process; `selfhost people
+    /// invite` opens its own, writes, and exits — deliberately, because a
+    /// permission tool that needs a working console to let somebody into the
+    /// console has a cycle in it (see `crates/cli/src/people_command.rs`).
+    ///
+    /// A handle that kept the entries it loaded at start-up therefore answered
+    /// out of a snapshot taken before the invitation existed. The operator minted
+    /// a code, sent it, and the person got the same uniform `401` a wrong code
+    /// gets — indistinguishable from a typo, on a door whose whole job is to
+    /// admit somebody holding nothing else. The invite flow could only ever have
+    /// worked on a deployment restarted between minting and redeeming, which is
+    /// why every test passed and nobody had completed the ceremony on real
+    /// hardware. Found 2026-08-15, on the first attempt to use it live.
+    ///
+    /// Re-reading also closes the write half of the same bug: [`Self::redeem`]
+    /// and [`Self::revoke`] persist the whole list, so a stale handle would have
+    /// erased any invitation minted by the other process since it loaded.
+    ///
+    /// The check is a stat, not a read — modified time and length — so the
+    /// common case costs one `metadata` call on a file of a few hundred bytes,
+    /// and both routes that reach it are already behind the shared failure gate.
+    ///
+    /// Lock poisoning is fatal, as in the sibling stores: a panic while
+    /// invitations were held leaves them in an unknown state, and limping on is
+    /// worse than stopping.
+    fn refreshed(&self) -> std::sync::MutexGuard<'_, Stored> {
+        let mut state = self.state.lock().expect("the invite store lock was poisoned");
+        let current = file_stamp(&self.path);
+        if current != state.seen {
+            // Announce a file that has become unreadable or malformed, but only
+            // when it changes: this runs on every lookup, and a broken file must
+            // not turn the log into the thing that fills the disk.
+            let (entries, seen) = read_entries(&self.path, true);
+            state.entries = entries;
+            state.seen = seen;
+        }
+        state
     }
+
+    /// Records what was just written, so the next operation does not re-read
+    /// this handle's own write back off the disk.
+    fn mark_written(&self, state: &mut Stored) {
+        state.seen = file_stamp(&self.path);
+    }
+}
+
+/// The file's identity for change detection: modified time and length.
+///
+/// `None` when the file is absent or cannot be stated, which is itself a value
+/// that compares unequal to a present file — so a store whose file appears, or
+/// disappears, notices either way.
+fn file_stamp(path: &Path) -> Option<(SystemTime, u64)> {
+    let metadata = std::fs::metadata(path).ok()?;
+    Some((metadata.modified().ok()?, metadata.len()))
+}
+
+/// Reads and parses the invite file, failing closed.
+///
+/// A missing file is an empty store. A malformed one is *also* an empty store —
+/// no invitation can be redeemed, rather than some unknown subset of them being
+/// live — and says so when `announce` is set.
+fn read_entries(path: &Path, announce: bool) -> (Vec<Invite>, Option<(SystemTime, u64)>) {
+    // Stamp first, so a write landing between the read and the stat is noticed
+    // on the next call rather than being mistaken for what was just read.
+    let stamp = file_stamp(path);
+    let entries = match std::fs::read_to_string(path) {
+        Ok(text) => match parse_invites(&text) {
+            Some(entries) => entries,
+            None => {
+                if announce {
+                    eprintln!(
+                        "admin: {} is not a valid invite file; no invitation can be \
+                         redeemed until it is repaired or removed",
+                        path.display()
+                    );
+                }
+                Vec::new()
+            }
+        },
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Vec::new(),
+        Err(error) => {
+            if announce {
+                eprintln!(
+                    "admin: could not read {}: {error}; no invitation can be redeemed",
+                    path.display()
+                );
+            }
+            Vec::new()
+        }
+    };
+    (entries, stamp)
 }
 
 // Deliberately not a revealing `Debug`: the digests are not codes, but a list of
@@ -443,10 +532,11 @@ mod tests {
         // Reach past the clock rather than sleeping an hour: the entry is
         // rewritten to have expired one second ago.
         {
-            let mut entries = invites.lock();
-            entries[0].expires_unix = now_unix().saturating_sub(1);
-            let entries = entries.clone();
+            let mut state = invites.refreshed();
+            state.entries[0].expires_unix = now_unix().saturating_sub(1);
+            let entries = state.entries.clone();
             invites.persist(&entries).expect("persists");
+            invites.mark_written(&mut state);
         }
         assert_eq!(invites.redeem(&code), None, "a lapsed invitation opens nothing");
         assert!(invites.outstanding().is_empty(), "and it is not shown as pending");
@@ -551,6 +641,79 @@ mod tests {
         }
         assert!(invites.mint(&person("one-too-many"), 1).is_err(), "a loop hits a wall");
         assert_eq!(invites.outstanding().len(), MAX_INVITES);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_code_minted_by_another_process_is_redeemable_by_a_handle_that_predates_it() {
+        // The two handles are the two processes this store really has: `daemon`
+        // is opened at start-up and lives forever, `cli` is `selfhost people
+        // invite` opening the file, writing, and exiting.
+        //
+        // This is the shipped bug. The daemon answered out of the entries it
+        // read at start-up, so an invitation minted afterwards did not exist as
+        // far as the invite door was concerned, and the person it was sent to
+        // got the same uniform 401 a wrong code gets.
+        let dir = scratch("cross-process");
+        let daemon = Invites::load(&dir);
+        assert!(daemon.outstanding().is_empty(), "nothing pending at start-up");
+
+        let cli = Invites::load(&dir);
+        let code = cli.mint(&person("dad"), 48).expect("the CLI mints");
+
+        assert_eq!(
+            daemon.name_for(&code).map(|name| name.to_string()),
+            Some("dad".to_owned()),
+            "the running daemon must see an invitation minted after it started"
+        );
+        assert_eq!(
+            daemon.redeem(&code).map(|name| name.to_string()),
+            Some("dad".to_owned()),
+            "and must be able to spend it"
+        );
+        assert!(daemon.redeem(&code).is_none(), "still single-use");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_handle_that_writes_does_not_erase_what_another_process_added() {
+        // The write half of the same bug: redeem and revoke persist the whole
+        // list, so a handle holding a stale snapshot would have written back a
+        // list that never contained the other process's invitation.
+        let dir = scratch("no-lost-update");
+        let daemon = Invites::load(&dir);
+        let first = daemon.mint(&person("alex"), 48).expect("mints");
+
+        let cli = Invites::load(&dir);
+        let second = cli.mint(&person("dad"), 48).expect("the CLI mints a second");
+
+        // The daemon spends its own invitation, rewriting the file.
+        assert!(daemon.redeem(&first).is_some(), "spends the first");
+
+        // The one the other process added must have survived that write.
+        assert_eq!(
+            daemon.name_for(&second).map(|name| name.to_string()),
+            Some("dad".to_owned()),
+            "redeeming one invitation must not erase another process's"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_invitation_withdrawn_by_the_cli_stops_opening_the_door() {
+        // `people uninvite` is the remedy the emailed-invitation path names for
+        // a code sent to the wrong address. It is worth nothing if the running
+        // daemon keeps honouring the code it just withdrew.
+        let dir = scratch("withdrawn");
+        let daemon = Invites::load(&dir);
+        let code = Invites::load(&dir).mint(&person("dad"), 48).expect("mints");
+        assert!(daemon.name_for(&code).is_some(), "live before it is withdrawn");
+
+        Invites::load(&dir).revoke(&person("dad")).expect("the CLI withdraws it");
+        assert!(
+            daemon.name_for(&code).is_none(),
+            "a withdrawn invitation must stop working without a restart"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
