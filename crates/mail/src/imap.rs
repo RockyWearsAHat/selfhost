@@ -23,7 +23,7 @@
 //!
 //! # What is intentionally left out
 //!
-//! No `APPEND`, no `IDLE`, no server-side search, and no quota. `EXPUNGE`,
+//! No `IDLE`, no server-side search, and no quota. `EXPUNGE`,
 //! `MOVE` (RFC 6851), and `COPY` are all real: they drive
 //! [`crate::store::Maildir::purge`]/[`crate::store::Maildir::move_message`]/
 //! [`crate::store::Maildir::save`], the same calls [`crate::ews`] and
@@ -49,6 +49,16 @@ use std::fmt;
 /// a `FETCH` item list with many header-field names is legitimately long; a line
 /// past this is refused rather than buffered without bound.
 pub const MAX_COMMAND_LINE: usize = 8192;
+
+/// The largest message `APPEND` will accept, in octets.
+///
+/// A command line is bounded by [`MAX_COMMAND_LINE`] because no argument is
+/// legitimately long; a message is a different kind of thing and needs its own
+/// ceiling. This one exists so an authenticated client cannot make the server
+/// buffer an unbounded allocation by announcing one — the octets are read into
+/// memory before they are written, so the announcement is a promise the server
+/// has to be willing to keep.
+pub const MAX_APPEND_BYTES: usize = 50 * 1024 * 1024;
 
 /// The status of a status response (`OK`/`NO`/`BAD`) or of an unsolicited one
 /// (`BYE`/`PREAUTH`).
@@ -217,6 +227,21 @@ pub enum IAction {
         /// The mailbox name just deselected, for the driver to resolve to a
         /// folder — the session's own view of it is already gone.
         mailbox: String,
+    },
+    /// Store this message in the named mailbox, then answer the tag.
+    ///
+    /// The message arrived as raw octets after a literal announcement, so it is
+    /// bytes rather than a `String`: what a client appends is whatever it sent,
+    /// and re-encoding it would change the message it asked to save.
+    Append {
+        /// Command tag to answer.
+        tag: String,
+        /// Destination mailbox, as the client named it.
+        mailbox: String,
+        /// Flags to set on the stored message.
+        flags: Vec<Flag>,
+        /// The message itself.
+        message: Vec<u8>,
     },
     /// Write these responses, then close the connection.
     Close(Vec<IResponse>),
@@ -540,6 +565,36 @@ pub struct ISession {
     /// [`ISession::command`]): the text assembled so far, with each completed
     /// literal re-quoted, and the octet count the next line must begin with.
     pending_literal: Option<PendingLiteral>,
+    /// An `APPEND` awaiting the message itself.
+    ///
+    /// Separate from [`Self::pending_literal`] because the two want opposite
+    /// things from the octets. A command-argument literal is *folded back into
+    /// the command* as a quoted string, which is why it refuses contents
+    /// containing CR/LF — a mailbox name or a password never has any. A message
+    /// is nothing but lines, so that path could never have carried one; it is
+    /// read as raw octets and never re-parsed as command text.
+    pending_append: Option<PendingAppend>,
+}
+
+/// An `APPEND` that has announced its message and is waiting for it.
+#[derive(Debug)]
+struct PendingAppend {
+    /// Command tag to answer once the message is stored.
+    tag: String,
+    /// Destination mailbox, as the client named it.
+    mailbox: String,
+    /// Flags to set on the stored message, from the optional `(\Seen …)` list.
+    flags: Vec<Flag>,
+    /// How many octets the message occupies.
+    expected: usize,
+    /// Why this append will be refused, if it will be.
+    ///
+    /// Recorded rather than answered immediately: the client announced the
+    /// literal and will send it regardless of what we reply, so the octets have
+    /// to be read and thrown away before the connection can carry another
+    /// command. Answering first and leaving a message in the stream is the
+    /// original defect — every one of its lines then parsed as a command.
+    refusal: Option<String>,
 }
 
 /// The in-progress state of a command whose next argument arrives as a
@@ -567,6 +622,7 @@ impl ISession {
             mailbox: None,
             pending_auth: None,
             pending_literal: None,
+            pending_append: None,
         }
     }
 
@@ -692,6 +748,28 @@ impl ISession {
             // assembled and, for a synchronising literal, invite the rest. A
             // LITERAL+ client has already sent it, so nothing is written.
             Some((prefix, expected, synchronizing)) => {
+                // `APPEND` is the one command whose literal is a *message*, not
+                // an argument. It cannot go through the folding path below: that
+                // re-quotes the octets back into the command line, which is why
+                // it refuses contents containing CR/LF — and a message is
+                // nothing but CR/LF. Before this branch existed, Apple Mail's
+                // save-to-Sent was answered `BAD`, and because the client had
+                // already committed to streaming the literal, every line of the
+                // message was then parsed as its own command. The log filled
+                // with `BAD command Mime-Version: 1.0 not implemented`.
+                if let Some(pending) = self.parse_append(prefix, expected) {
+                    // A refusal is recorded on the pending append rather than
+                    // answered now: the client is mid-command and will stream
+                    // the message whatever we say, so the octets must still be
+                    // consumed and discarded. Answering early and leaving them
+                    // in the stream is precisely the bug this replaces.
+                    self.pending_append = Some(pending);
+                    return if synchronizing {
+                        respond(IResponse::cont("Ready for message"))
+                    } else {
+                        IAction::Respond(Vec::new())
+                    };
+                }
                 if prefix.len() + expected > MAX_COMMAND_LINE {
                     return respond(refuse_literal(&logical));
                 }
@@ -704,6 +782,103 @@ impl ISession {
                 }
             }
             None => self.dispatch(&logical),
+        }
+    }
+
+    /// Recognises `APPEND <mailbox> [(flags)] ["date-time"]` ahead of its
+    /// message literal, returning the pending state to hold while it arrives.
+    ///
+    /// `None` means this was not an `APPEND` and the ordinary literal machinery
+    /// should handle it. `Some` always yields a pending append — a refusal is
+    /// carried on it rather than returned, so the message is still consumed.
+    ///
+    /// The date-time argument is parsed and discarded. `INTERNALDATE` is the
+    /// time the store recorded the file, and honouring a client-supplied one
+    /// would mean letting a client write a timestamp the server then reports as
+    /// its own; Apple Mail sends it on every save and does not mind.
+    fn parse_append(&self, prefix: &str, expected: usize) -> Option<PendingAppend> {
+        let (tag, remainder) = prefix.split_once(' ')?;
+        let (verb, args) = remainder.split_once(' ')?;
+        if !verb.eq_ignore_ascii_case("APPEND") {
+            return None;
+        }
+        let tag = tag.trim().to_owned();
+
+        let refuse = |why: &str| {
+            Some(PendingAppend {
+                tag: tag.clone(),
+                mailbox: String::new(),
+                flags: Vec::new(),
+                expected,
+                refusal: Some(why.to_owned()),
+            })
+        };
+
+        if self.state == IState::NotAuthenticated {
+            return refuse("APPEND requires authentication");
+        }
+        if expected > MAX_APPEND_BYTES {
+            return refuse("[TOOBIG] message exceeds the append limit");
+        }
+
+        let Some((mailbox, rest)) = next_arg(args.trim_start()) else {
+            return refuse("APPEND needs a mailbox");
+        };
+        if mailbox.is_empty() {
+            return refuse("APPEND needs a mailbox");
+        }
+
+        // The optional parenthesised flag list, then an optional quoted
+        // date-time. Both are positional and both may be absent.
+        let rest = rest.trim_start();
+        let mut flags = Vec::new();
+        if let Some(open) = rest.strip_prefix('(') {
+            match open.split_once(')') {
+                Some((inside, _after)) => {
+                    flags = inside.split_whitespace().filter_map(Flag::parse).collect();
+                    // What follows is the optional date-time, which is parsed by
+                    // being ignored: see this function's doc for why a
+                    // client-supplied INTERNALDATE is not honoured.
+                }
+                None => return refuse("APPEND flag list is not closed"),
+            }
+        }
+
+        Some(PendingAppend {
+            tag,
+            mailbox,
+            flags,
+            expected,
+            refusal: None,
+        })
+    }
+
+    /// How many octets of message the session is waiting for, if any.
+    ///
+    /// The driver reads exactly this many raw bytes off the socket and hands
+    /// them to [`Self::message_octets`], instead of reading another line. A
+    /// message is not a line and must never be fed through the command parser.
+    pub fn awaiting_message(&self) -> Option<usize> {
+        self.pending_append.as_ref().map(|pending| pending.expected)
+    }
+
+    /// Accepts the message octets [`Self::awaiting_message`] asked for.
+    ///
+    /// Returns the action that stores them, or the refusal that was decided
+    /// when the command was parsed — either way the octets are now off the
+    /// stream and the connection is back in sync.
+    pub fn message_octets(&mut self, message: Vec<u8>) -> IAction {
+        let Some(pending) = self.pending_append.take() else {
+            return respond(IResponse::untagged("BAD no message was expected"));
+        };
+        match pending.refusal {
+            Some(why) => respond(IResponse::tagged(&pending.tag, Status::No, why)),
+            None => IAction::Append {
+                tag: pending.tag,
+                mailbox: pending.mailbox,
+                flags: pending.flags,
+                message,
+            },
         }
     }
 
@@ -2115,6 +2290,121 @@ mod tests {
             .map(|r| r.text().into_owned())
             .find(|line| line.starts_with(tag))
             .unwrap_or_default()
+    }
+
+    // ---- APPEND ------------------------------------------------------------
+
+    /// The exact shape Apple Mail sends when it saves a copy to Sent.
+    ///
+    /// Before `APPEND` existed this was answered `BAD`, and because the client
+    /// had already committed to streaming the literal, every line of the
+    /// message was then parsed as its own command — the `BAD command
+    /// Mime-Version: 1.0 not implemented` flood in the production log.
+    #[test]
+    fn append_asks_for_the_message_instead_of_folding_it_into_the_command() {
+        let mut s = selected_session();
+        let action = s.command("a3 APPEND Sent (\\Seen) \"15-Aug-2026 18:39:20 +0000\" {42}\r\n");
+        match action {
+            IAction::Respond(responses) => {
+                assert!(responses[0].text().starts_with('+'), "expected a continuation");
+            }
+            other => panic!("expected a continuation, got {other:?}"),
+        }
+        assert_eq!(s.awaiting_message(), Some(42), "the driver must read 42 raw octets");
+        assert!(!s.awaiting_literal(), "an APPEND must not use the argument-literal path");
+    }
+
+    #[test]
+    fn the_message_octets_become_an_append_action_carrying_them_verbatim() {
+        let mut s = selected_session();
+        let body = b"Subject: hi\r\n\r\nline one\r\nline two\r\n";
+        let _ = s.command(&format!("a3 APPEND Sent {{{}}}\r\n", body.len()));
+        match s.message_octets(body.to_vec()) {
+            IAction::Append { tag, mailbox, flags, message } => {
+                assert_eq!(tag, "a3");
+                assert_eq!(mailbox, "Sent");
+                assert!(flags.is_empty());
+                assert_eq!(message, body, "the message must be stored exactly as sent");
+            }
+            other => panic!("expected Append, got {other:?}"),
+        }
+        assert_eq!(s.awaiting_message(), None, "the session is back to reading commands");
+    }
+
+    #[test]
+    fn append_flags_are_carried_through() {
+        let mut s = selected_session();
+        let _ = s.command("a3 APPEND Sent (\\Seen \\Draft) {5}\r\n");
+        match s.message_octets(b"hello".to_vec()) {
+            IAction::Append { flags, .. } => {
+                assert!(flags.contains(&Flag::Seen));
+                assert!(flags.contains(&Flag::Draft));
+            }
+            other => panic!("expected Append, got {other:?}"),
+        }
+    }
+
+    /// A message containing CRLF is the whole point — the argument-literal path
+    /// refuses those, which is exactly why APPEND needed its own.
+    #[test]
+    fn a_message_full_of_crlf_survives_intact() {
+        let mut s = selected_session();
+        let body = b"A: 1\r\nB: 2\r\n\r\nbody\r\nwith\r\nmany\r\nlines\r\n";
+        let _ = s.command(&format!("a3 APPEND Sent {{{}}}\r\n", body.len()));
+        match s.message_octets(body.to_vec()) {
+            IAction::Append { message, .. } => assert_eq!(message, body),
+            other => panic!("expected Append, got {other:?}"),
+        }
+    }
+
+    /// A refusal still consumes the octets. The client announced the literal and
+    /// will send it whatever we answer; replying early and leaving a message in
+    /// the stream is the original defect.
+    #[test]
+    fn a_refused_append_still_swallows_the_message_before_answering_no() {
+        let mut s = selected_session();
+        let _ = s.command("a3 APPEND NoSuchThing {5}\r\n");
+        assert_eq!(s.awaiting_message(), Some(5), "the octets must still be read");
+        // The mailbox name is resolved by the driver, so the session accepts it
+        // here; the size ceiling is the refusal the session itself makes.
+        let mut s = selected_session();
+        let huge = MAX_APPEND_BYTES + 1;
+        let _ = s.command(&format!("a4 APPEND Sent {{{huge}}}\r\n"));
+        assert_eq!(s.awaiting_message(), Some(huge), "a refused append still reads its octets");
+        match s.message_octets(Vec::new()) {
+            IAction::Respond(responses) => {
+                let line = tagged_line(&responses, "a4");
+                assert!(line.contains("NO"), "got {line}");
+                assert!(line.contains("TOOBIG"), "got {line}");
+            }
+            other => panic!("expected a tagged NO, got {other:?}"),
+        }
+        assert_eq!(s.awaiting_message(), None, "and the connection is back in sync");
+    }
+
+    #[test]
+    fn append_before_authentication_is_refused_and_still_drains() {
+        let mut s = ISession::new(config());
+        s.tls_established();
+        let _ = s.command("a1 APPEND Sent {4}\r\n");
+        assert_eq!(s.awaiting_message(), Some(4));
+        match s.message_octets(b"noop".to_vec()) {
+            IAction::Respond(responses) => {
+                assert!(tagged_line(&responses, "a1").contains("NO"));
+            }
+            other => panic!("expected a tagged NO, got {other:?}"),
+        }
+    }
+
+    /// A LOGIN literal must still take the folding path — the new branch keys on
+    /// the verb, and getting that wrong would break authentication.
+    #[test]
+    fn a_login_literal_still_uses_the_argument_path() {
+        let mut s = ISession::new(config());
+        s.tls_established();
+        let _ = s.command("a1 LOGIN {17}\r\n");
+        assert!(s.awaiting_literal(), "LOGIN must keep folding its literal");
+        assert_eq!(s.awaiting_message(), None, "and must not be mistaken for a message");
     }
 
     // ---- greeting and capability ------------------------------------------
