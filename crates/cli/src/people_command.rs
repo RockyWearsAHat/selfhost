@@ -36,9 +36,11 @@ Usage
   selfhost people capabilities               Every capability word, and its target
 
 Letting somebody in
-  selfhost people invite <name> [<cap>,…] [--hours N]
+  selfhost people invite <name> [<cap>,…] [--hours N] [--email <address>]
                                              Grant, then mint a one-time code they
-                                             use to register their own passkey
+                                             use to register their own passkey.
+                                             --email sends it to them; without it
+                                             the code is printed for you to pass on
   selfhost people invited                    Who has an invitation pending, until when
   selfhost people uninvite <name>            Withdraw an invitation nobody has used
 
@@ -107,6 +109,22 @@ fn invite(
 ) -> Result<(), String> {
     let name = name_argument(arguments)?;
     let hours = hours_argument(arguments)?;
+    // Validate the destination address BEFORE anything is written. A typo that
+    // cannot be an address at all must not cost an invitation: minting one
+    // supersedes any previous code for this person, so a command that fails
+    // halfway would silently revoke a live invitation to punish a typo.
+    let recipient = match email_argument(arguments)? {
+        Some(typed) => Some(
+            crate::invite_email::check_address(&typed).map_err(|error| error.to_string())?,
+        ),
+        None => None,
+    };
+    // Fail early on a deployment that cannot send at all, for the same reason:
+    // better to refuse before minting than to mint and then discover there is
+    // no mail subsystem to hand it to.
+    if recipient.is_some() {
+        crate::invite_email::sender(config).map_err(|error| error.to_string())?;
+    }
     // The capability list is whatever positional argument is not the `--hours`
     // pair, so `invite mom console.read` and `invite mom --hours 4` both read
     // the way they look.
@@ -134,26 +152,49 @@ fn invite(
 
     println!("✓ an invitation for {name}, good for {hours} hours and usable once");
     println!();
-    match console_host(config) {
-        Some(host) => {
-            println!("  Send them this link:");
+    // The one text that is both shown here and sent, so the operator reads
+    // exactly what the person will read rather than a summary of it.
+    let instructions = match console_host(config) {
+        Some(host) => format!(
+            "Open this link on the device you want to use, and it will ask for your \
+             fingerprint or face:\n\n    https://{host}/#invite={code}\n\nThat registers you as \
+             \"{name}\". Nobody needs to be present but you. The link works once, and stops \
+             working after {hours} hours."
+        ),
+        None => format!(
+            "Your code is:\n\n    {code}\n\nThis deployment declares no console site, so there \
+             is no address to open it at yet. It works once, and stops working after {hours} \
+             hours."
+        ),
+    };
+    for line in instructions.lines() {
+        if line.is_empty() {
             println!();
-            println!("    https://{host}/#invite={code}");
-        }
-        None => {
-            // No console site is configured, so there is no address to put the
-            // code at. Say that rather than printing half a link.
-            println!("  Their code is:");
-            println!();
-            println!("    {code}");
-            println!();
-            println!(
-                "  This deployment declares no console site, so there is no address to send \
-                 them to yet. Add a [[sites]] block with console = true, and they open it \
-                 at https://<that host>/#invite=<code>."
-            );
+        } else {
+            println!("  {line}");
         }
     }
+
+    if let Some(to) = &recipient {
+        println!();
+        match crate::invite_email::send(config, data_dir, name.as_str(), to, &instructions) {
+            Ok(id) => {
+                println!("✓ queued for delivery to {to} (message {id})");
+                println!();
+                println!(
+                    "  Queued is not delivered: the daemon signs it, routes it and retries a \
+                     deferral, so read the daemon log if it does not arrive. Check the address \
+                     above — a code sent to the wrong person is withdrawn with \
+                     `selfhost people uninvite {name}`, which is worth doing immediately rather \
+                     than hoping."
+                );
+            }
+            Err(error) => {
+                println!("✗ the invitation was minted but not sent: {error}");
+            }
+        }
+    }
+
     println!();
     println!(
         "  Opening it asks their device for a fingerprint or face and registers a passkey \
@@ -232,6 +273,26 @@ fn hours_argument(arguments: &[String]) -> Result<u64, String> {
         return Err("an invitation that lasts no time cannot be used".to_owned());
     }
     Ok(hours.min(selfhost_admin::invite::MAX_TTL_HOURS))
+}
+
+/// The address `--email` names, if it was given.
+///
+/// Absent is the default and stays the default: an invitation that travels by
+/// itself travels to whatever was typed, so sending is something the operator
+/// asks for in as many words, never something a flag's default does for them.
+fn email_argument(arguments: &[String]) -> Result<Option<String>, String> {
+    let Some(index) = arguments.iter().position(|word| word == "--email") else {
+        return Ok(None);
+    };
+    let text = arguments
+        .get(index + 1)
+        .ok_or_else(|| "--email needs an address after it".to_owned())?;
+    if text.starts_with("--") {
+        return Err(format!(
+            "--email needs an address after it, and \"{text}\" is another option"
+        ));
+    }
+    Ok(Some(text.clone()))
 }
 
 /// The console site's hostname, if this deployment declares one.

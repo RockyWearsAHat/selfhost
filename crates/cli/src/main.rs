@@ -18,6 +18,7 @@ mod identify;
 mod outside;
 mod kill_switch;
 mod investigate;
+mod invite_email;
 mod lan_dns;
 mod mail_task;
 mod mesh_task;
