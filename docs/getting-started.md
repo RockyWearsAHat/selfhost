@@ -14,11 +14,20 @@ nothing published to the internet until you decide to publish it.
 ```sh
 git clone https://github.com/RockyWearsAHat/selfhost
 cd selfhost
-cargo build --release
+cargo build --release -p selfhost-cli
 ```
 
 The binary lands at `target/release/selfhost`. Put it on your `PATH` if you
 like, or call it by path — the examples below assume it is on your `PATH`.
+
+**`-p selfhost-cli` is deliberate, and it is the whole server.** A bare
+`cargo build --release` also builds the two desktop applications
+(`selfhost-console`, `SelfHostVPN.app`), which are *clients*, not part of the
+thing you are about to run — and which pull `rui`, a separate repository, at a
+pinned revision. If you only want the server, you do not need that fetch.
+Measured on an Apple-silicon Mac from a fresh clone: **1 m 25 s** for
+`-p selfhost-cli`, with the crates.io packages already downloaded. Your first
+build also fetches 64 transitive packages.
 
 ## 2. Create a deployment
 
@@ -51,7 +60,21 @@ services and the control API — in one process. (`selfhost run` is a kept alias
 for the same thing; do not run both at once.)
 
 ```
-selfhost listening
+selfhost daemon
+  control api  http://127.0.0.1:9191
+  token        <your directory>/data/admin.token
+  catalogue    <your directory>/data/services.toml
+
+No services installed yet. Install one from the console, or add it to
+<your directory>/data/services.toml.
+
+Reach this from another machine by tunnelling, never by binding publicly:
+  ssh -L 9191:127.0.0.1:9191 <this-host>
+
+admin: no console password at <your directory>/data/console.passwd; console
+login is disabled until `selfhost console-password` sets one
+
+listening
   http  127.0.0.1:8080  (redirects to https)
   https 127.0.0.1:8443
   site  localhost → hello (0 instance(s))
@@ -131,6 +154,37 @@ that in minutes and lock you out for a week.
 selfhost check     # validates the config, reports every problem at once
 selfhost routes    # shows which hostname serves which site
 ```
+
+And, once it is running, two that ask whether it is actually *working* rather
+than whether it is configured:
+
+```sh
+selfhost health         # four loopback round trips: DNS, 80, 443, the control API
+selfhost service check  # is the OS registration still what it was installed as?
+```
+
+`health` prints what it asked and what came back for each part, and exits
+non-zero only for something that is running and **not serving** — so on a
+laptop where nothing is up it says `untestable` four times and exits zero.
+`docs/labs/supervision-lab.dx` is why both exist: a nameserver died every
+seventy-two hours for months while every process-is-alive signal stayed green.
+
+**`dns` is only checked if you asked for DNS.** Most deployments point a
+registrar's nameservers at this box and serve only HTTP, and those get
+`dns  not declared` and a zero exit — nothing to test here, not a failure.
+The line becomes a real check when this deployment says it serves DNS, which
+has two spellings: a `[dns]` section, or an installed `selfhost-lan-dns`
+registration (which is how the production box does it, with no `[dns]` section
+at all). If you *meant* to be authoritative and see `not declared`, the detail
+on that line names both and says which one is missing.
+
+This is worth a paragraph rather than a footnote because it was wrong until
+2026-08-17, and getting it wrong was expensive: naming a site was read as
+volunteering to be a nameserver, so an ordinary deployment reported `dns NOT
+SERVING` for ever, `selfhost health` exited non-zero for ever, and — worst — the
+daemon's repair loop spent all three attempts restarting a nameserver you never
+asked for. `docs/labs/first-run-lab.dx` §8 has the transcripts either side of
+the fix; `docs/labs/supervision-lab.dx` has the reasoning.
 
 `check` reports *all* problems in one run, each naming the field responsible:
 
@@ -428,6 +482,78 @@ rather than showing a black rectangle. A daemon started from a signed-in session
 captures directly and works in full. None of the Windows code has ever run;
 `HANDOFF.md` §5 is the order to confirm it in.
 
+## 11. Let somebody else use it
+
+Everything above is a deployment with one human in it. A second person needs two
+things, and they are deliberately **separate decisions**: a way to prove they are
+who they say (a passkey), and a set of powers (a grant). `crates/app/admin/src/invite.rs`
+argues the separation at length; the short version is that minting a credential
+and handing out authority are different acts, and an invitation that carried
+grants would collapse them into one.
+
+You need a console site first — the passkey's relying party is that site's first
+domain, and there is nowhere else to take it from.
+
+```toml
+[[sites]]
+name = "console"
+domains = ["admin.example.com"]
+static_root = "./sites/console"
+spa = true
+console = true
+allowed_cidrs = ["10.66.0.0/24"]   # a /24 or narrower; the VPN subnet, or 127.0.0.1/32
+```
+
+Then, in order:
+
+```sh
+selfhost check                                   # a console site with no allowed_cidrs is refused
+selfhost console-password                        # your own login; theirs will be a passkey
+selfhost daemon                                  # restart: the console site is read at startup
+selfhost people invite mom console.read,files.read:vault
+```
+
+That last command prints a link, once. Send it to them; opening it on their own
+device asks for a fingerprint or face and registers a passkey under the name
+**from the invitation, never from the request** — an invite for `mom` can only
+ever make a passkey called `mom`. `selfhost people invited` shows what is
+pending, `selfhost people uninvite <name>` withdraws a code sent to the wrong
+address, and re-inviting supersedes rather than adds, so there is never more
+than one live code per person.
+
+Some things worth knowing before you send one:
+
+- **Naming capabilities on the invite is optional, and skipping it is a
+  cul-de-sac.** `selfhost people invite mom` with no list mints a credential for
+  somebody who will log in to an empty console. The command says so, and
+  `selfhost people list` now names anybody who has enrolled and holds nothing so
+  the grant is not forgotten — but nothing chases you. Decide the grant when you
+  send the invitation if you can.
+- **A capability is a whole word with its target.** `selfhost people capabilities`
+  lists every one. `desktop.view` alone is refused; `desktop.view:alex-desktop`
+  is a grant.
+- **`selfhost people` writes the file directly and never calls the API**, on
+  purpose: it is the tool you reach for when the console is the broken thing.
+- **The person's share access is the console's FILES screen and nothing else.**
+  Of the three doors into a share, WebDAV authenticates against the *console
+  password* (yours, not theirs) and SMB against an *operating-system account*.
+  Per-person credentials stop at the console's own door today.
+- **Half the vocabulary opens nothing yet.** `site.admin`, `dns.admin` and
+  `mail.admin` are real entries in a real registry that no route consumes.
+  Granting one hands over a promise.
+
+**One thing to know before you rely on this.** Everything up to and including
+the door answering the code is proven — on this Mac and on the production box,
+with the output recorded. **The last step is not.** Nobody has yet opened an
+`/#invite=` link on a device and touched a fingerprint reader, so the passkey
+ceremony itself has never been performed by anyone; and it will need a
+certificate the browser trusts, because WebAuthn requires a secure context. If
+you are the first, expect to find something, and write down what.
+
+`docs/labs/people-lab.dx` is the subsystem's own document; `docs/labs/first-run-lab.dx`
+walks this path end to end with recorded output, and its "NOT PROVEN HERE"
+section is the list of what is still taken on trust.
+
 ## Where things live
 
 ```
@@ -438,10 +564,17 @@ data/                   everything the daemon owns, and nothing you edit
   services.toml         services installed through the console
   admin.token           the control API's bearer token, 0600
   console.passwd        the console login, PBKDF2
+  console.people        who else may use this box, and what each may do (0600)
+  console.passkeys      the registered passkeys — the credentials, not the powers
+  console.invites       outstanding invitations, as digests; never the codes
   audit.log             one line per control action, append-only
+  repair.log            one line per fault, repair and escalation the daemon saw
   desktop.disabled      the kill switch — present means everything is off
   storage.smb-owned     which SMB exports selfhost created (and may remove)
 ```
+
+A first run creates only `admin.token` and `tls/`; every other file appears the
+first time the thing it records is used.
 
 `data/` is what the backups are for. Deleting it loses the deployment.
 
@@ -456,8 +589,17 @@ Being straight with you so you do not go looking:
   both ends; no Finder and no Explorer has met it.
 - **Nothing publishes the DNS-SD records**, so a share does not yet appear in
   Finder's sidebar by itself. Windows has no mDNS responder at all.
-- **The peer mesh dials but is not answered** — there is no `/api/mesh/link`
-  route on the owner yet, so a second machine cannot join.
+- **The peer mesh is answered but carries nothing.** This used to say there was
+  no `/api/mesh/link` route on the owner; there is — `crates/app/admin/src/mesh_api.rs`,
+  reached through `StreamRoute::PeerLink`, and it admits or refuses a dial on its
+  merits. What is still missing is the splice: `crates/services/mesh/src/splice.rs`
+  exists and is tested, and nothing outside its own crate calls it, so an
+  admitted link moves no traffic anywhere.
+- **Nobody has ever completed the passkey ceremony.** The invitation door is
+  proven live on this Mac and on the production box — a real code is answered
+  with the invited person's name — but the last step needs a human and a
+  fingerprint reader, and has not happened. `docs/labs/first-run-lab.dx` is the
+  record.
 
 `docs/roadmap.md` is the crate-by-crate list and the ordering; `docs/labs/desktop-lab.dx`
 and `docs/labs/nas-lab.dx` are the two subsystems with runnable checks you can execute

@@ -37,6 +37,7 @@ mod share_command;
 mod site;
 mod storage_command;
 mod teardown;
+mod vpn_command;
 mod watch;
 
 use selfhost_admin::{Api, Fleet, Store, Token};
@@ -212,6 +213,17 @@ Commands
                              is not stored anywhere it can be read back.
                              `invited` lists what is pending; `uninvite <name>`
                              withdraws an invitation nobody has used.
+  vpn <list|status|preflight|up|down|who>
+                             Run relays and identify who is on them. A relay is
+                             one socket in front of one local service, and a roster
+                             of the people allowed through it.
+                             `list` shows every relay with its live state.
+                             `status <name>` shows one relay's state.
+                             `preflight <name>` reports the command that would run
+                             without running it (plan-before-acting).
+                             `up <name>` and `down <name>` start and stop a relay.
+                             `who <address>` identifies who arrived at a loopback
+                             socket, and answers clearly when nobody can be named.
   console-password [<password>]
                              Set the web console's login password; reads it
                              twice from stdin if omitted
@@ -295,6 +307,7 @@ fn main() -> ExitCode {
             let data_dir = teardown::data_dir(&config, &project_dir);
             people_command::run(&arguments, &data_dir, &config)
         }),
+        "vpn" => load().and_then(|(config, project_dir)| vpn_command::vpn(&arguments, &config, &project_dir)),
         "mail" => mail_command(&arguments),
         "console-password" => console_password_command(&arguments),
         "help" | "--help" | "-h" => {

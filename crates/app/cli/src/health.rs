@@ -19,7 +19,8 @@
 //! question it exists to answer** and reads the reply off the wire:
 //!
 //! - **DNS** — a real `SOA` query for a zone this deployment claims, sent to the
-//!   port the deployment serves DNS on, over the loopback interface.
+//!   port the deployment serves DNS on, over the loopback interface. Asked only
+//!   of a deployment that *declares* it serves DNS; see [`dns_duty`].
 //! - **HTTP** — a real `GET /` with a `Host:` header, and an `HTTP/1.` status
 //!   line read back. Any status counts: a 404 is the proxy answering, and the
 //!   thing being tested is whether it answers at all.
@@ -42,6 +43,31 @@
 //! [`Serving::No`] only when the control API *did* answer — a running deployment
 //! that is not serving, which is exactly the incident above — and
 //! [`Serving::Untestable`] otherwise.
+//!
+//! # "Not this deployment's job" is not "broken" either
+//!
+//! The grading above answers *is this deployment running here*. It does not
+//! answer *is this component this deployment's responsibility at all*, and on
+//! 2026-08-17 the first-run walk (`docs/labs/first-run-lab.dx`) proved the
+//! difference is not academic. [`probe_dns`] took its zone set from
+//! [`crate::lan_dns::served_origins`], which derives origins from the **site and
+//! mail domains** — so any deployment with an ordinary site name was assumed to
+//! be an authoritative nameserver. Most are not: they point a registrar's
+//! nameservers at this box and serve only HTTP. On every one of those,
+//! `selfhost health` read `dns NOT SERVING` and exited non-zero for ever,
+//! `selfhost doctor` failed, and — worst — [`crate::converge`] read a fault,
+//! spent all three repair attempts restarting a nameserver the deployment never
+//! asked for, and escalated. A supervisor that repeatedly restarts a service
+//! nobody declared manufactures the outage it exists to prevent.
+//!
+//! So a probe fires only where the deployment **declares that surface**, and
+//! [`Serving::NotDeclared`] is the answer where it does not. The other three
+//! components need no such test and the reason is worth writing down rather than
+//! leaving to be re-derived: `serve_everything` binds `http_bind`, `https_bind`
+//! and `admin_bind` unconditionally and fails to start if any of them will not
+//! bind, so a deployment that is running has, by construction, declared all
+//! three. DNS is the only component the daemon serves conditionally, and it was
+//! therefore the only one that could be over-claimed.
 //!
 //! # One opinion about health
 //!
@@ -219,24 +245,131 @@ pub async fn probe(component: Component, config: &Config, project_dir: &Path) ->
     }
 }
 
-/// Asks this machine's own nameserver for a zone this deployment claims.
+/// Whether serving DNS is this deployment's job, and — when it is — what says so.
 ///
-/// The zone set is [`crate::lan_dns::served_origins`], not `config.dns.zones`,
-/// and that difference is the point. The production box has **no `[dns]`
-/// section**: `selfhost lan-dns` synthesises one zone per registrable domain
-/// claimed anywhere in the config, which is the only reason DNS works there at
-/// all. A probe that read `[dns]` would have reported "no zone configured,
-/// nothing to check" throughout the seventy-two-hour outage — which is precisely
-/// what `doctor`'s authoritative-DNS section did.
+/// # Why this cannot be one signal
+///
+/// Two shapes both genuinely serve DNS and they declare it in different places,
+/// which is precisely why the first version of this probe guessed instead of
+/// asking:
+///
+/// - A deployment with a **`[dns]` section** serves `:53` from the daemon's own
+///   arm. `serve_everything` builds that arm only when the section is present,
+///   so the section is the declaration.
+/// - The **production box has no `[dns]` section** and serves DNS anyway,
+///   through the separately-registered `selfhost-lan-dns` task
+///   ([`crate::service_install::LAN_DNS_TASK_NAME`], and `docs/labs/checkup.dx`
+///   is the evidence). Reading only `[dns]` would have reported "nothing to
+///   check" on that box throughout the seventy-two-hour outage this whole
+///   module exists because of — which is exactly what `doctor`'s
+///   authoritative-DNS section did.
+///
+/// Neither signal alone is sufficient, so both are asked and either one is
+/// enough. **Absence of both is a real answer**, not a gap to be filled by
+/// inference: a deployment that claims a site name has not thereby volunteered
+/// to be a nameserver, and treating it as one is the over-claim recorded in this
+/// module's documentation.
+///
+/// Pure and total, so the three shapes that matter — ordinary site, `[dns]`
+/// section, production registration — are all testable on a machine that has
+/// none of them.
+pub fn dns_duty(config: &Config, separate_registration: Option<&str>) -> DnsDuty {
+    if config.dns.is_some() {
+        return DnsDuty::Declared(
+            "this deployment has a [dns] section, so the daemon serves :53 itself".to_owned(),
+        );
+    }
+    match separate_registration {
+        Some(name) => DnsDuty::Declared(format!(
+            "there is no [dns] section, but this machine has a {name} registration, which serves \
+             :53 from a separate process"
+        )),
+        None => DnsDuty::NotDeclared,
+    }
+}
+
+/// Whether this deployment is the thing that is supposed to answer DNS queries.
+///
+/// A two-state answer with the *reason* carried in it, rather than a boolean,
+/// because the reason is what a health line and a repair ledger have to print:
+/// "not serving" and "not this deployment's job" send an operator to two
+/// completely different places.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DnsDuty {
+    /// This deployment serves DNS, and this is what says so.
+    Declared(String),
+    /// Nothing about this deployment says it serves DNS.
+    NotDeclared,
+}
+
+/// Asks this machine's own nameserver for a zone this deployment claims — but
+/// only if this deployment ever said it serves DNS.
+///
+/// The declaration test is [`dns_duty`] and it is the whole of the fix recorded
+/// in this module's documentation: the zone set below comes from
+/// [`crate::lan_dns::served_origins`], which derives origins from site and mail
+/// domains, so it is a list of names this deployment *claims* and never evidence
+/// that it is authoritative for them. Using it to decide whether to probe at all
+/// is what made a registrar-hosted deployment permanently red and gave the
+/// convergence loop a fault to burn its repair budget on.
+///
+/// The zone set is still `served_origins` and not `config.dns.zones` once the
+/// probe does fire, and that difference is still the point: on the production
+/// box the zones exist only because that function invents them.
 async fn probe_dns(config: &Config, _project_dir: &Path) -> Probe {
+    // Only asked when there is no `[dns]` section, because that section already
+    // settles the question — and on Windows this answer costs a `schtasks`
+    // process. A convergence pass runs every sixty seconds, so a lookup that
+    // cannot change the verdict is one this loop should not pay for.
+    let registration =
+        config.dns.is_none().then(crate::service_install::separate_dns_registration).flatten();
+    probe_dns_declared(config, registration.as_deref()).await
+}
+
+/// [`probe_dns`] with the machine's answer about a separate registration passed
+/// in.
+///
+/// Split out so the production shape — no `[dns]` section, a live
+/// `selfhost-lan-dns` registration — can be exercised on a Mac, which has no
+/// Task Scheduler and would otherwise leave the one deployment this module was
+/// written for as the one shape no test covers.
+async fn probe_dns_declared(config: &Config, separate_registration: Option<&str>) -> Probe {
+    // The reason is carried down to the failure details rather than dropped: a
+    // `NOT SERVING` line and an escalation in the repair ledger both raise the
+    // question "why does supervision think DNS is this box's job", and the
+    // answer is exactly this sentence. Making an operator go and read the config
+    // to find out is how a diagnostic sends somebody to the wrong subsystem.
+    let declared = match dns_duty(config, separate_registration) {
+        DnsDuty::Declared(why) => why,
+        DnsDuty::NotDeclared => {
+            return Probe::new(
+                Component::Dns,
+                "dns",
+                Serving::NotDeclared,
+                format!(
+                    "nothing declares that this deployment serves DNS: there is no [dns] section \
+                     and no {} registration on this machine. Most deployments point a registrar's \
+                     nameservers at this box and serve only HTTP; if this one is meant to be \
+                     authoritative, add a [dns] section or install that registration and this \
+                     line becomes a real check",
+                    crate::service_install::LAN_DNS_TASK_NAME
+                ),
+            );
+        }
+    };
+
     let bind = dns_bind(config);
     let origins = crate::lan_dns::served_origins(config);
     let Some(origin) = origins.first() else {
+        // Declared, and there is nothing to ask. Untestable rather than a fault:
+        // a deployment that serves DNS for no zone is a configuration to fix,
+        // not a nameserver to restart, and restarting it would change nothing.
         return Probe::new(
             Component::Dns,
             "dns",
-            Serving::NotDeclared,
-            "no site or mail domain is configured, so this deployment claims no zone",
+            Serving::Untestable,
+            "this deployment serves DNS but names no zone — no [dns].zones entries and no site or \
+             mail domain to synthesise one from — so there is no question to ask it",
         );
     };
 
@@ -250,7 +383,8 @@ async fn probe_dns(config: &Config, _project_dir: &Path) -> Probe {
             Serving::No,
             format!(
                 "the nameserver answered but returned no SOA for {origin}, so it is running \
-                 without the zone this deployment is supposed to be authoritative for"
+                 without the zone this deployment is supposed to be authoritative for; \
+                 {declared}"
             ),
         ),
         Ok(response) => Probe::new(
@@ -263,7 +397,7 @@ async fn probe_dns(config: &Config, _project_dir: &Path) -> Probe {
             Component::Dns,
             target,
             Serving::No,
-            format!("nothing answered on {query_at}: {error}"),
+            format!("nothing answered on {query_at}: {error}; {declared}"),
         ),
     }
 }
@@ -933,6 +1067,188 @@ mod tests {
                 probe.detail
             );
         }
+    }
+
+    /// One ordinary website, of the shape `selfhost init` writes and the shape
+    /// the overwhelming majority of deployments have: a registrable name, served
+    /// over HTTP, with its DNS hosted at a registrar.
+    fn ordinary_site() -> selfhost_config::Site {
+        selfhost_config::Site {
+            name: "hello".into(),
+            domains: vec!["example.com".into()],
+            static_root: Some(std::path::PathBuf::from("./sites/hello")),
+            spa: false,
+            app_paths: Vec::new(),
+            instances: Vec::new(),
+            health: selfhost_config::Health::default(),
+            canonical_redirect: true,
+            allowed_cidrs: Vec::new(),
+            console: false,
+        }
+    }
+
+    /// A loopback port with nothing behind it, for the probes that have to be
+    /// asked a question and get silence.
+    async fn closed_port() -> u16 {
+        let listener =
+            tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("an ephemeral loopback port");
+        let port = listener.local_addr().expect("a bound address").port();
+        drop(listener);
+        port
+    }
+
+    #[test]
+    fn claiming_a_site_name_is_not_declaring_that_this_box_is_a_nameserver() {
+        // The defect this test exists for: `served_origins` derives zones from
+        // site and mail domains, so *every* deployment with a name looked like
+        // an authoritative nameserver. It is not a declaration — it is a list of
+        // names somebody else's registrar probably serves.
+        let mut config = config(1, 2, 3);
+        config.sites = vec![ordinary_site()];
+        assert!(
+            !crate::lan_dns::served_origins(&config).is_empty(),
+            "the site does claim a registrable name — that is what made the guess look right"
+        );
+        assert_eq!(dns_duty(&config, None), DnsDuty::NotDeclared);
+    }
+
+    #[test]
+    fn either_signal_alone_declares_dns_and_neither_is_sufficient_by_itself() {
+        // Both shapes genuinely serve DNS and they say so in different places.
+        // Reading only one of them is how this was got wrong in both directions:
+        // `[dns]` alone would have reported "nothing to check" on the production
+        // box during the outage, and the site set alone reports every ordinary
+        // deployment as a broken nameserver.
+        let mut with_section = config(1, 2, 3);
+        with_section.dns = Some(selfhost_config::Dns {
+            bind: "0.0.0.0:53".into(),
+            secondaries: Vec::new(),
+            dynamic_ip: false,
+            lan_ip: None,
+            zones: Vec::new(),
+        });
+        assert!(matches!(dns_duty(&with_section, None), DnsDuty::Declared(_)));
+
+        // The production shape: no section at all, and a separate registration.
+        let mut production = config(1, 2, 3);
+        production.sites = vec![ordinary_site()];
+        assert!(matches!(
+            dns_duty(&production, Some(crate::service_install::LAN_DNS_TASK_NAME)),
+            DnsDuty::Declared(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_deployment_that_never_declared_dns_is_not_asked_about_it() {
+        // The whole fix, at the probe. An ordinary site and no declaration must
+        // not produce a question, because a "no" to a question nobody asked for
+        // is what burned three repair attempts on a healthy deployment.
+        let mut config = config(1, 2, 3);
+        config.sites = vec![ordinary_site()];
+
+        let probe = probe_dns_declared(&config, None).await;
+        assert_eq!(probe.serving, Serving::NotDeclared, "{}", probe.detail);
+        assert!(!probe.serving.is_fault(), "and therefore nothing to repair");
+        // The silence has to be explainable, or a deployment that *should* be
+        // serving DNS learns nothing from a line that says "not declared".
+        assert!(probe.detail.contains("[dns] section"), "{}", probe.detail);
+        assert!(
+            probe.detail.contains(crate::service_install::LAN_DNS_TASK_NAME),
+            "{}",
+            probe.detail
+        );
+    }
+
+    #[tokio::test]
+    async fn a_deployment_that_does_declare_dns_and_is_silent_is_still_a_fault() {
+        // The half the fix must not blind. A `[dns]` section is a promise to
+        // serve `:53`; a nameserver that is not answering is the original
+        // outage, and it has to stay red.
+        let mut config = config(1, 2, 3);
+        config.sites = vec![ordinary_site()];
+        config.dns = Some(selfhost_config::Dns {
+            bind: format!("127.0.0.1:{}", closed_port().await),
+            secondaries: Vec::new(),
+            dynamic_ip: false,
+            lan_ip: None,
+            zones: Vec::new(),
+        });
+
+        let probe = probe_dns_declared(&config, None).await;
+        assert_eq!(probe.serving, Serving::No, "{}", probe.detail);
+        assert!(probe.serving.is_fault());
+        assert!(probe.target.starts_with("SOA example.com @"), "{}", probe.target);
+        // The declaration travels into the detail, which is the text the repair
+        // ledger and the escalation carry. "Why does supervision think DNS is
+        // this box's job" is the first question a `NOT SERVING` line raises, and
+        // an operator should not have to go and read the config to answer it.
+        assert!(probe.detail.contains("[dns] section"), "{}", probe.detail);
+    }
+
+    #[tokio::test]
+    async fn the_production_shape_has_no_dns_section_and_is_probed_anyway() {
+        // ALEX-DESKTOP: no `[dns]` section, DNS served by the separately
+        // registered `selfhost-lan-dns` task. A narrowing that read only the
+        // config would have made this box — the one machine the whole module was
+        // written for — the one shape nothing checks.
+        let mut config = config(1, 2, 3);
+        config.sites = vec![ordinary_site()];
+
+        let probe =
+            probe_dns_declared(&config, Some(crate::service_install::LAN_DNS_TASK_NAME)).await;
+        assert_ne!(probe.serving, Serving::NotDeclared, "{}", probe.detail);
+        assert!(
+            probe.target.starts_with("SOA example.com @"),
+            "a real SOA query was sent: {}",
+            probe.target
+        );
+    }
+
+    #[tokio::test]
+    async fn a_deployment_that_serves_dns_for_no_zone_has_nothing_to_be_asked() {
+        // Declared, and no question to put to it. Untestable rather than a
+        // fault: restarting a nameserver does not give it a zone.
+        let mut config = config(1, 2, 3);
+        config.dns = Some(selfhost_config::Dns {
+            bind: "0.0.0.0:53".into(),
+            secondaries: Vec::new(),
+            dynamic_ip: false,
+            lan_ip: None,
+            zones: Vec::new(),
+        });
+        let probe = probe_dns_declared(&config, None).await;
+        assert_eq!(probe.serving, Serving::Untestable, "{}", probe.detail);
+        assert!(!probe.serving.is_fault());
+    }
+
+    #[tokio::test]
+    async fn an_ordinary_deployment_with_nothing_running_has_no_faults_at_all() {
+        // `selfhost health` exits non-zero for a fault, so this is the exit code
+        // as well as the report: a laptop with one website and no daemon must
+        // read clean. It did not before the fix — `dns` read NOT SERVING here.
+        let closed = closed_port().await;
+        let mut config = config(closed, closed, closed);
+        config.sites = vec![ordinary_site()];
+
+        let probes = probe_all(&config, std::path::Path::new(".")).await;
+        for probe in &probes {
+            assert!(
+                !probe.serving.is_fault(),
+                "{} must not be a fault on an ordinary deployment: {}",
+                probe.component.label(),
+                probe.detail
+            );
+        }
+        // Not asserted as `NotDeclared` here, deliberately: this pass asks the
+        // *machine* whether it has a `selfhost-lan-dns` registration, and on the
+        // production box it does — where a probe is the right answer. The
+        // declaration test itself is asserted exactly, without a machine, in
+        // `a_deployment_that_never_declared_dns_is_not_asked_about_it`.
+        let dns = probes
+            .iter()
+            .find(|probe| probe.component == Component::Dns)
+            .expect("dns is probed on every pass");
+        assert!(!dns.serving.is_fault(), "{}", dns.detail);
     }
 
     #[test]

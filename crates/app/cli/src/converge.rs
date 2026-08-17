@@ -1016,6 +1016,122 @@ mod tests {
         }
     }
 
+    /// A throwaway data directory for a ledger, named after the calling line so
+    /// two tests in this file cannot collide.
+    fn scratch(line: u32) -> PathBuf {
+        let directory =
+            std::env::temp_dir().join(format!("selfhost-converge-{}-{line}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&directory);
+        std::fs::create_dir_all(&directory).expect("a temporary directory");
+        directory
+    }
+
+    /// One ordinary website — a registrable name served over HTTP, with DNS
+    /// hosted at a registrar. The shape `selfhost init` writes.
+    fn ordinary_site() -> selfhost_config::Site {
+        selfhost_config::Site {
+            name: "hello".into(),
+            domains: vec!["example.com".into()],
+            static_root: Some(PathBuf::from("./sites/hello")),
+            spa: false,
+            app_paths: Vec::new(),
+            instances: Vec::new(),
+            health: selfhost_config::Health::default(),
+            canonical_redirect: true,
+            allowed_cidrs: Vec::new(),
+            console: false,
+        }
+    }
+
+    #[tokio::test]
+    async fn a_deployment_that_never_declared_dns_is_never_repaired_for_not_serving_it() {
+        // **The defect this whole change exists for, asserted at the loop rather
+        // than at the probe** — because the probe's verdict was only half the
+        // damage. A deployment with an ordinary site name and no DNS declaration
+        // was read as a broken nameserver, and this loop then spent all three
+        // repair attempts restarting something the deployment never asked for
+        // and escalated. A supervisor that repeatedly restarts an undeclared
+        // service manufactures the outage it exists to prevent.
+        //
+        // Two hundred passes, which is more than three hours of a running box:
+        // the ledger must stay completely empty. Not "no restarts" — no lines at
+        // all, because there is nothing here that is wrong.
+        let mut config = config();
+        config.sites = vec![ordinary_site()];
+        let directory = scratch(line!());
+        let ledger = Ledger::in_dir(&directory);
+        let mut supervision = Supervision::new();
+
+        let probe = health::probe(Component::Dns, &config, Path::new(".")).await;
+        assert!(
+            !probe.serving.is_fault(),
+            "an undeclared component is not a fault: {}",
+            probe.detail
+        );
+        for _ in 0..200 {
+            handle(&mut supervision, &ledger, &config, Path::new("."), probe.clone()).await;
+        }
+
+        assert!(
+            ledger.entries().is_empty(),
+            "supervision must have nothing to say about a component this deployment never \
+             declared, and said: {:?}",
+            ledger.entries().iter().map(|entry| entry.line()).collect::<Vec<_>>()
+        );
+        assert!(ledger.outstanding().is_empty(), "and must never escalate one");
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    #[tokio::test]
+    async fn dns_a_deployment_does_declare_is_still_faulted_repaired_and_escalated() {
+        // The half the fix must not blind, asserted at the loop for the same
+        // reason. A `[dns]` section is a promise to serve `:53`; a nameserver
+        // that is silent is the original incident, and the loop must still
+        // record the fault, spend its bounded attempts, and give up loudly.
+        //
+        // `repair_for` returns `Unavailable` here — a `[dns]` deployment serves
+        // DNS in-process, and there is no separate task to restart — so what is
+        // being asserted is the *bound and the record*, with no service manager
+        // touched, which is exactly what makes this runnable on any machine.
+        let listener =
+            tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("an ephemeral loopback port");
+        let silent = listener.local_addr().expect("a bound address").port();
+        drop(listener);
+
+        let mut config = config();
+        config.sites = vec![ordinary_site()];
+        config.dns = Some(selfhost_config::Dns {
+            bind: format!("127.0.0.1:{silent}"),
+            secondaries: Vec::new(),
+            dynamic_ip: false,
+            lan_ip: None,
+            zones: Vec::new(),
+        });
+
+        let directory = scratch(line!());
+        let ledger = Ledger::in_dir(&directory);
+        let mut supervision = Supervision::new();
+
+        let probe = health::probe(Component::Dns, &config, Path::new(".")).await;
+        assert_eq!(probe.serving, Serving::No, "{}", probe.detail);
+        for _ in 0..20 {
+            handle(&mut supervision, &ledger, &config, Path::new("."), probe.clone()).await;
+        }
+
+        let count = |event: Event| {
+            ledger.entries().into_iter().filter(|entry| entry.event == event).count()
+        };
+        assert_eq!(count(Event::Fault), 1, "the moment it broke, once");
+        assert_eq!(
+            count(Event::StillFailing),
+            MAX_ATTEMPTS as usize,
+            "the repair budget is spent, and only once"
+        );
+        assert_eq!(count(Event::Escalated), 1, "and the giving-up is recorded, loudly and once");
+        assert_eq!(ledger.outstanding().len(), 1, "`doctor` must report this as a failure");
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
     #[test]
     fn dns_served_by_the_daemon_itself_is_not_repaired_by_restarting_a_task() {
         // Restarting `selfhost-lan-dns` on a box whose daemon serves :53 would

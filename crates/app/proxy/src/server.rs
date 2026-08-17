@@ -142,6 +142,19 @@ pub struct Server {
     /// the proxy's only use for this is the webhook relay — better to serve
     /// every site and answer a webhook with 502 than to refuse to start.
     admin_bind: Option<SocketAddr>,
+    /// The port `https_bind` names, used by the cleartext branch to say where
+    /// the secure listener actually is.
+    ///
+    /// Fixed at startup like `data_dir` and `admin_bind` rather than rebuilt by
+    /// [`Server::reload`], and for a stronger reason than either: a reload does
+    /// not rebind a listener, so a port taken from a freshly read config could
+    /// name a socket nothing is holding. What is bound is what was bound at
+    /// startup.
+    ///
+    /// `0` when `https_bind` asks the operating system to choose, which is the
+    /// shape every test in this module uses — see [`Server::https_authority`]
+    /// for why that case redirects to the bare hostname.
+    https_port: u16,
     /// The secret that authenticates a push to `/.selfhost/webhook/self`.
     ///
     /// Behind a lock and rebuilt by the same reload as `routes`, because it is
@@ -213,8 +226,44 @@ impl Server {
             pacc: RwLock::new(Self::pacc_documents(config)),
             data_dir,
             admin_bind: config.server.admin_bind.parse().ok(),
+            https_port: config
+                .server
+                .https_bind
+                .parse::<SocketAddr>()
+                .map(|address| address.port())
+                .unwrap_or(443),
             self_update_secret: RwLock::new(Self::self_update_secret(config)),
             mail: RwLock::new(None),
+        }
+    }
+
+    /// `host`, with the HTTPS port appended when it is not the default one.
+    ///
+    /// # The failure this exists to stop
+    ///
+    /// The cleartext listener's whole job is to send a caller to HTTPS, and it
+    /// did that by rewriting the scheme and nothing else — `http://host:8080/p`
+    /// became `https://host/p`, because [`Request::host`] strips the port
+    /// deliberately (routing is by name, and a site is one site however it was
+    /// reached). On the production shape, HTTPS is on 443 and that is right. On
+    /// **every other shape it is a redirect to a port nothing is listening on**,
+    /// including the one `selfhost init` writes and therefore the first
+    /// deployment anybody following `docs/getting-started.md` runs: the starter
+    /// config binds 8080 and 8443, and `curl -i http://localhost:8080/a/page`
+    /// — a command that document tells the reader to run — answered
+    /// `Location: https://localhost/a/page`, which connects to nothing.
+    ///
+    /// Two cases keep the bare hostname. 443 keeps it because that is what a
+    /// browser, a certificate and a WebAuthn origin all mean by a bare name, so
+    /// spelling it would make two spellings of one origin. Port `0` keeps it
+    /// because `https_bind` asked the operating system to choose and this
+    /// process cannot know what it chose — naming `:0` would be worse than
+    /// naming nothing, and a deployment that binds `:0` is a test harness, not
+    /// something a browser is being sent to.
+    fn https_authority(&self, host: &str) -> String {
+        match self.https_port {
+            443 | 0 => host.to_owned(),
+            port => format!("{host}:{port}"),
         }
     }
 
@@ -640,7 +689,11 @@ where
         // send every visitor to the first configured domain (e.g. "localhost") and
         // present a certificate for the wrong name. Canonicalisation, if enabled,
         // happens on the HTTPS side below where the certificate already matches.
-        let target = format!("https://{host}{}", request.target);
+        //
+        // The port comes from what this daemon actually bound, not from the
+        // caller's `Host`, which named the *cleartext* port. See
+        // [`Server::https_authority`].
+        let target = format!("https://{}{}", server.https_authority(&host), request.target);
         let response = Response::redirect(Status::PERMANENT_REDIRECT, &target)
             .unwrap_or_else(|_| Response::error_page(Status::BAD_REQUEST));
         write_response(stream, response, keep_alive).await?;
@@ -663,7 +716,11 @@ where
 
     let canonical = runtime.site.canonical();
     if runtime.site.canonical_redirect && host != canonical {
-        let target = format!("https://{canonical}{}", request.target);
+        // The same port reasoning as the cleartext upgrade above: this arrives
+        // over TLS on whatever port `https_bind` named, and sending the caller
+        // to the canonical name without it moves them to a port this deployment
+        // is not serving.
+        let target = format!("https://{}{}", server.https_authority(canonical), request.target);
         let response = Response::redirect(Status::MOVED_PERMANENTLY, &target)
             .unwrap_or_else(|_| Response::error_page(Status::BAD_REQUEST));
         write_response(stream, response, keep_alive).await?;
@@ -2122,6 +2179,50 @@ mod tests {
             allowed_cidrs: vec![],
             console: false,
         }
+    }
+
+    #[tokio::test]
+    async fn the_cleartext_upgrade_names_the_port_https_is_actually_bound_to() {
+        // The failure this prevents is the first thing `docs/getting-started.md`
+        // asks a reader to run. The starter config `selfhost init` writes binds
+        // 8080 and 8443; the upgrade used to answer `https://localhost/a/page`,
+        // which connects to nothing, and the reader's conclusion is that the
+        // deployment is broken.
+        let mut config = config_with(vec![site("hello", &["localhost"])]);
+        config.server.https_bind = "127.0.0.1:8443".into();
+        let server = Server::build(&config, std::path::Path::new("/tmp"));
+
+        let head = "GET /a/page?x=1 HTTP/1.1\r\nHost: localhost:8080\r\n\r\n";
+        let response = dispatch_bytes(&server, head, "127.0.0.1:5000", false, b"").await;
+        let text = String::from_utf8_lossy(&response);
+        assert!(text.starts_with("HTTP/1.1 308"), "{text}");
+        assert!(text.contains("Location: https://localhost:8443/a/page?x=1"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn the_upgrade_leaves_443_unspelled_because_that_is_what_a_bare_name_means() {
+        // A certificate, a browser and a WebAuthn origin all read the bare
+        // hostname as :443, so spelling it would create a second spelling of one
+        // origin — which is exactly what an origin check compares byte for byte.
+        let mut config = config_with(vec![site("hello", &["example.com"])]);
+        config.server.https_bind = "0.0.0.0:443".into();
+        let server = Server::build(&config, std::path::Path::new("/tmp"));
+
+        let head = "GET /a/page HTTP/1.1\r\nHost: example.com\r\n\r\n";
+        let response = dispatch_bytes(&server, head, "203.0.113.9:5000", false, b"").await;
+        let text = String::from_utf8_lossy(&response);
+        assert!(text.contains("Location: https://example.com/a/page"), "{text}");
+    }
+
+    #[test]
+    fn a_port_the_operating_system_chose_is_not_put_in_a_redirect() {
+        // `https_bind = ":0"` means "pick one", and this process is not told
+        // which — so naming `:0` would send a browser somewhere that certainly
+        // does not answer. Every test config in this module is that shape, which
+        // is why they keep passing unchanged.
+        let config = config_with(vec![site("hello", &["localhost"])]);
+        let server = Server::build(&config, std::path::Path::new("/tmp"));
+        assert_eq!(server.https_authority("localhost"), "localhost");
     }
 
     #[test]
