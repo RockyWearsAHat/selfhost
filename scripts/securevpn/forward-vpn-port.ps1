@@ -1,6 +1,6 @@
 # forward-vpn-port.ps1 - open (or close) the router forward for the Secure-VPN.
 # Speaks UPnP-IGD SOAP directly to the router from THIS box (the router only
-# forwards to the requesting device), same mechanism as scripts/forward-soap.ps1.
+# forwards to the requesting device), same mechanism as scripts/windows/forward-soap.ps1.
 # Maps WAN TCP 8443 -> 192.168.1.8:8443 so the VPN is reachable from the internet.
 #
 # Usage:  .\forward-vpn-port.ps1            (add the mapping)

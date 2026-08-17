@@ -31,6 +31,15 @@
 #   ./join-mac.sh --stop          take the tunnel down and undo the hosts entry
 #
 # The key material is written by whoever sent you this file; see KEYS below.
+#
+# WHAT IT WILL NOT DO TO A MACHINE THAT ALREADY WORKS
+#
+# It never deletes ~/.securevpn/app. If a client is already installed there, this
+# script adopts that directory as a checkout of the Secure-VPN repository without
+# overwriting a single file, and prints anything that differs from upstream. An
+# earlier version deleted the directory and cloned over the top, which threw away
+# a working install — and any local fix in it — on a machine whose owner was
+# running this to get their tunnel back.
 
 set -euo pipefail
 
@@ -82,16 +91,60 @@ PY="$(command -v python3 || true)"
 note "$(${PY} --version)"
 
 # ── 2. The client itself ──────────────────────────────────────────────────────
+#
+# THIS STEP NEVER DELETES ANYTHING. It used to: when ~/.securevpn/app existed
+# without a .git directory — which is exactly the state a hand-copied install is
+# in — it ran `rm -rf` and cloned over the top, destroying a working client and
+# any local fix in it, on a machine whose owner ran this script to *repair* their
+# tunnel. The source is a known repository (${REPO}), so there is no need to
+# guess: an existing directory is adopted as a checkout in place, with every file
+# left exactly as it is, and whatever differs from upstream is printed rather than
+# overwritten.
 say "2/5  Fetching the VPN client"
 mkdir -p "${BASE}"
-if [[ -d "${APP}/.git" ]]; then
-  git -C "${APP}" pull --ff-only --quiet && note "updated ${APP}"
-else
-  command -v git >/dev/null || die "git not found. Install Xcode command line tools:
+command -v git >/dev/null || die "git not found. Install Xcode command line tools:
     xcode-select --install"
-  rm -rf "${APP}"
+
+if [[ -d "${APP}/.git" ]]; then
+  # Fast-forward only, and non-fatal. A merge or a rebase here would rewrite
+  # somebody's tunnel from a script they ran to start it; a failure to update is
+  # not a reason to refuse to connect with the client already on disk.
+  if git -C "${APP}" pull --ff-only --quiet 2>/dev/null; then
+    note "updated ${APP} from ${REPO}"
+  else
+    note "could not fast-forward ${APP} — LEAVING IT EXACTLY AS IT IS"
+    note "  (local edits, or a diverged branch: git -C ${APP} status)"
+  fi
+elif [[ -e "${APP}" && ! -d "${APP}" ]]; then
+  # A file where the app directory belongs. Refusing is the only safe answer: it
+  # is not something this script put there, so it is not something this script
+  # gets to remove.
+  die "${APP} exists and is not a directory. Move it aside yourself, then re-run;
+    this script does not delete anything it did not create."
+elif [[ -d "${APP}" ]]; then
+  # Adopt: clone into a temporary directory, move only its .git into place, and
+  # touch none of the files that are already there. Afterwards the directory is a
+  # real checkout of ${REPO} whose working tree is still the user's own copy, so
+  # `git status` names the drift instead of the drift being silently discarded.
+  say "     ${APP} already exists and is not a git checkout"
+  note "adopting it in place — nothing here is deleted or overwritten"
+  TMP_CLONE="$(mktemp -d "${BASE}/.clone.XXXXXX")"
+  trap 'rm -rf "${TMP_CLONE}"' EXIT
+  git clone --quiet --depth 1 "${REPO}" "${TMP_CLONE}/app" || die "could not clone ${REPO}"
+  mv "${TMP_CLONE}/app/.git" "${APP}/.git"
+  rm -rf "${TMP_CLONE}"
+  trap - EXIT
+  if [[ -n "$(git -C "${APP}" status --porcelain)" ]]; then
+    note "your copy differs from ${REPO}:"
+    git -C "${APP}" status --short | sed 's/^/      /'
+    note "those files are UNCHANGED, and they are what the tunnel will run."
+    note "to take upstream's version of everything:  git -C ${APP} checkout -- ."
+  else
+    note "your copy matches upstream exactly; ${APP} is now tracked"
+  fi
+else
   git clone --quiet --depth 1 "${REPO}" "${APP}" || die "could not clone ${REPO}"
-  note "cloned into ${APP}"
+  note "cloned ${REPO} into ${APP}"
 fi
 
 # ── 3. Its one dependency ─────────────────────────────────────────────────────

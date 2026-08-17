@@ -602,21 +602,14 @@ textarea { resize: vertical; }
 .sortbtn[aria-sort]::after { content: " ▾"; font-size: 8px; }
 .sortbtn[aria-sort="ascending"]::after { content: " ▴"; }
 
-/* A row's name: the glyph says what it is, the label is the stored name and is
+/* A row's name: the icon says what it is, the label is the stored name and is
    inserted as text, never as markup. */
 .entryname { display: flex; gap: 7px; align-items: center; min-width: 0; }
-.entryname .glyph {
-  flex: none; width: 13px; text-align: center;
-  font-family: var(--mono); font-size: 11px; color: var(--idle); user-select: none;
-}
 .entryname .label {
   flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
 }
-.entryname button.label {
-  background: none; border: none; padding: 0; text-align: left; cursor: pointer;
-  font-size: 12.5px; color: var(--text);
-}
-.entryname button.label:hover { text-decoration: underline; }
+.entryname a.label { color: var(--text); text-decoration: none; }
+.entryname a.label:hover { text-decoration: underline; }
 .entryname input.label { padding: 1px 4px; font-size: 12.5px; font-family: var(--mono); }
 .rowtools { display: flex; gap: 3px; justify-content: flex-end; flex-wrap: wrap; }
 .rowtools .btn { padding: 1px 6px; font-size: 9.5px; letter-spacing: 0.05em; }
@@ -628,8 +621,12 @@ textarea { resize: vertical; }
   .rowtools .btn:focus-visible { opacity: 1; }
 }
 
+/* The drop veil, in its two readings. A valid drop is the accent reticle this
+   console uses for "aim here"; a refused one is the same shape in the bad ink,
+   because a read-only share has to look refused while the file is still in the
+   air rather than after four gigabytes have crossed the tunnel. */
 #fs-veil {
-  position: absolute; inset: 0; z-index: 2;
+  position: absolute; inset: 0; z-index: 3;
   display: flex; align-items: center; justify-content: center;
   background: rgba(6, 7, 8, 0.86);
   border: 1px dashed var(--accent);
@@ -637,8 +634,105 @@ textarea { resize: vertical; }
 #fs-veil span {
   font-size: 11px; letter-spacing: 0.18em; color: var(--accent);
 }
+#fs-veil.refuse { border-color: var(--bad); background: rgba(38, 15, 17, 0.88); }
+#fs-veil.refuse span { color: var(--bad); }
+
+/* ── the file-type icons ──────────────────────────────────────────── */
+
+/* Drawn, never fetched: the CSP is `default-src 'none'` with no `data:`, so an
+   icon font, a sprite sheet and a data-URI are all requests that would not
+   load. Every icon is a stroke on a 24-unit grid inheriting `currentColor`, so
+   an icon in a selected row is that row's ink with no second rule. */
+.icon { flex: none; fill: none; stroke: currentColor; stroke-width: 1.4; }
+.icon-small { width: 14px; height: 14px; color: var(--muted); }
+.icon-large { width: 34px; height: 34px; color: var(--muted); stroke-width: 1.1; }
+/* Colour only where it carries a fact: a folder is the thing you can descend
+   into and a key is the thing you must not leave lying about. Everything else
+   stays instrument-grey, because twelve tinted file types is decoration. */
+.icon.kind-folder { color: var(--ok); }
+.icon.kind-secret { color: var(--warn); }
+.chosen .icon, .tile.chosen .icon { color: var(--text); }
+
+/* ── the grid ─────────────────────────────────────────────────────── */
+
+#fs-gridsort { display: flex; gap: 10px; align-items: baseline; padding: 2px 0; }
+#fs-gridsort .fieldlabel { margin-right: 2px; }
+#fs-grid {
+  display: grid; gap: 4px; padding: 4px 0;
+  grid-template-columns: repeat(auto-fill, minmax(112px, 1fr));
+  max-height: 46vh; overflow-y: auto;
+}
+.tile {
+  display: flex; flex-direction: column; align-items: center; gap: 4px;
+  padding: 8px 4px 6px; min-width: 0; cursor: default;
+  border: 1px solid transparent;
+}
+.tile:hover { background: var(--raised); }
+.tile .tileart { display: flex; align-items: center; justify-content: center; height: 38px; }
+.tile .tilename {
+  width: 100%; font-size: 11.5px; text-align: center; line-height: 1.25;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.tile .tilemeta { font-size: 9.5px; color: var(--idle); text-align: center; }
+.tile input.label { width: 100%; font-size: 11px; text-align: center; }
+.tile.unreachable { color: var(--idle); }
+.tile.dragging { opacity: 0.45; }
+.tile.dropping { border-color: var(--ok); background: var(--ok-tint); }
+
+/* ── selection, and the ring, which are two different facts ───────── */
+
+/* A tint says "a command will act on this". A ring says "the keyboard is
+   here". They are drawn differently and they are drawn at the same time when
+   both are true, because merging them is how a file manager comes to disagree
+   with itself about what Delete is about to do. The ring is keyboard-only —
+   :focus-visible — so a click never leaves one behind. */
+/* Selection is a filled row with an accent bar down its leading edge. */
+#fs-table tbody tr.chosen td { background: var(--raised); }
+#fs-table tbody tr.chosen td:first-child { color: var(--text); box-shadow: inset 2px 0 0 var(--accent); }
+.tile.chosen { background: var(--raised); border-color: var(--border); }
+.tile.chosen .tilename { color: var(--text); }
+
+/* Focus is a hairline above and below the row, right across it — a different
+   shape from the selection bar, so the two are told apart at a glance even
+   when they are on the same row. It is a box-shadow rather than an outline
+   because `border-collapse: collapse` gives a <tr> no box of its own: an
+   outline on one renders as four separate rectangles, one per cell, which
+   reads as a rendering fault rather than as a focus ring. */
+#fs-table tbody tr:focus, .tile:focus { outline: none; }
+#fs-table tbody tr:focus-visible td {
+  box-shadow: inset 0 1px 0 var(--accent), inset 0 -1px 0 var(--accent);
+}
+#fs-table tbody tr.chosen:focus-visible td:first-child {
+  box-shadow: inset 2px 0 0 var(--accent), inset 0 1px 0 var(--accent), inset 0 -1px 0 var(--accent);
+}
+.tile:focus-visible { outline: 1px solid var(--accent); outline-offset: -1px; }
+#fs-table:focus-visible, #fs-grid:focus-visible { outline: 1px solid var(--accent); outline-offset: 1px; }
+.entryrow { cursor: default; }
+
+/* The rubber band. A hairline and a wash, not a filled rectangle: the names
+   underneath it have to stay readable while it is being dragged over them. */
+#fs-marquee {
+  position: absolute; z-index: 2; pointer-events: none;
+  border: 1px solid var(--accent); background: rgba(242, 245, 246, 0.07);
+}
+
+/* The verbs that act on the selection. */
+#fs-actbar { display: flex; gap: 6px; align-items: center; flex-wrap: wrap; min-height: 22px; }
+#fs-selection { color: var(--muted); font-variant-numeric: tabular-nums; }
+.viewswitch { display: flex; gap: 0; }
+.viewswitch .btn + .btn { margin-left: -1px; }
+
+/* An empty folder is furnished rather than blank: the reticle this console uses
+   everywhere for "nothing here, and that is a state rather than a fault", the
+   sentence, and what to do about it. */
+.fs-empty { flex: 1; display: flex; align-items: center; justify-content: center; min-height: 150px; }
+.fs-empty .emptybox { display: flex; flex-direction: column; align-items: center; gap: 10px; padding: 18px; }
+.fs-empty .caption { max-width: 42ch; }
+.fs-empty.bad-ink .caption { color: var(--bad); }
 
 #fs-transfers { display: flex; flex-direction: column; gap: 6px; }
+#fs-queue { display: flex; flex-direction: column; gap: 3px; }
+#fs-queue .upnote { font-size: 11.5px; color: var(--muted); }
 #fs-uploads { list-style: none; display: flex; flex-direction: column; max-height: 26vh; overflow-y: auto; }
 #fs-uploads li {
   display: flex; gap: 8px; align-items: center; flex-wrap: wrap;
@@ -648,9 +742,19 @@ textarea { resize: vertical; }
   flex: 1 1 160px; min-width: 0; font-size: 12.5px;
   overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
 }
+#fs-uploads li.up-queued .upname, #fs-uploads li.up-cancelled .upname { color: var(--muted); }
 #fs-uploads .upline { display: block; flex-basis: 100%; width: 100%; }
 #fs-uploads .upnote { font-size: 11.5px; }
 #fs-uploads .upnote.bad-ink { color: var(--bad); }
+#fs-uploads .upnote.dim { color: var(--idle); }
+/* The ceiling a refusal hit, as a word above the server's sentence. Small
+   capitals in the bad ink and nothing else — it is a label for scanning twelve
+   red rows, not a second error message. */
+#fs-uploads .upceiling {
+  flex: none; font-size: 9.5px; letter-spacing: 0.1em; color: var(--bad);
+  border: 1px solid var(--bad); padding: 0 4px;
+}
+#fs-uploads li.up-collided .upceiling { color: var(--warn); border-color: var(--warn); }
 /* A block, not an inline span: an inline element has no height to set, and a
    progress bar that silently collapses to nothing is the bug that costs an
    afternoon. */
@@ -658,6 +762,16 @@ textarea { resize: vertical; }
 .bar .fill { display: block; height: 100%; width: 0; background: var(--ok); transition: width 140ms linear; }
 .bar.done .fill { background: var(--accent); }
 .bar.bad .fill { background: var(--bad); }
+/* A queued transfer has an empty bar with a visible track, so a row that has
+   not started is distinguishable from one that has started and sent nothing. */
+.bar.queued { border-style: dashed; }
+#fs-queue-bar { height: 7px; }
+
+/* Anything that updates in place is tabular, so a column of numbers does not
+   shift the layout under the pointer as it counts. */
+.mono, .numeric, #fs-uploads .upnote, #fs-queue .upnote, .tilemeta {
+  font-variant-numeric: tabular-nums;
+}
 
 /* ── the desktop plate ────────────────────────────────────────────── */
 

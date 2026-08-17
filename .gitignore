@@ -9,10 +9,11 @@ data/
 # ...except the one `data/` that is source rather than state. The public suffix
 # list is `include_str!`d into `selfhost-config`, so a clone without it does not
 # compile — and until 2026-08-11 no clone had it: the rule above swallowed a
-# build input, every fresh checkout failed at `crates/config/src/psl.rs`, and the
-# production box only built because somebody had copied the file across by hand.
-!crates/config/data/
-!crates/config/data/public_suffix_list.dat
+# build input, every fresh checkout failed at `crates/foundation/config/src/psl.rs`,
+# and the production box only built because somebody had copied the file across by
+# hand.
+!crates/foundation/config/data/
+!crates/foundation/config/data/public_suffix_list.dat
 
 # Generated artifacts, rebuilt by `selfhost render`.
 runtime/
@@ -40,6 +41,23 @@ sites/*
 .doc/
 .helpers/
 
+# ...except the one file under .doc/ that is source rather than cache — the same
+# mistake, and the same correction, as crates/config/data above.
+#
+# A `.dx` file in the tree is a 71-byte pointer (`~ dx1 <sha256>`); the document's
+# actual text lives content-addressed in this pack. Ignoring it meant every clone
+# of this repository — including the production box — got fourteen dangling
+# pointers and no documentation at all, while this Mac was the only machine where
+# the project's maps existed. That is not hypothetical: `crates/rui/rui.dx` still
+# carries a `rui-restored` block recording the day a document's content was lost
+# to a pack rewrite and had to be replayed by hand from a session record.
+#
+# `index.db` genuinely is a cache (~7 MB, rebuilt from the pack and the tree), so
+# it stays ignored. The pack does not rebuild from anything.
+!.doc/
+.doc/*
+!.doc/repo.dxcp
+
 # Scratch directory for the service-manager demo (see .demo/svc)
 .demo/
 
@@ -47,9 +65,9 @@ sites/*
 CLAUDE.md
 
 # local security tooling & docs — do not commit
-scripts/verify-hardening.zsh
-scripts/lockdown.sh
-scripts/verify-security.sh
+scripts/macos/verify-hardening.zsh
+scripts/macos/lockdown.sh
+scripts/macos/verify-security.sh
 docs/SECURITY.md
 
 # Scratch deployments the dx labs build to prove a command works end to end.

@@ -84,7 +84,7 @@ Plain HTTP across an untrusted network is not an option the payload should ever
 describe: the bearer token would travel in cleartext. This is why the app's ATS
 exception exists but the doc insists on VPN or TLS.
 
-## 3. Existing endpoints the app uses (already implemented, `crates/admin`)
+## 3. Existing endpoints the app uses (already implemented, `crates/app/admin`)
 
 All under `http(s)://<host>:<port>`, all JSON, auth =
 `Authorization: Bearer <token>` unless noted. Errors are

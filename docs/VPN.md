@@ -53,7 +53,7 @@ hand-rolled ciphers. Do **not** reimplement its crypto.
   (`100.64.0.0/10`) or IPv6 unique-local (`fc00::/7`) only, and no IPv4 prefix
   broader than `/24` — so the one line between the internet and the control
   plane cannot be disarmed by an edit that looks harmless
-  (`crates/config/src/validate.rs`; `selfhost doctor` reports the same judgement
+  (`crates/foundation/config/src/validate.rs`; `selfhost doctor` reports the same judgement
   against a running deployment).
 - On the Mac, three loopback-only pieces make the **portless** URL work (all
   described under *Using it* below): a **scoped resolver file** sends lookups for
@@ -106,13 +106,15 @@ hand-rolled ciphers. Do **not** reimplement its crypto.
 | Box | Secure-VPN server | Scheduled task `selfhost-vpn` (SYSTEM, at startup, auto-restart), `scripts/securevpn/install-vpn-service.ps1`. Listens `0.0.0.0:8443`, forwards to `127.0.0.1:443`. |
 | Box | keys | `C:\ProgramData\selfhost\securevpn\keys` — `server.key` (private, never leaves), `client.pub` (pins the client). ACL: SYSTEM + Administrators only. |
 | Box | firewall + router | Inbound allow `SecureVPN 8443` (not `selfhost-` prefixed, so the reconciler leaves it alone); router forward WAN 8443 -> 192.168.1.8 via `forward-vpn-port.ps1`. |
-| Mac | Secure-VPN client | `~/.securevpn/` (`app/`, `venv/`, `keys/`). Driven by the SelfHostVPN app (`crates/vpn-ui`). |
+| Mac | Secure-VPN client | `~/.securevpn/` (`app/`, `venv/`, `keys/`). Driven by the SelfHostVPN app (`crates/ui/vpn-ui`). |
+| Upstream | the implementation | `https://github.com/RockyWearsAHat/Secure-VPN.git` — the operator's own project, all of it including `server.py`. This is the source of truth for both ends. |
+| Repo | a stamped snapshot | `scripts/securevpn/app/` — `crypto_core.py`, `protocol.py`, `client.py`, `key_manager.py`, `config.py`, vendored 2026-08-17 with SHA-256 digests so an installed copy can be checked against a reviewed one rather than assumed equal. Its `protocol.py` is already a commit behind upstream. |
 | Mac | keys | `~/.securevpn/keys` — `client.key` (private), `server.pub` (pins the server). No server private key here. |
 | Mac | portless-URL plumbing | Scoped resolver `/etc/resolver/admin.rockywearsahat.com` + vpn-ui's split-DNS responder (`127.0.0.1:53535`) + launchd-managed loopback 443 gate. See *Using it*. |
 
 ## Using it
 
-Open the SelfHostVPN app (`crates/vpn-ui`), **Connect**, then **Open Admin
+Open the SelfHostVPN app (`crates/ui/vpn-ui`), **Connect**, then **Open Admin
 Console** — it opens `https://admin.rockywearsahat.com` (no port). Log in with
 the console password. The console is reachable only while the tunnel runs.
 
@@ -130,7 +132,7 @@ Three Mac-side, loopback-only pieces make the portless URL work:
   anything else.
 - **Loopback 443 gate** — `com.selfhost.console-gate`, a root LaunchDaemon
   (binary `/Library/PrivilegedHelperTools/com.selfhost.console-gate`, source
-  `crates/vpn-ui/src/bin/console-gate.rs`, stderr
+  `crates/ui/vpn-ui/src/bin/console-gate.rs`, stderr
   `/var/log/selfhost-console-gate.log`) holding the *specific* `127.0.0.1:443`
   beside the proxy's wildcard `*:443` and passing the TLS bytes straight through
   to the tunnel's local end at `127.0.0.1:8443` — TLS stays end-to-end, the far
@@ -167,9 +169,18 @@ revoked key can no longer complete a handshake. To rotate the server key,
 regenerate `server.key`/`server.pub` on the box, restart the service, and
 distribute the new `server.pub` to each client.
 
-## Fixes applied to Secure-VPN (vendored copy on the box)
+## Fixes applied to Secure-VPN — all four are upstream now
 
-The deployed copy carries four fixes over upstream; offer them back:
+**Corrected 2026-08-17.** This section used to say the deployed copy carried four
+fixes over upstream and that two of them lived in a `server.py` "not in the
+repository", so they could only be taken on trust. Both halves were wrong.
+Secure-VPN is the operator's own repository —
+`https://github.com/RockyWearsAHat/Secure-VPN.git` — and a clone of it shows all
+four fixes present: `client.py` there is byte-identical to
+`scripts/securevpn/app/client.py`, and its `server.py` carries the leftover
+buffer, the 256-connection cap, the 30-second handshake deadline and `--key-dir`.
+They can be read, and they have been. The four are still listed because they
+explain *why* the code is shaped this way:
 1. **Per-connection sessions.** Upstream multiplexes every local connection over
    one shared tunnel to one target socket — fine for a single SSH session, but a
    browser's parallel connections would interleave and corrupt. Each local

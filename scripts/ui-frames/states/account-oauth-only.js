@@ -116,7 +116,7 @@ window.__STATE = {
             "id": "report-71bc4d09",
             "kind": "observation",
             "title": "Local Network permission resets when the .app is reinstalled",
-            "detail": "After scripts/macos-app.sh install the console cannot reach the box until the permission prompt is accepted again (Errno 65 until then).",
+            "detail": "After scripts/macos/macos-app.sh install the console cannot reach the box until the permission prompt is accepted again (Errno 65 until then).",
             "route": "",
             "repro": "",
             "first_at": "2026-08-11T08:12:00Z",

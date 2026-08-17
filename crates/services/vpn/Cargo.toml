@@ -1,0 +1,34 @@
+[package]
+name = "selfhost-vpn"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Runs a configured VPN relay as a supervised child of the vetted implementation, and turns a live session's address back into the person who holds the key."
+
+[dependencies]
+# The relay, the roster and every refusal the loader already makes. This crate's
+# whole input, and it is read-only here: a rule this crate re-decided would be a
+# second opinion about what is acceptable, which is worse than one.
+selfhost-config = { workspace = true }
+# `PersonName` is the authority on what a legal person's name is, which is the
+# half `config` deliberately does not decide. An attribution that did not carry
+# one would be a string a caller could compare against anything.
+selfhost-identity = { workspace = true }
+# The wire format the admin API and both consoles already speak.
+selfhost-json = { workspace = true }
+# The relay is one more supervised child. Nothing here spawns a process itself.
+selfhost-supervisor = { workspace = true }
+tokio = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time"] }
+
+[lints.rust]
+# Nothing in this crate touches a platform API. The transport is a program, the
+# supervision is `selfhost-supervisor`, and the only bytes read from disk are a
+# public key file — so a future edit reaching for a Win32 or POSIX symbol is a
+# sign the subsystem has taken a wrong turn, and it fails to compile instead.
+unsafe_code = "forbid"
+missing_docs = "warn"

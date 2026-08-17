@@ -610,16 +610,387 @@ function sharesNote(shares) {
   return "";
 }
 
-/** One upload row's right-hand reading: the fraction, the bytes, and the rate
- *  once there is enough of it to mean anything. */
-function transferLine(sent, total, bytesPerSecond) {
+/** One upload row's right-hand reading: the fraction, the bytes, the rate once
+ *  there is enough of it to mean anything, and the time left once that rate is
+ *  worth believing.
+ *
+ *  `etaSecs` is optional so that the three-argument form this started as still
+ *  reads the same; a caller with no estimate must pass none rather than a zero,
+ *  because "0s left" and "no idea yet" are opposite claims. */
+function transferLine(sent, total, bytesPerSecond, etaSecs) {
   const done = Math.max(0, finiteNumber(sent) || 0);
   const size = Math.max(0, finiteNumber(total) || 0);
   if (size === 0) return sizeText(done);
   const percent = Math.min(100, Math.floor((done / size) * 100));
   const rate = finiteNumber(bytesPerSecond);
   const speed = rate !== null && rate > 0 ? ` · ${rateText(rate)}` : "";
-  return `${percent}% · ${sizeText(done)} of ${sizeText(size)}${speed}`;
+  const left = etaSecs === undefined ? "" : etaText(etaSecs);
+  return `${percent}% · ${sizeText(done)} of ${sizeText(size)}${speed}${left ? ` · ${left}` : ""}`;
+}
+
+/* ── 1b-ii. The queue's arithmetic, and the desktop's own facts ─────── */
+
+/* Everything from here to the end of this section is pure and covered by
+   `node app.js`. It is the half of the file manager that has to be *right*
+   rather than merely drawn: a rate that jitters, an estimate that swings, a
+   refusal that says "failed", a range selection that is off by one — none of
+   those is visible in a screenshot, and every one of them is a table test. */
+
+/** How many seconds of history the rate reading is smoothed over.
+ *
+ *  A rate computed as bytes-so-far ÷ time-so-far is stable and *wrong*: it
+ *  keeps quoting the average of a transfer whose speed has since halved. A rate
+ *  computed from the last progress event alone is right and unreadable — it
+ *  swings by a factor of five between paints. This is the exponential middle,
+ *  and three seconds is chosen so that a genuine change in link speed shows
+ *  within about one breath while a single slow chunk does not. */
+const RATE_WINDOW = 3;
+
+/** The rate after one progress event, in bytes per second.
+ *
+ *  Weighted by how much time the sample actually covers rather than by event
+ *  count, because progress events arrive at whatever cadence the browser feels
+ *  like: a run of six events in 50ms must not overwrite three seconds of
+ *  history, and one event after a two-second stall must not be ignored. */
+function smoothRate(previous, bytes, seconds) {
+  const span = finiteNumber(seconds);
+  const prior = finiteNumber(previous);
+  if (span === null || span <= 0) return prior === null ? 0 : Math.max(0, prior);
+  const instant = Math.max(0, finiteNumber(bytes) || 0) / span;
+  if (prior === null || prior <= 0) return instant;
+  const weight = Math.min(1, span / RATE_WINDOW);
+  return prior + (instant - prior) * weight;
+}
+
+/** Seconds left at this rate, or null when nothing honest can be said.
+ *
+ *  Null rather than a large number for a rate of zero: a transfer that has not
+ *  moved has no estimate, and "∞" printed in a column is a reading nobody can
+ *  act on. */
+function etaSeconds(sent, total, bytesPerSecond) {
+  const done = Math.max(0, finiteNumber(sent) || 0);
+  const size = Math.max(0, finiteNumber(total) || 0);
+  const rate = finiteNumber(bytesPerSecond);
+  if (size <= 0 || rate === null || rate <= 0 || done >= size) return null;
+  return (size - done) / rate;
+}
+
+/** The estimate, quantised so it stops counting down one flickering second at a
+ *  time.
+ *
+ *  **This is the whole anti-jitter rule and it is deliberately coarse.** An
+ *  estimate is a guess about the future of a network, and rendering it to the
+ *  second claims a precision that does not exist — worse, it repaints the
+ *  string on every frame, so a reading nobody trusts is also the one thing on
+ *  the plate that never holds still. Five-second steps under a minute,
+ *  fifteen-second steps under ten, whole minutes above: the number changes when
+ *  something changed. */
+function steadyEta(seconds) {
+  const left = finiteNumber(seconds);
+  if (left === null || left < 0) return null;
+  if (left <= 5) return 5;
+  if (left < 60) return Math.ceil(left / 5) * 5;
+  if (left < 600) return Math.ceil(left / 15) * 15;
+  if (left < 86400) return Math.ceil(left / 60) * 60;
+  return null;
+}
+
+/** The estimate as words, or "" when there is none to give. */
+function etaText(seconds) {
+  const left = steadyEta(seconds);
+  return left === null ? "" : `${duration(left)} left`;
+}
+
+/** The states one queued transfer moves through.
+ *
+ *  `queued` and `sending` are the two live ones and the difference matters to
+ *  the person watching: a queue of forty files where three are moving is a
+ *  console that is working, and forty rows all claiming to be uploading at once
+ *  is a console that is lying about a browser's connection limit. */
+const TRANSFER_STATES = ["queued", "sending", "done", "collided", "refused", "cancelled"];
+
+/** Whether this transfer still has somewhere to go. */
+function transferLive(state) {
+  return state === "queued" || state === "sending";
+}
+
+/** Whether this transfer can be started again as it stands. */
+function transferRetryable(state) {
+  return state === "refused" || state === "cancelled" || state === "collided";
+}
+
+/** The whole batch as one reading: what is moving, what it adds up to, and when
+ *  it will be done.
+ *
+ *  The denominator is the *live and finished* work only. A cancelled or refused
+ *  transfer is reported beside the bar rather than inside it, because a bar
+ *  that can never reach its end is a bar that has stopped meaning anything —
+ *  and the operator's question during a forty-file drop is "how long", not "how
+ *  much did I abandon". */
+function queueReading(transfers) {
+  let total = 0, sent = 0, rate = 0;
+  let active = 0, queued = 0, done = 0, failed = 0;
+  for (const item of transfers || []) {
+    if (item.state === "sending") { active += 1; rate += finiteNumber(item.rate) || 0; }
+    else if (item.state === "queued") queued += 1;
+    else if (item.state === "done") done += 1;
+    else { failed += 1; continue; }
+    total += Math.max(0, finiteNumber(item.size) || 0);
+    sent += Math.min(
+      Math.max(0, finiteNumber(item.size) || 0),
+      Math.max(0, finiteNumber(item.sent) || 0),
+    );
+  }
+  const counted = active + queued + done;
+  const fraction = total > 0 ? Math.min(1, sent / total) : (counted > 0 && queued + active === 0 ? 1 : 0);
+  return {
+    total, sent, active, queued, done, failed, counted, fraction, rate,
+    etaSecs: etaSeconds(sent, total, rate),
+  };
+}
+
+/** The batch's one line of prose. */
+function queueLine(reading) {
+  if (!reading || reading.counted === 0) {
+    return reading && reading.failed > 0 ? `${reading.failed} did not go` : "";
+  }
+  const finished = `${reading.done} of ${reading.counted}`;
+  const bytes = reading.total > 0 ? ` · ${sizeText(reading.sent)} of ${sizeText(reading.total)}` : "";
+  const speed = reading.rate > 0 ? ` · ${rateText(reading.rate)}` : "";
+  const left = reading.active + reading.queued > 0 ? etaText(reading.etaSecs) : "";
+  const trouble = reading.failed > 0 ? ` · ${reading.failed} did not go` : "";
+  return `${finished}${bytes}${speed}${left ? ` · ${left}` : ""}${trouble}`;
+}
+
+/** Which ceiling a refused upload actually hit, in two or three words.
+ *
+ *  **The point of this function is that "upload failed" is never an answer.**
+ *  The server already sends prose good enough to act on — the 507 names the
+ *  limit, what is held and what was needed — and that prose is what the row
+ *  shows. What the prose does not do is *sort*: an operator scanning twelve red
+ *  rows needs to know at a glance whether this is a full disk (delete
+ *  something), a busy box (wait), or a name already taken (decide). So this is
+ *  the label above the sentence, never instead of it.
+ *
+ *  The quota and the free-space floor both answer `507 out-of-room`, and the
+ *  tag alone cannot tell them apart — `Admission`'s two sentences can, and this
+ *  reads them by their distinctive opening. If those sentences are ever
+ *  reworded, this falls back to the honest generic rather than to a wrong
+ *  specific: `crates/services/storage/src/quota.rs` is the other half of this
+ *  pair, and the fallback is what keeps a reword from becoming a lie. */
+function uploadCeiling(status, body) {
+  const code = finiteNumber(status) || 0;
+  const tag = body && typeof body.error === "string" ? body.error : "";
+  const said = body && typeof body.message === "string" ? body.message : "";
+  if (code === 0) return "NETWORK";
+  if (code === 401) return "SESSION";
+  if (code === 403 || tag === "not-permitted") return "NOT PERMITTED";
+  if (code === 409 || tag === "occupied" || tag === "collides") return "ALREADY THERE";
+  if (code === 411) return "SIZE BOUND";
+  if (code === 503) return "BOX BUSY";
+  if (code === 507) {
+    if (said.startsWith("this share is limited to")) return "SHARE QUOTA";
+    if (said.startsWith("the volume has")) return "DISK FULL";
+    return "OUT OF ROOM";
+  }
+  if (code === 404) return "FOLDER GONE";
+  if (code === 400) {
+    if (said.includes("has now sent") || said.includes("ended before")) return "FILE CHANGED";
+    return "REFUSED";
+  }
+  return "REFUSED";
+}
+
+/** The bulk plane's own ceiling on a single body, mirrored from
+ *  `storage_api::BULK_MAX_BODY`. Checked here so a file that cannot possibly be
+ *  accepted is refused before a gigabyte is pushed at a socket that will answer
+ *  `411` when it arrives. */
+const BULK_MAX_BODY = 64 * 1024 * 1024 * 1024;
+
+/** Whether this file can be admitted at all, decided from what the share has
+ *  already told us — or null when nothing here forbids it.
+ *
+ *  **A refusal from here is a courtesy, never an authority.** Quota, free space
+ *  and the in-flight budget are enforced as the bytes land and the numbers in
+ *  hand are as old as the last `GET /api/storage/shares`, so this only catches
+ *  what is certainly hopeless: a body past the API's framing bound, and a file
+ *  that does not fit in a quota with a whole share's slack to spare. Everything
+ *  else is sent and the server decides, because a client that guessed "no" on
+ *  stale numbers would refuse uploads that would have worked. */
+function preflight(size, share) {
+  const bytes = finiteNumber(size);
+  if (bytes === null || bytes < 0) return null;
+  if (bytes > BULK_MAX_BODY) {
+    return {
+      ceiling: "SIZE BOUND",
+      message: `this file is ${sizeText(bytes)} and the bulk route accepts `
+        + `${sizeText(BULK_MAX_BODY)} in one body; copy it in over SMB or WebDAV instead`,
+    };
+  }
+  const used = finiteNumber(share && share.usedBytes);
+  const quota = finiteNumber(share && share.quotaBytes);
+  if (used !== null && quota !== null && quota > 0 && used + bytes > quota) {
+    return {
+      ceiling: "SHARE QUOTA",
+      message: `this share is limited to ${sizeText(quota)} and already holds ${sizeText(used)}; `
+        + `this file needs another ${sizeText(bytes)}`,
+    };
+  }
+  const available = finiteNumber(share && share.availableBytes);
+  if (available !== null && bytes > available) {
+    return {
+      ceiling: "DISK FULL",
+      message: `the volume has ${sizeText(available)} free and this file is ${sizeText(bytes)}`,
+    };
+  }
+  return null;
+}
+
+/** What kind of thing a name looks like, for the icon that stands in front of
+ *  it in the grid.
+ *
+ *  A guess from the extension and nothing else: the listing carries no media
+ *  type, the box refuses to sniff one, and a NAS holds files written by
+ *  machines that never agreed on anything. So this decides the *drawing*, never
+ *  a behaviour — nothing here opens, previews, executes or trusts a file
+ *  differently because of what it is called. */
+const FILE_KINDS = [
+  ["image", ["png", "jpg", "jpeg", "gif", "webp", "bmp", "tif", "tiff", "svg", "heic", "heif", "avif", "ico", "raw", "cr2", "nef"]],
+  ["video", ["mp4", "mov", "mkv", "avi", "webm", "m4v", "mpg", "mpeg", "wmv", "flv"]],
+  ["audio", ["mp3", "wav", "flac", "aac", "m4a", "ogg", "opus", "aiff", "aif", "wma"]],
+  ["archive", ["zip", "tar", "gz", "tgz", "bz2", "xz", "7z", "rar", "zst", "lz4"]],
+  ["disk", ["iso", "dmg", "img", "vmdk", "vhd", "vhdx", "qcow2", "vdi"]],
+  ["code", ["js", "mjs", "ts", "tsx", "jsx", "rs", "py", "go", "c", "h", "cpp", "hpp", "cc", "java", "rb", "sh", "bash", "zsh", "fish", "css", "html", "htm", "json", "xml", "yaml", "yml", "toml", "sql", "swift", "kt", "php", "pl", "lua", "vim", "dx"]],
+  ["document", ["pdf", "doc", "docx", "odt", "rtf", "pages", "epub", "mobi", "tex"]],
+  ["sheet", ["xls", "xlsx", "csv", "tsv", "ods", "numbers"]],
+  ["slides", ["ppt", "pptx", "odp", "key"]],
+  ["secret", ["pem", "crt", "cer", "pfx", "p12", "gpg", "asc", "kdbx", "keychain"]],
+  ["text", ["txt", "md", "log", "ini", "conf", "cfg", "plist", "lock"]],
+];
+
+/** The extension of a name, lowercased, or "".
+ *
+ *  A leading dot is a hidden file rather than an extension — `.gitignore` is
+ *  not a file of type `gitignore` — so the dot has to be past the first
+ *  character to count. */
+function extensionOf(name) {
+  const text = String(name || "");
+  const dot = text.lastIndexOf(".");
+  if (dot <= 0 || dot === text.length - 1) return "";
+  return text.slice(dot + 1).toLowerCase();
+}
+
+/** The icon a listing entry wears. */
+function fileKind(name, kind) {
+  if (kind === "directory") return "folder";
+  const extension = extensionOf(name);
+  if (extension === "") return "file";
+  for (const [family, extensions] of FILE_KINDS) {
+    if (extensions.includes(extension)) return family;
+  }
+  return "file";
+}
+
+/** The names between two of them in a sorted listing, inclusive, whichever way
+ *  round they were clicked. The shift-click rule, extracted so that the
+ *  off-by-one lives in a test rather than in a listing. */
+function rangeBetween(names, from, to) {
+  const list = Array.from(names || []);
+  const start = list.indexOf(from);
+  const end = list.indexOf(to);
+  if (start < 0 || end < 0) return end < 0 ? [] : [to];
+  const [low, high] = start <= end ? [start, end] : [end, start];
+  return list.slice(low, high + 1);
+}
+
+/** Where the keyboard's next stop is, given the key, the list and how many
+ *  columns it is drawn in.
+ *
+ *  One function for both views because they are one behaviour with a different
+ *  column count: a list is a grid one tile wide, and writing that twice is
+ *  writing two subtly different sets of edge cases. Returns the current index
+ *  for a key it does not move on, so a caller can compare and know whether to
+ *  preventDefault. */
+function nextIndex(current, key, count, columns) {
+  if (count <= 0) return -1;
+  const width = Math.max(1, Math.floor(columns) || 1);
+  const at = current < 0 || current >= count ? -1 : current;
+  const clamp = (value) => Math.max(0, Math.min(count - 1, value));
+  switch (key) {
+    case "ArrowDown": return at < 0 ? 0 : clamp(at + width);
+    case "ArrowUp": return at < 0 ? 0 : clamp(at - width);
+    case "ArrowRight": return at < 0 ? 0 : clamp(at + 1);
+    case "ArrowLeft": return at < 0 ? 0 : clamp(at - 1);
+    case "Home": return 0;
+    case "End": return count - 1;
+    case "PageDown": return at < 0 ? 0 : clamp(at + width * 4);
+    case "PageUp": return at < 0 ? 0 : clamp(at - width * 4);
+    default: return at;
+  }
+}
+
+/** The rectangle two pointer positions describe, in the coordinates of whatever
+ *  they were measured against. Pure so that a marquee dragged up and to the
+ *  left is a test rather than a bug report. */
+function marqueeRect(ax, ay, bx, by) {
+  return {
+    left: Math.min(ax, bx),
+    top: Math.min(ay, by),
+    width: Math.abs(ax - bx),
+    height: Math.abs(ay - by),
+  };
+}
+
+/** Whether two rectangles touch. Edge contact does not count, so a marquee
+ *  dragged exactly along a row's boundary does not select it. */
+function rectsMeet(a, b) {
+  return a.left < b.left + b.width && b.left < a.left + a.width
+    && a.top < b.top + b.height && b.top < a.top + a.height;
+}
+
+/** How a marquee combines with what was already selected.
+ *
+ *  Additive when a modifier is held, replacing otherwise — and the *original*
+ *  selection is the base rather than whatever the marquee touched a moment ago,
+ *  so dragging back over a tile un-touches it instead of leaving it stuck. */
+function marqueeSelection(base, touched, additive) {
+  const chosen = new Set(additive ? base : []);
+  for (const name of touched) chosen.add(name);
+  return chosen;
+}
+
+/** What a delete of this selection has to be armed with.
+ *
+ *  A directory goes depth-infinity, so it takes a typed word exactly as an
+ *  uninstall does; a set holding one has no single name to type, so the count
+ *  is the token — a number the operator has to have read the sentence to know.
+ *  A selection of plain files is one confirmation, because each one is a thing
+ *  the operator can see and none of them takes anything else with it. */
+function deleteGate(entries) {
+  const list = Array.from(entries || []);
+  const folders = list.filter((entry) => entry && entry.kind === "directory").length;
+  if (list.length === 0) return null;
+  if (list.length === 1) {
+    const only = list[0];
+    return only.kind === "directory"
+      ? { token: only.name, label: `Type ${only.name} to delete this folder and everything inside it` }
+      : { token: null, label: `Delete ${only.name}?` };
+  }
+  if (folders === 0) {
+    return { token: null, label: `Delete these ${list.length} files?` };
+  }
+  return {
+    token: String(list.length),
+    label: `Type ${list.length} to delete ${list.length} items, including `
+      + `${folders} folder${folders === 1 ? "" : "s"} and everything inside`,
+  };
+}
+
+/** The view the listing is drawn in, from whatever was stored. Anything else —
+ *  a stale key, a hand-edited value, a browser that answered null — is the
+ *  list, because the list is the view that works at any width. */
+function storedView(raw) {
+  return raw === "grid" ? "grid" : "list";
 }
 
 /* ── 1c. The desktop: the wire, the states, and the readings ───────── */
@@ -1838,6 +2209,145 @@ if (typeof document === "undefined") {
   check("a transfer reads as a fraction", transferLine(512, 1024, 0), "50% · 512 B of 1.00 kB");
   check("a moving transfer wears its rate", transferLine(512, 1024, 2048), "50% · 512 B of 1.00 kB · 2.00 kB/s");
   check("a sizeless transfer reads as bytes", transferLine(512, 0, 0), "512 B");
+  check("a transfer with an estimate says how long",
+    transferLine(512, 1024, 2048, 0.25), "50% · 512 B of 1.00 kB · 2.00 kB/s · 5s left");
+  check("no estimate is offered rather than guessed",
+    transferLine(512, 1024, 2048, null), "50% · 512 B of 1.00 kB · 2.00 kB/s");
+
+  /* ── the upload queue's arithmetic ────────────────────────────────── */
+
+  check("the first sample is the rate", smoothRate(0, 1000, 1), 1000);
+  check("a steady rate stays put", smoothRate(1000, 1000, 1), 1000);
+  check("a change is followed, not jumped to", smoothRate(1000, 4000, 1), 2000);
+  check("a long gap counts for a whole window", smoothRate(1000, 12000, 3), 4000);
+  check("a sample of no time changes nothing", smoothRate(1000, 5000, 0), 1000);
+  check("a stalled transfer has no estimate", etaSeconds(10, 100, 0), null);
+  check("a finished transfer has no estimate", etaSeconds(100, 100, 10), null);
+  check("an estimate is bytes left over rate", etaSeconds(50, 100, 10), 5);
+  check("a sizeless transfer has no estimate", etaSeconds(0, 0, 10), null);
+  check("seconds round up to five", steadyEta(7), 10);
+  check("anything imminent reads as five", steadyEta(0.2), 5);
+  check("minutes round to quarter-minutes", steadyEta(200), 210);
+  check("hours round to whole minutes", steadyEta(3700), 3720);
+  check("a day away is no estimate at all", steadyEta(90000), null);
+  check("an estimate carries its unit", etaText(200), "3m 30s left");
+  check("no estimate is no words", etaText(null), "");
+  check("a queued item is live", transferLive("queued"), true);
+  check("a done item is not", transferLive("done"), false);
+  check("a cancelled item can go again", transferRetryable("cancelled"), true);
+  check("a finished item cannot be retried", transferRetryable("done"), false);
+  check("every drawn state is a known state",
+    TRANSFER_STATES.filter((s) => transferLive(s) || transferRetryable(s) || s === "done").length,
+    TRANSFER_STATES.length);
+
+  const batch = [
+    { state: "done", size: 100, sent: 100, rate: 0 },
+    { state: "sending", size: 100, sent: 50, rate: 25 },
+    { state: "queued", size: 200, sent: 0, rate: 0 },
+    { state: "refused", size: 900, sent: 10, rate: 0 },
+  ];
+  const reading = queueReading(batch);
+  check("the batch counts only work that can finish", reading.counted, 3);
+  check("a refusal is not in the denominator", reading.total, 400);
+  check("the batch adds up what has landed", reading.sent, 150);
+  check("the batch knows what is moving", [reading.active, reading.queued, reading.done], [1, 1, 1]);
+  check("a refusal is reported beside the bar", reading.failed, 1);
+  check("the batch estimates from the live rate", reading.etaSecs, 10);
+  check("the batch reads as one line", queueLine(reading),
+    "1 of 3 · 150 B of 400 B · 25 B/s · 10s left · 1 did not go");
+  check("an all-done batch stops estimating",
+    queueLine(queueReading([{ state: "done", size: 10, sent: 10 }])), "1 of 1 · 10 B of 10 B");
+  check("an empty queue says nothing", queueLine(queueReading([])), "");
+  check("a queue of nothing but refusals still says so",
+    queueLine(queueReading([{ state: "refused", size: 10, sent: 0 }])), "1 did not go");
+
+  check("a quota refusal names the quota",
+    uploadCeiling(507, { error: "out-of-room", message: "this share is limited to 100 bytes and already holds 90; the upload needs another 40" }),
+    "SHARE QUOTA");
+  check("a full volume names the disk",
+    uploadCeiling(507, { error: "out-of-room", message: "the volume has 10 bytes free and must keep 100 in reserve; the upload needs 40" }),
+    "DISK FULL");
+  check("a reworded 507 falls back to the honest generic",
+    uploadCeiling(507, { error: "out-of-room", message: "something else entirely" }), "OUT OF ROOM");
+  check("a busy box is a wait, not a failure", uploadCeiling(503, { error: "out-of-room" }), "BOX BUSY");
+  check("the framing bound is its own ceiling", uploadCeiling(411, null), "SIZE BOUND");
+  check("a collision is a decision", uploadCeiling(409, { error: "occupied" }), "ALREADY THERE");
+  check("a dead network is named as one", uploadCeiling(0, null), "NETWORK");
+  check("a file that grew mid-flight is named",
+    uploadCeiling(400, { message: "this upload said it would send 10 bytes and has now sent 20" }),
+    "FILE CHANGED");
+  check("an unexplained refusal is still not 'failed'", uploadCeiling(500, null), "REFUSED");
+
+  check("a file past the framing bound never leaves the browser",
+    preflight(BULK_MAX_BODY + 1, { writable: true }).ceiling, "SIZE BOUND");
+  check("a file that cannot fit the quota is refused here",
+    preflight(50, { usedBytes: 60, quotaBytes: 100 }).ceiling, "SHARE QUOTA");
+  check("a file that fits is not refused here",
+    preflight(30, { usedBytes: 60, quotaBytes: 100 }), null);
+  check("a file larger than the free space is refused here",
+    preflight(50, { usedBytes: 0, quotaBytes: null, availableBytes: 40 }).ceiling, "DISK FULL");
+  check("an unmeasurable share refuses nothing in advance",
+    preflight(50, { usedBytes: null, quotaBytes: null, availableBytes: null }), null);
+  check("the browser's bound is the API's bound", BULK_MAX_BODY, 64 * 1024 * 1024 * 1024);
+
+  /* ── the icons and the selection ──────────────────────────────────── */
+
+  check("a directory is a folder whatever it is called", fileKind("notes.txt", "directory"), "folder");
+  check("a photograph is a photograph", fileKind("holiday.JPG", "file"), "image");
+  check("a tarball is an archive", fileKind("backup.tar.gz", "file"), "archive");
+  check("a disk image is not an archive", fileKind("ventura.dmg", "file"), "disk");
+  check("a key is not a document", fileKind("server.pem", "file"), "secret");
+  check("a dotfile has no extension", extensionOf(".gitignore"), "");
+  check("a trailing dot is not an extension", extensionOf("weird."), "");
+  check("an unknown extension is a plain file", fileKind("thing.qqq", "file"), "file");
+  check("a name with no dot is a plain file", fileKind("Makefile", "file"), "file");
+
+  const names = ["a", "b", "c", "d", "e"];
+  check("a range is inclusive", rangeBetween(names, "b", "d"), ["b", "c", "d"]);
+  check("a range dragged backwards is the same range", rangeBetween(names, "d", "b"), ["b", "c", "d"]);
+  check("a range to itself is itself", rangeBetween(names, "c", "c"), ["c"]);
+  check("a range from a name that has gone is just the target",
+    rangeBetween(names, "zz", "c"), ["c"]);
+
+  check("down moves a row in a list", nextIndex(0, "ArrowDown", 5, 1), 1);
+  check("down moves a whole row in a grid", nextIndex(0, "ArrowDown", 12, 4), 4);
+  check("up at the top stays at the top", nextIndex(0, "ArrowUp", 12, 4), 0);
+  check("down at the end stays at the end", nextIndex(11, "ArrowDown", 12, 4), 11);
+  check("right walks the grid one tile", nextIndex(3, "ArrowRight", 12, 4), 4);
+  check("the first key press lands on the first item", nextIndex(-1, "ArrowDown", 5, 1), 0);
+  check("end is the last item", nextIndex(0, "End", 5, 1), 4);
+  check("a key that is not a move does not move", nextIndex(2, "x", 5, 1), 2);
+  check("an empty listing has nowhere to go", nextIndex(0, "ArrowDown", 0, 1), -1);
+
+  check("a marquee dragged up and left is still a rectangle",
+    marqueeRect(100, 100, 40, 60), { left: 40, top: 60, width: 60, height: 40 });
+  check("overlapping rectangles meet",
+    rectsMeet({ left: 0, top: 0, width: 10, height: 10 }, { left: 5, top: 5, width: 10, height: 10 }), true);
+  check("touching edges do not",
+    rectsMeet({ left: 0, top: 0, width: 10, height: 10 }, { left: 10, top: 0, width: 10, height: 10 }), false);
+  check("a plain marquee replaces the selection",
+    Array.from(marqueeSelection(["a"], ["b"], false)), ["b"]);
+  check("a modified marquee adds to it",
+    Array.from(marqueeSelection(["a"], ["b"], true)), ["a", "b"]);
+  check("dragging back off a tile releases it",
+    Array.from(marqueeSelection(["a"], [], true)), ["a"]);
+
+  check("one file is one confirmation",
+    deleteGate([{ name: "a.txt", kind: "file" }]).token, null);
+  check("one folder takes its own name",
+    deleteGate([{ name: "photos", kind: "directory" }]).token, "photos");
+  check("many files are still one confirmation",
+    deleteGate([{ name: "a", kind: "file" }, { name: "b", kind: "file" }]).token, null);
+  check("a set holding a folder takes the count, because it has no one name",
+    deleteGate([{ name: "a", kind: "file" }, { name: "p", kind: "directory" }]).token, "2");
+  check("the sentence says what will go",
+    deleteGate([{ name: "a", kind: "file" }, { name: "p", kind: "directory" }]).label,
+    "Type 2 to delete 2 items, including 1 folder and everything inside");
+  check("nothing selected arms nothing", deleteGate([]), null);
+
+  check("a stored view is honoured", storedView("grid"), "grid");
+  check("anything else is the list", storedView("gallery"), "list");
+  check("no stored view is the list", storedView(null), "list");
 
   /* ── the desktop ──────────────────────────────────────────────────── */
 
@@ -3896,11 +4406,54 @@ function boot() {
   const uploads = [];
   const uploadRows = new Map();
   let uploadSerial = 0;
+  /** How many transfers may be in flight at once.
+   *
+   *  Three, and the number is a budget rather than a throughput setting. A
+   *  browser allows six connections per origin and this console needs some of
+   *  them for the poll, the push stream and the listing refresh that follows
+   *  every completed upload — a queue that took all six would starve the page
+   *  that is drawing it, and the operator would watch a console go grey while
+   *  its files uploaded perfectly. Beyond that, three concurrent bodies is
+   *  where a single link is already saturated: more transfers past that point
+   *  do not go faster, they merely all finish last, which is the worst
+   *  arrangement for anyone watching a queue. */
+  const UPLOAD_CONCURRENCY = 3;
+  /** The queue's clock while anything is moving; see `tickQueue`. */
+  let queueTimer = null;
   /** The listing's order, which belongs to the operator rather than the server:
    *  the daemon answers in its own display order, and this re-sorts what
    *  arrived rather than asking for it again. */
   let sortColumn = "name";
   let sortAscending = true;
+  /** Which drawing of the listing is on screen, and where it is remembered.
+   *
+   *  Remembered on the machine rather than on the box: it is a fact about the
+   *  screen this person is sitting at, not about the deployment, and a console
+   *  opened on a phone should not have to be a grid because a desktop chose one
+   *  last week. */
+  const VIEW_KEY = "selfhost.console.files.view";
+  const SORT_KEY = "selfhost.console.files.sort";
+  let viewMode = "list";
+  /** What is selected, where a range starts from, and where the keyboard is.
+   *
+   *  **Selection and focus are two different facts and are stored separately.**
+   *  A row can be selected without the keyboard being on it (marquee a dozen,
+   *  then arrow away), and the keyboard can be on a row that is not selected
+   *  (ctrl-arrow past one). Merging them is the single most common way a file
+   *  manager comes to disagree with itself about what Delete is about to act
+   *  on, and the ring and the tint are drawn differently for the same reason. */
+  const selection = new Set();
+  let anchorName = null;
+  let cursorName = null;
+  /** The elements the current listing drew, by name, so selection and focus can
+   *  be repainted without rebuilding a listing somebody is dragging across. */
+  const entryElements = new Map();
+  /** How many tiles a grid row holds, read back from the layout rather than
+   *  assumed, so the arrow keys agree with what is on the screen at any width. */
+  let gridColumnCount = 1;
+  /** The marquee in progress: where it started, what was selected before it,
+   *  and whether it is adding rather than replacing. */
+  let marquee = null;
   /** The entry being renamed in place, the entry a confirm bar is armed to
    *  delete, and the entry the move bar is moving. One at a time, because two
    *  open forms over one listing is two ways to act on a row that has moved. */
@@ -3979,6 +4532,11 @@ function boot() {
     state.dir = plainPath(pathSegments(path));
     state.listing = null;
     state.listingNote = "";
+    // A selection is a set of names in one directory and means nothing in the
+    // next one. Carrying it across would arm a delete at names that are no
+    // longer on the screen, which is the one bug in a file manager nobody
+    // forgives.
+    clearSelection();
     closeStorageForms();
     // Every ancestor of where we are standing is open, so the tree always shows
     // the path taken to get here rather than needing to be re-expanded.
@@ -4107,6 +4665,15 @@ function boot() {
     if (made) { treeChildren.delete(state.dir); refreshListing(); refreshTree(); }
   }
 
+  /** Opens the in-place rename field on one entry. */
+  function beginRename(entry) {
+    if (!entry) return;
+    closeStorageForms();
+    renaming = entry.name;
+    rowsDirty = true;
+    render();
+  }
+
   /** Renames one entry in place. A rename is a move whose destination is the
    *  same directory, which is why it goes through the same route — two ways to
    *  move a file is two sets of rules about what may overwrite what. */
@@ -4123,59 +4690,380 @@ function boot() {
     else render();
   }
 
-  /** Moves one entry into another directory, in this share or another one.
+  /** Moves entries into another directory, in this share or another one.
    *
    *  `replace` is never sent, so the server's refusal to destroy something
    *  already at the destination stands: a move that silently overwrote would be
-   *  a delete nobody asked for. */
-  async function moveEntry(entry, fromDirectory, toShare, toDirectory) {
+   *  a delete nobody asked for.
+   *
+   *  One request per entry, in order, and the count is reported rather than the
+   *  names: the API has no bulk move, and inventing one on the client by firing
+   *  twelve requests at once would make the failure of the seventh impossible
+   *  to attribute. A partial move says so — *"moved 9 of 12"* — because the nine
+   *  really did move and pretending otherwise would send the operator looking
+   *  for them where they no longer are. */
+  async function moveEntries(entries, fromDirectory, toShare, toDirectory) {
     const share = state.share;
-    const from = joinPath(fromDirectory, entry.name);
-    const to = joinPath(toDirectory, entry.name);
-    if (!share || from === null || to === null || !usableShareId(toShare)) return;
-    if (toShare === share && plainPath(pathSegments(toDirectory)) === plainPath(pathSegments(fromDirectory))) {
-      closeStorageForms();
-      render();
-      return;
-    }
-    const body = { from, to };
-    if (toShare !== share) body.toShare = toShare;
+    if (!share || !usableShareId(toShare) || entries.length === 0) return;
+    const sameplace = toShare === share
+      && plainPath(pathSegments(toDirectory)) === plainPath(pathSegments(fromDirectory));
     closeStorageForms();
-    const moved = await storageCommand(`Moved ${entry.name}`, "POST",
-      `/api/storage/shares/${share}/rename`, body);
-    if (moved) {
-      treeChildren.delete(fromDirectory);
-      treeChildren.delete(toDirectory);
-      refreshShares();
-      refreshListing();
-      refreshTree();
-    } else {
-      render();
+    if (sameplace) { render(); return; }
+
+    let moved = 0;
+    let stopped = "";
+    for (const entry of entries) {
+      const from = joinPath(fromDirectory, entry.name);
+      const to = joinPath(toDirectory, entry.name);
+      if (from === null || to === null) continue;
+      const body = { from, to };
+      if (toShare !== share) body.toShare = toShare;
+      let reply;
+      try {
+        // eslint-disable-next-line no-await-in-loop
+        reply = await api(`/api/storage/shares/${share}/rename`, { method: "POST", body });
+      } catch { stopped = refusalText(0, null); break; }
+      if (reply.status === 401) { toLogin(); return; }
+      if (reply.status >= 400) { stopped = `${entry.name}: ${refusalText(reply.status, reply.body)}`; break; }
+      moved += 1;
     }
+
+    if (stopped) {
+      notify("problem", entries.length === 1 ? stopped
+        : `moved ${moved} of ${entries.length}, then stopped — ${stopped}`);
+    } else {
+      notify("done", entries.length === 1
+        ? `Moved ${entries[0].name}` : `Moved ${moved} items`);
+    }
+    treeChildren.delete(fromDirectory);
+    treeChildren.delete(toDirectory);
+    clearSelection();
+    refreshShares();
+    refreshListing();
+    refreshTree();
   }
 
-  async function deleteEntry(entry) {
+  /** Deletes entries, one request each, and says how far it got. */
+  async function deleteEntries(entries) {
     const share = state.share;
-    const path = joinPath(state.dir, entry.name);
     closeStorageForms();
-    if (!share || path === null) { render(); return; }
-    const gone = await storageCommand(`Deleted ${entry.name}`, "DELETE",
-      `/api/storage/shares/${share}/entry?path=${urlPath(path)}`);
-    if (gone) {
-      treeChildren.delete(state.dir);
+    if (!share || entries.length === 0) { render(); return; }
+    let gone = 0;
+    let stopped = "";
+    for (const entry of entries) {
+      const path = joinPath(state.dir, entry.name);
+      if (path === null) continue;
+      let reply;
+      try {
+        // eslint-disable-next-line no-await-in-loop
+        reply = await api(`/api/storage/shares/${share}/entry?path=${urlPath(path)}`, { method: "DELETE" });
+      } catch { stopped = refusalText(0, null); break; }
+      if (reply.status === 401) { toLogin(); return; }
+      if (reply.status >= 400) { stopped = `${entry.name}: ${refusalText(reply.status, reply.body)}`; break; }
+      gone += 1;
       treeChildren.delete(path);
       treeOpen.delete(path);
-      refreshShares();
-      refreshListing();
-      refreshTree();
-    } else {
-      render();
     }
+    if (stopped) {
+      notify("problem", entries.length === 1 ? stopped
+        : `deleted ${gone} of ${entries.length}, then stopped — ${stopped}`);
+    } else {
+      notify("done", entries.length === 1
+        ? `Deleted ${entries[0].name}` : `Deleted ${gone} items`);
+    }
+    treeChildren.delete(state.dir);
+    clearSelection();
+    refreshShares();
+    refreshListing();
+    refreshTree();
+  }
+
+  /* ── the selection ────────────────────────────────────────────────── */
+
+  /** The entries the listing is currently drawing, in the order it drew them.
+   *  Every selection rule — range, select-all, arrow — is expressed against
+   *  this order rather than against the server's, because the operator is
+   *  choosing what they can see. */
+  function visibleEntries() {
+    if (!state.listing || !Array.isArray(state.listing.entries)) return [];
+    return sortEntries(state.listing.entries, sortColumn, sortAscending);
+  }
+
+  function visibleNames() {
+    return visibleEntries().map((entry) => entry.name);
+  }
+
+  function entryNamed(name) {
+    return visibleEntries().find((entry) => entry.name === name) || null;
+  }
+
+  /** The entries a command should act on: what is selected, in listing order.
+   *  Names that have since gone from the listing are dropped rather than sent,
+   *  so a delete armed before a refresh cannot act on something that moved. */
+  function selectedEntries() {
+    return visibleEntries().filter((entry) => selection.has(entry.name));
+  }
+
+  function clearSelection() {
+    selection.clear();
+    anchorName = null;
+    cursorName = null;
+  }
+
+  /** Puts the selection and the keyboard on one name. */
+  function selectOnly(name) {
+    selection.clear();
+    if (name !== null) selection.add(name);
+    anchorName = name;
+    cursorName = name;
+    paintSelection();
+  }
+
+  /** Adds or removes one name without disturbing the rest — cmd/ctrl-click. */
+  function toggleSelected(name) {
+    if (selection.has(name)) selection.delete(name);
+    else selection.add(name);
+    anchorName = name;
+    cursorName = name;
+    paintSelection();
+  }
+
+  /** Selects everything between the anchor and this name — shift-click. */
+  function extendSelection(name) {
+    const from = anchorName === null ? name : anchorName;
+    selection.clear();
+    for (const between of rangeBetween(visibleNames(), from, name)) selection.add(between);
+    anchorName = from;
+    cursorName = name;
+    paintSelection();
+  }
+
+  /** What one click means, given which keys were down.
+   *
+   *  Kept in one place because the three rules have to agree between the list
+   *  and the grid: two copies of "shift extends, cmd toggles, a bare click
+   *  replaces" is how a console ends up with two different meanings for
+   *  shift-click depending on which view is showing. */
+  function clickSelect(name, event) {
+    if (event.shiftKey) extendSelection(name);
+    else if (event.metaKey || event.ctrlKey) toggleSelected(name);
+    else selectOnly(name);
+  }
+
+  function selectAll() {
+    selection.clear();
+    for (const name of visibleNames()) selection.add(name);
+    const names = visibleNames();
+    if (names.length > 0) {
+      anchorName = names[0];
+      if (cursorName === null) cursorName = names[0];
+    }
+    paintSelection();
+  }
+
+  /** Moves the keyboard, taking the selection with it unless a modifier says to
+   *  leave it behind.
+   *
+   *  Shift extends from the anchor, which is what every file manager does;
+   *  cmd/ctrl moves the ring alone, so the operator can walk past four files to
+   *  a fifth and add it with the space bar without losing the four.
+   *
+   *  Named for the listing rather than `moveCursor`, because the desktop plate
+   *  further down this file already declares one — and a function declaration
+   *  is hoisted over the whole closure, so the *later* one silently wins. The
+   *  arrow keys did nothing at all until a real key press was photographed.
+   *  Nothing about that is visible in a self-test or in a listing that draws
+   *  correctly. */
+  function moveListingCursor(key, event) {
+    const names = visibleNames();
+    if (names.length === 0) return false;
+    const at = cursorName === null ? -1 : names.indexOf(cursorName);
+    const columns = viewMode === "grid" ? gridColumnCount : 1;
+    const to = nextIndex(at, key, names.length, columns);
+    if (to < 0 || to === at) {
+      // A first press with nothing under the ring still has somewhere to land.
+      if (at >= 0 || to < 0) return false;
+    }
+    const name = names[Math.max(0, to)];
+    if (event.shiftKey) extendSelection(name);
+    else if (event.metaKey || event.ctrlKey) { cursorName = name; paintSelection(); }
+    else selectOnly(name);
+    return true;
+  }
+
+  /** Repaints selection, focus and the roving tab stop without rebuilding a
+   *  single row. Rebuilding is what loses a drag, a focus ring and a click. */
+  function paintSelection(focusCursor) {
+    const names = visibleNames();
+    if (cursorName !== null && !names.includes(cursorName)) cursorName = null;
+    for (const [name, element] of entryElements) {
+      const chosen = selection.has(name);
+      element.setAttribute("aria-selected", chosen ? "true" : "false");
+      element.classList.toggle("chosen", chosen);
+      element.tabIndex = name === cursorName ? 0 : -1;
+    }
+    // With nothing under the ring the container itself is the tab stop, so the
+    // listing is never a region the keyboard cannot enter.
+    const holder = viewMode === "grid" ? $("fs-grid") : $("fs-table");
+    holder.tabIndex = cursorName === null ? 0 : -1;
+    if (focusCursor && cursorName !== null) {
+      const element = entryElements.get(cursorName);
+      if (element) {
+        element.focus();
+        if (element.scrollIntoView) element.scrollIntoView({ block: "nearest" });
+      }
+    }
+    renderSelectionNote();
+    // The toolbar's verbs are a function of the selection, so they change with
+    // it rather than a poll later: a DELETE that stays grey for a second after
+    // a row is chosen is a button the operator has already decided is broken.
+    renderActions();
+  }
+
+  /** The one line that says what is selected. Furnishing rather than chrome: a
+   *  file manager whose delete acts on "the selection" has to show what that
+   *  is, in numbers, at all times. */
+  function renderSelectionNote() {
+    const chosen = selectedEntries();
+    const note = $("fs-selection");
+    if (chosen.length === 0) {
+      note.textContent = "";
+      note.hidden = true;
+      return;
+    }
+    note.hidden = false;
+    const bytes = chosen.reduce((sum, entry) =>
+      sum + (entry.kind === "directory" ? 0 : Math.max(0, finiteNumber(entry.size) || 0)), 0);
+    const folders = chosen.filter((entry) => entry.kind === "directory").length;
+    const files = chosen.length - folders;
+    const parts = [];
+    if (files > 0) parts.push(`${files} file${files === 1 ? "" : "s"}`);
+    if (folders > 0) parts.push(`${folders} folder${folders === 1 ? "" : "s"}`);
+    note.textContent = files > 0
+      ? `${parts.join(" · ")} selected · ${sizeText(bytes)}`
+      : `${parts.join(" · ")} selected`;
+  }
+
+  /** Opens one entry: descend into a folder, download a file.
+   *
+   *  The download is a click on a real anchor rather than a `location` change,
+   *  because the `download` attribute is what keeps a text file from replacing
+   *  this page — and the anchor is built and thrown away rather than kept,
+   *  because the listing under it changes. */
+  function openEntry(entry) {
+    if (!entry) return;
+    const path = joinPath(state.dir, entry.name);
+    if (path === null || entry.reachable === false) return;
+    if (entry.kind === "directory") { openDirectory(path); return; }
+    const link = document.createElement("a");
+    link.href = `/api/storage/blob/${state.share}/${urlPath(path)}`;
+    link.setAttribute("download", entry.name);
+    link.hidden = true;
+    document.body.append(link);
+    link.click();
+    link.remove();
   }
 
   /* ── uploads ──────────────────────────────────────────────────────── */
 
-  /** Starts one upload.
+  /** Puts one file in the queue. It does not start: [`pumpUploads`] decides
+   *  that, and it is the only thing that does.
+   *
+   *  A queue is not a nicety here. Dropping a folder of four hundred photographs
+   *  used to open four hundred requests, of which the browser ran six and left
+   *  the rest silently pending — and the box's own in-flight budget refused a
+   *  fistful of those with a `503` that read, to the operator, as random
+   *  failure. Queued is a state a person can be shown, and a state the box
+   *  never has to refuse. */
+  function enqueueUpload(file, directory, replace) {
+    const share = state.share;
+    const path = joinPath(directory, file.name);
+    const transfer = {
+      id: (uploadSerial += 1),
+      name: file.name,
+      // Where it is going, shown when it is not simply "here": a folder upload
+      // fills a tree the operator is not standing in.
+      directory,
+      share,
+      size: file.size,
+      sent: 0,
+      startedAt: 0,
+      lastAt: 0,
+      lastSent: 0,
+      rate: 0,
+      state: "queued",
+      note: "",
+      ceiling: "",
+      replace: Boolean(replace),
+      file,
+      request: null,
+    };
+    uploads.push(transfer);
+    if (!share || path === null) {
+      refuseTransfer(transfer, "UNADDRESSABLE",
+        "this name cannot be addressed over HTTP — a slash or a backslash in it means "
+        + "no URL names this file; copy it in over SMB or rename it at the machine");
+      return transfer;
+    }
+    // The two ceilings that can be known before a byte moves are checked before
+    // a byte moves. Everything else is the server's to decide.
+    const stopped = preflight(file.size, currentShare());
+    if (stopped) refuseTransfer(transfer, stopped.ceiling, stopped.message);
+    return transfer;
+  }
+
+  function refuseTransfer(transfer, ceiling, note) {
+    transfer.state = "refused";
+    transfer.ceiling = ceiling;
+    transfer.note = note;
+    renderUploads();
+  }
+
+  /** Starts whatever the concurrency budget has room for, oldest first. */
+  function pumpUploads() {
+    let running = uploads.filter((transfer) => transfer.state === "sending").length;
+    for (const transfer of uploads) {
+      if (running >= UPLOAD_CONCURRENCY) break;
+      if (transfer.state !== "queued") continue;
+      beginUpload(transfer);
+      running += 1;
+    }
+    renderUploads();
+    tickQueue();
+  }
+
+  /** The queue's own clock, alive only while something is moving.
+   *
+   *  **It exists so that a stalled transfer stops claiming a rate.** Progress
+   *  events are the only thing that moves the reading, and a link that has gone
+   *  quiet produces none — so without this, a transfer frozen at 40% would go on
+   *  displaying the 8 MB/s it managed a minute ago, and an estimate computed
+   *  from it. Decaying the rate through the same window the samples use means a
+   *  stall reads as a stall within a few seconds: the number falls, the estimate
+   *  lengthens, and then there is no estimate, which is the truth. */
+  function tickQueue() {
+    if (queueTimer !== null) return;
+    queueTimer = setInterval(() => {
+      const moving = uploads.filter((transfer) => transfer.state === "sending");
+      if (moving.length === 0) {
+        clearInterval(queueTimer);
+        queueTimer = null;
+        return;
+      }
+      const now = Date.now();
+      for (const transfer of moving) {
+        const quiet = (now - transfer.lastAt) / 1000;
+        if (quiet < 1.5) continue;
+        transfer.rate = smoothRate(transfer.rate, 0, quiet);
+        transfer.lastAt = now;
+        if (transfer.rate < 1) transfer.rate = 0;
+        drawUpload(transfer);
+      }
+      drawQueue();
+    }, 1000);
+  }
+
+  /** Sends one queued transfer.
    *
    *  **The `File` is handed to the request as its body and is never read.** A
    *  five-gigabyte file has no business in this page's heap: `xhr.send(file)`
@@ -4185,41 +5073,35 @@ function boot() {
    *  `file.arrayBuffer()` would put the whole thing in memory to no purpose at
    *  all — on a phone it would simply crash the tab.
    *
+   *  **`XMLHttpRequest`, in a file that otherwise uses `fetch` everywhere.**
+   *  That is not legacy and it is not an oversight: `fetch` has no upload
+   *  progress. It resolves once, when the response arrives, and a request body
+   *  that is a five-gigabyte file is a promise that stays pending for twenty
+   *  minutes with nothing to show. The streaming-request half of the platform
+   *  (`duplex: "half"`) would give progress, and it is HTTP/2-only in every
+   *  shipping browser — this console is reached over a tunnel to a box that
+   *  serves HTTP/1.1, so it would silently never apply. `xhr.upload.onprogress`
+   *  is the only thing here that actually reports bytes leaving the machine.
+   *
    *  `?replace=0` is deliberate: a drag onto a folder must not destroy a file
    *  that is already in it. The `409` that answers a collision is offered back
    *  to the operator as a REPLACE button, which is a decision rather than an
    *  accident. */
-  function startUpload(file, replace) {
-    const share = state.share;
-    const directory = state.dir;
-    const path = joinPath(directory, file.name);
-    const transfer = {
-      id: (uploadSerial += 1),
-      name: file.name,
-      share,
-      directory,
-      size: file.size,
-      sent: 0,
-      startedAt: Date.now(),
-      rate: 0,
-      state: "sending",
-      note: "",
-      file,
-      request: null,
-    };
-    uploads.push(transfer);
-    if (!share || path === null) {
-      transfer.state = "refused";
-      transfer.note = "this name cannot be addressed over HTTP — a slash or a backslash in it means "
-        + "no URL names this file; copy it in over SMB or rename it at the machine";
-      renderUploads();
-      return;
-    }
-
+  function beginUpload(transfer) {
+    const path = joinPath(transfer.directory, transfer.name);
+    if (!transfer.share || path === null) return;
     const request = new XMLHttpRequest();
     transfer.request = request;
-    const query = replace ? "" : "?replace=0";
-    request.open("PUT", `/api/storage/blob/${share}/${urlPath(path)}${query}`, true);
+    transfer.state = "sending";
+    transfer.startedAt = Date.now();
+    transfer.lastAt = transfer.startedAt;
+    transfer.lastSent = 0;
+    transfer.sent = 0;
+    transfer.rate = 0;
+    transfer.note = "";
+    transfer.ceiling = "";
+    const query = transfer.replace ? "" : "?replace=0";
+    request.open("PUT", `/api/storage/blob/${transfer.share}/${urlPath(path)}${query}`, true);
     // The same header every mutating request in this console carries: a page
     // that is not this one cannot set it, and the API refuses a non-GET without
     // it before it touches the store.
@@ -4227,10 +5109,18 @@ function boot() {
     request.setRequestHeader("Accept", "application/json");
     request.upload.addEventListener("progress", (event) => {
       if (!event.lengthComputable) return;
+      const now = Date.now();
+      const seconds = (now - transfer.lastAt) / 1000;
+      // Smoothed over a window rather than averaged from the start, so the
+      // reading follows a link that slows down instead of quoting the average
+      // of one that used to be fast. `smoothRate` is where that lives, and it
+      // is a table test.
+      transfer.rate = smoothRate(transfer.rate, event.loaded - transfer.lastSent, seconds);
+      transfer.lastAt = now;
+      transfer.lastSent = event.loaded;
       transfer.sent = event.loaded;
-      const elapsed = (Date.now() - transfer.startedAt) / 1000;
-      transfer.rate = elapsed > 0.4 ? event.loaded / elapsed : 0;
       drawUpload(transfer);
+      drawQueue();
     });
     request.addEventListener("load", () => {
       let body = null;
@@ -4240,38 +5130,235 @@ function boot() {
         transfer.state = "done";
         transfer.sent = transfer.size;
         transfer.note = "";
+        transfer.ceiling = "";
         if (transfer.share === state.share && transfer.directory === state.dir) refreshListing();
         refreshShares();
       } else if (request.status === 409) {
         transfer.state = "collided";
+        transfer.ceiling = uploadCeiling(request.status, body);
         transfer.note = refusalText(request.status, body);
       } else {
         transfer.state = "refused";
+        // The ceiling is the word above the sentence; the sentence is the
+        // server's own. Neither replaces the other — see `uploadCeiling`.
+        transfer.ceiling = uploadCeiling(request.status, body);
         transfer.note = refusalText(request.status, body);
       }
       drawUpload(transfer);
+      pumpUploads();
     });
     request.addEventListener("error", () => {
       transfer.state = "refused";
+      transfer.ceiling = uploadCeiling(0, null);
       transfer.note = refusalText(0, null);
       drawUpload(transfer);
+      pumpUploads();
     });
     request.addEventListener("abort", () => {
       transfer.state = "cancelled";
+      transfer.ceiling = "";
       transfer.note = "cancelled";
       drawUpload(transfer);
+      pumpUploads();
     });
-    request.send(file);
-    renderUploads();
+    request.send(transfer.file);
   }
 
+  /** Queues a set of plain files into the directory on screen. */
   function startUploads(files) {
     if (!state.share) return;
     if (!shareWritable()) {
       notify("problem", "this share is read-only for you");
       return;
     }
-    for (const file of files) startUpload(file, false);
+    for (const file of files) enqueueUpload(file, state.dir, false);
+    pumpUploads();
+  }
+
+  /** Queues files that arrived with a relative path — the `webkitdirectory`
+   *  input, whose `File`s carry `webkitRelativePath` and nothing else about the
+   *  tree they came from. */
+  async function startFolderUpload(files) {
+    if (!state.share || !shareWritable()) {
+      notify("problem", "this share is read-only for you");
+      return;
+    }
+    const made = new Set();
+    for (const file of files) {
+      const relative = String(file.webkitRelativePath || "");
+      const parts = relative.split("/").filter((part) => part !== "" && part !== ".");
+      parts.pop();
+      let directory = state.dir;
+      let usable = true;
+      for (const part of parts) {
+        const next = joinPath(directory, part);
+        if (next === null) { usable = false; break; }
+        directory = next;
+        if (!made.has(directory)) {
+          made.add(directory);
+          // Serialised on purpose: a child cannot be created before its parent,
+          // and this is the one place in the plate where request order is part
+          // of the meaning.
+          // eslint-disable-next-line no-await-in-loop
+          if (!await ensureDirectory(directory)) { usable = false; break; }
+        }
+      }
+      if (!usable) {
+        const transfer = enqueueUpload(file, state.dir, false);
+        refuseTransfer(transfer, "UNADDRESSABLE",
+          `the folder ${relative} holds a name no URL can carry; copy it in over SMB instead`);
+        continue;
+      }
+      enqueueUpload(file, directory, false);
+    }
+    pumpUploads();
+  }
+
+  /** Creates one directory, treating "it is already there" as success.
+   *
+   *  A folder upload walks a tree that partly exists — the second drop of the
+   *  same folder is the ordinary case, not the error case — so an `occupied`
+   *  is what a caller wanted rather than what it feared. */
+  async function ensureDirectory(path) {
+    let reply;
+    try { reply = await api(`/api/storage/shares/${state.share}/mkdir`, { method: "POST", body: { path } }); }
+    catch { return false; }
+    if (reply.status === 401) { toLogin(); return false; }
+    if (reply.status >= 200 && reply.status < 300) { treeChildren.delete(parentPath(path)); return true; }
+    const tag = reply.body && typeof reply.body.error === "string" ? reply.body.error : "";
+    if (reply.status === 409 && (tag === "occupied" || tag === "collides")) return true;
+    notify("problem", refusalText(reply.status, reply.body));
+    return false;
+  }
+
+  /** Walks what was dropped, when the browser will say what it was.
+   *
+   *  `webkitGetAsEntry` is the only way to tell a dropped *folder* from a
+   *  dropped file: `dataTransfer.files` reports a directory as a zero-byte
+   *  `File` with the folder's name, which uploaded is a zero-byte file where a
+   *  folder should be — silent, plausible, and wrong. The entries must be taken
+   *  synchronously in the drop handler, before the first `await`, because the
+   *  item list is emptied the moment the handler yields.
+   *
+   *  Non-standard and Firefox-shaped: the API is `webkitGetAsEntry` everywhere
+   *  including Firefox and Safari, which is why it is called by that name and
+   *  why the plain-file path below is still the fallback rather than dead code. */
+  function acceptDrop(dataTransfer) {
+    if (!state.share) return;
+    if (!shareWritable()) {
+      notify("problem", "this share is read-only for you");
+      return;
+    }
+    const roots = [];
+    const items = dataTransfer ? dataTransfer.items : null;
+    if (items) {
+      for (const item of Array.from(items)) {
+        if (typeof item.webkitGetAsEntry !== "function") continue;
+        const entry = item.webkitGetAsEntry();
+        if (entry) roots.push(entry);
+      }
+    }
+    if (roots.length > 0) {
+      walkDrop(roots, state.dir);
+      return;
+    }
+    const dropped = dataTransfer ? dataTransfer.files : null;
+    if (dropped && dropped.length > 0) startUploads(Array.from(dropped));
+  }
+
+  /** Queues a dropped tree, creating the folders as it goes. */
+  async function walkDrop(entries, directory) {
+    for (const entry of entries) {
+      if (entry.isFile) {
+        // eslint-disable-next-line no-await-in-loop
+        const file = await fileOfEntry(entry);
+        if (file) enqueueUpload(file, directory, false);
+        else notify("problem", `${entry.name} could not be read from the drop`);
+        continue;
+      }
+      if (!entry.isDirectory) continue;
+      const child = joinPath(directory, entry.name);
+      if (child === null) {
+        notify("problem", `${entry.name} holds a name no URL can carry; copy it in over SMB instead`);
+        continue;
+      }
+      // eslint-disable-next-line no-await-in-loop
+      if (!await ensureDirectory(child)) continue;
+      // eslint-disable-next-line no-await-in-loop
+      await walkDrop(await readEntries(entry), child);
+    }
+    pumpUploads();
+    refreshListing();
+    refreshTree();
+  }
+
+  function fileOfEntry(entry) {
+    return new Promise((resolve) => {
+      try { entry.file((file) => resolve(file), () => resolve(null)); }
+      catch { resolve(null); }
+    });
+  }
+
+  /** Every child of a directory entry.
+   *
+   *  `readEntries` answers in batches and signals the end with an empty one —
+   *  a caller that reads once gets the first hundred children and silently
+   *  loses the rest, which on a photo library is most of it. */
+  function readEntries(entry) {
+    return new Promise((resolve) => {
+      const reader = entry.createReader();
+      const found = [];
+      const step = () => {
+        reader.readEntries((batch) => {
+          if (!batch || batch.length === 0) { resolve(found); return; }
+          found.push(...batch);
+          step();
+        }, () => resolve(found));
+      };
+      try { step(); } catch { resolve(found); }
+    });
+  }
+
+  /** Cancels one transfer, whether it has started or not. */
+  function cancelUpload(transfer) {
+    if (transfer.state === "queued") {
+      transfer.state = "cancelled";
+      transfer.note = "cancelled before it started";
+      drawUpload(transfer);
+      renderUploads();
+      return;
+    }
+    if (transfer.state === "sending" && transfer.request) {
+      try { transfer.request.abort(); } catch { /* already finished */ }
+    }
+  }
+
+  /** Cancels everything still to come. Deliberately not a clear: a cancelled
+   *  row stays on screen with its reason, because "I stopped that" is a fact
+   *  worth being able to read afterwards. */
+  function cancelAllUploads() {
+    for (const transfer of uploads.slice()) {
+      if (transferLive(transfer.state)) cancelUpload(transfer);
+    }
+    renderUploads();
+  }
+
+  /** Puts one finished-badly transfer back in the queue, alone.
+   *
+   *  The whole batch is not restarted and the row is not rebuilt: a retry is
+   *  one file going again, and everything else in the queue carries on
+   *  untouched around it. */
+  function retryUpload(transfer, replace) {
+    if (!transferRetryable(transfer.state)) return;
+    transfer.replace = Boolean(replace);
+    transfer.state = "queued";
+    transfer.sent = 0;
+    transfer.rate = 0;
+    transfer.note = "";
+    transfer.ceiling = "";
+    transfer.request = null;
+    drawUpload(transfer);
+    pumpUploads();
   }
 
   /** Cancels everything still moving. Called when the session ends, because an
@@ -4286,11 +5373,12 @@ function boot() {
     uploads.length = 0;
     for (const row of uploadRows.values()) row.remove();
     uploadRows.clear();
+    if (queueTimer !== null) { clearInterval(queueTimer); queueTimer = null; }
   }
 
   function clearFinishedUploads() {
     for (let at = uploads.length - 1; at >= 0; at -= 1) {
-      if (uploads[at].state === "sending") continue;
+      if (transferLive(uploads[at].state)) continue;
       const row = uploadRows.get(uploads[at].id);
       if (row) { row.remove(); uploadRows.delete(uploads[at].id); }
       uploads.splice(at, 1);
@@ -4319,7 +5407,7 @@ function boot() {
     renderShareCards();
     renderTree();
     renderCrumbs();
-    renderRows();
+    renderListing();
     renderUploads();
   }
 
@@ -4454,66 +5542,130 @@ function boot() {
     const writable = shareWritable();
     $("fs-mkdir").disabled = !writable;
     $("fs-upload").disabled = !writable;
+    $("fs-upload-folder").disabled = !writable;
+    renderActions();
   }
 
-  /** The listing.
+  /** The toolbar that acts on the selection.
+   *
+   *  **This is what makes the plate keyboard-complete.** The per-row buttons are
+   *  a pointer convenience and are out of the tab order on purpose — a hundred
+   *  rows with three tab stops each is a listing nobody can tab past. Every verb
+   *  they offer is here instead, acting on whatever is selected, reachable with
+   *  one Tab from the listing and disabled in words rather than silently
+   *  missing. */
+  function renderActions() {
+    const chosen = selectedEntries();
+    const writable = shareWritable();
+    const files = chosen.filter((entry) => entry.kind !== "directory");
+    $("fs-act-open").disabled = chosen.length !== 1;
+    $("fs-act-download").disabled = files.length !== 1 || files.length !== chosen.length;
+    $("fs-act-rename").disabled = !writable || chosen.length !== 1;
+    $("fs-act-move").disabled = !writable || chosen.length === 0;
+    $("fs-act-delete").disabled = !writable || chosen.length === 0;
+  }
+
+  /** The listing, in whichever of its two drawings is chosen.
    *
    *  Every cell here is `textContent` and every link is `urlPath`. The header of
-   *  this file says why at length; this is the function it was written about. */
-  function renderRows() {
+   *  this file says why at length; this is the function it was written about.
+   *
+   *  Two drawings, one model: the table and the grid select, open, drag, sort
+   *  and delete through exactly the same functions, and differ only in what
+   *  they paint. That is the whole reason the view is a toggle rather than a
+   *  second file manager — a grid that had its own selection code would have its
+   *  own selection bugs. */
+  function renderListing() {
     if (!rowsDirty) return;
     rowsDirty = false;
+    entryElements.clear();
     const body = $("fs-rows");
+    const grid = $("fs-grid");
     body.textContent = "";
+    grid.textContent = "";
     const empty = $("fs-empty");
+    empty.textContent = "";
     const listing = state.listing;
 
     if (!listing) {
       $("fs-table-wrap").hidden = true;
+      grid.hidden = true;
       empty.hidden = false;
-      empty.textContent = state.listingNote || "Reading…";
-      empty.className = state.listingNote ? "caption centered bad-ink" : "caption centered";
+      empty.className = state.listingNote ? "fs-empty bad-ink" : "fs-empty";
+      empty.append(furnishedEmpty(state.listingNote || "Reading…", ""));
+      renderSelectionNote();
       return;
     }
-    $("fs-table-wrap").hidden = false;
-    empty.hidden = listing.entries.length > 0;
-    empty.className = "caption centered";
-    empty.textContent = shareWritable()
-      ? "This folder is empty. Drop files on it, or make one inside it."
-      : "This folder is empty.";
 
-    for (const entry of sortEntries(listing.entries, sortColumn, sortAscending)) {
-      body.append(entryRow(entry));
+    const entries = visibleEntries();
+    const showGrid = viewMode === "grid";
+    $("fs-table-wrap").hidden = showGrid || entries.length === 0;
+    grid.hidden = !showGrid || entries.length === 0;
+    empty.hidden = entries.length > 0;
+    empty.className = "fs-empty";
+    if (entries.length === 0) {
+      // Furnished, not blank: an empty folder is a place to put something, and
+      // the console says what the two ways of doing that are.
+      empty.append(furnishedEmpty(
+        "This folder is empty.",
+        shareWritable()
+          ? "Drop files or a folder here, or make one inside it."
+          : "This share is read-only for you."));
     }
+
+    for (const entry of entries) {
+      if (showGrid) grid.append(entryTile(entry));
+      else body.append(entryRow(entry));
+    }
+    measureGrid();
+    paintSelection();
+  }
+
+  /** An empty state with something in it: the reticle this console uses
+   *  everywhere for "nothing here, and that is a state rather than a fault",
+   *  the sentence, and what to do about it. */
+  function furnishedEmpty(sentence, guidance) {
+    const holder = document.createElement("div");
+    holder.className = "emptybox";
+    const reticle = document.createElement("span");
+    reticle.className = "reticle";
+    const dot = document.createElement("span");
+    dot.className = "dot";
+    reticle.append(dot);
+    const line = document.createElement("p");
+    line.className = "caption centered";
+    line.textContent = sentence;
+    holder.append(reticle, line);
+    if (guidance) {
+      const hint = document.createElement("p");
+      hint.className = "caption centered dim";
+      hint.textContent = guidance;
+      holder.append(hint);
+    }
+    return holder;
+  }
+
+  /** Whether an entry can be addressed at all. An unreachable name has no URL,
+   *  so it can be shown and nothing else — it is not selectable, because every
+   *  verb the selection offers would be a request that cannot be built. */
+  function entryReachable(entry) {
+    return entry.reachable !== false && joinPath(state.dir, entry.name) !== null;
   }
 
   function entryRow(entry) {
     const row = document.createElement("tr");
     const directory = entry.kind === "directory";
-    const reachable = entry.reachable !== false && joinPath(state.dir, entry.name) !== null;
+    const reachable = entryReachable(entry);
+    row.className = "entryrow";
     if (!reachable) row.classList.add("unreachable");
 
     const nameCell = document.createElement("td");
     const holder = document.createElement("span");
     holder.className = "entryname";
-    const glyph = document.createElement("span");
-    glyph.className = "glyph";
-    glyph.textContent = directory ? "▣" : "▢";
-    holder.append(glyph);
+    holder.append(kindIcon(fileKind(entry.name, entry.kind), "small"));
 
     if (renaming === entry.name) {
-      const field = document.createElement("input");
-      field.className = "label mono";
-      field.value = entry.name;
-      field.spellcheck = false;
-      field.setAttribute("aria-label", "New name");
-      field.addEventListener("keydown", (event) => {
-        if (event.key === "Enter") { event.preventDefault(); renameEntry(entry, field.value.trim()); }
-        else if (event.key === "Escape") { event.preventDefault(); renaming = null; rowsDirty = true; render(); }
-      });
-      holder.append(field);
-      // Focus after the row is in the document, which it is not yet.
-      setTimeout(() => { field.focus(); field.select(); }, 0);
+      holder.append(renameField(entry));
     } else if (!reachable) {
       const label = document.createElement("span");
       label.className = "label";
@@ -4522,11 +5674,9 @@ function boot() {
         ? `unreachable over HTTP: ${entry.blockedReason}` : "unreachable over HTTP";
       holder.append(label);
     } else if (directory) {
-      const label = document.createElement("button");
-      label.type = "button";
+      const label = document.createElement("span");
       label.className = "label";
       label.textContent = entry.name;
-      label.addEventListener("click", () => openDirectory(joinPath(state.dir, entry.name)));
       holder.append(label);
     } else {
       const label = document.createElement("a");
@@ -4534,8 +5684,14 @@ function boot() {
       label.textContent = entry.name;
       // Straight at the bulk route, so the browser streams it through the
       // Range machinery and a paused download resumes rather than restarting.
+      // Out of the tab order — the row is the tab stop — but still a real
+      // anchor, so the browser's own "save linked file" menu works on it.
       label.href = `/api/storage/blob/${state.share}/${urlPath(joinPath(state.dir, entry.name))}`;
       label.setAttribute("download", entry.name);
+      label.tabIndex = -1;
+      // A single click selects; it does not open. Opening is the double click,
+      // exactly as it is on a desktop, and the anchor must not race it.
+      label.addEventListener("click", (event) => event.preventDefault());
       holder.append(label);
     }
     nameCell.append(holder);
@@ -4551,39 +5707,150 @@ function boot() {
     const toolCell = document.createElement("td");
     const tools = document.createElement("span");
     tools.className = "rowtools";
-    if (reachable && renaming !== entry.name) {
-      if (shareWritable()) {
-        tools.append(rowButton("RENAME", "ghost", () => {
-          closeStorageForms();
-          renaming = entry.name;
-          rowsDirty = true;
-          render();
-        }));
-        tools.append(rowButton("MOVE", "ghost", () => openMove(entry)));
-        tools.append(rowButton("DELETE", "danger", () => armDelete(entry)));
-      }
+    if (reachable && renaming !== entry.name && shareWritable()) {
+      tools.append(rowButton("RENAME", "ghost", () => beginRename(entry)));
+      tools.append(rowButton("MOVE", "ghost", () => openMove([entry])));
+      tools.append(rowButton("DELETE", "danger", () => armDelete([entry])));
     }
     toolCell.append(tools);
 
     row.append(nameCell, sizeCell, whenCell, toolCell);
+    wireEntry(row, entry, reachable);
+    return row;
+  }
 
-    if (reachable && shareWritable()) {
-      row.draggable = true;
-      row.addEventListener("dragstart", (event) => {
-        dragged = { share: state.share, directory: state.dir, entry };
-        row.classList.add("dragging");
+  /** One tile in the grid. Same model, same handlers, a different drawing. */
+  function entryTile(entry) {
+    const tile = document.createElement("div");
+    const reachable = entryReachable(entry);
+    tile.className = "tile";
+    if (!reachable) tile.classList.add("unreachable");
+
+    const art = document.createElement("span");
+    art.className = "tileart";
+    art.append(kindIcon(fileKind(entry.name, entry.kind), "large"));
+
+    const name = document.createElement("span");
+    name.className = "tilename";
+    if (renaming === entry.name) {
+      name.append(renameField(entry));
+    } else {
+      name.textContent = entry.name;
+      name.title = entry.name;
+    }
+
+    const meta = document.createElement("span");
+    meta.className = "tilemeta mono";
+    // One line, and it is the column being sorted by.
+    //
+    // A tile is 112 pixels wide and "278 kB · 2026-08-15 14:55" is not: it
+    // wraps to two lines, and a grid whose rows are different heights because
+    // some names are longer than others is a grid that reads as broken. So the
+    // tile shows the fact the listing is currently ordered by — which is also
+    // the fact the operator asked to see when they chose that sort — and the
+    // other one is one click away in the list.
+    meta.textContent = sortColumn === "modified"
+      ? whenText(entry.modified)
+      : entry.kind === "directory" ? "folder" : sizeText(entry.size);
+    tile.title = entry.kind === "directory"
+      ? `${entry.name} · ${whenText(entry.modified)}`
+      : `${entry.name} · ${sizeText(entry.size)} · ${whenText(entry.modified)}`;
+
+    tile.append(art, name, meta);
+    wireEntry(tile, entry, reachable);
+    return tile;
+  }
+
+  /** The rename field, shared by both drawings. */
+  function renameField(entry) {
+    const field = document.createElement("input");
+    field.className = "label mono";
+    field.value = entry.name;
+    field.spellcheck = false;
+    field.setAttribute("aria-label", "New name");
+    field.addEventListener("click", (event) => event.stopPropagation());
+    field.addEventListener("keydown", (event) => {
+      event.stopPropagation();
+      if (event.key === "Enter") { event.preventDefault(); renameEntry(entry, field.value.trim()); }
+      else if (event.key === "Escape") { event.preventDefault(); renaming = null; rowsDirty = true; render(); }
+    });
+    // Focus after the row is in the document, which it is not yet.
+    setTimeout(() => { field.focus(); field.select(); }, 0);
+    return field;
+  }
+
+  /** Everything a selectable, openable, draggable entry does — attached to a
+   *  table row and to a grid tile alike.
+   *
+   *  The element carries `aria-selected` and a roving `tabindex`, and its
+   *  selected state and its focus state are drawn differently on purpose: a
+   *  tinted row says "this is what a command will act on" and a ring says "this
+   *  is where the keyboard is", and they are not the same claim. */
+  function wireEntry(element, entry, reachable) {
+    element.setAttribute("role", viewMode === "grid" ? "option" : "row");
+    if (!reachable) {
+      element.setAttribute("aria-disabled", "true");
+      element.tabIndex = -1;
+      return;
+    }
+    element.tabIndex = -1;
+    element.setAttribute("aria-selected", "false");
+    entryElements.set(entry.name, element);
+
+    element.addEventListener("click", (event) => {
+      if (event.target instanceof Element && event.target.closest(".rowtools")) return;
+      clickSelect(entry.name, event);
+    });
+    element.addEventListener("dblclick", (event) => {
+      if (event.target instanceof Element && event.target.closest(".rowtools")) return;
+      event.preventDefault();
+      openEntry(entry);
+    });
+    element.addEventListener("focus", () => {
+      if (cursorName !== entry.name) { cursorName = entry.name; paintSelection(); }
+    });
+
+    if (shareWritable()) {
+      element.draggable = true;
+      element.addEventListener("dragstart", (event) => {
+        // Dragging something outside the selection makes it the selection
+        // first, which is what every file manager does and the only reading
+        // that cannot surprise: a drag never moves a file the operator had
+        // forgotten was still selected somewhere off screen.
+        if (!selection.has(entry.name)) selectOnly(entry.name);
+        dragged = { share: state.share, directory: state.dir, entries: selectedEntries() };
+        for (const name of selection) {
+          const held = entryElements.get(name);
+          if (held) held.classList.add("dragging");
+        }
         if (event.dataTransfer) {
           event.dataTransfer.effectAllowed = "move";
           // A payload is set because a drag with none is refused outright by
           // some browsers; nothing ever reads it back, because the source is
           // this page and `dragged` already holds it.
-          event.dataTransfer.setData("text/plain", entry.name);
+          event.dataTransfer.setData("text/plain", dragged.entries.map((one) => one.name).join("\n"));
         }
       });
-      row.addEventListener("dragend", () => { dragged = null; row.classList.remove("dragging"); });
+      element.addEventListener("dragend", () => {
+        dragged = null;
+        for (const held of entryElements.values()) held.classList.remove("dragging");
+      });
     }
-    if (directory && reachable) makeDropTarget(row, () => joinPath(state.dir, entry.name));
-    return row;
+    if (entry.kind === "directory") makeDropTarget(element, () => joinPath(state.dir, entry.name));
+  }
+
+  /** How many tiles fit across, read off the layout the browser actually chose.
+   *
+   *  Asked of `grid-template-columns` rather than computed from a tile width,
+   *  because the grid is `auto-fill` and the browser is the only thing that
+   *  knows how many it fitted. The arrow keys are wrong the moment this is a
+   *  guess. */
+  function measureGrid() {
+    if (viewMode !== "grid") { gridColumnCount = 1; return; }
+    const grid = $("fs-grid");
+    const columns = window.getComputedStyle(grid).gridTemplateColumns;
+    const counted = columns && columns !== "none" ? columns.split(" ").filter(Boolean).length : 1;
+    gridColumnCount = Math.max(1, counted);
   }
 
   function rowButton(text, kind, act) {
@@ -4591,8 +5858,50 @@ function boot() {
     button.type = "button";
     button.className = `btn ${kind} small`;
     button.textContent = text;
-    button.addEventListener("click", act);
+    // Out of the tab order on purpose: the same verbs are on the selection
+    // toolbar, which is one tab stop rather than three per row.
+    button.tabIndex = -1;
+    button.addEventListener("click", (event) => { event.stopPropagation(); act(); });
     return button;
+  }
+
+  /** The file-type icons, drawn rather than fetched.
+   *
+   *  Inline SVG, built node by node through `createElementNS`. Not a choice of
+   *  style: this page's CSP is `default-src 'none'` with `img-src 'self'` and no
+   *  `data:`, so an icon font, a sprite sheet and a data-URI are all requests
+   *  that would simply not load — and the console ships as three files with no
+   *  build step, so there is nowhere for a sprite to live anyway. Every path
+   *  here is on a 24-unit grid and inherits `currentColor`, so an icon in a
+   *  selected row is the selected row's ink without a second rule. */
+  const ICON_PATHS = {
+    folder: ["M3 6h6l2 2.5h10V19H3z"],
+    image: ["M3 5h18v14H3z", "M3 15l5-4 4 3 3.5-3L21 15"],
+    video: ["M3 5h18v14H3z", "M10 9l5 3-5 3z"],
+    audio: ["M9 17V6l9-2v11", "M6 17.5a3 1.5 0 106 0 3 1.5 0 10-6 0", "M15 15.5a3 1.5 0 106 0 3 1.5 0 10-6 0"],
+    archive: ["M4 4h16v16H4z", "M10 4v6", "M12 4v6", "M10 12h4v4h-4z"],
+    disk: ["M4 4h16v16H4z", "M12 8a4 4 0 100 8 4 4 0 100-8", "M12 11.5a0.5 0.5 0 100 1 0.5 0.5 0 100-1"],
+    code: ["M5 4h14v16H5z", "M9 10l-2 2 2 2", "M15 10l2 2-2 2"],
+    document: ["M6 3h8l4 4v14H6z", "M14 3v4h4", "M9 12h6", "M9 15h6"],
+    sheet: ["M5 4h14v16H5z", "M5 9h14", "M5 14h14", "M12 4v16"],
+    slides: ["M4 5h16v10H4z", "M12 15v4", "M8 19h8"],
+    secret: ["M12 3l7 3v6c0 4-3 6.5-7 9-4-2.5-7-5-7-9V6z", "M12 10a1.5 1.5 0 100 3 1.5 1.5 0 100-3", "M12 13v2.5"],
+    text: ["M6 3h8l4 4v14H6z", "M14 3v4h4", "M9 12h6", "M9 15h6", "M9 18h3"],
+    file: ["M6 3h8l4 4v14H6z", "M14 3v4h4"],
+  };
+
+  function kindIcon(kind, scale) {
+    const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+    svg.setAttribute("viewBox", "0 0 24 24");
+    svg.setAttribute("class", `icon icon-${scale} kind-${kind}`);
+    svg.setAttribute("aria-hidden", "true");
+    svg.setAttribute("focusable", "false");
+    for (const shape of ICON_PATHS[kind] || ICON_PATHS.file) {
+      const path = document.createElementNS("http://www.w3.org/2000/svg", "path");
+      path.setAttribute("d", shape);
+      svg.append(path);
+    }
+    return svg;
   }
 
   /** What is being dragged inside this page, or null. Held here rather than
@@ -4601,7 +5910,7 @@ function boot() {
    *  must decide whether it wants the drop. */
   let dragged = null;
 
-  /** Makes an element accept an entry dragged from the listing. */
+  /** Makes an element accept entries dragged from the listing. */
   function makeDropTarget(element, destination) {
     element.addEventListener("dragover", (event) => {
       if (!dragged) return;
@@ -4620,17 +5929,25 @@ function boot() {
       dragged = null;
       if (into === null) return;
       // Dropping a folder into itself, or into where it already is, is not a
-      // move; it is the ordinary result of a slightly missed drag.
-      const self = joinPath(source.directory, source.entry.name);
-      if (self !== null && (into === self || into.startsWith(`${self}/`))) return;
-      moveEntry(source.entry, source.directory, source.share, into);
+      // move; it is the ordinary result of a slightly missed drag. Filtered per
+      // entry rather than refused wholesale, so dragging five files and the
+      // folder they are being dropped into moves the five.
+      const wanted = source.entries.filter((entry) => {
+        const self = joinPath(source.directory, entry.name);
+        return self === null || (into !== self && !into.startsWith(`${self}/`));
+      });
+      if (wanted.length === 0) return;
+      moveEntries(wanted, source.directory, source.share, into);
     });
   }
 
-  function openMove(entry) {
+  function openMove(entries) {
     closeStorageForms();
-    moving = entry;
-    $("fs-move-label").textContent = `Move ${entry.name} into`;
+    if (!entries || entries.length === 0) return;
+    moving = entries;
+    $("fs-move-label").textContent = entries.length === 1
+      ? `Move ${entries[0].name} into`
+      : `Move ${entries.length} items into`;
     const picker = $("fs-move-share");
     picker.textContent = "";
     for (const share of state.shares) {
@@ -4648,30 +5965,38 @@ function boot() {
 
   function commitMove() {
     if (!moving) return;
-    const entry = moving;
+    const entries = moving;
     const toShare = $("fs-move-share").value;
     const toDirectory = $("fs-move-path").value;
-    moveEntry(entry, state.dir, toShare, toDirectory);
+    moveEntries(entries, state.dir, toShare, toDirectory);
   }
 
-  /** Arms the delete. A directory goes depth-infinity, which is what the button
-   *  means to a person and what `DELETE` means in RFC 4918 — so, exactly like an
-   *  uninstall, it takes a typed name rather than a click. A single file is one
-   *  confirmation, because it is one thing and the operator can see which. */
-  function armDelete(entry) {
+  /** Arms the delete — arms it, and does not fire it.
+   *
+   *  A directory goes depth-infinity, which is what the button means to a
+   *  person and what `DELETE` means in RFC 4918 — so, exactly like an uninstall,
+   *  it takes a typed name rather than a click. A set holding one has no single
+   *  name to type, so the count is the token: a number the operator can only
+   *  know by having read the sentence. A selection of plain files is one
+   *  confirmation, because each is a thing they can see and none of them takes
+   *  anything else with it. `deleteGate` is that rule, and it is a table test.
+   *
+   *  Nothing in this plate deletes on a keystroke: pressing Delete arms this
+   *  bar, and the bar is what deletes. */
+  function armDelete(entries) {
     closeStorageForms();
-    condemned = entry;
-    const directory = entry.kind === "directory";
+    const gate = deleteGate(entries);
+    if (!gate) return;
+    condemned = { entries, token: gate.token };
     const bar = $("fs-confirm");
     const input = $("fs-confirm-input");
-    $("fs-confirm-label").textContent = directory
-      ? `Type ${entry.name} to delete this folder and everything inside it`
-      : `Delete ${entry.name}?`;
-    input.hidden = !directory;
+    $("fs-confirm-label").textContent = gate.label;
+    input.hidden = gate.token === null;
     input.value = "";
-    $("fs-confirm-go").disabled = directory;
+    $("fs-confirm-go").disabled = gate.token !== null;
     bar.hidden = false;
-    if (directory) input.focus();
+    if (gate.token !== null) input.focus();
+    else $("fs-confirm-go").focus();
   }
 
   /* ── the transfer log ─────────────────────────────────────────────── */
@@ -4680,21 +6005,45 @@ function boot() {
     const panel = $("fs-transfers");
     panel.hidden = uploads.length === 0;
     if (panel.hidden) return;
-    const active = uploads.filter((transfer) => transfer.state === "sending").length;
-    $("fs-transfer-count").textContent = active > 0
-      ? `${active} MOVING · ${uploads.length}` : String(uploads.length);
+    const reading = queueReading(uploads);
+    $("fs-transfer-count").textContent = reading.active > 0
+      ? `${reading.active} MOVING · ${reading.queued} QUEUED · ${uploads.length}`
+      : String(uploads.length);
+    $("fs-transfer-cancel").disabled = reading.active + reading.queued === 0;
+    $("fs-transfer-clear").disabled = uploads.every((transfer) => transferLive(transfer.state));
     const list = $("fs-uploads");
     for (const transfer of uploads) {
       if (!uploadRows.has(transfer.id)) list.append(buildUploadRow(transfer));
       drawUpload(transfer);
     }
+    drawQueue();
+  }
+
+  /** The whole batch as one bar and one line.
+   *
+   *  Separate from the per-file rows because they answer different questions,
+   *  and the batch's is the one an operator actually asks during a folder drop:
+   *  not "how is photo 214 doing" but "how long until I can close this". */
+  function drawQueue() {
+    const reading = queueReading(uploads);
+    const bar = $("fs-queue-bar");
+    const fill = bar.firstElementChild;
+    fill.style.width = `${Math.round(reading.fraction * 100)}%`;
+    bar.className = reading.active + reading.queued > 0 ? "bar"
+      : reading.failed > 0 ? "bar bad" : "bar done";
+    $("fs-queue-note").textContent = queueLine(reading);
   }
 
   function buildUploadRow(transfer) {
     const row = document.createElement("li");
     const name = document.createElement("span");
     name.className = "upname mono";
-    name.textContent = transfer.name;
+    name.textContent = transfer.directory === state.dir || transfer.directory === ""
+      ? transfer.name : `${transfer.directory}/${transfer.name}`;
+    name.title = name.textContent;
+    const ceiling = document.createElement("span");
+    ceiling.className = "upceiling";
+    ceiling.hidden = true;
     const note = document.createElement("span");
     note.className = "upnote";
     const rule = document.createElement("span");
@@ -4702,6 +6051,10 @@ function boot() {
     const action = document.createElement("button");
     action.type = "button";
     action.className = "btn ghost small";
+    const cancel = document.createElement("button");
+    cancel.type = "button";
+    cancel.className = "btn ghost small";
+    cancel.textContent = "CANCEL";
     const bar = document.createElement("span");
     bar.className = "bar";
     const fill = document.createElement("span");
@@ -4710,8 +6063,9 @@ function boot() {
     const line = document.createElement("span");
     line.className = "upline";
     line.append(bar);
-    row.append(name, note, rule, action, line);
+    row.append(name, ceiling, note, rule, action, cancel, line);
     action.addEventListener("click", () => actOnUpload(transfer));
+    cancel.addEventListener("click", () => cancelUpload(transfer));
     uploadRows.set(transfer.id, row);
     return row;
   }
@@ -4722,19 +6076,35 @@ function boot() {
   function drawUpload(transfer) {
     const row = uploadRows.get(transfer.id);
     if (!row) return;
-    const [, note, , action, line] = row.children;
+    const [, ceiling, note, , action, cancel, line] = row.children;
     const bar = line.firstElementChild;
     const fill = bar.firstElementChild;
     const fraction = transfer.size > 0 ? Math.min(1, transfer.sent / transfer.size) : 0;
+    ceiling.hidden = !transfer.ceiling;
+    ceiling.textContent = transfer.ceiling;
+    cancel.hidden = !transferLive(transfer.state);
+    row.className = `up-${transfer.state}`;
 
-    if (transfer.state === "sending") {
+    if (transfer.state === "queued") {
+      note.className = "upnote dim";
+      note.textContent = `queued · ${sizeText(transfer.size)}`;
+      bar.className = "bar queued";
+      fill.style.width = "0";
+      action.hidden = true;
+    } else if (transfer.state === "sending") {
       note.className = "upnote";
-      note.textContent = transferLine(transfer.sent, transfer.size, transfer.rate);
+      // The body being fully sent is not the file being stored. The last chunk
+      // leaves, and then the box writes it, fsyncs it and publishes it — which
+      // on a large file over a tunnel is a real wait, and a row still reading
+      // "100% · 8.00 MB/s" through it is a row claiming to be doing something
+      // it finished doing. So the two are said differently.
+      note.textContent = transfer.size > 0 && transfer.sent >= transfer.size
+        ? `all ${sizeText(transfer.size)} sent · waiting for the box to store it`
+        : transferLine(transfer.sent, transfer.size, transfer.rate,
+          etaSeconds(transfer.sent, transfer.size, transfer.rate));
       bar.className = "bar";
       fill.style.width = `${Math.round(fraction * 100)}%`;
-      action.textContent = "CANCEL";
-      action.hidden = false;
-      action.className = "btn ghost small";
+      action.hidden = true;
     } else if (transfer.state === "done") {
       note.className = "upnote";
       note.textContent = `sent · ${sizeText(transfer.size)}`;
@@ -4750,29 +6120,25 @@ function boot() {
       action.hidden = false;
       action.className = "btn small";
     } else {
-      note.className = "upnote bad-ink";
+      // Refused or cancelled. The ceiling chip beside the name says which
+      // ceiling; this says what the server said about it, in its own words.
+      note.className = transfer.state === "cancelled" ? "upnote dim" : "upnote bad-ink";
       note.textContent = transfer.note;
-      bar.className = "bar bad";
-      fill.style.width = "100%";
-      action.hidden = transfer.state === "cancelled";
+      bar.className = transfer.state === "cancelled" ? "bar queued" : "bar bad";
+      fill.style.width = transfer.state === "cancelled" ? `${Math.round(fraction * 100)}%` : "100%";
+      action.hidden = false;
       action.textContent = "RETRY";
       action.className = "btn ghost small";
     }
   }
 
+  /** The row's one button, whatever it currently is.
+   *
+   *  A retry keeps the row it had rather than making a new one: the queue is a
+   *  log of what was asked for, and a file that took three attempts is one line
+   *  that says so, not three lines that look like three files. */
   function actOnUpload(transfer) {
-    if (transfer.state === "sending") {
-      if (transfer.request) { try { transfer.request.abort(); } catch { /* already finished */ } }
-      return;
-    }
-    if (transfer.state === "collided" || transfer.state === "refused") {
-      const at = uploads.indexOf(transfer);
-      if (at >= 0) uploads.splice(at, 1);
-      const row = uploadRows.get(transfer.id);
-      if (row) { row.remove(); uploadRows.delete(transfer.id); }
-      startUpload(transfer.file, transfer.state === "collided");
-      renderUploads();
-    }
+    if (transferRetryable(transfer.state)) retryUpload(transfer, transfer.state === "collided");
   }
 
   /* ── the desktop plate ────────────────────────────────────────────── */
@@ -6600,12 +7966,13 @@ function boot() {
   });
 
   $("fs-confirm-input").addEventListener("input", () => {
-    $("fs-confirm-go").disabled = !condemned || $("fs-confirm-input").value !== condemned.name;
+    $("fs-confirm-go").disabled = !condemned || condemned.token === null
+      || $("fs-confirm-input").value !== condemned.token;
   });
   $("fs-confirm-go").addEventListener("click", () => {
     if (!condemned) return;
-    if (condemned.kind === "directory" && $("fs-confirm-input").value !== condemned.name) return;
-    deleteEntry(condemned);
+    if (condemned.token !== null && $("fs-confirm-input").value !== condemned.token) return;
+    deleteEntries(condemned.entries);
   });
   $("fs-confirm-cancel").addEventListener("click", () => { closeStorageForms(); render(); });
 
@@ -6616,23 +7983,208 @@ function boot() {
     // Cleared so that choosing the same file twice in a row still fires.
     $("fs-file").value = "";
   });
+  $("fs-upload-folder").addEventListener("click", () => $("fs-folder").click());
+  $("fs-folder").addEventListener("change", () => {
+    const chosen = $("fs-folder").files;
+    if (chosen && chosen.length > 0) startFolderUpload(Array.from(chosen));
+    $("fs-folder").value = "";
+  });
   $("fs-transfer-clear").addEventListener("click", clearFinishedUploads);
+  $("fs-transfer-cancel").addEventListener("click", cancelAllUploads);
+
+  /* The selection's own verbs. Every one of them is on the toolbar as well as
+     on a row, because a row's buttons are a pointer affordance and the toolbar
+     is the keyboard's. */
+  $("fs-act-open").addEventListener("click", () => {
+    const chosen = selectedEntries();
+    if (chosen.length === 1) openEntry(chosen[0]);
+  });
+  $("fs-act-download").addEventListener("click", () => {
+    for (const entry of selectedEntries()) {
+      if (entry.kind !== "directory") openEntry(entry);
+    }
+  });
+  $("fs-act-rename").addEventListener("click", () => {
+    const chosen = selectedEntries();
+    if (chosen.length === 1) beginRename(chosen[0]);
+  });
+  $("fs-act-move").addEventListener("click", () => openMove(selectedEntries()));
+  $("fs-act-delete").addEventListener("click", () => armDelete(selectedEntries()));
+
+  /* The two drawings of one listing. The choice is the operator's and it is
+     remembered on this machine; a browser with no storage at all (a locked-down
+     profile, private mode in some builds) simply gets the list every time,
+     which is the view that works at any width. */
+  function chooseView(mode) {
+    viewMode = storedView(mode);
+    try { window.localStorage.setItem(VIEW_KEY, viewMode); } catch { /* no storage, no memory */ }
+    $("fs-view-list").setAttribute("aria-pressed", viewMode === "list" ? "true" : "false");
+    $("fs-view-grid").setAttribute("aria-pressed", viewMode === "grid" ? "true" : "false");
+    $("fs-gridsort").hidden = viewMode !== "grid";
+    rowsDirty = true;
+    render();
+  }
+  $("fs-view-list").addEventListener("click", () => chooseView("list"));
+  $("fs-view-grid").addEventListener("click", () => chooseView("grid"));
 
   // The sort belongs to the operator: the server answers in its own display
-  // order and this re-sorts what arrived rather than asking for it again.
-  for (const [id, column] of [["fs-sort-name", "name"], ["fs-sort-size", "size"], ["fs-sort-modified", "modified"]]) {
-    $(id).addEventListener("click", () => {
-      if (sortColumn === column) sortAscending = !sortAscending;
-      else { sortColumn = column; sortAscending = column === "name"; }
-      for (const other of ["fs-sort-name", "fs-sort-size", "fs-sort-modified"]) {
-        $(other).removeAttribute("aria-sort");
-      }
-      $(id).setAttribute("aria-sort", sortAscending ? "ascending" : "descending");
-      rowsDirty = true;
-      render();
+  // order and this re-sorts what arrived rather than asking for it again. It is
+  // remembered for the same reason the view is — a person who sorts by date has
+  // said something about how they work, not about this one folder.
+  const SORT_BUTTONS = [
+    ["fs-sort-name", "name"], ["fs-sort-size", "size"], ["fs-sort-modified", "modified"],
+    ["fs-gsort-name", "name"], ["fs-gsort-size", "size"], ["fs-gsort-modified", "modified"],
+  ];
+  function chooseSort(column, toggle) {
+    if (toggle && sortColumn === column) sortAscending = !sortAscending;
+    else if (sortColumn !== column) { sortColumn = column; sortAscending = column === "name"; }
+    try {
+      window.localStorage.setItem(SORT_KEY, `${sortColumn}:${sortAscending ? "asc" : "desc"}`);
+    } catch { /* no storage, no memory */ }
+    for (const [id, of] of SORT_BUTTONS) {
+      if (of === sortColumn) $(id).setAttribute("aria-sort", sortAscending ? "ascending" : "descending");
+      else $(id).removeAttribute("aria-sort");
+    }
+    rowsDirty = true;
+    render();
+  }
+  for (const [id, column] of SORT_BUTTONS) {
+    $(id).addEventListener("click", () => chooseSort(column, true));
+  }
+
+  /* What was remembered from last time, applied before the first listing is
+     drawn so the plate never flashes the other view on its way to this one. */
+  try {
+    viewMode = storedView(window.localStorage.getItem(VIEW_KEY));
+    const remembered = String(window.localStorage.getItem(SORT_KEY) || "").split(":");
+    if (["name", "size", "modified"].includes(remembered[0])) {
+      sortColumn = remembered[0];
+      sortAscending = remembered[1] !== "desc";
+    }
+  } catch { /* no storage, no memory */ }
+  chooseView(viewMode);
+  chooseSort(sortColumn, false);
+
+  /* The keyboard, on the listing.
+   *
+   *  Bound to the drop field rather than to each row, so it works whichever
+   *  view is drawn, survives a rebuild, and can be read in one place — which is
+   *  what a keyboard map has to be if it is to stay complete. Every binding
+   *  here has a pointer equivalent and vice versa; that is the rule the plate
+   *  is held to, not a coincidence. */
+  $("fs-drop").addEventListener("keydown", (event) => {
+    // A field inside the listing (the rename box) owns its own keys.
+    if (event.target instanceof Element
+      && (event.target.tagName === "INPUT" || event.target.tagName === "SELECT")) return;
+    const key = event.key;
+    if ((event.metaKey || event.ctrlKey) && (key === "a" || key === "A")) {
+      event.preventDefault();
+      selectAll();
+      paintSelection(true);
+      return;
+    }
+    if (["ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight", "Home", "End", "PageUp", "PageDown"].includes(key)) {
+      if (moveListingCursor(key, event)) { event.preventDefault(); paintSelection(true); }
+      return;
+    }
+    if (key === "Enter") {
+      event.preventDefault();
+      const chosen = selectedEntries();
+      openEntry(chosen.length === 1 ? chosen[0] : entryNamed(cursorName));
+      return;
+    }
+    if (key === " " && cursorName !== null) {
+      event.preventDefault();
+      toggleSelected(cursorName);
+      return;
+    }
+    // Delete, and cmd-Backspace — the Finder's own binding for the same thing.
+    // Both only *arm* the confirm bar; nothing here removes a file on a
+    // keystroke, which is the rule the whole plate is held to.
+    if (key === "Delete" || (key === "Backspace" && (event.metaKey || event.ctrlKey))) {
+      event.preventDefault();
+      if (shareWritable()) armDelete(selectedEntries());
+      return;
+    }
+    if (key === "Backspace") {
+      event.preventDefault();
+      if (state.dir !== "") openDirectory(parentPath(state.dir));
+      return;
+    }
+    if (key === "F2") {
+      event.preventDefault();
+      const chosen = selectedEntries();
+      if (shareWritable() && chosen.length === 1) beginRename(chosen[0]);
+      return;
+    }
+    if (key === "Escape") {
+      if (selection.size > 0) { event.preventDefault(); clearSelection(); paintSelection(); }
+    }
+  });
+
+  /* The marquee. A drag that starts on the field itself rather than on a row is
+     a rubber band; a drag that starts on a row is a move, and the two never
+     compete because the row's own `draggable` claims the pointer first. */
+  $("fs-drop").addEventListener("pointerdown", (event) => {
+    if (event.button !== 0) return;
+    if (event.target instanceof Element
+      && event.target.closest(".entryrow, .tile, button, a, input, select, #fs-veil")) return;
+    const field = $("fs-drop");
+    const box = field.getBoundingClientRect();
+    marquee = {
+      x: event.clientX - box.left + field.scrollLeft,
+      y: event.clientY - box.top + field.scrollTop,
+      base: Array.from(selection),
+      additive: event.shiftKey || event.metaKey || event.ctrlKey,
+      drawn: false,
+    };
+    field.setPointerCapture(event.pointerId);
+  });
+  $("fs-drop").addEventListener("pointermove", (event) => {
+    if (!marquee) return;
+    const field = $("fs-drop");
+    const box = field.getBoundingClientRect();
+    const at = {
+      x: event.clientX - box.left + field.scrollLeft,
+      y: event.clientY - box.top + field.scrollTop,
+    };
+    const rect = marqueeRect(marquee.x, marquee.y, at.x, at.y);
+    // A band under a few pixels is a click that wobbled, not a selection.
+    if (!marquee.drawn && rect.width < 4 && rect.height < 4) return;
+    marquee.drawn = true;
+    const band = $("fs-marquee");
+    band.hidden = false;
+    band.style.left = `${rect.left}px`;
+    band.style.top = `${rect.top}px`;
+    band.style.width = `${rect.width}px`;
+    band.style.height = `${rect.height}px`;
+    const touched = [];
+    for (const [name, element] of entryElements) {
+      const item = element.getBoundingClientRect();
+      const relative = {
+        left: item.left - box.left + field.scrollLeft,
+        top: item.top - box.top + field.scrollTop,
+        width: item.width,
+        height: item.height,
+      };
+      if (rectsMeet(rect, relative)) touched.push(name);
+    }
+    selection.clear();
+    for (const name of marqueeSelection(marquee.base, touched, marquee.additive)) selection.add(name);
+    paintSelection();
+  });
+  for (const ending of ["pointerup", "pointercancel"]) {
+    $("fs-drop").addEventListener(ending, (event) => {
+      if (!marquee) return;
+      // A band that was never drawn was a click on the background, and a click
+      // on the background clears the selection — which is how a desktop says
+      // "nothing".
+      if (!marquee.drawn && !marquee.additive) { clearSelection(); paintSelection(); }
+      marquee = null;
+      $("fs-marquee").hidden = true;
+      try { $("fs-drop").releasePointerCapture(event.pointerId); } catch { /* already gone */ }
     });
   }
-  $("fs-sort-name").setAttribute("aria-sort", "ascending");
 
   /* Drag and drop. Two entirely different drags land on the same field: files
      from the operating system, which are an upload, and a row from this
@@ -6642,16 +8194,34 @@ function boot() {
   const dropField = $("fs-drop");
   const carriesFiles = (event) => Boolean(event.dataTransfer)
     && Array.from(event.dataTransfer.types || []).includes("Files");
+
+  /** Raises the veil, in one of its two readings.
+   *
+   *  **A refused drop has to look refused while the file is still in the air.**
+   *  A read-only share that simply ignored the drag would let an operator drop
+   *  four gigabytes of holiday photographs onto a target that was never going
+   *  to take them, and find out afterwards — so the veil is raised either way
+   *  and says which one this is, with `dropEffect` set to match so the pointer
+   *  itself carries the same answer. */
+  function raiseVeil() {
+    const veil = $("fs-veil");
+    const writable = shareWritable();
+    veil.className = writable ? "" : "refuse";
+    veil.firstElementChild.textContent = writable
+      ? "RELEASE TO UPLOAD HERE"
+      : "THIS SHARE IS READ-ONLY FOR YOU";
+    veil.hidden = false;
+  }
   dropField.addEventListener("dragenter", (event) => {
-    if (!carriesFiles(event) || !shareWritable()) return;
+    if (!carriesFiles(event)) return;
     event.preventDefault();
     dropDepth += 1;
-    $("fs-veil").hidden = false;
+    raiseVeil();
   });
   dropField.addEventListener("dragover", (event) => {
-    if (!carriesFiles(event) || !shareWritable()) return;
+    if (!carriesFiles(event)) return;
     event.preventDefault();
-    if (event.dataTransfer) event.dataTransfer.dropEffect = "copy";
+    if (event.dataTransfer) event.dataTransfer.dropEffect = shareWritable() ? "copy" : "none";
   });
   dropField.addEventListener("dragleave", () => {
     if (dropDepth > 0) dropDepth -= 1;
@@ -6662,8 +8232,9 @@ function boot() {
     event.preventDefault();
     dropDepth = 0;
     $("fs-veil").hidden = true;
-    const dropped = event.dataTransfer ? event.dataTransfer.files : null;
-    if (dropped && dropped.length > 0) startUploads(Array.from(dropped));
+    // Synchronously, before any await: the item list is emptied the moment this
+    // handler yields, and with it every chance of telling a folder from a file.
+    acceptDrop(event.dataTransfer);
   });
   // A file dropped anywhere else on the page is the browser's default: it
   // navigates away from the console and opens the file. Refused everywhere,

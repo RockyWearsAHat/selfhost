@@ -63,7 +63,7 @@ Authentication is a bearer token in `data/admin.token`, mode `0600`, generated
 from the operating system's entropy and compared in constant time.
 
 The web console (the `console = true` site the proxy relays to this port) adds
-two browser credentials, both implemented in `crates/admin`: a cookie session
+two browser credentials, both implemented in `crates/app/admin`: a cookie session
 against the `console.passwd` PBKDF2 hash (`POST /api/session`), and passkeys —
 WebAuthn with Touch ID / Face ID / Windows Hello — under `/api/webauthn/*`,
 stored in `data/console.passkeys`. Passkeys are named per person, and a person's
@@ -251,7 +251,7 @@ daemon's key does not already reach.
 
 ## What a service is
 
-See [`selfhost_config::service`](../crates/config/src/service.rs) for the full
+See [`selfhost_config::service`](../crates/foundation/config/src/service.rs) for the full
 model. The parts that matter:
 
 - **`program` and `args`, not a command line.** A single string has to be
@@ -288,16 +288,15 @@ directly. Two crates, split by what they are about:
 
 | crate | what | `unsafe` | tests |
 |---|---|---|---|
-| `crates/rui` | The interface library: elements, style, layout, the rasteriser, the TrueType engine, text, animation, and the platform windows | confined to `shell/platform/` | 401 |
-| `crates/console` | The application: the client, the poller, and the views | **forbidden** | 110 |
+| `rui` | The interface library: elements, style, layout, the rasteriser, the TrueType engine, text, animation, and the platform windows | confined to `shell/platform/` | 401 |
+| `crates/ui/console` | The application: the client, the poller, and the views | **forbidden** | 110 |
 
 `rui` is not a selfhost component. It is a general interface library that this
 console happens to be the first program written in — it has no dependencies at
-all, knows nothing about services or daemons, and is documented on its own terms
-in [`crates/rui/README.md`](../crates/rui/README.md). It now lives in its own
-repository as well, at <https://github.com/RockyWearsAHat/rui>, which is where
-it is developed and where other projects take it from; this workspace still
-builds it from `crates/rui` by path. What follows here is what the *console*
+all, knows nothing about services or daemons. It lives in its own
+repository at <https://github.com/RockyWearsAHat/rui>, where it is developed and maintained.
+This workspace consumes it as a git dependency pinned to an exact revision.
+What follows here is what the *console*
 does with it, and why.
 
 Everything above the window is pure: it turns a font's bytes and a stream of
@@ -425,9 +424,9 @@ Three smaller things were making the same gesture cost more than it should:
 ### Text is rasterised here, not by the platform
 
 An earlier revision of this document planned to delegate text to Core Text,
-DirectWrite, and Xft. That is reversed: `crates/rui/src/font` parses the SFNT
+DirectWrite, and Xft. That is reversed: the `rui` library's font module parses the SFNT
 container, the character map, and TrueType outlines, and fills them with an
-analytic scanline rasteriser.
+analytic scanline rasteriser (see <https://github.com/RockyWearsAHat/rui>).
 
 The reason is what the alternative cost. Three separate bodies of
 foreign-function code, a link-time dependency on Linux, a text path that cannot
@@ -444,8 +443,8 @@ punctuation are correct, and are **kerned** — the pair adjustments in a face's
 a table lookup rather than the reordering engine shaping would need. Where text
 is *cut* — a caret, a wrapped line, an ellipsis — the unit is a grapheme
 cluster under a documented subset of UAX #29, so a letter is never separated
-from its accent; `crates/rui/src/text/grapheme.rs` states what that subset
-covers and what it does not. These are limits of the font engine and not of the
+from its accent. The `rui` library's text module documents what that subset
+covers and what it does not (see <https://github.com/RockyWearsAHat/rui>). These are limits of the font engine and not of the
 toolkit — `Font::parse` takes bytes, so a deployment needing more is a question
 of which file gets loaded.
 
@@ -511,7 +510,7 @@ behind it is that the interfaces which actually read as advanced — a surgical
 robot's console, a lab instrument's front panel — are not decorated at all.
 Futurism, done seriously, is precision: true black, structure in grey
 hairlines, right angles, and room. `THEATRE` in
-`crates/console/src/view/style.rs` is that palette, and three rules are the
+`crates/ui/console/src/view/style.rs` is that palette, and three rules are the
 whole design:
 
 - **The accent is light, not a hue.** The one accent is an off-white — the
@@ -559,7 +558,7 @@ Both halves of that are choices the seam exists for: `App::theme` takes a
 `Theme::with_palette` swaps the colours, and everything below reads whatever
 comes back — and `App::ground` hands over the bare window the same way, so an
 application can paint the surface its interface sits on without the library
-growing an opinion about rulers. `crates/console/src/view/style.rs` is where
+growing an opinion about rulers. `crates/ui/console/src/view/style.rs` is where
 the console spends all three — the palette, the corner, and the ground — and
 nothing else.
 
@@ -939,7 +938,7 @@ In the native console the same discipline is a type: a path is percent-encoded
 exactly once, by one function, and a share id is checked against the daemon's own
 grammar before it is put in a URL. The decisions themselves — quota readings,
 size and date text, sort order, breadcrumbs, the form's five refusals — are pure
-functions in `crates/console/src/nas.rs`, each one mirroring its named
+functions in `crates/ui/console/src/nas.rs`, each one mirroring its named
 counterpart in `sites/console/app.js` and asserted against it.
 
 ### DESKTOP
@@ -1093,14 +1092,14 @@ end.
 What neither can check is how the motion *feels*, which needs the window.
 Opening it on a Mac is the last step nobody has done since the change.
 
-**A drawing change is not on screen until `scripts/macos-app.sh install` has
+**A drawing change is not on screen until `scripts/macos/macos-app.sh install` has
 run.** The application in `/Applications` holds a copy of the binary, so
 rebuilding `target/release` does not change what the Dock launches, and a
 console left open goes on running the build it started from — an interface pass
 can be finished, tested, and still look untouched to the person it was for. The
 script quits the running console, force-closing one that will not go, replaces
 the bundle, and reopens it if it was open. Finish any session that touched
-`crates/rui` or `crates/console` with it.
+`crates/ui/console` with it (or modified the external `rui` repository at <https://github.com/RockyWearsAHat/rui>).
 
 **Compile-verified only.** The Windows and X11 backends type-check for
 `x86_64-pc-windows-gnu` and `x86_64-unknown-linux-gnu` but have never been run —
@@ -1108,7 +1107,7 @@ everything so far has been built and tested on a Mac. They are the first thing
 to exercise when the Windows machine arrives, and `cargo run -p rui --example
 counter` on each is the cheapest way to do it.
 
-**The desktop stream has never crossed a real socket.** `crates/console/src/
+**The desktop stream has never crossed a real socket.** `crates/ui/console/src/
 channel.rs` writes the RFC 6455 client handshake by hand, verifies the accept
 key, refuses a subprotocol it does not know, decodes masked frames, assembles
 tiles onto a surface and fits each completed frame on its own thread — all of it

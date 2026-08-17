@@ -80,7 +80,20 @@ $cmdLine = "/c `"`"$Python`" $pyArgs >> `"$logFile`" 2>&1`""
 $action  = New-ScheduledTaskAction -Execute "$env:SystemRoot\System32\cmd.exe" -Argument $cmdLine -WorkingDirectory $VpnDir
 $trigger = New-ScheduledTaskTrigger -AtStartup
 $principal = New-ScheduledTaskPrincipal -UserId 'SYSTEM' -LogonType ServiceAccount -RunLevel Highest
+# ExecutionTimeLimit of zero means *no limit*, and it is not a preference: leave
+# it out and Task Scheduler applies its own default of 72 hours and kills the
+# server three days after it starts, with the task still sitting in `Ready`. That
+# is what happened to `selfhost-lan-dns` on 2026-08-16, and this task is the same
+# shape of risk — a VPN killed every three days takes the admin console's only
+# reachable route with it.
+#
+# `selfhost service check` audits this task's settings against the one
+# authoritative statement of them (crates/app/cli/src/service_install.rs), and
+# the running daemon re-checks every six hours and repairs drift, whichever path
+# created the task. It never touches what the task *runs*: the action below
+# starts a Python program from another repository and is nobody else's business.
 $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries `
+  -StartWhenAvailable -MultipleInstances IgnoreNew `
   -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 1) -ExecutionTimeLimit ([TimeSpan]::Zero)
 
 Register-ScheduledTask -TaskName $taskName -Action $action -Trigger $trigger `

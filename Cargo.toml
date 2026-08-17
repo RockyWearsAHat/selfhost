@@ -1,31 +1,49 @@
 [workspace]
 resolver = "3"
+# The five layers are a dependency order, not a filing convention: a crate may
+# depend on its own layer and on the layers above it in this list, and never
+# downward. `cargo tree` is the check, and the arrangement was derived from the
+# real graph rather than chosen first — which is why `login` and `supervisor`
+# sit in foundation (they depend on nothing but `json`/`config`) and `proxy`
+# sits in app (it depends on `mail` and `admin`, so it is not a network crate
+# however much its name suggests one).
 members = [
-    "crates/acme",
-    "crates/admin",
-    "crates/app-deploy",
-    "crates/config",
-    "crates/desk",
-    "crates/dns",
-    "crates/identity",
-    "crates/igd",
-    "crates/login",
-    "crates/firewall",
-    "crates/git",
-    "crates/http",
-    "crates/json",
-    "crates/mail",
-    "crates/mesh",
-    "crates/proxy",
-    "crates/screen",
-    "crates/storage",
-    "crates/ws",
-    "crates/reports",
-    "crates/supervisor",
-    "crates/rui",
-    "crates/console",
-    "crates/vpn-ui",
-    "crates/cli",
+    # foundation — primitives. Nothing here reaches for a socket of its own.
+    "crates/foundation/json",
+    "crates/foundation/http",
+    "crates/foundation/config",
+    "crates/foundation/identity",
+    "crates/foundation/login",
+    "crates/foundation/supervisor",
+
+    # net — the wire. Protocols we own, byte for byte.
+    "crates/net/igd",
+    "crates/net/ws",
+    "crates/net/dns",
+    "crates/net/acme",
+    "crates/net/firewall",
+
+    # services — the capabilities a deployment actually offers.
+    "crates/services/desk",
+    "crates/services/screen",
+    "crates/services/mail",
+    "crates/services/mesh",
+    "crates/services/storage",
+    "crates/services/git",
+    "crates/services/reports",
+    "crates/services/app-deploy",
+    "crates/services/vpn",
+
+    # ui — the two apps. The toolkit they are written in, `rui`, is not here:
+    # it is its own project, consumed as a pinned git dependency below.
+    "crates/ui/console",
+    "crates/ui/vpn-ui",
+
+    # app — the top: the control API, the proxy that composes every service,
+    # and the one binary an operator runs.
+    "crates/app/admin",
+    "crates/app/proxy",
+    "crates/app/cli",
 ]
 
 [workspace.package]
@@ -37,12 +55,19 @@ repository = "https://github.com/RockyWearsAHat/selfhost"
 
 # Dependency policy
 # -----------------
-# Two categories of dependency are permitted, and nothing else:
+# Three categories of dependency are permitted, and nothing else:
 #
 #   1. Foundations — the async runtime and the TLS/crypto implementation. These
 #      sit at the same level as the standard library. Hand-writing cryptography
 #      would make this project less safe, not more independent.
 #   2. Serialisation of our own config format.
+#   3. Our own projects, by pinned revision. Today that is exactly one: `rui`,
+#      the interface library the two desktop applications are written in. It is
+#      not a third-party package — it is written here, in a separate repository,
+#      because nothing in it knows what selfhost is. Vendoring it by path was the
+#      alternative, and it produced two copies that drifted. A pin is not a
+#      loosening of this policy: it is the same rule applied to code that had
+#      been exempt from it by being copied instead of depended on.
 #
 # Everything above the socket is written here: HTTP parsing, the reverse proxy,
 # load balancing, health checking, Range handling, ACME, the DNS wire format,
@@ -69,28 +94,39 @@ webpki-roots = "1"
 serde = { version = "1", features = ["derive"] }
 toml = "0.8"
 
-selfhost-acme = { path = "crates/acme" }
-selfhost-admin = { path = "crates/admin" }
-selfhost-app-deploy = { path = "crates/app-deploy" }
-selfhost-config = { path = "crates/config" }
-selfhost-desk = { path = "crates/desk" }
-selfhost-dns = { path = "crates/dns" }
-selfhost-identity = { path = "crates/identity" }
-selfhost-igd = { path = "crates/igd" }
-selfhost-firewall = { path = "crates/firewall" }
-selfhost-git = { path = "crates/git" }
-selfhost-http = { path = "crates/http" }
-selfhost-json = { path = "crates/json" }
-selfhost-login = { path = "crates/login" }
-selfhost-mail = { path = "crates/mail" }
-selfhost-mesh = { path = "crates/mesh" }
-selfhost-proxy = { path = "crates/proxy" }
-selfhost-reports = { path = "crates/reports" }
-selfhost-screen = { path = "crates/screen" }
-selfhost-storage = { path = "crates/storage" }
-selfhost-supervisor = { path = "crates/supervisor" }
-selfhost-ws = { path = "crates/ws" }
-rui = { path = "crates/rui" }
+selfhost-acme = { path = "crates/net/acme" }
+selfhost-admin = { path = "crates/app/admin" }
+selfhost-app-deploy = { path = "crates/services/app-deploy" }
+selfhost-config = { path = "crates/foundation/config" }
+selfhost-desk = { path = "crates/services/desk" }
+selfhost-dns = { path = "crates/net/dns" }
+selfhost-identity = { path = "crates/foundation/identity" }
+selfhost-igd = { path = "crates/net/igd" }
+selfhost-firewall = { path = "crates/net/firewall" }
+selfhost-git = { path = "crates/services/git" }
+selfhost-http = { path = "crates/foundation/http" }
+selfhost-json = { path = "crates/foundation/json" }
+selfhost-login = { path = "crates/foundation/login" }
+selfhost-mail = { path = "crates/services/mail" }
+selfhost-mesh = { path = "crates/services/mesh" }
+selfhost-proxy = { path = "crates/app/proxy" }
+selfhost-reports = { path = "crates/services/reports" }
+selfhost-screen = { path = "crates/services/screen" }
+selfhost-storage = { path = "crates/services/storage" }
+selfhost-supervisor = { path = "crates/foundation/supervisor" }
+selfhost-vpn = { path = "crates/services/vpn" }
+selfhost-ws = { path = "crates/net/ws" }
+# rui is NOT part of this project. It is a zero-dependency interface library
+# with its own repository, nothing in it knows selfhost exists, and it was
+# vendored here by path until 2026-08-17 — which meant two copies that had to be
+# kept in step by hand, and which had silently drifted ~2,300 lines apart.
+#
+# Pinned to an exact revision rather than tracking `main` on purpose: the
+# production box self-updates from every push to this repository and rebuilds
+# unattended, so a moving dependency would let unreviewed interface changes onto
+# it without anyone deciding. Bumping `rev` is therefore a deliberate commit that
+# shows up in review, which is the whole point.
+rui = { git = "https://github.com/RockyWearsAHat/rui.git", rev = "80e3003563c26952e4d63c52d8eb8f5052cb463c" }
 
 # The release profile is what the self-updater rebuilds on every push, so its
 # job is to be *fast to rebuild*, not to squeeze the last percent of runtime
@@ -98,6 +134,23 @@ rui = { path = "crates/rui" }
 # binary from scratch on any change and was the bulk of each deploy's build
 # time; parallel codegen plus incremental reuse turns a push into a rebuild of
 # only what changed.
+# Editing rui while working here
+# ------------------------------
+# The pin above is what builds. To change rui itself, clone it beside this
+# repository and uncomment the two lines below — cargo then builds every `rui`
+# dependency from your working copy instead of the pinned revision, so an edit
+# is visible in `selfhost-console` immediately, with no commit and no bump:
+#
+#     git clone https://github.com/RockyWearsAHat/rui.git ../rui
+#
+# [patch."https://github.com/RockyWearsAHat/rui.git"]
+# rui = { path = "../rui" }
+#
+# Uncommented, this file no longer builds on a machine without `../rui` — which
+# includes the production box. So: uncomment to work, push the rui change to its
+# own repository, bump `rev` above, and re-comment before committing. Anything
+# else recreates the two-copies problem this replaced.
+
 [profile.release]
 opt-level = 3
 lto = false

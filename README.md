@@ -82,7 +82,7 @@ as separate capabilities and driving requiring a *fresh* credential). Neither
 binds a socket — the admin API is still loopback-only and the only public surface
 is still the proxy on 80/443. Neither has ever run on Windows: about nine
 thousand lines of Windows-only code type-check for `x86_64-pc-windows-gnu` and
-have never executed. `desktop-lab.dx` and `nas-lab.dx` carry the evidence,
+have never executed. `docs/labs/desktop-lab.dx` and `docs/labs/nas-lab.dx` carry the evidence,
 including what is unverified, and `docs/SECURITY.md` §3.7 is the specification
 they answer to.
 
@@ -113,37 +113,61 @@ fix — reverse DNS and the NAT in front of the router belong to the ISP, and
 
 ## Layout
 
+The five directories under `crates/` are a dependency order, not a filing
+convention: a crate may depend on its own layer and on the layers above it, and
+never downward. `docs/principles.dx` carries the check that proves it.
+
+One dependency of ours is deliberately **not** in this tree. `rui` — the
+declarative interface library both desktop applications are written in;
+elements, style, layout, rasteriser, TrueType engine, windows, no dependencies —
+is its own project at <https://github.com/RockyWearsAHat/rui>, because nothing in
+it knows what selfhost is. It is consumed as a git dependency pinned to an exact
+revision. It was vendored here by path until 2026-08-17, which meant two copies
+kept in step by hand; they had drifted about 2,300 lines apart. To change it,
+clone it beside this repository and uncomment the `[patch]` block in
+`Cargo.toml` — the instructions are there.
+
 ```
 crates/
-  http/     HTTP/1.1 parsing and serialisation. Pure, no I/O, no dependencies.
-  json/     JSON, for the control API.
-  ws/       RFC 6455 WebSockets. Binary frames only; five of six modules pure.
-  config/   Deployment config model and validation. The source of truth.
-  identity/ Who the caller is and what they may do. Sits below everything asking.
-  proxy/    TLS termination, static serving, reverse proxy, load balancing, and
-            the two loopback relays (/api/* and /dav).
-  mail/     Addresses and the SMTP session state machine.
-  dns/      DNS wire format, stub resolver, authoritative zones.
-  acme/     RFC 8555 certificate issuance. igd/ app-deploy/ alongside.
-  supervisor/ Runs services and keeps them running. firewall/ reconciles rules.
-  storage/  Shares: the confining resolver, WebDAV, quotas, and the OS's own
-            SMB server driven as a program.
-  desk/     The remote-desktop protocol. Pure; `unsafe_code = "forbid"`.
-  screen/   This machine's pixels and input devices. The FFI lives here.
-  mesh/     One outbound link carrying many channels. A worker dials; nothing
-            listens.
-  admin/    The loopback control API the console drives.
-  git/      Watches a branch and redeploys the service built from it.
-  rui/      `rui`: a declarative interface library — elements, style, layout,
-            rasteriser, TrueType engine, windows. No dependencies, and nothing
-            in it knows about selfhost. Its own repository is at
-            github.com/RockyWearsAHat/rui. See crates/rui/README.md.
-  console/  The `selfhost-console` desktop binary, written in `rui`.
-  vpn-ui/   SelfHostVPN.app, the desktop VPN panel.
-  cli/      The `selfhost` binary, including `doctor` and `daemon`.
-docs/       Getting started, the security guidebook, measured constraints,
-            roadmap.
-*.dx        The index and the runnable labs — start at index.dx.
+  foundation/   Primitives. Nothing here opens a socket of its own.
+    json/       JSON, for the control API.
+    http/       HTTP/1.1 parsing and serialisation. Pure, no I/O.
+    config/     Deployment config model and validation. The source of truth.
+    identity/   Who the caller is and what they may do. Below everything asking.
+    login/      Shared password and session handling.
+    supervisor/ Runs services and keeps them running.
+  net/          The wire. Protocols we own, byte for byte.
+    igd/        UPnP IGD port mapping.
+    ws/         RFC 6455 WebSockets. Binary frames only; five of six modules pure.
+    dns/        DNS wire format, stub resolver, authoritative zones.
+    acme/       RFC 8555 certificate issuance.
+    firewall/   Host firewall reconciliation (pf, nftables, netsh).
+  services/     The capabilities a deployment actually offers.
+    desk/       The remote-desktop protocol. Pure; `unsafe_code = "forbid"`.
+    screen/     This machine's pixels and input devices. The FFI lives here.
+    mail/       Addresses and the SMTP session state machine.
+    mesh/       One outbound link carrying many channels. A worker dials;
+                nothing listens.
+    storage/    Shares: the confining resolver, WebDAV, quotas, and the OS's own
+                SMB server driven as a program.
+    git/        Watches a branch and redeploys the service built from it.
+    reports/    The public report intake, its database, and its account layer.
+    app-deploy/ Webhook deploys: build first, swap only on success.
+  ui/           The two desktop applications. Not the toolkit — see below.
+    console/    The `selfhost-console` desktop binary, written in `rui`.
+    vpn-ui/     SelfHostVPN.app, the desktop VPN panel.
+  app/          The top. Composes everything below.
+    admin/      The loopback control API the console drives.
+    proxy/      TLS termination, static serving, reverse proxy, load balancing,
+                and the two loopback relays (/api/* and /dav). Here rather than
+                in net/ because it depends on mail and admin.
+    cli/        The `selfhost` binary, including `doctor` and `daemon`.
+docs/           principles.dx (how to work here), architecture.dx, surfaces.dx,
+                the security guidebook, measured constraints, roadmap.
+  labs/         One runnable document per subsystem, with recorded verdicts.
+index.dx        The map. Start here.
+scripts/        macos/ windows/ shared/ for loose scripts; securevpn/,
+                mail-discovery/ and ui-frames/ are whole tools that span both.
 ```
 
 ## Security properties enforced in code
@@ -201,8 +225,8 @@ cargo build --release
 ### Installing the console on macOS
 
 ```sh
-scripts/macos-app.sh install     # build, bundle, install, pin to the Dock, reopen
-scripts/macos-app.sh uninstall   # unpin, remove the bundle and the CLI link
+scripts/macos/macos-app.sh install     # build, bundle, install, pin to the Dock, reopen
+scripts/macos/macos-app.sh uninstall   # unpin, remove the bundle and the CLI link
 ```
 
 Run `install` after every change to the console or the interface library. The bundle in
@@ -213,7 +237,7 @@ the bundle, and reopens it if it was open, so the window on screen is the code
 in the working tree.
 
 The icon is drawn by the library itself at every size macOS asks for — see
-`crates/rui/examples/icon.rs` — rather than stored as a picture nobody can
+the `rui` library documentation at <https://github.com/RockyWearsAHat/rui> — rather than stored as a picture nobody can
 review. Removing the application deliberately leaves your project and its data
 alone; `selfhost teardown` is what removes those.
 
