@@ -23,7 +23,7 @@ are themselves worth having on record.
 | NAT layers | **one** — the router holds the public IP directly now | router UPnP WAN address matches the address seen outbound; the second-router hop described below is gone |
 | outbound :25 | **blocked** | see "Outbound port 25 is blocked" below — measured from the box, not guessed from a single tool's verdict |
 | outbound :587, :465, :443, :53(tcp) | open | `Test-NetConnection -Port <port>` from the box |
-| inbound :80, :443, :25, :587 | open, port-forwarded | `scripts/forward-soap.ps1`; verified live by Let's Encrypt's own validators reaching the box from outside, and by SMTP/submission connecting from off the LAN |
+| inbound :80, :443, :25, :587 | open, port-forwarded | `scripts/windows/forward-soap.ps1`; verified live by Let's Encrypt's own validators reaching the box from outside, and by SMTP/submission connecting from off the LAN |
 
 ### Outbound port 25 is blocked — confirmed, not assumed
 
@@ -82,7 +82,7 @@ address — ask in the same message as the outbound-25 request, and ask about a
 static IP while at it, since a lease that moves again invalidates both fixes.
 
 Consequence for the design, unchanged: outbound mail supports **both** `direct`
-and `relay` as first-class modes (`crates/mail/src/client.rs` and
+and `relay` as first-class modes (`crates/services/mail/src/client.rs` and
 `[mail.relay]` respectively). Neither is hardcoded as impossible — but on *this*
 network, today, `direct` cannot be used until the ISP lifts the port-25 block,
 measured above, not assumed.

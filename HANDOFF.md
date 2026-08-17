@@ -1,27 +1,44 @@
 # Handoff — selfhost
 
 **Started:** 2026-07-26 · **§3 and §5 rewritten:** 2026-08-10 ·
-**Repo:** <https://github.com/RockyWearsAHat/selfhost> · **Branch:**
-`service-manager` (production tracks `main`)
+**Header corrected for the reorganisation:** 2026-08-17 ·
+**Repo:** <https://github.com/RockyWearsAHat/selfhost> · **Branch:** `main`
 **Prior session:** the question that started this is in
 `/tmp/lvlup-self-hosting-handoff.md` — hosting websites from a spare PC, free,
 unrestricted, load balanced.
 
-> **Read this first.** Production is ALEX-DESKTOP (Windows, `192.168.1.8`), a
-> clone of this repo that self-updates from pushes to `main` (`[self_update]`,
-> 60 s poll → fetch, rebuild, restart). The admin console SPA (`sites/console`)
-> is live at `admin.rockywearsahat.com`, VPN-gated to loopback. Two large
-> subsystems — **remote desktop** and **network storage** — landed on this
-> branch on 2026-08-10 and have never run on that box. §3 is the current state
-> and §5 is what has to be confirmed there, in order. **Do not soften §3: about
-> nine thousand lines of this workspace have never executed anywhere.**
+> **What this file is.** Orientation and *judgement* — who you are working with,
+> facts that were measured so nobody re-derives them, and the traps. It is the
+> one document here that is opinion rather than record, which is why it is not a
+> `.dx` document. Everything factual has moved to the spine below, and where the
+> two disagree, **the spine wins** — it verifies itself and this file does not.
 >
-> The maps are elsewhere and are kept true: `index.dx` (the file tree),
-> `selfhost.dx` (the platform in one page), `desktop-lab.dx` and `nas-lab.dx`
-> (the two new subsystems, with runnable checks), `console-lab.dx` and
-> `web-console-lab.dx` (the two consoles), `docs/SECURITY.md` (the guidebook
-> you must read before writing anything networked). This file is orientation
-> and judgement; it does not repeat them.
+> **Start at `index.dx`.** It routes, and it *computes* its own answers about
+> which crates make up which binary. Then:
+>
+> - `docs/status.dx` — where the project stands, what blocks publishing, what to
+>   build next. **Read this before choosing work.**
+> - `docs/principles.dx` — how to work here: the layering law (with a runnable
+>   check), what travels with the repository and what does not, and how to move a
+>   dx document without destroying it.
+> - `docs/architecture.dx` — the platform in one page (was `selfhost.dx`).
+> - `docs/surfaces.dx` — every socket, path and credential.
+> - `docs/labs/` — one runnable document per subsystem, verdicts recorded.
+> - `docs/SECURITY.md` — read before writing anything networked.
+>
+> **Two things in §3–§7 below are stale and are corrected here.** The crate
+> layout changed on 2026-08-16: `crates/` is now five dependency layers
+> (`foundation`, `net`, `services`, `ui`, `app`), so every bare `crates/<name>`
+> path in the prose has moved. And `rui` left this repository on 2026-08-17 — it
+> is its own project, consumed by pinned revision.
+>
+> **What has not changed, and must not be softened:** production is ALEX-DESKTOP
+> (Windows, `192.168.1.8`), a clone that self-updates from pushes to `main` and
+> rebuilds unattended — *a push is a deployment*. Roughly 6,900 lines under
+> `*/windows/` have still never executed, on the platform production runs on.
+> And as of 2026-08-17 there is a confirmed security finding open against the
+> VPN: it is **not** a permissions layer. See
+> `docs/labs/vpn-identity-lab.dx` before trusting it for anything.
 
 ---
 
@@ -131,7 +148,7 @@ Everything in this list was done by running it, not by testing it:
   and kept in the platform's state directory, a launch with no arguments — which
   is what the Dock produces — opens the one used last, and the masthead's
   `‹ MACHINES` steps back to a list where one is opened, forgotten or added
-  *without restarting the window*. `crates/console/src/session.rs` is where a
+  *without restarting the window*. `crates/ui/console/src/session.rs` is where a
   connection lives: each `Link` owns its two threads **and the snapshot they
   write into**, so a poller finishing a request from the machine just left
   cannot put its services under this one's name. Three defects went with it, all
@@ -140,18 +157,18 @@ Everything in this list was done by running it, not by testing it:
   recovered from a daemon restart, because the token was read once and the
   daemon writes a new one every time it starts — which the self-updater makes it
   do on every push; and a fresh install reported `CONNECTING 127.0.0.1:9191` for
-  ever at an address nothing was dialling. `console-lab.dx` has the frames and
+  ever at an address nothing was dialling. `docs/labs/console-lab.dx` has the frames and
   the ledger.
 
 ### 3.2 The two new subsystems, and exactly how far they got
 
 Both are **off unless a file says otherwise** and **neither binds a socket** —
 checked rather than asserted: there are zero occurrences of `TcpListener`,
-`UdpSocket` or `::bind(` in `crates/{desk,screen,ws,mesh,identity,storage}`. The
+`UdpSocket` or `::bind(` in the new subsystems (`crates/services/desk`, `crates/services/screen`, `crates/net/ws`, `crates/services/mesh`, `crates/foundation/identity`, `crates/services/storage`). The
 admin API is still `127.0.0.1:9191` and the only public surface is still the
 proxy on 80/443.
 
-**Remote desktop** (`desktop-lab.dx` is the document; `docs/SECURITY.md` §3.7
+**Remote desktop** (`docs/labs/desktop-lab.dx` is the document; `docs/SECURITY.md` §3.7
 SCR-01…03 is the specification). The protocol, the capture and injection layers,
 the ticket mint, the freshness rule, the per-message capability re-check, the
 audit trail, the kill switch and both consoles' plates are written and tested.
@@ -172,7 +189,7 @@ send its `Authorization` header, or the handshake is the same uninformative
 Windows daemon installed as a service is `SYSTEM` in session 0 and cannot capture
 the console user's desktop by any method — `Get-Process selfhost | Select SI`
 answers `0` for both processes there. The agent produces an encoded message
-stream rather than pixels, so `crates/desk/src/relay.rs` is a second driver that
+stream rather than pixels, so `crates/services/desk/src/relay.rs` is a second driver that
 forwards it byte for byte under this session's own deadline, capability re-check
 and kill switch, reading one byte of each message to decide direction and
 decoding nothing. Measured through an SSH tunnel from this Mac: **932 tiles and
@@ -188,7 +205,7 @@ its own words — `ImpersonateNamedPipeClient` cannot run before a read, so the
 client check failed every time and disconnected the agent it had just accepted.
 Then three more: a relay that refunds credit cannot *start* a stream, credit was
 being granted in a vocabulary the agent does not read, and the data path ran at
-the supervisor's one-second decision cadence. `desktop-lab.dx` lists all seven.
+the supervisor's one-second decision cadence. `docs/labs/desktop-lab.dx` lists all seven.
 
 **Input has still never crossed it.** `allow_input = true` on that box and
 nothing has typed through the relay; `bearer_may_control = false`, so proving it
@@ -202,7 +219,7 @@ session store and the people registry) and both drivers take it. The stand-in
 survives only where there is no console password at all — no store to read — and
 says so.
 
-**Network storage** (`nas-lab.dx`; `docs/SECURITY.md` §3.7 NAS-01…03). Shares,
+**Network storage** (`docs/labs/nas-lab.dx`; `docs/SECURITY.md` §3.7 NAS-01…03). Shares,
 the confining resolver, the descriptor walk, quotas, the JSON API and its bulk
 byte plane, WebDAV at `/dav` (relayed by the proxy, answered by the admin API
 behind its own Basic-over-TLS door), the SMB reconciler for all three platforms,
@@ -216,10 +233,10 @@ the DNS-SD records; `storage smb apply` has deliberately never been run; and
 and a `[[shares]]` block coexist.
 
 **The peer mesh** is dialled and now answered but not yet spliced:
-`crates/admin/src/mesh_api.rs` answers `GET /api/mesh/link` and admits or
-refuses a dial on its merits (`crates/mesh/src/accept.rs`) — the route is no
-longer a 404. What's still missing is `crates/mesh/src/splice.rs`: written and
-tested, but nothing outside `crates/mesh` calls it, so an admitted link
+`crates/app/admin/src/mesh_api.rs` answers `GET /api/mesh/link` and admits or
+refuses a dial on its merits (`crates/services/mesh/src/accept.rs`) — the route is no
+longer a 404. What's still missing is `crates/services/mesh/src/splice.rs`: written and
+tested, but nothing outside `crates/services/mesh` calls it, so an admitted link
 carries no traffic anywhere yet. The dialler also verifies the owner's
 certificate against the bundled Mozilla roots with no accept-any path, so an
 owner on `acme = "self-signed"` cannot be dialled at all.
@@ -228,12 +245,12 @@ owner on `acme = "self-signed"` cannot be dialled at all.
 
 Be exact about this, because everything above is macOS.
 
-- **7,292 lines live in Windows-only files** — `crates/screen/src/windows/*`
-  (5,131), `crates/rui/src/shell/platform/windows.rs` (980),
-  `crates/storage/src/fs/windows.rs` (634), `crates/storage/src/smb/windows.rs`
-  (547) — and with the `cfg(windows)` arms in `crates/cli`
-  (`desk_local`, `desk_supervisor`, `service_install`), `crates/admin/src/token.rs`,
-  `crates/rui/src/shell/fonts.rs` and `crates/firewall/src/backend/netsh.rs`, it
+- **7,292 lines live in Windows-only files** — `crates/services/screen/src/windows/*`
+  (5,131), the `rui` library's Windows shell code at <https://github.com/RockyWearsAHat/rui> (980),
+  `crates/services/storage/src/fs/windows.rs` (634), `crates/services/storage/src/smb/windows.rs`
+  (547) — and with the `cfg(windows)` arms in `crates/app/cli`
+  (`desk_local`, `desk_supervisor`, `service_install`), `crates/app/admin/src/token.rs`,
+  rui's font handling, and `crates/net/firewall/src/backend/netsh.rs`, it
   is **roughly nine thousand lines**. None of it has ever run. Not once, not
   anywhere.
 - **What the Windows check does and does not prove.** `cargo check --workspace
@@ -268,12 +285,11 @@ Be exact about this, because everything above is macOS.
 
 ### 3.4 Two rules that keep catching people
 
-- **A drawing change is not on screen until `scripts/macos-app.sh install` has
+- **A drawing change is not on screen until `scripts/macos/macos-app.sh install` has
   run.** The bundle in `/Applications` holds a *copy* of the binary. See §7.
 - **`rui` has its own repository** (<https://github.com/RockyWearsAHat/rui>,
-  public, MIT, CI on macOS/Windows/Linux). This workspace builds it from
-  `crates/rui` by path, so the two are copies and changes made here have to be
-  pushed there. Its own practices document is `crates/rui/rui.dx`.
+  public, MIT, CI on macOS/Windows/Linux). As of 2026-08-17 it is consumed as a git dependency pinned to an exact revision
+  rather than vendored locally. To modify it, clone the rui repository beside this one and uncomment the `[patch]` block in `Cargo.toml` — the instructions are in the file.
 
 ## 4. Measured facts — do not re-derive
 
@@ -380,7 +396,7 @@ later step assumes them.
     for a surprise, and everything visual depends on it.
 
 **What to do first back on the Mac, independent of the Windows box:** wire
-`Api::standings` into `crates/cli/src/desk_task.rs` so a revocation ends a stream
+`Api::standings` into `crates/app/cli/src/desk_task.rs` so a revocation ends a stream
 at the next keystroke rather than at its ceiling (§3.2), add
 `fn operator_start(&self)` to `selfhost_admin::Fleet` plus a route so the
 console's start button has something to call, and decide whether `/dav` should
@@ -426,14 +442,15 @@ have a config switch. All three are small and all three are named in the labs.
 
 ## 7. Traps
 
-- **A change to the console is not delivered until `scripts/macos-app.sh
+- **A change to the console is not delivered until `scripts/macos/macos-app.sh
   install` has run.** He looks at the application in `/Applications`, and that
-  bundle holds a *copy* of the binary — editing `crates/rui` or `crates/console`,
+  bundle holds a *copy* of the binary — editing `crates/ui/console`,
   or even running `cargo build`, changes nothing about what is on his screen.
+  Changes to `rui` require editing its separate repository at <https://github.com/RockyWearsAHat/rui> and updating the pinned revision in `Cargo.toml`.
   This is not hypothetical: a whole session of interface work was reported as
   done and looked untouched to him, because the bundle was three hours older
-  than the code. So: **any session that touches `crates/rui`, `crates/console`,
-  or the icon ends with `scripts/macos-app.sh install`, before
+  than the code. So: **any session that touches `crates/ui/console`
+  or the icon ends with `scripts/macos/macos-app.sh install`, before
   the work is called done.** The script quits a running console, force-closing
   one that will not go, and reopens it afterwards if it was open — assume he is
   developing, that the console is running, and that he will look at it the
@@ -441,7 +458,7 @@ have a config switch. All three are small and all three are named in the labs.
   asking him to restart anything. Never ask him to close it for you.
 - **Do not be lenient about HTTP framing.** Every heuristic is a guess about
   what some other implementation would have guessed, and that gap is the
-  smuggling vulnerability. `crates/http/src/request.rs` rejects ambiguity on
+  smuggling vulnerability. `crates/foundation/http/src/request.rs` rejects ambiguity on
   purpose.
 - **Do not pop `..` in paths** — `files::resolve` refuses instead, so an attempt
   cannot silently serve a different file.
@@ -464,7 +481,7 @@ have a config switch. All three are small and all three are named in the labs.
 - **A deployment stops the service; it does not restart it.** Updating a working
   copy under a running process makes its exit look like a crash, and the restart
   policy then fights the deployment for the process. The sequence and its reason
-  are in `crates/git/src/deploy.rs`.
+  are in `crates/services/git/src/deploy.rs`.
 - **A repository URL is untrusted input.** It arrives over the control API, and
   `git`'s `ext::` transport runs its argument as a command. The transports are an
   allow-list in `selfhost_config::git`; do not widen it to "whatever git accepts".
@@ -498,7 +515,7 @@ have a config switch. All three are small and all three are named in the labs.
   so `".. "` passes an exact-equality refusal and normalises back to `..`. That
   is a directory traversal, not a naming nicety, and it is the single most likely
   way a NAS gets rooted. The rule is on every platform and never behind a `cfg`.
-- **`crates/proxy/src/files.rs` is not reusable for the share write path** and
+- **`crates/app/proxy/src/files.rs` is not reusable for the share write path** and
   was deliberately not reused: `confine()` canonicalises, which returns ENOENT
   for every path being created, and `resolve` invents paths, which on a file
   share means serving a different file than was asked for.

@@ -15,11 +15,25 @@ through, in case that topology ever regresses.
 **Superseded 2026-08-12: outbound port 25 is no longer blocked.** `selfhost
 doctor --deep` now measures it open and gets a live SMTP handshake through to
 both `gmail-smtp-in.l.google.com` and `outlook-com.olc.protection.outlook.com`,
-each confirming the connecting address is `172.83.6.109`. Do not open the call
-with Ask 1 below — it is resolved. The live problem is the PTR record (Ask 2):
-mail passes SPF/DKIM/DMARC and still lands straight in Junk at Gmail/Outlook
-because the reverse DNS does not forward-confirm. That is the whole reason for
-this call now.
+each confirming the connecting address is `172.83.6.109`. The port-25 ask that
+used to open this script is resolved and has been removed; **Ask 1 below — the
+PTR record — is now the whole reason for this call.** Mail passes SPF/DKIM/DMARC
+and still lands straight in Junk at Gmail/Outlook because the reverse DNS does
+not forward-confirm.
+
+**Re-measured 2026-08-16 — nothing has changed and nothing can be changed from
+here.** `dig -x 172.83.6.109` still returns `172-83-6-109.ip.fdtnet.net`, and
+that name still has no A record. The reverse zone `6.83.172.in-addr.arpa` has
+`SOA ns1.firstdigital.com. ipadmin.firstdigital.com. 2026012302` and is
+delegated to `ns1/ns2.firstdigital.com` — **not** to `ns1/ns2.rockywearsahat.com`,
+which serve only the forward zone. A PTR written into our own zone would never
+be asked for by any resolver on the internet, so this record cannot be set
+ourselves; only FirstDigital can set it, or delegate it. Prefer delegation
+(Ask 1's second half) — it is the one outcome that means never making this call
+again. Note that if delegation is granted, `crates/net/dns` needs work first: the
+wire codec handles `PTR` (`RecordType::Ptr`, `wire.rs:38`) but the zone layer
+has no PTR record kind at all — `data_type` maps `RecordData::Name` to `CNAME`
+only (`zone.rs:468`), so the server cannot yet answer a reverse query.
 
 ## Facts to have in front of you
 

@@ -459,6 +459,6 @@ Being straight with you so you do not go looking:
 - **The peer mesh dials but is not answered** — there is no `/api/mesh/link`
   route on the owner yet, so a second machine cannot join.
 
-`docs/roadmap.md` is the crate-by-crate list and the ordering; `desktop-lab.dx`
-and `nas-lab.dx` are the two subsystems with runnable checks you can execute
+`docs/roadmap.md` is the crate-by-crate list and the ordering; `docs/labs/desktop-lab.dx`
+and `docs/labs/nas-lab.dx` are the two subsystems with runnable checks you can execute
 yourself rather than take on trust.

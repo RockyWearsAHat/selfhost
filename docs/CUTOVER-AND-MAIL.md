@@ -2,7 +2,7 @@
 
 Snapshot: 2026-08-08. Box public IP **172.83.6.109** (dynamic — `dynamic_ip` in
 `[dns]` keeps the apex `A` current in the zone this box serves; see
-`crates/dns/src/updater.rs`). Box LAN IP 192.168.1.8.
+`crates/net/dns/src/updater.rs`). Box LAN IP 192.168.1.8.
 
 ## Moving a site from its temporary/old IP to the real IP
 
@@ -69,12 +69,12 @@ rewrites the apex `A` in the zone this box already serves.
 Four mechanisms are published for a mail domain, in the order clients came to
 them. Nothing here needs a per-client profile, and none of it costs a port —
 Autodiscover/EWS/ActiveSync rides the existing proxy on 443 exactly as PACC
-does (`crates/proxy/src/server.rs`'s `dispatch`), not a listener of its own.
+does (`crates/app/proxy/src/server.rs`'s `dispatch`), not a listener of its own.
 
 | Mechanism | What is published | Who uses it |
 |-----------|-------------------|-------------|
 | Guessable hostnames | `A` records + certificate SANs for `mail.`, `imap.`, `smtp.` | Nearly every client, as a guess after discovery fails. This is why setup works today once the two hostnames are typed. |
-| RFC 6186 SRV | `_imaps._tcp` → `0 1 993 imap.<domain>`, `_submission._tcp` → `0 1 587 smtp.<domain>`, `_submissions._tcp` → `0 1 465 smtp.<domain>` | Thunderbird and others. **Not macOS/iOS Mail** — a sweep of the dyld shared cache on macOS 15.5 finds those service labels zero times (`discovery-lab.dx`). |
+| RFC 6186 SRV | `_imaps._tcp` → `0 1 993 imap.<domain>`, `_submission._tcp` → `0 1 587 smtp.<domain>`, `_submissions._tcp` → `0 1 465 smtp.<domain>` | Thunderbird and others. **Not macOS/iOS Mail** — a sweep of the dyld shared cache on macOS 15.5 finds those service labels zero times (`docs/labs/discovery-lab.dx`). |
 | **PACC** (`draft-ietf-mailmaint-pacc`) | `A` + certificate for `ua-auto-config.<domain>`, the document served at `https://ua-auto-config.<domain>/.well-known/user-agent-configuration.json`, and a `_ua-auto-config` `TXT` carrying `v=UAAC1; a=sha256; d=<base64 SHA-256 of the document>` | Nothing shipping yet — Apple co-authors the draft and was implementing a client in July 2026. Published now because it is inert to clients that have never heard of it and is the only specified path that ends with an address and a password being enough. |
 | **Exchange Autodiscover, EWS, and ActiveSync** | `A` + certificate for `autodiscover.<domain>`; `POST /autodiscover/autodiscover.xml` on that host and on the bare mail domain (`selfhost_mail::autodiscover`); `POST /EWS/Exchange.asmx` (`selfhost_mail::ews`) and `POST /Microsoft-Server-ActiveSync` (`selfhost_mail::eas`), both Basic-auth gated against the same `Authenticator` IMAP/submission already trust | **This is the one macOS/iOS Mail actually act on — once the user picks "Microsoft Exchange" as the account type.** Confirmed live 2026-08-13 (see below): Mail ignores RFC 6186 SRV and the IMAP/SMTP blocks of a plain Autodiscover response — the only server-driven path it follows is an `EXCH`/`ASUrl` block naming a working EWS endpoint, and it then drives the mailbox over EWS, not IMAP. iOS Mail's equivalent is ActiveSync, reached via the same Autodiscover response's `MobileSync` block. Both are real, working protocol servers here (folder listing, message fetch as raw MIME, send, flag, delete), backed by the same `Maildir` IMAP/submission use — not a stub that only answers discovery. |
 
@@ -98,7 +98,7 @@ accurately: no server hostnames are ever typed — address, password, and (until
 client-side) one account-type selection.
 
 The document, the digest, and the hostname all come from one derivation
-(`crates/config/src/pacc.rs`), so the served zone after any config change
+(`crates/foundation/config/src/pacc.rs`), so the served zone after any config change
 republishes a digest that matches the bytes the proxy serves. Check them against
 each other any time:
 
@@ -119,7 +119,7 @@ echo | openssl s_client -connect <box>:443 -servername ua-auto-config.<domain> \
 
 `ua-auto-config.` (and, since this feature, `autodiscover.`) joins the existing
 mail certificate's SAN set rather than taking one of its own, and
-`crates/cli/src/acme_task.rs` reissues an order whose name set has grown — a
+`crates/app/cli/src/acme_task.rs` reissues an order whose name set has grown — a
 certificate is not left uncovering a host it should name just because it is
 young. That rule exists because of what 2026-08-12 found: document, digest, and
 `A` record all correct, and the host still served the `rcgen` self-signed
@@ -210,7 +210,7 @@ whole mail path from that older finding onward has moved. Concretely, as of
   `docs/isp-ptr-request-email.txt`.
 - Blocklist status could not be confirmed via public resolvers (1.1.1.1,
   8.8.8.8) or the LAN router resolver — Spamhaus refuses all three and answers
-  `127.255.255.254`, which `crates/dns/src/resolver.rs::is_real_listing()`
+  `127.255.255.254`, which `crates/net/dns/src/resolver.rs::is_real_listing()`
   correctly treats as "refused", not "listed". The prior IP (`172.83.7.210`)
   *was* Spamhaus XBL+CSS listed (see `docs/constraints.md`); that's moot now
   since the IP changed to `172.83.6.109`, and `doctor --deep`'s neighbour

@@ -377,11 +377,37 @@
         <div id="fs-bar">
           <nav id="fs-crumbs" aria-label="Breadcrumb"></nav>
           <span class="rule"></span>
+          <!-- The two drawings of one listing. A pressed pair rather than a
+               dropdown: which one is showing is a reading, and a reading is
+               something this console shows rather than hides behind a click. -->
+          <span class="viewswitch" role="group" aria-label="Listing view">
+            <button id="fs-view-list" class="btn ghost small" type="button" aria-pressed="true">LIST</button>
+            <button id="fs-view-grid" class="btn ghost small" type="button" aria-pressed="false">GRID</button>
+          </span>
           <button id="fs-up" class="btn ghost small" type="button" title="Up one folder">UP</button>
           <button id="fs-mkdir" class="btn ghost small" type="button">NEW FOLDER</button>
           <button id="fs-upload" class="btn ghost small" type="button">UPLOAD</button>
+          <button id="fs-upload-folder" class="btn ghost small" type="button">UPLOAD FOLDER</button>
           <button id="fs-reload" class="btn ghost small" type="button">REFRESH</button>
           <input id="fs-file" type="file" multiple hidden>
+          <!-- webkitdirectory is non-standard and universal: it is the only way
+               a file picker offers a folder, and every shipping browser spells
+               it with the prefix. -->
+          <input id="fs-folder" type="file" multiple webkitdirectory hidden>
+        </div>
+
+        <!-- The verbs, acting on the selection.
+             The per-row buttons are a pointer convenience and are deliberately
+             out of the tab order; this bar is how the same verbs are reached
+             from the keyboard, one Tab from the listing. -->
+        <div id="fs-actbar">
+          <span id="fs-selection" class="caption micro" hidden></span>
+          <span class="rule"></span>
+          <button id="fs-act-open" class="btn ghost small" type="button" disabled>OPEN</button>
+          <button id="fs-act-download" class="btn ghost small" type="button" disabled>DOWNLOAD</button>
+          <button id="fs-act-rename" class="btn ghost small" type="button" disabled>RENAME</button>
+          <button id="fs-act-move" class="btn ghost small" type="button" disabled>MOVE</button>
+          <button id="fs-act-delete" class="btn danger small" type="button" disabled>DELETE</button>
         </div>
 
         <!-- Inline forms rather than dialogs: a modal over an instrument panel
@@ -411,8 +437,18 @@
           <button id="fs-confirm-cancel" class="btn ghost small" type="button">CANCEL</button>
         </div>
 
+        <!-- The grid has no column headers to click, so the sort lives here
+             when it is showing. Same three columns, same handler. -->
+        <div id="fs-gridsort" hidden>
+          <span class="fieldlabel">SORT</span>
+          <button id="fs-gsort-name" class="sortbtn" type="button">NAME</button>
+          <button id="fs-gsort-size" class="sortbtn" type="button">SIZE</button>
+          <button id="fs-gsort-modified" class="sortbtn" type="button">MODIFIED</button>
+        </div>
+
         <div id="fs-drop">
-          <div id="fs-table-wrap"><table id="fs-table">
+          <div id="fs-table-wrap"><table id="fs-table" role="grid" aria-label="Files"
+                                        aria-multiselectable="true">
             <thead><tr>
               <th><button id="fs-sort-name" class="sortbtn" type="button">NAME</button></th>
               <th class="numeric"><button id="fs-sort-size" class="sortbtn" type="button">SIZE</button></th>
@@ -421,7 +457,12 @@
             </tr></thead>
             <tbody id="fs-rows"></tbody>
           </table></div>
-          <p id="fs-empty" class="caption centered" hidden></p>
+          <!-- The icon view. A listbox rather than a second table: the tiles
+               carry no columns, and a multi-selectable listbox is what a
+               screen reader already knows how to announce. -->
+          <div id="fs-grid" role="listbox" aria-multiselectable="true" aria-label="Files" hidden></div>
+          <div id="fs-empty" class="fs-empty" hidden></div>
+          <div id="fs-marquee" aria-hidden="true" hidden></div>
           <div id="fs-veil" hidden><span>RELEASE TO UPLOAD HERE</span></div>
         </div>
 
@@ -432,7 +473,14 @@
           <div class="section-rule">
             <h2>TRANSFERS</h2><span class="rule"></span>
             <span id="fs-transfer-count" class="mono micro"></span>
+            <button id="fs-transfer-cancel" class="btn ghost small" type="button">CANCEL ALL</button>
             <button id="fs-transfer-clear" class="btn ghost small" type="button">CLEAR FINISHED</button>
+          </div>
+          <!-- The batch as one reading, above the rows. During a folder drop
+               this is the line an operator actually watches. -->
+          <div id="fs-queue">
+            <span id="fs-queue-note" class="upnote mono"></span>
+            <span id="fs-queue-bar" class="bar"><span class="fill"></span></span>
           </div>
           <ul id="fs-uploads"></ul>
         </div>
