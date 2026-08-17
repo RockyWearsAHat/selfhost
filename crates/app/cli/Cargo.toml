@@ -38,6 +38,7 @@ selfhost-reports = { workspace = true }
 ring = { workspace = true }
 selfhost-http = { workspace = true }
 selfhost-supervisor = { workspace = true }
+selfhost-vpn = { workspace = true }
 tokio = { workspace = true }
 rustls = { workspace = true }
 tokio-rustls = { workspace = true }

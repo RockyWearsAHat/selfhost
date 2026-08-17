@@ -65,18 +65,18 @@ file from locking the operator out of the console they would fix it with.
 
 /// Runs the command. `arguments[0]` is the word `people`.
 ///
-/// `config` is read for exactly one thing — the console site's hostname, so an
-/// invitation can be printed as a link the person can actually open rather than
-/// a code with no address attached.
+/// `config` is read for exactly one thing — the console site's hostname and the
+/// port it is served on, so an invitation can be printed as a link the person
+/// can actually open rather than a code with no address attached.
 pub fn run(arguments: &[String], data_dir: &Path, config: &Config) -> Result<(), String> {
     let people = selfhost_admin::people_registry(data_dir);
     match arguments.get(1).map(String::as_str) {
-        Some("list") | None => list(&people),
+        Some("list") | None => list(&people, data_dir),
         Some("capabilities") => {
             print!("{}", vocabulary());
             Ok(())
         }
-        Some("show") => show(&people, name_argument(arguments)?),
+        Some("show") => show(&people, name_argument(arguments)?, data_dir),
         Some("grant") => set(&people, name_argument(arguments)?, wanted(arguments)?),
         Some("allow") => amend(&people, name_argument(arguments)?, wanted(arguments)?, Amend::Add),
         Some("deny") => amend(&people, name_argument(arguments)?, wanted(arguments)?, Amend::Take),
@@ -154,10 +154,10 @@ fn invite(
     println!();
     // The one text that is both shown here and sent, so the operator reads
     // exactly what the person will read rather than a summary of it.
-    let instructions = match console_host(config) {
-        Some(host) => format!(
+    let instructions = match console_origin(config) {
+        Some(origin) => format!(
             "Open this link on the device you want to use, and it will ask for your \
-             fingerprint or face:\n\n    https://{host}/#invite={code}\n\nThat registers you as \
+             fingerprint or face:\n\n    {origin}/#invite={code}\n\nThat registers you as \
              \"{name}\". Nobody needs to be present but you. The link works once, and stops \
              working after {hours} hours."
         ),
@@ -295,19 +295,45 @@ fn email_argument(arguments: &[String]) -> Result<Option<String>, String> {
     Ok(Some(text.clone()))
 }
 
-/// The console site's hostname, if this deployment declares one.
+/// The origin an invitation link must be opened at, if this deployment declares
+/// a console site.
 ///
 /// The first domain of the first site with `console = true`, which is the same
 /// name the daemon hands the WebAuthn relying party — so the link printed here
 /// is the origin the passkey will actually be scoped to, and not a second guess
 /// at it.
-fn console_host(config: &Config) -> Option<&str> {
-    config
+///
+/// # Why the port is here and is not assumed to be 443
+///
+/// It used to be assumed. The link was built as `https://{host}/#invite=…`
+/// whatever `https_bind` said, so on every deployment not serving HTTPS on 443
+/// — which includes the one `selfhost init` writes, and therefore the first
+/// deployment anybody following `docs/getting-started.md` builds — the operator
+/// was handed a link to a port nothing listens on and told to send it to
+/// somebody else. The person receiving it gets a connection refused, on the one
+/// credential-issuing door they have no other way through. A hostname with no
+/// port is only right on the production shape, and printing an address is
+/// exactly the place where "usually right" is worth nothing.
+///
+/// 443 is still spelled without a port, because that is what a browser and a
+/// WebAuthn origin both mean by the bare name, and adding it would make the two
+/// spellings of one origin differ.
+fn console_origin(config: &Config) -> Option<String> {
+    let host = config
         .sites
         .iter()
         .find(|site| site.console)
-        .and_then(|site| site.domains.first())
-        .map(String::as_str)
+        .and_then(|site| site.domains.first())?;
+    let port = config
+        .server
+        .https_bind
+        .parse::<std::net::SocketAddr>()
+        .map(|address| address.port())
+        .unwrap_or(443);
+    Some(match port {
+        443 => format!("https://{host}"),
+        other => format!("https://{host}:{other}"),
+    })
 }
 
 /// Whether an amendment adds capabilities or takes them away.
@@ -358,10 +384,61 @@ fn parse_list(text: &str) -> Result<Vec<Capability>, String> {
         .collect()
 }
 
-/// Prints everyone with an entry.
-fn list(people: &People) -> Result<(), String> {
+/// Everyone who has registered a passkey under a name that could be a person's,
+/// newest registration last.
+///
+/// # Why this command reads the credential store at all
+///
+/// Minting a credential and granting a power are deliberately separate acts —
+/// `crates/app/admin/src/invite.rs` states why, and that separation is not
+/// something to collapse. What it left open is the state *between* them, and
+/// that state was invisible from here: redeeming an invitation writes a passkey
+/// and nothing else, so somebody who had completed the ceremony and was waiting
+/// to be given something appeared in no `selfhost people` output at all.
+/// `people list` said "nobody", `people invited` said nothing was pending
+/// (their invitation had been spent, correctly), and `people show <name>` said
+/// they had no entry — while `selfhost doctor` counted their passkey and the
+/// browser console listed it. Two halves of one deployment disagreeing about
+/// who exists is how an operator ends up sharing the console password instead
+/// of finishing the grant, which is the outcome the whole invite door was built
+/// to remove.
+///
+/// The store is read, never written: this reports a fact about who can prove
+/// who they are. It does not confer anything, and being listed here is
+/// precisely the state of holding nothing.
+///
+/// Names that cannot be a person's are dropped rather than shown. The owner's
+/// own passkeys are stored under the reserved name `owner`, which
+/// [`PersonName::parse`] refuses by design, so the operator never appears in
+/// their own waiting list. An owner who deliberately registered a passkey under
+/// an ordinary name *will* appear, and that is the honest answer: at that point
+/// the deployment holds a named identity with no grants, whoever it belongs to.
+fn enrolled_names(data_dir: &Path) -> Vec<PersonName> {
+    let mut names: Vec<PersonName> = Vec::new();
+    for passkey in selfhost_admin::webauthn::Passkeys::load(data_dir).list() {
+        let Ok(name) = PersonName::parse(&passkey.user) else {
+            continue;
+        };
+        if !names.contains(&name) {
+            names.push(name);
+        }
+    }
+    names
+}
+
+/// Prints everyone with an entry, and everyone who can log in and has not been
+/// given anything yet.
+fn list(people: &People, data_dir: &Path) -> Result<(), String> {
     let entries = people.list();
-    if entries.is_empty() {
+    // Somebody with an entry that is empty is in the same stalled state as
+    // somebody with no entry at all, so the two are reported together rather
+    // than as separate kinds of nothing.
+    let waiting: Vec<PersonName> = enrolled_names(data_dir)
+        .into_iter()
+        .filter(|name| people.find(name).is_none_or(|person| person.grants.is_empty()))
+        .collect();
+
+    if entries.is_empty() && waiting.is_empty() {
         println!("Nobody but the owner holds anything on this deployment.");
         println!();
         println!("  selfhost people allow <name> console.read");
@@ -372,28 +449,65 @@ fn list(people: &People) -> Result<(), String> {
         );
         return Ok(());
     }
+
+    // Somebody who is in both lists is printed once, in the second: an empty
+    // entry beside a registered passkey is the stalled state, not two facts.
+    let mut listed = 0;
     for person in &entries {
+        if waiting.contains(&person.name) {
+            continue;
+        }
         print_person(person);
+        listed += 1;
+    }
+    if !waiting.is_empty() {
+        println!();
+        println!("Registered a passkey and holds nothing — waiting on you:");
+        for name in &waiting {
+            println!("  {name}");
+            println!("    selfhost people allow {name} console.read");
+        }
     }
     println!();
-    println!(
-        "{} {}, and the owner, who is never listed.",
-        entries.len(),
-        if entries.len() == 1 { "person" } else { "people" }
+    print!(
+        "{listed} {}",
+        if listed == 1 { "person holds something" } else { "people hold something" }
     );
+    if !waiting.is_empty() {
+        print!(", {} waiting on you", waiting.len());
+    }
+    println!(", and the owner, who is never listed.");
     Ok(())
 }
 
-/// Prints one person's entry, or says there is none.
-fn show(people: &People, name: PersonName) -> Result<(), String> {
+/// Prints one person's entry, or says what state they are actually in.
+///
+/// "No entry" and "no such person" are different answers and were being given
+/// the same one. Somebody who has enrolled holds nothing *yet*, which is a
+/// waiting grant rather than a typo, and the command that finishes it belongs
+/// in the message.
+fn show(people: &People, name: PersonName, data_dir: &Path) -> Result<(), String> {
+    let enrolled = enrolled_names(data_dir).contains(&name);
     match people.find(&name) {
         Some(person) => {
             print_person(&person);
+            if person.grants.is_empty() && enrolled {
+                println!("  — but has registered a passkey, so they can log in to an empty console");
+            }
+            Ok(())
+        }
+        None if enrolled => {
+            println!();
+            println!("{name}");
+            println!("  holds nothing");
+            println!("  — but has registered a passkey, so they can log in to an empty console");
+            println!();
+            println!("  selfhost people allow {name} console.read");
             Ok(())
         }
         None => Err(format!(
-            "{name} has no entry here, so they hold nothing; `selfhost people allow {name} \
-             console.read` makes one"
+            "{name} has no entry here and has registered no passkey, so they hold nothing and \
+             cannot log in; `selfhost people invite {name} console.read` does both"
         )),
     }
 }
@@ -536,6 +650,107 @@ mod tests {
         let owner = ["owner".to_owned(), "show".to_owned(), "owner".to_owned()];
         let refusal = name_argument(&owner).unwrap_err();
         assert!(refusal.contains("not a usable person name"), "{refusal}");
+    }
+
+    /// The config `selfhost init` writes, plus a console site — the shape every
+    /// first deployment has, and the one the link used to be wrong on.
+    ///
+    /// Written as the text an operator would write rather than as a struct
+    /// literal, so the fixture goes through the same parser and validator a
+    /// real deployment does and cannot describe a config that would be refused.
+    fn config_with_console(https_bind: &str) -> Config {
+        Config::parse(&format!(
+            r#"
+version = 1
+[server]
+http_bind = "127.0.0.1:8080"
+https_bind = "{https_bind}"
+acme_email = "a@b.com"
+acme = "self-signed"
+data_dir = "./data"
+[[nodes]]
+name = "home"
+role = "owner"
+[[sites]]
+name = "console"
+domains = ["admin.example.com"]
+static_root = "./sites/console"
+spa = true
+console = true
+allowed_cidrs = ["10.66.0.0/24"]
+"#
+        ))
+        .expect("the fixture must be a config this deployment would accept")
+    }
+
+    #[test]
+    fn an_invitation_link_names_the_port_the_console_is_actually_served_on() {
+        // The failure this prevents: the operator is handed a link to :443 on a
+        // deployment serving 8443, sends it to somebody else, and that person
+        // gets a connection refused on the one door meant to admit them.
+        assert_eq!(
+            console_origin(&config_with_console("127.0.0.1:8443")).as_deref(),
+            Some("https://admin.example.com:8443")
+        );
+        // And 443 keeps the bare spelling, which is what a browser and a
+        // WebAuthn origin both mean by the hostname alone.
+        assert_eq!(
+            console_origin(&config_with_console("0.0.0.0:443")).as_deref(),
+            Some("https://admin.example.com")
+        );
+    }
+
+    #[test]
+    fn a_deployment_with_no_console_site_has_no_link_to_print() {
+        let mut config = config_with_console("0.0.0.0:443");
+        config.sites.clear();
+        assert_eq!(console_origin(&config), None);
+    }
+
+    #[test]
+    fn somebody_who_has_enrolled_is_visible_even_though_they_hold_nothing() {
+        // The stall this closes: redeeming an invitation writes a passkey and
+        // nothing else, so between enrolling and being granted a person existed
+        // on the box and appeared in no `selfhost people` output at all.
+        let dir = std::env::temp_dir()
+            .join(format!("selfhost-people-enrolled-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("a scratch directory");
+        // The store's own on-disk shape. An uncompressed P-256 point — 0x04 and
+        // sixty-four bytes — is all the loader checks, because a public key is
+        // verified at login and not at read, so a constant stands in for a real
+        // credential without pretending a ceremony happened.
+        let key = "BAEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE";
+        std::fs::write(
+            dir.join(selfhost_admin::webauthn::PASSKEYS_FILENAME),
+            format!(
+                r#"{{"passkeys":[
+                    {{"id":"a","publicKey":"{key}","user":"dad","label":"phone","createdUnix":1}},
+                    {{"id":"b","publicKey":"{key}","user":"dad","label":"laptop","createdUnix":2}},
+                    {{"id":"c","publicKey":"{key}","user":"owner","label":"mac","createdUnix":3}}
+                ]}}"#
+            ),
+        )
+        .expect("writes the fixture");
+
+        let names = enrolled_names(&dir);
+        assert_eq!(names.len(), 1, "one person, not one per device: {names:?}");
+        assert_eq!(names[0].as_str(), "dad");
+        // The operator must never appear in their own waiting list: the owner's
+        // passkeys are stored under the reserved name, which `PersonName`
+        // refuses in every casing.
+        assert!(!names.iter().any(|name| name.as_str().eq_ignore_ascii_case("owner")));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_deployment_nobody_has_enrolled_on_lists_nobody() {
+        let dir = std::env::temp_dir()
+            .join(format!("selfhost-people-empty-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("a scratch directory");
+        assert!(enrolled_names(&dir).is_empty(), "a missing store is an empty one");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

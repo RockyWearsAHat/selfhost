@@ -370,6 +370,12 @@ enum Route<'a> {
     ShareRename(&'a str),
     /// `DELETE /api/storage/shares/<id>/entry?path=…`
     ShareDelete(&'a str),
+    /// `POST /api/storage/shares/<id>/sessions?path=...&size=...`
+    BeginSession(&'a str),
+    /// `GET /api/storage/shares/<id>/sessions/<ticket>`
+    QuerySession(&'a str, &'a str),
+    /// `POST /api/storage/shares/<id>/sessions/<ticket>?finish` or `?abandon`
+    FinishSession(&'a str, &'a str),
     /// `GET /api/firewall`
     FirewallState,
     /// `POST /api/firewall/reconcile`
@@ -441,6 +447,15 @@ impl<'a> Route<'a> {
             }
             (Method::Delete, ["api", "storage", "shares", id, "entry"]) => {
                 Some(Self::ShareDelete(id))
+            }
+            (Method::Post, ["api", "storage", "shares", id, "sessions"]) => {
+                Some(Self::BeginSession(id))
+            }
+            (Method::Get, ["api", "storage", "shares", id, "sessions", ticket]) => {
+                Some(Self::QuerySession(id, ticket))
+            }
+            (Method::Post, ["api", "storage", "shares", id, "sessions", ticket]) => {
+                Some(Self::FinishSession(id, ticket))
             }
             // Authenticated, not on `/api/health`: the open ports it reveals are
             // as sensitive as the service list, so it sits inside the wall.
@@ -519,7 +534,7 @@ impl<'a> Route<'a> {
             Self::ShareList(id) | Self::ShareStat(id) => {
                 storage_api::demand(id, storage_api::Wants::Read)
             }
-            Self::ShareMkdir(id) | Self::ShareRename(id) | Self::ShareDelete(id) => {
+            Self::ShareMkdir(id) | Self::ShareRename(id) | Self::ShareDelete(id) | Self::BeginSession(id) | Self::QuerySession(id, _) | Self::FinishSession(id, _) => {
                 storage_api::demand(id, storage_api::Wants::Write)
             }
             Self::Install(_)
@@ -1089,6 +1104,9 @@ impl Api {
             Route::ShareMkdir(id) => self.share_mkdir(id, &caller, body).await,
             Route::ShareRename(id) => self.share_rename(id, &caller, body).await,
             Route::ShareDelete(id) => self.share_delete(id, &caller, query).await,
+            Route::BeginSession(id) => self.begin_session(id, &caller, query).await,
+            Route::QuerySession(id, ticket) => self.query_session(id, ticket, &caller).await,
+            Route::FinishSession(id, ticket) => self.finish_session(id, ticket, &caller, query).await,
             Route::FirewallState => self.firewall_state().await,
             Route::FirewallReconcile => self.firewall_reconcile().await,
             Route::RegisterChallenge => self.webauthn_register_challenge(),
@@ -1975,6 +1993,16 @@ impl Api {
     /// non-`GET` without [`CONSOLE_HEADER`] before the session store is
     /// consulted. A cross-site upload therefore cannot even refresh the
     /// operator's idle timer, let alone write a file.
+    ///
+    /// A `PUT` carrying `?ticket=` is a chunk of a resumable upload rather than
+    /// a whole one. It is decided here exactly as an ordinary upload is —
+    /// same framing rules, same `FilesWrite` capability on the share the URL
+    /// names — and it differs in one thing only, which
+    /// [`storage_api::Transfer::Resume`] states: the bytes go to the descriptor
+    /// the session already holds, and the path resolved here is not where they
+    /// land. The ticket is checked against that session's own share before a
+    /// byte is read, so the capability decided here is the capability the write
+    /// actually spends.
     pub fn bulk_for(&self, request: &Request) -> Result<storage_api::Bulk, storage_api::Denied> {
         use storage_api::{Denied, Transfer};
 
@@ -1985,17 +2013,44 @@ impl Api {
             Method::Get | Method::Head => {
                 Transfer::Download(storage_api::requested_disposition(query))
             }
-            Method::Put => Transfer::Upload {
-                declared: storage_api::declared_length(request)?,
-                existing: storage_api::requested_existing(query),
-            },
+            Method::Put => {
+                // The framing is decided the same way whichever kind of write
+                // this is: a real `Content-Length` inside the sanity bound, and
+                // never chunked. A resumed chunk is a body like any other.
+                let declared = storage_api::declared_length(request)?;
+                match (storage_api::requested_resume(query)?, self.storage.as_ref()) {
+                    // `?ticket=` says the bytes belong to an upload that is
+                    // already open. The path in the URL still has to be there
+                    // and still has to resolve — it is what the capability
+                    // below is decided against — but it is *not* where the
+                    // bytes go: the session's own descriptor is, and it was
+                    // resolved once, when the session began.
+                    (Some((ticket, offset)), Some(volumes)) => Transfer::Resume {
+                        uploads: Arc::clone(volumes.uploads()),
+                        ticket,
+                        offset,
+                        declared,
+                    },
+                    // A ticket presented to a daemon that serves no share at
+                    // all falls through to the ordinary upload and meets the
+                    // ordinary refusal a moment later. A deployment must not
+                    // answer differently depending on whether it holds
+                    // sessions.
+                    _ => Transfer::Upload {
+                        declared,
+                        existing: storage_api::requested_existing(query),
+                    },
+                }
+            }
             _ => return Err(Denied::WrongMethod),
         };
 
         let share = selfhost_identity::ShareId::parse(id).map_err(|_| Denied::Unauthorised)?;
-        let want = match transfer {
+        let want = match &transfer {
             Transfer::Download(_) => Capability::FilesRead(share),
-            Transfer::Upload { .. } => Capability::FilesWrite(share),
+            // A resumed chunk writes, so it demands exactly what an upload
+            // demands, on the share the URL names.
+            Transfer::Upload { .. } | Transfer::Resume { .. } => Capability::FilesWrite(share),
         };
         let caller = self.caller(request).ok_or(Denied::Unauthorised)?;
         if !self.policy().decide(&caller, &want).is_allowed() {
@@ -2142,6 +2197,54 @@ impl Api {
         };
         storage_api::delete(volume, caller.identity(), query_value(query, "path").unwrap_or(""))
             .await
+    }
+
+    /// Answers `POST /api/storage/shares/<id>/sessions?path=...&size=...`.
+    ///
+    /// Begins a resumable upload session. The caller provides the target path
+    /// and the declared file size. Returns the session ticket and current offset.
+    async fn begin_session(&self, id: &str, caller: &Caller, query: &str) -> Response {
+        let (Some(volumes), Some(volume)) = (self.storage.as_ref(), self.volume(id)) else {
+            return problem(Status(404), "no such share");
+        };
+        let path = query_value(query, "path").unwrap_or("");
+        let size = query_value(query, "size").unwrap_or("0");
+        storage_api::begin_session(volume, caller.identity(), path, size, volumes.uploads()).await
+    }
+
+    /// Answers `GET /api/storage/shares/<id>/sessions/<ticket>`.
+    ///
+    /// Queries the progress of a resumable upload session by its ticket.
+    async fn query_session(&self, id: &str, ticket: &str, _caller: &Caller) -> Response {
+        let Some(_volume) = self.volume(id) else {
+            return problem(Status(404), "no such share");
+        };
+        let Some(volumes) = self.storage.as_ref() else {
+            return problem(Status(404), "no such share");
+        };
+        // We validate the share exists above, but the ticket is checked by
+        // Sessions::progress itself. The caller does not need special permission
+        // to query a session once they hold its ticket — the ticket is the credential.
+        storage_api::query_session(ticket, volumes.uploads()).await
+    }
+
+    /// Answers `POST /api/storage/shares/<id>/sessions/<ticket>?finish` or `?abandon`.
+    ///
+    /// Finalizes or cancels a resumable upload session. A query parameter of
+    /// `finish=1` or `finish=true` publishes the file; any other query (or none)
+    /// abandons the session and removes the partial file.
+    async fn finish_session(&self, id: &str, ticket: &str, _caller: &Caller, query: &str) -> Response {
+        let Some(_volume) = self.volume(id) else {
+            return problem(Status(404), "no such share");
+        };
+        let Some(volumes) = self.storage.as_ref() else {
+            return problem(Status(404), "no such share");
+        };
+        // Like query_session, the ticket is the credential and no further
+        // permission check is needed beyond the share's own permit() check,
+        // which was already done when the session was created.
+        let finish = matches!(query_value(query, "finish"), Some("1") | Some("true"));
+        storage_api::finish_session(ticket, volumes.uploads(), finish).await
     }
 
     /// Answers `GET /api/desktop`: the operator's own switches.

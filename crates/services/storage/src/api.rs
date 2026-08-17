@@ -1125,6 +1125,15 @@ impl Sessions {
     /// A refused chunk (a quota breach) leaves the session in place, so the
     /// caller can report the failure and then abandon it deliberately.
     ///
+    /// **An empty chunk is a deliberate no-op that still checks everything.**
+    /// The bulk route uses it as its pre-flight: before it reads a single byte
+    /// of a resumed body off the socket it appends nothing at the offset the
+    /// client claimed, which answers [`Failure::NoSession`] or
+    /// [`Failure::WrongOffset`] straight away rather than after the client has
+    /// spent a gigabyte of uplink on bytes that were never going to be taken.
+    /// An early return for an empty chunk would look like an optimisation and
+    /// would quietly delete that check.
+    ///
     /// **This holds the table's lock across the write**, so two resumable
     /// uploads do not proceed in parallel. That is a known ceiling on
     /// throughput and it is stated rather than hidden: the alternative is a
@@ -1146,6 +1155,30 @@ impl Sessions {
         Ok(session.receiver.progress())
     }
 
+    /// Which share a session is writing into.
+    ///
+    /// The bulk route that streams a resumed chunk has checked the caller's
+    /// capability against the share named in the **URL**, and the bytes are
+    /// going to the descriptor named by the **ticket**. Those are two separate
+    /// facts, and a route that never compared them would be a confused deputy:
+    /// a ticket that leaked out of one person's session, presented by somebody
+    /// who holds `FilesWrite` on a *different* share, would write into a share
+    /// they were never granted. This is how the route compares them, and it is
+    /// the only reason a session's share is readable from outside.
+    ///
+    /// A ticket nobody holds is [`Failure::NoSession`] — the same answer a
+    /// ticket on another share produces at the route, so a caller cannot use
+    /// the difference to discover that somebody else's upload exists.
+    pub fn share_of(&self, ticket: &str) -> Result<String, Failure> {
+        let mut entries = self.lock();
+        Self::sweep(&mut entries);
+        let index = Self::find(&entries, ticket).ok_or(Failure::NoSession)?;
+        entries
+            .get(index)
+            .map(|session| session.receiver.share().to_string())
+            .ok_or(Failure::NoSession)
+    }
+
     /// How far along a session is.
     pub fn progress(&self, ticket: &str) -> Result<Progress, Failure> {
         let mut entries = self.lock();
@@ -1155,8 +1188,36 @@ impl Sessions {
     }
 
     /// Publishes a finished upload.
+    ///
+    /// **A session that has not received everything it declared is refused, and
+    /// is left where it is.** An ordinary upload whose body stops short
+    /// publishes nothing, and it would be a strange NAS where the resumable
+    /// path was the one that silently committed a truncated file under the name
+    /// the person will later open. The refusal is [`Failure::WrongOffset`]
+    /// carrying what has landed, because that is already the sentence a client
+    /// knows how to act on: it says where the missing bytes start.
+    ///
+    /// The session survives the refusal, which is the part that has to be right.
+    /// Removing it first and then discovering it was short would drop the
+    /// [`Receiver`], and dropping a receiver deletes the partial file — a client
+    /// that called `finish` one chunk too early would lose the whole upload.
+    /// Nothing is taken out of the table until the length is known to be met.
     pub fn finish(&self, ticket: &str) -> Result<(), Failure> {
-        let session = self.take(ticket)?;
+        let mut entries = self.lock();
+        Self::sweep(&mut entries);
+        let index = Self::find(&entries, ticket).ok_or(Failure::NoSession)?;
+        let progress = entries
+            .get(index)
+            .map(|session| session.receiver.progress())
+            .ok_or(Failure::NoSession)?;
+        if progress.received != progress.declared {
+            return Err(Failure::WrongOffset { expected: progress.received });
+        }
+        let session = entries.remove(index);
+        // The publish is a `sync_all`, a rename and a directory fsync, and the
+        // table's lock has no business being held across any of them: this
+        // session is already out of the table, so nothing else can reach it.
+        drop(entries);
         session.receiver.commit()
     }
 
@@ -1661,6 +1722,14 @@ mod tests {
         assert!(wrong.to_json().to_text().contains("\"offset\""));
 
         sessions.append(ticket.as_str(), 3, b"def").expect("appended");
+
+        // Finishing early publishes nothing and destroys nothing: the session
+        // is still there, still holding the six bytes that landed, and the
+        // refusal says where the missing ones start.
+        let early = sessions.finish(ticket.as_str()).expect_err("six of nine is not finished");
+        assert!(matches!(early, Failure::WrongOffset { expected: 6 }));
+        assert_eq!(sessions.progress(ticket.as_str()).expect("still open").received, 6);
+
         sessions.append(ticket.as_str(), 6, b"ghi").expect("appended");
         sessions.finish(ticket.as_str()).expect("published");
 
@@ -1668,6 +1737,37 @@ mod tests {
         assert!(sessions.is_empty());
         assert!(matches!(sessions.progress(ticket.as_str()), Err(Failure::NoSession)));
 
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_session_names_its_own_share_and_an_empty_append_checks_without_writing() {
+        // Both facts the bulk route's pre-flight is built on. It refuses a
+        // resumed chunk *before* reading the body by appending nothing at the
+        // offset the client claimed, and it compares the share the ticket is on
+        // against the share the URL named — so a leaked ticket cannot be
+        // presented on a share the holder happens to be able to write.
+        let root = scratch("resume-preflight");
+        let volume = open_volume("vault", &root, None);
+        let sessions = Sessions::new();
+        let at = volume.resolve("/preflight.bin").expect("a legal path");
+
+        let receiver = volume.receive(&owner(), &at, Existing::Refuse, 6).expect("admitted");
+        let ticket = sessions.begin(receiver).expect("a ticket");
+
+        assert_eq!(sessions.share_of(ticket.as_str()).expect("known"), "vault");
+        assert!(matches!(sessions.share_of("0".repeat(32).as_str()), Err(Failure::NoSession)));
+
+        // An empty chunk moves nothing and still answers both questions.
+        let probe = sessions.append(ticket.as_str(), 0, b"").expect("an empty append");
+        assert_eq!(probe, Progress { received: 0, declared: 6 });
+        sessions.append(ticket.as_str(), 0, b"abc").expect("appended");
+        let after = sessions.append(ticket.as_str(), 3, b"").expect("an empty append");
+        assert_eq!(after, Progress { received: 3, declared: 6 });
+        let wrong = sessions.append(ticket.as_str(), 0, b"").expect_err("refused");
+        assert!(matches!(wrong, Failure::WrongOffset { expected: 3 }));
+
+        sessions.abandon(ticket.as_str()).expect("removed");
         let _ = std::fs::remove_dir_all(&root);
     }
 

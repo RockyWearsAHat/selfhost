@@ -98,6 +98,10 @@ POST   /api/storage/shares/{id}/mkdir|rename
 DELETE /api/storage/shares/{id}/entry
 GET    /api/storage/blob/{id}/{path...}  download   — streams, never buffered
 PUT    /api/storage/blob/{id}/{path...}  upload     — streams, never buffered
+POST   /api/storage/shares/{id}/sessions?path=&size=      begin a resumable upload
+GET    /api/storage/shares/{id}/sessions/{ticket}         how far it has got
+POST   /api/storage/shares/{id}/sessions/{ticket}?finish=1  publish it (else abandon)
+PUT    /api/storage/blob/{id}/{path...}?ticket=&offset=   one chunk of one session
 
 GET    /api/desktop                      the settings this deployment chose
 GET    /api/desktop/nodes                machines this box can reach
@@ -109,8 +113,15 @@ GET    /api/audit                        what the dangerous capabilities did
 *      /dav, /dav/{share}/{path...}      WebDAV — its OWN Basic credential
 ```
 
-Three notes on that table. **The byte plane is separate from the JSON plane on
-purpose:** `/api/storage/blob/*` and the WebDAV byte verbs own their socket and
+Four notes on that table. **A resume is both planes at once, and only the bytes
+go on the byte plane:** the three `sessions` routes are small JSON, and the chunk
+itself is the ordinary blob `PUT` with `?ticket=` naming the session — the same
+socket loop, the same refusal to buffer, the same quota re-check. The destination
+is resolved once, when the session is begun, and a resumed chunk never re-derives
+it from the path in its own URL. An offset the server disagrees with is answered
+`409` carrying the offset to seek to, so an interrupted client asks, learns and
+continues instead of starting again. **The byte plane is separate from the JSON
+plane on purpose:** `/api/storage/blob/*` and the WebDAV byte verbs own their socket and
 stream, because answering them through the ordinary request path would mean
 reading a share's largest file into a `Vec` under `panic = "abort"`. **WebDAV is
 not under `/api`** — the proxy relays `/dav` to this port with the request target

@@ -314,6 +314,7 @@ dependencies = [
  "selfhost-screen",
  "selfhost-storage",
  "selfhost-supervisor",
+ "selfhost-vpn",
  "selfhost-ws",
  "tokio",
  "tokio-rustls",

@@ -24,6 +24,27 @@
 //! function over the request head that says *whether, and to what*, and
 //! `download` and `upload` are the only things here that own bytes.
 //!
+//! # A resume is one plane speaking to the other, and the seam is where it broke
+//!
+//! A resumable upload has a foot in both planes and that is exactly where it
+//! went wrong once. The control plane opens a session
+//! (`POST /api/storage/shares/<id>/sessions?path=…&size=…`), reports its offset
+//! (`GET …/sessions/<ticket>`) and closes it (`POST …/sessions/<ticket>?finish=1`)
+//! — all small JSON, all through [`Api::handle`](crate::Api::handle). The bytes
+//! cannot go that way, so they go the only way bytes go here: a blob `PUT`,
+//! with `?ticket=` naming the session and `?offset=` saying where the client
+//! believes it is.
+//!
+//! For a while the control half existed and the bulk half did not. Every route
+//! answered, [`Sessions`] was tested on its own, and no request could put a byte
+//! into a session — so a client following the documented flow began an upload,
+//! read an offset that was zero for ever, and started again from the beginning
+//! every time while the API reported a live session. A resume that lies about
+//! its offset is worse than no resume, because the client believes it. The
+//! lesson is written into the tests rather than only here: the seam between the
+//! routes and the type is tested by driving both halves, because a test of
+//! either half alone is what let it ship.
+//!
 //! # Everything in this file blocks, and none of it blocks the runtime
 //!
 //! A descriptor walk, a `stat`, a directory read, a rename, a subtree measure —
@@ -603,7 +624,15 @@ pub struct Bulk {
 }
 
 /// Which way a bulk transfer runs.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// Not `Copy` any more, and the reason is [`Transfer::Resume`]: a resumed chunk
+/// names a session by an owned ticket and carries the table it lives in. The
+/// two byte-moving variants are told apart here rather than by a flag on
+/// [`Bulk`], because they differ in the thing that matters most — *where the
+/// destination came from*. An [`Transfer::Upload`] writes to the path in this
+/// request; a [`Transfer::Resume`] writes to a descriptor opened when the
+/// session began and never re-derived from anything a later request says.
+#[derive(Debug, Clone)]
 pub enum Transfer {
     /// Bytes leave the box. Carries what the caller asked to happen to them,
     /// which the storage crate is free to overrule for anything that could carry
@@ -617,6 +646,29 @@ pub enum Transfer {
         declared: u64,
         /// Whether an existing name may be replaced.
         existing: Existing,
+    },
+    /// Bytes arrive for an upload that is already under way.
+    ///
+    /// The same socket, the same streaming, the same quota re-check as
+    /// [`Transfer::Upload`] — and a destination this request does not get to
+    /// choose. `?ticket=` names a session; the session holds the open directory
+    /// descriptor and the open file the bytes go into, both from the single
+    /// [`Volume::resolve`] that ran when the session began.
+    Resume {
+        /// The sessions this daemon holds, so the writer can reach the one the
+        /// ticket names.
+        uploads: Arc<Sessions>,
+        /// The capability naming which session. Opaque here: it is compared
+        /// inside [`Sessions`], without short-circuiting.
+        ticket: String,
+        /// Where the client believes the session has got to. Checked against
+        /// what the server has rather than believed — a mismatch is answered
+        /// with the real offset so the client can seek to it.
+        offset: u64,
+        /// This request's own `Content-Length`, which is the size of **this
+        /// chunk** and not of the file. The file's declared size was fixed when
+        /// the session began.
+        declared: u64,
     },
 }
 
@@ -650,6 +702,14 @@ pub enum Denied {
     /// A `PUT` that declared no length, declared a chunked body, or declared
     /// more than [`BULK_MAX_BODY`].
     Unframed(&'static str),
+    /// A `PUT` naming a session whose `?offset=` is not a whole number of
+    /// bytes.
+    ///
+    /// Refused rather than defaulted, because the two plausible defaults are
+    /// both wrong: starting from zero would silently re-send a file from the
+    /// beginning, and starting from wherever the server is would write the
+    /// client's bytes at an offset the client did not mean.
+    BadOffset,
 }
 
 impl Denied {
@@ -665,6 +725,9 @@ impl Denied {
             Self::NoShare => problem(Status(404), "no such share"),
             Self::Refused(failure) => selfhost_storage::api::failed(failure),
             Self::Unframed(why) => problem(Status(411), why),
+            Self::BadOffset => {
+                problem(Status(400), "an upload's offset must be a whole number of bytes")
+            }
         }
     }
 }
@@ -681,6 +744,7 @@ impl fmt::Display for Denied {
             // On a NAS the file names are the sensitive thing.
             Self::Refused(failure) => write!(out, "the path was refused: {}", failure.tag()),
             Self::Unframed(why) => write!(out, "{why}"),
+            Self::BadOffset => write!(out, "the resumed offset is not a number"),
         }
     }
 }
@@ -747,6 +811,150 @@ pub fn requested_existing(query: &str) -> Existing {
     }
 }
 
+/// Whether a `PUT` is a chunk of an upload that is already under way, and where
+/// the client thinks that upload has got to.
+///
+/// `?ticket=…&offset=…`, and it is deliberately a query parameter on the
+/// existing blob `PUT` rather than a route of its own. A resumed chunk *is* an
+/// upload — the same method, the same share, the same streaming, the same quota
+/// re-check — and the only difference is which descriptor the bytes land in. A
+/// second route would have been a second copy of the socket-to-disk loop, which
+/// is the one loop in this crate that must never be written twice.
+///
+/// `Ok(None)` means an ordinary upload, which is why the absence of a ticket
+/// leaves every other behaviour of this route exactly as it was.
+///
+/// A missing `offset` reads as zero, which is a claim like any other and is
+/// checked like any other: a client that forgets it and whose session has
+/// already received bytes is told the real offset rather than quietly appending
+/// at the wrong place.
+pub fn requested_resume(query: &str) -> Result<Option<(String, u64)>, Denied> {
+    let Some(ticket) = crate::query_value(query, "ticket") else {
+        return Ok(None);
+    };
+    let offset = match crate::query_value(query, "offset") {
+        None => 0,
+        Some(text) => text.parse::<u64>().map_err(|_| Denied::BadOffset)?,
+    };
+    Ok(Some((ticket.to_owned(), offset)))
+}
+
+/// Answers `POST /api/storage/shares/<id>/sessions?path=...&size=...`.
+///
+/// Begins a resumable upload session. The `size` is the declared length,
+/// which is admitted against the quota before anything is written. Returns
+/// the session ticket and the starting offset (always 0 for a new session).
+///
+/// A caller who holds `FilesWrite` capability for the share may begin sessions.
+/// The ticket itself is the capability to append to this session — a 32-character
+/// random hex string, unguessable and unrelated to the path or the share.
+///
+/// **This is where the path is resolved, and it is the only time it is.** The
+/// [`selfhost_storage::api::Receiver`] built here holds the destination file and
+/// the directory descriptor it was created relative to for the whole life of the
+/// session, so every later chunk lands in the same directory *object* — not at
+/// whatever the same path spells by then. A resumed `PUT` therefore supplies a
+/// path in its URL (the bulk route is shaped that way, and it is what the share
+/// capability is decided against) and that path is never used to place a byte.
+///
+/// The bytes themselves go on the bulk plane, because they can be gigabytes:
+///
+/// ```text
+/// PUT /api/storage/blob/<share>/<path>?ticket=<ticket>&offset=<offset>
+/// Content-Length: <this chunk's length>
+/// ```
+///
+/// which answers `{"offset":…,"declared":…}` — the same two fields as the
+/// progress route — or `409` with the offset to seek to.
+pub async fn begin_session(
+    volume: &Arc<Volume>,
+    who: &Identity,
+    path: &str,
+    size_str: &str,
+    uploads: &Arc<Sessions>,
+) -> Response {
+    let Ok(size) = size_str.parse::<u64>() else {
+        return problem(Status(400), "\"size\" must be a non-negative integer");
+    };
+    let volume = Arc::clone(volume);
+    let who = who.clone();
+    let uploads = Arc::clone(uploads);
+    let at = match volume.resolve(path) {
+        Ok(at) => at,
+        Err(failure) => return selfhost_storage::api::failed(&failure),
+    };
+
+    match blocking(move || {
+        // Receiver is created here, checking permissions and quota before
+        // anything is written. Sessions::begin() wraps it and returns the ticket.
+        let receiver = volume.receive(&who, &at, Existing::Replace, size)?;
+        let ticket = uploads.begin(receiver)?;
+        Ok((ticket, size))
+    }).await {
+        Ok((ticket, declared)) => ok(Json::object([
+            ("ticket", Json::string(ticket.as_str())),
+            ("offset", Json::Number(0.0)),
+            ("declared", Json::Number(declared as f64)),
+        ])),
+        Err(failure) => selfhost_storage::api::failed(&failure),
+    }
+}
+
+/// Answers `GET /api/storage/shares/<id>/sessions/<ticket>`.
+///
+/// Queries the progress of a resumable upload session. Returns the number of
+/// bytes received and the total declared length. If the session does not exist
+/// (expired or unknown ticket), returns `NoSession` as 404.
+///
+/// A caller who holds any value of the ticket (the random string) may query
+/// any session. The ticket is the credential.
+pub async fn query_session(
+    ticket: &str,
+    uploads: &Arc<Sessions>,
+) -> Response {
+    let uploads = Arc::clone(uploads);
+    let ticket = ticket.to_string();
+    match blocking(move || uploads.progress(&ticket)).await {
+        Ok(progress) => ok(Json::object([
+            ("offset", Json::Number(progress.received as f64)),
+            ("declared", Json::Number(progress.declared as f64)),
+        ])),
+        Err(failure) => selfhost_storage::api::failed(&failure),
+    }
+}
+
+/// Answers `POST /api/storage/shares/<id>/sessions/<ticket>?finish` or `?abandon`.
+///
+/// Finalizes or cancels a resumable upload session.
+///
+/// If `?finish` is set, publishes the uploaded file and removes the session.
+/// The declared length must have been received in full: a session that is short
+/// is refused `409` with the offset it has reached, and — the part that matters
+/// — is **left open**, so a client that called this one chunk too early can send
+/// the rest rather than having lost the upload. See [`Sessions::finish`].
+///
+/// If `?abandon` is set, removes the session and the partial file it created,
+/// giving back the quota room as though the session never happened.
+///
+/// A caller who holds the ticket may finalize or abandon their own session.
+pub async fn finish_session(
+    ticket: &str,
+    uploads: &Arc<Sessions>,
+    finish: bool,
+) -> Response {
+    let uploads = Arc::clone(uploads);
+    let ticket = ticket.to_string();
+    let result = if finish {
+        blocking(move || uploads.finish(&ticket)).await
+    } else {
+        blocking(move || uploads.abandon(&ticket)).await
+    };
+    match result {
+        Ok(()) => selfhost_storage::api::done(),
+        Err(failure) => selfhost_storage::api::failed(&failure),
+    }
+}
+
 /// Serves a bulk transfer over the connection that asked for it.
 ///
 /// The only function in this module that owns a socket. It writes its own
@@ -769,8 +977,13 @@ pub async fn serve<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    let placement = Placement { volume: plan.volume, who: plan.who, at: plan.at };
-    match plan.transfer {
+    let Bulk { volume, at, who, transfer } = plan;
+    // Read before the volume is moved into the placement, because a resumed
+    // chunk reports under the share the *URL* named — which is also the share
+    // the ticket is checked against, so the two cannot drift.
+    let share = volume.share().id().as_str().to_owned();
+    let placement = Placement { volume, who, at };
+    match transfer {
         Transfer::Download(disposition) => {
             download_bytes(stream, request, placement, disposition, &json_failure).await
         }
@@ -786,6 +999,16 @@ where
                     truncated: problem(Status(400), "the body ended before the declared length"),
                     failed: &json_failure,
                 },
+            )
+            .await
+        }
+        Transfer::Resume { uploads, ticket, offset, declared } => {
+            resume_bytes(
+                stream,
+                prefix,
+                Resumption { uploads, ticket, offset, share },
+                declared,
+                &json_failure,
             )
             .await
         }
@@ -972,7 +1195,7 @@ where
     let mut receiver = match opening {
         Ok(receiver) => receiver,
         Err(failure) => {
-            return refuse_upload(stream, &share, &(answers.failed)(&failure)).await;
+            return refuse_bytes(stream, &share, "upload", &(answers.failed)(&failure)).await;
         }
     };
 
@@ -1056,6 +1279,197 @@ where
     Ok(Report { share, direction: "upload", bytes: received, status })
 }
 
+/// Everything a resumed chunk needs that is not the bytes themselves.
+///
+/// Bundled for the same reason [`Placement`] is: these four travel together or
+/// not at all, and this is a function that moves a gigabyte, where a transposed
+/// argument would be silent. Note what is **not** in it — a path. A resumed
+/// chunk has no path, by design: the destination was resolved once, when the
+/// session began, and the descriptor has been held open ever since.
+pub struct Resumption {
+    /// The sessions this daemon holds.
+    pub uploads: Arc<Sessions>,
+    /// The capability naming which session the bytes belong to.
+    pub ticket: String,
+    /// Where the client says the session has got to.
+    pub offset: u64,
+    /// The share the **URL** named, which the ticket is checked against before
+    /// anything is written. Also what the transfer is reported under.
+    pub share: String,
+}
+
+/// Receives one chunk of an upload that is already under way.
+///
+/// This is the half that was missing: [`Sessions`] could hold an upload open
+/// across requests and the bulk plane had no way to put a byte into one, so a
+/// client could begin a session, watch its offset stay at zero for ever, and
+/// finish it empty. Following the documented resume flow it would restart from
+/// zero on every attempt while the API cheerfully reported a live session —
+/// worse than no resume at all, because the client believed the offset.
+///
+/// Three properties are kept, and each one is load-bearing:
+///
+/// 1. **Nothing is buffered.** The socket is read into one fixed 64 KiB buffer and
+///    each chunk is handed to a blocking task through a bounded feed, exactly
+///    as [`upload_bytes`] does. What is *not* like `upload_bytes` is who owns
+///    the destination: the [`selfhost_storage::api::Receiver`] belongs to the
+///    session table and outlives this request, so the task holds an [`Arc`] to
+///    the table rather than the receiver itself, and the table's own lock
+///    serialises the writes.
+/// 2. **The offset is checked, never believed.** The pre-flight below appends
+///    an empty chunk at the offset the client claimed, which is refused with
+///    [`Failure::WrongOffset`] carrying what the server actually has — and that
+///    number reaches the client in the response body, because
+///    `Failure::to_json` puts it there. That is the whole point of the field: a
+///    client that lost its connection asks, learns, seeks and continues.
+///    Checking before the body is read means a client that seeks wrong is told
+///    so in one round trip instead of after uploading a gigabyte that could
+///    never have been accepted.
+/// 3. **The ticket cannot reach another session or another file.** The session
+///    is found by constant-time ticket comparison inside [`Sessions`], the
+///    bytes go to the descriptor that session opened, and the URL's path is
+///    never consulted. The one thing the URL still decides is which share's
+///    capability the caller had to hold, so the ticket is additionally required
+///    to belong to *that* share — otherwise a leaked ticket plus a capability
+///    on some unrelated share would be a write into a share nobody granted.
+///
+/// **An interrupted resume does not abandon the session**, which is the other
+/// half of the difference from [`upload_bytes`]. A truncated ordinary upload
+/// must publish nothing; a truncated resumed chunk must keep exactly what
+/// landed, because keeping it is the feature. The bytes that arrived stay, the
+/// offset moves by that much, and the client picks up from there.
+pub async fn resume_bytes<S>(
+    stream: &mut S,
+    prefix: Vec<u8>,
+    resumption: Resumption,
+    declared: u64,
+    failed: &(dyn Fn(&Failure) -> Response + Sync),
+) -> std::io::Result<Report>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let Resumption { uploads, ticket, offset, share } = resumption;
+
+    // The pre-flight: does this ticket name a live session, is that session on
+    // the share whose capability was just checked, and is the client seeking to
+    // the byte the session actually wants next? An empty append answers all
+    // three without writing anything and without reading the body.
+    let admitted = {
+        let uploads = Arc::clone(&uploads);
+        let ticket = ticket.clone();
+        let share = share.clone();
+        blocking(move || {
+            // A ticket for another share is answered as though it named no
+            // session at all. Telling the two apart would let a caller who
+            // holds one share confirm that a ticket they came by belongs to
+            // another.
+            if uploads.share_of(&ticket)? != share {
+                return Err(Failure::NoSession);
+            }
+            uploads.append(&ticket, offset, &[])
+        })
+        .await
+    };
+    let landed = match admitted {
+        Ok(progress) => progress,
+        Err(failure) => return refuse_bytes(stream, &share, "resume", &failed(&failure)).await,
+    };
+
+    let (feed, mut chunks) = tokio::sync::mpsc::channel::<Vec<u8>>(FEED_DEPTH);
+    let writer = {
+        let uploads = Arc::clone(&uploads);
+        let ticket = ticket.clone();
+        tokio::task::spawn_blocking(move || {
+            // The running offset is the server's own arithmetic from here on.
+            // The client's number was checked once, at the pre-flight; every
+            // later chunk continues from what this task has written, so a
+            // client cannot move the write head mid-body.
+            let mut at = offset;
+            let mut progress = landed;
+            while let Some(bytes) = chunks.blocking_recv() {
+                progress = uploads.append(&ticket, at, &bytes)?;
+                at += bytes.len() as u64;
+            }
+            Ok(progress)
+        })
+    };
+
+    let mut received: u64 = 0;
+    let mut scratch = vec![0u8; CHUNK];
+    let mut remaining = declared;
+    let mut truncated = false;
+
+    for start in prefix.chunks(CHUNK) {
+        let take = (remaining.min(start.len() as u64)) as usize;
+        if take == 0 {
+            break;
+        }
+        remaining -= take as u64;
+        received += take as u64;
+        if feed.send(start[..take].to_vec()).await.is_err() {
+            break;
+        }
+    }
+
+    while remaining > 0 {
+        let want = (remaining.min(CHUNK as u64)) as usize;
+        match stream.read(&mut scratch[..want]).await {
+            Ok(0) => {
+                truncated = true;
+                break;
+            }
+            Ok(read) => {
+                remaining -= read as u64;
+                received += read as u64;
+                if feed.send(scratch[..read].to_vec()).await.is_err() {
+                    break;
+                }
+            }
+            Err(error) => {
+                // Named for the same reason `upload_bytes` names it: a client
+                // that closed its laptop and a socket that faulted both stop
+                // the transfer, and only one of them is a machine to go and
+                // look at. Neither one abandons the session.
+                eprintln!("admin: resumed upload cut short after {received} byte(s): {error}");
+                truncated = true;
+                break;
+            }
+        }
+    }
+
+    drop(feed);
+    let written = match writer.await {
+        Ok(result) => result,
+        Err(error) => Err(Failure::Io(format!("the upload task did not finish: {error}"))),
+    };
+
+    let response = match written {
+        Ok(progress) if !truncated && remaining == 0 => progressed(&progress),
+        // The body stopped short. Unlike an ordinary upload nothing is
+        // unwound: what landed stays, which is the entire feature. The client
+        // asks the session route where it got to and sends the next chunk from
+        // there, so this refusal does not have to carry the offset itself.
+        Ok(_) => problem(Status(400), "the body ended before the declared length"),
+        Err(failure) => failed(&failure),
+    };
+    let status = response.status.code();
+    write_response(stream, &response).await?;
+    Ok(Report { share, direction: "resume", bytes: received, status })
+}
+
+/// How far a session has got, in the one shape every session route speaks.
+///
+/// `GET /api/storage/shares/<id>/sessions/<ticket>` and an accepted chunk
+/// answer with the same two fields, so a client parses one shape wherever it
+/// learns an offset — and a resume that ends normally needs no second request
+/// to find out where it now is.
+fn progressed(progress: &selfhost_storage::api::Progress) -> Response {
+    ok(Json::object([
+        ("offset", Json::Number(progress.received as f64)),
+        ("declared", Json::Number(progress.declared as f64)),
+    ]))
+}
+
 /// One item on the socket-to-disk feed.
 ///
 /// The two terminal markers are the point of the type: see [`upload`].
@@ -1069,16 +1483,21 @@ enum Feed {
     Abandon,
 }
 
-/// Answers an upload that was refused before it began.
+/// Answers an arriving transfer that was refused before it began.
 ///
 /// The body is drained rather than ignored only in the sense that it is not
 /// read at all: the connection is answered and closed, which is what
 /// [`crate::handle_connection`](crate) does with every response, so the
 /// unread body dies with the socket rather than being read into memory to be
-/// thrown away.
-async fn refuse_upload<S>(
+/// thrown away. That property is what lets a resumed chunk be refused on its
+/// offset without the client's gigabyte ever being read.
+///
+/// `direction` is the word the report is logged under, so an upload that never
+/// started and a resume that never started are told apart in the daemon's log.
+async fn refuse_bytes<S>(
     stream: &mut S,
     share: &str,
+    direction: &'static str,
     response: &Response,
 ) -> std::io::Result<Report>
 where
@@ -1086,7 +1505,7 @@ where
 {
     let status = response.status.code();
     write_response(stream, response).await?;
-    Ok(Report { share: share.to_owned(), direction: "upload", bytes: 0, status })
+    Ok(Report { share: share.to_owned(), direction, bytes: 0, status })
 }
 
 /// Writes a complete response — head and in-memory body — to a socket.
@@ -1213,5 +1632,121 @@ mod tests {
         assert!(printed.contains("vault"), "{printed}");
         let debugged = format!("{report:?}");
         assert!(!debugged.contains('/'), "a report must not carry a path: {debugged}");
+    }
+
+    /// The resumable sessions provide a ticket that a caller can use to resume
+    /// an upload, and the offset is validated to prevent out-of-order appends.
+    #[tokio::test]
+    async fn a_resumable_upload_session_is_created_and_progressed() {
+        let root = std::env::temp_dir()
+            .join(format!("selfhost-storage-admin-resume-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("a scratch directory");
+
+        let share = selfhost_storage::share::Share::new(
+            &selfhost_storage::share::Reserved::new(std::env::temp_dir().join("unused"), None)
+                .expect("reserved"),
+            "vault",
+            &root,
+            false,
+            true,
+            None,
+        ).expect("a legal share");
+        let volume = Arc::new(
+            selfhost_storage::api::Volume::open(
+                share,
+                Arc::new(selfhost_storage::quota::Ledger::new()),
+            )
+            .expect("the root opens"),
+        );
+        let who = selfhost_identity::Identity::Owner;
+        let uploads = Arc::new(Sessions::new());
+
+        // Begin a session for a 100-byte file.
+        let result = begin_session(&volume, &who, "/test.bin", "100", &uploads).await;
+        assert_eq!(result.status.code(), 200);
+        let body = match &result.body {
+            Body::Bytes(b) => String::from_utf8(b.clone()).expect("valid json"),
+            _ => panic!("expected bytes"),
+        };
+        let json = selfhost_json::parse(&body).expect("valid json");
+        let ticket_str = json
+            .get("ticket")
+            .and_then(Json::as_str)
+            .expect("ticket present");
+        let offset = json
+            .get("offset")
+            .and_then(|v| v.as_f64())
+            .expect("offset present");
+        assert_eq!(offset, 0.0);
+
+        // Query the session.
+        let progress = query_session(ticket_str, &uploads).await;
+        assert_eq!(progress.status.code(), 200);
+        let body = match &progress.body {
+            Body::Bytes(b) => String::from_utf8(b.clone()).expect("valid json"),
+            _ => panic!("expected bytes"),
+        };
+        let json = selfhost_json::parse(&body).expect("valid json");
+        assert_eq!(json.get("offset").and_then(|v| v.as_f64()), Some(0.0));
+        assert_eq!(json.get("declared").and_then(|v| v.as_f64()), Some(100.0));
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A wrong offset is refused with the expected offset in the response,
+    /// so a client can resume from the right place.
+    #[tokio::test]
+    async fn a_wrong_offset_in_a_resumable_session_is_refused_with_the_expected_one() {
+        let root = std::env::temp_dir()
+            .join(format!("selfhost-storage-admin-wrong-offset-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("a scratch directory");
+
+        let share = selfhost_storage::share::Share::new(
+            &selfhost_storage::share::Reserved::new(std::env::temp_dir().join("unused"), None)
+                .expect("reserved"),
+            "vault",
+            &root,
+            false,
+            true,
+            None,
+        ).expect("a legal share");
+        let volume = Arc::new(
+            selfhost_storage::api::Volume::open(
+                share,
+                Arc::new(selfhost_storage::quota::Ledger::new()),
+            )
+            .expect("the root opens"),
+        );
+        let who = selfhost_identity::Identity::Owner;
+        let uploads = Arc::new(Sessions::new());
+
+        // Begin a session.
+        let result = begin_session(&volume, &who, "/test.bin", "100", &uploads).await;
+        let body = match &result.body {
+            Body::Bytes(b) => String::from_utf8(b.clone()).expect("valid json"),
+            _ => panic!("expected bytes"),
+        };
+        let json = selfhost_json::parse(&body).expect("valid json");
+        let ticket_str = json.get("ticket").and_then(Json::as_str).expect("ticket");
+
+        // Try to append at a wrong offset. The Sessions::append validates it,
+        // returning a WrongOffset failure with the expected value.
+        let ticket_owned = ticket_str.to_string();
+        let sessions_clone = Arc::clone(&uploads);
+        let result = blocking(move || {
+            sessions_clone.append(&ticket_owned, 50, b"wrong offset")
+        }).await;
+
+        match result {
+            Err(Failure::WrongOffset { expected }) => {
+                // The expected offset must be present in the error.
+                assert_eq!(expected, 0, "expected offset must match what was received");
+            }
+            other => panic!("expected WrongOffset, got {other:?}"),
+        }
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

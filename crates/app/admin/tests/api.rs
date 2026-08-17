@@ -1663,6 +1663,222 @@ async fn drive(prefix: Vec<u8>, request: Request, plan: storage_api::Bulk) -> St
     String::from_utf8_lossy(&written).into_owned()
 }
 
+/// The JSON body of a raw response the bulk plane wrote to a socket.
+///
+/// The bulk plane writes its own head, so a test that wants to read what it
+/// said has to split the body off itself. Worth doing rather than matching on
+/// the text: the number in a `wrong-offset` refusal is the whole point of that
+/// refusal, and a `contains` check would pass on a body that merely mentioned
+/// it somewhere.
+fn answered_json(answer: &str) -> Json {
+    let body = answer.split_once("\r\n\r\n").map(|(_, body)| body).unwrap_or("");
+    selfhost_json::parse(body).expect("the bulk plane answers JSON")
+}
+
+#[tokio::test]
+async fn an_interrupted_upload_resumes_from_the_offset_the_session_reports() {
+    // The end-to-end resume, driven through the real routes rather than
+    // through `Sessions` — because the defect this test exists for was
+    // *between* the two. Every piece of the session machinery worked in
+    // isolation and no production caller ever appended a byte, so a client
+    // could begin a session, read an offset that was zero for ever, and finish
+    // an empty file while the API reported a live upload.
+    let (api, dir) = storage_api_with_shares("bulk-resume");
+
+    // Patterned rather than repetitive, so a file assembled in the wrong order,
+    // or with a chunk written twice, cannot pass by luck.
+    let whole: Vec<u8> = (0..200_000u32).map(|index| (index % 251) as u8).collect();
+
+    // 1. Begin, over the control route a client actually calls.
+    let (status, begun) = send(
+        &api,
+        "POST",
+        &format!("/api/storage/shares/vault/sessions?path=/big.bin&size={}", whole.len()),
+        "",
+    )
+    .await;
+    assert_eq!(status, 200, "{begun:?}");
+    let ticket = begun.get("ticket").and_then(Json::as_str).expect("a ticket").to_owned();
+    assert_eq!(begun.get("offset").and_then(Json::as_f64), Some(0.0), "a new session is at zero");
+
+    // 2. Send part of it and vanish: the peer promises 120 000 bytes, sends
+    //    70 000 and hangs up, which is what a tunnel dropping looks like.
+    let promised = 120_000usize;
+    let delivered = 70_000usize;
+    let (request, _) = request_with(
+        "PUT",
+        &format!("/api/storage/blob/vault/big.bin?ticket={ticket}&offset=0"),
+        Some(TOKEN),
+        &[("Content-Length", &promised.to_string())],
+        "",
+    );
+    let plan = api.bulk_for(&request).expect("the owner may write");
+    let (mut ours, theirs) = tokio::io::duplex(64 * 1024);
+    let first = whole[..delivered].to_vec();
+    let feeder = tokio::spawn(async move {
+        let mut theirs = theirs;
+        tokio::io::AsyncWriteExt::write_all(&mut theirs, &first).await.expect("the first part");
+        tokio::io::AsyncWriteExt::shutdown(&mut theirs).await.expect("half-closed");
+        let mut answer = Vec::new();
+        theirs.read_to_end(&mut answer).await.expect("the answer is readable");
+        answer
+    });
+    let report = storage_api::serve(&mut ours, Vec::new(), &request, plan)
+        .await
+        .expect("the transfer is answered");
+    drop(ours);
+    feeder.await.expect("the feeder finished");
+    assert_eq!(report.status, 400, "a body that stopped short is still the request's fault");
+    assert_eq!(report.bytes, delivered as u64, "what arrived is what was counted");
+
+    // 3. Ask where it got to. This is the assertion the defect fails: with no
+    //    production caller for `Sessions::append` the answer stays zero and the
+    //    client restarts from the beginning for ever.
+    let (status, progress) =
+        send(&api, "GET", &format!("/api/storage/shares/vault/sessions/{ticket}"), "").await;
+    assert_eq!(status, 200, "{progress:?}");
+    let offset = progress.get("offset").and_then(Json::as_f64).expect("an offset") as u64;
+    assert_ne!(offset, 0, "an interrupted upload that reports zero has not resumed anything");
+    assert_eq!(offset, delivered as u64, "the session kept exactly what landed");
+
+    // 4. A client that seeks to the wrong place is told the right one, in the
+    //    body, before it spends its uplink on bytes that cannot be taken.
+    let (request, _) = request_with(
+        "PUT",
+        &format!("/api/storage/blob/vault/big.bin?ticket={ticket}&offset=0"),
+        Some(TOKEN),
+        &[("Content-Length", "10")],
+        "",
+    );
+    let plan = api.bulk_for(&request).expect("the owner may write");
+    let answer = drive(whole[..10].to_vec(), request, plan).await;
+    assert!(answer.starts_with("HTTP/1.1 409"), "{answer}");
+    let refusal = answered_json(&answer);
+    assert_eq!(refusal.get("error").and_then(Json::as_str), Some("wrong-offset"));
+    assert_eq!(
+        refusal.get("offset").and_then(Json::as_f64),
+        Some(delivered as f64),
+        "the refusal has to carry the offset to seek to, or the client is stuck"
+    );
+
+    // 5. Resume from the reported offset with the rest of the file.
+    let rest = whole[offset as usize..].to_vec();
+    let (request, _) = request_with(
+        "PUT",
+        &format!("/api/storage/blob/vault/big.bin?ticket={ticket}&offset={offset}"),
+        Some(TOKEN),
+        &[("Content-Length", &rest.len().to_string())],
+        "",
+    );
+    let plan = api.bulk_for(&request).expect("the owner may write");
+    let answer = drive(rest, request, plan).await;
+    assert!(answer.starts_with("HTTP/1.1 200"), "{answer}");
+    let accepted = answered_json(&answer);
+    assert_eq!(
+        accepted.get("offset").and_then(Json::as_f64),
+        Some(whole.len() as f64),
+        "an accepted chunk answers with the new offset, so the client needs no second request"
+    );
+
+    // 6. Finish, over the control route again.
+    let (status, done) = send(
+        &api,
+        "POST",
+        &format!("/api/storage/shares/vault/sessions/{ticket}?finish=1"),
+        "",
+    )
+    .await;
+    assert_eq!(status, 200, "{done:?}");
+
+    // 7. The file on disk is what was sent, byte for byte.
+    let landed = std::fs::read(dir.path().join("vault").join("big.bin")).expect("the file");
+    assert_eq!(landed.len(), whole.len(), "the whole declared length is on disk");
+    assert!(landed == whole, "the resumed file must be byte-for-byte what was sent");
+}
+
+#[tokio::test]
+async fn a_ticket_cannot_carry_bytes_into_a_share_it_was_not_minted_for() {
+    // A ticket is a capability naming one session, and the URL is what decides
+    // which share's capability the caller had to hold. If the two were never
+    // compared, a ticket that leaked out of a `vault` upload plus a write
+    // capability on some other share would put the holder's bytes into `vault`
+    // — a share they were never granted. The refusal is the same 404 an unknown
+    // ticket gets, so nobody can use the difference to confirm that somebody
+    // else's upload exists.
+    let (api, dir) = storage_api_with_shares("bulk-resume-cross-share");
+
+    let (status, begun) = send(
+        &api,
+        "POST",
+        "/api/storage/shares/vault/sessions?path=/secret.bin&size=64",
+        "",
+    )
+    .await;
+    assert_eq!(status, 200, "{begun:?}");
+    let ticket = begun.get("ticket").and_then(Json::as_str).expect("a ticket").to_owned();
+
+    // The same ticket, presented on a different share's blob path.
+    let (request, _) = request_with(
+        "PUT",
+        &format!("/api/storage/blob/photos/secret.bin?ticket={ticket}&offset=0"),
+        Some(TOKEN),
+        &[("Content-Length", "4")],
+        "",
+    );
+    let plan = api.bulk_for(&request).expect("the owner may write to photos");
+    let answer = drive(b"oops".to_vec(), request, plan).await;
+    assert!(answer.starts_with("HTTP/1.1 404"), "{answer}");
+    assert_eq!(
+        answered_json(&answer).get("error").and_then(Json::as_str),
+        Some("no-session"),
+        "a ticket on another share is answered as though it named no session at all"
+    );
+
+    // Nothing moved, in either share: not the session's offset, and not a file
+    // under the name the URL supplied.
+    let (_, progress) =
+        send(&api, "GET", &format!("/api/storage/shares/vault/sessions/{ticket}"), "").await;
+    assert_eq!(progress.get("offset").and_then(Json::as_f64), Some(0.0));
+    assert!(!dir.path().join("photos").join("secret.bin").exists(), "nothing was written");
+}
+
+#[tokio::test]
+async fn a_put_with_no_ticket_is_the_ordinary_upload_it_always_was() {
+    // The resume parameters are additive: without `?ticket=` the bulk plane
+    // must behave exactly as it did, including refusing an offset it has no
+    // session to check it against.
+    let (api, dir) = storage_api_with_shares("bulk-resume-absent");
+
+    let (request, body) = request_with(
+        "PUT",
+        "/api/storage/blob/vault/plain.txt?offset=99",
+        Some(TOKEN),
+        &[],
+        "written the old way",
+    );
+    let plan = api.bulk_for(&request).expect("the owner may write");
+    assert!(
+        matches!(plan.transfer, storage_api::Transfer::Upload { .. }),
+        "no ticket means the plan is the ordinary upload it always was"
+    );
+    let answer = drive(body, request, plan).await;
+    assert!(answer.starts_with("HTTP/1.1 200"), "{answer}");
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("vault").join("plain.txt")).expect("the file"),
+        "written the old way"
+    );
+
+    // And an offset that is not a number is refused rather than guessed at.
+    let (request, _) = request_with(
+        "PUT",
+        "/api/storage/blob/vault/plain.txt?ticket=deadbeef&offset=soon",
+        Some(TOKEN),
+        &[("Content-Length", "4")],
+        "",
+    );
+    assert!(matches!(api.bulk_for(&request), Err(Denied::BadOffset)));
+}
+
 // ---- WebDAV -----------------------------------------------------------------
 //
 // The rules about *what a path may reach*, what a `207` looks like and what a
