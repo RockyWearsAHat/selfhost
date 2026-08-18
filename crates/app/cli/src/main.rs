@@ -102,6 +102,17 @@ Commands
                              self-repair loop measures, so the two cannot
                              disagree. Exits non-zero if anything that is running
                              is not serving.
+  converge [--once] [--passes <n>] [--interval <seconds>]
+                             Run the daemon's own self-repair loop here, in the
+                             foreground, for a bounded number of passes: probe,
+                             restart what is separately registered and not
+                             serving, and append every transition to
+                             <data_dir>/repair.log. The same code the daemon
+                             runs, so proving it here proves the daemon's. It
+                             really restarts things; do not run it while the
+                             daemon is running, or two convergers will each
+                             restart the same service. Exits non-zero if
+                             supervision has given up on anything.
   watch-dns [--bind <addr>] [--upstream <addr>]
                              Answer DNS for the network and name the device
                              asking for a residential proxy service
@@ -263,6 +274,7 @@ fn main() -> ExitCode {
         "site" => find_config().and_then(|path| site::run(&arguments, &path)),
         "doctor" => doctor_command(&arguments),
         "health" => health_command(),
+        "converge" => converge_command(&arguments),
         "watch-dns" => watch_command(&arguments),
         "dns" => dns_command(&arguments),
         "serve-dns" => serve_dns_command(&arguments),
@@ -561,6 +573,96 @@ fn health_command() -> Result<(), String> {
         1 => Err("1 part of this deployment is running and not serving".into()),
         many => Err(format!("{many} parts of this deployment are running and not serving")),
     }
+}
+
+/// Runs the daemon's own self-repair loop in the foreground, for a bounded
+/// number of passes.
+///
+/// # Why a command exists for a loop that lives in the daemon
+///
+/// `crates/app/cli/src/converge.rs` is the code that notices a component has
+/// stopped serving and restarts it, and on Windows every step it takes is a
+/// `schtasks` invocation. Until this command existed, the only way to execute
+/// any of that was to run the production daemon and wait for something to break
+/// — so the whole path shipped unexecuted, which `docs/labs/supervision-lab.dx`
+/// says plainly in its own "what is unverified" section. A supervisor proved by
+/// argument rather than by running it is exactly the class of thing this lab was
+/// written to distrust.
+///
+/// This is the *same* [`converge::ConvergeLoop`] the daemon drives, on the same
+/// registrations and writing the same ledger; only the pacing and the stopping
+/// differ. Nothing here is a test double.
+///
+/// # It really does repair
+///
+/// This restarts services and rewrites registration settings, because a rehearsal
+/// that stopped short of acting would prove nothing about the three `schtasks`
+/// calls that were the untested part. `--dry-run` is deliberately *not* offered:
+/// there is already a command that looks without touching (`selfhost health`,
+/// and `selfhost service check` without `--repair`), and a third mode whose
+/// output resembles a repair without being one is how a document ends up
+/// claiming a path ran.
+///
+/// Do not run it while the daemon is running its own loop: two convergers would
+/// each restart the same task and each read the other's repair as its own.
+fn converge_command(arguments: &[String]) -> Result<(), String> {
+    let (config, project_dir) = load()?;
+    let data_dir = teardown::data_dir(&config, &project_dir);
+
+    let passes: u32 = match value_of(arguments, "--passes") {
+        Some(given) => given.parse().map_err(|_| format!("--passes {given}: expected a number"))?,
+        None if arguments.iter().any(|a| a == "--once") => 1,
+        None => 10,
+    };
+    let interval = match value_of(arguments, "--interval") {
+        Some(given) => Duration::from_secs(
+            given.parse().map_err(|_| format!("--interval {given}: expected whole seconds"))?,
+        ),
+        None => converge::PASS_INTERVAL,
+    };
+    if passes == 0 {
+        return Err("--passes 0 would converge nothing".into());
+    }
+
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| format!("could not start the async runtime: {e}"))?;
+
+    let ledger_path = converge::Ledger::in_dir(&data_dir).path().to_path_buf();
+    println!(
+        "converging {passes} pass(es), {}s apart; every transition is appended to {}",
+        interval.as_secs(),
+        ledger_path.display()
+    );
+
+    runtime.block_on(async {
+        let mut loop_ = converge::ConvergeLoop::new(&data_dir);
+        for pass in 1..=passes {
+            if pass > 1 {
+                tokio::time::sleep(interval).await;
+            }
+            println!("-- pass {pass} of {passes}");
+            // The drift check runs on the first pass and then not again for this
+            // run: a foreground run is minutes long and a registration's settings
+            // change only when a person changes them, so re-querying the
+            // scheduler every pass would be noise with a subprocess behind it.
+            loop_.pass(&config, &project_dir, converge::DRIFT_INTERVAL).await;
+        }
+    });
+
+    // Non-zero if supervision has given up on anything, so this is usable as a
+    // gate. `outstanding` is the same reading `selfhost doctor` reports, so the
+    // two cannot disagree about whether the box is in hand.
+    let outstanding = converge::Ledger::in_dir(&data_dir).outstanding();
+    if outstanding.is_empty() {
+        println!("\nnothing is escalated");
+        return Ok(());
+    }
+    for entry in &outstanding {
+        println!("  ESCALATED  {}  {}", entry.component, entry.detail);
+    }
+    Err(format!("supervision has given up on {} component(s)", outstanding.len()))
 }
 
 /// The value following a named option, if it was given.
