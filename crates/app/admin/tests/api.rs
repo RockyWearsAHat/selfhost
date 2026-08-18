@@ -3305,7 +3305,7 @@ async fn a_grant_written_through_the_api_is_the_grant_the_policy_then_enforces()
     let api = api.with_people(People::load(dir.path()));
 
     let (status, body) =
-        as_owner(&api, "PUT", "/api/people/mom", r#"{"grants":["console.read","mail.admin"]}"#).await;
+        as_owner(&api, "PUT", "/api/people/mom", r#"{"grants":["console.read","node.admin"]}"#).await;
     assert_eq!(status, 200, "{body:?}");
     assert_eq!(body.get("name").and_then(Json::as_str), Some("mom"));
 
@@ -3322,7 +3322,10 @@ async fn a_grant_written_through_the_api_is_the_grant_the_policy_then_enforces()
         .iter()
         .filter_map(Json::as_str)
         .collect();
-    assert_eq!(held, ["console.read", "mail.admin"]);
+    // `node.admin` rather than `mail.admin`, which reads the same and is no
+    // longer grantable: nothing consumes it, so `grants_from_body` refuses it
+    // at the seam. See `Capability::is_honoured`.
+    assert_eq!(held, ["console.read", "node.admin"]);
 
     // And it is a whole-set write: submitting a smaller set takes the rest away
     // rather than adding to it.

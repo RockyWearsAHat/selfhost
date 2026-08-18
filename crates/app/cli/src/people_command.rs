@@ -11,6 +11,16 @@
 //! and both writers persist the same way — a private temporary file and a
 //! rename — so a change made here is a change the running daemon honours.
 //!
+//! That last clause was **untrue between this command shipping and 2026-08-18**,
+//! and it is worth leaving the correction here rather than quietly fixing the
+//! sentence. `People` snapshotted the file when it was constructed, and the
+//! daemon constructs one at start-up and keeps it, so a grant written here was
+//! invisible to the running box until it restarted — and, far worse, so was a
+//! revocation. `selfhost people deny` printed a confident ✓ and changed nothing
+//! about what the person could actually still do. The fix is in
+//! `selfhost_identity::registry`'s `Stored`; the property is pinned by
+//! `a_handle_answers_for_the_file_and_not_for_the_moment_it_was_built`.
+//!
 //! # Grants are stated whole, and shown before they are written
 //!
 //! `grant` takes the complete set a person is to hold, exactly as the API's
@@ -20,6 +30,8 @@
 //! read back before it is a fact.
 
 use selfhost_admin::invite::{DEFAULT_TTL_HOURS, Invites};
+use selfhost_identity::audit::{AuditLog, AuditRecord, Authority};
+use selfhost_identity::{Credential, Decision, Identity};
 use selfhost_config::Config;
 use selfhost_identity::{Capability, Grants, People, Person, PersonName};
 use std::path::Path;
@@ -77,10 +89,14 @@ pub fn run(arguments: &[String], data_dir: &Path, config: &Config) -> Result<(),
             Ok(())
         }
         Some("show") => show(&people, name_argument(arguments)?, data_dir),
-        Some("grant") => set(&people, name_argument(arguments)?, wanted(arguments)?),
-        Some("allow") => amend(&people, name_argument(arguments)?, wanted(arguments)?, Amend::Add),
-        Some("deny") => amend(&people, name_argument(arguments)?, wanted(arguments)?, Amend::Take),
-        Some("forget") => forget(&people, name_argument(arguments)?),
+        Some("grant") => set(&people, data_dir, name_argument(arguments)?, wanted(arguments)?),
+        Some("allow") => {
+            amend(&people, data_dir, name_argument(arguments)?, wanted(arguments)?, Amend::Add)
+        }
+        Some("deny") => {
+            amend(&people, data_dir, name_argument(arguments)?, wanted(arguments)?, Amend::Take)
+        }
+        Some("forget") => forget(&people, data_dir, name_argument(arguments)?),
         Some("invite") => invite(&people, data_dir, config, arguments),
         Some("invited") => invited(data_dir),
         Some("uninvite") => uninvite(data_dir, name_argument(arguments)?),
@@ -133,9 +149,11 @@ fn invite(
         let before = people.find(&name).map(|person| person.grants).unwrap_or_else(Grants::none);
         let after = Grants::new(capabilities)
             .map_err(|_| "too many capabilities for one person".to_owned())?;
+        let written = spell(&after);
         people
             .set_grants(&name, after)
             .map_err(|error| format!("could not write the registry: {error}"))?;
+        record(data_dir, Authority::GrantsChanged, name.as_str(), &format!("now:{written}"));
         println!("✓ {name}");
         println!("  was: {}", spell(&before));
         match people.find(&name) {
@@ -149,6 +167,14 @@ fn invite(
     let code = Invites::load(data_dir)
         .mint(&name, hours)
         .map_err(|error| format!("could not write the invitation: {error}"))?;
+    // Never the code itself: it exists in exactly one readable place by design,
+    // and a log file in the same directory as its digest would be a second.
+    record(
+        data_dir,
+        Authority::InvitationMinted,
+        name.as_str(),
+        &format!("hours:{hours} holds:{}", if holds_nothing { "nothing" } else { "grants" }),
+    );
 
     println!("✓ an invitation for {name}, good for {hours} hours and usable once");
     println!();
@@ -245,6 +271,12 @@ fn invited(data_dir: &Path) -> Result<(), String> {
 fn uninvite(data_dir: &Path, name: PersonName) -> Result<(), String> {
     match Invites::load(data_dir).revoke(&name) {
         Ok(true) => {
+            record(
+                data_dir,
+                Authority::InvitationWithdrawn,
+                name.as_str(),
+                "invitation withdrawn before use",
+            );
             println!("✓ the invitation for {name} is withdrawn and its code opens nothing");
             println!();
             println!(
@@ -374,14 +406,62 @@ fn parse_list(text: &str) -> Result<Vec<Capability>, String> {
         .map(str::trim)
         .filter(|word| !word.is_empty())
         .map(|word| {
-            Capability::parse(word).ok_or_else(|| {
+            let capability = Capability::parse(word).ok_or_else(|| {
                 format!(
                     "\"{word}\" is not a capability this deployment knows, or it is missing the \
                      target it takes; run `selfhost people capabilities` for the list"
                 )
-            })
+            })?;
+            // The same refusal `PUT /api/people/<name>` makes, for the same
+            // reason and from the same predicate: a word nothing honours is a
+            // promise, and the granting seam is the only place the operator can
+            // be told before they rely on it. Two seams, one rule, stated in
+            // `Capability::is_honoured` and read here rather than repeated.
+            if !capability.is_honoured() {
+                return Err(format!(
+                    "\"{word}\" is a real capability that nothing in this deployment honours \
+                     yet: no route asks for it, so granting it would record a power {} \
+                     and you would believe you had delegated something you had not",
+                    "its holder cannot use",
+                ));
+            }
+            Ok(capability)
         })
         .collect()
+}
+
+/// Writes down an act of authority the CLI performed.
+///
+/// # Why this command writes to the trail at all
+///
+/// Because it writes the registry. The console's routes were given audit
+/// records on 2026-08-18; this command is the *other* writer of the same file,
+/// and a trail that recorded only the half of the writes that went through the
+/// browser would be worse than none — it would read as complete. `via:cli` is
+/// in every detail below so an operator can tell which door a change came
+/// through, since the two have genuinely different threat models: the console
+/// needs a passkey, and this needs a shell on the box.
+///
+/// Recorded as [`Identity::Owner`] with [`Credential::Bearer`], matching
+/// `crates/app/cli/src/audit.rs`: a process that can read and write the data
+/// directory holds everything the bearer token holds, and claiming a passkey
+/// was presented would be the log inventing a ceremony that did not happen.
+fn record(data_dir: &Path, authority: Authority, subject: &str, detail: &str) {
+    let log = AuditLog::in_dir(data_dir);
+    let wrote = AuditRecord::now(
+        Identity::Owner,
+        Credential::Bearer,
+        authority.against(subject),
+        Decision::Allow,
+        format!("{detail} via:cli"),
+    )
+    .and_then(|record| log.append(&record));
+    if let Err(error) = wrote {
+        eprintln!(
+            "  ! could not write {} ({error}); this change happened and is unlogged",
+            log.path().display()
+        );
+    }
 }
 
 /// Everyone who has registered a passkey under a name that could be a person's,
@@ -526,15 +606,21 @@ fn print_person(person: &Person) {
 }
 
 /// Replaces a person's set with exactly `capabilities`.
-fn set(people: &People, name: PersonName, capabilities: Vec<Capability>) -> Result<(), String> {
+fn set(
+    people: &People,
+    data_dir: &Path,
+    name: PersonName,
+    capabilities: Vec<Capability>,
+) -> Result<(), String> {
     let before = people.find(&name).map(|person| person.grants).unwrap_or_else(Grants::none);
     let after = Grants::new(capabilities).map_err(|_| "too many capabilities for one person".to_owned())?;
-    write(people, &name, &before, after)
+    write(people, data_dir, &name, &before, after)
 }
 
 /// Adds to or takes from what a person already holds.
 fn amend(
     people: &People,
+    data_dir: &Path,
     name: PersonName,
     capabilities: Vec<Capability>,
     how: Amend,
@@ -553,18 +639,28 @@ fn amend(
             }
         }
     }
-    write(people, &name, &before, after)
+    write(people, data_dir, &name, &before, after)
 }
 
 /// Persists a change and reports it as a before and an after.
-fn write(people: &People, name: &PersonName, before: &Grants, after: Grants) -> Result<(), String> {
+fn write(
+    people: &People,
+    data_dir: &Path,
+    name: &PersonName,
+    before: &Grants,
+    after: Grants,
+) -> Result<(), String> {
     let unchanged = before == &after;
+    let written = spell(&after);
     people
         .set_grants(name, after)
         .map_err(|error| format!("could not write the registry: {error}"))?;
     if unchanged {
+        // No record: the trail says what changed, and nothing did. A line here
+        // would make re-running a command look like a second permission change.
         println!("✓ {name} already held exactly that; nothing changed");
     } else {
+        record(data_dir, Authority::GrantsChanged, name.as_str(), &format!("now:{written}"));
         println!("✓ {name}");
         println!("  was: {}", spell(before));
         match people.find(name) {
@@ -574,8 +670,9 @@ fn write(people: &People, name: &PersonName, before: &Grants, after: Grants) -> 
     }
     println!();
     println!(
-        "  Takes effect on the daemon's next read of the registry. They also need a passkey \
-         registered under the name {name} before any of this can be used."
+        "  In effect now: a running daemon re-reads this file, so this needs no restart. \
+         They also need a passkey registered under the name {name} before any of this can \
+         be used."
     );
     Ok(())
 }
@@ -593,9 +690,10 @@ fn spell(grants: &Grants) -> String {
 }
 
 /// Removes an entry entirely.
-fn forget(people: &People, name: PersonName) -> Result<(), String> {
+fn forget(people: &People, data_dir: &Path, name: PersonName) -> Result<(), String> {
     match people.remove(&name) {
         Ok(true) => {
+            record(data_dir, Authority::PersonForgotten, name.as_str(), "removed from the registry");
             println!("✓ {name} is no longer in the registry and holds nothing");
             println!();
             println!(
@@ -612,10 +710,18 @@ fn forget(people: &People, name: PersonName) -> Result<(), String> {
 /// The capability vocabulary, from the API's own list rather than a second copy.
 fn vocabulary() -> String {
     let mut text = String::from("Every capability word, and the target it takes:\n\n");
-    for (word, target) in selfhost_admin::people_api::VOCABULARY {
-        match target {
-            Some(kind) => text.push_str(&format!("  {word}:<{kind}>\n")),
-            None => text.push_str(&format!("  {word}\n")),
+    for (word, target, grantable) in selfhost_admin::people_api::VOCABULARY {
+        let spelled = match target {
+            Some(kind) => format!("  {word}:<{kind}>"),
+            None => format!("  {word}"),
+        };
+        // Shown rather than hidden, and marked rather than silently refused on
+        // submit: an operator planning who gets what is entitled to know that a
+        // word exists and is not yet wired to anything.
+        if grantable {
+            text.push_str(&format!("{spelled}\n"));
+        } else {
+            text.push_str(&format!("{spelled:<28}(no route honours this yet; not grantable)\n"));
         }
     }
     text
@@ -757,14 +863,40 @@ allowed_cidrs = ["10.66.0.0/24"]
     fn every_word_the_help_advertises_is_a_word_that_parses() {
         // USAGE lists the vocabulary for a person reading it; this is the guard
         // that keeps that copy honest against the enum that enforces it.
-        for (word, target) in selfhost_admin::people_api::VOCABULARY {
+        for (word, target, grantable) in selfhost_admin::people_api::VOCABULARY {
             assert!(USAGE.contains(word), "{word} is missing from the help text");
             let spelling = match target {
                 Some("share") => format!("{word}:vault"),
                 Some(_) => format!("{word}:alex-desktop"),
                 None => word.to_owned(),
             };
-            assert!(Capability::parse(&spelling).is_some(), "{spelling}");
+            let capability = Capability::parse(&spelling).expect(&spelling);
+            // And `parse_list` — the seam this command grants through — agrees
+            // with the table about which words are offerable. A help text that
+            // advertises a word the command then refuses is worse than one that
+            // omits it.
+            assert_eq!(
+                parse_list(&spelling).is_ok(),
+                grantable,
+                "{word}: the help text and `parse_list` disagree",
+            );
+            assert_eq!(capability.is_honoured(), grantable, "{word}");
+        }
+    }
+
+    #[test]
+    fn the_help_says_which_words_are_not_grantable_yet() {
+        // The three that exist and open nothing are shown rather than hidden —
+        // an operator planning who gets what is entitled to know a word exists
+        // and is not wired to anything — but they are marked, so nobody plans
+        // around one.
+        let listed = vocabulary();
+        for word in ["site.admin", "dns.admin", "mail.admin"] {
+            let line = listed
+                .lines()
+                .find(|line| line.trim_start().starts_with(word))
+                .unwrap_or_else(|| panic!("{word} is missing from `people capabilities`"));
+            assert!(line.contains("not grantable"), "{word} is offered without a caveat: {line}");
         }
     }
 }

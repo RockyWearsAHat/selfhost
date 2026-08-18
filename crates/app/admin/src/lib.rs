@@ -44,6 +44,7 @@
 
 pub mod audit_api;
 pub mod dav_api;
+pub mod device_password;
 pub mod desk_api;
 pub mod invite;
 pub mod mesh_api;
@@ -79,6 +80,7 @@ use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
+pub use device_password::DevicePasswords;
 pub use passwd::ConsolePassword;
 pub use session::{Authenticated, FailureGate, Sessions};
 pub use dav_api::Webdav;
@@ -141,6 +143,16 @@ pub struct Api {
     /// from this registry, and a person with no registry to be found in holds
     /// exactly what a person with an empty entry holds, which is nothing.
     people: Option<People>,
+    /// The per-person storage passwords, so a share can be mounted by somebody
+    /// who is not the operator.
+    ///
+    /// `None` until a data directory has been named, and `None` means nobody has
+    /// a device password — which sends every WebDAV user name to the deployment's
+    /// door, exactly as it behaved before this store existed. It is a handle onto
+    /// a file rather than a loaded table, because its writer is the CLI in a
+    /// different process; see [`device_password`] for why that distinction is the
+    /// whole design.
+    device_passwords: Option<device_password::DevicePasswords>,
     /// The outstanding invitations: one-time codes that let somebody who is not
     /// the owner register a passkey under a name the owner chose.
     ///
@@ -686,6 +698,7 @@ impl Api {
             streams: Streams::new(),
             policy: Policy::locked_down(),
             people: None,
+            device_passwords: None,
             invites: None,
             storage: None,
             desktop: None,
@@ -783,8 +796,21 @@ impl Api {
     pub fn with_console_auth(self, dir: &Path) -> Self {
         self.with_console_auth_parts(ConsolePassword::load(dir), Sessions::new())
             .with_people(people_registry(dir))
+            .with_device_passwords(device_password::DevicePasswords::in_dir(dir))
             .with_invites(invite::Invites::load(dir))
             .with_audit(selfhost_identity::AuditLog::in_dir(dir))
+    }
+
+    /// Records the per-person storage passwords `/dav` resolves a user name
+    /// against.
+    ///
+    /// Separate from [`Api::with_console_auth`] on the same grounds as
+    /// [`Api::with_people`] — a test hands in a scratch store — and paired with
+    /// it in practice, because a device password is meaningless without the
+    /// registry entry whose grants decide what it opens.
+    pub fn with_device_passwords(mut self, store: device_password::DevicePasswords) -> Self {
+        self.device_passwords = Some(store);
+        self
     }
 
     /// Records the invitation store the invite door reads and the owner's mint
@@ -1110,17 +1136,17 @@ impl Api {
             Route::FirewallState => self.firewall_state().await,
             Route::FirewallReconcile => self.firewall_reconcile().await,
             Route::RegisterChallenge => self.webauthn_register_challenge(),
-            Route::Register => self.webauthn_register(body),
+            Route::Register => self.webauthn_register(&caller, body),
             Route::ListPasskeys => self.webauthn_list(),
-            Route::RemovePasskey(id) => self.webauthn_remove(id),
+            Route::RemovePasskey(id) => self.webauthn_remove(&caller, id),
             Route::WhoAmI => json(Status(200), people_api::whoami_json(&caller)),
             Route::Vocabulary => json(Status(200), people_api::vocabulary_json()),
             Route::ListPeople => self.list_people(),
-            Route::SetGrants(name) => self.set_grants(name, body),
-            Route::ForgetPerson(name) => self.forget_person(name),
-            Route::MintInvite(name) => self.mint_invite(name, body),
+            Route::SetGrants(name) => self.set_grants(&caller, name, body),
+            Route::ForgetPerson(name) => self.forget_person(&caller, name),
+            Route::MintInvite(name) => self.mint_invite(&caller, name, body),
             Route::ListInvites => self.list_invites(),
-            Route::RevokeInvite(name) => self.revoke_invite(name),
+            Route::RevokeInvite(name) => self.revoke_invite(&caller, name),
         }
     }
 
@@ -1145,7 +1171,7 @@ impl Api {
     /// Their name still has to be a name — [`PersonName`] refuses the owner's
     /// spelling in every casing, so no grant written here can touch the
     /// operator's own authority.
-    fn set_grants(&self, name: &str, body: &[u8]) -> Response {
+    fn set_grants(&self, caller: &Caller, name: &str, body: &[u8]) -> Response {
         let Some(people) = &self.people else {
             return problem(Status(404), NO_REGISTRY);
         };
@@ -1160,9 +1186,22 @@ impl Api {
             Ok(grants) => grants,
             Err(refusal) => return problem(Status(400), &refusal.message()),
         };
+        // The words as they will be recorded, taken before the set is moved
+        // into the registry: the audit line has to say *what they now hold*,
+        // and reading it back out of the store afterwards would record what the
+        // store thinks rather than what was asked for.
+        let written = people_api::spell_grants(&grants);
         match people.set_grants(&person, grants) {
             Ok(()) => match people.find(&person) {
-                Some(entry) => json(Status(200), people_api::person_json(&entry)),
+                Some(entry) => {
+                    self.record_authority(
+                        caller,
+                        selfhost_identity::audit::Authority::GrantsChanged,
+                        person.as_str(),
+                        format!("now:{written}"),
+                    );
+                    json(Status(200), people_api::person_json(&entry))
+                }
                 // The registry accepted the write and then could not find the
                 // entry it had just made. Nothing sane produces this; saying so
                 // is better than a 200 over a roster that disagrees with itself.
@@ -1173,7 +1212,7 @@ impl Api {
     }
 
     /// Forgets a person entirely.
-    fn forget_person(&self, name: &str) -> Response {
+    fn forget_person(&self, caller: &Caller, name: &str) -> Response {
         let Some(people) = &self.people else {
             return problem(Status(404), NO_REGISTRY);
         };
@@ -1181,7 +1220,15 @@ impl Api {
             return problem(Status(400), "not a usable person name");
         };
         match people.remove(&person) {
-            Ok(true) => json(Status(200), Json::object([("forgot", Json::string(name))])),
+            Ok(true) => {
+                self.record_authority(
+                    caller,
+                    selfhost_identity::audit::Authority::PersonForgotten,
+                    person.as_str(),
+                    "removed from the registry",
+                );
+                json(Status(200), Json::object([("forgot", Json::string(name))]))
+            }
             Ok(false) => problem(Status(404), "nobody by that name holds anything here"),
             Err(error) => problem(Status(500), &format!("could not save the registry: {error}")),
         }
@@ -1204,7 +1251,7 @@ impl Api {
     /// and almost always a mistake — they would register a passkey, log in, and
     /// find a console with nothing on it. Saying so is cheaper than the support
     /// conversation.
-    fn mint_invite(&self, name: &str, body: &[u8]) -> Response {
+    fn mint_invite(&self, caller: &Caller, name: &str, body: &[u8]) -> Response {
         let Some(invites) = &self.invites else {
             return problem(Status(404), NO_REGISTRY);
         };
@@ -1238,6 +1285,17 @@ impl Api {
             .as_ref()
             .map(|people| people.find(&person).is_none_or(|entry| entry.grants.is_empty()))
             .unwrap_or(true);
+
+        // Never the code — the whole point of the store keeping only a digest
+        // is that the code exists in exactly one readable place, and a log file
+        // beside the digest would be a second. What is worth recording is that
+        // a way in was created, for whom, and how long it lives.
+        self.record_authority(
+            caller,
+            selfhost_identity::audit::Authority::InvitationMinted,
+            person.as_str(),
+            format!("hours:{hours} holds:{}", if holds_nothing { "nothing" } else { "grants" }),
+        );
 
         let mut fields = vec![
             ("name", Json::string(person.as_str())),
@@ -1280,7 +1338,7 @@ impl Api {
     }
 
     /// Withdraws a pending invitation before anybody has used it.
-    fn revoke_invite(&self, name: &str) -> Response {
+    fn revoke_invite(&self, caller: &Caller, name: &str) -> Response {
         let Some(invites) = &self.invites else {
             return problem(Status(404), NO_REGISTRY);
         };
@@ -1288,7 +1346,15 @@ impl Api {
             return problem(Status(400), "not a usable person name");
         };
         match invites.revoke(&person) {
-            Ok(true) => json(Status(200), Json::object([("withdrew", Json::string(name))])),
+            Ok(true) => {
+                self.record_authority(
+                    caller,
+                    selfhost_identity::audit::Authority::InvitationWithdrawn,
+                    person.as_str(),
+                    "invitation withdrawn before use",
+                );
+                json(Status(200), Json::object([("withdrew", Json::string(name))]))
+            }
             Ok(false) => problem(Status(404), "nobody by that name has an invitation pending"),
             Err(error) => {
                 problem(Status(500), &format!("could not save the invitations: {error}"))
@@ -1369,6 +1435,24 @@ impl Api {
                 // Spent only now, with a credential really in existence.
                 let _ = invites.redeem(code);
                 console.gate.reset();
+                // The one line in this trail that is not the owner acting.
+                // Recorded as the *person themselves*, by the passkey they have
+                // just created, because that is literally what happened — and
+                // because writing it as the owner would put a line in the log
+                // saying the operator did something they were not present for.
+                // It is the moment somebody who could not authenticate here
+                // became able to, which makes it the record this file most
+                // needed and least had.
+                self.record_authority(
+                    &Caller::new(
+                        selfhost_identity::Identity::Person(name.clone()),
+                        selfhost_identity::Credential::Passkey,
+                        selfhost_identity::Grants::none(),
+                    ),
+                    selfhost_identity::audit::Authority::InvitationRedeemed,
+                    name.as_str(),
+                    format!("label:{}", passkey.label),
+                );
                 json(
                     Status(200),
                     Json::object([
@@ -1674,7 +1758,7 @@ impl Api {
     /// Answers `POST /api/webauthn/register`: verifies and stores a new
     /// passkey. Behind the wall, but a 401-shaped refusal would mislead an
     /// authenticated caller — a rejected ceremony is this route's 400.
-    fn webauthn_register(&self, body: &[u8]) -> Response {
+    fn webauthn_register(&self, caller: &Caller, body: &[u8]) -> Response {
         let Some((_, webauthn)) = self.webauthn() else {
             return problem(Status(404), "passkey login is not configured on this deployment");
         };
@@ -1682,13 +1766,21 @@ impl Api {
             return problem(Status(400), "body must be a JSON registration");
         };
         match webauthn.register(&registration) {
-            Ok(passkey) => json(
-                Status(200),
-                Json::object([
-                    ("registered", Json::string(passkey.label)),
-                    ("user", Json::string(passkey.user)),
-                ]),
-            ),
+            Ok(passkey) => {
+                self.record_authority(
+                    caller,
+                    selfhost_identity::audit::Authority::PasskeyRegistered,
+                    &passkey.user,
+                    format!("label:{}", passkey.label),
+                );
+                json(
+                    Status(200),
+                    Json::object([
+                        ("registered", Json::string(passkey.label)),
+                        ("user", Json::string(passkey.user)),
+                    ]),
+                )
+            }
             Err(_) => problem(Status(400), "the registration could not be verified"),
         }
     }
@@ -1702,12 +1794,20 @@ impl Api {
     }
 
     /// Answers `DELETE /api/webauthn/credentials/<id>`: revokes one passkey.
-    fn webauthn_remove(&self, id: &str) -> Response {
+    fn webauthn_remove(&self, caller: &Caller, id: &str) -> Response {
         let Some((_, webauthn)) = self.webauthn() else {
             return problem(Status(404), "passkey login is not configured on this deployment");
         };
         match webauthn.remove(id) {
-            Ok(true) => json(Status(200), Json::object([("removed", Json::string(id))])),
+            Ok(true) => {
+                self.record_authority(
+                    caller,
+                    selfhost_identity::audit::Authority::PasskeyRemoved,
+                    id,
+                    "passkey removed",
+                );
+                json(Status(200), Json::object([("removed", Json::string(id))]))
+            }
             Ok(false) => problem(Status(404), "no such passkey"),
             Err(error) => problem(Status(500), &format!("could not save the passkeys: {error}")),
         }
@@ -1789,6 +1889,8 @@ impl Api {
     pub fn dav_wiring(&self) -> Option<dav_api::Wiring<'_>> {
         Some(dav_api::Wiring {
             password: Arc::clone(&self.console.as_ref()?.password),
+            device_passwords: self.device_passwords.clone(),
+            people: self.people.clone(),
             webdav: Arc::clone(self.webdav.as_ref()?),
             volumes: self.storage.as_ref()?,
             policy: self.policy(),
@@ -2321,6 +2423,51 @@ impl Api {
     /// who has already proved they are the owner, but an `io::Error`'s text can
     /// carry a path from a locale-dependent message and there is nothing to gain
     /// by relaying it.
+    /// Writes down an act of authority: who minted, changed or destroyed what.
+    ///
+    /// # Why this is called after the act and not before it
+    ///
+    /// Every caller below records only on the success arm, so the trail says
+    /// *what happened* rather than *what was attempted*. That is the opposite of
+    /// the desktop's rule, where a refused input is still a line, and the reason
+    /// is what the two logs are for: the desktop trail answers "what did this
+    /// session do to my machine", where an attempt is evidence; this one answers
+    /// "who can authenticate here, and who made that so", where an attempt that
+    /// changed nothing changed nothing. A refusal on these routes is a 401 from
+    /// a caller who was not the owner, and the whole set of them from one
+    /// stranger is one fact, not thirteen.
+    ///
+    /// # Why a failure to write is not a failure to act
+    ///
+    /// [`AuditLog::append`] complains on stderr and the act stands, exactly as
+    /// `crates/app/cli`'s auditor does. An operator who cannot revoke somebody's
+    /// access because the disk is full is worse off than one whose revocation is
+    /// unlogged, and the complaint is what stops the loss being silent.
+    fn record_authority(
+        &self,
+        caller: &Caller,
+        authority: selfhost_identity::audit::Authority,
+        subject: &str,
+        detail: impl Into<String>,
+    ) {
+        let Some(log) = &self.audit else { return };
+        let record = selfhost_identity::AuditRecord::now(
+            caller.identity().clone(),
+            caller.credential().clone(),
+            authority.against(subject),
+            selfhost_identity::Decision::Allow,
+            detail,
+        );
+        let wrote = record.and_then(|record| log.append(&record));
+        if let Err(error) = wrote {
+            eprintln!(
+                "admin: could not write {} ({error}); this act of authority happened and is \
+                 unlogged",
+                log.path().display()
+            );
+        }
+    }
+
     fn audit_trail(&self, query: &str) -> Response {
         let Some(log) = &self.audit else {
             // Never wired: no data directory was named, so nothing was ever
