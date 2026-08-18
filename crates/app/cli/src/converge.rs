@@ -504,22 +504,62 @@ impl Ledger {
 /// separate registration, or it would be one more thing that can die quietly and
 /// leave everything looking fine — the exact failure it exists to catch.
 pub async fn converge_forever(config: Config, project_dir: PathBuf, data_dir: PathBuf) -> ! {
-    let ledger = Ledger::in_dir(&data_dir);
-    let mut supervision = Supervision::new();
-    let mut next_drift_check = Instant::now();
-
+    let mut loop_ = ConvergeLoop::new(&data_dir);
     loop {
         // The first pass waits, so the components the daemon has just started
         // have bound their sockets before anything measures them.
         tokio::time::sleep(PASS_INTERVAL).await;
+        loop_.pass(&config, &project_dir, DRIFT_INTERVAL).await;
+    }
+}
 
-        if Instant::now() >= next_drift_check {
-            check_registration_drift(&ledger).await;
-            next_drift_check = Instant::now() + DRIFT_INTERVAL;
+/// The convergence loop's state, held across passes.
+///
+/// Extracted from [`converge_forever`] so that the same passes can be driven from
+/// the foreground by `selfhost converge`, against the same registrations, with the
+/// same ledger. That is not a convenience: the whole of this loop is Windows
+/// service-manager code that had never executed anywhere, and a supervisor whose
+/// only entry point is "run the production daemon for an hour" is a supervisor
+/// that gets proved by argument rather than by running it. One implementation,
+/// two drivers — the daemon's, which never stops, and the operator's, which is
+/// bounded and prints what it is doing.
+#[derive(Debug)]
+pub struct ConvergeLoop {
+    /// Where transitions are written.
+    ledger: Ledger,
+    /// Per-component failure budgets and the last state each was seen in.
+    supervision: Supervision,
+    /// When the registrations are next compared against what they were installed
+    /// as. Immediately, on the first pass, so a drift that is already there is
+    /// reported by the first thing that looks.
+    next_drift_check: Instant,
+}
+
+impl ConvergeLoop {
+    /// A loop with an empty budget table, writing to `<data_dir>/repair.log`.
+    pub fn new(data_dir: &Path) -> Self {
+        Self {
+            ledger: Ledger::in_dir(data_dir),
+            supervision: Supervision::new(),
+            next_drift_check: Instant::now(),
+        }
+    }
+
+    /// One pass: check registration drift if it is due, then probe every
+    /// component and act on what came back.
+    ///
+    /// Nothing is slept here — the caller owns the pacing, because the daemon
+    /// sleeps *before* its first pass so that components it has just started have
+    /// bound their sockets, and a foreground run started by a person wants its
+    /// first pass now.
+    pub async fn pass(&mut self, config: &Config, project_dir: &Path, drift_interval: Duration) {
+        if Instant::now() >= self.next_drift_check {
+            check_registration_drift(&self.ledger).await;
+            self.next_drift_check = Instant::now() + drift_interval;
         }
 
-        for probe in health::probe_all(&config, &project_dir).await {
-            handle(&mut supervision, &ledger, &config, &project_dir, probe).await;
+        for probe in health::probe_all(config, project_dir).await {
+            handle(&mut self.supervision, &self.ledger, config, project_dir, probe).await;
         }
     }
 }
