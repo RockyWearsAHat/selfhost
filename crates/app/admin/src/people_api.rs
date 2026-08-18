@@ -55,6 +55,16 @@ pub enum BadGrants {
     Unknown(String),
     /// More capabilities than [`selfhost_identity::policy::MAX_GRANTS`].
     TooMany,
+    /// A real word from the vocabulary that no route in this deployment
+    /// consumes yet — see [`Capability::is_honoured`]. Carries the word.
+    ///
+    /// Refused rather than stored, because a stored one is a **promise**: the
+    /// operator reads the console row as "she can manage the DNS", stops doing
+    /// it themselves, and the person they delegated to finds that nothing
+    /// happens — with no error and no audit line, because no code path is
+    /// involved at all. A refusal at the moment of granting is the only place
+    /// that misunderstanding can be caught.
+    NotYetHonoured(String),
 }
 
 impl BadGrants {
@@ -74,6 +84,12 @@ impl BadGrants {
                  see /api/people/capabilities for every word and whether it takes a target"
             ),
             Self::TooMany => "too many capabilities for one person".to_owned(),
+            Self::NotYetHonoured(word) => format!(
+                "\"{word}\" is a real capability that nothing in this deployment honours yet: \
+                 no route asks for it, so granting it would record a power its holder cannot \
+                 use and you would believe you had delegated something you had not. \
+                 It becomes grantable in the release that ships the routes behind it"
+            ),
         }
     }
 }
@@ -90,6 +106,9 @@ pub fn grants_from_body(body: &[u8]) -> Result<Grants, BadGrants> {
     for entry in entries {
         let word = entry.as_str().ok_or(BadGrants::NotAString)?;
         let capability = Capability::parse(word).ok_or_else(|| BadGrants::Unknown(word.to_owned()))?;
+        if !capability.is_honoured() {
+            return Err(BadGrants::NotYetHonoured(word.to_owned()));
+        }
         capabilities.push(capability);
     }
     Grants::new(capabilities).map_err(|_| BadGrants::TooMany)
@@ -110,6 +129,20 @@ pub fn person_json(person: &Person) -> Json {
 /// toggled and submitted round-trips exactly.
 pub fn grants_json(grants: &Grants) -> Json {
     Json::array(grants.iter().map(|capability| Json::string(wire_word(capability))))
+}
+
+/// A grant set as one comma-separated field, for an audit line.
+///
+/// The same wire words [`grants_json`] renders, joined — so what the trail says
+/// somebody was given is spelled identically to what the console shows them
+/// holding, and an operator comparing the two is comparing strings rather than
+/// interpreting two formats. An empty set is the word `nothing`, because
+/// `now:` followed by the end of the field reads as a truncated line.
+pub fn spell_grants(grants: &Grants) -> String {
+    if grants.is_empty() {
+        return "nothing".to_owned();
+    }
+    grants.iter().map(wire_word).collect::<Vec<_>>().join(",")
 }
 
 /// A capability as one string: the word, and its target after a colon.
@@ -163,27 +196,41 @@ pub fn whoami_json(caller: &Caller) -> Json {
 /// in every interface, so this list is derived from the same parse function that
 /// enforces it: each entry below is round-tripped through [`Capability::parse`]
 /// in this module's tests.
-pub const VOCABULARY: [(&str, Option<&str>); 12] = [
-    ("console.read", None),
-    ("service.control", None),
-    ("files.read", Some("share")),
-    ("files.write", Some("share")),
-    ("files.admin", None),
-    ("desktop.view", Some("node")),
-    ("desktop.control", Some("node")),
-    ("clipboard.read", Some("node")),
-    ("node.admin", None),
-    ("site.admin", None),
-    ("dns.admin", None),
-    ("mail.admin", None),
+/// Every capability word, its target if it takes one, and whether any route in
+/// this deployment honours it yet.
+///
+/// The third column exists so a console can render an ungrantable word as
+/// exactly that — greyed, with the reason — rather than offering a toggle the
+/// `PUT` will refuse. Kept beside the other two rather than derived at runtime
+/// because this table is what a client draws from before it has a
+/// [`Capability`] to ask, and `honoured_word` below is what stops the two
+/// disagreeing.
+pub const VOCABULARY: [(&str, Option<&str>, bool); 12] = [
+    ("console.read", None, true),
+    ("service.control", None, true),
+    ("files.read", Some("share"), true),
+    ("files.write", Some("share"), true),
+    ("files.admin", None, true),
+    ("desktop.view", Some("node"), true),
+    ("desktop.control", Some("node"), true),
+    ("clipboard.read", Some("node"), true),
+    ("node.admin", None, true),
+    // Real words, no route. See `Capability::is_honoured`.
+    ("site.admin", None, false),
+    ("dns.admin", None, false),
+    ("mail.admin", None, false),
 ];
 
 /// [`VOCABULARY`] as JSON.
 pub fn vocabulary_json() -> Json {
-    Json::array(VOCABULARY.iter().map(|(word, target)| {
+    Json::array(VOCABULARY.iter().map(|(word, target, honoured)| {
         Json::object([
             ("word", Json::string(*word)),
             ("target", target.map_or(Json::Null, Json::string)),
+            // False means the word exists and nothing consumes it: a console
+            // should show it and refuse to offer it, so an operator learns why
+            // rather than finding the toggle rejected on submit.
+            ("grantable", Json::Bool(*honoured)),
         ])
     }))
 }
@@ -228,13 +275,39 @@ mod tests {
     fn every_word_the_vocabulary_advertises_parses() {
         // The guard on the copy: this list lives beside the enum it describes,
         // so it is checked against the parser that enforces the real one.
-        for (word, target) in VOCABULARY {
+        for (word, target, grantable) in VOCABULARY {
             let spelling = match target {
                 Some("share") => format!("{word}:vault"),
                 Some(_) => format!("{word}:alex-desktop"),
                 None => word.to_owned(),
             };
-            assert!(Capability::parse(&spelling).is_some(), "{spelling} did not parse");
+            let capability = Capability::parse(&spelling).expect("{spelling} did not parse");
+            // The third column is the same fact `Capability::is_honoured`
+            // states, not a second opinion about it. Two tables that could
+            // disagree is how a console ends up offering a toggle the `PUT`
+            // refuses.
+            assert_eq!(
+                capability.is_honoured(),
+                grantable,
+                "{word}: the vocabulary and the capability disagree about whether \
+                 anything honours it",
+            );
+        }
+    }
+
+    #[test]
+    fn a_word_nothing_honours_is_refused_rather_than_stored() {
+        // A promise is worse than an absence: the operator reads the row as a
+        // delegation, stops doing the job, and the holder finds that nothing
+        // happens — with no error anywhere, because no code path is involved.
+        for word in ["site.admin", "dns.admin", "mail.admin"] {
+            let body = format!(r#"{{"grants":["console.read","{word}"]}}"#);
+            let refusal = grants_from_body(body.as_bytes()).unwrap_err();
+            assert_eq!(refusal, BadGrants::NotYetHonoured(word.to_owned()));
+            // Whole set or none of it, exactly as an unknown word behaves: a
+            // set applied minus one entry leaves somebody holding what nobody
+            // chose.
+            assert!(refusal.message().contains(word));
         }
     }
 
@@ -245,7 +318,7 @@ mod tests {
         let original = Grants::new([
             Capability::DesktopControl(NodeName::parse("alex-desktop").unwrap()),
             Capability::FilesWrite(ShareId::parse("vault").unwrap()),
-            Capability::MailAdmin,
+            Capability::NodeAdmin,
         ])
         .unwrap();
         let body = format!(r#"{{"grants":{}}}"#, grants_json(&original).to_text());

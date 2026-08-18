@@ -410,7 +410,9 @@ mod tests {
         let log = std::fs::read_to_string(dir.join("audit.log")).expect("the log exists");
         assert_eq!(log.lines().count(), 1, "{log}");
         let line = log.lines().next().unwrap_or_default();
-        assert!(line.contains("capability=node.admin"), "{line}");
+        // `act=` since selfhost-audit/2, which renamed the field because it
+        // started carrying acts of authority that no capability names.
+        assert!(line.contains("act=node.admin"), "{line}");
         assert!(line.contains("detail=invite:alex-desktop"), "{line}");
         assert!(!line.contains(&std::fs::read_to_string(
             owner_token_path(&dir, "alex-desktop")

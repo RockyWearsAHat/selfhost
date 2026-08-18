@@ -290,6 +290,52 @@ impl Capability {
         }
     }
 
+    /// Whether any route in this deployment actually consumes this capability.
+    ///
+    /// # Why a word can exist and open nothing
+    ///
+    /// This vocabulary was written whole, ahead of the subsystems that would
+    /// honour it, because a permission model retrofitted onto a shipped route is
+    /// a model nobody has tested against the route. That was the right order to
+    /// build it in and it left three words —
+    /// [`Capability::SiteAdmin`], [`Capability::DnsAdmin`] and
+    /// [`Capability::MailAdmin`] — that a person can be granted and that no
+    /// handler anywhere asks for. A grant of one of them is a **promise**: a row
+    /// in the console, a line an operator reads as "she can manage the DNS", and
+    /// no code path that agrees.
+    ///
+    /// That is worse than the word not existing. It is a permission an operator
+    /// believes they have delegated, so they stop doing the job themselves, and
+    /// the person they delegated it to cannot do it either — and the failure
+    /// surfaces as neither an error nor an audit line, because nothing happens
+    /// at all. So the granting seams refuse them, naming this method, until the
+    /// routes exist. The variants stay: the model is right and the day
+    /// `site.admin` has a handler this returns `true` and one line changes.
+    ///
+    /// This is deliberately a property of the *capability*, stated once here
+    /// beside the enum, rather than a check copied into each seam that writes a
+    /// grant. There are two such seams today — `PUT /api/people/<name>` and
+    /// `selfhost people grant|allow` — and a rule living in both is a rule that
+    /// gets fixed in one.
+    pub fn is_honoured(&self) -> bool {
+        match self {
+            Self::ConsoleRead
+            | Self::ServiceControl
+            | Self::FilesRead(_)
+            | Self::FilesWrite(_)
+            | Self::FilesAdmin
+            | Self::DesktopView(_)
+            | Self::DesktopControl(_)
+            | Self::ClipboardRead(_)
+            | Self::NodeAdmin => true,
+            // Grep for the name in `crates/app/admin/src/lib.rs`'s `Route::demand`
+            // before flipping one of these: the test
+            // `every_unhonoured_word_is_absent_from_every_routes_demand` is what
+            // holds this list to the truth, and it reads that function.
+            Self::SiteAdmin | Self::DnsAdmin | Self::MailAdmin => false,
+        }
+    }
+
     /// The object this capability is about, for the variants that have one.
     ///
     /// Always a validated token, so a caller rendering it into a log line or a

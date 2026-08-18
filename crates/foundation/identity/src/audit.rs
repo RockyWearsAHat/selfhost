@@ -59,7 +59,18 @@ pub const AUDIT_FILENAME: &str = "audit.log";
 /// Present so a reader can tell at a glance which format it is looking at, and
 /// so the day the fields change there is somewhere to say so rather than a
 /// silent reinterpretation of old lines.
-pub const AUDIT_FORMAT: &str = "selfhost-audit/1";
+pub const AUDIT_FORMAT: &str = "selfhost-audit/2";
+
+/// The marker this format replaced, still accepted by readers.
+///
+/// Version 1 carried a `capability=` field where version 2 carries `act=`. The
+/// rename was not cosmetic: `capability` had become a lie the moment authority
+/// acts started being recorded, because those are precisely the things no
+/// capability names ([`Authority`]). Nothing else about the line changed, so a
+/// reader that handles both is a two-line difference and an existing
+/// `data/audit.log` keeps rendering in the console instead of going blank on
+/// the day of the upgrade — which is the version bump paying for itself.
+pub const AUDIT_FORMAT_V1: &str = "selfhost-audit/1";
 
 /// Bytes of entropy in a record's id: 128 bits, rendered as 32 hex characters.
 ///
@@ -119,6 +130,127 @@ impl fmt::Display for AuditId {
     }
 }
 
+/// An act that creates, changes or destroys the means to authenticate — the
+/// things no [`Capability`] names.
+///
+/// # Why these are not capabilities, and why they are recorded anyway
+///
+/// The permission vocabulary has no word for "may grant", deliberately: a grant
+/// is a power somebody holds until it is taken away, and no grant should ever
+/// confer the ability to mint another. So the routes that write the registry and
+/// mint invitations ask for the owner's identity rather than for a capability —
+/// and that left them, until 2026-08-18, writing **no audit record at all**,
+/// because [`AuditRecord`] was keyed on a `Capability` and there was no honest
+/// word to file them under.
+///
+/// That was the most uncomfortable gap in the trail and the one hardest to
+/// argue away: minting a credential for somebody else is precisely the act an
+/// audit log exists for. Inventing a `Capability::PeopleAdmin` to hold them
+/// would have been the wrong repair — it would put "may grant" into a
+/// vocabulary that refuses to contain it, and something would eventually grant
+/// it. Widening the *record* instead costs one enum and keeps the permission
+/// model exactly as it was.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Authority {
+    /// Somebody's whole grant set was replaced.
+    GrantsChanged,
+    /// A person was removed from the registry entirely.
+    PersonForgotten,
+    /// A one-time invitation code was minted for a name.
+    InvitationMinted,
+    /// A pending invitation was withdrawn before anybody used it.
+    InvitationWithdrawn,
+    /// An invitation was redeemed: a passkey now exists under that name.
+    ///
+    /// The single most consequential line this log carries. Every other entry
+    /// here is the owner acting; this one is somebody who was not previously
+    /// able to authenticate becoming able to, and it is written by the route
+    /// that stands *ahead* of the authorisation wall.
+    InvitationRedeemed,
+    /// A passkey was enrolled for the owner.
+    PasskeyRegistered,
+    /// A passkey was removed.
+    PasskeyRemoved,
+}
+
+impl Authority {
+    /// The word this act is written down as.
+    ///
+    /// Namespaced away from every [`Capability::name`] on purpose: a reader
+    /// grepping the log for `capability=` words must never match one of these,
+    /// because they are not powers anybody was granted.
+    pub fn name(&self) -> &'static str {
+        match self {
+            Self::GrantsChanged => "authority.grants",
+            Self::PersonForgotten => "authority.forget",
+            Self::InvitationMinted => "authority.invite",
+            Self::InvitationWithdrawn => "authority.uninvite",
+            Self::InvitationRedeemed => "authority.redeem",
+            Self::PasskeyRegistered => "authority.enrol",
+            Self::PasskeyRemoved => "authority.unenrol",
+        }
+    }
+}
+
+/// What a record is about.
+///
+/// Either a power from the closed vocabulary, exercised or refused — which is
+/// every record this log carried before 2026-08-18 — or an [`Authority`] act
+/// that has no capability to be filed under. One type so that
+/// [`AuditRecord::line`] has one field to render and a reader has one column to
+/// read, rather than two record shapes that have to be told apart.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Act {
+    /// A capability was exercised, or asked for and refused.
+    Exercised(Capability),
+    /// Authority itself was created, changed or destroyed, and whose it was.
+    ///
+    /// The second field is the subject: the person whose grants changed, the
+    /// name an invitation was minted for, the passkey that was removed. It
+    /// occupies the same `target=` column a capability's share or node does,
+    /// which is what lets one grep answer *everything that has ever concerned
+    /// this person* across both kinds of record.
+    Authority(Authority, String),
+}
+
+impl Act {
+    /// The word written into the `act=` field.
+    pub fn name(&self) -> &str {
+        match self {
+            Self::Exercised(capability) => capability.name(),
+            Self::Authority(authority, _) => authority.name(),
+        }
+    }
+
+    /// What the act was about: a capability's target, or the person or
+    /// credential an authority act concerns.
+    ///
+    /// Returns a `&str` the caller must still escape. A [`Capability`]'s target
+    /// is a validated token and needs none; an [`Authority`]'s subject is a
+    /// [`PersonName`](crate::PersonName) or a passkey id, and the second of
+    /// those is a client-supplied string. [`AuditRecord::line`] escapes the
+    /// field either way, so this distinction never has to be remembered.
+    pub fn target(&self) -> Option<&str> {
+        match self {
+            Self::Exercised(capability) => capability.target(),
+            Self::Authority(_, subject) => Some(subject.as_str()),
+        }
+    }
+}
+
+impl From<Capability> for Act {
+    fn from(capability: Capability) -> Self {
+        Self::Exercised(capability)
+    }
+}
+
+impl Authority {
+    /// This act, against the person or credential it concerns.
+    pub fn against(self, subject: impl Into<String>) -> Act {
+        Act::Authority(self, subject.into())
+    }
+}
+
 /// One decision, as it will be written down.
 ///
 /// A plain record of already-decided facts: it performs no authorisation and
@@ -136,8 +268,9 @@ pub struct AuditRecord {
     pub identity: Identity,
     /// How they had proved it.
     pub credential: Credential,
-    /// What they asked to do.
-    pub capability: Capability,
+    /// What they asked to do: a capability exercised, or an act of authority
+    /// that no capability names.
+    pub act: Act,
     /// What the policy answered.
     pub decision: Decision,
     /// Free text naming the specific thing: a peer address, a file path, a
@@ -155,7 +288,7 @@ impl AuditRecord {
     pub fn now(
         identity: Identity,
         credential: Credential,
-        capability: Capability,
+        act: impl Into<Act>,
         decision: Decision,
         detail: impl Into<String>,
     ) -> io::Result<Self> {
@@ -167,7 +300,7 @@ impl AuditRecord {
                 .unwrap_or(0),
             identity,
             credential,
-            capability,
+            act: act.into(),
             decision,
             detail: detail.into(),
         })
@@ -198,10 +331,10 @@ impl AuditRecord {
         line.push_str(&escape_field(self.identity.as_str()));
         line.push_str(" credential=");
         line.push_str(self.credential.as_str());
-        line.push_str(" capability=");
-        line.push_str(&escape_field(self.capability.name()));
+        line.push_str(" act=");
+        line.push_str(&escape_field(self.act.name()));
         line.push_str(" target=");
-        line.push_str(&escape_field(self.capability.target().unwrap_or("")));
+        line.push_str(&escape_field(self.act.target().unwrap_or("")));
         line.push_str(" outcome=");
         line.push_str(self.decision.as_str());
         line.push_str(" reason=");
@@ -392,10 +525,74 @@ mod tests {
             at_unix: 1_754_000_000,
             identity: Identity::Person(PersonName::parse("Mary-Anne").unwrap()),
             credential: Credential::Passkey,
-            capability: Capability::DesktopControl(node()),
+            act: Act::Exercised(Capability::DesktopControl(node())),
             decision: Decision::Allow,
             detail: detail.to_owned(),
         }
+    }
+
+    #[test]
+    fn an_act_of_authority_renders_under_a_word_no_capability_can_spell() {
+        // The gap this closed: `PUT /api/people/<name>` and the invite routes
+        // are owner-only rather than capability-gated, so before `Authority`
+        // existed there was no word to file them under and they wrote nothing
+        // at all. The property to hold is that the new words cannot be confused
+        // with the old ones — a reader grepping for a granted power must never
+        // match an act of authority, and the other way round.
+        let redeemed = AuditRecord {
+            id: AuditId::from_bytes([0x11; AUDIT_ID_BYTES]),
+            at_unix: 1_754_000_000,
+            identity: Identity::Person(PersonName::parse("guest").unwrap()),
+            credential: Credential::Passkey,
+            act: Authority::InvitationRedeemed.against("guest"),
+            decision: Decision::Allow,
+            detail: "label:phone".to_owned(),
+        };
+        assert_eq!(
+            redeemed.line(),
+            "selfhost-audit/2 id=11111111111111111111111111111111 at=1754000000 \
+             identity=person who=guest credential=passkey act=authority.redeem \
+             target=guest outcome=allow reason=- detail=label:phone"
+        );
+
+        // No `Authority` word is spellable as a `Capability`, so a grant can
+        // never be written that makes a person's row read like an audit act,
+        // and no capability word collides with an authority one.
+        for authority in [
+            Authority::GrantsChanged,
+            Authority::PersonForgotten,
+            Authority::InvitationMinted,
+            Authority::InvitationWithdrawn,
+            Authority::InvitationRedeemed,
+            Authority::PasskeyRegistered,
+            Authority::PasskeyRemoved,
+        ] {
+            assert!(
+                Capability::parse(authority.name()).is_none(),
+                "{} parses as a capability, so it could be granted",
+                authority.name(),
+            );
+        }
+    }
+
+    #[test]
+    fn the_subject_of_an_authority_act_is_escaped_like_any_other_field() {
+        // A passkey id is client-supplied, unlike a capability's target, which
+        // is always a validated token. It lands in the same `target=` column,
+        // so the column's guarantee has to come from the escaping rather than
+        // from the grammar of what usually goes there.
+        let removed = AuditRecord {
+            id: AuditId::from_bytes([0x22; AUDIT_ID_BYTES]),
+            at_unix: 1,
+            identity: Identity::Owner,
+            credential: Credential::Bearer,
+            act: Authority::PasskeyRemoved.against("a b\nselfhost-audit/2 id=forged"),
+            decision: Decision::Allow,
+            detail: "passkey removed".to_owned(),
+        };
+        let line = removed.line();
+        assert_eq!(line.lines().count(), 1, "a subject added a line: {line}");
+        assert!(!line.contains("id=forged"), "a subject forged a field: {line}");
     }
 
     #[test]
@@ -403,8 +600,8 @@ mod tests {
         let line = record("keydown:0x04").line();
         assert_eq!(
             line,
-            "selfhost-audit/1 id=abababababababababababababababab at=1754000000 \
-             identity=person who=Mary-Anne credential=passkey capability=desktop.control \
+            "selfhost-audit/2 id=abababababababababababababababab at=1754000000 \
+             identity=person who=Mary-Anne credential=passkey act=desktop.control \
              target=alex-desktop outcome=allow reason=- detail=keydown:0x04"
         );
     }
