@@ -1,0 +1,84 @@
+<!doctype html>
+<!-- Design comp: television plates, phone width. Living Room TV showing Netflix
+     with remote keypad and DIAL application launcher; Bedroom TV idle with launcher
+     and note. Markup uses the page's own classes; theatre.css is the shipped stylesheet
+     plus the design-kit extensions this comp exists to prove. -->
+<html lang="en"><head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>comp — televisions</title>
+<link rel="stylesheet" href="theatre.css">
+</head><body>
+
+<main id="rooms">
+<div class="room">
+  <div class="section-rule"><h2>LIVING ROOM</h2><span class="rule"></span><span class="micro">1 DEVICE</span></div>
+  <div class="roomdevices">
+
+  <!-- Living Room TV playing Netflix, REMOTE control visible with keypad and keyrow,
+       and launch form to start a new app via DIAL. -->
+  <section class="plate device">
+    <div class="title-rule">
+      <span class="title">Living Room TV</span><span class="rule"></span>
+      <span class="micro kind">TELEVISION</span><span class="lamp ok"></span>
+    </div>
+    <p class="doing">Showing Netflix.</p>
+    <div class="controls">
+      <div class="actions">
+        <button class="btn">STOP</button>
+        <button class="btn" aria-pressed="true">REMOTE</button>
+      </div>
+      <div>
+        <div class="keypad">
+          <span class="gap"></span>
+          <button class="btn">▲</button>
+          <span class="gap"></span>
+          <button class="btn">◀</button>
+          <button class="btn ok">OK</button>
+          <button class="btn">▶</button>
+          <span class="gap"></span>
+          <button class="btn">▼</button>
+          <span class="gap"></span>
+        </div>
+        <div class="keyrow">
+          <button class="btn">BACK</button>
+          <button class="btn">HOME</button>
+          <button class="btn">MENU</button>
+        </div>
+      </div>
+      <div class="inline-form">
+        <span class="fieldlabel">APP</span>
+        <input type="text" placeholder="netflix">
+        <button class="btn primary">LAUNCH</button>
+      </div>
+    </div>
+  </section>
+
+  </div>
+</div>
+
+<div class="room">
+  <div class="section-rule"><h2>BEDROOM</h2><span class="rule"></span><span class="micro">1 DEVICE</span></div>
+  <div class="roomdevices">
+
+  <!-- Bedroom TV idle, no remote (DIAL only), launcher only with note explaining
+       the device capability. -->
+  <section class="plate device">
+    <div class="title-rule">
+      <span class="title">Bedroom TV</span><span class="rule"></span>
+      <span class="micro kind">TELEVISION</span><span class="lamp idle"></span>
+    </div>
+    <p class="doing">Nothing running.</p>
+    <div class="controls">
+      <div class="inline-form">
+        <span class="fieldlabel">APP</span>
+        <input type="text" placeholder="netflix">
+        <button class="btn primary">LAUNCH</button>
+      </div>
+    </div>
+    <p class="note">Remote keys need nothing on this set — DIAL only. More arrives if a driver ever can.</p>
+  </section>
+
+  </div>
+</div>
+</main>
+</body></html>

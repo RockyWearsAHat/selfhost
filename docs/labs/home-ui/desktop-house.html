@@ -1,0 +1,334 @@
+<!doctype html>
+<!-- Design comp: the house on the laptop view, 1280px viewport.
+     Masthead + bank (inline evidence) + lights deck (wide strip) + rooms grid
+     (three to four columns, side-by-side with align-items:start).
+     Markup uses theatre.css vocabulary only; no new CSS. -->
+<html lang="en"><head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>comp — the house at desktop width</title>
+<link rel="stylesheet" href="theatre.css">
+<style>
+  /* Desktop extension: inline evidence on bank, LIGHTS deck layout. */
+  #bank { flex-direction: row; align-items: center; justify-content: space-between; }
+  .bank-main { flex: 1; }
+  .evidence { flex: 0 0 auto; display: flex; gap: 14px; flex-wrap: nowrap; }
+  /* Lights deck as a wide strip with controls grouped horizontally. */
+  #lights-deck {
+    display: flex; gap: 12px; align-items: center; flex-wrap: wrap;
+    padding: 12px; background: var(--sunken); border: 1px solid var(--border);
+  }
+  #lights-deck .section-rule { flex: 0 0 auto; }
+  #lights-scope { flex: 0 0 auto; display: flex; gap: 4px; flex-wrap: wrap; }
+  #lights-controls { flex: 0 0 auto; display: flex; gap: 4px; align-items: center; }
+  #lights-controls .slider { display: flex; gap: 8px; align-items: center; }
+  #lights-controls .slider input { flex: 1; min-width: 100px; }
+  #lights-palette { flex: 0 1 auto; display: flex; gap: 5px; flex-wrap: wrap; }
+  #lights-effects { flex: 1 1 auto; display: flex; gap: 4px; flex-wrap: wrap; }
+</style>
+</head><body>
+
+<!-- Masthead: HOME wordmark, DEVICE CONTROL label, rule, generation, ok lamp, stateword. -->
+<header id="masthead">
+  <span class="wordmark">HOME</span>
+  <span class="designation">DEVICE CONTROL</span>
+  <span class="rule"></span>
+  <span class="micro mono" id="gen">#214</span>
+  <span class="lampline">
+    <span class="lamp ok"></span>
+    <span class="stateword">OK</span>
+  </span>
+</header>
+
+<!-- Bank: condition with inline evidence. -->
+<section id="bank" class="plate">
+  <div class="bank-main">
+    <div id="condition">Music in the kitchen; three lights on.</div>
+  </div>
+  <div class="evidence">
+    <div class="reading">
+      <span class="micro">DEVICES</span>
+      <span class="mono">9</span>
+    </div>
+    <div class="reading">
+      <span class="micro">ACTIVE</span>
+      <span class="mono">4</span>
+    </div>
+    <div class="reading">
+      <span class="micro">UNREACHABLE</span>
+      <span class="mono">0</span>
+    </div>
+  </div>
+</section>
+
+<!-- LIGHTS deck: wide strip with scope, controls, palette, effects on one line. -->
+<section id="lights-deck">
+  <div class="section-rule">
+    <h2>LIGHTS</h2>
+  </div>
+  <div id="lights-scope" class="scope">
+    <button class="btn small" aria-pressed="true">ALL <span class="count">(4)</span></button>
+    <button class="btn small">LIVING ROOM <span class="count">(2)</span></button>
+    <button class="btn small">BEDROOM <span class="count">(1)</span></button>
+    <button class="btn small">OFFICE <span class="count">(1)</span></button>
+  </div>
+  <div id="lights-controls">
+    <button class="btn small">ON</button>
+    <button class="btn small">OFF</button>
+    <div class="slider">
+      <input type="range" min="0" max="100" value="70" aria-label="Brightness">
+      <span class="value mono">70</span>
+    </div>
+  </div>
+  <div id="lights-palette" class="palette">
+    <button class="chip" style="background: #E03A3F;" aria-pressed="false" title="Crimson"></button>
+    <button class="chip" style="background: #FF7A2F;" aria-pressed="false" title="Ember"></button>
+    <button class="chip" style="background: #FFB46B;" aria-pressed="false" title="Gold"></button>
+    <button class="chip" style="background: #7FAE62;" aria-pressed="false" title="Moss"></button>
+    <button class="chip" style="background: #2FB3A5;" aria-pressed="true" title="Teal"></button>
+    <button class="chip" style="background: #4F9FE0;" aria-pressed="false" title="Sky"></button>
+    <button class="chip" style="background: #8F6FE8;" aria-pressed="false" title="Violet"></button>
+    <button class="chip" style="background: #E26FAE;" aria-pressed="false" title="Rose"></button>
+  </div>
+  <div id="lights-effects" class="effects">
+    <button class="btn small">FIREPLACE</button>
+    <button class="btn small">OCEAN</button>
+    <button class="btn small">FOREST</button>
+    <button class="btn small">SUNSET</button>
+    <button class="btn small">PARTY</button>
+    <button class="btn small">FOCUS</button>
+    <button class="btn small">RELAX</button>
+    <button class="btn small">NIGHT</button>
+  </div>
+</section>
+
+<!-- Rooms grid: columns side-by-side, align-items:start. -->
+<main id="rooms">
+
+<!-- Kitchen -->
+<div class="room">
+  <div class="section-rule"><h2>KITCHEN</h2><span class="rule"></span><span class="micro">2 DEVICES</span></div>
+  <div class="roomdevices">
+    <!-- Kitchen speaker (coordinator) -->
+    <section class="plate device">
+      <div class="title-rule">
+        <span class="title">Kitchen</span><span class="rule"></span>
+        <span class="micro kind">SPEAKER</span><span class="lamp ok"></span>
+      </div>
+      <p class="doing">Playing, grouped with Move.</p>
+      <div class="deck playing">
+        <div class="platter-well">
+          <div class="platter"><span class="disclabel">HM</span><span class="spindle"></span></div>
+          <div class="tonearm"><span class="arm" style="--arm:7deg"></span><span class="pivot"></span></div>
+        </div>
+        <div class="deck-panel">
+          <div class="nowplaying">
+            <span class="track">Harvest Moon</span>
+            <span class="artist">Neil Young</span>
+          </div>
+          <div class="progress">
+            <span class="bar"><span class="fill" style="width:38%"></span></span>
+            <span class="clock mono">1:54 / 5:03</span>
+          </div>
+          <div class="actions">
+            <button class="btn" aria-label="Previous">&#9198;</button>
+            <button class="btn primary" aria-label="Pause">&#9208;</button>
+            <button class="btn" aria-label="Next">&#9197;</button>
+            <button class="btn" aria-pressed="false">MUTE</button>
+          </div>
+        </div>
+      </div>
+      <div class="slider">
+        <span class="fieldlabel">VOLUME</span>
+        <input type="range" min="0" max="100" value="40" aria-label="Volume">
+        <span class="value mono">40</span>
+      </div>
+      <div class="grouprow">
+        <span class="caption">Coordinating: Move follows this deck.</span>
+        <button class="btn small">LEAVE</button>
+      </div>
+    </section>
+
+    <!-- Move speaker (follower) -->
+    <section class="plate device">
+      <div class="title-rule">
+        <span class="title">Move</span><span class="rule"></span>
+        <span class="micro kind">SPEAKER</span><span class="lamp ok"></span>
+      </div>
+      <p class="doing">Following Kitchen &mdash; Harvest Moon.</p>
+      <div class="slider">
+        <span class="fieldlabel">VOLUME</span>
+        <input type="range" min="0" max="100" value="25" aria-label="Volume">
+        <span class="value mono">25</span>
+      </div>
+      <div class="grouprow">
+        <span class="caption">Grouped under Kitchen.</span>
+        <button class="btn small">LEAVE</button>
+      </div>
+    </section>
+  </div>
+</div>
+
+<!-- Living Room -->
+<div class="room">
+  <div class="section-rule"><h2>LIVING ROOM</h2><span class="rule"></span><span class="micro">3 DEVICES</span></div>
+  <div class="roomdevices">
+    <!-- Couch Left light -->
+    <section class="plate device">
+      <div class="title-rule">
+        <span class="title">Couch Left</span><span class="rule"></span>
+        <span class="micro kind">LIGHT</span><span class="lamp ok"></span>
+      </div>
+      <p class="doing">On, teal, 70%.</p>
+      <div class="swatchline">
+        <span class="micro">COLOR</span>
+        <span class="swatch" style="background: #2FB3A5;"></span>
+        <span class="micro mono">#2FB3A5</span>
+      </div>
+      <div class="controls">
+        <div class="actions">
+          <button class="btn">ON</button>
+          <button class="btn">OFF</button>
+        </div>
+        <div class="slider">
+          <span class="fieldlabel">BRIGHT</span>
+          <input type="range" min="0" max="100" value="70" aria-label="Brightness">
+          <span class="value mono">70</span>
+        </div>
+      </div>
+    </section>
+
+    <!-- Couch Right light -->
+    <section class="plate device">
+      <div class="title-rule">
+        <span class="title">Couch Right</span><span class="rule"></span>
+        <span class="micro kind">LIGHT</span><span class="lamp ok"></span>
+      </div>
+      <p class="doing">On, teal, 70%.</p>
+      <div class="swatchline">
+        <span class="micro">COLOR</span>
+        <span class="swatch" style="background: #2FB3A5;"></span>
+        <span class="micro mono">#2FB3A5</span>
+      </div>
+      <div class="controls">
+        <div class="actions">
+          <button class="btn">ON</button>
+          <button class="btn">OFF</button>
+        </div>
+        <div class="slider">
+          <span class="fieldlabel">BRIGHT</span>
+          <input type="range" min="0" max="100" value="70" aria-label="Brightness">
+          <span class="value mono">70</span>
+        </div>
+      </div>
+    </section>
+
+    <!-- Living Room TV -->
+    <section class="plate device">
+      <div class="title-rule">
+        <span class="title">Living Room TV</span><span class="rule"></span>
+        <span class="micro kind">TELEVISION</span><span class="lamp ok"></span>
+      </div>
+      <p class="doing">Showing Netflix.</p>
+      <div class="controls">
+        <div class="actions">
+          <button class="btn">STOP</button>
+          <button class="btn">REMOTE</button>
+        </div>
+      </div>
+      <div class="inline-form">
+        <span class="fieldlabel">APP</span>
+        <input type="text" placeholder="netflix">
+        <button class="btn primary small">LAUNCH</button>
+      </div>
+    </section>
+  </div>
+</div>
+
+<!-- Bedroom -->
+<div class="room">
+  <div class="section-rule"><h2>BEDROOM</h2><span class="rule"></span><span class="micro">2 DEVICES</span></div>
+  <div class="roomdevices">
+    <!-- Bedside light (with setmark applying) -->
+    <section class="plate device">
+      <div class="title-rule">
+        <span class="title">Bedside</span><span class="rule"></span>
+        <span class="micro kind">LIGHT</span><span class="lamp ok"></span>
+      </div>
+      <p class="doing">Converging to off.</p>
+      <span class="setmark">
+        <span class="lamp pending"></span>
+        <span class="micro">SET OFF — APPLYING</span>
+      </span>
+      <div class="controls">
+        <div class="actions">
+          <button class="btn">ON</button>
+          <button class="btn">OFF</button>
+        </div>
+        <div class="slider">
+          <span class="fieldlabel">BRIGHT</span>
+          <input type="range" min="0" max="100" value="50" aria-label="Brightness">
+          <span class="value mono">50</span>
+        </div>
+      </div>
+    </section>
+
+    <!-- Bedroom TV -->
+    <section class="plate device">
+      <div class="title-rule">
+        <span class="title">Bedroom TV</span><span class="rule"></span>
+        <span class="micro kind">TELEVISION</span><span class="lamp idle"></span>
+      </div>
+      <p class="doing">Nothing running.</p>
+      <div class="inline-form">
+        <span class="fieldlabel">APP</span>
+        <input type="text" placeholder="netflix">
+        <button class="btn primary small">LAUNCH</button>
+      </div>
+      <p class="note">Remote keys need nothing on this set — DIAL only. More arrives if a driver ever can.</p>
+    </section>
+  </div>
+</div>
+
+<!-- Office -->
+<div class="room">
+  <div class="section-rule"><h2>OFFICE</h2><span class="rule"></span><span class="micro">1 DEVICE</span></div>
+  <div class="roomdevices">
+    <!-- Desk light (off) -->
+    <section class="plate device">
+      <div class="title-rule">
+        <span class="title">Desk</span><span class="rule"></span>
+        <span class="micro kind">LIGHT</span><span class="lamp idle"></span>
+      </div>
+      <p class="doing">Off.</p>
+      <div class="controls">
+        <div class="actions">
+          <button class="btn">ON</button>
+          <button class="btn">OFF</button>
+        </div>
+        <div class="slider">
+          <span class="fieldlabel">BRIGHT</span>
+          <input type="range" min="0" max="100" value="0" disabled aria-label="Brightness">
+          <span class="value mono">0</span>
+        </div>
+      </div>
+    </section>
+  </div>
+</div>
+
+<!-- Unplaced -->
+<div class="room">
+  <div class="section-rule"><h2>UNPLACED</h2><span class="rule"></span><span class="micro">1 DEVICE</span></div>
+  <div class="roomdevices">
+    <!-- Brother printer (quiet fixture) -->
+    <section class="plate device">
+      <div class="title-rule">
+        <span class="title">Brother HL-3040CN</span><span class="rule"></span>
+        <span class="micro kind">FIXTURE</span><span class="lamp idle"></span>
+      </div>
+      <p class="note">Shown because it is here; nothing to drive.</p>
+    </section>
+  </div>
+</div>
+
+</main>
+</body></html>

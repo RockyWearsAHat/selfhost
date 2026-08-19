@@ -103,7 +103,7 @@ house is being swept; anything that answers appears here by itself.`
 ### desktop-house.html — the laptop view, 1280px
 Same content as phone-house, but the rooms grid shows its columns (three to
 four across), bank evidence inline beside the sentence, LIGHTS deck as a
-wide strip under the bank with palette/effects/scope on one line. Prove the
+wide strip under the bank with palette, effects and scope in one compact strip (a second wrapped line is fine). Prove the
 grid: rooms side by side, `align-items:start` visible (rooms of different
 heights top-aligned).
 
