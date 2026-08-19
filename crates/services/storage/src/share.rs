@@ -792,6 +792,14 @@ impl Share {
             Grantee::Owner => Some(Mode::Admin),
             Grantee::Machine => Some(Mode::Write),
             Grantee::Person(name) => self.grant_for(name.as_str()),
+            // An agent's authority is exactly what `console.agents` granted it
+            // (see `selfhost_identity::Identity::Agent`), and today nothing
+            // grants an agent a share mode — `Capability::SiteAdmin` is the
+            // door this identity was built for, not `files.read`/`files.write`.
+            // `None` here is the same "no matching grant" answer an unknown
+            // person gets, not a special case: a share's `[shares.grants]`
+            // table has no agent entries to be found in.
+            Grantee::Agent(_) => None,
         };
 
         match held {

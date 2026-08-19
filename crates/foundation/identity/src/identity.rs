@@ -90,6 +90,15 @@ pub const OWNER_NAME: &str = "owner";
 /// trail would be deniable — "that was the other machine".
 pub const MACHINE_NAME: &str = "machine";
 
+/// The longest agent's name accepted, in characters.
+///
+/// Matched to [`MAX_PERSON_NAME_CHARS`] for the same reason that constant is
+/// matched to the passkey holder-name cap: an agent name ends up in the same
+/// audit line and the same JSON shape a person's does, so the two grammars
+/// should not be able to drift into "a name valid for one identity kind and
+/// not the other".
+pub const MAX_AGENT_NAME_CHARS: usize = MAX_PERSON_NAME_CHARS;
+
 /// The longest person's name accepted, in characters.
 ///
 /// Matched deliberately to the cap `crates/admin/src/webauthn.rs` already puts
@@ -265,13 +274,159 @@ impl fmt::Display for PersonName {
     }
 }
 
+/// Why a string is not a usable agent's name.
+///
+/// A near-copy of [`InvalidPersonName`] rather than a shared type, because the
+/// two names are validated for the same reasons but belong to different
+/// registries — a `PersonName` is looked up in `console.people`, an
+/// `AgentName` in `console.agents` — and collapsing them into one type would
+/// let a future change to one grammar silently reach the other.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum InvalidAgentName {
+    /// The name was empty.
+    Empty,
+    /// The name was longer than [`MAX_AGENT_NAME_CHARS`] characters.
+    TooLong {
+        /// How many characters were offered.
+        chars: usize,
+    },
+    /// The name was [`OWNER_NAME`], or a differently-cased spelling of it.
+    ReservedOwnerName,
+    /// The name was [`MACHINE_NAME`], or a differently-cased spelling of it.
+    ReservedMachineName,
+    /// The name did not begin and end with a letter or a digit.
+    Edge,
+    /// The name contained a character that is neither alphanumeric nor one of
+    /// the permitted separators.
+    Forbidden {
+        /// The first offending character, so the message can quote it.
+        character: char,
+    },
+    /// Two separators sat next to each other.
+    AdjacentSeparators,
+}
+
+impl fmt::Display for InvalidAgentName {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Empty => write!(f, "an agent's name may not be empty"),
+            Self::TooLong { chars } => write!(
+                f,
+                "an agent's name may be at most {MAX_AGENT_NAME_CHARS} characters ({chars} given)"
+            ),
+            Self::ReservedOwnerName => write!(
+                f,
+                "\"{OWNER_NAME}\" names the deployment's own credentials and may not name an agent"
+            ),
+            Self::ReservedMachineName => write!(
+                f,
+                "\"{MACHINE_NAME}\" names this box's own bearer token and may not name an agent"
+            ),
+            Self::Edge => {
+                write!(f, "an agent's name must begin and end with a letter or a digit")
+            }
+            Self::Forbidden { character } => write!(
+                f,
+                "an agent's name may not contain {character:?}; \
+                 letters, digits, and the marks {SEPARATORS:?} are allowed"
+            ),
+            Self::AdjacentSeparators => {
+                write!(f, "an agent's name may not put two of {SEPARATORS:?} side by side")
+            }
+        }
+    }
+}
+
+impl std::error::Error for InvalidAgentName {}
+
+/// A validated agent's name — a machine Alex has explicitly trusted with a
+/// scoped, revocable credential (`selfhost agent add <name>`), never a person
+/// and never this box's own automation.
+///
+/// # Why this is a fourth identity and not a fourth shape of [`Identity::Person`]
+///
+/// A person is proved by a passkey — hardware, a biometric, a human at a
+/// keyboard at the moment of the request. An agent is a headless process that
+/// cannot perform that ceremony on every call, so it is given a different kind
+/// of credential ([`crate::Credential::Agent`]) with different properties
+/// (unattended, like the bearer token — see [`crate::Credential::is_unattended`]).
+/// Folding it into `Person` would let an agent's audit lines read as though a
+/// human had proved presence at the keyboard, which is exactly the confusion
+/// [`Identity::Machine`] already exists to prevent for the box's own
+/// automation. An agent is neither that automation (its capability list is not
+/// fixed and not one of the two programs [`Identity::Machine`]'s doc names) nor
+/// the owner (whose grants are never even consulted, see
+/// [`crate::Policy::decide`]) — it needs its own variant so its authority can be
+/// exactly, and only, what was explicitly granted to it.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct AgentName(String);
+
+impl AgentName {
+    /// Validates `text` as an agent's name. Same grammar as [`PersonName::parse`]
+    /// — see this module's documentation for the reasoning, which applies
+    /// unchanged: no trimming, the owner/machine sentinels are refused in any
+    /// casing, and the character set is bounded to what cannot break a log line,
+    /// a JSON field, or an `Authorization` header (an agent's name travels in a
+    /// wire token, `agent:<name>:<secret>`, which a person's name never does —
+    /// one more reason a colon can never appear in either grammar).
+    pub fn parse(text: &str) -> Result<Self, InvalidAgentName> {
+        if text.is_empty() {
+            return Err(InvalidAgentName::Empty);
+        }
+        let chars = text.chars().count();
+        if chars > MAX_AGENT_NAME_CHARS {
+            return Err(InvalidAgentName::TooLong { chars });
+        }
+        if text.eq_ignore_ascii_case(OWNER_NAME) {
+            return Err(InvalidAgentName::ReservedOwnerName);
+        }
+        if text.eq_ignore_ascii_case(MACHINE_NAME) {
+            return Err(InvalidAgentName::ReservedMachineName);
+        }
+
+        let mut previous_separator = None;
+        let mut last_was_separator = false;
+        for (index, character) in text.chars().enumerate() {
+            let separator = SEPARATORS.contains(&character);
+            if !separator && !character.is_alphanumeric() {
+                return Err(InvalidAgentName::Forbidden { character });
+            }
+            if index == 0 && separator {
+                return Err(InvalidAgentName::Edge);
+            }
+            if separator && previous_separator.is_some_and(|previous| (previous, character) != ('.', ' '))
+            {
+                return Err(InvalidAgentName::AdjacentSeparators);
+            }
+            previous_separator = separator.then_some(character);
+            last_was_separator = separator;
+        }
+        if last_was_separator {
+            return Err(InvalidAgentName::Edge);
+        }
+        Ok(Self(text.to_owned()))
+    }
+
+    /// The name as written.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for AgentName {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
 /// Who a request is from.
 ///
-/// Deliberately closed and deliberately small. Three kinds of caller exist: the
+/// Deliberately closed and deliberately small. Four kinds of caller exist: the
 /// operator holding the deployment's own password, this box's own automation
-/// holding its token, and a person holding a credential of their own. *How* each
-/// one proved it is a separate axis — [`crate::Credential`] — precisely so that
-/// "who" and "how they proved it" never collapse into one another.
+/// holding its token, a person holding a credential of their own, and a
+/// trusted machine holding a scoped agent credential. *How* each one proved it
+/// is a separate axis — [`crate::Credential`] — precisely so that "who" and
+/// "how they proved it" never collapse into one another.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Identity {
     /// The deployment itself: whoever holds the console password. Not a person —
@@ -290,6 +445,17 @@ pub enum Identity {
     Machine,
     /// A named person, proved by their own passkey.
     Person(PersonName),
+    /// A trusted machine — an AI agent, a script, a second box of Alex's —
+    /// holding a scoped, revocable credential minted by `selfhost agent add`.
+    ///
+    /// See [`AgentName`]'s documentation for why this is not folded into
+    /// [`Identity::Person`] or [`Identity::Machine`]. Its authority is never a
+    /// blanket allow and is never read from the people registry: it comes
+    /// solely from the grants recorded for this name in `console.agents` (see
+    /// `selfhost_admin::agent_store`), looked up fresh on every request by the
+    /// same discipline `crates/app/admin::device_password` already uses for a
+    /// credential store whose writer is a different process from its reader.
+    Agent(AgentName),
 }
 
 impl Identity {
@@ -314,23 +480,32 @@ impl Identity {
 
     /// The name this identity is stored and displayed under.
     ///
-    /// Round-trips through [`Identity::parse`] for every value that can exist,
-    /// which is what lets the session store keep holding a plain string without
-    /// that string being a second source of truth.
+    /// Round-trips through [`Identity::parse`] for every value that can exist
+    /// *except* [`Identity::Agent`] — an agent is never produced by parsing a
+    /// bare string against this registry's rules, it is produced by
+    /// `selfhost_admin::agent_store` looking a presented token up in
+    /// `console.agents`, so there is no `Identity::parse` round trip to keep for
+    /// it. This is still the right place to render its name: every other
+    /// identity's storage/display string lives here, and one function per
+    /// identity kind that formats itself is how a future variant is guaranteed
+    /// to be added here too, rather than growing a second `match` elsewhere that
+    /// can drift.
     pub fn as_str(&self) -> &str {
         match self {
             Self::Owner => OWNER_NAME,
             Self::Machine => MACHINE_NAME,
             Self::Person(name) => name.as_str(),
+            Self::Agent(name) => name.as_str(),
         }
     }
 
     /// Whether this is the deployment's own identity.
     ///
-    /// Deliberately false for [`Identity::Machine`]. Every caller of this asks
-    /// it in order to decide something a person should decide — may this hand
-    /// out authority, may this read the record of everybody else — and the
-    /// answer for a token in a file is no. The places that genuinely mean "the
+    /// Deliberately false for [`Identity::Machine`] and [`Identity::Agent`].
+    /// Every caller of this asks it in order to decide something a person
+    /// should decide — may this hand out authority, may this read the record of
+    /// everybody else — and the answer for a token in a file, or a credential
+    /// minted for a trusted machine, is no. The places that genuinely mean "the
     /// box itself is allowed here too" say so by naming [`Identity::Machine`]
     /// beside this, which is one word longer and impossible to write by
     /// accident.
@@ -339,8 +514,21 @@ impl Identity {
     }
 
     /// Whether this is the box's own automation.
+    ///
+    /// Deliberately false for [`Identity::Agent`] — the two are different
+    /// identities with different provenance (a fixed, non-extensible list of
+    /// the box's own programs versus an operator-minted, revocable, per-machine
+    /// credential) and the whole point of separating them is that a check
+    /// written for one must not accidentally admit the other. See
+    /// [`Policy::decide`](crate::Policy::decide)'s `the_machine_may`, which
+    /// [`Identity::Agent`] never reaches.
     pub fn is_machine(&self) -> bool {
         matches!(self, Self::Machine)
+    }
+
+    /// Whether this is a trusted machine holding a scoped agent credential.
+    pub fn is_agent(&self) -> bool {
+        matches!(self, Self::Agent(_))
     }
 
     /// The word the audit log uses for this identity's *kind*.
@@ -353,6 +541,7 @@ impl Identity {
             Self::Owner => "owner",
             Self::Machine => "machine",
             Self::Person(_) => "person",
+            Self::Agent(_) => "agent",
         }
     }
 }
@@ -502,5 +691,34 @@ mod tests {
         assert!(!Identity::parse("Alex").unwrap().is_owner());
         assert_eq!(Identity::Owner.kind(), "owner");
         assert_eq!(Identity::parse("Alex").unwrap().kind(), "person");
+    }
+
+    #[test]
+    fn an_agent_name_follows_the_same_grammar_as_a_persons() {
+        assert!(AgentName::parse("claude-mac").is_ok());
+        assert!(AgentName::parse("Claude on ALEX-DESKTOP").is_ok());
+        for spelling in ["owner", "Owner", "OWNER"] {
+            assert_eq!(AgentName::parse(spelling), Err(InvalidAgentName::ReservedOwnerName));
+        }
+        for spelling in ["machine", "Machine", "MACHINE"] {
+            assert_eq!(AgentName::parse(spelling), Err(InvalidAgentName::ReservedMachineName));
+        }
+        assert_eq!(AgentName::parse(""), Err(InvalidAgentName::Empty));
+        assert_eq!(AgentName::parse(" claude"), Err(InvalidAgentName::Edge));
+        assert!(AgentName::parse("claude:mac").is_err(), "a colon must never be a valid character — it is the token's own field separator");
+        let over = "a".repeat(MAX_AGENT_NAME_CHARS + 1);
+        assert!(matches!(AgentName::parse(&over), Err(InvalidAgentName::TooLong { .. })));
+    }
+
+    #[test]
+    fn an_agent_is_neither_the_owner_nor_the_machine() {
+        let agent = Identity::Agent(AgentName::parse("claude-mac").unwrap());
+        assert!(!agent.is_owner());
+        assert!(!agent.is_machine());
+        assert!(agent.is_agent());
+        assert!(!Identity::Owner.is_agent());
+        assert!(!Identity::Machine.is_agent());
+        assert_eq!(agent.kind(), "agent");
+        assert_eq!(agent.as_str(), "claude-mac");
     }
 }

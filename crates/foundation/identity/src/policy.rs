@@ -364,6 +364,16 @@ impl Caller {
         Self::new(identity, Credential::Passkey, grants)
     }
 
+    /// The caller behind a verified agent token, presented on this request.
+    ///
+    /// `grants` are looked up before this call, exactly as [`Caller::passkey`]'s
+    /// are — by `selfhost_admin::agent_store` reading `console.agents` fresh,
+    /// never by this crate's own registry, which knows nothing about agents.
+    /// See [`crate::Identity::Agent`].
+    pub fn agent(name: crate::identity::AgentName, grants: Grants) -> Self {
+        Self::new(Identity::Agent(name), Credential::Agent, grants)
+    }
+
     /// The caller behind a live session cookie.
     ///
     /// The constructor nearly every authenticated request in this deployment
@@ -727,7 +737,7 @@ mod tests {
     use super::*;
     use crate::capability::{NodeName, ShareId};
     use crate::credential::Opening;
-    use crate::identity::PersonName;
+    use crate::identity::{AgentName, PersonName};
     use std::time::{Duration, Instant};
 
     /// The login instant every session in these tests stands for.
@@ -764,9 +774,14 @@ mod tests {
         Identity::Person(PersonName::parse("Mom").expect("a valid name"))
     }
 
+    fn agent() -> Identity {
+        use crate::identity::AgentName;
+        Identity::Agent(AgentName::parse("claude-mac").expect("a valid name"))
+    }
+
     /// Every identity the model has, for the sweep.
     fn every_identity() -> Vec<Identity> {
-        vec![Identity::Owner, Identity::Machine, person()]
+        vec![Identity::Owner, Identity::Machine, person(), agent()]
     }
 
     /// The five capabilities the bearer token does not hold, written out here
@@ -1085,6 +1100,65 @@ mod tests {
                     "holding {granted}, wanting {want}"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn an_agent_holds_exactly_what_it_was_granted_and_nothing_it_was_not() {
+        // The security-critical property this whole variant exists for: an
+        // agent scoped to `site.admin` alone can do site things and nothing
+        // else — not console reads, not service control, not another site's
+        // capability by accident, and never the owner's blanket allow.
+        let shapes = Capability::every_shape(&share(), &node());
+        for granted in &shapes {
+            let scoped = Caller::agent(
+                AgentName::parse("claude-mac").unwrap(),
+                Grants::new([granted.clone()]).expect("one grant"),
+            );
+            for want in &shapes {
+                let expected = if satisfies(granted, want) {
+                    Decision::Allow
+                } else {
+                    Decision::Refuse(Refusal::NotGranted)
+                };
+                assert_eq!(
+                    Policy::new(true).decide(&scoped, want),
+                    expected,
+                    "agent holding {granted}, wanting {want}"
+                );
+            }
+        }
+        // An agent with nothing granted opens nothing — including SiteAdmin,
+        // which is the one capability minting an agent is usually *for*.
+        let bare = Caller::agent(AgentName::parse("claude-mac").unwrap(), Grants::none());
+        assert_eq!(
+            Policy::new(true).decide(&bare, &Capability::SiteAdmin),
+            Decision::Refuse(Refusal::NotGranted)
+        );
+        // A "fully granted" agent still never becomes the owner: its grants are
+        // consulted (unlike the owner's, which never are), so an agent minted
+        // with a corrupted or over-broad grant file is bounded by exactly what
+        // that file says — never by a blanket allow.
+        let maximal = Caller::agent(
+            AgentName::parse("claude-mac").unwrap(),
+            Grants::new(shapes.clone()).unwrap(),
+        );
+        for want in &shapes {
+            assert_eq!(Policy::new(true).decide(&maximal, want), Decision::Allow, "{want}");
+        }
+        assert!(!maximal.identity().is_owner(), "grants are not identity");
+    }
+
+    #[test]
+    fn the_bearer_token_never_gains_site_admin_through_the_agent_door() {
+        // The other half of the design: SiteAdmin is reachable now, and the
+        // machine credential must still never reach it — an agent's existence
+        // must not have widened the bearer token's fixed list.
+        for policy in [Policy::locked_down(), Policy::new(true).with_passkey_enrolled(true)] {
+            assert_eq!(
+                policy.decide(&Caller::bearer(), &Capability::SiteAdmin),
+                Decision::Refuse(Refusal::OutsideTheMachinesScope)
+            );
         }
     }
 

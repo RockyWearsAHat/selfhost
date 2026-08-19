@@ -191,6 +191,20 @@ pub enum Credential {
     /// [`Session`] for why it carries when and by what rather than merely
     /// existing.
     Session(Session),
+    /// A scoped agent token, verified against `console.agents`, presented on
+    /// *this* request.
+    ///
+    /// Deliberately shaped like [`Credential::Passkey`] rather than like
+    /// [`Credential::Bearer`]: it does not carry *which* agent, because that
+    /// answer lives in [`Identity::Agent`](crate::Identity::Agent), built by
+    /// whoever looked the presented token up in the store — the same division
+    /// [`Credential::Passkey`] already keeps between "how it was proved" and
+    /// "who it was proved for". It is **unattended** (a secret in an
+    /// environment variable or a file, replayed by an unattended process — see
+    /// [`Credential::is_unattended`]) and **not deployment-wide** (it names one
+    /// specific trusted machine, the way [`Credential::Passkey`] names one
+    /// specific person).
+    Agent,
 }
 
 impl Credential {
@@ -205,6 +219,7 @@ impl Credential {
             Self::Bearer => "bearer",
             Self::Password => "password",
             Self::Passkey => "passkey",
+            Self::Agent => "agent",
             Self::Session(session) => match session.opened_by {
                 Opening::Password => "session.password",
                 Opening::Passkey => "session.passkey",
@@ -223,7 +238,7 @@ impl Credential {
     pub fn is_deployment_wide(&self) -> bool {
         match self {
             Self::Bearer | Self::Password => true,
-            Self::Passkey => false,
+            Self::Passkey | Self::Agent => false,
             Self::Session(session) => session.opened_by == Opening::Password,
         }
     }
@@ -246,10 +261,27 @@ impl Credential {
         match self {
             Self::Bearer => identity.is_machine(),
             Self::Password => identity.is_owner(),
-            Self::Passkey => !identity.is_machine(),
+            // Neither the machine (a WebAuthn ceremony needs hardware and a
+            // person, and `Identity::Machine` is a token in a file) nor an
+            // agent (the whole reason `Identity::Agent` exists is that a
+            // headless process cannot perform that ceremony per request — see
+            // `AgentName`'s documentation) can wear a passkey's identity.
+            Self::Passkey => !identity.is_machine() && !identity.is_agent(),
+            // Narrower than the passkey's row, and deliberately: an agent
+            // credential is minted for one entry in `console.agents`, and that
+            // store cannot spell the owner or the machine (see
+            // `AgentName::parse`). There is therefore no such thing as "the
+            // owner's" or "the machine's" agent credential, and admitting one
+            // here would be a second way to wear either identity with a stored
+            // secret rather than the credential each already has.
+            Self::Agent => identity.is_agent(),
+            // A session is minted by a login, and neither the bearer token nor
+            // an agent token opens one — the machine and an agent both present
+            // their credential directly on every request. Same exclusion as
+            // `Self::Passkey` just above, for the same reason.
             Self::Session(session) => match session.opened_by {
                 Opening::Password => identity.is_owner(),
-                Opening::Passkey => !identity.is_machine(),
+                Opening::Passkey => !identity.is_machine() && !identity.is_agent(),
             },
         }
     }
@@ -283,6 +315,14 @@ impl Credential {
     /// - [`Credential::Passkey`] — signed on hardware, after user verification,
     ///   at this instant. False, and it is the only credential for which that
     ///   is provable rather than assumed.
+    /// - [`Credential::Agent`] — a secret in an environment variable or a file
+    ///   on a trusted machine, replayed by an unattended process on every
+    ///   request. True, for the same reason [`Credential::Bearer`] is: nothing
+    ///   about presenting it proves a person is there, which is exactly why an
+    ///   agent must never be handed [`Capability::DesktopControl`](crate::Capability::DesktopControl)
+    ///   or [`Capability::ClipboardRead`](crate::Capability::ClipboardRead)
+    ///   without the same `[desktop].bearer_may_control` arming the bearer
+    ///   token itself needs.
     /// - [`Credential::Session`] — false, and deliberately so. A cookie is
     ///   certainly replayed by the browser, but it carries [`Session::opened_at`]
     ///   and [`Session::opened_by`], and *how recently* a person was present is a
@@ -293,7 +333,7 @@ impl Credential {
     ///   refusing every browser a keyboard for ever, which is not a stricter
     ///   rule, it is a broken feature.
     pub fn is_unattended(&self) -> bool {
-        matches!(self, Self::Bearer | Self::Password)
+        matches!(self, Self::Bearer | Self::Password | Self::Agent)
     }
 
     /// One credential of every shape, for exhaustive tables.
@@ -310,6 +350,7 @@ impl Credential {
             Self::Bearer,
             Self::Password,
             Self::Passkey,
+            Self::Agent,
             Self::Session(Session::new(Opening::Password, opened_at)),
             Self::Session(Session::new(Opening::Passkey, opened_at)),
         ]
@@ -346,7 +387,7 @@ mod tests {
         words.sort_unstable();
         words.dedup();
         assert_eq!(words.len(), shapes.len(), "one word each, all distinct");
-        assert_eq!(shapes.len(), 5, "extend every_shape when a variant is added");
+        assert_eq!(shapes.len(), 6, "extend every_shape when a variant is added");
     }
 
     #[test]
@@ -355,6 +396,7 @@ mod tests {
         assert!(Credential::Bearer.is_deployment_wide());
         assert!(Credential::Password.is_deployment_wide());
         assert!(!Credential::Passkey.is_deployment_wide());
+        assert!(!Credential::Agent.is_deployment_wide(), "an agent token names one machine");
         assert!(
             Credential::Session(Session::new(Opening::Password, now)).is_deployment_wide(),
             "there is one console password, so the session it minted names nobody"
@@ -371,6 +413,7 @@ mod tests {
         assert!(Credential::Bearer.is_unattended(), "a token in a file");
         assert!(Credential::Password.is_unattended(), "a password in a keychain, on every WebDAV request");
         assert!(!Credential::Passkey.is_unattended(), "signed on hardware, this instant");
+        assert!(Credential::Agent.is_unattended(), "a secret in a file, replayed by an unattended process");
         for opening in Opening::EVERY {
             assert!(
                 !Credential::Session(Session::new(opening, now)).is_unattended(),
@@ -381,25 +424,28 @@ mod tests {
 
     #[test]
     fn every_credential_belongs_to_exactly_the_identities_it_can_stand_for() {
-        use crate::identity::PersonName;
+        use crate::identity::{AgentName, PersonName};
         let now = moment();
         let person = Identity::Person(PersonName::parse("Mom").expect("a valid name"));
+        let agent = Identity::Agent(AgentName::parse("claude-mac").expect("a valid name"));
         // The table, written the other way round from the implementation so the
         // two have to agree rather than restate each other. The load-bearing row
         // is the first: the token is the machine's and nobody else's, which is
         // what stops it from being the operator in the audit trail.
-        let expected: [(Credential, [bool; 3]); 5] = [
-            //                                    owner, machine, person
-            (Credential::Bearer, [false, true, false]),
-            (Credential::Password, [true, false, false]),
-            (Credential::Passkey, [true, false, true]),
-            (Credential::Session(Session::new(Opening::Password, now)), [true, false, false]),
-            (Credential::Session(Session::new(Opening::Passkey, now)), [true, false, true]),
+        let expected: [(Credential, [bool; 4]); 6] = [
+            //                                    owner, machine, person, agent
+            (Credential::Bearer, [false, true, false, false]),
+            (Credential::Password, [true, false, false, false]),
+            (Credential::Passkey, [true, false, true, false]),
+            (Credential::Agent, [false, false, false, true]),
+            (Credential::Session(Session::new(Opening::Password, now)), [true, false, false, false]),
+            (Credential::Session(Session::new(Opening::Passkey, now)), [true, false, true, false]),
         ];
-        for (credential, [owner, machine, named] ) in expected {
+        for (credential, [owner, machine, named, agent_owns]) in expected {
             assert_eq!(credential.belongs_to(&Identity::Owner), owner, "{credential} / owner");
             assert_eq!(credential.belongs_to(&Identity::Machine), machine, "{credential} / machine");
             assert_eq!(credential.belongs_to(&person), named, "{credential} / person");
+            assert_eq!(credential.belongs_to(&agent), agent_owns, "{credential} / agent");
         }
     }
 
@@ -412,6 +458,7 @@ mod tests {
         assert!(!Credential::Password.is_a_password_login(), "that is the WebDAV mount");
         assert!(!Credential::Bearer.is_a_password_login());
         assert!(!Credential::Passkey.is_a_password_login());
+        assert!(!Credential::Agent.is_a_password_login());
         assert!(!Credential::Session(Session::new(Opening::Passkey, now)).is_a_password_login());
     }
 

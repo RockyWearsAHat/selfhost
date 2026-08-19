@@ -163,19 +163,30 @@ pub fn whoami_json(caller: &Caller) -> Json {
 /// in every interface, so this list is derived from the same parse function that
 /// enforces it: each entry below is round-tripped through [`Capability::parse`]
 /// in this module's tests.
-pub const VOCABULARY: [(&str, Option<&str>); 12] = [
-    ("console.read", None),
-    ("service.control", None),
-    ("files.read", Some("share")),
-    ("files.write", Some("share")),
-    ("files.admin", None),
-    ("desktop.view", Some("node")),
-    ("desktop.control", Some("node")),
-    ("clipboard.read", Some("node")),
-    ("node.admin", None),
-    ("site.admin", None),
-    ("dns.admin", None),
-    ("mail.admin", None),
+/// Every capability word, its target if it takes one, and whether any route in
+/// this deployment honours it yet.
+///
+/// The third column exists so a console can render an ungrantable word as
+/// exactly that — greyed, with the reason — rather than offering a toggle the
+/// `PUT` will refuse. Kept beside the other two rather than derived at runtime
+/// because this table is what a client draws from before it has a
+/// [`Capability`] to ask, and `honoured_word` below is what stops the two
+/// disagreeing.
+pub const VOCABULARY: [(&str, Option<&str>, bool); 12] = [
+    ("console.read", None, true),
+    ("service.control", None, true),
+    ("files.read", Some("share"), true),
+    ("files.write", Some("share"), true),
+    ("files.admin", None, true),
+    ("desktop.view", Some("node"), true),
+    ("desktop.control", Some("node"), true),
+    ("clipboard.read", Some("node"), true),
+    ("node.admin", None, true),
+    // `site.admin` gained real routes in `crates/app/admin::site_api`; the other
+    // two remain real words with no route. See `Capability::is_honoured`.
+    ("site.admin", None, true),
+    ("dns.admin", None, false),
+    ("mail.admin", None, false),
 ];
 
 /// [`VOCABULARY`] as JSON.
