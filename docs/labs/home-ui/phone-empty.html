@@ -1,33 +1,54 @@
 <!doctype html>
-<!-- Design comp: empty house, connection in progress. Masthead showing sweep
-     ring and connecting state, reticle sighting mark centered, caption
-     explaining the wait. -->
+<!-- Design comp: empty house states. Two sections:
+     (1) EMPTY HOUSE: masthead, one plate with "No devices yet..." and SCAN button.
+     (2) CONNECTING: masthead with idle lamp and stateword, stale data plate.
+     On INSTRUMENT, the home app's design system. -->
 <html lang="en"><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
 <title>comp — empty</title>
-<link rel="stylesheet" href="theatre.css">
-<style>
-/* comp-local layout */
-.empty-wrapper { display: flex; flex-direction: column; align-items: center; gap: 14px; max-width: 300px; }
-</style>
+<link rel="stylesheet" href="instrument.css">
 </head><body>
 
-<header id="masthead">
-  <span class="wordmark">HOME</span>
-  <span class="designation">DEVICE CONTROL</span>
-  <span class="rule"></span>
-  <span class="micro readout" id="gen">#1</span>
-  <span class="sweep"></span>
-  <span class="stateword warn">CONNECTING</span>
-</header>
+<main id="rooms">
 
-<div class="empty">
-  <div class="empty-wrapper">
-    <div class="reticle">
-      <span class="dot"></span>
-    </div>
-    <p class="caption centered">No devices found on this network yet. The house is being swept; anything that answers appears here by itself.</p>
+<!-- EMPTY HOUSE: before any discovery. Masthead, then one furnished plate. -->
+<div class="room">
+  <div class="masthead">
+    <span class="wordmark">HOME</span>
+    <span class="rule"></span>
+    <span class="gen">#0</span>
+    <span class="lamp"></span>
+  </div>
+  <div class="roomdevices">
+    <section class="plate">
+      <p style="font-size: var(--t-body); color: var(--muted); line-height: 1.5;">No devices yet. The house will appear here as it is discovered.</p>
+      <div class="actions">
+        <button class="btn small ghost">SCAN THE NETWORK</button>
+      </div>
+    </section>
   </div>
 </div>
 
+<!-- CONNECTING: sweep in progress. Masthead with staleword, stale data plate. -->
+<div class="room">
+  <div class="masthead">
+    <span class="wordmark">HOME</span>
+    <span class="rule"></span>
+    <span class="gen">#0</span>
+    <span class="lamp"></span>
+    <span class="stateword">CONNECTING</span>
+  </div>
+  <div class="roomdevices">
+    <section class="plate">
+      <div class="bank">
+        <p class="condition" style="color: var(--muted);">As of 12:04 — music in the kitchen; three lights on.</p>
+        <span class="setmark">
+          <span class="address">STALE</span>
+        </span>
+      </div>
+    </section>
+  </div>
+</div>
+
+</main>
 </body></html>
