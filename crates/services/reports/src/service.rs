@@ -1491,9 +1491,7 @@ impl Service {
             | "passkey/login/start"
             | "passkey/login/finish"
             | "services/create"
-            | "services/rotate" => {
-                refuse(Status::METHOD_NOT_ALLOWED, "this endpoint takes POST")
-            }
+            | "services/rotate" => refuse(Status::METHOD_NOT_ALLOWED, "this endpoint takes POST"),
             "verify" | "me" | "mine" | "me/usage" | "download" | "capabilities" | ""
             | "index.html" | "app.css" | "app.js" | "favicon.svg" => {
                 refuse(Status::METHOD_NOT_ALLOWED, "this endpoint takes GET")
@@ -5159,7 +5157,13 @@ mod tests {
         for _ in 0..600 {
             assert_eq!(
                 service
-                    .answer(&get("/report/health"), b"", "198.51.100.100", now, UNIX_EPOCH)
+                    .answer(
+                        &get("/report/health"),
+                        b"",
+                        "198.51.100.100",
+                        now,
+                        UNIX_EPOCH
+                    )
                     .status,
                 Status::OK,
                 "a health check that can be rate-limited drops the site out of rotation"
@@ -5217,7 +5221,11 @@ mod tests {
         let id = service.store().list("dx").expect("list")[0].id.clone();
         let withdraw_body = format!(r#"{{"project":"dx","id":"{id}"}}"#);
         let ordinary: [(&str, Request, &[u8]); 5] = [
-            ("GET /report/mine", get_with_cookie("/report/mine", &cookie), b""),
+            (
+                "GET /report/mine",
+                get_with_cookie("/report/mine", &cookie),
+                b"",
+            ),
             (
                 "GET /report/download",
                 get_with_cookie("/report/download", &cookie),
@@ -5949,7 +5957,12 @@ mod tests {
         let service = service_with_accounts("svc-refusals");
         let body = r#"{"name":"myapp"}"#;
         let signed_out = call(&service, &json_post("/report/services/create", body), body);
-        assert_eq!(signed_out.status, Status::UNAUTHORIZED, "{}", text(&signed_out));
+        assert_eq!(
+            signed_out.status,
+            Status::UNAUTHORIZED,
+            "{}",
+            text(&signed_out)
+        );
 
         let cookie = set_cookie(&register(&service, "owner@example.com", "password-1"));
         let taken = r#"{"name":"dx"}"#;
@@ -6079,7 +6092,12 @@ mod tests {
             r#"{"project":"myapp","kind":"bug","title":"one too many","detail":"d"}"#,
             "203.0.113.9",
         );
-        assert_eq!(fresh.status, Status::SERVICE_UNAVAILABLE, "{}", text(&fresh));
+        assert_eq!(
+            fresh.status,
+            Status::SERVICE_UNAVAILABLE,
+            "{}",
+            text(&fresh)
+        );
         assert!(text(&fresh).contains("free plan"), "{}", text(&fresh));
 
         let sighting = file(
@@ -6088,6 +6106,10 @@ mod tests {
             "203.0.113.10",
         );
         assert_eq!(sighting.status, Status::OK, "{}", text(&sighting));
-        assert!(text(&sighting).contains("\"known\":true"), "{}", text(&sighting));
+        assert!(
+            text(&sighting).contains("\"known\":true"),
+            "{}",
+            text(&sighting)
+        );
     }
 }
