@@ -506,3 +506,82 @@ input[type="range"]::-webkit-slider-thumb {
 
 /* machine text: the address line every device may carry — mono, faint */
 .address { font: 500 var(--t-micro) var(--mono); letter-spacing: 0.06em; color: var(--faint); }
+
+/* =====================  MERGED IN — 2026-08-19, executive pass  ==========
+   Folded in from the parallel THEATRE v4 line by the directing session, so
+   the folder carries ONE system. Each block keeps the rui contract: wells
+   are Bevels, glows are Glow, arcs are arc Strokes, discs are discs. */
+
+/* the VU pair: two meter wells beside the track's name. Needle = one
+   rotated Stroke; lit only while music actually plays. */
+.vus { display: flex; gap: var(--s2); align-self: center; }
+.vu {
+  position: relative; width: 64px; height: 36px; overflow: hidden; flex: none;
+  border-radius: 10px;
+  background: linear-gradient(180deg, var(--well-hi), var(--well-lo));
+  box-shadow: inset 0 1px 2px rgba(0,0,0,.5), inset 0 -1px 0 var(--bottomlight);
+}
+.vu::before {  /* the scale arc */
+  content: ""; position: absolute; left: 8px; right: 8px; top: 8px; height: 46px;
+  border: 1px solid #33363c; border-radius: 50%;
+  border-bottom-color: transparent; border-left-color: transparent; border-right-color: transparent;
+}
+.vu .needle {
+  position: absolute; left: 50%; bottom: -2px; width: 1.5px; height: 32px;
+  background: linear-gradient(180deg, var(--accent-hi), rgba(70,200,178,0.12));
+  transform-origin: 50% 100%; transform: rotate(var(--vu, -42deg));
+  box-shadow: 0 0 6px var(--accent-glow);
+}
+.vu .vu-tag {
+  position: absolute; right: 5px; bottom: 2px;
+  font: 600 8px var(--mono); letter-spacing: 0.1em; color: var(--faint);
+}
+.deck:not(.playing) .vu .needle { background: #4a4e55; box-shadow: none; }
+
+/* spectrum + temperature strips: the whole range under the thumb; presets
+   stay as chips. The strip is content (a light's own colour), never brand. */
+.slider.spectrum input[type="range"]::-webkit-slider-runnable-track,
+.slider.spectrum input[type="range"]::-moz-range-track {
+  height: 9px; border-radius: 5px;
+  background: linear-gradient(90deg,#ff3b30,#ff9500,#ffe14d,#57d769,#2fb3a5,#3aa0ff,#7d5bff,#ff4fa3);
+  box-shadow: inset 0 1px 1px rgba(0,0,0,.45), inset 0 0 0 1px rgba(0,0,0,.35);
+}
+.slider.temp input[type="range"]::-webkit-slider-runnable-track,
+.slider.temp input[type="range"]::-moz-range-track {
+  height: 9px; border-radius: 5px;
+  background: linear-gradient(90deg,#ff9329,#ffb46b,#ffdcb8,#f5efe6,#dfeefc);
+  box-shadow: inset 0 1px 1px rgba(0,0,0,.45), inset 0 0 0 1px rgba(0,0,0,.35);
+}
+.slider.spectrum input[type="range"]::-webkit-slider-thumb,
+.slider.temp input[type="range"]::-webkit-slider-thumb { margin-top: -4.5px; }
+.slider.spectrum .value, .slider.temp .value { width: auto; min-width: 52px; }
+
+/* a lit bulb's plate emits its own colour — the page reports what the room
+   looks like. Set --glow to the bulb's colour on the plate. */
+.plate.lit {
+  box-shadow:
+    inset 0 1px 0 var(--toplight),
+    inset 0 6px 26px -18px var(--glow, transparent),
+    0 0 30px -16px var(--glow, transparent);
+}
+.port .orb.colored { background: linear-gradient(180deg,
+  color-mix(in srgb, var(--glow, var(--accent)) 88%, #fff 12%), var(--glow, var(--accent))); }
+
+/* live readouts: a machine number that is currently changing (a playing
+   clock, an applying value) may carry the accent's glow. Static machine
+   text stays faint mono — glow marks liveness, not machinehood. */
+.readout { color: var(--accent-hi); text-shadow: 0 0 8px var(--accent-glow); }
+
+/* the bare mat: a transport device with NOTHING playing shows an empty
+   platter well — rubber rings, no record. The record is the music. */
+.mat {
+  position: absolute; top: 16px; left: 14px; width: 112px; height: 112px;
+  border-radius: 50%;
+  background: repeating-radial-gradient(circle at 50% 50%, #101216 0 3px, #14171b 3px 6.5px);
+  box-shadow: inset 0 1px 3px rgba(0,0,0,.5);
+}
+.mat::after {  /* the spindle waiting */
+  content: ""; position: absolute; left: 50%; top: 50%; width: 4px; height: 4px;
+  transform: translate(-50%,-50%); border-radius: 50%;
+  background: #8b9097; box-shadow: 0 0 5px rgba(238,237,231,.4);
+}
