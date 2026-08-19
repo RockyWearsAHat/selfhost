@@ -387,8 +387,12 @@ pub fn fresh_enough(caller: &Caller, window: Duration, now: Instant) -> bool {
         },
         // Presented on this very request: nothing is fresher than that.
         Credential::Password | Credential::Passkey => true,
-        // No login moment to be recent. Armed in config or refused by policy.
-        Credential::Bearer => true,
+        // No login moment to be recent. Armed in config or refused by policy —
+        // same reasoning for an agent's token as for the bearer token: both are
+        // replayed by an unattended process, and `Policy::decide` already
+        // refuses either one `DesktopControl`/`ClipboardRead` unless
+        // `[desktop].bearer_may_control` is set.
+        Credential::Bearer | Credential::Agent => true,
     }
 }
 

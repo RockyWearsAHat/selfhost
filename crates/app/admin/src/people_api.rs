@@ -191,10 +191,14 @@ pub const VOCABULARY: [(&str, Option<&str>, bool); 12] = [
 
 /// [`VOCABULARY`] as JSON.
 pub fn vocabulary_json() -> Json {
-    Json::array(VOCABULARY.iter().map(|(word, target)| {
+    Json::array(VOCABULARY.iter().map(|(word, target, honoured)| {
         Json::object([
             ("word", Json::string(*word)),
             ("target", target.map_or(Json::Null, Json::string)),
+            // False means the word exists and nothing consumes it: a console
+            // should show it and refuse to offer it, so an operator learns why
+            // rather than finding the toggle rejected on submit.
+            ("grantable", Json::Bool(*honoured)),
         ])
     }))
 }
@@ -239,13 +243,23 @@ mod tests {
     fn every_word_the_vocabulary_advertises_parses() {
         // The guard on the copy: this list lives beside the enum it describes,
         // so it is checked against the parser that enforces the real one.
-        for (word, target) in VOCABULARY {
+        for (word, target, grantable) in VOCABULARY {
             let spelling = match target {
                 Some("share") => format!("{word}:vault"),
                 Some(_) => format!("{word}:alex-desktop"),
                 None => word.to_owned(),
             };
-            assert!(Capability::parse(&spelling).is_some(), "{spelling} did not parse");
+            let capability = Capability::parse(&spelling).expect("{spelling} did not parse");
+            // The third column is the same fact `Capability::is_honoured`
+            // states, not a second opinion about it. Two tables that could
+            // disagree is how a console ends up offering a toggle the `PUT`
+            // refuses.
+            assert_eq!(
+                capability.is_honoured(),
+                grantable,
+                "{word}: the vocabulary and the capability disagree about whether \
+                 anything honours it",
+            );
         }
     }
 
