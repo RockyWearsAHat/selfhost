@@ -14,6 +14,12 @@ selfhost-json = { workspace = true }
 # `io-std` on top of the workspace set: the MCP surface speaks JSON-RPC over
 # this process's own stdio, which no other subsystem needs.
 tokio = { workspace = true, features = ["io-std"] }
+# The OS random source, and nothing more: the firetv driver's ADB auth needs an
+# RSA key, and the key needs entropy to be generated. This is not a second
+# crypto provider — the RSA operation itself is written against this crate's own
+# fixed-width integer in `firetv::rsa`, keeping the workspace's one-provider
+# policy intact (see the root Cargo.toml note). `getrandom` only fills a buffer.
+getrandom = "0.2"
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time"] }
