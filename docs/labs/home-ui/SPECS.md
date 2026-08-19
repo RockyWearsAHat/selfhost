@@ -1,8 +1,13 @@
 # Design comps — build specs
 
 Every comp is a static HTML file in this folder, phone width unless stated,
-linking `theatre.css` (the shipped stylesheet + design-kit extensions) with a
-relative `<link rel="stylesheet" href="theatre.css">`. Comps use the page's own
+linking a design system stylesheet with a relative `<link>`. There are two:
+`instrument.css` — INSTRUMENT, the home app's own system (operator directive
+2026-08-19: diverge from the console, use rui to its fullest potential; warm
+graphite, depth by light, SDF capsule-and-disc geometry, one verdigris
+accent, every rule naming the rui capability that renders it) — and
+`theatre.css`, the console's THEATRE, which the not-yet-reclothed comps
+still wear. New comps use INSTRUMENT; `phone-player.html` is its reference. Comps use the page's own
 class vocabulary — `.plate .device .title-rule .doing .deck .slider .actions
 .grouprow .keypad .palette .chip .effects .scope .setmark .lamp .stateword
 .section-rule .bank .alert` — and invent no new CSS unless the spec says so
