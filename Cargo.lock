@@ -386,6 +386,7 @@ dependencies = [
 name = "selfhost-home"
 version = "0.1.0"
 dependencies = [
+ "getrandom",
  "selfhost-config",
  "selfhost-http",
  "selfhost-json",
