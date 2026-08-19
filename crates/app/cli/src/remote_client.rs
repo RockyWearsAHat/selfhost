@@ -296,6 +296,13 @@ impl RemoteClient {
     pub async fn request(&self, method: &str, path: &str, body: Option<&[u8]>) -> Result<Json, String> {
         let name = rustls::pki_types::ServerName::try_from(self.remote.host.clone())
             .map_err(|_| format!("{} is not a usable server name for TLS", self.remote.host))?;
+        let body = body.unwrap_or(&[]);
+        // A file upload's body is orders of magnitude larger than any JSON
+        // document, and the fixed deadline that suits a question does not suit
+        // a transfer: allow one extra second per 256 KiB sent, so a site asset
+        // crossing a tunnel is judged by how much is being sent rather than by
+        // a constant chosen for reading service lists.
+        let deadline = REQUEST_TIMEOUT + Duration::from_secs((body.len() / (256 * 1024)) as u64);
 
         // The bundled Mozilla roots and the `ring` provider named explicitly,
         // exactly as `mesh_task`'s dialler does it: what verifies the far side
@@ -326,7 +333,6 @@ impl RemoteClient {
                 .await
                 .map_err(|error| format!("TLS to {} failed: {error}", self.remote))?;
 
-            let body = body.unwrap_or(&[]);
             let request = format!(
                 "{method} {path} HTTP/1.1\r\nHost: {}\r\nAuthorization: Bearer {}\r\n\
                  Accept: application/json\r\nContent-Type: application/json\r\n\
@@ -371,10 +377,10 @@ impl RemoteClient {
             Ok(raw)
         };
 
-        let raw = tokio::time::timeout(REQUEST_TIMEOUT, exchange)
+        let raw = tokio::time::timeout(deadline, exchange)
             .await
             .map_err(|_| {
-                format!("{} did not finish answering within {}s", self.remote, REQUEST_TIMEOUT.as_secs())
+                format!("{} did not finish answering within {}s", self.remote, deadline.as_secs())
             })??;
 
         answer(&raw)
@@ -448,7 +454,16 @@ fn answer(raw: &[u8]) -> Result<Json, String> {
              against that box's data/admin.token",
             status.0
         ),
-        404 => format!("{} {said} — this box does not serve that route", status.0),
+        // "does not serve that route" is the right reading only when the far
+        // side said nothing — a bare 404 from a proxy or an old build. When
+        // the admin API sent its own explanation ("no site named …", "this
+        // site has no static content directory …"), that explanation *is* the
+        // answer, and stamping a routing diagnosis over it sends the operator
+        // hunting for a deployment problem that does not exist.
+        404 if said == status.reason() => {
+            format!("{} {said} — this box does not serve that route", status.0)
+        }
+        404 => format!("{} {said}", status.0),
         _ => format!("{} {said}", status.0),
     })
 }
