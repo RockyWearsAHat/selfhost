@@ -300,6 +300,12 @@ pub struct Device {
     /// Why it cannot be driven, when it is present but cannot be. Shown to the
     /// reader verbatim, so it must be a sentence, not a code.
     pub note: Option<String>,
+    /// A URL the driver needs between sweeps, as the device itself stated it —
+    /// for a DIAL television, the applications base out of its
+    /// `Application-URL` header. `None` for drivers that compose their own
+    /// addresses from a host and a well-known port. Never rendered to the
+    /// page: it is transport, not a fact about the house.
+    pub location: Option<String>,
 }
 
 impl Device {
@@ -316,6 +322,7 @@ impl Device {
             capabilities: Vec::new(),
             state: State::default(),
             note: None,
+            location: None,
         }
     }
 
@@ -342,7 +349,7 @@ impl Device {
     /// where a refusal produces a sentence.
     #[must_use]
     pub fn admits(&self, command: &Command) -> bool {
-        self.reachable && self.can(command.needs())
+        self.reachable && command.admitted_by().iter().any(|needed| self.can(*needed))
     }
 }
 
@@ -393,24 +400,30 @@ pub enum Command {
 }
 
 impl Command {
-    /// The capability a device must advertise to be asked this.
+    /// The capabilities any one of which admits this command.
+    ///
+    /// Almost every command is admitted by exactly one capability. `Stop` is
+    /// the exception, stated here rather than special-cased at a call site: a
+    /// transport stops its playback and an application surface stops its
+    /// running app, and both are honestly "stop" to the person pressing the
+    /// button — a television that can only launch and stop apps must not be
+    /// told it "cannot be asked to stop".
     #[must_use]
-    pub fn needs(&self) -> Capability {
+    pub fn admitted_by(&self) -> &'static [Capability] {
         match self {
-            Command::Play
-            | Command::Pause
-            | Command::Stop
-            | Command::Next
-            | Command::Previous => Capability::Transport,
-            Command::Volume(_) | Command::VolumeStep(_) => Capability::Volume,
-            Command::Mute(_) => Capability::Mute,
-            Command::Join(_) | Command::Leave => Capability::Group,
-            Command::Power(_) => Capability::Power,
-            Command::Brightness(_) => Capability::Brightness,
-            Command::Color(_) => Capability::Color,
-            Command::ColorTemp(_) => Capability::ColorTemp,
-            Command::Key(_) => Capability::Keys,
-            Command::Launch(_) => Capability::Apps,
+            Command::Play | Command::Pause | Command::Next | Command::Previous => {
+                &[Capability::Transport]
+            }
+            Command::Stop => &[Capability::Transport, Capability::Apps],
+            Command::Volume(_) | Command::VolumeStep(_) => &[Capability::Volume],
+            Command::Mute(_) => &[Capability::Mute],
+            Command::Join(_) | Command::Leave => &[Capability::Group],
+            Command::Power(_) => &[Capability::Power],
+            Command::Brightness(_) => &[Capability::Brightness],
+            Command::Color(_) => &[Capability::Color],
+            Command::ColorTemp(_) => &[Capability::ColorTemp],
+            Command::Key(_) => &[Capability::Keys],
+            Command::Launch(_) => &[Capability::Apps],
         }
     }
 
@@ -565,10 +578,24 @@ mod tests {
 
     #[test]
     fn a_command_names_the_capability_it_needs() {
-        assert_eq!(Command::Play.needs(), Capability::Transport);
-        assert_eq!(Command::Volume(30).needs(), Capability::Volume);
-        assert_eq!(Command::Leave.needs(), Capability::Group);
-        assert_eq!(Command::Key(Key::Up).needs(), Capability::Keys);
+        assert_eq!(Command::Play.admitted_by(), &[Capability::Transport]);
+        assert_eq!(Command::Volume(30).admitted_by(), &[Capability::Volume]);
+        assert_eq!(Command::Leave.admitted_by(), &[Capability::Group]);
+        assert_eq!(Command::Key(Key::Up).admitted_by(), &[Capability::Keys]);
+    }
+
+    /// A television whose whole surface is launch-and-stop must admit a stop —
+    /// the app surface stops its running app — while still refusing a play it
+    /// has no way to perform.
+    #[test]
+    fn a_stop_is_admitted_by_an_app_surface_as_well_as_a_transport() {
+        let mut tv = Device::new(DeviceId::new("dial", "x"), "TV", Kind::Television)
+            .advertise(&[Capability::Apps]);
+        tv.reachable = true;
+        assert!(tv.admits(&Command::Stop));
+        assert!(tv.admits(&Command::Launch("Netflix".into())));
+        assert!(!tv.admits(&Command::Play));
+        assert!(!tv.admits(&Command::Pause));
     }
 
     /// The gate the whole design rests on: a speaker is not asked to change

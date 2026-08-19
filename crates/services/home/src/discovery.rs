@@ -32,28 +32,28 @@
 //! A device answering three times is expected, not a fault, which is why
 //! everything is deduplicated by the UUID in its `USN` rather than by address.
 //!
-//! # Why a Fire TV is decided by a TCP connection
+//! # Why a television is decided by its DIAL answer, and no longer by a port
 //!
-//! Sonos is the device that matters here and it is discovered properly: it
-//! answers a `ZonePlayer` search with a stable `RINCON_` identity. An Amazon
-//! box answers a general search too, but answering says nothing about whether
-//! it can be driven — its debug bridge is off until somebody enables it by hand
-//! on the device. Reporting one as a Fire TV on the strength of its SSDP text
-//! would put a tile on the page that refuses every command. So a host is called
-//! [`FoundKind::FireTv`] only when a TCP connection to port 5555 is accepted.
-//! That is a reachability probe and stops there: no ADB handshake is spoken in
-//! this module, because the protocol belongs with the driver that uses it.
-//!
-//! The rejected alternative was sweeping the whole subnet for open ports. It
-//! finds boxes that answer no discovery at all, and it costs a few hundred
-//! connections per sweep, sets off every intrusion detector on the network, and
-//! guesses at the subnet it should scan. Probing only hosts that already spoke
-//! to us keeps the sweep to as many connections as there are devices.
+//! The first rule here was "a Fire TV is a host that accepts TCP 5555", argued
+//! deliberately: SSDP text says nothing about drivability, and the debug
+//! bridge is the thing a driver would speak. The principle was right and the
+//! port was wrong. ADB is off by default, must be enabled by hand on the
+//! device, and does not exist at all on Vega-based Fire TVs — so the rule made
+//! *both* real televisions in the test house invisible, and would do the same
+//! in every deployer's house. Measured on 2026-08-18 (home-lab.dx §"The
+//! televisions, driven"): both televisions answer a targeted `M-SEARCH` for
+//! `urn:dial-multiscreen-org:service:dial:1`, and the DIAL surface behind that
+//! answer — launch, stop, status — is unauthenticated and needs nothing from
+//! any operator. So a host is called [`FoundKind::Dial`] because it *said so*
+//! in its own protocol, exactly the way a Sonos is a `ZonePlayer` because it
+//! answered as one. The debug bridge stopped being identity; when an ADB
+//! driver exists it will be one extra capability on a television that already
+//! is one, probed by that driver and never here.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
-use tokio::net::{TcpStream, UdpSocket};
+use tokio::net::UdpSocket;
 
 /// The SSDP multicast group and port, fixed by the specification.
 const SSDP_GROUP: &str = "239.255.255.250:1900";
@@ -61,9 +61,14 @@ const SSDP_GROUP: &str = "239.255.255.250:1900";
 /// The search target that only a Sonos answers.
 const SONOS_TARGET: &str = "urn:schemas-upnp-org:device:ZonePlayer:1";
 
-/// The search target everything with a UPnP stack answers, which is how a
-/// candidate for the port 5555 probe gets onto the list at all.
+/// The search target everything with a UPnP stack answers, which is what puts
+/// the whole answering population on the list for a person diagnosing a hole.
 const EVERYTHING_TARGET: &str = "ssdp:all";
+
+/// The search target a DIAL device answers — a television, measured here on
+/// both Fire TVs and answered by *only* this target, never by `ssdp:all`
+/// alone (home-lab.dx §"The televisions, driven").
+const DIAL_TARGET: &str = "urn:dial-multiscreen-org:service:dial:1";
 
 /// How many times the search is sent across the caller's window.
 ///
@@ -72,19 +77,6 @@ const EVERYTHING_TARGET: &str = "ssdp:all";
 /// every extra burst is another round of answers from every device on the
 /// network.
 pub const BURSTS: u32 = 3;
-
-/// The port Android's debug bridge listens on, and the only thing this module
-/// asks about a television.
-pub const ADB_PORT: u16 = 5555;
-
-/// How long a single port probe may wait before the host counts as closed.
-///
-/// A LAN handshake completes in single-digit milliseconds; this budget is only
-/// ever spent in full by a host that silently drops the SYN, which is what a
-/// firewalled port does. It is a ceiling on how far past the caller's window a
-/// sweep can run, and the probes run concurrently, so it is paid once and not
-/// once per device.
-pub const PROBE_BUDGET: Duration = Duration::from_millis(800);
 
 /// The largest SSDP response worth reading.
 ///
@@ -105,9 +97,9 @@ pub enum FoundKind {
     /// A Sonos zone player: it answered the `ZonePlayer` search, or named
     /// itself Sonos, or quoted a household.
     Sonos,
-    /// A host with the Android debug bridge accepting connections. Decided by
-    /// the probe, never by what the host said about itself.
-    FireTv,
+    /// A DIAL device — a television. Decided by its answer to the DIAL search,
+    /// which is the device's own statement, exactly as a Sonos's is.
+    Dial,
     /// Something that answered discovery and is neither of the above.
     Unknown,
 }
@@ -118,7 +110,7 @@ impl FoundKind {
     pub fn as_str(self) -> &'static str {
         match self {
             FoundKind::Sonos => "sonos",
-            FoundKind::FireTv => "firetv",
+            FoundKind::Dial => "dial",
             FoundKind::Unknown => "unknown",
         }
     }
@@ -187,9 +179,7 @@ impl Found {
 /// Finds every device on the local network that answers within `timeout`.
 ///
 /// The window is the SSDP budget: the searches are spread across it and answers
-/// are taken until it closes. The port 5555 probes then run concurrently and
-/// may add up to [`PROBE_BUDGET`] on top, so a caller sizing a startup
-/// sequence should allow for the window plus a second.
+/// are taken until it closes.
 ///
 /// Never fails. A machine with no route to the multicast group, no permission
 /// to bind, or no devices to find all produce an empty `Vec`.
@@ -202,9 +192,7 @@ pub async fn sweep(timeout: Duration) -> Vec<Found> {
     // whatever it is going to be, and refusing to sweep over it helps nobody.
     let _ = socket.set_multicast_ttl_v4(4);
 
-    let mut found = listen(&socket, timeout).await;
-    upgrade_reachable_televisions(&mut found).await;
-    found
+    listen(&socket, timeout).await
 }
 
 /// Sends the bursts and collects answers until the window closes.
@@ -230,7 +218,7 @@ async fn listen(socket: &UdpSocket, timeout: Duration) -> Vec<Found> {
             return found;
         }
         if sent < BURSTS && now >= next_burst {
-            for target in [SONOS_TARGET, EVERYTHING_TARGET] {
+            for target in [SONOS_TARGET, DIAL_TARGET, EVERYTHING_TARGET] {
                 let _ = socket.send_to(search(target).as_bytes(), SSDP_GROUP).await;
             }
             sent += 1;
@@ -256,58 +244,6 @@ async fn listen(socket: &UdpSocket, timeout: Duration) -> Vec<Found> {
             Err(_) => {}
         }
     }
-}
-
-/// Turns hosts with an open debug bridge into [`FoundKind::FireTv`].
-///
-/// Every host that answered anything is a candidate except the speakers, which
-/// are already identified and do not run a debug bridge; probing them would be
-/// two connections per sweep spent proving something known. A host that does
-/// not accept the connection keeps the kind it had, so a closed port removes
-/// nothing from the list — it only declines to promise the thing is drivable.
-async fn upgrade_reachable_televisions(found: &mut [Found]) {
-    let mut candidates: Vec<String> = Vec::new();
-    for entry in found.iter() {
-        if entry.kind != FoundKind::Sonos && !candidates.contains(&entry.address) {
-            candidates.push(entry.address.clone());
-        }
-    }
-    if candidates.is_empty() {
-        return;
-    }
-
-    let mut probes = Vec::with_capacity(candidates.len());
-    for host in candidates {
-        probes.push(tokio::spawn(async move {
-            let open = accepts_adb(&host).await;
-            (host, open)
-        }));
-    }
-
-    let mut open: HashSet<String> = HashSet::new();
-    for probe in probes {
-        // A probe that panicked or was cancelled is a host we learned nothing
-        // about, which is the same outcome as a closed port.
-        if let Ok((host, true)) = probe.await {
-            open.insert(host);
-        }
-    }
-
-    for entry in found.iter_mut() {
-        if entry.kind != FoundKind::Sonos && open.contains(&entry.address) {
-            entry.kind = FoundKind::FireTv;
-        }
-    }
-}
-
-/// Whether a TCP connection to the debug bridge is accepted.
-///
-/// Connect and drop. Anything more — a handshake, a version banner — is the
-/// ADB driver's protocol, and speaking half of it here would put the same
-/// parsing in two places.
-async fn accepts_adb(host: &str) -> bool {
-    let connect = TcpStream::connect((host, ADB_PORT));
-    matches!(tokio::time::timeout(PROBE_BUDGET, connect).await, Ok(Ok(_)))
 }
 
 /// Builds an `M-SEARCH` for one target.
@@ -374,10 +310,20 @@ pub fn parse(datagram: &str, source: &str) -> Option<Found> {
         || usn.contains("RINCON_")
         || server.to_ascii_lowercase().contains("sonos")
         || household.is_some();
+    // The DIAL service urn, in the ST of an answer to the targeted search or
+    // in the USN either way — a device states it, this module only reads it.
+    let dial = search_target.contains("dial-multiscreen-org:service:dial")
+        || usn.contains("dial-multiscreen-org:service:dial");
 
     Some(Found {
         address,
-        kind: if sonos { FoundKind::Sonos } else { FoundKind::Unknown },
+        kind: if sonos {
+            FoundKind::Sonos
+        } else if dial {
+            FoundKind::Dial
+        } else {
+            FoundKind::Unknown
+        },
         name: model_of(server),
         key: uuid_of(usn),
         household,
@@ -799,7 +745,7 @@ LOCATION: http://192.168.1.1:56688/rootDesc.xml\r\n\r\n";
     #[test]
     fn a_kind_travels_as_one_lowercase_word() {
         assert_eq!(FoundKind::Sonos.as_str(), "sonos");
-        assert_eq!(FoundKind::FireTv.as_str(), "firetv");
+        assert_eq!(FoundKind::Dial.as_str(), "dial");
         assert_eq!(FoundKind::Unknown.as_str(), "unknown");
     }
 
@@ -811,32 +757,52 @@ LOCATION: http://192.168.1.1:56688/rootDesc.xml\r\n\r\n";
         assert!(found.iter().all(|entry| !entry.address.is_empty()));
     }
 
-    /// A closed port leaves a host on the list as whatever it already was; only
-    /// an accepted connection may call something a Fire TV.
-    #[tokio::test]
-    async fn a_host_with_no_debug_bridge_is_not_called_a_fire_tv() {
-        let mut found = vec![Found {
-            // Reserved for documentation by RFC 5737, so nothing answers and
-            // the probe spends its whole budget, which is the case worth
-            // holding to a bound.
-            address: "192.0.2.1".to_owned(),
-            kind: FoundKind::Unknown,
-            name: None,
-            key: Some("0d1a-77".to_owned()),
-            household: None,
-            location: None,
-        }];
-        upgrade_reachable_televisions(&mut found).await;
-        assert_eq!(found[0].kind, FoundKind::Unknown);
+    /// The answer both real televisions gave to the targeted DIAL search on
+    /// 2026-08-18 (home-lab.dx §"The televisions, driven"): identity comes
+    /// from the device's own protocol statement, never from an open port.
+    /// The `SERVER` line is the one the Android-based television reported.
+    const DIAL_ANSWER: &str = "HTTP/1.1 200 OK\r\n\
+CACHE-CONTROL: max-age=1800\r\n\
+EXT:\r\n\
+LOCATION: http://192.168.1.4:60000/dd.xml\r\n\
+SERVER: Linux/4.4.120+ UPnP/1.0 quick_ssdp/1.1\r\n\
+ST: urn:dial-multiscreen-org:service:dial:1\r\n\
+USN: uuid:17df6a1e-1e65-4d29-a538-fdd4d8d38a03::urn:dial-multiscreen-org:service:dial:1\r\n\
+\r\n";
+
+    /// A television is a television because it answered the DIAL search —
+    /// TCP 5555 was the old rule, and it made both real Fire TVs invisible
+    /// because the debug bridge is off by default and cannot exist on Vega.
+    #[test]
+    fn a_television_is_recognised_by_its_dial_answer() {
+        let found = parse(DIAL_ANSWER, "192.168.1.4").expect("a 200 answer is a device");
+        assert_eq!(found.kind, FoundKind::Dial);
+        assert_eq!(found.address, "192.168.1.4");
+        assert_eq!(found.location.as_deref(), Some("http://192.168.1.4:60000/dd.xml"));
+        assert_eq!(found.key.as_deref(), Some("17df6a1e-1e65-4d29-a538-fdd4d8d38a03"));
     }
 
-    /// A speaker is never probed and never reclassified, however the network
-    /// answers — a Sonos does not run a debug bridge, and a sweep that renamed
-    /// one would take the speakers off the page.
-    #[tokio::test]
-    async fn a_sonos_is_never_reclassified_by_the_probe() {
-        let mut found = vec![parse(CAPTURED, "192.168.1.6").expect("a device")];
-        upgrade_reachable_televisions(&mut found).await;
-        assert_eq!(found[0].kind, FoundKind::Sonos);
+    /// The same television answers `ssdp:all` first as `Unknown`; the DIAL
+    /// answer must sharpen the entry already recorded, not add a second one.
+    #[test]
+    fn a_dial_answer_sharpens_the_general_answer_for_the_same_device() {
+        let general = "HTTP/1.1 200 OK\r\n\
+LOCATION: http://192.168.1.4:60000/dd.xml\r\n\
+ST: upnp:rootdevice\r\n\
+USN: uuid:17df6a1e-1e65-4d29-a538-fdd4d8d38a03::upnp:rootdevice\r\n\r\n";
+        let mut found = Vec::new();
+        absorb(&mut found, parse(general, "192.168.1.4").expect("a device"));
+        assert_eq!(found[0].kind, FoundKind::Unknown);
+        absorb(&mut found, parse(DIAL_ANSWER, "192.168.1.4").expect("a device"));
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].kind, FoundKind::Dial);
+    }
+
+    /// The search must ask for DIAL by name: both televisions answered only
+    /// the targeted search, so `ssdp:all` alone does not surface them as DIAL.
+    #[test]
+    fn the_sweep_asks_for_dial_by_name() {
+        let probe = search(DIAL_TARGET);
+        assert!(probe.contains("ST: urn:dial-multiscreen-org:service:dial:1\r\n"));
     }
 }

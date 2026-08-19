@@ -275,6 +275,23 @@ pub async fn get(address: &str, path: &str) -> Result<String, SoapError> {
 /// call" a property of the module rather than a habit of its callers. Both
 /// deadlines live here: one on the handshake, one on everything after it.
 async fn exchange(address: &str, request: &[u8]) -> Result<(u16, String), SoapError> {
+    let (status, _, body) = http(address, request).await?;
+    Ok((status, body))
+}
+
+/// One raw HTTP exchange, headers included, for a sibling driver.
+///
+/// SOAP callers never read a response header, so [`exchange`] drops them; DIAL
+/// (`crate::dial`) rides the same transport and its one navigational fact —
+/// the `Application-URL` a television states over its device description —
+/// arrives *only* as a header. This entry point exists so that driver reuses
+/// this module's connect, deadline and framing discipline instead of growing a
+/// second copy of it. The request bytes are the caller's, already serialised,
+/// because each protocol's request shape belongs to its own module.
+pub(crate) async fn http(
+    address: &str,
+    request: &[u8],
+) -> Result<(u16, selfhost_http::Headers, String), SoapError> {
     let authority = authority(address);
 
     let stream = timeout(CONNECT_TIMEOUT, TcpStream::connect(&authority))
@@ -286,10 +303,10 @@ async fn exchange(address: &str, request: &[u8]) -> Result<(u16, String), SoapEr
         let mut stream = stream;
         stream.write_all(request).await.map_err(|error| SoapError::Io(error.to_string()))?;
         stream.flush().await.map_err(|error| SoapError::Io(error.to_string()))?;
-        let (status, body) = read_response(&mut stream).await?;
+        let (status, headers, body) = read_response(&mut stream).await?;
         let body = String::from_utf8(body)
             .map_err(|_| SoapError::Malformed("the body was not UTF-8".to_owned()))?;
-        Ok((status, body))
+        Ok((status, headers, body))
     })
     .await
     .map_err(|_| SoapError::Io(format!("no answer from {authority} within {EXCHANGE_TIMEOUT:?}")))?
@@ -361,7 +378,7 @@ fn get_request(authority: &str, path: &str) -> Vec<u8> {
 /// framing the speakers use can be exercised from a byte slice with no socket,
 /// no speaker, and no network in the test sandbox. Enforces
 /// [`MAX_RESPONSE_BYTES`] in every branch.
-async fn read_response<R>(stream: &mut R) -> Result<(u16, Vec<u8>), SoapError>
+async fn read_response<R>(stream: &mut R) -> Result<(u16, selfhost_http::Headers, Vec<u8>), SoapError>
 where
     R: AsyncRead + Unpin,
 {
@@ -423,7 +440,7 @@ where
         }
     };
 
-    Ok((head.status.code(), body))
+    Ok((head.status.code(), head.headers, body))
 }
 
 /// Appends one read to `buffer`, enforcing the size cap. `false` at end of stream.
@@ -564,7 +581,7 @@ mod tests {
     /// are exercised with no speaker in reach of the sandbox.
     async fn read(raw: &[u8]) -> Result<(u16, String), SoapError> {
         let mut source = raw;
-        let (status, body) = read_response(&mut source).await?;
+        let (status, _, body) = read_response(&mut source).await?;
         Ok((status, String::from_utf8(body).unwrap()))
     }
 
