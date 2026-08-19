@@ -535,7 +535,7 @@ input:focus-visible, select:focus-visible { outline: none; border-color: var(--a
 }
 .tonearm .arm {
   position: absolute; right: 10px; top: 10px; width: 2px; height: 78px;
-  transform-origin: 1px 1px; transform: rotate(var(--arm, -24deg));
+  transform-origin: 1px 1px; transform: rotate(var(--arm, -12deg));
   background: linear-gradient(var(--muted), var(--accent) 92%);
 }
 .tonearm .arm::after {  /* the head, a lamp-slot at the arm's end */
@@ -566,7 +566,9 @@ input:focus-visible, select:focus-visible { outline: none; border-color: var(--a
 }
 /* Temperature chips render their own kelvin as ink on the tint they set. */
 .chip.temp { width: auto; padding: 0 8px; font-size: 10px; letter-spacing: 0.05em;
-  display: flex; align-items: center; justify-content: center; color: var(--on-accent); }
+  /* gap, because the chip is a flex row and the space between the name and its
+     kelvin collapses without it — the first capture printed CANDLE2200K. */
+  display: flex; gap: 4px; align-items: center; justify-content: center; color: var(--on-accent); }
 /* Effects are words, not colours: the far device runs the pattern, the page
    only names it, so an effect chip is a small button, and the running one is
    pressed. */
@@ -603,3 +605,12 @@ input:focus-visible, select:focus-visible { outline: none; border-color: var(--a
       mockups carry it standalone ─────────────────────────────────── */
 @keyframes pulse-warn { 0%, 100% { opacity: 1; } 50% { opacity: 0.4; } }
 @keyframes pulse-bad  { 0%, 100% { opacity: 1; } 50% { opacity: 0.4; } }
+
+/* Phone-width slider order: the label and the value share the first line and
+   the track takes the whole next one — a number orphaned under the track was
+   the first thing every capture of the 2026-08-19 pass got wrong. */
+@media (max-width: 480px) {
+  .slider .fieldlabel { order: 1; }
+  .slider .value { order: 2; margin-left: auto; }
+  .slider input[type="range"] { order: 3; }
+}

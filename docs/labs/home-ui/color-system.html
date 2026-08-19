@@ -1,0 +1,169 @@
+<!doctype html>
+<!-- Design comp: the choices legend board, 720px. Five reference sections:
+     the eight colour chips, temperature chips, effects, steadfastness marks,
+     and the lamp legend. This board is the design's legend, not a page.
+     Markup uses the page's own class vocabulary; theatre.css is the shipped
+     stylesheet plus design-kit extensions. -->
+<html lang="en"><head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>comp — the choices legend</title>
+<link rel="stylesheet" href="theatre.css">
+<style>
+/* 720px width as specified for this legend board. */
+body { max-width: 720px; }
+/* Large colour chips for legend legibility. */
+.chip-large { width: 48px; height: 32px; }
+.chip-row { display: flex; flex-direction: column; align-items: center; gap: 4px; }
+/* Palette layout for chips. */
+.palette { gap: 8px; flex-wrap: wrap; margin-top: 8px; }
+/* Effects button row. */
+.effects { margin-top: 8px; }
+/* Setmark section. */
+.setmark-section { display: flex; flex-direction: column; gap: 10px; margin-top: 8px; }
+.setmark-item { display: flex; flex-direction: column; gap: 0; }
+/* Lamp legend. */
+.lamp-legend { display: flex; flex-direction: column; gap: 8px; margin-top: 8px; }
+.lampline { margin-bottom: 0; }
+/* Consistent caption margin. */
+.caption { margin-top: 4px; }
+section.plate { margin-bottom: 0; }
+</style>
+</head><body>
+
+<section class="plate">
+  <div class="section-rule"><h2>COLOUR CHIPS</h2><span class="rule"></span></div>
+  <div class="palette">
+    <div class="chip-row">
+      <div class="chip chip-large" style="background:#E03A3F;"></div>
+      <span class="micro" style="text-align:center;">CRIMSON<br>#E03A3F</span>
+    </div>
+    <div class="chip-row">
+      <div class="chip chip-large" style="background:#FF7A2F;"></div>
+      <span class="micro" style="text-align:center;">EMBER<br>#FF7A2F</span>
+    </div>
+    <div class="chip-row">
+      <div class="chip chip-large" style="background:#FFB46B;"></div>
+      <span class="micro" style="text-align:center;">GOLD<br>#FFB46B</span>
+    </div>
+    <div class="chip-row">
+      <div class="chip chip-large" style="background:#7FAE62;"></div>
+      <span class="micro" style="text-align:center;">MOSS<br>#7FAE62</span>
+    </div>
+    <div class="chip-row">
+      <div class="chip chip-large" style="background:#2FB3A5;"></div>
+      <span class="micro" style="text-align:center;">TEAL<br>#2FB3A5</span>
+    </div>
+    <div class="chip-row">
+      <div class="chip chip-large" style="background:#4F9FE0;"></div>
+      <span class="micro" style="text-align:center;">SKY<br>#4F9FE0</span>
+    </div>
+    <div class="chip-row">
+      <div class="chip chip-large" style="background:#8F6FE8;"></div>
+      <span class="micro" style="text-align:center;">VIOLET<br>#8F6FE8</span>
+    </div>
+    <div class="chip-row">
+      <div class="chip chip-large" style="background:#E26FAE;"></div>
+      <span class="micro" style="text-align:center;">ROSE<br>#E26FAE</span>
+    </div>
+    <div class="chip-row">
+      <div class="chip chip-large chip add" style="background:transparent;">+</div>
+      <span class="micro" style="text-align:center;">add<br>chip</span>
+    </div>
+  </div>
+</section>
+
+<section class="plate">
+  <div class="section-rule"><h2>TEMPERATURE CHIPS</h2><span class="rule"></span></div>
+  <div class="palette">
+    <div class="chip temp" style="background:#FF9329;">CANDLE 2200K</div>
+    <div class="chip temp" style="background:#FFB46B;">WARM 2700K</div>
+    <div class="chip temp" style="background:#FFDCB8;">NEUTRAL 4000K</div>
+    <div class="chip temp" style="background:#F5EFE6;">DAY 5500K</div>
+  </div>
+</section>
+
+<section class="plate">
+  <div class="section-rule"><h2>EFFECTS</h2><span class="rule"></span></div>
+  <div class="effects" style="flex-wrap: wrap; gap: 12px;">
+    <div style="display: flex; flex-direction: column; gap: 4px; align-items: center;">
+      <button class="btn small">FIREPLACE</button>
+      <span class="caption" style="width: 80px; text-align: center;">Flickering warm ambient light</span>
+    </div>
+    <div style="display: flex; flex-direction: column; gap: 4px; align-items: center;">
+      <button class="btn small">OCEAN</button>
+      <span class="caption" style="width: 80px; text-align: center;">Wave-like rippling soothing tones</span>
+    </div>
+    <div style="display: flex; flex-direction: column; gap: 4px; align-items: center;">
+      <button class="btn small">FOREST</button>
+      <span class="caption" style="width: 80px; text-align: center;">Gentle green nature-inspired mood</span>
+    </div>
+    <div style="display: flex; flex-direction: column; gap: 4px; align-items: center;">
+      <button class="btn small">SUNSET</button>
+      <span class="caption" style="width: 80px; text-align: center;">Warm golden transitioning colors</span>
+    </div>
+    <div style="display: flex; flex-direction: column; gap: 4px; align-items: center;">
+      <button class="btn small">PARTY</button>
+      <span class="caption" style="width: 80px; text-align: center;">Vibrant multicolor pulsing rhythm</span>
+    </div>
+    <div style="display: flex; flex-direction: column; gap: 4px; align-items: center;">
+      <button class="btn small">FOCUS</button>
+      <span class="caption" style="width: 80px; text-align: center;">Bright steady cool productivity</span>
+    </div>
+    <div style="display: flex; flex-direction: column; gap: 4px; align-items: center;">
+      <button class="btn small">RELAX</button>
+      <span class="caption" style="width: 80px; text-align: center;">Soft warm dimmed evening glow</span>
+    </div>
+    <div style="display: flex; flex-direction: column; gap: 4px; align-items: center;">
+      <button class="btn small">NIGHT</button>
+      <span class="caption" style="width: 80px; text-align: center;">Dim red minimal sleep light</span>
+    </div>
+  </div>
+</section>
+
+<section class="plate">
+  <div class="section-rule"><h2>STEADFASTNESS MARKS</h2><span class="rule"></span></div>
+  <div class="setmark-section">
+    <div class="setmark-item">
+      <span class="setmark"><span class="lamp pending"></span><span class="micro">SET 0% — APPLYING</span></span>
+      <p class="caption">Converging: the hub sent a command, the device is still answering.</p>
+    </div>
+    <div class="setmark-item">
+      <span class="setmark holdout"><span class="lamp pending"></span><span class="micro">SET OFF — DEVICE SAYS ON, RETRYING</span></span>
+      <p class="caption">Holdout: device dissenting after patience; the hub is retrying.</p>
+    </div>
+    <div class="setmark-item">
+      <div style="opacity: 0.5;">
+        <span class="setmark"><span class="lamp idle"></span><span class="micro">SET 0%</span></span>
+      </div>
+      <p class="caption">Device gone: unreachable. Set state applies when it does.</p>
+    </div>
+  </div>
+</section>
+
+<section class="plate">
+  <div class="section-rule"><h2>LAMP LEGEND</h2><span class="rule"></span></div>
+  <div class="lamp-legend">
+    <div class="lampline">
+      <span class="lamp ok"></span>
+      <span class="caption">OK: device is responding, on and available.</span>
+    </div>
+    <div class="lampline">
+      <span class="lamp warn"></span>
+      <span class="caption">WARN: something needs attention but is not broken — a device converging, or stale commands waiting.</span>
+    </div>
+    <div class="lampline">
+      <span class="lamp bad"></span>
+      <span class="caption">BAD: the hub refused the command, or the device stopped answering.</span>
+    </div>
+    <div class="lampline">
+      <span class="lamp idle"></span>
+      <span class="caption">IDLE: device is off, or the page has no report yet.</span>
+    </div>
+    <div class="lampline">
+      <span class="lamp pending"></span>
+      <span class="caption">PENDING: a command is in flight to the device, still waiting for confirmation.</span>
+    </div>
+  </div>
+</section>
+
+</body></html>

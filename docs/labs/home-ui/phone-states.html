@@ -1,0 +1,93 @@
+<!doctype html>
+<!-- Design comp: the honesty board — refusal, convergence states, and cloud-only
+     devices. Phone width. Demonstrates alert bars, applying setmarks, holdout
+     states, device-gone dimming, cloud-only rows, and stale masthead. Markup uses
+     the page's own classes; theatre.css is the shipped stylesheet. -->
+<html lang="en"><head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>The honesty board.</title>
+<link rel="stylesheet" href="theatre.css">
+</head><body>
+
+<!-- 1. Refusal alert bar: The hub refused a command with a validation error. -->
+<div class="alert problem">
+  <span class="flagbar"></span>
+  <span id="notice-text">The hub refused: volume must be 0–100.</span>
+  <button class="btn ghost small" aria-label="Dismiss">×</button>
+</div>
+
+<main id="rooms">
+<div class="room">
+
+  <!-- 2. Bedside with applying setmark: The light is converging to the set state. -->
+  <section class="plate device">
+    <div class="title-rule">
+      <span class="title">Bedside</span><span class="rule"></span>
+      <span class="micro kind">LIGHT</span><span class="lamp ok"></span>
+    </div>
+    <p class="doing">Converging to off.</p>
+    <span class="setmark">
+      <span class="lamp pending"></span>
+      <span class="micro">SET 0% — APPLYING</span>
+    </span>
+  </section>
+
+  <!-- 3. Move speaker gone: Unreachable device, dimmed, but volume slider still shows set value. -->
+  <section class="plate device gone">
+    <div class="title-rule">
+      <span class="title">Move</span><span class="rule"></span>
+      <span class="micro kind">SPEAKER</span><span class="lamp idle"></span>
+    </div>
+    <p class="doing">Not answering.</p>
+    <p class="note">Set state applies when it does.</p>
+    <div class="controls">
+      <div class="slider">
+        <span class="fieldlabel">VOLUME</span>
+        <input type="range" min="0" max="100" value="25" disabled aria-label="Volume">
+        <span class="value mono">25</span>
+      </div>
+    </div>
+  </section>
+
+  <!-- 4. Porch: Cloud-only bulb, shown to prove nothing is silently missing. No controls. -->
+  <section class="plate device">
+    <div class="title-rule">
+      <span class="title">Porch</span><span class="rule"></span>
+      <span class="micro kind">LIGHT</span><span class="lamp idle"></span>
+    </div>
+    <p class="note">Cloud-only, no local protocol. Shown so nothing is silently missing.</p>
+  </section>
+
+</div>
+</main>
+
+<!-- 5. Stale masthead strip: The page is waiting for the hub to respond; commands
+     are queued but not executed. -->
+<div class="lampline" style="padding: 8px 0; border-top: 1px solid var(--border); border-bottom: 1px solid var(--border);">
+  <span class="lamp warn"></span>
+  <span class="stateword warn">STALE</span>
+  <span class="rule"></span>
+  <span class="caption">Commands wait; the page will not pretend.</span>
+</div>
+
+<main id="rooms" style="margin-top: 8px;">
+<div class="room">
+
+  <!-- 6. Holdout example: A device has dissented after patience; the setmark
+       turns amber and shows the device's own state instead. -->
+  <section class="plate device">
+    <div class="title-rule">
+      <span class="title">Desk</span><span class="rule"></span>
+      <span class="micro kind">LIGHT</span><span class="lamp warn"></span>
+    </div>
+    <p class="doing">Off, 0%.</p>
+    <span class="setmark holdout">
+      <span class="lamp pending"></span>
+      <span class="micro">SET OFF — DEVICE SAYS ON, RETRYING</span>
+    </span>
+  </section>
+
+</div>
+</main>
+
+</body></html>

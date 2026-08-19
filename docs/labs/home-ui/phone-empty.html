@@ -1,0 +1,33 @@
+<!doctype html>
+<!-- Design comp: empty house, connection in progress. Masthead showing sweep
+     ring and connecting state, reticle sighting mark centered, caption
+     explaining the wait. -->
+<html lang="en"><head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>comp — empty</title>
+<link rel="stylesheet" href="theatre.css">
+<style>
+/* comp-local layout */
+.empty-wrapper { display: flex; flex-direction: column; align-items: center; gap: 14px; max-width: 300px; }
+</style>
+</head><body>
+
+<header id="masthead">
+  <span class="wordmark">HOME</span>
+  <span class="designation">DEVICE CONTROL</span>
+  <span class="rule"></span>
+  <span class="micro" id="gen">#1</span>
+  <span class="sweep"></span>
+  <span class="stateword warn">CONNECTING</span>
+</header>
+
+<div class="empty">
+  <div class="empty-wrapper">
+    <div class="reticle">
+      <span class="dot"></span>
+    </div>
+    <p class="caption centered">No devices found on this network yet. The house is being swept; anything that answers appears here by itself.</p>
+  </div>
+</div>
+
+</body></html>
