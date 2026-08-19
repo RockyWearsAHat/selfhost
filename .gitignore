@@ -61,13 +61,11 @@ sites/*
 # Scratch directory for the service-manager demo (see .demo/svc)
 .demo/
 
-# local agent/security notes — never commit
+# local agent/security notes — never commit. These two are *writing about* the
+# defences: the guidebook's findings, the working notes, what is still weak and
+# where. That is the half worth keeping off a public repository — unlike the
+# scripts, which merely do standard hardening and say nothing a scan would not.
 CLAUDE.md
-
-# local security tooling & docs — do not commit
-scripts/macos/verify-hardening.zsh
-scripts/macos/lockdown.sh
-scripts/macos/verify-security.sh
 docs/SECURITY.md
 
 # Scratch deployments the dx labs build to prove a command works end to end.
