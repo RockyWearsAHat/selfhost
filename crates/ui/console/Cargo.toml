@@ -25,6 +25,11 @@ selfhost-desk = { workspace = true }
 selfhost-firewall = { workspace = true }
 selfhost-http = { workspace = true }
 selfhost-json = { workspace = true }
+# The lock in front of every connection: ask the operating system to prove a
+# person is at this computer — Touch ID, or the account password behind it. The
+# one crate here that is allowed `unsafe` on this one's behalf, which is what
+# lets this one go on forbidding it.
+selfhost-presence = { workspace = true }
 # The two platform key tables, in the one direction they are written and read
 # backwards here. See `remote::usage_for_code` for why a second table is the one
 # thing a keystroke forwarder must never write.

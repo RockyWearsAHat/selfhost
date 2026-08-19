@@ -39,10 +39,10 @@
 //! is what lets the console survive a daemon that restarted and rewrote it.
 
 use crate::client::Client;
+use crate::gate::{self, Latch};
 use crate::machines::{Machine, Machines};
 use crate::state::Snapshot;
-use crate::tunnel::TunnelSpec;
-use crate::{poller, tunnel};
+use crate::tunnel::{self, TunnelSpec};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -218,19 +218,24 @@ pub struct Link {
 }
 
 impl Link {
-    /// Opens a connection: the tunnel if there is one, and the poller.
-    pub fn open(spec: Option<TunnelSpec>, connect: Connector) -> Self {
+    /// Opens a connection: the lock, and behind it the tunnel and the poller.
+    ///
+    /// Nothing is dialled here. [`crate::gate`] is what starts the other two
+    /// threads, and it does it only once a person has been proved to be at this
+    /// computer — so a link that is refused has read no token, started no `ssh`
+    /// and composed no request. The snapshot is created shut for the same reason:
+    /// the window must never draw one frame of an unlocked console before the
+    /// gate thread has had its first turn.
+    pub fn open(spec: Option<TunnelSpec>, connect: Connector, proof: Arc<Latch>) -> Self {
         let shared = Arc::new(Mutex::new(Snapshot::default()));
         let alive = Arc::new(AtomicBool::new(true));
-        let mut threads = Vec::new();
-        if let Some(spec) = spec {
-            threads.push(tunnel::spawn(spec, Arc::clone(&shared), Arc::clone(&alive)));
-        }
-        threads.push(poller::spawn(
-            move || connect(),
+        let threads = vec![gate::spawn(
+            spec,
+            connect,
             Arc::clone(&shared),
             Arc::clone(&alive),
-        ));
+            proof,
+        )];
         Self { alive, threads, shared }
     }
 
