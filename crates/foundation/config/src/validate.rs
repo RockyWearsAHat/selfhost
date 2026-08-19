@@ -87,6 +87,7 @@ impl Config {
         self.check_self_update(&mut problems);
         self.check_shares(&mut problems);
         self.check_desktop(&mut problems);
+        self.check_home(&mut problems);
         self.check_mesh(&mut problems);
         self.check_vpn(&mut problems);
 
@@ -165,6 +166,16 @@ impl Config {
     /// some route other than TOML cannot skip it.
     fn check_shares(&self, problems: &mut Vec<Problem>) {
         crate::storage::check_shares(&self.shares, "shares", problems);
+    }
+
+    /// The smart-home section, when present, must name a fixed port and
+    /// intervals that are not zero and not transposed. Delegated to
+    /// [`crate::house::Home::check`]. Absent `[home]` validates nothing,
+    /// because absent means the subsystem does not exist.
+    fn check_home(&self, problems: &mut Vec<Problem>) {
+        if let Some(home) = &self.home {
+            home.check("home", problems);
+        }
     }
 
     /// The desktop section, when present, must be internally honest and within
@@ -750,6 +761,7 @@ mod tests {
             shares: vec![],
             desktop: None,
             mesh: None,
+            home: None,
             vpn: Vec::new(),
         }
     }

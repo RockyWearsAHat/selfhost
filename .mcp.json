@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "home": {
+      "command": "cargo",
+      "args": ["run", "-q", "-p", "selfhost-cli", "--bin", "selfhost", "--", "home", "mcp"]
+    }
+  }
+}

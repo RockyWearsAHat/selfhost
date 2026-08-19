@@ -1,0 +1,307 @@
+<!doctype html>
+<!-- Design comp: the whole house on INSTRUMENT — masthead, bank condition,
+     then rooms in census order, each with .section-rule header + one
+     .roomdevices grid of .plate.device sections. Every device is its own
+     plate: title-rule, doing sentence, controls, address footer. The
+     Kitchen deck is copied verbatim from phone-player.html; the LIGHTS
+     deck plate and every light plate carry BRIGHT plus the COLOR/TEMP
+     strips. No JavaScript, no external requests, shapes and text only. -->
+<html lang="en"><head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>comp — the house</title>
+<link rel="stylesheet" href="instrument.css">
+</head><body>
+
+<main id="rooms">
+
+<div class="masthead">
+  <span class="wordmark">HOME</span>
+  <span class="rule"></span>
+  <span class="gen">#214</span>
+  <span class="stateword">
+    <span class="lamp ok"></span>OK
+  </span>
+</div>
+
+<div class="bank">
+  <div class="condition">Music in the kitchen; three lights on.</div>
+  <div class="evidence">DEVICES 9 &middot; ACTIVE 4 &middot; UNREACHABLE 0</div>
+</div>
+
+<!-- LIGHTS deck: scope row, ON/OFF, BRIGHT, the COLOR/TEMP strips, palette, effects. -->
+<div class="section-rule"><h2>Lights</h2><span class="rule"></span></div>
+<div class="roomdevices">
+
+<section class="plate device lit" style="--glow:#2FB3A5">
+  <div class="title-rule">
+    <span class="title">All lights</span><span class="rule"></span>
+    <span class="micro kind">SCOPE</span><span class="lamp ok"></span>
+  </div>
+  <p class="doing">Three on, one turning off.</p>
+  <div class="scope">
+    <button class="btn small" aria-pressed="true">ALL <span class="count">(4)</span></button>
+    <button class="btn small" aria-pressed="false">LIVING ROOM <span class="count">(2)</span></button>
+    <button class="btn small" aria-pressed="false">BEDROOM <span class="count">(1)</span></button>
+    <button class="btn small" aria-pressed="false">OFFICE <span class="count">(1)</span></button>
+  </div>
+  <div class="actions">
+    <button class="btn" aria-pressed="true">ON</button>
+    <button class="btn" aria-pressed="false">OFF</button>
+  </div>
+  <div class="slider">
+    <span class="fieldlabel">BRIGHT</span>
+    <input type="range" min="0" max="100" value="70" aria-label="Brightness">
+    <span class="value mono readout">70</span>
+  </div>
+  <div class="slider spectrum"><span class="fieldlabel">COLOR</span><input type="range" min="0" max="100" value="62" aria-label="Color"><span class="value mono readout">#2FB3A5</span></div>
+  <div class="slider temp"><span class="fieldlabel">TEMP</span><input type="range" min="0" max="100" value="20" aria-label="Temperature"><span class="value mono readout">2700K</span></div>
+  <div class="palette">
+    <button class="chip" style="--c:#E03A3F" aria-pressed="false" aria-label="Crimson"></button>
+    <button class="chip" style="--c:#FF7A2F" aria-pressed="false" aria-label="Ember"></button>
+    <button class="chip" style="--c:#FFB46B" aria-pressed="false" aria-label="Gold"></button>
+    <button class="chip" style="--c:#7FAE62" aria-pressed="false" aria-label="Moss"></button>
+    <button class="chip" style="--c:#2FB3A5" aria-pressed="true" aria-label="Teal"></button>
+    <button class="chip" style="--c:#4F9FE0" aria-pressed="false" aria-label="Sky"></button>
+    <button class="chip" style="--c:#8F6FE8" aria-pressed="false" aria-label="Violet"></button>
+    <button class="chip" style="--c:#E26FAE" aria-pressed="false" aria-label="Rose"></button>
+    <button class="chip add" aria-label="Add colour">+</button>
+  </div>
+  <div class="effects">
+    <button class="btn small ghost">FIREPLACE</button>
+    <button class="btn small ghost">OCEAN</button>
+    <button class="btn small ghost">FOREST</button>
+    <button class="btn small ghost">SUNSET</button>
+    <button class="btn small ghost">PARTY</button>
+    <button class="btn small ghost">FOCUS</button>
+    <button class="btn small ghost">RELAX</button>
+    <button class="btn small ghost">NIGHT</button>
+  </div>
+</section>
+
+</div>
+
+<div class="room">
+  <div class="section-rule"><h2>Kitchen</h2><span class="rule"></span></div>
+  <div class="roomdevices">
+
+  <!-- Playing, coordinating the group — deck copied verbatim from phone-player.html. -->
+  <section class="plate device">
+    <div class="title-rule">
+      <span class="title">Kitchen</span><span class="rule"></span>
+      <span class="micro kind">SPEAKER</span><span class="lamp ok"></span>
+    </div>
+    <p class="doing">Playing, grouped with Move.</p>
+    <div class="deck playing">
+      <div class="table">
+        <div class="platter">
+          <div class="vinyl">
+            <div class="label"><span class="l1">HARVEST MOON</span><span class="l2">NEIL YOUNG</span></div>
+          </div>
+        </div>
+        <span class="spindle"></span>
+        <div class="tonearm"><span class="base"></span><span class="tube" style="--arm:14deg"></span></div>
+      </div>
+      <div class="deck-panel">
+        <div class="toprow">
+          <div class="nowplaying">
+            <span class="track">Harvest Moon</span>
+            <span class="artist">Neil Young</span>
+          </div>
+          <div class="vus">
+            <span class="vu"><span class="needle" style="--vu:-4deg"></span><span class="vu-tag">L</span></span>
+            <span class="vu"><span class="needle" style="--vu:16deg"></span><span class="vu-tag">R</span></span>
+          </div>
+        </div>
+        <div class="progress">
+          <span class="bar"><span class="fill" style="width:38%"></span></span>
+          <span class="clock mono readout">1:54 / 5:03</span>
+        </div>
+        <div class="actions">
+          <button class="btn" aria-label="Previous">&#9198;</button>
+          <button class="btn primary" aria-label="Pause">&#9208;</button>
+          <button class="btn" aria-label="Next">&#9197;</button>
+          <button class="btn" aria-pressed="false">MUTE</button>
+        </div>
+      </div>
+    </div>
+    <div class="slider">
+      <span class="fieldlabel">VOLUME</span>
+      <input type="range" min="0" max="100" value="40" aria-label="Volume">
+      <span class="value mono readout">40</span>
+    </div>
+    <div class="grouprow">
+      <span class="caption">Coordinating: Move follows this deck.</span>
+      <button class="btn small">LEAVE</button>
+    </div>
+    <span class="address mono">192.168.1.6 &middot; sonos</span>
+  </section>
+
+  <!-- The follower: grouped under Kitchen, its own volume only. -->
+  <section class="plate device">
+    <div class="title-rule">
+      <span class="title">Move</span><span class="rule"></span>
+      <span class="micro kind">SPEAKER</span><span class="lamp ok"></span>
+    </div>
+    <p class="doing">Following Kitchen &mdash; Harvest Moon.</p>
+    <div class="slider">
+      <span class="fieldlabel">VOLUME</span>
+      <input type="range" min="0" max="100" value="25" aria-label="Volume">
+      <span class="value mono readout">25</span>
+    </div>
+    <div class="grouprow">
+      <span class="caption">Grouped under Kitchen.</span>
+      <button class="btn small">LEAVE</button>
+    </div>
+    <span class="address mono">192.168.1.17 &middot; sonos</span>
+  </section>
+
+  </div>
+</div>
+
+<div class="room">
+  <div class="section-rule"><h2>Living Room</h2><span class="rule"></span></div>
+  <div class="roomdevices">
+
+  <section class="plate device lit" style="--glow:#2FB3A5">
+    <div class="title-rule">
+      <span class="title">Couch Left</span><span class="rule"></span>
+      <span class="micro kind">LIGHT</span><span class="lamp ok"></span>
+    </div>
+    <p class="doing">On &mdash; 70%, teal.</p>
+    <div class="actions">
+      <button class="btn" aria-pressed="true">ON</button>
+      <button class="btn" aria-pressed="false">OFF</button>
+    </div>
+    <div class="slider">
+      <span class="fieldlabel">BRIGHT</span>
+      <input type="range" min="0" max="100" value="70" aria-label="Brightness">
+      <span class="value mono readout">70</span>
+    </div>
+    <div class="slider spectrum"><span class="fieldlabel">COLOR</span><input type="range" min="0" max="100" value="62" aria-label="Color"><span class="value mono readout">#2FB3A5</span></div>
+    <div class="slider temp"><span class="fieldlabel">TEMP</span><input type="range" min="0" max="100" value="20" aria-label="Temperature"><span class="value mono readout">2700K</span></div>
+    <span class="address mono">192.168.1.18 &middot; wiz</span>
+  </section>
+
+  <section class="plate device lit" style="--glow:#2FB3A5">
+    <div class="title-rule">
+      <span class="title">Couch Right</span><span class="rule"></span>
+      <span class="micro kind">LIGHT</span><span class="lamp ok"></span>
+    </div>
+    <p class="doing">On &mdash; 70%, teal.</p>
+    <div class="actions">
+      <button class="btn" aria-pressed="true">ON</button>
+      <button class="btn" aria-pressed="false">OFF</button>
+    </div>
+    <div class="slider">
+      <span class="fieldlabel">BRIGHT</span>
+      <input type="range" min="0" max="100" value="70" aria-label="Brightness">
+      <span class="value mono readout">70</span>
+    </div>
+    <div class="slider spectrum"><span class="fieldlabel">COLOR</span><input type="range" min="0" max="100" value="62" aria-label="Color"><span class="value mono readout">#2FB3A5</span></div>
+    <div class="slider temp"><span class="fieldlabel">TEMP</span><input type="range" min="0" max="100" value="20" aria-label="Temperature"><span class="value mono readout">2700K</span></div>
+    <span class="address mono">192.168.1.19 &middot; wiz</span>
+  </section>
+
+  <section class="plate device">
+    <div class="title-rule">
+      <span class="title">Living Room TV</span><span class="rule"></span>
+      <span class="micro kind">TELEVISION</span><span class="lamp ok"></span>
+    </div>
+    <p class="doing">YouTube running.</p>
+    <div class="actions">
+      <button class="btn small ghost">STOP</button>
+    </div>
+    <span class="address mono">192.168.1.4 &middot; dial</span>
+  </section>
+
+  </div>
+</div>
+
+<div class="room">
+  <div class="section-rule"><h2>Bedroom</h2><span class="rule"></span></div>
+  <div class="roomdevices">
+
+  <section class="plate device">
+    <div class="title-rule">
+      <span class="title">Bedside</span><span class="rule"></span>
+      <span class="micro kind">LIGHT</span><span class="lamp pending"></span>
+    </div>
+    <p class="doing">Converging to off.</p>
+    <div class="actions">
+      <button class="btn" aria-pressed="false">ON</button>
+      <button class="btn" aria-pressed="true">OFF</button>
+    </div>
+    <div class="slider">
+      <span class="fieldlabel">BRIGHT</span>
+      <input type="range" min="0" max="100" value="50" aria-label="Brightness">
+      <span class="value mono readout">50</span>
+    </div>
+    <div class="slider spectrum"><span class="fieldlabel">COLOR</span><input type="range" min="0" max="100" value="62" aria-label="Color"><span class="value mono readout">#2FB3A5</span></div>
+    <div class="slider temp"><span class="fieldlabel">TEMP</span><input type="range" min="0" max="100" value="20" aria-label="Temperature"><span class="value mono readout">2700K</span></div>
+    <span class="setmark">
+      <span class="lamp pending"></span>
+      <span class="micro">SET OFF &mdash; APPLYING</span>
+    </span>
+    <span class="address mono">192.168.1.20 &middot; wiz</span>
+  </section>
+
+  <section class="plate device">
+    <div class="title-rule">
+      <span class="title">Bedroom TV</span><span class="rule"></span>
+      <span class="micro kind">TELEVISION</span><span class="lamp idle"></span>
+    </div>
+    <p class="doing">Nothing running.</p>
+    <div class="actions">
+      <button class="btn small ghost">APPS</button>
+    </div>
+    <span class="address mono">192.168.1.12 &middot; dial</span>
+  </section>
+
+  </div>
+</div>
+
+<div class="room">
+  <div class="section-rule"><h2>Office</h2><span class="rule"></span></div>
+  <div class="roomdevices">
+
+  <section class="plate device">
+    <div class="title-rule">
+      <span class="title">Desk</span><span class="rule"></span>
+      <span class="micro kind">LIGHT</span><span class="lamp idle"></span>
+    </div>
+    <p class="doing">Off.</p>
+    <div class="actions">
+      <button class="btn" aria-pressed="false">ON</button>
+      <button class="btn" aria-pressed="true">OFF</button>
+    </div>
+    <div class="slider">
+      <span class="fieldlabel">BRIGHT</span>
+      <input type="range" min="0" max="100" value="0" disabled aria-label="Brightness">
+      <span class="value mono readout">0</span>
+    </div>
+    <div class="slider spectrum"><span class="fieldlabel">COLOR</span><input type="range" min="0" max="100" value="62" aria-label="Color"><span class="value mono readout">#2FB3A5</span></div>
+    <div class="slider temp"><span class="fieldlabel">TEMP</span><input type="range" min="0" max="100" value="20" aria-label="Temperature"><span class="value mono readout">2700K</span></div>
+    <span class="address mono">192.168.1.21 &middot; wiz</span>
+  </section>
+
+  </div>
+</div>
+
+<div class="room">
+  <div class="section-rule"><h2>Unplaced</h2><span class="rule"></span></div>
+  <div class="roomdevices">
+
+  <section class="plate device">
+    <div class="title-rule">
+      <span class="title">Brother HL-3040CN</span><span class="rule"></span>
+      <span class="micro kind">FIXTURE</span><span class="lamp idle"></span>
+    </div>
+    <p class="doing">Printer &mdash; shown, not driven.</p>
+    <span class="address mono">192.168.1.14 &middot; ipp</span>
+  </section>
+
+  </div>
+</div>
+
+</main>
+</body></html>

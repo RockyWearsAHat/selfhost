@@ -18,6 +18,7 @@ pub mod dns;
 pub mod edit;
 pub mod git;
 pub mod home;
+pub mod house;
 pub mod mail;
 pub mod mesh;
 pub mod pacc;
@@ -37,6 +38,7 @@ pub use cidr::Cidr;
 pub use desktop::Desktop;
 pub use dns::{Dns, RecordConfig, SoaConfig, ZoneConfig};
 pub use git::{GitWatch, SelfUpdate};
+pub use house::Home;
 pub use mail::{DkimConfig, Mail, MailBind, Mailbox, Relay};
 pub use mesh::Mesh;
 pub use service::{RestartPolicy, ServiceCatalog, ServiceSpec, StartMode};
@@ -87,6 +89,13 @@ pub struct Config {
     /// still binds nothing at all.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mesh: Option<Mesh>,
+    /// The smart-home subsystem: the devices in the house, and the loopback
+    /// API the dashboard is served from. Absent means it does not exist —
+    /// nothing is discovered and nothing is polled — which is the default
+    /// because this is the one section whose subsystem sweeps the local
+    /// network by multicast and then speaks to whatever answered.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub home: Option<Home>,
     /// The VPN relays this deployment runs: a controlled door in front of one
     /// local service each, and the roster of people allowed through it. Empty
     /// means none — a relay is declared, never discovered, and it is the one
@@ -605,6 +614,7 @@ mod tests {
             shares: vec![],
             desktop: None,
             mesh: None,
+            home: None,
             vpn: Vec::new(),
         };
 
@@ -645,6 +655,7 @@ mod tests {
             shares: vec![],
             desktop: None,
             mesh: None,
+            home: None,
             vpn: Vec::new(),
         };
 

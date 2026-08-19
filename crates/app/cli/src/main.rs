@@ -18,6 +18,7 @@ mod dns_status;
 mod doctor;
 mod hairpin;
 mod health;
+mod home_task;
 mod identify;
 mod outside;
 mod kill_switch;
@@ -250,6 +251,11 @@ Commands
   console-password [<password>]
                              Set the web console's login password; reads it
                              twice from stdin if omitted
+  home mcp                   Serve the house as MCP tools on stdio, for an
+                             agent harness: `house` reads every device and its
+                             live state, `command` drives one. The same hub and
+                             capability gate the dashboard uses, needing no
+                             config and no running daemon.
   help                       Show this message
 
 Config lives in selfhost.config.toml. Everything else is derived from it.
@@ -338,6 +344,7 @@ fn main() -> ExitCode {
         "mcp" => mcp_command::run(&arguments),
         "vpn" => load().and_then(|(config, project_dir)| vpn_command::vpn(&arguments, &config, &project_dir)),
         "mail" => mail_command(&arguments),
+        "home" => home_command(&arguments),
         "console-password" => console_password_command(&arguments),
         "help" | "--help" | "-h" => {
             eprint!("{USAGE}");
@@ -387,6 +394,41 @@ fn load() -> Result<(Config, PathBuf), String> {
     let config = Config::load(&path).map_err(|e| e.to_string())?;
     let project_dir = path.parent().unwrap_or(Path::new(".")).to_path_buf();
     Ok((config, project_dir))
+}
+
+/// The smart-home subsystem, spoken for an agent: `selfhost home mcp`.
+///
+/// Stdio carries JSON-RPC and nothing else, so this must print nothing —
+/// every human-facing line under it goes to stderr.
+fn home_command(arguments: &[String]) -> Result<(), String> {
+    match arguments.get(1).map(String::as_str) {
+        Some("mcp") => {
+            // The daemon's own registry when this runs inside a deployment, so
+            // agent and dashboard agree about names; a per-user file when not.
+            // Never an error — the whole point of this surface is that an
+            // agent can be handed the house with zero setup.
+            let registry = load()
+                .map(|(config, dir)| teardown::data_dir(&config, &dir).join("home.registry"))
+                .unwrap_or_else(|_| {
+                    std::env::var_os("HOME")
+                        .map(|home| PathBuf::from(home).join(".selfhost").join("home.registry"))
+                        .unwrap_or_default()
+                });
+            let runtime = tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+                .map_err(|e| format!("could not start the async runtime: {e}"))?;
+            let hub = std::sync::Arc::new(selfhost_home::Hub::new(registry));
+            // No config here by design, so the cadence is the crate's own
+            // defaults — the same numbers the `[home]` block documents.
+            runtime.spawn(std::sync::Arc::clone(&hub).run(
+                selfhost_home::hub::DEFAULT_REFRESH_EVERY,
+                selfhost_home::hub::DEFAULT_DISCOVER_EVERY,
+            ));
+            runtime.block_on(selfhost_home::mcp::serve(hub)).map_err(|e| e.to_string())
+        }
+        _ => Err("usage: selfhost home mcp    (serve the house as MCP tools on stdio)".into()),
+    }
 }
 
 /// Writes a starter config and a page for it to serve.
@@ -1119,6 +1161,14 @@ async fn serve_everything(
     if let Some(desk) = desk.as_ref() {
         println!("\n{}", desk.summary());
         api = api.with_desktop(*desk.config(), Arc::clone(desk) as Arc<dyn Fleet>);
+    }
+
+    // The house. Absent `[home]` starts nothing at all; when present it binds
+    // loopback only and is reached through its own site's `app_paths`, never
+    // through the admin API — see docs/labs/home-lab.dx for why that route is
+    // the one available and why the site's `allowed_cidrs` is the whole gate.
+    if let Some(home) = home_task::start(&config, &data_dir) {
+        println!("\n{}", home.banner());
     }
 
     // ---- the web tier -------------------------------------------------------

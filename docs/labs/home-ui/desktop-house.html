@@ -1,0 +1,232 @@
+<!doctype html>
+<!-- Design comp: the house given a laptop's room — the phone page's exact
+     rows in a two-column grid; nothing redesigns, the bench just widens.
+     Derived from phone-house.html — masthead, bank condition,
+     then rooms in census order, each with .section-rule header + one .plate of
+     stacked .row entries. Every device is a row: mini port, name+state, control.
+     No JavaScript, no external requests, shapes and text only. -->
+<html lang="en"><head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>comp — the house, on a desk</title>
+<link rel="stylesheet" href="instrument.css">
+<style>
+/* Desktop: the SAME rows, more bench space — main becomes a two-column
+   grid; nameplate and bank span the bench. (rui: the identical view fn
+   at a wider size; layout.rs flow handles the columns.) */
+main#rooms { max-width: 1080px; display: grid; grid-template-columns: 1fr 1fr;
+  gap: var(--s5) var(--s6); align-content: start; }
+.masthead, .bank { grid-column: 1 / -1; }
+.roomcell { display: flex; flex-direction: column; gap: var(--s3); min-width: 0; }
+</style>
+</head><body>
+
+<main id="rooms">
+
+<!-- Masthead: HOME wordmark with accent period, flex rule, gen counter, status lamp + word. -->
+<div class="masthead">
+  <span class="wordmark">HOME</span>
+  <span class="rule"></span>
+  <span class="gen">#214</span>
+  <span class="stateword">
+    <span class="lamp ok"></span>OK
+  </span>
+</div>
+
+<!-- Bank: one sentence of house truth + device census in mono. -->
+<div class="bank">
+  <div class="condition">Music in the kitchen; three lights on.</div>
+  <div class="evidence">DEVICES 9 · ACTIVE 4 · UNREACHABLE 0</div>
+</div>
+
+
+<!-- KITCHEN: 2 devices. -->
+<div class="roomcell">
+<div class="section-rule">
+  <h2>Kitchen</h2>
+  <span class="rule"></span>
+</div>
+
+<div class="plate">
+  <div class="row">
+    <div class="port lit" style="--arc:40; --arccol:var(--accent);">
+      <div class="ring"></div>
+      <div class="orb"></div>
+    </div>
+    <div class="who">
+      <span class="name">Kitchen</span>
+      <span class="state">Playing — Harvest Moon · with Move.</span>
+    </div>
+    <div class="ctl">
+      <button class="btn small ghost">PAUSE</button>
+    </div>
+  </div>
+
+  <div class="row">
+    <div class="port lit" style="--arc:25; --arccol:var(--accent);">
+      <div class="ring"></div>
+      <div class="orb"></div>
+    </div>
+    <div class="who">
+      <span class="name">Move</span>
+      <span class="state">Following Kitchen.</span>
+    </div>
+    <div class="ctl">
+      <button class="btn small ghost">LEAVE</button>
+    </div>
+  </div>
+</div>
+
+<!-- LIVING ROOM: 3 devices. -->
+</div>
+
+<div class="roomcell">
+<div class="section-rule">
+  <h2>Living Room</h2>
+  <span class="rule"></span>
+</div>
+
+<div class="plate">
+  <div class="row">
+    <div class="port lit" style="--arc:70; --arccol:var(--accent);">
+      <div class="ring"></div>
+      <div class="orb"></div>
+    </div>
+    <div class="who">
+      <span class="name">Couch Left</span>
+      <span class="state">On — 70%, teal.</span>
+    </div>
+    <div class="ctl">
+      <div class="seg">
+        <button aria-pressed="true">ON</button>
+        <button class="offside" aria-pressed="false">OFF</button>
+      </div>
+    </div>
+  </div>
+
+  <div class="row">
+    <div class="port lit" style="--arc:70; --arccol:var(--accent);">
+      <div class="ring"></div>
+      <div class="orb"></div>
+    </div>
+    <div class="who">
+      <span class="name">Couch Right</span>
+      <span class="state">On — 70%, teal.</span>
+    </div>
+    <div class="ctl">
+      <div class="seg">
+        <button aria-pressed="true">ON</button>
+        <button class="offside" aria-pressed="false">OFF</button>
+      </div>
+    </div>
+  </div>
+
+  <div class="row">
+    <div class="port">
+      <div class="ring"></div>
+      <div class="orb">TV</div>
+    </div>
+    <div class="who">
+      <span class="name">Living Room TV</span>
+      <span class="state">YouTube running.</span>
+    </div>
+    <div class="ctl">
+      <button class="btn small ghost">STOP</button>
+    </div>
+  </div>
+</div>
+
+<!-- BEDROOM: 2 devices. -->
+</div>
+
+<div class="roomcell">
+<div class="section-rule">
+  <h2>Bedroom</h2>
+  <span class="rule"></span>
+</div>
+
+<div class="plate">
+  <div class="row">
+    <div class="port">
+      <div class="ring"></div>
+      <div class="orb"></div>
+    </div>
+    <div class="who">
+      <span class="name">Bedside</span>
+      <span class="state"><span class="setmark"><span class="lamp pending"></span><span class="micro">SET OFF — APPLYING</span></span></span>
+    </div>
+    <div class="ctl">
+      <div class="seg">
+        <button aria-pressed="false">ON</button>
+        <button class="offside" aria-pressed="true">OFF</button>
+      </div>
+    </div>
+  </div>
+
+  <div class="row">
+    <div class="port">
+      <div class="ring"></div>
+      <div class="orb">TV</div>
+    </div>
+    <div class="who">
+      <span class="name">Bedroom TV</span>
+      <span class="state">Nothing running.</span>
+    </div>
+    <div class="ctl">
+      <button class="btn small ghost">APPS</button>
+    </div>
+  </div>
+</div>
+
+<!-- OFFICE: 1 device. -->
+</div>
+
+<div class="roomcell">
+<div class="section-rule">
+  <h2>Office</h2>
+  <span class="rule"></span>
+</div>
+
+<div class="plate">
+  <div class="row">
+    <div class="port">
+      <div class="ring"></div>
+      <div class="orb"></div>
+    </div>
+    <div class="who">
+      <span class="name">Desk</span>
+      <span class="state">Off.</span>
+    </div>
+    <div class="ctl">
+      <div class="seg">
+        <button aria-pressed="false">ON</button>
+        <button class="offside" aria-pressed="true">OFF</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- UNPLACED: 1 fixture. -->
+</div>
+
+<div class="roomcell">
+<div class="section-rule">
+  <h2>Unplaced</h2>
+  <span class="rule"></span>
+</div>
+
+<div class="plate">
+  <div class="row fixture">
+    <div class="port">
+      <div class="ring"></div>
+      <div class="orb">PR</div>
+    </div>
+    <div class="who">
+      <span class="name">Brother HL-3040CN</span>
+      <span class="state">Printer — shown, not driven.</span>
+    </div>
+  </div>
+</div>
+
+</div>
+</main>
+</body></html>
