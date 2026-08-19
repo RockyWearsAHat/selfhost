@@ -1,0 +1,605 @@
+/* The house panel's house style: the console's THEATRE palette and primitives,
+   verbatim, because the two pages are served by one machine and read by one
+   person and there is no argument for them being two designs. Structure is
+   hairline rules with ticks, never nested card outlines; status is carried by
+   lamps — small lit slots — and by state words in small capitals that stay
+   muted unless something needs attention. Machine text is strictly monospace;
+   a track title and a device's name are not machine text, they are content,
+   and they are set in the interface face.
+
+   Nothing here animates without cause. There are exactly two loops on the
+   page — the sweep while the link is being made, and the pulse under a lamp
+   that wants attention — and everything else is a state transition of 140ms or
+   less. A dashboard is a thing somebody glances at from the far side of a
+   room; motion on it means something changed, or it means nothing at all. */
+
+:root {
+  color-scheme: dark;
+  --bg:        #060708;
+  --bg-deep:   #020203;
+  --surface:   #0d0e10;
+  --surface-d: #090a0c;
+  --raised:    #15171a;
+  --sunken:    #020304;
+  --border:    #24272b;
+  --text:      #e9ecee;
+  --muted:     #70787e;
+  --accent:    #f2f5f6;
+  --on-accent: #0a0b0d;
+  --ok:        #7e96a0;
+  --ok-tint:   #0d1317;
+  --warn:      #e0a458;
+  --warn-tint: #21180a;
+  --bad:       #f2555a;
+  --bad-tint:  #260f11;
+  --idle:      #4a5157;
+  --idle-tint: #0f1114;
+  --ui:   -apple-system, "Segoe UI", "Helvetica Neue", Arial, sans-serif;
+  --mono: ui-monospace, "SF Mono", "Cascadia Mono", "Menlo", "Consolas", monospace;
+}
+
+* { margin: 0; padding: 0; box-sizing: border-box; }
+
+/* The UA hides [hidden] with specificity 0-1-0; any id or class display rule
+   beats it silently. This page toggles every optional control with the
+   attribute, so the attribute must always win. */
+[hidden] { display: none !important; }
+
+html, body { min-height: 100vh; }
+
+body {
+  background: linear-gradient(var(--bg), var(--bg-deep) 60vh);
+  color: var(--text);
+  font: 14px/1.5 var(--ui);
+  padding: 16px;
+  padding-left: max(16px, env(safe-area-inset-left));
+  padding-right: max(16px, env(safe-area-inset-right));
+  padding-bottom: max(16px, env(safe-area-inset-bottom));
+  display: flex; flex-direction: column; gap: 8px;
+}
+
+/* The ground's one decoration: a measurement ruler along the top edge,
+   minor divisions every 10px, a longer major every 50px. */
+body::before {
+  content: "";
+  display: block;
+  height: 7px;
+  margin: -16px -16px 9px;
+  background-image:
+    repeating-linear-gradient(90deg, transparent 0 49px, rgba(233, 236, 238, 0.22) 49px 50px),
+    repeating-linear-gradient(90deg, transparent 0 9px, rgba(233, 236, 238, 0.10) 9px 10px);
+  background-size: 100% 7px, 100% 3px;
+  background-repeat: no-repeat;
+}
+
+button, input, select, textarea { font: inherit; color: inherit; }
+
+:focus-visible { outline: 1px solid var(--accent); outline-offset: 1px; }
+
+::selection { background: var(--accent); color: var(--on-accent); }
+
+/* Scrollbars are furniture, machined to match the panel. */
+::-webkit-scrollbar { width: 9px; height: 9px; }
+::-webkit-scrollbar-track { background: var(--sunken); }
+::-webkit-scrollbar-thumb { background: var(--raised); border: 1px solid var(--border); }
+::-webkit-scrollbar-thumb:hover { background: var(--border); }
+
+/* ── type ─────────────────────────────────────────────────────────── */
+
+.wordmark {
+  font-size: 14px; font-weight: 600; letter-spacing: 0.24em; color: var(--text);
+}
+.designation {
+  font-size: 11px; letter-spacing: 0.18em; color: var(--muted); align-self: center;
+}
+.title { font-size: 15px; font-weight: 600; letter-spacing: 0.02em; }
+.caption { font-size: 12px; color: var(--muted); }
+.micro { font-size: 10px; }
+.mono { font-family: var(--mono); }
+.centered { text-align: center; }
+.dim { color: var(--idle); }
+.bad-ink  { color: var(--bad); }
+.warn-ink { color: var(--warn); }
+
+/* State words: small capitals, quiet unless something needs looking at. A
+   house where every speaker that is playing shouts PLAYING in colour cannot
+   say when one of them has stopped answering. */
+.stateword {
+  font-size: 10.5px; letter-spacing: 0.06em; text-transform: uppercase;
+  color: var(--muted); white-space: nowrap; align-self: center;
+}
+.stateword.warn { color: var(--warn); }
+.stateword.bad  { color: var(--bad); }
+
+.fieldlabel {
+  font-size: 10px; letter-spacing: 0.12em; color: var(--muted);
+  text-transform: uppercase;
+}
+
+/* Anything that updates in place is tabular, so a volume counting up under the
+   pointer does not shift the control it is attached to. */
+.mono, .numeric { font-variant-numeric: tabular-nums; }
+
+/* ── marks ────────────────────────────────────────────────────────── */
+
+/* A status lamp: a 5×14 slot machined into the panel, lit by value. On this
+   page the fill is the device's own switch — a light that is on and a speaker
+   that is playing fill their slot, and everything that is merely idle leaves
+   it an empty outline, which is the state that most needed telling apart.
+   Only the two states that want attention breathe. */
+.lamp { width: 5px; height: 14px; flex: none; align-self: center; }
+.lamp.ok   { background: var(--ok); }
+.lamp.warn { background: var(--warn); animation: pulse-warn 1.2s ease-in-out infinite; }
+.lamp.bad  { background: var(--bad); animation: pulse-bad 1.2s ease-in-out infinite; }
+.lamp.idle { background: none; border: 1px solid var(--idle); }
+
+@keyframes pulse-warn {
+  0%, 100% { box-shadow: 0 0 5px 0 rgba(224, 164, 88, 0.19); }
+  50%      { box-shadow: 0 0 5px 1px rgba(224, 164, 88, 0.55); }
+}
+@keyframes pulse-bad {
+  0%, 100% { box-shadow: 0 0 5px 0 rgba(242, 85, 90, 0.19); }
+  50%      { box-shadow: 0 0 5px 1px rgba(242, 85, 90, 0.55); }
+}
+
+/* A connection being made: the one mark allowed to loop, and the one circle on
+   the page. */
+.sweep {
+  width: 14px; height: 14px; flex: none; align-self: center;
+  border-radius: 50%;
+  border: 2px solid rgba(242, 245, 246, 0.16);
+  border-top-color: var(--warn);
+  animation: sweep 2.4s linear infinite;
+}
+@keyframes sweep { to { transform: rotate(360deg); } }
+
+@media (prefers-reduced-motion: reduce) {
+  .lamp.warn, .lamp.bad { animation: none; box-shadow: 0 0 5px 1px rgba(224, 164, 88, 0.35); }
+  .lamp.bad  { box-shadow: 0 0 5px 1px rgba(242, 85, 90, 0.35); }
+  .sweep { animation: none; }
+  /* The transitions below are all under 140ms and read as the control moving
+     rather than as motion, but somebody who asked for no motion asked for
+     none. */
+  * { transition-duration: 0ms !important; }
+}
+
+/* A hairline that takes the room left, stopped by a tick: a measurement,
+   not the unfinished top of a box. */
+.rule { flex: 1 1 auto; height: 1px; background: var(--border); align-self: center; position: relative; }
+.rule::after {
+  content: ""; position: absolute; right: 0; top: -3px;
+  width: 1px; height: 7px; background: var(--border);
+}
+
+.lampline { display: flex; gap: 6px; align-items: center; }
+
+/* The empty page's reticle: a sighting mark, crosshair through an open square,
+   drawn with hairlines — nothing to show, said precisely. */
+.reticle {
+  width: 56px; height: 56px; margin: 0 auto 14px; position: relative;
+  border: 1px solid var(--border);
+}
+.reticle::before, .reticle::after {
+  content: ""; position: absolute; background: var(--border);
+}
+.reticle::before { left: 50%; top: -8px; bottom: -8px; width: 1px; }
+.reticle::after  { top: 50%; left: -8px; right: -8px; height: 1px; }
+.reticle .dot {
+  position: absolute; left: 50%; top: 50%; width: 3px; height: 3px;
+  margin: -1px 0 0 -1px; background: var(--muted);
+}
+
+/* ── surfaces ─────────────────────────────────────────────────────── */
+
+/* A framed surface one value above the ground: gradient fill, grey hairline,
+   a sheen along the top edge that says it is lit from above, and corner
+   brackets that say it is bolted down. */
+.plate {
+  background: linear-gradient(var(--surface), var(--surface-d));
+  border: 1px solid var(--border);
+  box-shadow: inset 0 1px 0 rgba(242, 245, 246, 0.14);
+  padding: 12px;
+  position: relative;
+}
+.plate::before, .plate::after {
+  content: ""; position: absolute; width: 7px; height: 7px; pointer-events: none;
+}
+.plate::before {
+  top: -1px; left: -1px;
+  border-top: 1px solid rgba(242, 245, 246, 0.38);
+  border-left: 1px solid rgba(242, 245, 246, 0.38);
+}
+.plate::after {
+  bottom: -1px; right: -1px;
+  border-bottom: 1px solid rgba(242, 245, 246, 0.38);
+  border-right: 1px solid rgba(242, 245, 246, 0.38);
+}
+
+.section-rule, .title-rule { display: flex; gap: 8px; align-items: center; }
+.section-rule h2 {
+  font-size: 10px; font-weight: 600; letter-spacing: 0.15em; color: var(--muted);
+}
+.section-rule .micro, .title-rule .micro { color: var(--muted); }
+
+/* ── controls ─────────────────────────────────────────────────────── */
+
+.btn {
+  font-size: 11px; letter-spacing: 0.06em; text-transform: uppercase;
+  background: var(--raised);
+  border: 1px solid var(--border);
+  padding: 6px 12px;
+  cursor: pointer;
+  transition: border-color 120ms ease, background-color 120ms ease;
+}
+.btn:hover:not(:disabled) { border-color: var(--muted); }
+.btn:active:not(:disabled) { background: var(--sunken); }
+.btn:disabled { color: var(--idle); cursor: default; }
+.btn.primary { background: var(--accent); color: var(--on-accent); border-color: var(--accent); font-weight: 600; }
+.btn.primary:hover:not(:disabled) { border-color: var(--accent); box-shadow: 0 0 0 1px rgba(242, 245, 246, 0.35); }
+.btn.primary:disabled { background: var(--raised); color: var(--idle); border-color: var(--border); font-weight: 400; box-shadow: none; }
+.btn.danger { color: var(--bad); }
+.btn.danger:hover:not(:disabled) { border-color: var(--bad); }
+.btn.ghost { background: none; }
+.btn.small { padding: 2px 8px; font-size: 10.5px; }
+/* A held-down toggle: pressed reads as a switch left on. MUTE is the only one
+   of these on the page, and it is the one control whose *state* is the reason
+   somebody is looking for it. */
+.btn[aria-pressed="true"] {
+  background: var(--sunken); border-color: var(--muted);
+  box-shadow: inset 0 1px 3px rgba(0, 0, 0, 0.7);
+}
+
+input, select {
+  background: var(--sunken);
+  border: 1px solid var(--border);
+  padding: 6px 8px;
+  font-size: 13px;
+  width: 100%;
+  transition: border-color 120ms ease;
+}
+input:focus, select:focus { border-color: var(--muted); outline: none; }
+input:focus-visible, select:focus-visible { outline: none; border-color: var(--accent); }
+::placeholder { color: var(--idle); }
+
+/* ── masthead & bank ──────────────────────────────────────────────── */
+
+#masthead {
+  display: flex; gap: 10px; align-items: center; min-height: 30px; flex-wrap: wrap;
+  padding-bottom: 6px; border-bottom: 1px solid var(--border);
+}
+#gen { color: var(--muted); align-self: center; }
+
+.alert {
+  display: flex; gap: 9px; align-items: center;
+  min-height: 30px; padding: 4px 6px 4px 0;
+  border: 1px solid; font-size: 13px;
+}
+.alert .flagbar { width: 3px; align-self: stretch; flex: none; }
+.alert #notice-text { flex: 1 1 auto; }
+.alert.problem { border-color: var(--bad); background: var(--bad-tint); color: var(--bad); }
+.alert.problem .flagbar { background: var(--bad); }
+
+#bank {
+  display: flex; gap: 16px; align-items: center; justify-content: space-between;
+  flex-wrap: wrap; min-height: 62px;
+}
+.bank-main { display: flex; flex-direction: column; gap: 4px; min-width: 0; }
+#condition { font-size: 17px; }
+.evidence { display: flex; gap: 14px; flex-wrap: wrap; }
+.reading { display: inline-flex; gap: 6px; align-items: baseline; }
+.reading .mono { font-size: 12.5px; }
+.reading .mono.bad-ink { color: var(--bad); }
+
+.empty { flex: 1; display: flex; align-items: center; justify-content: center; min-height: 240px; }
+
+/* ── rooms ────────────────────────────────────────────────────────── */
+
+/* A room is a section rule and the plates standing under it — not a card with
+   more cards inside it. The rule states how far the room extends, which is the
+   job a floating label cannot do, and it does it for a fiftieth of the ink of
+   a second outline drawn around six plates that already have one each. */
+/* The rooms themselves flow, and this is the decision that makes a laptop
+   worth opening the page on. Stacking each room full-width was the first
+   arrangement, and on a 1500px window a household of two speakers in two rooms
+   drew two nearly-empty bands down the left edge with two thirds of the screen
+   black — every plate 360px wide because that is all one device in a wrapping
+   grid can claim. Letting the ROOMS wrap instead puts them side by side and
+   fills the window with readings rather than with ground.
+   `align-items: start` matters: without it a room of one device stretches to
+   the height of the tallest room beside it, and a plate taller than its
+   contents reads as a plate with something missing from it. */
+#rooms {
+  display: grid; gap: 14px;
+  grid-template-columns: repeat(auto-fill, minmax(320px, 1fr));
+  align-items: start;
+}
+.room { display: flex; flex-direction: column; gap: 8px; min-width: 0; }
+
+/* Inside one room the plates stack. They are already inside a column the outer
+   grid sized, so a second wrapping grid here would fight it — the room would
+   claim one column at 320px and then try to lay two 300px plates across it. A
+   room with many devices grows downward, which is the axis a page can afford. */
+.roomdevices { display: grid; gap: 8px; grid-template-columns: 1fr; }
+
+/* ── a device ─────────────────────────────────────────────────────── */
+
+.device { display: flex; flex-direction: column; gap: 8px; min-width: 0; }
+.device .title { overflow-wrap: anywhere; }
+.device .kind { flex: none; }
+
+/* An unreachable device is dimmed, never hidden. A panel that removes what it
+   cannot reach answers "where did the hall light go?" with silence, and the
+   whole reason to have this page open is that something is not where it should
+   be. Its own note keeps full contrast, because the note is the only thing on
+   a dimmed plate anybody needs to read. */
+.device.gone { background: var(--surface-d); }
+.device.gone .title,
+.device.gone .doing,
+.device.gone .readings,
+.device.gone .controls,
+.device.gone .nowplaying,
+.device.gone .progress { opacity: 0.5; }
+.device.gone .note { opacity: 1; }
+
+.doing { font-size: 12.5px; color: var(--text); }
+.note { font-size: 12px; color: var(--muted); overflow-wrap: anywhere; }
+.address { color: var(--idle); align-self: flex-start; }
+
+/* What is playing. Set in the interface face and not the fixed-width one: a
+   track title is somebody's words, not a machine's, and setting it in the face
+   reserved for addresses and identifiers says the opposite. */
+.nowplaying { display: flex; flex-direction: column; gap: 1px; min-width: 0; }
+.nowplaying .track {
+  font-size: 13.5px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.nowplaying .artist {
+  font-size: 12px; color: var(--muted);
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+
+/* The position readout. A block, not an inline span: an inline element has no
+   height to set, and a bar that silently collapses to nothing is the bug that
+   costs an afternoon. The fill's transition matches the poll's own step, so it
+   walks rather than jumping. */
+.progress { display: flex; gap: 8px; align-items: center; }
+.bar { display: block; flex: 1 1 auto; height: 5px; background: var(--bg-deep); border: 1px solid var(--border); }
+.bar .fill { display: block; height: 100%; width: 0; background: var(--ok); transition: width 140ms linear; }
+.progress .clock { font-size: 11px; color: var(--muted); flex: none; }
+
+/* The dials: this device's vital numbers, machined into one bar. */
+.readings {
+  display: flex; gap: 0; flex-wrap: wrap;
+  background: var(--sunken); border: 1px solid var(--border);
+}
+.readings .dial {
+  display: flex; flex-direction: column; gap: 2px;
+  padding: 6px 12px; min-width: 84px;
+}
+.readings .dial + .dial { border-left: 1px solid var(--border); }
+.readings .dial .mono { font-size: 13px; }
+.readings .dial .mono.bad-ink { color: var(--bad); }
+
+/* The colour a bulb is actually showing, in the lamp's own slot. This is the
+   one hue on the page that is not a status, and it is a reading rather than
+   chrome: the device chose it, this page only reports it. */
+.swatchline { display: flex; gap: 6px; align-items: center; }
+.swatch { width: 5px; height: 14px; flex: none; border: 1px solid var(--border); }
+
+.controls { display: flex; flex-direction: column; gap: 7px; }
+
+.actions {
+  display: flex; gap: 4px; align-items: center;
+  padding: 4px; background: var(--sunken); border: 1px solid var(--border);
+  flex-wrap: wrap;
+}
+.actions .rule { min-width: 16px; margin: 0 8px; }
+
+/* ── the slider ───────────────────────────────────────────────────── */
+
+/* A real range input, given the panel's vocabulary rather than the browser's:
+   a sunken track machined into the plate, and a thumb that is the lamp's own
+   5×14 slot in the accent. Every corner square — the one circle on this page
+   is the sweep. The vendor pseudo-elements cannot be listed in one rule,
+   because a selector list containing a pseudo-element a browser does not know
+   is discarded whole, taking the ones it does know with it. */
+.slider { display: flex; gap: 8px; align-items: center; }
+.slider .fieldlabel { flex: none; }
+.slider .value { font-size: 12.5px; color: var(--text); flex: none; min-width: 40px; text-align: right; }
+.slider input[type="range"] {
+  appearance: none; -webkit-appearance: none;
+  flex: 1 1 auto; width: auto; min-width: 80px;
+  height: 14px; padding: 0; margin: 0;
+  background: none; border: none; cursor: pointer;
+}
+.slider input[type="range"]:disabled { cursor: default; }
+
+.slider input[type="range"]::-webkit-slider-runnable-track {
+  height: 6px; background: var(--sunken); border: 1px solid var(--border);
+}
+.slider input[type="range"]::-webkit-slider-thumb {
+  appearance: none; -webkit-appearance: none;
+  width: 5px; height: 14px; border: none; border-radius: 0;
+  background: var(--accent);
+  /* Centre the 14px slot on the 6px track: (6 + 2 border − 14) / 2. */
+  margin-top: -4px;
+}
+.slider input[type="range"]:disabled::-webkit-slider-thumb { background: var(--idle); }
+
+.slider input[type="range"]::-moz-range-track {
+  height: 6px; background: var(--sunken); border: 1px solid var(--border);
+}
+.slider input[type="range"]::-moz-range-thumb {
+  width: 5px; height: 14px; border: none; border-radius: 0;
+  background: var(--accent);
+}
+.slider input[type="range"]:disabled::-moz-range-thumb { background: var(--idle); }
+
+/* ── grouping, keys, apps, colour ─────────────────────────────────── */
+
+.grouprow { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+.grouprow .caption { flex: 1 1 140px; min-width: 0; }
+.grouprow select { flex: 1 1 140px; width: auto; min-width: 0; }
+.grouprow .btn { flex: none; }
+
+/* The remote's pad. Laid out as the hand expects to find it rather than as a
+   row of five buttons, because a direction pad whose keys are in a line is one
+   people press the wrong half of in the dark. */
+.keypad { display: grid; grid-template-columns: repeat(3, 34px); gap: 3px; }
+.keypad .btn { padding: 5px 0; text-align: center; font-size: 12px; }
+.keypad .btn.ok { font-size: 10px; }
+.keypad .gap { visibility: hidden; }
+.keyrow { display: flex; gap: 3px; flex-wrap: wrap; }
+
+/* Launching an application takes a typed identifier rather than a row of
+   buttons wearing brands. The hub advertises the *capability* and never the
+   catalogue, so a row of brand buttons would be a list this page invented, and
+   an invented list is one that is wrong on the day somebody installs something
+   new. The identifier is the far device's own word for the app, so it is
+   machine text and set in the fixed-width face. */
+.inline-form { display: flex; gap: 6px; align-items: center; flex-wrap: wrap; }
+.inline-form .fieldlabel { flex: none; }
+.inline-form input { flex: 1 1 120px; width: auto; min-width: 0; }
+.inline-form .btn { flex: none; }
+.inline-form input.bad { border-color: var(--bad); }
+
+/* ── narrow windows ───────────────────────────────────────────────── */
+
+@media (max-width: 720px) {
+  /* One room per row on a phone. The outer grid would already fall to one
+     column at this width, but stating it means the breakpoint does not depend
+     on the minmax above staying 320px. */
+  #rooms { grid-template-columns: 1fr; }
+  #bank { flex-direction: column; align-items: flex-start; gap: 10px; }
+}
+
+@media (max-width: 480px) {
+  body { padding: 10px; }
+  body::before { margin: -10px -10px 8px; }
+  .readings .dial { min-width: 72px; padding: 6px 10px; }
+  /* The volume label and the number will not share a line with a slider worth
+     dragging at this width, so the slider takes the line under them. */
+  .slider { flex-wrap: wrap; }
+  .slider input[type="range"] { flex-basis: 100%; }
+}
+
+/* ═══ design-kit extensions — drafted in docs/labs/home-ui-lab.dx ═══════════
+   Everything below extends the page's shipped stylesheet (copied verbatim
+   above) with the components the 2026-08-19 design pass adds: the record
+   deck, the light palette and effects, group decks, and the convergence
+   marks the steadfastness doctrine requires. When the design is agreed these
+   move into sites/home/styles.css and this file becomes the diff's origin. */
+
+/* ── the deck — music as a record on a platter ────────────────────── */
+/* The platter is the one large circle permitted on the page, and it earns it
+   the same way the sweep earns its ring: it depicts motion that is really
+   happening. A record that is playing turns; a paused record stands still
+   with the tonearm resting where playback stopped. The turn is the second
+   allowed loop *only while playing* — an idle deck is motionless. */
+.deck {
+  display: flex; gap: 14px; align-items: center;
+  padding: 12px; background: var(--sunken); border: 1px solid var(--border);
+}
+.platter-well { position: relative; width: 118px; height: 118px; flex: none; }
+.platter {
+  position: absolute; inset: 0; border-radius: 50%;
+  border: 1px solid var(--border);
+  background:
+    radial-gradient(circle at 38% 30%, rgba(233,236,238,0.05), transparent 55%),
+    repeating-radial-gradient(circle, #0b0c0e 0 2px, #101214 2px 2.6px),
+    #0b0c0e;
+}
+.deck.playing .platter { animation: platter-turn 3.6s linear infinite; }
+@keyframes platter-turn { to { transform: rotate(360deg); } }
+@media (prefers-reduced-motion: reduce) { .deck.playing .platter { animation: none; } }
+.platter .disclabel {
+  position: absolute; left: 50%; top: 50%; width: 40px; height: 40px;
+  transform: translate(-50%, -50%); border-radius: 50%;
+  background: var(--raised); border: 1px solid var(--border);
+  display: flex; align-items: center; justify-content: center;
+  font-size: 11px; letter-spacing: 0.12em; color: var(--muted);
+}
+.platter .spindle {
+  position: absolute; left: 50%; top: 50%; width: 3px; height: 3px;
+  transform: translate(-50%, -50%); background: var(--accent);
+}
+/* The tonearm is the progress indicator: parked off the record at rest,
+   12deg at the lead-in groove, 42deg at the run-out. The page sets the angle
+   with `--arm`; nothing else about it changes. */
+.tonearm {
+  position: absolute; right: -4px; top: -4px; width: 24px; height: 24px;
+  z-index: 2;
+}
+.tonearm .pivot {
+  position: absolute; right: 6px; top: 6px; width: 10px; height: 10px;
+  background: var(--raised); border: 1px solid var(--border);
+}
+.tonearm .arm {
+  position: absolute; right: 10px; top: 10px; width: 2px; height: 78px;
+  transform-origin: 1px 1px; transform: rotate(var(--arm, -24deg));
+  background: linear-gradient(var(--muted), var(--accent) 92%);
+}
+.tonearm .arm::after {  /* the head, a lamp-slot at the arm's end */
+  content: ""; position: absolute; left: -2px; bottom: 0;
+  width: 6px; height: 10px; background: var(--accent);
+}
+.deck-panel { display: flex; flex-direction: column; gap: 7px; min-width: 0; flex: 1 1 auto; }
+
+/* ── light palette, temps, effects — choices, machined ────────────── */
+/* Chips are choices, not status: the eight colours come from the measured
+   pipeline in color.rs, so a chip shows what the bulb will actually do. The
+   selected chip carries a hairline halo — selection is a fact, so it gets a
+   mark, not a glow. */
+.palette { display: flex; gap: 5px; flex-wrap: wrap; }
+.chip {
+  width: 34px; height: 22px; flex: none; cursor: pointer;
+  border: 1px solid var(--border); background: var(--raised);
+  position: relative; padding: 0;
+}
+.chip[aria-pressed="true"]::after {
+  content: ""; position: absolute; inset: -4px;
+  border: 1px solid var(--accent); pointer-events: none;
+}
+.chip:hover { border-color: var(--muted); }
+.chip.add {
+  color: var(--muted); font-size: 13px; line-height: 1;
+  display: flex; align-items: center; justify-content: center;
+}
+/* Temperature chips render their own kelvin as ink on the tint they set. */
+.chip.temp { width: auto; padding: 0 8px; font-size: 10px; letter-spacing: 0.05em;
+  display: flex; align-items: center; justify-content: center; color: var(--on-accent); }
+/* Effects are words, not colours: the far device runs the pattern, the page
+   only names it, so an effect chip is a small button, and the running one is
+   pressed. */
+.effects { display: flex; gap: 4px; flex-wrap: wrap; }
+
+/* ── group decks — every light, one room, or one bulb ─────────────── */
+/* The scope row decides what the deck's controls address. It is a row of
+   pressed-state buttons, not tabs: ALL and each room are the standing scopes,
+   and the pressed one is where every command below it lands. */
+.scope { display: flex; gap: 4px; flex-wrap: wrap; align-items: center; }
+.scope .btn[aria-pressed="true"] {
+  background: var(--accent); color: var(--on-accent); border-color: var(--accent);
+  box-shadow: none; font-weight: 600;
+}
+.scope .count { font-size: 10px; color: var(--muted); margin-left: 2px; }
+
+/* ── convergence — the server's state, on its way to the house ────── */
+/* The page never shows a device's dissent as truth. A control set to a value
+   stays at that value; until the device confirms, the plate wears a SET mark:
+   a hollow lamp and the word APPLYING, muted — convergence is normal work,
+   not an alarm. If the hub reports it has been retrying past its patience,
+   the mark turns amber and says the device's own state instead. */
+.setmark { display: inline-flex; gap: 6px; align-items: center; }
+.setmark .lamp.pending { background: none; border: 1px solid var(--ok); animation: pulse-set 1.2s ease-in-out infinite; }
+@keyframes pulse-set { 0%, 100% { opacity: 1; } 50% { opacity: 0.35; } }
+.setmark .micro { letter-spacing: 0.08em; text-transform: uppercase; color: var(--muted); }
+.setmark.holdout .lamp.pending { border-color: var(--warn); }
+.setmark.holdout .micro { color: var(--warn); }
+
+/* ── room rule actions ────────────────────────────────────────────── */
+.section-rule .btn.small { flex: none; }
+
+/* ── the lamp pulse the shipped sheet defines inline; restated here so
+      mockups carry it standalone ─────────────────────────────────── */
+@keyframes pulse-warn { 0%, 100% { opacity: 1; } 50% { opacity: 0.4; } }
+@keyframes pulse-bad  { 0%, 100% { opacity: 1; } 50% { opacity: 0.4; } }

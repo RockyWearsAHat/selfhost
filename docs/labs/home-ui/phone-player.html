@@ -1,0 +1,126 @@
+<!doctype html>
+<!-- Design comp: the speaker plate as a record deck, phone width. Three
+     states: the Kitchen Sonos One playing and coordinating a group, the Move
+     following it, and the same deck paused. Markup uses the page's own
+     classes; theatre.css is the shipped stylesheet plus the design-kit
+     extensions this comp exists to prove. -->
+<html lang="en"><head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>comp — the deck</title>
+<link rel="stylesheet" href="theatre.css">
+</head><body>
+
+<main id="rooms">
+<div class="room">
+  <div class="section-rule"><h2>KITCHEN</h2><span class="rule"></span><span class="micro">2 DEVICES</span></div>
+  <div class="roomdevices">
+
+  <!-- Playing, coordinating a group. The platter turns; the tonearm sits at
+       38% of the record. -->
+  <section class="plate device">
+    <div class="title-rule">
+      <span class="title">Kitchen</span><span class="rule"></span>
+      <span class="micro kind">SPEAKER</span><span class="lamp ok"></span>
+    </div>
+    <p class="doing">Playing, grouped with Move.</p>
+    <div class="deck playing">
+      <div class="platter-well">
+        <div class="platter"><span class="disclabel">HM</span><span class="spindle"></span></div>
+        <div class="tonearm"><span class="arm" style="--arm:7deg"></span><span class="pivot"></span></div>
+      </div>
+      <div class="deck-panel">
+        <div class="nowplaying">
+          <span class="track">Harvest Moon</span>
+          <span class="artist">Neil Young</span>
+        </div>
+        <div class="progress">
+          <span class="bar"><span class="fill" style="width:38%"></span></span>
+          <span class="clock mono">1:54 / 5:03</span>
+        </div>
+        <div class="actions">
+          <button class="btn" aria-label="Previous">&#9198;</button>
+          <button class="btn primary" aria-label="Pause">&#9208;</button>
+          <button class="btn" aria-label="Next">&#9197;</button>
+          <span class="rule"></span>
+          <button class="btn" aria-pressed="false">MUTE</button>
+        </div>
+      </div>
+    </div>
+    <div class="slider">
+      <span class="fieldlabel">VOLUME</span>
+      <input type="range" min="0" max="100" value="40" aria-label="Volume">
+      <span class="value mono">40</span>
+    </div>
+    <div class="grouprow">
+      <span class="caption">Coordinating: Move follows this deck.</span>
+      <button class="btn small">LEAVE</button>
+    </div>
+  </section>
+
+  <!-- The follower: no deck of its own — the record is on the coordinator's
+       platter. It keeps its own volume, which is the one fact grouping does
+       not take from a speaker. -->
+  <section class="plate device">
+    <div class="title-rule">
+      <span class="title">Move</span><span class="rule"></span>
+      <span class="micro kind">SPEAKER</span><span class="lamp ok"></span>
+    </div>
+    <p class="doing">Following Kitchen &mdash; Harvest Moon.</p>
+    <div class="slider">
+      <span class="fieldlabel">VOLUME</span>
+      <input type="range" min="0" max="100" value="25" aria-label="Volume">
+      <span class="value mono">25</span>
+    </div>
+    <div class="grouprow">
+      <span class="caption">Grouped under Kitchen.</span>
+      <button class="btn small">LEAVE</button>
+    </div>
+  </section>
+
+  <!-- Paused, alone: the platter stands still, the arm rests parked, and the
+       join picker offers the one other speaker in the house. -->
+  <section class="plate device">
+    <div class="title-rule">
+      <span class="title">Kitchen</span><span class="rule"></span>
+      <span class="micro kind">SPEAKER</span><span class="lamp idle"></span>
+    </div>
+    <p class="doing">Paused &mdash; Harvest Moon.</p>
+    <div class="deck">
+      <div class="platter-well">
+        <div class="platter"><span class="disclabel">HM</span><span class="spindle"></span></div>
+        <div class="tonearm"><span class="arm"></span><span class="pivot"></span></div>
+      </div>
+      <div class="deck-panel">
+        <div class="nowplaying">
+          <span class="track">Harvest Moon</span>
+          <span class="artist">Neil Young</span>
+        </div>
+        <div class="progress">
+          <span class="bar"><span class="fill" style="width:38%"></span></span>
+          <span class="clock mono">1:54 / 5:03</span>
+        </div>
+        <div class="actions">
+          <button class="btn" aria-label="Previous">&#9198;</button>
+          <button class="btn primary" aria-label="Play">&#9205;</button>
+          <button class="btn" aria-label="Next">&#9197;</button>
+          <span class="rule"></span>
+          <button class="btn" aria-pressed="false">MUTE</button>
+        </div>
+      </div>
+    </div>
+    <div class="slider">
+      <span class="fieldlabel">VOLUME</span>
+      <input type="range" min="0" max="100" value="40" aria-label="Volume">
+      <span class="value mono">40</span>
+    </div>
+    <div class="grouprow">
+      <span class="caption">Alone.</span>
+      <select aria-label="Join"><option>join Move&hellip;</option></select>
+      <button class="btn small">JOIN</button>
+    </div>
+  </section>
+
+  </div>
+</div>
+</main>
+</body></html>
