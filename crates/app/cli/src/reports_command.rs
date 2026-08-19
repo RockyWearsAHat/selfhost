@@ -481,9 +481,7 @@ fn project(arguments: &[String], store: &Store, accounts_dir: &Path) -> Result<(
             match owners.rotate(&key, "operator")? {
                 Some(token) => {
                     println!("reader token: {token}");
-                    println!(
-                        "this is shown once — store it now; the old token no longer works"
-                    );
+                    println!("this is shown once — store it now; the old token no longer works");
                 }
                 None => {
                     return Err(format!(
@@ -494,9 +492,7 @@ fn project(arguments: &[String], store: &Store, accounts_dir: &Path) -> Result<(
             }
             Ok(())
         }
-        _ => Err(
-            "`reports project` takes `add <key>` or `rotate <key>`".to_string()
-        ),
+        _ => Err("`reports project` takes `add <key>` or `rotate <key>`".to_string()),
     }
 }
 
@@ -517,10 +513,8 @@ fn projects(store: &Store) -> Result<(), String> {
 /// `selfhost reports list [<project>]`.
 fn list(named: Option<&str>, store: &Store) -> Result<(), String> {
     let keys = match named {
-        Some(named) => vec![
-            selfhost_reports::report::project_key(named)
-                .map_err(|refusal| refusal.message().to_string())?,
-        ],
+        Some(named) => vec![selfhost_reports::report::project_key(named)
+            .map_err(|refusal| refusal.message().to_string())?],
         None => store.projects().map_err(|error| error.to_string())?,
     };
     for key in keys {
