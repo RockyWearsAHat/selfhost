@@ -52,6 +52,7 @@ pub mod color;
 pub mod device;
 pub mod dial;
 pub mod discovery;
+pub mod firetv;
 pub mod hub;
 pub mod mcp;
 pub mod registry;

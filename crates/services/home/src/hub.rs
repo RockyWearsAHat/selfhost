@@ -42,6 +42,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use crate::device::{Command, Device, DeviceId};
 use crate::dial;
 use crate::discovery;
+use crate::firetv;
 use crate::registry::Registry;
 use crate::sonos;
 use crate::wiz;
@@ -78,6 +79,10 @@ pub struct Hub {
     registry: Mutex<Registry>,
     /// Where that registry is kept.
     registry_path: PathBuf,
+    /// Where the Fire TV ADB key is kept — beside the registry, empty for a
+    /// test hub. Held so a firetv command can load or generate it without the
+    /// driver having to know where a deployment's state lives.
+    adb_key_path: PathBuf,
     /// When set, an admitted command is recorded instead of being sent.
     ///
     /// A test seam, and a deliberately narrow one: it sits *after* the whole
@@ -93,11 +98,13 @@ impl Hub {
     #[must_use]
     pub fn new(registry_path: PathBuf) -> Self {
         let registry = Registry::load(&registry_path);
+        let adb_key_path = firetv::key_path_beside(&registry_path);
         Hub {
             devices: Mutex::new(BTreeMap::new()),
             generation: AtomicU64::new(1),
             registry: Mutex::new(registry),
             registry_path,
+            adb_key_path,
             performed: None,
         }
     }
@@ -114,6 +121,7 @@ impl Hub {
             generation: AtomicU64::new(1),
             registry: Mutex::new(Registry::default()),
             registry_path: PathBuf::new(),
+            adb_key_path: PathBuf::new(),
             performed: Some(Mutex::new(Vec::new())),
         }
     }
@@ -196,7 +204,18 @@ impl Hub {
         let outcome = match device.id.driver() {
             sonos::DRIVER => sonos::perform(&device, &house, &command).await,
             wiz::DRIVER => wiz::perform(&device, &command).await,
-            dial::DRIVER => dial::perform(&device, &command).await,
+            // A Fire TV is two protocols behind one capability set: DIAL owns
+            // apps (launch, stop, status) and ADB owns power and keys. The
+            // capability gate above has already proved the television advertises
+            // what this command needs, so the split here is only about which
+            // wire carries it — and a Vega television, which never advertised
+            // power or keys, never reaches the ADB arm.
+            dial::DRIVER => match command {
+                Command::Power(_) | Command::Key(_) => {
+                    firetv::perform(&device, &command, &self.adb_key_path).await
+                }
+                _ => dial::perform(&device, &command).await,
+            },
             other => Err(format!("Nothing here knows how to drive a {other}.")),
         };
 
@@ -413,7 +432,15 @@ impl Hub {
         match device.id.driver() {
             sonos::DRIVER => sonos::refresh(&mut device).await,
             wiz::DRIVER => wiz::refresh(&mut device).await,
-            dial::DRIVER => dial::refresh(&mut device).await,
+            dial::DRIVER => {
+                // DIAL decides the television's reachability and running app;
+                // the ADB probe then reflects whether power and key control is
+                // available right now, so enabling ADB on the device makes the
+                // controls appear within one refresh and disabling it removes
+                // them. The probe is a cheap connect and never a command.
+                dial::refresh(&mut device).await;
+                firetv::probe(&mut device).await;
+            }
             // A driver that does not exist yet leaves the device exactly as
             // discovery left it, note and all.
             _ => return,
