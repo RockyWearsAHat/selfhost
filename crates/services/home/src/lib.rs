@@ -28,6 +28,7 @@
 //! | [`registry`] | no | the names and rooms a person gave things, across restarts |
 //! | [`sonos`] | mixed | the Sonos protocol: topology, transport, volume, events |
 //! | [`wiz`] | mixed | the WiZ light protocol: JSON over UDP, discovery by broadcast |
+//! | [`dial`] | mixed | the DIAL protocol: a television's launch, stop and status |
 //! | [`discovery`] | no | finding what is on the network, by SSDP and a debug-bridge probe |
 //! | [`hub`] | no | the live state of the house, and the one place it is mutated |
 //! | [`api`] | yes | the JSON shape the browser sees, and the command vocabulary |
@@ -49,6 +50,7 @@
 pub mod api;
 pub mod color;
 pub mod device;
+pub mod dial;
 pub mod discovery;
 pub mod hub;
 pub mod mcp;

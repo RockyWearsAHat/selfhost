@@ -40,6 +40,7 @@ use std::sync::Mutex;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::device::{Command, Device, DeviceId};
+use crate::dial;
 use crate::discovery;
 use crate::registry::Registry;
 use crate::sonos;
@@ -174,7 +175,7 @@ impl Hub {
                 .clone()
                 .unwrap_or_else(|| format!("{} is not answering.", device.name)));
         }
-        if !device.can(command.needs()) {
+        if !command.admitted_by().iter().any(|needed| device.can(*needed)) {
             return Err(format!(
                 "{} cannot be asked to {}.",
                 device.name,
@@ -195,6 +196,7 @@ impl Hub {
         let outcome = match device.id.driver() {
             sonos::DRIVER => sonos::perform(&device, &house, &command).await,
             wiz::DRIVER => wiz::perform(&device, &command).await,
+            dial::DRIVER => dial::perform(&device, &command).await,
             other => Err(format!("Nothing here knows how to drive a {other}.")),
         };
 
@@ -327,22 +329,17 @@ impl Hub {
             }
         }
 
-        // A Fire TV is recorded even though nothing can drive it yet, because
-        // "your television is here but ADB is switched off" is a fact the
-        // reader needs in order to fix it, and an empty page is not.
-        for firetv in found.iter().filter(|f| f.kind == discovery::FoundKind::FireTv) {
-            let mut device = Device::new(
-                DeviceId::new("firetv", &firetv.address),
-                firetv.name.clone().unwrap_or_else(|| "Fire TV".to_owned()),
-                crate::device::Kind::Television,
-            );
-            device.address = Some(firetv.address.clone());
-            device.reachable = false;
-            device.note = Some(
-                "The debug bridge is not enabled on this television, so nothing here can drive it yet."
-                    .to_owned(),
-            );
-            self.adopt(vec![device]);
+        // A television names and describes itself in its device description,
+        // which is one fetch away; a fetch that fails leaves it off the page
+        // this sweep and found again on the next, exactly like a speaker
+        // whose household document did not answer.
+        for television in found.iter().filter(|f| f.kind == discovery::FoundKind::Dial) {
+            match dial::television(television).await {
+                Ok(device) => self.adopt(vec![device]),
+                Err(error) => {
+                    eprintln!("[home] a television's description did not answer: {error}");
+                }
+            }
         }
     }
 
@@ -359,11 +356,13 @@ impl Hub {
                     Some(existing) => {
                         if existing.name != device.name
                             || existing.address != device.address
+                            || existing.location != device.location
                             || existing.state.group != device.state.group
                             || existing.state.coordinator != device.state.coordinator
                         {
                             existing.name = device.name;
                             existing.address = device.address;
+                            existing.location = device.location;
                             existing.state.coordinator = device.state.coordinator;
                             existing.state.group = device.state.group;
                             existing.state.battery_pct = device.state.battery_pct;
@@ -414,6 +413,7 @@ impl Hub {
         match device.id.driver() {
             sonos::DRIVER => sonos::refresh(&mut device).await,
             wiz::DRIVER => wiz::refresh(&mut device).await,
+            dial::DRIVER => dial::refresh(&mut device).await,
             // A driver that does not exist yet leaves the device exactly as
             // discovery left it, note and all.
             _ => return,
