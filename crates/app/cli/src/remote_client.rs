@@ -18,11 +18,17 @@
 //!   closed match over the commands that are actually implemented ([`plan`]),
 //!   and everything else is an error and a non-zero exit. There is deliberately
 //!   no fall-through arm.
-//! * **Read-only.** [`RemoteClient`] can send a `GET` and has no method that
-//!   sends anything else, so "this command has no remote implementation" cannot
-//!   quietly become "this command mutates the far side in a way nobody
-//!   reviewed". Making the class of request unrepresentable is cheaper than
-//!   checking for it at every call site.
+//! * **`--remote <host>` itself stays read-only.** [`plan`] — the closed set
+//!   `--remote` drives — only ever calls [`RemoteClient::get`], so nothing
+//!   reachable through the global `--remote` flag can mutate the far side.
+//!   [`RemoteClient::request`] can send any method with a body, but it is
+//!   deliberately **not** wired into [`plan`]/[`run`] at all: `selfhost mcp`
+//!   (`crate::mcp_command`) is the one caller, it takes its own `--host` flag
+//!   rather than the global `--remote` (so a long-running stdio server is
+//!   never confused with a one-shot read-only query), and it authenticates
+//!   with a scoped **agent** token rather than the deployment's bearer token —
+//!   see that module for why an unattended process gets a bounded credential
+//!   instead of the root one.
 //! * **HTTPS only.** `http://` is refused by [`Remote::parse`] rather than
 //!   upgraded, because the request carries a bearer token that is the whole of
 //!   this deployment's authority: sending it in clear once is a compromise, and
@@ -268,12 +274,26 @@ impl RemoteClient {
 
     /// Asks the far side one question and hands back the answer's JSON.
     ///
-    /// `GET` is the only method here on purpose — see the module note. The
-    /// connection is closed after the answer rather than pooled: these commands
-    /// make a handful of requests and exit, and a client that keeps a connection
-    /// alive has to handle a peer that half-closes it, which is machinery for no
-    /// gain.
+    /// `GET` and no body — the shape every `--remote` command in this file
+    /// uses. See [`RemoteClient::request`] for the general form the MCP server
+    /// (`crate::mcp_command`) needs, which this is now a thin wrapper over.
     pub async fn get(&self, path: &str) -> Result<Json, String> {
+        self.request("GET", path, None).await
+    }
+
+    /// Asks the far side one question, with a method and an optional body, and
+    /// hands back the answer's JSON.
+    ///
+    /// The general form [`RemoteClient::get`] wraps. Unlike `get`, this is not
+    /// restricted to read-only verbs — it is what `selfhost mcp` uses to reach
+    /// `POST`/`PUT`/`DELETE` site-management routes on the far side, always
+    /// authenticated with an **agent** token (see `crate::agent_command` and
+    /// `selfhost_admin::agent_store`) rather than the deployment's own bearer
+    /// token, so what this method can do on the far side is bounded by
+    /// whatever that agent was granted — never by what this method itself
+    /// permits. Every invariant [`RemoteClient::get`] held still holds: HTTPS
+    /// only, the connection closed after one answer, a bounded read.
+    pub async fn request(&self, method: &str, path: &str, body: Option<&[u8]>) -> Result<Json, String> {
         let name = rustls::pki_types::ServerName::try_from(self.remote.host.clone())
             .map_err(|_| format!("{} is not a usable server name for TLS", self.remote.host))?;
 
@@ -306,16 +326,25 @@ impl RemoteClient {
                 .await
                 .map_err(|error| format!("TLS to {} failed: {error}", self.remote))?;
 
+            let body = body.unwrap_or(&[]);
             let request = format!(
-                "GET {path} HTTP/1.1\r\nHost: {}\r\nAuthorization: Bearer {}\r\n\
-                 Accept: application/json\r\nConnection: close\r\n\r\n",
+                "{method} {path} HTTP/1.1\r\nHost: {}\r\nAuthorization: Bearer {}\r\n\
+                 Accept: application/json\r\nContent-Type: application/json\r\n\
+                 Content-Length: {}\r\nConnection: close\r\n\r\n",
                 self.remote.authority(),
-                self.token
+                self.token,
+                body.len(),
             );
             stream
                 .write_all(request.as_bytes())
                 .await
                 .map_err(|error| format!("cannot send to {}: {error}", self.remote))?;
+            if !body.is_empty() {
+                stream
+                    .write_all(body)
+                    .await
+                    .map_err(|error| format!("cannot send to {}: {error}", self.remote))?;
+            }
 
             let mut raw = Vec::new();
             let mut buffer = [0u8; 8192];

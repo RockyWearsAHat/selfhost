@@ -4,6 +4,7 @@
 //! crates so it stays callable from tests without going through `argv`.
 
 mod acme_task;
+mod agent_command;
 mod app_command;
 mod assess;
 mod audit;
@@ -24,6 +25,7 @@ mod investigate;
 mod invite_email;
 mod lan_dns;
 mod mail_task;
+mod mcp_command;
 mod mesh_task;
 mod node_command;
 mod oui;
@@ -235,6 +237,16 @@ Commands
                              `up <name>` and `down <name>` start and stop a relay.
                              `who <address>` identifies who arrived at a loopback
                              socket, and answers clearly when nobody can be named.
+  agent <add|list|revoke>    Scoped, revocable credentials for trusted machines —
+                             an AI agent, a script. `add <name> --grant <cap>`
+                             mints one and prints its token once; it holds
+                             exactly the capabilities granted, never more.
+  mcp --host <admin-host>    A Model Context Protocol server on stdin/stdout, so
+                             an AI agent can manage sites on <admin-host>
+                             through tools it can list and call. Reads its
+                             credential from SELFHOST_AGENT_TOKEN or
+                             ~/.selfhost/agent-token — an agent token, never the
+                             deployment's own.
   console-password [<password>]
                              Set the web console's login password; reads it
                              twice from stdin if omitted
@@ -319,6 +331,11 @@ fn main() -> ExitCode {
             let data_dir = teardown::data_dir(&config, &project_dir);
             people_command::run(&arguments, &data_dir, &config)
         }),
+        "agent" => load().and_then(|(config, project_dir)| {
+            let data_dir = teardown::data_dir(&config, &project_dir);
+            agent_command::run(&arguments, &data_dir)
+        }),
+        "mcp" => mcp_command::run(&arguments),
         "vpn" => load().and_then(|(config, project_dir)| vpn_command::vpn(&arguments, &config, &project_dir)),
         "mail" => mail_command(&arguments),
         "console-password" => console_password_command(&arguments),
@@ -993,7 +1010,17 @@ async fn serve_everything(
     // Console auth is read once here: a `selfhost console-password` run takes
     // effect at the next daemon restart.
     let mut api = Api::new(supervisor.clone(), store, token, watches.clone(), firewall.clone())
-        .with_console_auth(&data_dir);
+        .with_console_auth(&data_dir)
+        // `selfhost agent add|list|revoke` writes `console.agents` directly,
+        // in this same data directory; this is what lets the daemon verify
+        // the tokens that store mints. Always wired, on the same terms the
+        // bearer token always is: a store with nothing in it opens nothing.
+        .with_agents(&data_dir)
+        // `/api/sites`, gated by `Capability::SiteAdmin`. `config_path` is the
+        // same file `selfhost site` edits directly; a site created remotely
+        // is indistinguishable, once written, from one typed at this box's
+        // own keyboard.
+        .with_site_admin(config_path.clone(), data_dir.clone());
     // Only when the section is live: a route that answers 202 and pokes a
     // watcher that is not running would report a deployment nobody is doing.
     if config.self_update.as_ref().is_some_and(|update| update.enabled) {
