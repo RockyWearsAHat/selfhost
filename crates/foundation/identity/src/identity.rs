@@ -343,6 +343,16 @@ impl Identity {
         matches!(self, Self::Machine)
     }
 
+    /// Whether this identity names one person.
+    ///
+    /// The predicate a per-person credential is checked against. Written here
+    /// rather than as a `matches!` at each call site because the interesting
+    /// property is what it is *not*: neither the owner nor the machine, both of
+    /// which are the deployment rather than somebody.
+    pub fn is_person(&self) -> bool {
+        matches!(self, Self::Person(_))
+    }
+
     /// The word the audit log uses for this identity's *kind*.
     ///
     /// Written as its own field beside the name, so a person whose name merely

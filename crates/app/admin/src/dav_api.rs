@@ -107,11 +107,13 @@
 //! The same rule [`crate::storage_api`] holds: on a NAS the file names *are* the
 //! data. A refusal is logged by share id and reason tag, never by name.
 
-use crate::{ConsolePassword, storage_api::Volumes};
+use crate::{ConsolePassword, DevicePasswords, storage_api::Volumes};
 use selfhost_http::{Method, Request, Response, Status};
-use selfhost_identity::{Capability, Caller, Identity, Policy, ShareId as CapabilityShareId};
+use selfhost_identity::{
+    Capability, Caller, Grants, Identity, People, Policy, ShareId as CapabilityShareId,
+};
 use selfhost_storage::api::{Failure, Volume};
-use selfhost_storage::auth::{self, Cached, Credentials, KeyUnavailable, Presented};
+use selfhost_storage::auth::{self, Cached, Credentials, Door, KeyUnavailable, Presented};
 use selfhost_storage::dav::lock::{self, Guard, Locks, Reach, Release, TakeRefused};
 use selfhost_storage::dav::method::{self, Overwrite, Verb};
 use selfhost_storage::dav::multistatus::Mount;
@@ -222,10 +224,20 @@ impl Webdav {
 /// of its own and cannot form a second opinion about the policy, the shares or
 /// the password.
 pub struct Wiring<'a> {
-    /// The stored hash every Basic credential is verified against. An `Arc`
-    /// rather than a reference because the cold verification is moved onto the
-    /// blocking pool.
+    /// The stored hash a Basic credential at the *deployment's* door is verified
+    /// against. An `Arc` rather than a reference because the cold verification is
+    /// moved onto the blocking pool.
     pub password: Arc<ConsolePassword>,
+    /// The per-person storage passwords, for a Basic credential at a *person's*
+    /// door. `None` — a deployment with no data directory — means every user name
+    /// takes the deployment's door, which is how this endpoint behaved before
+    /// per-person credentials existed.
+    pub device_passwords: Option<DevicePasswords>,
+    /// The registry a person's grants are read from once they have authenticated
+    /// as themselves. `None` means every person holds nothing, so a device
+    /// password would open no share at all — which is why it is wired beside the
+    /// store rather than optional in practice.
+    pub people: Option<People>,
     /// The credential cache and the lock table, shared with every other
     /// connection.
     pub webdav: Arc<Webdav>,
@@ -335,27 +347,59 @@ pub fn unauthenticated() -> Response {
 ///    reaches the 70 ms of PBKDF2, and it reaches it on the blocking pool, so a
 ///    cold mount does not stall every other connection the daemon is serving.
 ///
-/// The user name is not checked against anything, and that is deliberate rather
-/// than an omission: the console credential is a password with no account beside
-/// it, so there is no name to compare against and inventing one would be a
-/// second secret an operator has to be told. The name is still part of the cache
-/// key — `alice` and `bob` with the same password are two entries — and it is
-/// the only half of the credential that may be logged.
+/// # The user name now decides which store the password is checked against
 ///
-/// Returns [`auth::authenticated`]'s caller and no other, for the reason this
-/// module's documentation gives: a mount must never be able to hold a keyboard.
+/// For most of this endpoint's life the name was read, used as part of the cache
+/// key, and otherwise ignored — there was one console password, so there was
+/// nothing to look a name up in. That is the door `docs/labs/nas-lab.dx`
+/// recorded as open: the console password opened every share for anybody who had
+/// it, and the per-share capability check further down this file was written,
+/// tested and unreachable, because the only caller that ever arrived was the
+/// owner.
+///
+/// [`Door::for_name`] closes it. A name that is a registered person *who holds a
+/// device password* is checked against that person's own hash and authenticates
+/// as them; every other name goes to the console password and authenticates as
+/// the owner, unchanged. The door is chosen before any password is compared, and
+/// it is part of the cache key — see [`Door`] for the sequence in which a cache
+/// that ignored it would hand one person's caller to somebody who presented the
+/// deployment's password.
+///
+/// Returns one of [`auth::authenticated`]'s two callers and no other, for the
+/// reason this module's documentation gives: a mount must never be able to hold a
+/// keyboard, whether or not it has a name on it.
 pub async fn authenticate(
     request: &Request,
     password: Arc<ConsolePassword>,
+    device_passwords: Option<&DevicePasswords>,
+    people: Option<&People>,
     cache: &Credentials,
 ) -> Result<Caller, Unauthenticated> {
     let presented =
         auth::parse_basic(request.headers.get_str("authorization")).ok_or(Unauthenticated::Absent)?;
-    if cache.throttled(&presented) {
+
+    // Which store, decided from the name alone and before any secret is
+    // compared. A deployment with no device-password store sends every name to
+    // the deployment's door, which is exactly how this behaved before.
+    let door = Door::for_name(presented.user(), |name| {
+        device_passwords.is_some_and(|store| store.holds(name))
+    });
+    // What the person holds, read now so the answer is the registry's at the
+    // moment of the request rather than at the moment the cache entry was made.
+    // Empty for the deployment's door, where it is never read: the owner's
+    // authority is not a grant set.
+    let grants = match (&door, people) {
+        (Door::Person(name), Some(people)) => {
+            people.grants_for(&Identity::Person(name.clone()))
+        }
+        _ => Grants::none(),
+    };
+
+    if cache.throttled(&door, &presented) {
         return Err(Unauthenticated::Throttled);
     }
-    match cache.look_up(&presented) {
-        Cached::Verified => return Ok(auth::authenticated()),
+    match cache.look_up(&door, &presented) {
+        Cached::Verified => return Ok(auth::authenticated(&door, grants)),
         Cached::Rejected => return Err(Unauthenticated::Wrong),
         Cached::Unknown => {}
     }
@@ -372,20 +416,22 @@ pub async fn authenticate(
     // before the first had finished. Without this second look the queue would
     // drain into one PBKDF2 run per waiter, which is the cost this cache exists
     // to remove.
-    match cache.look_up(&presented) {
-        Cached::Verified => return Ok(auth::authenticated()),
+    match cache.look_up(&door, &presented) {
+        Cached::Verified => return Ok(auth::authenticated(&door, grants)),
         Cached::Rejected => return Err(Unauthenticated::Wrong),
         Cached::Unknown => {}
     }
 
-    let Some((presented, verified)) = verify_off_runtime(password, presented).await else {
+    let Some((presented, verified)) =
+        verify_off_runtime(password, device_passwords.cloned(), door.clone(), presented).await
+    else {
         // The verification did not finish, so nothing is known and nothing is
         // remembered — a decision that was never made must not become a cache
         // entry. Refusing is the only safe reading.
         return Err(Unauthenticated::Wrong);
     };
-    cache.remember(&presented, verified);
-    if verified { Ok(auth::authenticated()) } else { Err(Unauthenticated::Wrong) }
+    cache.remember(&door, &presented, verified);
+    if verified { Ok(auth::authenticated(&door, grants)) } else { Err(Unauthenticated::Wrong) }
 }
 
 /// Runs the one cold PBKDF2 verification on the blocking pool.
@@ -401,12 +447,23 @@ pub async fn authenticate(
 /// `None` only if the task failed to join, which under `panic = "abort"` cannot
 /// happen in production — the process is already gone — so the branch is written
 /// for a test build rather than unwrapped.
+/// The store is chosen by `door`, which was decided from the user name before
+/// this was called. There is no fallback between the two: a person whose device
+/// password is wrong is refused, and is *not* then offered the console password,
+/// because a door that tried both would mean the deployment's password could
+/// still authenticate as anybody who had one.
 async fn verify_off_runtime(
     password: Arc<ConsolePassword>,
+    device_passwords: Option<DevicePasswords>,
+    door: Door,
     presented: Presented,
 ) -> Option<(Presented, bool)> {
     tokio::task::spawn_blocking(move || {
-        let verified = password.verify(presented.password());
+        let verified = match door.person() {
+            None => password.verify(presented.password()),
+            Some(name) => device_passwords
+                .is_some_and(|store| store.verify(name, presented.password())),
+        };
         (presented, verified)
     })
     .await
@@ -522,10 +579,15 @@ impl std::error::Error for Refused {}
 /// the connection handler needs: it authenticates, recognises the verb, and
 /// hands back everything the transfer will need — without opening a descriptor.
 pub async fn admit(wiring: &Wiring<'_>, request: &Request) -> Result<Passage, Refused> {
-    let caller =
-        authenticate(request, Arc::clone(&wiring.password), wiring.webdav.credentials())
-            .await
-            .map_err(Refused::Unauthenticated)?;
+    let caller = authenticate(
+        request,
+        Arc::clone(&wiring.password),
+        wiring.device_passwords.as_ref(),
+        wiring.people.as_ref(),
+        wiring.webdav.credentials(),
+    )
+    .await
+    .map_err(Refused::Unauthenticated)?;
     if !is_byte_verb(&request.method) {
         return Err(Refused::NotAVerb);
     }
@@ -816,6 +878,8 @@ pub async fn answer(wiring: &Wiring<'_>, request: &Request, body: &[u8]) -> Resp
     let caller = match authenticate(
         request,
         Arc::clone(&wiring.password),
+        wiring.device_passwords.as_ref(),
+        wiring.people.as_ref(),
         wiring.webdav.credentials(),
     )
     .await
