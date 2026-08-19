@@ -428,7 +428,7 @@ fn tool_schema(name: &str, description: &str, params: &[Param]) -> Json {
                     fields.push(("items".to_owned(), Json::object([("type", Json::string("object"))])));
                 }
             }
-            (field.to_string(), Json::object(fields.into_iter()))
+            (field.to_string(), Json::object(fields))
         })
         .collect();
     let required: Vec<Json> =
@@ -581,7 +581,7 @@ async fn call_tool(client: &RemoteClient, name: &str, arguments: &Json) -> Resul
             if let Some(instances) = objects(arguments, "instances")? {
                 fields.push(("instances".to_owned(), instances));
             }
-            let body = Json::object(fields.into_iter()).to_text();
+            let body = Json::object(fields).to_text();
             let answer = client.request("POST", "/api/sites", Some(body.as_bytes())).await?;
             Ok(answer.to_text())
         }

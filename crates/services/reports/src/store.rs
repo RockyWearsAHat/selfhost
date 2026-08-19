@@ -9,18 +9,20 @@
 //! object written to `<id>.json.tmp` and renamed over `<id>.json`, so a reader sees the record
 //! as it was or as it now is, never half of it.
 //!
-//! # A service is the unit a checkout subscribes to, and filing is how one is born
+//! # A service is the unit a checkout subscribes to, and creating one is a registered act
 //!
-//! `data/reports/<service>/` holds one service's defects. A service exists because a report was
-//! filed to `…/report?<service>` — that is the whole of registering one, and it is why the
-//! service is in the address rather than in a form somebody has to fill in first. An operator
-//! can still create one ahead of time (`selfhost reports project add dx`), which changes
-//! nothing except the order.
+//! `data/reports/<service>/` holds one service's defects. A service used to come into
+//! existence the first time anything filed to `…/report?<service>`; it no longer does,
+//! because a service is the thing an owner is metered and charged on, and a directory a
+//! stranger named is a bill nobody agreed to. A service is created by a signed-in account
+//! ([`crate::service`]'s `services/create` route, which also records who owns it in
+//! [`crate::ownership`]) or by the operator (`selfhost reports project add dx`); *filing* to a
+//! service that exists stays exactly as open as it always was.
 //!
-//! Creating on demand is a door, so it is a bounded one: [`MAX_PROJECTS`] caps how many
-//! services this box will hold, and passing it refuses in a sentence rather than filling the
-//! disk with directories a stranger named. Within one service the record cap does the same job.
-//! A checkout still asks for one key's open reports and folds them into its own `reports.dx`.
+//! Creation is still a bounded door: [`MAX_PROJECTS`] caps how many services this box will
+//! hold — enforced in [`Store::add_project`], the one place a project directory is made — and
+//! within one service the record cap does the same job. A checkout still asks for one key's
+//! open reports and folds them into its own `reports.dx`.
 //!
 //! # One record per defect, however many times it is reported
 //!
@@ -146,6 +148,15 @@ pub struct Recorded {
     pub fresh: bool,
 }
 
+/// What one service holds on disk — the meter a plan's caps are checked against.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Usage {
+    /// Distinct open defects — one record file each.
+    pub records: usize,
+    /// Bytes their files take, unreadable siblings included.
+    pub bytes: u64,
+}
+
 /// The report database rooted at one directory.
 #[derive(Debug, Clone)]
 pub struct Store {
@@ -174,12 +185,19 @@ impl Store {
     }
 
     /// Creates the project `key`, so reports about it are accepted. Creating one twice is not
-    /// an error — the operator's intent is the same either way.
+    /// an error — the caller's intent is the same either way.
     ///
     /// # Errors
-    /// [`StoreError::Io`] when the directory cannot be created.
+    /// [`StoreError::Full`] when a new project would pass [`MAX_PROJECTS`], [`StoreError::Io`]
+    /// when the directory cannot be created.
     pub fn add_project(&self, key: &str) -> Result<(), StoreError> {
         let dir = self.project_dir(key);
+        if !dir.is_dir() && self.projects()?.len() >= MAX_PROJECTS {
+            return Err(StoreError::Full(format!(
+                "this box already holds {MAX_PROJECTS} services, so `{key}` cannot be added — \
+                 retire an unused one first"
+            )));
+        }
         fs::create_dir_all(&dir).map_err(|error| {
             StoreError::Io(format!("could not create {}: {error}", dir.display()))
         })?;
@@ -211,25 +229,23 @@ impl Store {
         Ok(keys)
     }
 
-    /// Files `report`, creating its record or adding a sighting to the one that exists — and
-    /// creating the service itself when this is the first report filed to it.
+    /// Files `report`, creating its record or adding a sighting to the one that exists.
     ///
     /// # Errors
-    /// [`StoreError::Full`] when a new service would pass [`MAX_PROJECTS`] or a *new* defect
-    /// would pass [`MAX_RECORDS`], [`StoreError::Io`] when the record cannot be written. A
+    /// [`StoreError::NoProject`] when the service does not exist — creation is
+    /// [`Store::add_project`]'s alone now, a registered act rather than a side effect of
+    /// filing — [`StoreError::Full`] when a *new* defect would pass [`MAX_RECORDS`],
+    /// [`StoreError::Io`] when the record cannot be written. A
     /// record that exists but cannot be read is replaced rather than refused — the reporter is
     /// not made to pay for corruption here — and the unreadable bytes are kept beside it as
     /// `<id>.json.broken`.
     pub fn record(&self, report: &Report) -> Result<Recorded, StoreError> {
         if !self.has_project(&report.project) {
-            if self.projects()?.len() >= MAX_PROJECTS {
-                return Err(StoreError::Full(format!(
-                    "this box already holds {MAX_PROJECTS} services, so `{}` cannot be added — \
-                     file to one that exists, or ask the owner to retire an unused one",
-                    report.project
-                )));
-            }
-            self.add_project(&report.project)?;
+            return Err(StoreError::NoProject(format!(
+                "`{}` is not a service this box hosts — a registered account creates one, or \
+                 the operator does with `selfhost reports project add {}`",
+                report.project, report.project
+            )));
         }
         let id = report.id();
         let path = self.record_path(&report.project, &id);
@@ -368,6 +384,43 @@ impl Store {
         fs::remove_file(&path).map_err(|error| {
             StoreError::Io(format!("could not remove {}: {error}", path.display()))
         })
+    }
+
+    /// What `project` holds on disk: its records and their bytes.
+    ///
+    /// Measured from the record files themselves rather than kept as a second ledger, so the
+    /// meter can never drift from the thing it meters — deleting a report is the whole of
+    /// shrinking usage. Bounded by [`MAX_RECORDS`] files per service, so this is a directory
+    /// listing, not a walk. Unreadable `.json.broken` siblings count toward bytes — they are
+    /// still the owner's disk — and never toward records.
+    ///
+    /// # Errors
+    /// [`StoreError::NoProject`] when the key names nothing, [`StoreError::Io`] when the
+    /// directory cannot be listed.
+    pub fn usage(&self, project: &str) -> Result<Usage, StoreError> {
+        if !self.has_project(project) {
+            return Err(StoreError::NoProject(format!(
+                "`{project}` is not a service this box hosts"
+            )));
+        }
+        let dir = self.project_dir(project);
+        let listing = fs::read_dir(&dir).map_err(|error| {
+            StoreError::Io(format!("could not read {}: {error}", dir.display()))
+        })?;
+        let mut usage = Usage::default();
+        for entry in listing.filter_map(Result::ok) {
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else { continue };
+            let Ok(meta) = entry.metadata() else { continue };
+            if !meta.is_file() {
+                continue;
+            }
+            usage.bytes = usage.bytes.saturating_add(meta.len());
+            if name.ends_with(".json") {
+                usage.records += 1;
+            }
+        }
+        Ok(usage)
     }
 
     /// How many distinct defects `project` holds.
@@ -693,38 +746,56 @@ mod tests {
         }
     }
 
-    /// Filing is registration: a service exists because a report named it.
+    /// Creation is a registered act now: filing to a service nobody created is refused in a
+    /// sentence naming both doors that do create one, and writes nothing.
     #[test]
-    fn a_report_about_a_service_nobody_declared_creates_that_service() {
+    fn a_report_about_a_service_nobody_created_is_refused_by_name() {
         let store = scratch("unknown-project");
         let mut elsewhere = report("t", "d");
         elsewhere.project = "billing".to_string();
-        let recorded = store.record(&elsewhere).expect("filed");
-        assert!(recorded.fresh);
-        assert!(store.has_project("billing"));
-        assert_eq!(store.list("billing").expect("list").len(), 1);
+        let error = store.record(&elsewhere).expect_err("refused");
+        assert!(matches!(error, StoreError::NoProject(_)));
+        assert!(error.to_string().contains("registered account"), "{error}");
+        assert!(error.to_string().contains("project add billing"), "{error}");
+        assert!(!store.has_project("billing"));
     }
 
-    /// The bound on that door: a stranger may bring a service into existence, but not an
-    /// unbounded number of them, and the refusal says what to do.
+    /// The bound moved with the door: creation is [`Store::add_project`]'s alone, so the cap
+    /// is checked there — while a service already here keeps taking reports, and re-adding an
+    /// existing one stays a no-op even at the cap.
     #[test]
     fn a_new_service_past_the_cap_is_refused_while_the_ones_here_keep_working() {
         let store = scratch("project-cap");
-        for nth in 0..MAX_PROJECTS {
+        for nth in 0..MAX_PROJECTS - 1 {
             store.add_project(&format!("svc{nth}")).expect("project");
         }
-        let mut fresh = report("t", "d");
-        fresh.project = "one-too-many".to_string();
-        let error = store.record(&fresh).expect_err("refused");
+        let error = store.add_project("one-too-many").expect_err("refused");
         assert!(matches!(error, StoreError::Full(_)));
         assert!(error.to_string().contains("services"), "{error}");
         assert!(!store.has_project("one-too-many"));
 
+        store.add_project("svc0").expect("re-adding is a no-op");
         let mut known = report("t", "d");
         known.project = "svc0".to_string();
         store
             .record(&known)
             .expect("a service that exists still takes reports");
+    }
+
+    /// The meter reads the files themselves, so it can never drift from what is stored.
+    #[test]
+    fn usage_counts_records_and_bytes_from_the_files_themselves() {
+        let store = scratch("usage");
+        assert_eq!(store.usage("dx").expect("usage"), Usage::default());
+
+        store.record(&report("first", "d")).expect("file");
+        store.record(&report("second", "d")).expect("file");
+        let usage = store.usage("dx").expect("usage");
+        assert_eq!(usage.records, 2);
+        assert!(usage.bytes > 0);
+
+        let error = store.usage("ghost").expect_err("no such service");
+        assert!(matches!(error, StoreError::NoProject(_)));
     }
 
     #[test]
