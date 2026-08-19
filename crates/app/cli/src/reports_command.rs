@@ -53,7 +53,7 @@ use selfhost_config::Config;
 use selfhost_json::Json;
 use selfhost_reports::oauth::Provider;
 use selfhost_reports::service::{self, AccountsConfig, Service};
-use selfhost_reports::{Mailbox, Store};
+use selfhost_reports::{Accounts, Mailbox, Owners, Plan, Store};
 
 /// Where the intake listens when nothing says otherwise.
 ///
@@ -94,9 +94,11 @@ pub fn run(arguments: &[String], config: &Config, project_dir: &Path) -> Result<
         "close" => close(arguments, &store),
         "token" => token(arguments, &data_dir),
         "oauth" => oauth_command(arguments, &data_dir.join(ACCOUNTS_DIR)),
+        "owners" => owners(&data_dir.join(ACCOUNTS_DIR), &store),
+        "usage" => usage(arguments.get(2).map(String::as_str), &store),
         other => Err(format!(
             "`{other}` is not a reports command — it is serve, project, projects, list, close, \
-             token, or oauth"
+             token, oauth, owners, or usage"
         )),
     }
 }
@@ -763,6 +765,69 @@ fn save_oauth_providers(accounts_dir: &Path, providers: &[Provider]) -> Result<(
         .map_err(|error| format!("could not store {}: {error}", path.display()))
 }
 
+/// `selfhost reports owners` — services owned by accounts, with the owner's email and plan.
+fn owners(accounts_dir: &Path, store: &Store) -> Result<(), String> {
+    let owners = Owners::load(accounts_dir);
+    let accounts = Accounts::load(accounts_dir);
+    let entries = owners.entries();
+    if entries.is_empty() {
+        println!("no services are owned by accounts");
+        return Ok(());
+    }
+    for entry in entries {
+        let email = accounts
+            .find_by_id(&entry.owner)
+            .map(|account| account.email.clone())
+            .unwrap_or_else(|| entry.owner.clone());
+        let plan = accounts
+            .find_by_id(&entry.owner)
+            .map(|account| Plan::parse(&account.plan).word().to_string())
+            .unwrap_or_else(|| "—".to_string());
+        let usage = store
+            .usage(&entry.service)
+            .map(|usage| format!("{} records, {} bytes", usage.records, usage.bytes))
+            .unwrap_or_else(|_| "—".to_string());
+        println!("{:<24} {:<32} {:<8} {}", entry.service, email, plan, usage);
+    }
+    Ok(())
+}
+
+/// `selfhost reports usage [service]` — storage metering for services.
+fn usage(named: Option<&str>, store: &Store) -> Result<(), String> {
+    let services = match named {
+        Some(named) => vec![named.to_string()],
+        None => store.projects().map_err(|error| error.to_string())?,
+    };
+    if services.is_empty() {
+        println!("no services are configured yet");
+        return Ok(());
+    }
+    let mut total_records: usize = 0;
+    let mut total_bytes: u64 = 0;
+    for service in services.iter() {
+        match store.usage(service) {
+            Ok(service_usage) => {
+                println!(
+                    "{:<24} {} records, {} bytes",
+                    service, service_usage.records, service_usage.bytes
+                );
+                total_records += service_usage.records;
+                total_bytes += service_usage.bytes;
+            }
+            Err(_) => {
+                println!("{:<24} —", service);
+            }
+        }
+    }
+    if services.len() > 1 {
+        println!(
+            "{:<24} {} records, {} bytes",
+            "total", total_records, total_bytes
+        );
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1012,6 +1077,34 @@ mod tests {
             .permissions()
             .mode();
         assert_eq!(mode & 0o077, 0, "no group or world access: mode {mode:o}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn owners_on_an_empty_store_says_so() {
+        let dir = scratch("owners-empty");
+        let accounts_dir = dir.join("accounts");
+        let store_dir = dir.join("store");
+        std::fs::create_dir_all(&accounts_dir).expect("created accounts dir");
+        std::fs::create_dir_all(&store_dir).expect("created store dir");
+        let store = Store::open(&store_dir).expect("opened store");
+        let output = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            owners(&accounts_dir, &store)
+        }));
+        assert!(output.is_ok(), "owners should not panic");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn usage_totals_multiple_projects() {
+        let dir = scratch("usage-totals");
+        let store_dir = dir.join("store");
+        std::fs::create_dir_all(&store_dir).expect("created store dir");
+        let store = Store::open(&store_dir).expect("opened store");
+        store.add_project("proj-a").expect("added proj-a");
+        store.add_project("proj-b").expect("added proj-b");
+        let output = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| usage(None, &store)));
+        assert!(output.is_ok(), "usage should not panic");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
