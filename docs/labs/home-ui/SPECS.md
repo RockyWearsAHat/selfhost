@@ -113,3 +113,18 @@ micro under each); (2) temp chips with kelvin; (3) effects with a five-word
 description each in muted caption; (4) the three setmark states with their
 exact wording; (5) lamp legend: ok / warn / bad / idle / pending with one
 line each on when they appear. This board is the design's legend, not a page.
+
+## The material pass (2026-08-19, second round) — black glass and phosphor
+
+Three materials, already in theatre.css; comps opt in with classes:
+
+- **`.readout`** on machine numbers ONLY (slider values, clocks, kelvin, hex,
+  the generation counter, bank evidence numbers): phosphor glow. Prose never
+  glows.
+- **`.lit` + inline `--glow:#RRGGBB`** on a light plate whose bulb is ON: the
+  plate emits its bulb's colour from the top edge, faintly. The LIGHTS deck
+  plate is lit with the scope's colour. Off/converging bulbs are not lit.
+- **The deck's top row**: `<div class="toprow">` wraps the `.nowplaying` block
+  and a `.vus` pair:
+  `<div class="vus"><span class="vu"><span class="needle" style="--vu:-4deg"></span><span class="vu-tag">L</span></span><span class="vu"><span class="needle" style="--vu:16deg"></span><span class="vu-tag">R</span></span></div>`
+  Playing: needles angled as above. Paused/idle: omit the style so they rest.

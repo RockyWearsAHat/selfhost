@@ -614,3 +614,180 @@ input:focus-visible, select:focus-visible { outline: none; border-color: var(--a
   .slider .value { order: 2; margin-left: auto; }
   .slider input[type="range"] { order: 3; }
 }
+
+/* ═══ GRAND PASS — black glass and phosphor ═════════════════════════════════
+   The 2026-08-19 elevation: the page is the faceplate of a piece of hi-fi
+   equipment the household owns. Three materials and nothing else:
+     1. milled panel  — plates and wells get depth: top edge-light, floor
+        shadow, brushed sheen. Structure stops being lines and becomes metal.
+     2. phosphor      — machine numbers glow like a VFD readout behind glass.
+        One reserved hue (ice), applied by the .readout class, never to prose.
+     3. glass         — chips and lamps are backlit tiles; a lit bulb's plate
+        emits its own colour, faintly, from the top edge.
+   Status discipline is untouched: amber and red still mean fault, healthy is
+   still quiet, idle still stops drawing. */
+
+:root {
+  --panel-hi:  rgba(233, 240, 244, 0.055);  /* top edge-light on milled parts */
+  --phos:      #cfeef7;                      /* phosphor ink */
+  --phos-glow: rgba(140, 216, 235, 0.42);    /* its bloom */
+}
+
+/* ── the ground: a faint overhead wash, then true black ───────────── */
+body {
+  background:
+    radial-gradient(1100px 480px at 50% -180px, rgba(233,240,244,0.045), transparent 70%),
+    linear-gradient(var(--bg), var(--bg-deep) 60vh);
+}
+
+/* ── milled panel ─────────────────────────────────────────────────── */
+.plate {
+  background:
+    linear-gradient(rgba(233,240,244,0.05), rgba(233,240,244,0) 26%),
+    linear-gradient(#101214, #0a0b0d 75%);
+  border-color: #26292d;
+  border-top-color: #34383d;
+  box-shadow:
+    inset 0 1px 0 var(--panel-hi),
+    0 14px 28px -20px #000,
+    0 1px 0 #000;
+}
+/* the sunken wells actually sink */
+.actions, .readings, .deck {
+  background: linear-gradient(#040506, #090b0c);
+  box-shadow: inset 0 2px 5px rgba(0,0,0,0.75), inset 0 -1px 0 rgba(233,240,244,0.03);
+}
+/* engraved section labels */
+.section-rule h2 {
+  color: #8d969c;
+  text-shadow: 0 1px 0 rgba(0,0,0,0.9), 0 -1px 0 rgba(233,240,244,0.05);
+}
+.wordmark { text-shadow: 0 0 14px rgba(242,245,246,0.28); }
+
+/* ── phosphor readouts ────────────────────────────────────────────── */
+/* .readout goes on machine numbers only: slider values, clocks, kelvin, hex,
+   the generation counter. Prose never glows. */
+.readout {
+  color: var(--phos);
+  text-shadow: 0 0 7px var(--phos-glow), 0 0 1px var(--phos-glow);
+}
+.device.gone .readout { color: var(--muted); text-shadow: none; }
+
+/* ── keycap buttons ───────────────────────────────────────────────── */
+.btn {
+  background: linear-gradient(#1c1f23, #121418);
+  border-color: #2c3035;
+  border-top-color: #3a3f45;
+  box-shadow: inset 0 1px 0 rgba(233,240,244,0.06), 0 2px 3px rgba(0,0,0,0.55);
+}
+.btn:active:not(:disabled) {
+  background: linear-gradient(#101215, #0c0e10);
+  box-shadow: inset 0 2px 5px rgba(0,0,0,0.7);
+  transform: translateY(0.5px);
+}
+.btn.primary { box-shadow: 0 0 14px -4px rgba(242,245,246,0.45), inset 0 1px 0 rgba(255,255,255,0.35); }
+.btn[aria-pressed="true"] {
+  background: linear-gradient(#0b0d0f, #0e1013);
+  box-shadow: inset 0 2px 5px rgba(0,0,0,0.75), inset 0 0 0 1px rgba(233,240,244,0.05);
+}
+.btn:disabled { text-shadow: none; box-shadow: inset 0 1px 0 rgba(233,240,244,0.03); }
+
+/* ── the slider: machined channel, lit thumb ──────────────────────── */
+.slider input[type="range"]::-webkit-slider-runnable-track {
+  background: linear-gradient(#050607, #0b0d0e);
+  box-shadow: inset 0 1px 3px rgba(0,0,0,0.8), inset 0 -1px 0 rgba(233,240,244,0.04);
+}
+.slider input[type="range"]::-webkit-slider-thumb {
+  box-shadow: 0 0 8px rgba(242,245,246,0.55), inset 0 1px 0 rgba(255,255,255,0.5);
+}
+.slider input[type="range"]::-moz-range-track {
+  background: linear-gradient(#050607, #0b0d0e);
+  box-shadow: inset 0 1px 3px rgba(0,0,0,0.8);
+}
+.slider input[type="range"]::-moz-range-thumb { box-shadow: 0 0 8px rgba(242,245,246,0.55); }
+
+/* ── glass tiles ──────────────────────────────────────────────────── */
+.chip {
+  box-shadow:
+    inset 0 1px 0 rgba(255,255,255,0.28),
+    inset 0 -7px 12px rgba(0,0,0,0.38),
+    0 1px 2px rgba(0,0,0,0.6);
+}
+.chip.add, .chip.temp { box-shadow: inset 0 1px 0 rgba(255,255,255,0.12), 0 1px 2px rgba(0,0,0,0.6); }
+.chip[aria-pressed="true"] { box-shadow: inset 0 1px 0 rgba(255,255,255,0.32), inset 0 -7px 12px rgba(0,0,0,0.3), 0 0 12px -2px rgba(233,240,244,0.25); }
+.lamp.ok   { box-shadow: 0 0 9px -1px var(--ok); }
+.lamp.warn { box-shadow: 0 0 9px -1px var(--warn); }
+.lamp.bad  { box-shadow: 0 0 9px -1px var(--bad); }
+.setmark .lamp.pending { box-shadow: 0 0 7px -2px var(--ok); }
+
+/* ── a lit bulb's plate emits its colour ──────────────────────────── */
+/* The plate carries class "lit" and an inline --glow; luminance follows the
+   bulb, not a style guide — the page only reports what the room looks like. */
+.device.lit {
+  border-top-color: #3d4247;
+  box-shadow:
+    inset 0 1px 0 var(--panel-hi),
+    inset 0 3px 14px -10px var(--glow, transparent),
+    0 0 26px -14px var(--glow, transparent),
+    0 14px 28px -20px #000;
+}
+.device.lit .swatch { box-shadow: 0 0 10px -1px var(--glow, transparent); border-color: transparent; }
+
+/* ── the deck, made hero ──────────────────────────────────────────── */
+.deck { padding: 14px; gap: 16px; }
+.platter {
+  background:
+    conic-gradient(from 210deg,
+      transparent 0 38%, rgba(255,255,255,0.055) 46%, transparent 54%,
+      transparent 72%, rgba(255,255,255,0.035) 82%, transparent 90%),
+    repeating-radial-gradient(circle, #0a0b0d 0 1.6px, #101315 1.6px 2.2px),
+    radial-gradient(circle, #0e1013 0 30%, #0a0b0d 70%);
+  border-color: #2c3034;
+  box-shadow: 0 4px 14px -6px #000, inset 0 0 20px rgba(0,0,0,0.7);
+}
+.platter .disclabel {
+  background: linear-gradient(#23272d, #191d21);
+  border-color: #383d43;
+  color: #aeb7bd;
+  box-shadow: inset 0 1px 0 rgba(255,255,255,0.08), 0 0 8px rgba(0,0,0,0.8);
+}
+.platter .spindle { box-shadow: 0 0 5px rgba(242,245,246,0.7); }
+.tonearm .arm::after { box-shadow: 0 0 6px rgba(242,245,246,0.55); }
+.tonearm .pivot { background: linear-gradient(#22262b, #15181b); border-color: #383d43; }
+
+/* the VU pair: two needle meters, driven by --vu (rest -42deg, hot +42deg).
+   The scale is the instrument's own marking, muted; only the needle is lit. */
+.vus { display: flex; gap: 6px; align-self: flex-start; }
+.vu {
+  position: relative; width: 62px; height: 34px; overflow: hidden; flex: none;
+  background: linear-gradient(#0b0d0f, #07090a);
+  border: 1px solid var(--border);
+  box-shadow: inset 0 1px 3px rgba(0,0,0,0.8);
+}
+.vu::before {  /* the arc */
+  content: ""; position: absolute; left: 7px; right: 7px; top: 8px; height: 44px;
+  border: 1px solid #2e3338; border-radius: 50%;
+  border-bottom-color: transparent; border-left-color: transparent; border-right-color: transparent;
+}
+.vu .needle {
+  position: absolute; left: 50%; bottom: -2px; width: 1.5px; height: 30px;
+  background: linear-gradient(var(--phos), rgba(207,238,247,0.15));
+  transform-origin: 50% 100%; transform: rotate(var(--vu, -42deg));
+  box-shadow: 0 0 5px var(--phos-glow);
+}
+.vu .vu-tag {
+  position: absolute; right: 3px; bottom: 1px;
+  font-family: var(--mono); font-size: 8px; color: var(--idle); letter-spacing: 0.08em;
+}
+.deck:not(.playing) .vu .needle { background: var(--idle); box-shadow: none; }
+
+/* the nowplaying row shares its line with the meters */
+.deck-panel .toprow { display: flex; gap: 10px; align-items: flex-start; }
+.deck-panel .toprow .nowplaying { flex: 1 1 auto; min-width: 0; }
+
+/* At phone width the meters yield the line to the track's name — the title is
+   somebody's words and never truncates for furniture; the VUs drop under it,
+   holding the right edge. */
+.deck-panel .toprow { flex-wrap: wrap; }
+.deck-panel .toprow .nowplaying { flex: 1 1 150px; }
+.deck-panel .toprow .vus { margin-left: auto; }

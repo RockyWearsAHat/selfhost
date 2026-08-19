@@ -17,7 +17,7 @@
        address: ALL (4 lights), LIVING ROOM (2), BEDROOM (1), or OFFICE (1).
        Controls: ON/OFF pair, brightness slider, palette with teal selected,
        temperature chips, effects row. -->
-  <section class="plate device">
+  <section class="plate device lit" style="--glow:#2FB3A5">
     <div class="section-rule">
       <h2>LIGHTS</h2><span class="rule"></span>
     </div>
@@ -37,7 +37,7 @@
     <div class="slider">
       <span class="fieldlabel">BRIGHT</span>
       <input type="range" min="0" max="100" value="70" aria-label="Brightness">
-      <span class="value mono">70</span>
+      <span class="value mono readout">70</span>
     </div>
 
     <div class="palette">
@@ -77,7 +77,7 @@
   <div class="roomdevices">
 
   <!-- Couch Left: on, 70%, teal; palette expanded to show single-light colour selection -->
-  <section class="plate device">
+  <section class="plate device lit" style="--glow:#2FB3A5">
     <div class="title-rule">
       <span class="title">Couch Left</span><span class="rule"></span>
       <span class="micro kind">LIGHT</span><span class="lamp ok"></span>
@@ -89,7 +89,7 @@
     </div>
     <div class="swatchline">
       <span class="swatch" style="background: #2FB3A5"></span>
-      <span class="micro mono">#2FB3A5</span>
+      <span class="micro mono readout">#2FB3A5</span>
     </div>
     <div class="palette">
       <button class="chip" style="background: #E03A3F" aria-pressed="false" aria-label="Crimson"></button>
@@ -105,12 +105,12 @@
     <div class="slider">
       <span class="fieldlabel">BRIGHT</span>
       <input type="range" min="0" max="100" value="70" aria-label="Brightness">
-      <span class="value mono">70</span>
+      <span class="value mono readout">70</span>
     </div>
   </section>
 
   <!-- Couch Right: on, 70%, teal -->
-  <section class="plate device">
+  <section class="plate device lit" style="--glow:#2FB3A5">
     <div class="title-rule">
       <span class="title">Couch Right</span><span class="rule"></span>
       <span class="micro kind">LIGHT</span><span class="lamp ok"></span>
@@ -122,12 +122,12 @@
     </div>
     <div class="swatchline">
       <span class="swatch" style="background: #2FB3A5"></span>
-      <span class="micro mono">#2FB3A5</span>
+      <span class="micro mono readout">#2FB3A5</span>
     </div>
     <div class="slider">
       <span class="fieldlabel">BRIGHT</span>
       <input type="range" min="0" max="100" value="70" aria-label="Brightness">
-      <span class="value mono">70</span>
+      <span class="value mono readout">70</span>
     </div>
   </section>
 
@@ -149,7 +149,7 @@
     <div class="slider">
       <span class="fieldlabel">BRIGHT</span>
       <input type="range" min="0" max="100" value="0" aria-label="Brightness">
-      <span class="value mono">0</span>
+      <span class="value mono readout">0</span>
     </div>
   </section>
 
@@ -167,7 +167,7 @@
     <div class="slider">
       <span class="fieldlabel">BRIGHT</span>
       <input type="range" min="0" max="100" value="0" disabled aria-label="Brightness">
-      <span class="value mono">0</span>
+      <span class="value mono readout">0</span>
     </div>
   </section>
 
