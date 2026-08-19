@@ -936,6 +936,7 @@ mod tests {
             shares: Vec::new(),
             desktop: None,
             mesh: None,
+            home: None,
             vpn: Vec::new(),
         }
     }

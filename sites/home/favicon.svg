@@ -1,0 +1,11 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16">
+  <!-- The house at a glance: three lamp slots in a machined plate, one lit.
+       The same mark the console wears, said in the plural — because that is
+       what this page is, and because one lit slot among unlit ones is exactly
+       what the page itself looks like on an ordinary evening. -->
+  <rect width="16" height="16" fill="#060708"/>
+  <rect x="0.5" y="0.5" width="15" height="15" fill="none" stroke="#24272b"/>
+  <rect x="3" y="4" width="2" height="8" fill="#4a5157"/>
+  <rect x="7" y="4" width="2" height="8" fill="#f2f5f6"/>
+  <rect x="11" y="4" width="2" height="8" fill="#4a5157"/>
+</svg>

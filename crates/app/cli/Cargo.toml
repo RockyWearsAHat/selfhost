@@ -36,6 +36,7 @@ selfhost-reports = { workspace = true }
 # report feed's bearer token. The same `ring` rustls already links through
 # `selfhost-proxy`; naming it here adds nothing new to the tree.
 ring = { workspace = true }
+selfhost-home = { workspace = true }
 selfhost-http = { workspace = true }
 selfhost-supervisor = { workspace = true }
 selfhost-vpn = { workspace = true }

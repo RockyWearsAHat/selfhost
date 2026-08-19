@@ -30,6 +30,7 @@ members = [
     "crates/services/mesh",
     "crates/services/storage",
     "crates/services/git",
+    "crates/services/home",
     "crates/services/reports",
     "crates/services/app-deploy",
     "crates/services/vpn",
@@ -104,6 +105,7 @@ selfhost-identity = { path = "crates/foundation/identity" }
 selfhost-igd = { path = "crates/net/igd" }
 selfhost-firewall = { path = "crates/net/firewall" }
 selfhost-git = { path = "crates/services/git" }
+selfhost-home = { path = "crates/services/home" }
 selfhost-http = { path = "crates/foundation/http" }
 selfhost-json = { path = "crates/foundation/json" }
 selfhost-login = { path = "crates/foundation/login" }
