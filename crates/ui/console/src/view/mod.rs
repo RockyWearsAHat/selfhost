@@ -60,11 +60,13 @@ mod detail;
 mod exposure;
 pub(crate) mod files;
 mod install;
+mod lock;
 mod machines;
 mod people;
 mod style;
 
 use crate::channel::{Live, Session};
+use crate::gate::Latch;
 use crate::machines::{Machine, Machines};
 use crate::nas;
 use crate::remote::{self, ControlRefusal};
@@ -274,6 +276,20 @@ pub struct Console {
     /// changes: a remembered point from another screen would suppress the first
     /// real movement on this one.
     aimed: Option<(i32, i32)>,
+    /// Whether a person has been proved to be at this computer.
+    ///
+    /// Held by the console rather than by the link, so that opening a second
+    /// machine does not raise a second sheet: what was proved is that somebody is
+    /// here, not that they are here for one particular server. [`Console::lock`]
+    /// clears it, and every link opened afterwards finds it shut. See
+    /// [`crate::gate`].
+    proof: Arc<Latch>,
+    /// The tunnel the open link is managed over, kept so it can be opened again.
+    ///
+    /// A relock is not a teardown: it stops the link and opens the same one
+    /// afresh, which is what puts the gate back in front of it. That needs the
+    /// spec the link was built with, and this is where it is kept.
+    spec: Option<crate::tunnel::TunnelSpec>,
     /// Whether the window is filling the screen.
     ///
     /// Written by the person, through [`Console::toggle_full_screen`], and by
@@ -311,6 +327,8 @@ impl Console {
             viewport_focus: false,
             held: Modifiers::default(),
             aimed: None,
+            proof: Latch::shut(),
+            spec: None,
             full_screen: false,
         }
     }
@@ -331,6 +349,13 @@ impl Console {
         );
         console.machines = machines;
         console.store = store;
+        // A console with no link has nothing behind a lock: no token has been
+        // read, no tunnel exists and no daemon is being polled. Standing a lock
+        // in front of *this* snapshot would be a door with nothing behind it —
+        // and worse, an unopenable one, because the thread that answers UNLOCK is
+        // the link's own gate and there is no link. Every link brings a snapshot
+        // of its own, created shut. See [`crate::gate`].
+        console.with_snapshot(|snapshot| snapshot.lock.state = crate::state::LockState::Open);
         // Said once, because nothing else will ever say it: a console with no
         // machine has no poller to report a link, so a snapshot left at its
         // default would claim it was connecting to an address nothing is
@@ -353,8 +378,9 @@ impl Console {
         self.retire_link();
         let target = Arc::new(Mutex::new(target));
         let connect = session::connector(&target);
-        let link = MachineLink::open(spec, Arc::clone(&connect));
+        let link = MachineLink::open(spec.clone(), Arc::clone(&connect), Arc::clone(&self.proof));
         self.shared = link.snapshot();
+        self.spec = spec;
         self.target = Some(target);
         self.connect = Some(connect);
         self.link = Some(link);
@@ -376,6 +402,43 @@ impl Console {
             link.closing();
             self.retiring.push(link);
         }
+    }
+
+    /// Shuts the console, and opens the same connection again behind the lock.
+    ///
+    /// A relock is deliberately not a disconnection-and-forget: the machine on
+    /// screen is still the machine this window is for, and being asked to prove
+    /// somebody is here should not also cost the operator the machine they were
+    /// on. So the latch is cleared and the link is opened afresh — and the link's
+    /// own gate is what stands in front of it, exactly as it did at launch. The
+    /// threads of the old one are stopped on the way past, so nothing carries on
+    /// polling behind the plate.
+    ///
+    /// Does nothing on a console with no link. There is no connection to shut and
+    /// no gate thread to answer UNLOCK, so a lock here would be one nothing could
+    /// open — see [`Console::paired`].
+    pub(crate) fn lock(&mut self) {
+        let Some(connect) = self.connect.clone() else { return };
+        self.proof.close();
+        self.retire_link();
+        let link = MachineLink::open(self.spec.clone(), connect, Arc::clone(&self.proof));
+        self.shared = link.snapshot();
+        self.link = Some(link);
+    }
+
+    /// Asks the gate to raise the system's sheet again.
+    ///
+    /// What UNLOCK does. The flag is taken by [`crate::gate`]'s own thread, which
+    /// is the only thing that can raise a sheet — the window neither asks nor
+    /// waits, so a person holding a mouse button down cannot queue up a second
+    /// one behind the first.
+    pub(crate) fn ask_again(&mut self) {
+        self.with_snapshot(|snapshot| snapshot.lock.asked_again = true);
+    }
+
+    /// Where the lock is, for the plate that draws it.
+    pub(crate) fn lock_state(&self) -> crate::state::Lock {
+        self.snapshot().lock.clone()
     }
 
     /// Every machine paired on this computer, for the overview to draw.
@@ -1005,6 +1068,15 @@ pub fn view(console: &Console) -> El<Console> {
     let snapshot = console.snapshot();
     let screen = snapshot.screen;
 
+    // Before anything else, and returning before anything else is described. A
+    // console whose lock is shut has connected to nothing, so there is no
+    // masthead worth drawing — the link it would report is not being dialled —
+    // and no plate under it holds a reading. See [`lock`].
+    if !snapshot.lock.open() {
+        drop(snapshot);
+        return lock::view(console);
+    }
+
     // A filled screen showing a machine's own screen is the far machine and
     // nothing else — no masthead, no tabs, no page margin. Only the DESKTOP
     // screen claims it: a window made full screen while a log is open is a
@@ -1150,6 +1222,12 @@ fn header(console: &Console, snapshot: &Snapshot) -> El<Console> {
         style::rule(),
         style::link_mark(status, label.to_uppercase(), reaching),
         micro(detail).max_w(300.0).align_self(Align::Center),
+        // The way out, beside the state of the connection it shuts. It is on the
+        // masthead and not on a plate because it is about the whole window: what
+        // it takes away is every plate at once, and a control that does that
+        // belongs with the nameplate rather than inside one of the things it
+        // closes.
+        button("LOCK").on_click(|console: &mut Console| console.lock()).align_self(Align::Center),
     ))
     .gap(10.0)
     .h(MASTHEAD)
@@ -1974,7 +2052,24 @@ mod tests {
     }
 
     /// A console showing `snapshot`, ready to be described or drawn.
+    ///
+    /// Unlocked, and explicitly: this console has no link, so nothing here has
+    /// read a credential or reached a machine and there is nothing for a lock to
+    /// stand in front of — and the thread that would answer one is a link's own
+    /// gate, which a console with no link does not have. Every frame in this file
+    /// is a picture of a console somebody has already opened. [`locked`] is the
+    /// one that photographs the other state.
     pub(crate) fn console(snapshot: Snapshot) -> Console {
+        let console = Console::showing(
+            Arc::new(Mutex::new(snapshot)),
+            Bound::new("127.0.0.1:9191".parse().expect("a valid address"), None),
+        );
+        console.shared.lock().expect("a fresh lock").lock.state = crate::state::LockState::Open;
+        console
+    }
+
+    /// The same, left shut — the console before anybody has proved they are here.
+    pub(crate) fn locked(snapshot: Snapshot) -> Console {
         Console::showing(
             Arc::new(Mutex::new(snapshot)),
             Bound::new("127.0.0.1:9191".parse().expect("a valid address"), None),
@@ -3234,6 +3329,23 @@ mod tests {
                 println!("wrote {path}");
             }
         };
+
+        // The first thing anybody now sees, before the console has connected to
+        // anything: the lock. Photographed at both sizes, because it is the one
+        // screen every launch goes through and a sentence that wraps badly at
+        // 560 is a sentence read badly every single time.
+        for (name, size) in [("locked", (1000, 660)), ("locked-narrow", (560, 420))] {
+            written(
+                name,
+                Snapshot::default(),
+                |console| {
+                    console.with_snapshot(|snapshot| {
+                        snapshot.lock.state = crate::state::LockState::Shut;
+                    });
+                },
+                size,
+            );
+        }
 
         written("console", busy(), |_| {}, (1000, 660));
         written("install", busy(), |console| console.form_mut().open_blank(), (1000, 660));
