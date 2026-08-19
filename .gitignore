@@ -71,3 +71,6 @@ docs/SECURITY.md
 # Scratch deployments the dx labs build to prove a command works end to end.
 # The lab rebuilds it on every run; nothing in it is source.
 /gen/
+
+# Claude Code personal project settings
+.claude/settings.local.json
