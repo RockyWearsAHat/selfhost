@@ -3385,3 +3385,167 @@ async fn forgetting_a_person_is_reported_separately_from_never_having_known_them
     let (status, _) = as_owner(&api, "DELETE", "/api/people/mom", "").await;
     assert_eq!(status, 404, "gone and never-there are different facts");
 }
+
+/// A minimal, valid `selfhost.config.toml` text — the same shape
+/// [`firewall_manager`] parses, written to disk so `site_api`'s handlers have
+/// a real file to read and rewrite.
+const MINIMAL_CONFIG: &str = "version = 1\n\
+     [server]\n\
+     http_bind = \"127.0.0.1:8080\"\n\
+     https_bind = \"127.0.0.1:8443\"\n\
+     acme_email = \"a@b.com\"\n\
+     acme = \"self-signed\"\n\
+     data_dir = \"./data\"\n\
+     [[nodes]]\n\
+     name = \"home\"\n\
+     role = \"owner\"\n";
+
+/// An API wired for site administration: a real config file on disk, plus the
+/// agent store and site-admin door open over the same scratch directory.
+fn site_admin_api(name: &str) -> (Api, ScratchDir, std::path::PathBuf) {
+    let (api, dir) = api(name);
+    let config_path = dir.path().join("selfhost.config.toml");
+    std::fs::write(&config_path, MINIMAL_CONFIG).expect("writes a starter config");
+    let api = api.with_agents(dir.path()).with_site_admin(config_path.clone(), dir.path().to_path_buf());
+    (api, dir, config_path)
+}
+
+/// Mints an agent holding exactly `capabilities` and returns its whole token.
+fn mint_agent(
+    dir: &std::path::Path,
+    name: &str,
+    capabilities: Vec<selfhost_identity::Capability>,
+) -> String {
+    let store = selfhost_admin::agent_store::AgentStore::in_dir(dir);
+    let agent_name = selfhost_identity::AgentName::parse(name).expect("a valid agent name");
+    let grants = selfhost_identity::Grants::new(capabilities).expect("under the grant cap");
+    store.mint(&agent_name, grants).expect("mints").as_str().to_owned()
+}
+
+/// The security property this whole feature exists for: an agent token
+/// scoped to `site.admin` can create a site over the API, the plain
+/// deployment bearer token cannot (it is `Identity::Machine`, and
+/// `Policy::decide`'s fixed list withholds `SiteAdmin` from it — see
+/// `selfhost_identity::policy`), an unauthenticated request cannot, and a
+/// revoked agent's token stops working immediately.
+#[tokio::test]
+async fn only_a_scoped_agent_token_may_administer_sites() {
+    let (api, dir, config_path) = site_admin_api("sites-agent-only");
+    let agent_token = mint_agent(dir.path(), "claude-mac", vec![selfhost_identity::Capability::SiteAdmin]);
+
+    let add_body = r#"{"name":"blog","domains":["blog.example.com"],"static":true}"#;
+
+    // No credential at all: the ordinary uninformative 401.
+    let (status, _) = call(&api, "POST", "/api/sites", None, add_body).await;
+    assert_eq!(status, 401);
+
+    // The deployment's own bearer token: `Identity::Machine`'s fixed list
+    // withholds `SiteAdmin` — this must still be refused even though the
+    // token opens most of the rest of this API.
+    let (status, _) = call(&api, "POST", "/api/sites", Some(TOKEN), add_body).await;
+    assert_eq!(status, 401, "the bearer token must never reach SiteAdmin");
+
+    // The scoped agent token: succeeds, and the config file actually gained
+    // the site.
+    let (status, body) = call(&api, "POST", "/api/sites", Some(&agent_token), add_body).await;
+    assert_eq!(status, 200, "{body:?}");
+    let written = std::fs::read_to_string(&config_path).expect("reads the config back");
+    assert!(written.contains("blog.example.com"), "{written}");
+
+    // Listing and showing the site over the same agent token both see it.
+    let (status, listed) = call(&api, "GET", "/api/sites", Some(&agent_token), "").await;
+    assert_eq!(status, 200);
+    assert_eq!(listed.get("count").and_then(Json::as_u64), Some(1));
+    let (status, _) = call(&api, "GET", "/api/sites/blog", Some(&agent_token), "").await;
+    assert_eq!(status, 200);
+
+    // Revoked: the very next request with the same token is refused, with
+    // nothing to restart.
+    let store = selfhost_admin::agent_store::AgentStore::in_dir(dir.path());
+    let agent_name = selfhost_identity::AgentName::parse("claude-mac").unwrap();
+    assert!(store.revoke(&agent_name).expect("revokes"));
+    let (status, _) = call(&api, "GET", "/api/sites", Some(&agent_token), "").await;
+    assert_eq!(status, 401, "a revoked agent's token must stop working immediately");
+}
+
+/// An agent granted a capability *other* than `SiteAdmin` still cannot reach
+/// `/api/sites` — the grant model is exact, not "any agent token opens the
+/// site door".
+#[tokio::test]
+async fn an_agent_without_site_admin_is_refused_the_site_routes() {
+    let (api, dir, _config_path) = site_admin_api("sites-agent-scoped");
+    let narrow_token = mint_agent(dir.path(), "narrow", vec![selfhost_identity::Capability::ConsoleRead]);
+
+    let (status, _) = call(&api, "GET", "/api/sites", Some(&narrow_token), "").await;
+    assert_eq!(status, 401, "console.read must not open the site door");
+}
+
+/// A caller over this API can never choose an arbitrary filesystem path for a
+/// site's static content — only `static: true`, which the server answers with
+/// its own managed directory. See `site_api`'s module documentation.
+#[tokio::test]
+async fn a_remote_caller_cannot_name_an_arbitrary_static_root() {
+    let (api, dir, _config_path) = site_admin_api("sites-no-arbitrary-path");
+    let agent_token = mint_agent(dir.path(), "claude-mac", vec![selfhost_identity::Capability::SiteAdmin]);
+
+    // The wire shape has no field for a path at all — `static` is a boolean —
+    // so the only way to ask for content is the managed directory. Confirm a
+    // request that tries to smuggle one in through an unrecognised field is
+    // simply ignored rather than honoured.
+    let body = r#"{"name":"evil","domains":["evil.example.com"],"static":true,"staticRoot":"/etc"}"#;
+    let (status, response) = call(&api, "POST", "/api/sites", Some(&agent_token), body).await;
+    assert_eq!(status, 200, "{response:?}");
+    let (status, show) = call(&api, "GET", "/api/sites/evil", Some(&agent_token), "").await;
+    assert_eq!(status, 200);
+    assert_eq!(show.get("hasStaticContent").and_then(Json::as_bool), Some(true));
+    // The managed root lives under the scratch data directory, never `/etc`.
+    let managed_root = dir.path().join("sites").join("evil");
+    assert!(managed_root.is_dir(), "the server allocated its own content directory");
+}
+
+/// Uploading, listing and deleting a file in a site's managed content, all
+/// through the safe `selfhost_storage::fs::Dir`/`Upload` primitives — and a
+/// traversal attempt on the same routes is refused.
+#[tokio::test]
+async fn site_files_round_trip_and_traversal_is_refused() {
+    let (api, dir, _config_path) = site_admin_api("sites-files");
+    let agent_token = mint_agent(dir.path(), "claude-mac", vec![selfhost_identity::Capability::SiteAdmin]);
+    call(
+        &api,
+        "POST",
+        "/api/sites",
+        Some(&agent_token),
+        r#"{"name":"blog","domains":["blog.example.com"],"static":true}"#,
+    )
+    .await;
+
+    let (status, _) =
+        call(&api, "PUT", "/api/sites/blog/files/entry?path=index.html", Some(&agent_token), "<h1>hi</h1>").await;
+    assert_eq!(status, 200);
+
+    let (status, listing) = call(&api, "GET", "/api/sites/blog/files/list", Some(&agent_token), "").await;
+    assert_eq!(status, 200);
+    let entries = listing.as_array().expect("a JSON array");
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].get("name").and_then(Json::as_str), Some("index.html"));
+
+    let (status, _) =
+        call(&api, "DELETE", "/api/sites/blog/files/entry?path=index.html", Some(&agent_token), "").await;
+    assert_eq!(status, 200);
+    let (status, listing) = call(&api, "GET", "/api/sites/blog/files/list", Some(&agent_token), "").await;
+    assert_eq!(status, 200);
+    assert_eq!(listing.as_array().expect("a JSON array").len(), 0);
+
+    // A traversal attempt: refused by the same resolver every share route
+    // already relies on, never a write outside the managed directory.
+    let (status, _) = call(
+        &api,
+        "PUT",
+        "/api/sites/blog/files/entry?path=../../etc/passwd",
+        Some(&agent_token),
+        "pwned",
+    )
+    .await;
+    assert_eq!(status, 400, "a traversal attempt must be refused, not resolved");
+    assert!(!dir.path().join("etc").exists(), "nothing was written outside the managed directory");
+}

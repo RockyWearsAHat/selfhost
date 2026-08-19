@@ -42,6 +42,7 @@
 
 #![warn(missing_docs)]
 
+pub mod agent_store;
 pub mod audit_api;
 pub mod dav_api;
 pub mod desk_api;
@@ -50,6 +51,7 @@ pub mod mesh_api;
 pub mod passwd;
 pub mod people_api;
 pub mod session;
+pub mod site_api;
 pub mod storage_api;
 pub mod store;
 pub mod stream;
@@ -60,7 +62,7 @@ pub mod webauthn;
 use selfhost_firewall::Manager;
 use selfhost_git::{Nudge, Watches};
 use selfhost_http::{Body, Method, Request, Response, Status};
-use selfhost_identity::{Caller, Capability, Opening, People, PersonName, Policy};
+use selfhost_identity::{Caller, Capability, Grants, Opening, People, PersonName, Policy};
 
 /// What a deployment with no permission registry answers on every people route.
 ///
@@ -70,15 +72,21 @@ use selfhost_identity::{Caller, Capability, Opening, People, PersonName, Policy}
 const NO_REGISTRY: &str =
     "this daemon holds no permission registry, so it can neither name people nor grant them \
      anything; it was built without one";
+/// What a deployment with no site-admin wiring answers on every `/api/sites`
+/// route. See [`Api::with_site_admin`].
+const NO_SITES: &str =
+    "this daemon was not given a config path to manage sites with; it was built without \
+     `Api::with_site_admin`";
 use selfhost_json::Json;
 use selfhost_supervisor::Supervisor;
 use selfhost_supervisor::state::{spec_from_json, spec_to_json};
 use std::net::SocketAddr;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
+pub use agent_store::AgentStore;
 pub use passwd::ConsolePassword;
 pub use session::{Authenticated, FailureGate, Sessions};
 pub use dav_api::Webdav;
@@ -200,6 +208,24 @@ pub struct Api {
     /// outside. A worker's dial is otherwise the one upgrade on this API whose
     /// credential arrives *after* the `101`; see [`mesh_api`].
     peers: Option<Peerage>,
+    /// The scoped, revocable credentials for trusted machines — an AI agent, a
+    /// script — minted by `selfhost agent add`.
+    ///
+    /// `None` until a data directory has been named, and `None` means no agent
+    /// token opens anything: `Api::caller` never builds an
+    /// `Identity::Agent` caller without a store to verify one against, which is
+    /// the honest report for a deployment that has enrolled no agent. A handle
+    /// onto a file rather than a loaded table, for the same reason
+    /// `device_password`-shaped stores always are — see [`agent_store`].
+    agents: Option<agent_store::AgentStore>,
+    /// Manages websites: their hostnames, and (for a site created over this
+    /// API) their content.
+    ///
+    /// `None` until a data directory and a config path have both been named
+    /// ([`Api::with_site_admin`]), and `None` makes every `/api/sites` route
+    /// answer as though this build did not serve it — the honest report for a
+    /// daemon nobody has wired a config path into.
+    sites: Option<site_api::Wiring>,
 }
 
 /// Cookie-session authentication, present once [`Api::with_console_auth`] has
@@ -404,6 +430,27 @@ enum Route<'a> {
     ListInvites,
     /// `DELETE /api/people/invites/<name>`
     RevokeInvite(&'a str),
+    /// `GET /api/sites`
+    Sites,
+    /// `GET /api/sites/<name>`
+    SiteShow(&'a str),
+    /// `POST /api/sites`
+    SiteAdd,
+    /// `DELETE /api/sites/<name>` — unroutes only; never deletes content. See
+    /// [`site_api`].
+    SiteRemove(&'a str),
+    /// `POST /api/sites/<name>/domains`
+    SiteAddDomain(&'a str),
+    /// `DELETE /api/sites/<name>/domains/<hostname>`
+    SiteRemoveDomain(&'a str, &'a str),
+    /// `GET /api/sites/<name>/files/list?path=…`
+    SiteFileList(&'a str),
+    /// `POST /api/sites/<name>/files/mkdir`
+    SiteFileMkdir(&'a str),
+    /// `PUT /api/sites/<name>/files/entry?path=…`
+    SiteFilePut(&'a str),
+    /// `DELETE /api/sites/<name>/files/entry?path=…`
+    SiteFileDelete(&'a str),
 }
 
 impl<'a> Route<'a> {
@@ -488,6 +535,25 @@ impl<'a> Route<'a> {
             (Method::Get, ["api", "people"]) => Some(Self::ListPeople),
             (Method::Put, ["api", "people", name]) => Some(Self::SetGrants(name)),
             (Method::Delete, ["api", "people", name]) => Some(Self::ForgetPerson(name)),
+            // Matched ahead of the per-site routes below, on the same grounds
+            // as "capabilities"/"invites" above: "files" names the site-scoped
+            // storage sub-tree, never a site called `files`.
+            (Method::Get, ["api", "sites", name, "files", "list"]) => Some(Self::SiteFileList(name)),
+            (Method::Post, ["api", "sites", name, "files", "mkdir"]) => {
+                Some(Self::SiteFileMkdir(name))
+            }
+            (Method::Put, ["api", "sites", name, "files", "entry"]) => Some(Self::SiteFilePut(name)),
+            (Method::Delete, ["api", "sites", name, "files", "entry"]) => {
+                Some(Self::SiteFileDelete(name))
+            }
+            (Method::Post, ["api", "sites", name, "domains"]) => Some(Self::SiteAddDomain(name)),
+            (Method::Delete, ["api", "sites", name, "domains", hostname]) => {
+                Some(Self::SiteRemoveDomain(name, hostname))
+            }
+            (Method::Get, ["api", "sites"]) => Some(Self::Sites),
+            (Method::Post, ["api", "sites"]) => Some(Self::SiteAdd),
+            (Method::Get, ["api", "sites", name]) => Some(Self::SiteShow(name)),
+            (Method::Delete, ["api", "sites", name]) => Some(Self::SiteRemove(name)),
             _ => None,
         }
     }
@@ -575,10 +641,75 @@ impl<'a> Route<'a> {
             // list, like the roster, is a list of who is about to be able to
             // reach this machine.
             Self::MintInvite(_) | Self::ListInvites | Self::RevokeInvite(_) => Demand::OwnerOnly,
+            // Every site route, list through file upload, is `SiteAdmin` — the
+            // capability [`Capability::is_honoured`] names as the one whose
+            // promise this module keeps. Reading and writing share the same
+            // demand: a caller who may see a site's definition and content is
+            // exactly the caller this API considers able to change it, the
+            // same choice `Capability::FilesAdmin` already makes for a share.
+            Self::Sites
+            | Self::SiteShow(_)
+            | Self::SiteAdd
+            | Self::SiteRemove(_)
+            | Self::SiteAddDomain(_)
+            | Self::SiteRemoveDomain(_, _)
+            | Self::SiteFileList(_)
+            | Self::SiteFileMkdir(_)
+            | Self::SiteFilePut(_)
+            | Self::SiteFileDelete(_) => Demand::Held(Capability::SiteAdmin),
             // The vocabulary is a constant of the build, not a fact about this
             // deployment: it names the words that exist, never who holds one.
             // A client needs it to render a grant editor at all.
             Self::Vocabulary | Self::WhoAmI => Demand::Authenticated,
+        }
+    }
+}
+
+#[cfg(test)]
+mod site_route_tests {
+    use super::*;
+
+    /// `Capability::is_honoured` and this table must agree — the security
+    /// property `Capability::is_honoured`'s own documentation promises: no
+    /// unhonoured word is ever the demand of a real route, and (checked here
+    /// the other way round) `SiteAdmin`, now honoured, really is demanded by
+    /// the routes this module claims for it.
+    #[test]
+    fn every_unhonoured_word_is_absent_from_every_routes_demand() {
+        let routes: Vec<Route> = vec![
+            Route::Sites,
+            Route::SiteShow("blog"),
+            Route::SiteAdd,
+            Route::SiteRemove("blog"),
+            Route::SiteAddDomain("blog"),
+            Route::SiteRemoveDomain("blog", "home.example.com"),
+            Route::SiteFileList("blog"),
+            Route::SiteFileMkdir("blog"),
+            Route::SiteFilePut("blog"),
+            Route::SiteFileDelete("blog"),
+            Route::ListServices,
+            Route::WhoAmI,
+        ];
+        for capability in Capability::every_shape(
+            &selfhost_identity::ShareId::parse("vault").unwrap(),
+            &selfhost_identity::NodeName::parse("home").unwrap(),
+        ) {
+            if capability.is_honoured() {
+                continue;
+            }
+            for route in &routes {
+                assert_ne!(
+                    route.demand(),
+                    Demand::Held(capability.clone()),
+                    "{route:?} demands {capability}, which nothing honours yet"
+                );
+            }
+        }
+        // And the positive half: SiteAdmin is honoured, and it really is what
+        // every site route demands.
+        assert!(Capability::SiteAdmin.is_honoured());
+        for route in &routes[..10] {
+            assert_eq!(route.demand(), Demand::Held(Capability::SiteAdmin), "{route:?}");
         }
     }
 }
@@ -692,7 +823,37 @@ impl Api {
             webdav: Webdav::new().ok().map(Arc::new),
             audit: None,
             peers: None,
+            agents: None,
+            sites: None,
         }
+    }
+
+    /// Opens the trusted-machine door: agent tokens minted by `selfhost agent
+    /// add` may now authenticate as `Identity::Agent`, holding exactly what
+    /// they were granted.
+    ///
+    /// Without this call `Api::caller` never has a store to verify an
+    /// `agent:<name>:<secret>` token against, so every such token is refused —
+    /// the honest report for a deployment nobody has enrolled an agent on.
+    pub fn with_agents(mut self, data_dir: &Path) -> Self {
+        self.agents = Some(agent_store::AgentStore::in_dir(data_dir));
+        self
+    }
+
+    /// Opens `/api/sites`: creating, listing, and publishing content to
+    /// websites this deployment's proxy answers for.
+    ///
+    /// `config_path` is the same `selfhost.config.toml` the CLI's `selfhost
+    /// site` command edits directly (see `crates/app/cli/src/site.rs`) — this
+    /// is the API-reachable door onto the identical file, so a site created
+    /// remotely is indistinguishable, once written, from one an operator typed
+    /// `selfhost site add` for. `data_dir` is where an API-created site's
+    /// managed content directory lives (`<data_dir>/sites/<name>/`); see
+    /// [`site_api`] for why a caller over this door may never choose an
+    /// arbitrary `static_root` the way the local CLI can.
+    pub fn with_site_admin(mut self, config_path: PathBuf, data_dir: PathBuf) -> Self {
+        self.sites = Some(site_api::Wiring::new(config_path, data_dir));
+        self
     }
 
     /// Records the machines this owner has invited, and opens the link route.
@@ -1121,6 +1282,16 @@ impl Api {
             Route::MintInvite(name) => self.mint_invite(name, body),
             Route::ListInvites => self.list_invites(),
             Route::RevokeInvite(name) => self.revoke_invite(name),
+            Route::Sites => self.sites_list(),
+            Route::SiteShow(name) => self.sites_show(name),
+            Route::SiteAdd => self.sites_add(body),
+            Route::SiteRemove(name) => self.sites_remove(name),
+            Route::SiteAddDomain(name) => self.sites_add_domain(name, body),
+            Route::SiteRemoveDomain(name, hostname) => self.sites_remove_domain(name, hostname),
+            Route::SiteFileList(name) => self.sites_file_list(name, query),
+            Route::SiteFileMkdir(name) => self.sites_file_mkdir(name, body),
+            Route::SiteFilePut(name) => self.sites_file_put(name, query, body),
+            Route::SiteFileDelete(name) => self.sites_file_delete(name, query),
         }
     }
 
@@ -1169,6 +1340,86 @@ impl Api {
                 None => problem(Status(500), "the registry accepted the change and lost it"),
             },
             Err(error) => problem(Status(500), &format!("could not save the registry: {error}")),
+        }
+    }
+
+    /// Answers `GET /api/sites`.
+    fn sites_list(&self) -> Response {
+        match &self.sites {
+            Some(wiring) => site_api::list(wiring),
+            None => problem(Status(404), NO_SITES),
+        }
+    }
+
+    /// Answers `GET /api/sites/<name>`.
+    fn sites_show(&self, name: &str) -> Response {
+        match &self.sites {
+            Some(wiring) => site_api::show(wiring, name),
+            None => problem(Status(404), NO_SITES),
+        }
+    }
+
+    /// Answers `POST /api/sites`.
+    fn sites_add(&self, body: &[u8]) -> Response {
+        match &self.sites {
+            Some(wiring) => site_api::add(wiring, body),
+            None => problem(Status(404), NO_SITES),
+        }
+    }
+
+    /// Answers `DELETE /api/sites/<name>`.
+    fn sites_remove(&self, name: &str) -> Response {
+        match &self.sites {
+            Some(wiring) => site_api::remove(wiring, name),
+            None => problem(Status(404), NO_SITES),
+        }
+    }
+
+    /// Answers `POST /api/sites/<name>/domains`.
+    fn sites_add_domain(&self, name: &str, body: &[u8]) -> Response {
+        match &self.sites {
+            Some(wiring) => site_api::add_domain(wiring, name, body),
+            None => problem(Status(404), NO_SITES),
+        }
+    }
+
+    /// Answers `DELETE /api/sites/<name>/domains/<hostname>`.
+    fn sites_remove_domain(&self, name: &str, hostname: &str) -> Response {
+        match &self.sites {
+            Some(wiring) => site_api::remove_domain(wiring, name, hostname),
+            None => problem(Status(404), NO_SITES),
+        }
+    }
+
+    /// Answers `GET /api/sites/<name>/files/list?path=…`.
+    fn sites_file_list(&self, name: &str, query: &str) -> Response {
+        match &self.sites {
+            Some(wiring) => site_api::list_files(wiring, name, query),
+            None => problem(Status(404), NO_SITES),
+        }
+    }
+
+    /// Answers `POST /api/sites/<name>/files/mkdir`.
+    fn sites_file_mkdir(&self, name: &str, body: &[u8]) -> Response {
+        match &self.sites {
+            Some(wiring) => site_api::mkdir(wiring, name, body),
+            None => problem(Status(404), NO_SITES),
+        }
+    }
+
+    /// Answers `PUT /api/sites/<name>/files/entry?path=…`.
+    fn sites_file_put(&self, name: &str, query: &str, body: &[u8]) -> Response {
+        match &self.sites {
+            Some(wiring) => site_api::put_file(wiring, name, query, body),
+            None => problem(Status(404), NO_SITES),
+        }
+    }
+
+    /// Answers `DELETE /api/sites/<name>/files/entry?path=…`.
+    fn sites_file_delete(&self, name: &str, query: &str) -> Response {
+        match &self.sites {
+            Some(wiring) => site_api::delete_file(wiring, name, query),
+            None => problem(Status(404), NO_SITES),
         }
     }
 
@@ -1391,7 +1642,9 @@ impl Api {
     /// relay keep presenting the token exactly as before, the browser presents
     /// its cookie.
     fn authorised(&self, request: &Request) -> bool {
-        self.bearer_authorised(request) || self.cookie_authorised(request)
+        self.bearer_authorised(request)
+            || self.agent_authorised(request).is_some()
+            || self.cookie_authorised(request)
     }
 
     /// Whether the request carries the right bearer token.
@@ -1401,6 +1654,30 @@ impl Api {
             .get_str("authorization")
             .and_then(|value| value.strip_prefix("Bearer "))
             .is_some_and(|presented| self.token.matches(presented.trim()))
+    }
+
+    /// Whether the request carries a valid agent token, and if so which agent
+    /// and what it was granted.
+    ///
+    /// An agent token has the wire shape `agent:<name>:<secret>`, presented in
+    /// the same `Authorization: Bearer` field the deployment's own token uses.
+    /// The two can never be confused: [`Token::matches`] is an exact
+    /// byte-for-byte comparison against one fixed 64-character hex string, so a
+    /// value shaped like `agent:...` fails it by construction and reaches this
+    /// check instead, and `bearer_authorised` is tried first in every caller of
+    /// this method — an agent's token is never mistaken for the deployment's.
+    fn agent_authorised(&self, request: &Request) -> Option<(selfhost_identity::AgentName, Grants)> {
+        let agents = self.agents.as_ref()?;
+        let presented = request
+            .headers
+            .get_str("authorization")
+            .and_then(|value| value.strip_prefix("Bearer "))?
+            .trim();
+        let rest = presented.strip_prefix("agent:")?;
+        let (name, secret) = rest.split_once(':')?;
+        let name = selfhost_identity::AgentName::parse(name).ok()?;
+        let grants = agents.verify(&name, secret)?;
+        Some((name, grants))
     }
 
     /// Whether the request carries a live session cookie — and, for a non-GET,
@@ -1458,6 +1735,12 @@ impl Api {
             // answer `Identity::Owner`, which meant an unattended webhook and
             // the person at the keyboard were the same line in the audit trail.
             return Some(Caller::bearer());
+        }
+        if let Some((name, grants)) = self.agent_authorised(request) {
+            // An agent's caller holds exactly what `console.agents` granted it
+            // — never the machine's fixed list, never the owner's blanket
+            // allow. See `agent_store` and `Policy::decide`'s step 6.
+            return Some(Caller::agent(name, grants));
         }
         let console = self.console.as_ref()?;
         if request.method != Method::Get && !has_console_header(request) {
