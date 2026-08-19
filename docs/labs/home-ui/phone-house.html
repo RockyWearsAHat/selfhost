@@ -1,325 +1,205 @@
 <!doctype html>
-<!-- Design comp: the whole house, phone width. Masthead, bank plate with condition
-     and evidence, LIGHTS deck (scope row ALL pressed, ON/OFF pair, brightness slider,
-     palette, effects), then rooms in census order: Kitchen (playing deck + Move follower),
-     Living Room (two lights + TV), Bedroom (Bedside + TV), Office (Desk off), and
-     UNPLACED section (printer fixture). Markup uses the page's own classes; theatre.css
-     is the shipped stylesheet plus design-kit extensions. -->
+<!-- Design comp: the whole house on INSTRUMENT — masthead, bank condition,
+     then rooms in census order, each with .section-rule header + one .plate of
+     stacked .row entries. Every device is a row: mini port, name+state, control.
+     No JavaScript, no external requests, shapes and text only. -->
 <html lang="en"><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
 <title>comp — the house</title>
-<link rel="stylesheet" href="theatre.css">
+<link rel="stylesheet" href="instrument.css">
 </head><body>
 
-<!-- Masthead: HOME wordmark, DEVICE CONTROL label, rule, generation, ok lamp, stateword. -->
-<header id="masthead">
-  <span class="wordmark">HOME</span>
-  <span class="designation">DEVICE CONTROL</span>
-  <span class="rule"></span>
-  <span class="micro mono readout" id="gen">#214</span>
-  <span class="lampline">
-    <span class="lamp ok"></span>
-    <span class="stateword">OK</span>
-  </span>
-</header>
-
-<!-- Bank: condition with evidence. -->
-<section id="bank" class="plate">
-  <div class="bank-main">
-    <div id="condition">Music in the kitchen; three lights on.</div>
-  </div>
-  <div class="evidence">
-    <div class="reading">
-      <span class="micro">DEVICES</span>
-      <span class="mono readout">9</span>
-    </div>
-    <div class="reading">
-      <span class="micro">ACTIVE</span>
-      <span class="mono readout">4</span>
-    </div>
-    <div class="reading">
-      <span class="micro">UNREACHABLE</span>
-      <span class="mono readout">0</span>
-    </div>
-  </div>
-</section>
-
-<!-- LIGHTS deck: scope row, ON/OFF pair, brightness slider, palette, effects. -->
-<section class="plate device lit" style="--glow:#2FB3A5">
-  <div class="section-rule">
-    <h2>LIGHTS</h2><span class="rule"></span>
-  </div>
-
-  <div class="scope">
-    <button class="btn small" aria-pressed="true">ALL <span class="count">(4)</span></button>
-    <button class="btn small">LIVING ROOM <span class="count">(2)</span></button>
-    <button class="btn small">BEDROOM <span class="count">(1)</span></button>
-    <button class="btn small">OFFICE <span class="count">(1)</span></button>
-  </div>
-
-  <div class="actions">
-    <button class="btn">ON</button>
-    <button class="btn">OFF</button>
-  </div>
-
-  <div class="slider">
-    <span class="fieldlabel">BRIGHT</span>
-    <input type="range" min="0" max="100" value="70" aria-label="Brightness">
-    <span class="value mono readout">70</span>
-  </div>
-
-  <div class="palette">
-    <button class="chip" style="background: #E03A3F" aria-pressed="false" aria-label="Crimson"></button>
-    <button class="chip" style="background: #FF7A2F" aria-pressed="false" aria-label="Ember"></button>
-    <button class="chip" style="background: #FFB46B" aria-pressed="false" aria-label="Gold"></button>
-    <button class="chip" style="background: #7FAE62" aria-pressed="false" aria-label="Moss"></button>
-    <button class="chip" style="background: #2FB3A5" aria-pressed="true" aria-label="Teal"></button>
-    <button class="chip" style="background: #4F9FE0" aria-pressed="false" aria-label="Sky"></button>
-    <button class="chip" style="background: #8F6FE8" aria-pressed="false" aria-label="Violet"></button>
-    <button class="chip" style="background: #E26FAE" aria-pressed="false" aria-label="Rose"></button>
-    <button class="chip add">+</button>
-  </div>
-
-  <div class="effects">
-    <button class="btn small" aria-pressed="false">FIREPLACE</button>
-    <button class="btn small" aria-pressed="false">OCEAN</button>
-    <button class="btn small" aria-pressed="false">FOREST</button>
-    <button class="btn small" aria-pressed="false">SUNSET</button>
-    <button class="btn small" aria-pressed="false">PARTY</button>
-    <button class="btn small" aria-pressed="false">FOCUS</button>
-    <button class="btn small" aria-pressed="false">RELAX</button>
-    <button class="btn small" aria-pressed="false">NIGHT</button>
-  </div>
-
-  <p class="caption">Commands land on every light in the scope. Each bulb still answers alone below.</p>
-</section>
-
-<!-- Rooms in census order. -->
 <main id="rooms">
 
-<!-- KITCHEN: playing coordinator + Move follower. -->
-<div class="room">
-  <div class="section-rule"><h2>KITCHEN</h2><span class="rule"></span><span class="micro">2 DEVICES</span></div>
-  <div class="roomdevices">
+<!-- Masthead: HOME wordmark with accent period, flex rule, gen counter, status lamp + word. -->
+<div class="masthead">
+  <span class="wordmark">HOME</span>
+  <span class="rule"></span>
+  <span class="gen">#214</span>
+  <span class="stateword">
+    <span class="lamp ok"></span>OK
+  </span>
+</div>
 
-  <!-- Kitchen speaker: playing, coordinating. -->
-  <section class="plate device">
-    <div class="title-rule">
-      <span class="title">Kitchen</span><span class="rule"></span>
-      <span class="micro kind">SPEAKER</span><span class="lamp ok"></span>
-    </div>
-    <p class="doing">Playing, grouped with Move.</p>
-    <div class="deck playing">
-      <div class="platter-well">
-        <div class="platter"><span class="disclabel">HM</span><span class="spindle"></span></div>
-        <div class="tonearm"><span class="arm" style="--arm:7deg"></span><span class="pivot"></span></div>
-      </div>
-      <div class="deck-panel">
-        <div class="toprow">
-          <div class="nowplaying">
-            <span class="track">Harvest Moon</span>
-            <span class="artist">Neil Young</span>
-          </div>
-          <div class="vus">
-            <span class="vu"><span class="needle" style="--vu:-4deg"></span><span class="vu-tag">L</span></span>
-            <span class="vu"><span class="needle" style="--vu:16deg"></span><span class="vu-tag">R</span></span>
-          </div>
-        </div>
-        <div class="progress">
-          <span class="bar"><span class="fill" style="width:38%"></span></span>
-          <span class="clock mono readout">1:54 / 5:03</span>
-        </div>
-        <div class="actions">
-          <button class="btn" aria-label="Previous">&#9198;</button>
-          <button class="btn primary" aria-label="Pause">&#9208;</button>
-          <button class="btn" aria-label="Next">&#9197;</button>
-          <button class="btn" aria-pressed="false">MUTE</button>
-        </div>
-      </div>
-    </div>
-    <div class="slider">
-      <span class="fieldlabel">VOLUME</span>
-      <input type="range" min="0" max="100" value="40" aria-label="Volume">
-      <span class="value mono readout">40</span>
-    </div>
-    <div class="grouprow">
-      <span class="caption">Coordinating: Move follows this deck.</span>
-      <button class="btn small">LEAVE</button>
-    </div>
-  </section>
+<!-- Bank: one sentence of house truth + device census in mono. -->
+<div class="bank">
+  <div class="condition">Music in the kitchen; three lights on.</div>
+  <div class="evidence">DEVICES 9 · ACTIVE 4 · UNREACHABLE 0</div>
+</div>
 
-  <!-- Move: follower. -->
-  <section class="plate device">
-    <div class="title-rule">
-      <span class="title">Move</span><span class="rule"></span>
-      <span class="micro kind">SPEAKER</span><span class="lamp ok"></span>
-    </div>
-    <p class="doing">Following Kitchen &mdash; Harvest Moon.</p>
-    <div class="slider">
-      <span class="fieldlabel">VOLUME</span>
-      <input type="range" min="0" max="100" value="25" aria-label="Volume">
-      <span class="value mono readout">25</span>
-    </div>
-    <div class="grouprow">
-      <span class="caption">Grouped under Kitchen.</span>
-      <button class="btn small">LEAVE</button>
-    </div>
-  </section>
 
+<!-- KITCHEN: 2 devices. -->
+<div class="section-rule">
+  <h2>Kitchen</h2>
+  <span class="rule"></span>
+</div>
+
+<div class="plate">
+  <div class="row">
+    <div class="port lit" style="--arc:40; --arccol:var(--accent);">
+      <div class="ring"></div>
+      <div class="orb"></div>
+    </div>
+    <div class="who">
+      <span class="name">Kitchen</span>
+      <span class="state">Playing — Harvest Moon · with Move.</span>
+    </div>
+    <div class="ctl">
+      <button class="btn small ghost">PAUSE</button>
+    </div>
+  </div>
+
+  <div class="row">
+    <div class="port lit" style="--arc:25; --arccol:var(--accent);">
+      <div class="ring"></div>
+      <div class="orb"></div>
+    </div>
+    <div class="who">
+      <span class="name">Move</span>
+      <span class="state">Following Kitchen.</span>
+    </div>
+    <div class="ctl">
+      <button class="btn small ghost">LEAVE</button>
+    </div>
   </div>
 </div>
 
-<!-- LIVING ROOM: two lights + TV. -->
-<div class="room">
-  <div class="section-rule"><h2>LIVING ROOM</h2><span class="rule"></span><span class="micro">3 DEVICES</span></div>
-  <div class="roomdevices">
+<!-- LIVING ROOM: 3 devices. -->
+<div class="section-rule">
+  <h2>Living Room</h2>
+  <span class="rule"></span>
+</div>
 
-  <!-- Couch Left: on, 70%, teal. -->
-  <section class="plate device lit" style="--glow:#2FB3A5">
-    <div class="title-rule">
-      <span class="title">Couch Left</span><span class="rule"></span>
-      <span class="micro kind">LIGHT</span><span class="lamp ok"></span>
+<div class="plate">
+  <div class="row">
+    <div class="port lit" style="--arc:70; --arccol:var(--accent);">
+      <div class="ring"></div>
+      <div class="orb"></div>
     </div>
-    <p class="doing">On, 70%, teal.</p>
-    <div class="actions">
-      <button class="btn">ON</button>
-      <button class="btn">OFF</button>
+    <div class="who">
+      <span class="name">Couch Left</span>
+      <span class="state">On — 70%, teal.</span>
     </div>
-    <div class="slider">
-      <span class="fieldlabel">BRIGHT</span>
-      <input type="range" min="0" max="100" value="70" aria-label="Brightness">
-      <span class="value mono readout">70</span>
-    </div>
-    <div class="swatchline">
-      <span class="swatch" style="background: #2FB3A5"></span>
-      <span class="micro mono readout">#2FB3A5</span>
-    </div>
-  </section>
-
-  <!-- Couch Right: on, 70%, teal. -->
-  <section class="plate device lit" style="--glow:#2FB3A5">
-    <div class="title-rule">
-      <span class="title">Couch Right</span><span class="rule"></span>
-      <span class="micro kind">LIGHT</span><span class="lamp ok"></span>
-    </div>
-    <p class="doing">On, 70%, teal.</p>
-    <div class="actions">
-      <button class="btn">ON</button>
-      <button class="btn">OFF</button>
-    </div>
-    <div class="slider">
-      <span class="fieldlabel">BRIGHT</span>
-      <input type="range" min="0" max="100" value="70" aria-label="Brightness">
-      <span class="value mono readout">70</span>
-    </div>
-    <div class="swatchline">
-      <span class="swatch" style="background: #2FB3A5"></span>
-      <span class="micro mono readout">#2FB3A5</span>
-    </div>
-  </section>
-
-  <!-- Living Room TV: showing Netflix, REMOTE disclosure closed, launch form. -->
-  <section class="plate device">
-    <div class="title-rule">
-      <span class="title">Living Room TV</span><span class="rule"></span>
-      <span class="micro kind">TELEVISION</span><span class="lamp ok"></span>
-    </div>
-    <p class="doing">Showing Netflix.</p>
-    <div class="controls">
-      <div class="actions">
-        <button class="btn">STOP</button>
-        <button class="btn" aria-pressed="false">REMOTE</button>
-      </div>
-      <div class="inline-form">
-        <span class="fieldlabel">APP</span>
-        <input type="text" placeholder="netflix">
-        <button class="btn primary">LAUNCH</button>
+    <div class="ctl">
+      <div class="seg">
+        <button aria-pressed="true">ON</button>
+        <button class="offside" aria-pressed="false">OFF</button>
       </div>
     </div>
-  </section>
+  </div>
 
+  <div class="row">
+    <div class="port lit" style="--arc:70; --arccol:var(--accent);">
+      <div class="ring"></div>
+      <div class="orb"></div>
+    </div>
+    <div class="who">
+      <span class="name">Couch Right</span>
+      <span class="state">On — 70%, teal.</span>
+    </div>
+    <div class="ctl">
+      <div class="seg">
+        <button aria-pressed="true">ON</button>
+        <button class="offside" aria-pressed="false">OFF</button>
+      </div>
+    </div>
+  </div>
+
+  <div class="row">
+    <div class="port">
+      <div class="ring"></div>
+      <div class="orb">TV</div>
+    </div>
+    <div class="who">
+      <span class="name">Living Room TV</span>
+      <span class="state">YouTube running.</span>
+    </div>
+    <div class="ctl">
+      <button class="btn small ghost">STOP</button>
+    </div>
   </div>
 </div>
 
-<!-- BEDROOM: Bedside + Bedroom TV. -->
-<div class="room">
-  <div class="section-rule"><h2>BEDROOM</h2><span class="rule"></span><span class="micro">2 DEVICES</span></div>
-  <div class="roomdevices">
+<!-- BEDROOM: 2 devices. -->
+<div class="section-rule">
+  <h2>Bedroom</h2>
+  <span class="rule"></span>
+</div>
 
-  <!-- Bedside: converging to off with setmark. -->
-  <section class="plate device">
-    <div class="title-rule">
-      <span class="title">Bedside</span><span class="rule"></span>
-      <span class="micro kind">LIGHT</span><span class="lamp ok"></span>
+<div class="plate">
+  <div class="row">
+    <div class="port">
+      <div class="ring"></div>
+      <div class="orb"></div>
     </div>
-    <p class="doing">Converging to off.</p>
-    <span class="setmark">
-      <span class="lamp pending"></span>
-      <span class="micro">SET 0% — APPLYING</span>
-    </span>
-    <div class="slider">
-      <span class="fieldlabel">BRIGHT</span>
-      <input type="range" min="0" max="100" value="0" aria-label="Brightness">
-      <span class="value mono readout">0</span>
+    <div class="who">
+      <span class="name">Bedside</span>
+      <span class="state"><span class="setmark"><span class="lamp pending"></span><span class="micro">SET OFF — APPLYING</span></span></span>
     </div>
-  </section>
-
-  <!-- Bedroom TV: idle, launch form only, no remote. -->
-  <section class="plate device">
-    <div class="title-rule">
-      <span class="title">Bedroom TV</span><span class="rule"></span>
-      <span class="micro kind">TELEVISION</span><span class="lamp idle"></span>
-    </div>
-    <p class="doing">Nothing running.</p>
-    <div class="controls">
-      <div class="inline-form">
-        <span class="fieldlabel">APP</span>
-        <input type="text" placeholder="netflix">
-        <button class="btn primary">LAUNCH</button>
+    <div class="ctl">
+      <div class="seg">
+        <button aria-pressed="false">ON</button>
+        <button class="offside" aria-pressed="true">OFF</button>
       </div>
     </div>
-    <p class="note">Remote keys need nothing on this set — DIAL only. More arrives if a driver ever can.</p>
-  </section>
+  </div>
 
+  <div class="row">
+    <div class="port">
+      <div class="ring"></div>
+      <div class="orb">TV</div>
+    </div>
+    <div class="who">
+      <span class="name">Bedroom TV</span>
+      <span class="state">Nothing running.</span>
+    </div>
+    <div class="ctl">
+      <button class="btn small ghost">APPS</button>
+    </div>
   </div>
 </div>
 
-<!-- OFFICE: Desk off. -->
-<div class="room">
-  <div class="section-rule"><h2>OFFICE</h2><span class="rule"></span><span class="micro">1 DEVICE</span></div>
-  <div class="roomdevices">
+<!-- OFFICE: 1 device. -->
+<div class="section-rule">
+  <h2>Office</h2>
+  <span class="rule"></span>
+</div>
 
-  <!-- Desk: off. -->
-  <section class="plate device">
-    <div class="title-rule">
-      <span class="title">Desk</span><span class="rule"></span>
-      <span class="micro kind">LIGHT</span><span class="lamp idle"></span>
+<div class="plate">
+  <div class="row">
+    <div class="port">
+      <div class="ring"></div>
+      <div class="orb"></div>
     </div>
-    <p class="doing">Off.</p>
-    <div class="slider">
-      <span class="fieldlabel">BRIGHT</span>
-      <input type="range" min="0" max="100" value="0" disabled aria-label="Brightness">
-      <span class="value mono readout">0</span>
+    <div class="who">
+      <span class="name">Desk</span>
+      <span class="state">Off.</span>
     </div>
-  </section>
-
+    <div class="ctl">
+      <div class="seg">
+        <button aria-pressed="false">ON</button>
+        <button class="offside" aria-pressed="true">OFF</button>
+      </div>
+    </div>
   </div>
 </div>
 
-<!-- UNPLACED: printer as quiet fixture. -->
-<div class="room">
-  <div class="section-rule"><h2>UNPLACED</h2><span class="rule"></span><span class="micro">1 DEVICE</span></div>
-  <div class="roomdevices">
+<!-- UNPLACED: 1 fixture. -->
+<div class="section-rule">
+  <h2>Unplaced</h2>
+  <span class="rule"></span>
+</div>
 
-  <!-- Brother HL-3040CN: printer, shown not driven. -->
-  <section class="plate device">
-    <div class="title-rule">
-      <span class="title">Brother HL-3040CN</span><span class="rule"></span>
-      <span class="micro kind">FIXTURE</span><span class="lamp idle"></span>
+<div class="plate">
+  <div class="row fixture">
+    <div class="port">
+      <div class="ring"></div>
+      <div class="orb">PR</div>
     </div>
-    <p class="note">Shown because it is here; nothing to drive.</p>
-  </section>
-
+    <div class="who">
+      <span class="name">Brother HL-3040CN</span>
+      <span class="state">Printer — shown, not driven.</span>
+    </div>
   </div>
 </div>
 

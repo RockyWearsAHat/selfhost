@@ -1,0 +1,119 @@
+<!doctype html>
+<!-- Design comp: the expandability proof, phone width. Three plates for
+     devices this house does not own yet — a plug, a television, a
+     speaker — rendered from drivers already on the roadmap. Nothing here
+     is invented per-brand: the markup is the same plate the house already
+     draws for a Kasa plug, a Roku, or a DLNA speaker it does own, proving
+     that a device arriving is a driver discovering it, not a screen
+     somebody designs on the day it shows up. Markup uses the page's own
+     classes; theatre.css is the shipped stylesheet, untouched. -->
+<html lang="en"><head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>comp — not in this house yet</title>
+<link rel="stylesheet" href="theatre.css">
+</head><body>
+
+<main id="rooms">
+<div class="room">
+  <div class="section-rule"><h2>NOT IN THIS HOUSE &mdash; YET</h2><span class="rule"></span><span class="micro">3 PLATES</span></div>
+  <p class="caption">The plates already exist for the drivers on the roadmap. A device that arrives is discovered by its own protocol and renders itself; nothing here is designed per-brand.</p>
+  <div class="roomdevices">
+
+  <!-- A Kasa plug. The driver needs no account and no pairing step — the
+       plate is the same one any kasa device gets, on the day one answers. -->
+  <section class="plate device">
+    <div class="title-rule">
+      <span class="title">Heater</span><span class="rule"></span>
+      <span class="micro kind">PLUG</span><span class="lamp ok"></span>
+    </div>
+    <p class="doing">On.</p>
+    <div class="actions">
+      <button class="btn primary" disabled>ON</button>
+      <button class="btn">OFF</button>
+    </div>
+    <span class="address mono">192.168.1.x &middot; kasa &middot; udp 9999</span>
+    <p class="note">Arrives with the kasa driver &mdash; no account, no pairing.</p>
+  </section>
+
+  <!-- A Roku, found by ECP: apps, volume, and the same d-pad remote the
+       Living Room set already draws, open because REMOTE is pressed. -->
+  <section class="plate device">
+    <div class="title-rule">
+      <span class="title">Den TV</span><span class="rule"></span>
+      <span class="micro kind">TELEVISION</span><span class="lamp ok"></span>
+    </div>
+    <p class="doing">Netflix, at 24%.</p>
+    <div class="actions">
+      <button class="btn">STOP</button>
+      <button class="btn" aria-pressed="true">REMOTE</button>
+    </div>
+    <div class="keypad">
+      <span class="gap"></span><button class="btn" aria-label="Up">&#9650;</button><span class="gap"></span>
+      <button class="btn" aria-label="Left">&#9664;</button><button class="btn ok" aria-label="OK">OK</button><button class="btn" aria-label="Right">&#9654;</button>
+      <span class="gap"></span><button class="btn" aria-label="Down">&#9660;</button><span class="gap"></span>
+    </div>
+    <div class="keyrow">
+      <button class="btn small">BACK</button>
+      <button class="btn small">HOME</button>
+    </div>
+    <div class="slider">
+      <span class="fieldlabel">VOLUME</span>
+      <input type="range" min="0" max="100" value="24" aria-label="Volume">
+      <span class="value mono readout">24</span>
+    </div>
+    <div class="inline-form">
+      <span class="fieldlabel">APP</span>
+      <input type="text" class="mono" placeholder="netflix" aria-label="App identifier">
+      <button class="btn small">LAUNCH</button>
+    </div>
+    <span class="address mono">192.168.1.x &middot; roku ecp :8060</span>
+  </section>
+
+  <!-- A DLNA speaker, never played: the mat is bare because no disc has
+       ever landed on it, and the tonearm carries no --arm — it is parked,
+       not resting mid-groove. The clock has nothing to read either, so it
+       stays plain text; the phosphor readout is for a number that is real. -->
+  <section class="plate device">
+    <div class="title-rule">
+      <span class="title">Soundbar</span><span class="rule"></span>
+      <span class="micro kind">SPEAKER</span><span class="lamp idle"></span>
+    </div>
+    <p class="doing">Nothing on the platter.</p>
+    <div class="deck">
+      <div class="table">
+        <div class="platter">
+          <div class="mat"></div>
+        </div>
+        <span class="spindle"></span>
+        <div class="tonearm"><span class="base"></span><span class="tube"></span></div>
+      </div>
+      <div class="deck-panel">
+        <div class="vus">
+          <span class="vu"><span class="needle"></span><span class="vu-tag">L</span></span>
+          <span class="vu"><span class="needle"></span><span class="vu-tag">R</span></span>
+        </div>
+        <div class="progress">
+          <span class="bar"><span class="fill" style="width:0"></span></span>
+          <span class="clock mono">&ndash;:&ndash;&ndash; / &ndash;:&ndash;&ndash;</span>
+        </div>
+        <div class="actions">
+          <button class="btn" aria-label="Previous">&#9198;</button>
+          <button class="btn primary" aria-label="Play">&#9205;</button>
+          <button class="btn" aria-label="Next">&#9197;</button>
+          <button class="btn" aria-pressed="false">MUTE</button>
+        </div>
+      </div>
+    </div>
+    <div class="slider">
+      <span class="fieldlabel">VOLUME</span>
+      <input type="range" min="0" max="100" value="30" aria-label="Volume">
+      <span class="value mono readout">30</span>
+    </div>
+    <span class="address mono">192.168.1.x &middot; dlna</span>
+  </section>
+
+  </div>
+  <p class="note">One new capability is one new row in the table in docs/labs/home-ui-lab.dx &mdash; the plate assembles itself from what the device advertises.</p>
+</div>
+</main>
+</body></html>

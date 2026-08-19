@@ -1,90 +1,99 @@
 <!doctype html>
-<!-- Design comp: the honesty board — refusal, convergence states, and cloud-only
-     devices. Phone width. Demonstrates alert bars, applying setmarks, holdout
-     states, device-gone dimming, cloud-only rows, and stale masthead. Markup uses
-     the page's own classes; theatre.css is the shipped stylesheet. -->
+<!-- Design comp: the honesty board — four states that separate an instrument
+     from a demo. Phone width. On INSTRUMENT, the home app's own design system.
+     Each plate shows a distinct device state: APPLYING, HOLDOUT, UNREACHABLE,
+     REGROUPING. No JavaScript, no external requests. -->
 <html lang="en"><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
-<title>The honesty board.</title>
-<link rel="stylesheet" href="theatre.css">
+<title>States — the honesty board.</title>
+<link rel="stylesheet" href="instrument.css">
 </head><body>
-
-<!-- 1. Refusal alert bar: The hub refused a command with a validation error. -->
-<div class="alert problem">
-  <span class="flagbar"></span>
-  <span id="notice-text">The hub refused: volume must be 0–100.</span>
-  <button class="btn ghost small" aria-label="Dismiss">×</button>
-</div>
 
 <main id="rooms">
 <div class="room">
 
-  <!-- 2. Bedside with applying setmark: The light is converging to the set state. -->
+  <!-- (1) APPLYING: Light plate, converging to set state, setmark pending. -->
   <section class="plate device">
     <div class="title-rule">
       <span class="title">Bedside</span><span class="rule"></span>
-      <span class="micro kind">LIGHT</span><span class="lamp ok"></span>
+      <span class="kind">Light</span><span class="lamp pending"></span>
     </div>
     <p class="doing">Converging to off.</p>
+    <div class="port">
+      <div class="ring" style="--arc:0;"></div>
+      <div class="orb"></div>
+    </div>
+    <div class="seg">
+      <button aria-pressed="true" class="offside">OFF</button>
+      <button aria-pressed="false">ON</button>
+    </div>
     <span class="setmark">
       <span class="lamp pending"></span>
       <span class="micro">SET 0% — APPLYING</span>
     </span>
+    <span class="address mono">192.168.1.20 &middot; wiz</span>
   </section>
 
-  <!-- 3. Move speaker gone: Unreachable device, dimmed, but volume slider still shows set value. -->
-  <section class="plate device gone">
-    <div class="title-rule">
-      <span class="title">Move</span><span class="rule"></span>
-      <span class="micro kind">SPEAKER</span><span class="lamp idle"></span>
-    </div>
-    <p class="doing">Not answering.</p>
-    <p class="note">Set state applies when it does.</p>
-    <div class="controls">
-      <div class="slider">
-        <span class="fieldlabel">VOLUME</span>
-        <input type="range" min="0" max="100" value="25" disabled aria-label="Volume">
-        <span class="value mono readout">25</span>
-      </div>
-    </div>
-  </section>
-
-  <!-- 4. Porch: Cloud-only bulb, shown to prove nothing is silently missing. No controls. -->
-  <section class="plate device">
-    <div class="title-rule">
-      <span class="title">Porch</span><span class="rule"></span>
-      <span class="micro kind">LIGHT</span><span class="lamp idle"></span>
-    </div>
-    <p class="note">Cloud-only, no local protocol. Shown so nothing is silently missing.</p>
-  </section>
-
-</div>
-</main>
-
-<!-- 5. Stale masthead strip: The page is waiting for the hub to respond; commands
-     are queued but not executed. -->
-<div class="lampline" style="padding: 8px 0; border-top: 1px solid var(--border); border-bottom: 1px solid var(--border);">
-  <span class="lamp warn"></span>
-  <span class="stateword warn">STALE</span>
-  <span class="rule"></span>
-  <span class="caption">Commands wait; the page will not pretend.</span>
-</div>
-
-<main id="rooms" style="margin-top: 8px;">
-<div class="room">
-
-  <!-- 6. Holdout example: A device has dissented after patience; the setmark
-       turns amber and shows the device's own state instead. -->
+  <!-- (2) HOLDOUT: Same shape, device dissents after patience, setmark red. -->
   <section class="plate device">
     <div class="title-rule">
       <span class="title">Desk</span><span class="rule"></span>
-      <span class="micro kind">LIGHT</span><span class="lamp warn"></span>
+      <span class="kind">Light</span><span class="lamp bad"></span>
     </div>
-    <p class="doing">Off, 0%.</p>
+    <p class="doing">Told to turn off; the device still says on.</p>
+    <div class="port">
+      <div class="ring" style="--arc:0;"></div>
+      <div class="orb"></div>
+    </div>
+    <div class="seg">
+      <button aria-pressed="true" class="offside">OFF</button>
+      <button aria-pressed="false">ON</button>
+    </div>
     <span class="setmark holdout">
       <span class="lamp pending"></span>
       <span class="micro">SET OFF — DEVICE SAYS ON, RETRYING</span>
     </span>
+    <span class="address mono">192.168.1.21 &middot; wiz</span>
+  </section>
+
+  <!-- (3) UNREACHABLE: Dimmed plate, controls at server set values (seg ON, slider 60). -->
+  <section class="plate device gone">
+    <div class="title-rule">
+      <span class="title">Couch Left</span><span class="rule"></span>
+      <span class="kind">Light</span><span class="lamp idle"></span>
+    </div>
+    <p class="doing">Not answering.</p>
+    <p class="doing">Set state applies when it does.</p>
+    <div class="port">
+      <div class="ring" style="--arc:60;"></div>
+      <div class="orb"></div>
+    </div>
+    <div class="seg">
+      <button aria-pressed="false" class="offside">OFF</button>
+      <button aria-pressed="true">ON</button>
+    </div>
+    <div class="cap-bright">
+      <span class="fieldlabel">BRIGHT</span>
+      <input type="range" min="0" max="100" value="60" disabled aria-label="Brightness">
+      <span class="value">60</span>
+    </div>
+    <span class="address mono">192.168.1.18 &middot; wiz</span>
+  </section>
+
+  <!-- (4) SPEAKER REGROUPING: Speaker fell out of group, lamp pending, regrouping. -->
+  <section class="plate device">
+    <div class="title-rule">
+      <span class="title">Move</span><span class="rule"></span>
+      <span class="kind">Speaker</span><span class="lamp pending"></span>
+    </div>
+    <p class="doing">Move — was following Kitchen; regrouping.</p>
+    <div class="cap-volume">
+      <span class="fieldlabel">VOLUME</span>
+      <input type="range" min="0" max="100" value="40" aria-label="Volume">
+      <span class="value">40</span>
+      <button class="btn small ghost" aria-pressed="false">MUTE</button>
+    </div>
+    <span class="address mono">192.168.1.17 &middot; sonos</span>
   </section>
 
 </div>

@@ -1,12 +1,13 @@
 <!doctype html>
-<!-- Design comp: television plates, phone width. Living Room TV showing Netflix
-     with remote keypad and DIAL application launcher; Bedroom TV idle with launcher
-     and note. Markup uses the page's own classes; theatre.css is the shipped stylesheet
-     plus the design-kit extensions this comp exists to prove. -->
+<!-- Design comp: television plates on INSTRUMENT, phone width. Living Room TV
+     (Fire TV 4K) showing YouTube with apps, volume, and d-pad remote control;
+     Bedroom TV (Vega) idle, apps-only, no remote keys. Markup patterns from
+     phone-player.html reference comp; every visual device maps to a named
+     rui capability per instrument.css. -->
 <html lang="en"><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
 <title>comp — televisions</title>
-<link rel="stylesheet" href="theatre.css">
+<link rel="stylesheet" href="instrument.css">
 </head><body>
 
 <main id="rooms">
@@ -14,43 +15,49 @@
   <div class="section-rule"><h2>LIVING ROOM</h2><span class="rule"></span><span class="micro">1 DEVICE</span></div>
   <div class="roomdevices">
 
-  <!-- Living Room TV playing Netflix, REMOTE control visible with keypad and keyrow,
-       and launch form to start a new app via DIAL. -->
+  <!-- Living Room TV (Fire TV 4K) showing YouTube, with app switcher,
+       volume control, and full d-pad remote with directional keys and HOME/BACK. -->
   <section class="plate device">
     <div class="title-rule">
       <span class="title">Living Room TV</span><span class="rule"></span>
-      <span class="micro kind">TELEVISION</span><span class="lamp ok"></span>
+      <span class="kind">Television</span><span class="lamp live"></span>
     </div>
-    <p class="doing">Showing Netflix.</p>
-    <div class="controls">
-      <div class="actions">
-        <button class="btn">STOP</button>
-        <button class="btn" aria-pressed="true">REMOTE</button>
+    <p class="doing">Showing YouTube.</p>
+    <div class="tvrow">
+      <div class="screenwell">
+        <span class="appname">YouTube</span>
+        <span class="running">Running</span>
       </div>
-      <div>
-        <div class="keypad">
-          <span class="gap"></span>
-          <button class="btn">▲</button>
-          <span class="gap"></span>
-          <button class="btn">◀</button>
-          <button class="btn ok">OK</button>
-          <button class="btn">▶</button>
-          <span class="gap"></span>
-          <button class="btn">▼</button>
-          <span class="gap"></span>
-        </div>
-        <div class="keyrow">
-          <button class="btn">BACK</button>
-          <button class="btn">HOME</button>
-          <button class="btn">MENU</button>
+      <div class="tvpanel">
+        <div class="cap-apps">
+          <button class="btn small ghost" aria-pressed="true">YOUTUBE</button>
+          <button class="btn small ghost">NETFLIX</button>
+          <button class="btn small ghost">PRIME</button>
+          <button class="btn small ghost">SPOTIFY</button>
+          <button class="btn small">STOP</button>
         </div>
       </div>
-      <div class="inline-form">
-        <span class="fieldlabel">APP</span>
-        <input type="text" placeholder="netflix">
-        <button class="btn primary">LAUNCH</button>
+    </div>
+    <div class="cap-volume">
+          <span class="fieldlabel">Volume</span>
+          <input type="range" min="0" max="100" value="45" aria-label="Volume">
+          <span class="value">45</span>
+          <button class="btn small ghost">MUTE</button>
+        </div>
+    <div class="cap-keys">
+      <div class="dpad">
+        <button class="up">&#x25B2;&#xFE0E;</button>
+        <button class="left">&#x25C0;&#xFE0E;</button>
+        <button class="okbtn">OK</button>
+        <button class="right">&#x25B6;&#xFE0E;</button>
+        <button class="down">&#x25BC;&#xFE0E;</button>
+      </div>
+      <div class="keycol">
+        <button class="btn small ghost">BACK</button>
+        <button class="btn small ghost">HOME</button>
       </div>
     </div>
+    <span class="address mono">192.168.1.4 &middot; dial</span>
   </section>
 
   </div>
@@ -60,22 +67,25 @@
   <div class="section-rule"><h2>BEDROOM</h2><span class="rule"></span><span class="micro">1 DEVICE</span></div>
   <div class="roomdevices">
 
-  <!-- Bedroom TV idle, no remote (DIAL only), launcher only with note explaining
-       the device capability. -->
+  <!-- Bedroom TV (Vega), apps-only: no remote keypad, no volume control.
+       The screenwell reads as idle glass; apps available to launch. -->
   <section class="plate device">
     <div class="title-rule">
       <span class="title">Bedroom TV</span><span class="rule"></span>
-      <span class="micro kind">TELEVISION</span><span class="lamp idle"></span>
+      <span class="kind">Television</span><span class="lamp ok"></span>
     </div>
     <p class="doing">Nothing running.</p>
-    <div class="controls">
-      <div class="inline-form">
-        <span class="fieldlabel">APP</span>
-        <input type="text" placeholder="netflix">
-        <button class="btn primary">LAUNCH</button>
-      </div>
+    <div class="screenwell dark">
+      <span class="appname">Nothing running</span>
     </div>
-    <p class="note">Remote keys need nothing on this set — DIAL only. More arrives if a driver ever can.</p>
+    <div class="cap-apps">
+      <button class="btn small ghost">YOUTUBE</button>
+      <button class="btn small ghost">NETFLIX</button>
+      <button class="btn small ghost">PRIME</button>
+      <button class="btn small ghost">SPOTIFY</button>
+    </div>
+    <p class="doing">Apps only — this set takes no keys.</p>
+    <span class="address mono">192.168.1.12 &middot; dial</span>
   </section>
 
   </div>

@@ -1,37 +1,38 @@
 <!doctype html>
-<!-- Design comp: the speaker plate as a record deck, phone width — on
-     INSTRUMENT, the home app's own design system (diverged from the
-     console's THEATRE on the operator's 2026-08-19 directive; see
-     instrument.css for the rui implementation contract). Three states:
-     the Kitchen Sonos One playing and coordinating a group, the Move
-     following it, and the same deck paused. No JavaScript, no external
-     requests; every visual device maps to a named rui capability. -->
+<!-- Design comp: the speaker plate as a record deck, phone width. Three
+     states: the Kitchen Sonos One playing and coordinating a group, the Move
+     following it, and the same deck paused — the disc stays on the platter
+     and the arm rests where playback stopped; only the rotation and the
+     meter needles stop. Markup uses the page's own classes; theatre.css is
+     the shipped stylesheet plus the design-kit layers this comp proves. -->
 <html lang="en"><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
 <title>comp — the deck</title>
-<link rel="stylesheet" href="instrument.css">
+<link rel="stylesheet" href="theatre.css">
 </head><body>
 
 <main id="rooms">
 <div class="room">
-  <div class="section-rule"><h2>Kitchen</h2><span class="rule"></span><span class="micro">2 DEVICES</span></div>
+  <div class="section-rule"><h2>KITCHEN</h2><span class="rule"></span><span class="micro">2 DEVICES</span></div>
   <div class="roomdevices">
 
-  <!-- Playing, coordinating a group. The platter turns (the page's one
-       motion loop); the arm rides at 38% of the record; the live lamp
-       carries the accent because this device is making sound now. -->
+  <!-- Playing, coordinating the group: the record turns, the needles are up,
+       the arm is 38% of the way across the grooves. -->
   <section class="plate device">
     <div class="title-rule">
       <span class="title">Kitchen</span><span class="rule"></span>
-      <span class="kind">Speaker</span><span class="lamp live"></span>
+      <span class="micro kind">SPEAKER</span><span class="lamp ok"></span>
     </div>
     <p class="doing">Playing, grouped with Move.</p>
     <div class="deck playing">
-      <div class="platter-well">
+      <div class="table">
         <div class="platter">
-          <span class="disclabel"><span class="mono-mark">HM</span><span class="rpm">33&#8531; RPM</span><span class="hole"></span></span>
+          <div class="vinyl">
+            <div class="label"><span class="l1">HARVEST MOON</span><span class="l2">NEIL YOUNG</span></div>
+          </div>
         </div>
-        <div class="tonearm"><span class="base"></span><span class="boom" style="--arm:-13deg"><span class="counterweight"></span><span class="tube"></span><span class="headshell"></span></span></div>
+        <span class="spindle"></span>
+        <div class="tonearm"><span class="base"></span><span class="tube" style="--arm:14deg"></span></div>
       </div>
       <div class="deck-panel">
         <div class="toprow">
@@ -39,69 +40,72 @@
             <span class="track">Harvest Moon</span>
             <span class="artist">Neil Young</span>
           </div>
+          <div class="vus">
+            <span class="vu"><span class="needle" style="--vu:-4deg"></span><span class="vu-tag">L</span></span>
+            <span class="vu"><span class="needle" style="--vu:16deg"></span><span class="vu-tag">R</span></span>
+          </div>
         </div>
         <div class="progress">
           <span class="bar"><span class="fill" style="width:38%"></span></span>
-          <span class="clock">1:54&thinsp;/&thinsp;5:03</span>
+          <span class="clock mono readout">1:54 / 5:03</span>
         </div>
         <div class="actions">
-          <button class="btn" aria-label="Previous">&#9198;&#xFE0E;</button>
-          <button class="btn primary" aria-label="Pause">&#9208;&#xFE0E;</button>
-          <button class="btn" aria-label="Next">&#9197;&#xFE0E;</button>
+          <button class="btn" aria-label="Previous">&#9198;</button>
+          <button class="btn primary" aria-label="Pause">&#9208;</button>
+          <button class="btn" aria-label="Next">&#9197;</button>
+          <button class="btn" aria-pressed="false">MUTE</button>
         </div>
       </div>
     </div>
     <div class="slider">
-      <span class="fieldlabel">Volume</span>
+      <span class="fieldlabel">VOLUME</span>
       <input type="range" min="0" max="100" value="40" aria-label="Volume">
-      <span class="value">40</span>
-      <button class="btn small ghost" aria-pressed="false">MUTE</button>
+      <span class="value mono readout">40</span>
     </div>
     <div class="grouprow">
       <span class="caption">Coordinating: Move follows this deck.</span>
-      <button class="btn small ghost">LEAVE</button>
+      <button class="btn small">LEAVE</button>
     </div>
+    <span class="address mono">192.168.1.6 &middot; sonos</span>
   </section>
 
-  <!-- The follower: no deck of its own — the record is on the
-       coordinator's platter, so it shows a still mini-disc. It keeps its
-       own volume, the one fact grouping does not take from a speaker. -->
+  <!-- The follower: the record is on the coordinator's platter, so this
+       plate keeps only its own volume — the one fact grouping leaves it. -->
   <section class="plate device">
     <div class="title-rule">
       <span class="title">Move</span><span class="rule"></span>
-      <span class="kind">Speaker</span><span class="lamp live"></span>
+      <span class="micro kind">SPEAKER</span><span class="lamp ok"></span>
     </div>
-    <div class="followrow">
-      <span class="minidisc" aria-hidden="true"></span>
-      <p class="doing">Following Kitchen &mdash; Harvest Moon.</p>
-    </div>
+    <p class="doing">Following Kitchen &mdash; Harvest Moon.</p>
     <div class="slider">
-      <span class="fieldlabel">Volume</span>
+      <span class="fieldlabel">VOLUME</span>
       <input type="range" min="0" max="100" value="25" aria-label="Volume">
-      <span class="value">25</span>
+      <span class="value mono readout">25</span>
     </div>
     <div class="grouprow">
       <span class="caption">Grouped under Kitchen.</span>
-      <button class="btn small ghost">LEAVE</button>
+      <button class="btn small">LEAVE</button>
     </div>
+    <span class="address mono">192.168.1.17 &middot; sonos</span>
   </section>
 
-  <!-- Paused, alone: the platter stands still, the arm rests parked off
-       the record, the fill and playhead go grey, and the join picker
-       offers the one other speaker in the house. Same geometry as the
-       playing deck — instruments hold their shape between states. -->
+  <!-- Paused, alone: the disc stays put, the arm rests where it stopped,
+       the needles lie down, and the join picker offers the other speaker. -->
   <section class="plate device">
     <div class="title-rule">
       <span class="title">Kitchen</span><span class="rule"></span>
-      <span class="kind">Speaker</span><span class="lamp ok"></span>
+      <span class="micro kind">SPEAKER</span><span class="lamp idle"></span>
     </div>
     <p class="doing">Paused &mdash; Harvest Moon.</p>
     <div class="deck">
-      <div class="platter-well">
+      <div class="table">
         <div class="platter">
-          <span class="disclabel"><span class="mono-mark">HM</span><span class="rpm">33&#8531; RPM</span><span class="hole"></span></span>
+          <div class="vinyl">
+            <div class="label"><span class="l1">HARVEST MOON</span><span class="l2">NEIL YOUNG</span></div>
+          </div>
         </div>
-        <div class="tonearm"><span class="base"></span><span class="boom"><span class="counterweight"></span><span class="tube"></span><span class="headshell"></span></span></div>
+        <span class="spindle"></span>
+        <div class="tonearm"><span class="base"></span><span class="tube" style="--arm:14deg"></span></div>
       </div>
       <div class="deck-panel">
         <div class="toprow">
@@ -109,29 +113,34 @@
             <span class="track">Harvest Moon</span>
             <span class="artist">Neil Young</span>
           </div>
+          <div class="vus">
+            <span class="vu"><span class="needle"></span><span class="vu-tag">L</span></span>
+            <span class="vu"><span class="needle"></span><span class="vu-tag">R</span></span>
+          </div>
         </div>
         <div class="progress">
           <span class="bar"><span class="fill" style="width:38%"></span></span>
-          <span class="clock">1:54&thinsp;/&thinsp;5:03</span>
+          <span class="clock mono readout">1:54 / 5:03</span>
         </div>
         <div class="actions">
-          <button class="btn" aria-label="Previous">&#9198;&#xFE0E;</button>
-          <button class="btn primary" aria-label="Play">&#9205;&#xFE0E;</button>
-          <button class="btn" aria-label="Next">&#9197;&#xFE0E;</button>
+          <button class="btn" aria-label="Previous">&#9198;</button>
+          <button class="btn primary" aria-label="Play">&#9205;</button>
+          <button class="btn" aria-label="Next">&#9197;</button>
+          <button class="btn" aria-pressed="false">MUTE</button>
         </div>
       </div>
     </div>
     <div class="slider">
-      <span class="fieldlabel">Volume</span>
+      <span class="fieldlabel">VOLUME</span>
       <input type="range" min="0" max="100" value="40" aria-label="Volume">
-      <span class="value">40</span>
-      <button class="btn small ghost" aria-pressed="false">MUTE</button>
+      <span class="value mono readout">40</span>
     </div>
     <div class="grouprow">
       <span class="caption">Alone.</span>
       <select aria-label="Join"><option>join Move&hellip;</option></select>
-      <button class="btn small ghost">JOIN</button>
+      <button class="btn small">JOIN</button>
     </div>
+    <span class="address mono">192.168.1.6 &middot; sonos</span>
   </section>
 
   </div>
