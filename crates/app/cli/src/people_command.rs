@@ -612,10 +612,11 @@ fn forget(people: &People, name: PersonName) -> Result<(), String> {
 /// The capability vocabulary, from the API's own list rather than a second copy.
 fn vocabulary() -> String {
     let mut text = String::from("Every capability word, and the target it takes:\n\n");
-    for (word, target) in selfhost_admin::people_api::VOCABULARY {
+    for (word, target, honoured) in selfhost_admin::people_api::VOCABULARY {
+        let suffix = if honoured { "" } else { " (declared, no route honours it yet)" };
         match target {
-            Some(kind) => text.push_str(&format!("  {word}:<{kind}>\n")),
-            None => text.push_str(&format!("  {word}\n")),
+            Some(kind) => text.push_str(&format!("  {word}:<{kind}>{suffix}\n")),
+            None => text.push_str(&format!("  {word}{suffix}\n")),
         }
     }
     text
@@ -757,7 +758,7 @@ allowed_cidrs = ["10.66.0.0/24"]
     fn every_word_the_help_advertises_is_a_word_that_parses() {
         // USAGE lists the vocabulary for a person reading it; this is the guard
         // that keeps that copy honest against the enum that enforces it.
-        for (word, target) in selfhost_admin::people_api::VOCABULARY {
+        for (word, target, _honoured) in selfhost_admin::people_api::VOCABULARY {
             assert!(USAGE.contains(word), "{word} is missing from the help text");
             let spelling = match target {
                 Some("share") => format!("{word}:vault"),

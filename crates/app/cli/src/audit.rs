@@ -236,9 +236,14 @@ fn node_of(name: &str) -> NodeName {
 ///   able to tell them apart.
 /// - [`Identity::Owner`] is now the console password alone, which is what a
 ///   console login is.
+/// - [`Identity::Agent`] is an agent token and nothing else, the same
+///   non-inference as [`Identity::Machine`]: [`Credential::belongs_to`] admits
+///   no other credential for it, so a session carrying an agent's name was
+///   opened by that agent's token, full stop.
 fn credential_of(identity: &Identity) -> Credential {
     let opening = match identity {
         Identity::Machine => return Credential::Bearer,
+        Identity::Agent(_) => return Credential::Agent,
         Identity::Person(_) => Opening::Passkey,
         Identity::Owner => Opening::Password,
     };
