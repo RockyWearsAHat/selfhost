@@ -183,8 +183,8 @@ impl Report {
     /// Returns a [`Refusal`] naming the field to fix: a body that is not an object, an unknown
     /// kind, an empty title or detail, a project key that is not a key, or an identity field
     /// over its cap. Whether the project *exists* is decided by [`crate::store`], not here —
-    /// and under this contract a service that does not exist yet is created by the first report
-    /// filed to it.
+    /// and under this contract a service must be registered and claimed by its owner before the
+    /// first report can be filed to it.
     pub fn parse(body: &Json, project: &str, at: String, source: String) -> Result<Self, Refusal> {
         if body.get("kind").is_none() && body.get("title").is_none() {
             return Err(Refusal(
