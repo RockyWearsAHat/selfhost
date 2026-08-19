@@ -3425,6 +3425,83 @@ fn mint_agent(
     store.mint(&agent_name, grants).expect("mints").as_str().to_owned()
 }
 
+/// The console site is not administrable through this API, by anybody.
+///
+/// The escalation, before this: an agent scoped to `site.admin` and nothing
+/// else could release the console's hostname (`DELETE .../domains/...` —
+/// validation only refuses a hostname claimed *twice*, so releasing it first
+/// makes the next call legal) and then claim that same hostname for a site
+/// whose files it uploads. The operator opening the console through the tunnel
+/// would then be served agent-authored content, over the real certificate, at
+/// the exact name where they type a password or use a passkey. Removing the
+/// site outright was one call and took the console off the air.
+#[tokio::test]
+async fn the_console_site_is_refused_to_every_caller_of_this_api() {
+    let (api, dir, config_path) = site_admin_api("sites-console-guard");
+    let agent_token =
+        mint_agent(dir.path(), "claude-mac", vec![selfhost_identity::Capability::SiteAdmin]);
+
+    // A console site, exactly as an operator writes one.
+    let mut source = std::fs::read_to_string(&config_path).expect("the starter config");
+    source.push_str(
+        "\n[[sites]]\nname = \"admin\"\ndomains = [\"admin.example.com\"]\n\
+         static_root = \"./sites/console\"\nconsole = true\n\
+         allowed_cidrs = [\"127.0.0.1/32\"]\n",
+    );
+    std::fs::write(&config_path, &source).expect("writes the console site");
+
+    // Every mutating route, refused — and refused legibly, since the caller
+    // passed the capability check and can see the site in `sites_list`.
+    let (status, body) = call(
+        &api,
+        "DELETE",
+        "/api/sites/admin/domains/admin.example.com",
+        Some(&agent_token),
+        "",
+    )
+    .await;
+    assert_eq!(status, 403, "releasing the console's hostname: {body:?}");
+
+    let (status, _) = call(
+        &api,
+        "POST",
+        "/api/sites/admin/domains",
+        Some(&agent_token),
+        r#"{"hostname":"sneaky.example.com"}"#,
+    )
+    .await;
+    assert_eq!(status, 403, "adding a hostname to the console site");
+
+    let (status, _) = call(&api, "DELETE", "/api/sites/admin", Some(&agent_token), "").await;
+    assert_eq!(status, 403, "taking the console off the air");
+
+    let (status, _) = call(
+        &api,
+        "PUT",
+        "/api/sites/admin/files/entry?path=index.html",
+        Some(&agent_token),
+        "<h1>not the console</h1>",
+    )
+    .await;
+    assert_eq!(status, 403, "writing content under the console site's name");
+
+    // The console site is still exactly as the operator wrote it.
+    let after = std::fs::read_to_string(&config_path).expect("the config survives");
+    assert!(after.contains("admin.example.com"), "the hostname was not released");
+    assert!(after.contains("console = true"), "the console site was not removed");
+
+    // And an ordinary site is untouched by the guard.
+    let (status, _) = call(
+        &api,
+        "POST",
+        "/api/sites",
+        Some(&agent_token),
+        r#"{"name":"blog","domains":["blog.example.com"],"static":true}"#,
+    )
+    .await;
+    assert_eq!(status, 200, "a normal site is still administrable");
+}
+
 /// The security property this whole feature exists for: an agent token
 /// scoped to `site.admin` can create a site over the API, the plain
 /// deployment bearer token cannot (it is `Identity::Machine`, and

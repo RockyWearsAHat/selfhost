@@ -1130,7 +1130,37 @@ async fn serve_everything(
     // reach a proxy whose backends have not been started.
     let server = Arc::new(Server::build(&config, &project_dir));
     server.spawn_health_tasks();
-    tokio::spawn(watch_config(Arc::clone(&server), config_path, project_dir.clone()));
+
+    // One place the live config is published from, so everything that has to
+    // react to an edit reads the same value at the same moment.
+    //
+    // # The defect this closes
+    //
+    // The watch below reloaded the proxy's routing table and *nothing else*, and
+    // for a hand-edited file that was defensible: the operator was already at a
+    // shell and could restart. It stopped being defensible the moment a site
+    // could be created through the API — `POST /api/sites`, and the MCP tools
+    // above it. A site added that way was routed within seconds and had **no DNS
+    // record and no certificate** until somebody restarted the daemon, so an
+    // agent that "published a site" produced a hostname that resolved nowhere
+    // and, if reached by IP, presented the wrong certificate. Half-configured is
+    // worse than unconfigured, because it reports success.
+    //
+    // Two subscribers, both below: the zone set is rebuilt and adopted, and the
+    // certificate sweep is woken to issue for hostnames it has never seen. The
+    // *listeners* still belong to startup — a changed bind address, `[mail]`, or
+    // `[dns].bind` needs the restart it always did, and this says so rather than
+    // implying more than it does.
+    let (config_now, config_changes) = tokio::sync::watch::channel(Arc::new(config.clone()));
+    tokio::spawn(watch_config(
+        Arc::clone(&server),
+        config_path,
+        project_dir.clone(),
+        config_now,
+    ));
+    if let Some(authority) = dns.clone() {
+        tokio::spawn(readopt_zones(authority, config_changes.clone(), project_dir.clone()));
+    }
 
     let certificates = CertificateStore::open(&data_dir).map_err(|e| e.to_string())?;
 
@@ -1164,6 +1194,7 @@ async fn serve_everything(
             project_dir.clone(),
             certificates.clone(),
             Arc::clone(&resolver),
+            config_changes.clone(),
         ));
     }
 
@@ -2330,7 +2361,12 @@ const CONFIG_POLL_INTERVAL: Duration = Duration::from_secs(3);
 /// A config that fails to parse or validate is logged and left alone — the
 /// previous good routing table keeps serving rather than the daemon crashing
 /// on a typo, or worse, going dark mid-edit.
-async fn watch_config(server: Arc<Server>, config_path: PathBuf, project_dir: PathBuf) {
+async fn watch_config(
+    server: Arc<Server>,
+    config_path: PathBuf,
+    project_dir: PathBuf,
+    published: tokio::sync::watch::Sender<Arc<Config>>,
+) {
     let mut last_modified = std::fs::metadata(&config_path).and_then(|m| m.modified()).ok();
     let mut ticker = tokio::time::interval(CONFIG_POLL_INTERVAL);
     // The first tick fires immediately; skip it, since `serve` just loaded
@@ -2338,7 +2374,30 @@ async fn watch_config(server: Arc<Server>, config_path: PathBuf, project_dir: Pa
     ticker.tick().await;
     loop {
         ticker.tick().await;
-        check_and_reload(&server, &config_path, &project_dir, &mut last_modified);
+        check_and_reload(&server, &config_path, &project_dir, &mut last_modified, Some(&published));
+    }
+}
+
+/// Rebuilds and adopts the zone set whenever the config changes.
+///
+/// The rebuild goes through [`lan_dns::build_authority`] — the same constructor
+/// startup used — so a hostname added to a site, a whole new site, or a new mail
+/// domain gets exactly the records it would have got from a restart, derived the
+/// one way rather than patched a second way. The running public address is
+/// carried across rather than rediscovered: the dynamic-IP updater owns that
+/// fact, and asking the network again here would race it.
+///
+/// Adoption preserves each zone's serial — see [`Authority::adopt`].
+async fn readopt_zones(
+    authority: selfhost_dns::authority::Authority,
+    mut changes: tokio::sync::watch::Receiver<Arc<Config>>,
+    project_dir: PathBuf,
+) {
+    while changes.changed().await.is_ok() {
+        let config = changes.borrow_and_update().clone();
+        let rebuilt = lan_dns::build_authority(&config, &project_dir, authority.public_ip().await);
+        let origins = authority.adopt(&rebuilt).await;
+        println!("config: DNS zones rebuilt — now serving {}", origins.join(", "));
     }
 }
 
@@ -2354,6 +2413,7 @@ fn check_and_reload(
     config_path: &Path,
     project_dir: &Path,
     last_modified: &mut Option<std::time::SystemTime>,
+    published: Option<&tokio::sync::watch::Sender<Arc<Config>>>,
 ) {
     let Ok(metadata) = std::fs::metadata(config_path) else { return };
     let Ok(modified) = metadata.modified() else { return };
@@ -2366,6 +2426,13 @@ fn check_and_reload(
         Ok(config) => {
             server.reload(&config, project_dir);
             eprintln!("config: reloaded — {} site(s) now routed", config.sites.len());
+            // Published *after* the routing table is live, so a subscriber can
+            // never act on a config the proxy is not yet serving — a zone that
+            // resolved to a hostname the proxy would 404 would be the same
+            // half-configured state in the other direction.
+            if let Some(published) = published {
+                let _ = published.send(Arc::new(config));
+            }
         }
         Err(error) => eprintln!(
             "config: {} changed but does not validate ({error}) — keeping the previous config \
@@ -2423,10 +2490,23 @@ role = \"owner\"
         let with_site = format!(
             "{BASE}\n[[sites]]\nname = \"a\"\ndomains = [\"example.com\"]\nstatic_root = \"./x\"\n"
         );
+        // A subscriber, because routing is only half of what a new site needs:
+        // the zone rebuild and the certificate sweep both hang off this
+        // publication, and a reload that forgot to publish would put the
+        // deployment back in the half-configured state this exists to end.
+        let (published, mut listening) =
+            tokio::sync::watch::channel(std::sync::Arc::new(config.clone()));
+
         write_config(&config_path, &with_site, t0 + Duration::from_secs(1));
-        check_and_reload(&server, &config_path, &dir, &mut last_modified);
+        check_and_reload(&server, &config_path, &dir, &mut last_modified, Some(&published));
 
         assert!(server.route("example.com").is_some(), "the added site is now routed");
+        assert!(listening.has_changed().expect("the sender is alive"), "the reload published");
+        assert_eq!(
+            listening.borrow_and_update().sites.len(),
+            1,
+            "subscribers see the config that was just applied, not the one at startup"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -2448,8 +2528,14 @@ role = \"owner\"
         let broken = format!(
             "{with_site}\n[[sites]]\nname = \"b\"\ndomains = [\"example.com\"]\nstatic_root = \"./y\"\n"
         );
+        let (published, mut listening) =
+            tokio::sync::watch::channel(std::sync::Arc::new(config.clone()));
         write_config(&config_path, &broken, t0 + Duration::from_secs(1));
-        check_and_reload(&server, &config_path, &dir, &mut last_modified);
+        check_and_reload(&server, &config_path, &dir, &mut last_modified, Some(&published));
+        assert!(
+            !listening.has_changed().expect("the sender is alive"),
+            "an invalid edit publishes nothing — a subscriber must never act on it"
+        );
 
         // The previous, valid routing table is still the one live.
         assert!(server.route("example.com").is_some(), "the last-good config is still serving");
@@ -2467,7 +2553,7 @@ role = \"owner\"
 
         // Nothing on disk changed since `last_modified`, so this must be a
         // no-op rather than re-reading and re-applying the same config.
-        check_and_reload(&server, &config_path, &dir, &mut last_modified);
+        check_and_reload(&server, &config_path, &dir, &mut last_modified, None);
         assert_eq!(last_modified, Some(t0));
     }
 }
