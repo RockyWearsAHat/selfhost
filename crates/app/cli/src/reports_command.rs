@@ -4,12 +4,13 @@
 //! selfhost reports serve [--port N] [--route /report] [--project dx] [--no-mail]
 //!                         [--accounts --public-base-url URL [--rp-id HOST] [--site-name NAME]
 //!                          --verify-from ADDR]
-//! selfhost reports project add <key>      make a service reports may be filed against
-//! selfhost reports projects               what this box holds reports for
-//! selfhost reports list [<project>]       the open reports, newest sighting first
-//! selfhost reports close <project> <id>   a fixed report leaves the database
-//! selfhost reports token [--new]          the token a subscribed checkout reads the feed with
-//! selfhost reports oauth add|list|remove  the "sign in with…" providers accounts offers
+//! selfhost reports project add <key>       make a service reports may be filed against
+//! selfhost reports project rotate <key>    mint a fresh reader token for an operator-claimed service
+//! selfhost reports projects                what this box holds reports for
+//! selfhost reports list [<project>]        the open reports, newest sighting first
+//! selfhost reports close <project> <id>    a fixed report leaves the database
+//! selfhost reports token [--new]           the token a subscribed checkout reads the feed with
+//! selfhost reports oauth add|list|remove   the "sign in with…" providers accounts offers
 //! ```
 //!
 //! `serve` is what a supervised service runs; everything else is an operator at a terminal.
@@ -17,9 +18,9 @@
 //! module only turns arguments into that crate's values, and it deliberately holds no rules of
 //! its own.
 //!
-//! `project add` is now a convenience rather than a precondition: a service comes into
-//! existence when the first report is filed to `…/report?<service>`, which is what lets a tool
-//! nobody here has configured reach the people who fix it.
+//! `project add` registers a service and claims it for the operator, minting a scoped reader
+//! token. Filing to an unclaimed or unregistered service is refused — service creation is no
+//! longer auto-created on first report.
 //!
 //! # The account subsystem is off unless `--accounts` says otherwise
 //!
@@ -88,7 +89,7 @@ pub fn run(arguments: &[String], config: &Config, project_dir: &Path) -> Result<
 
     match arguments.get(1).map(String::as_str).unwrap_or("list") {
         "serve" => serve(arguments, config, &data_dir, store),
-        "project" => project(arguments, &store),
+        "project" => project(arguments, &store, &data_dir.join(ACCOUNTS_DIR)),
         "projects" => projects(&store),
         "list" => list(arguments.get(2).map(String::as_str), &store),
         "close" => close(arguments, &store),
@@ -440,8 +441,8 @@ fn mailbox(arguments: &[String], config: &Config) -> Result<Option<Mailbox>, Str
     Mailbox::new(&from, &to, &hostname, &host, port).map(Some)
 }
 
-/// `selfhost reports project add <key>`.
-fn project(arguments: &[String], store: &Store) -> Result<(), String> {
+/// `selfhost reports project add <key>` and `selfhost reports project rotate <key>`.
+fn project(arguments: &[String], store: &Store, accounts_dir: &Path) -> Result<(), String> {
     match arguments.get(2).map(String::as_str) {
         Some("add") => {
             let named = arguments.get(3).ok_or(
@@ -451,9 +452,47 @@ fn project(arguments: &[String], store: &Store) -> Result<(), String> {
                 .map_err(|refusal| refusal.message().to_string())?;
             store.add_project(&key).map_err(|error| error.to_string())?;
             println!("reports about `{key}` are now accepted");
+
+            let owners = Owners::load(accounts_dir);
+            match owners.claim(&key, "operator") {
+                Ok(token) => {
+                    println!("reader token: {token}");
+                    println!(
+                        "this is shown once — store it now; `selfhost reports project rotate \
+                         {key}` mints a fresh one if it's lost"
+                    );
+                }
+                Err(_) => {
+                    println!(
+                        "a reader token already exists for `{key}` — run `selfhost reports \
+                         project rotate {key}` to mint a fresh one"
+                    );
+                }
+            }
             Ok(())
         }
-        _ => Err("`reports project` takes `add <key>`".to_string()),
+        Some("rotate") => {
+            let named = arguments.get(3).ok_or(
+                "`reports project rotate` needs a key, e.g. `selfhost reports project rotate dx`",
+            )?;
+            let key = selfhost_reports::report::project_key(named)
+                .map_err(|refusal| refusal.message().to_string())?;
+            let owners = Owners::load(accounts_dir);
+            match owners.rotate(&key, "operator")? {
+                Some(token) => {
+                    println!("reader token: {token}");
+                    println!("this is shown once — store it now; the old token no longer works");
+                }
+                None => {
+                    return Err(format!(
+                        "`{key}` has no operator-claimed token to rotate — run `selfhost \
+                         reports project add {key}` first"
+                    ));
+                }
+            }
+            Ok(())
+        }
+        _ => Err("`reports project` takes `add <key>` or `rotate <key>`".to_string()),
     }
 }
 
@@ -474,10 +513,8 @@ fn projects(store: &Store) -> Result<(), String> {
 /// `selfhost reports list [<project>]`.
 fn list(named: Option<&str>, store: &Store) -> Result<(), String> {
     let keys = match named {
-        Some(named) => vec![
-            selfhost_reports::report::project_key(named)
-                .map_err(|refusal| refusal.message().to_string())?,
-        ],
+        Some(named) => vec![selfhost_reports::report::project_key(named)
+            .map_err(|refusal| refusal.message().to_string())?],
         None => store.projects().map_err(|error| error.to_string())?,
     };
     for key in keys {
@@ -1105,6 +1142,136 @@ mod tests {
         store.add_project("proj-b").expect("added proj-b");
         let output = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| usage(None, &store)));
         assert!(output.is_ok(), "usage should not panic");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn project_add_claims_ownership_and_prints_a_reader_token_once() {
+        let dir = scratch("project-add-claim");
+        let accounts_dir = dir.join("accounts");
+        let store_dir = dir.join("store");
+        std::fs::create_dir_all(&accounts_dir).expect("created accounts dir");
+        std::fs::create_dir_all(&store_dir).expect("created store dir");
+        let store = Store::open(&store_dir).expect("opened store");
+
+        let arguments = vec![
+            "reports".to_string(),
+            "project".to_string(),
+            "add".to_string(),
+            "myapp".to_string(),
+        ];
+        let output = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            project(&arguments, &store, &accounts_dir)
+        }));
+        assert!(output.is_ok(), "project add should not panic");
+
+        // Verify ownership was claimed
+        let owners = Owners::load(&accounts_dir);
+        assert_eq!(owners.owner_of("myapp").as_deref(), Some("operator"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn project_add_twice_is_a_successful_no_op_that_does_not_reveal_the_existing_token() {
+        let dir = scratch("project-add-twice");
+        let accounts_dir = dir.join("accounts");
+        let store_dir = dir.join("store");
+        std::fs::create_dir_all(&accounts_dir).expect("created accounts dir");
+        std::fs::create_dir_all(&store_dir).expect("created store dir");
+        let store = Store::open(&store_dir).expect("opened store");
+
+        let arguments = vec![
+            "reports".to_string(),
+            "project".to_string(),
+            "add".to_string(),
+            "myapp".to_string(),
+        ];
+        let first = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            project(&arguments, &store, &accounts_dir)
+        }));
+        assert!(first.is_ok(), "first add should succeed");
+
+        let second = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            project(&arguments, &store, &accounts_dir)
+        }));
+        assert!(second.is_ok(), "second add should also succeed (no-op)");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn project_rotate_mints_a_fresh_token_and_kills_the_old_one() {
+        let dir = scratch("project-rotate-fresh");
+        let accounts_dir = dir.join("accounts");
+        let store_dir = dir.join("store");
+        std::fs::create_dir_all(&accounts_dir).expect("created accounts dir");
+        std::fs::create_dir_all(&store_dir).expect("created store dir");
+        let store = Store::open(&store_dir).expect("opened store");
+
+        // First, add a project
+        let add_arguments = vec![
+            "reports".to_string(),
+            "project".to_string(),
+            "add".to_string(),
+            "myapp".to_string(),
+        ];
+        project(&add_arguments, &store, &accounts_dir).expect("add succeeded");
+
+        // Get the old token by directly accessing the owner
+        let owners_before = Owners::load(&accounts_dir);
+        let entries = owners_before.entries();
+        assert_eq!(entries.len(), 1);
+        let old_digest = entries[0].reader_digest.clone();
+
+        // Now rotate
+        let rotate_arguments = vec![
+            "reports".to_string(),
+            "project".to_string(),
+            "rotate".to_string(),
+            "myapp".to_string(),
+        ];
+        let rotate_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            project(&rotate_arguments, &store, &accounts_dir)
+        }));
+        assert!(rotate_result.is_ok(), "rotate should not panic");
+
+        // Verify the token changed
+        let owners_after = Owners::load(&accounts_dir);
+        let entries_after = owners_after.entries();
+        assert_eq!(entries_after.len(), 1);
+        assert_ne!(
+            entries_after[0].reader_digest, old_digest,
+            "token digest should be different after rotation"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn project_rotate_of_an_unclaimed_key_is_refused() {
+        let dir = scratch("project-rotate-unclaimed");
+        let accounts_dir = dir.join("accounts");
+        let store_dir = dir.join("store");
+        std::fs::create_dir_all(&accounts_dir).expect("created accounts dir");
+        std::fs::create_dir_all(&store_dir).expect("created store dir");
+        let store = Store::open(&store_dir).expect("opened store");
+
+        // Try to rotate a key that was never claimed
+        let arguments = vec![
+            "reports".to_string(),
+            "project".to_string(),
+            "rotate".to_string(),
+            "unclaimed".to_string(),
+        ];
+        let result = project(&arguments, &store, &accounts_dir);
+        assert!(result.is_err(), "rotate of unclaimed key should fail");
+        let error = result.unwrap_err();
+        assert!(
+            error.contains("no operator-claimed token to rotate"),
+            "error message should mention no operator-claimed token: {error}"
+        );
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
