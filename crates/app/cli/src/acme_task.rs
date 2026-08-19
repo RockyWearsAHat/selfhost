@@ -53,6 +53,7 @@ pub async fn issue_and_renew(
     project_dir: PathBuf,
     store: CertificateStore,
     resolver: Arc<SniResolver>,
+    mut changes: tokio::sync::watch::Receiver<Arc<Config>>,
 ) {
     if matches!(config.server.acme, AcmeEnvironment::SelfSigned) {
         return;
@@ -63,8 +64,26 @@ pub async fn issue_and_renew(
     let account_dir = data_dir.join("acme");
 
     loop {
-        let interval = run_sweep(&config, &store, &resolver, &account_dir, &challenge_dir).await;
-        sleep(interval).await;
+        // Read the *current* config each sweep rather than the one this task was
+        // spawned with. A site added after startup — which is what the site API
+        // and the MCP tools above it do — used to be invisible here until the
+        // daemon restarted, so its hostname was routed and served the fallback
+        // self-signed certificate: a browser warning on a site that had just
+        // reported success.
+        let current = changes.borrow_and_update().clone();
+        let interval = run_sweep(&current, &store, &resolver, &account_dir, &challenge_dir).await;
+
+        // Whichever comes first: the ordinary timer, or a config change. Waiting
+        // out a twelve-hour sweep interval before noticing a site created a
+        // minute ago is the same defect wearing a clock.
+        tokio::select! {
+            _ = sleep(interval) => {}
+            changed = changes.changed() => {
+                if changed.is_err() {
+                    return; // the daemon is shutting down; nothing publishes any more
+                }
+            }
+        }
     }
 }
 

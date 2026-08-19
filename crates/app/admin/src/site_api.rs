@@ -91,6 +91,47 @@ impl Wiring {
     }
 }
 
+/// Refuses any change to the site that serves the admin console.
+///
+/// # The escalation this closes
+///
+/// Every route here is reachable by an unattended agent credential scoped to
+/// `SiteAdmin` and nothing else, and `SiteAdmin` was written to mean "may manage
+/// sites". The console site is not one of those in any useful sense — it is the
+/// door the caller's own operator authenticates at, and it was reachable by name
+/// like any other. Two ordinary calls were enough:
+/// `DELETE /api/sites/admin/domains/admin.example.com`, then
+/// `POST /api/sites/<its-own>/domains` claiming that hostname — validation only
+/// refuses a hostname claimed *twice*, so releasing it first makes the second
+/// call legal. The console's own `allowed_cidrs` gate survives that, but the
+/// gate is not what was attacked: after it, the operator opening the console
+/// through the tunnel would reach agent-authored content, served over the real
+/// certificate at the exact name where they type a password or present a
+/// passkey. `remove` was worse still and simpler — one call and the console
+/// stops being served at all.
+///
+/// So the rule is flat, and deliberately not a capability: **a site with
+/// `console = true` is not manageable through this API**, by any caller, however
+/// scoped. Minting a wider grant cannot reach it; only somebody with a shell on
+/// the box and the config file in front of them can change the console's
+/// routing, which is exactly who could already.
+///
+/// The refusal is legible rather than a uniform 404: the caller has already
+/// passed the capability check and can see the site in `sites_list`, so hiding
+/// the reason would teach it nothing except that this API is unreliable.
+fn refuse_if_console(wiring: &Wiring, name: &str) -> Option<Response> {
+    let config = load(wiring).ok()?;
+    let site = config.sites.iter().find(|site| site.name == name)?;
+    site.console.then(|| {
+        problem(
+            Status(403),
+            "that site serves the admin console, and the console is not manageable through \
+             this API — its routing is changed with a shell on the box, by somebody who \
+             already holds the authority it protects",
+        )
+    })
+}
+
 /// Loads the config, or the 500 a caller should see for a config this daemon
 /// itself cannot read.
 fn load(wiring: &Wiring) -> Result<Config, Response> {
@@ -318,6 +359,9 @@ pub fn add(wiring: &Wiring, body: &[u8]) -> Response {
 /// different kind of power than "managing sites", and this route does not
 /// carry it.
 pub fn remove(wiring: &Wiring, name: &str) -> Response {
+    if let Some(refusal) = refuse_if_console(wiring, name) {
+        return refusal;
+    }
     let source = match read_source(wiring) {
         Ok(source) => source,
         Err(refusal) => return refusal,
@@ -345,6 +389,9 @@ fn parse_hostname(body: &[u8]) -> Result<String, String> {
 
 /// Answers `POST /api/sites/<name>/domains`.
 pub fn add_domain(wiring: &Wiring, name: &str, body: &[u8]) -> Response {
+    if let Some(refusal) = refuse_if_console(wiring, name) {
+        return refusal;
+    }
     let hostname = match parse_hostname(body) {
         Ok(hostname) => hostname,
         Err(message) => return problem(Status(400), &message),
@@ -365,6 +412,9 @@ pub fn add_domain(wiring: &Wiring, name: &str, body: &[u8]) -> Response {
 
 /// Answers `DELETE /api/sites/<name>/domains/<hostname>`.
 pub fn remove_domain(wiring: &Wiring, name: &str, hostname: &str) -> Response {
+    if let Some(refusal) = refuse_if_console(wiring, name) {
+        return refusal;
+    }
     let source = match read_source(wiring) {
         Ok(source) => source,
         Err(refusal) => return refusal,
@@ -467,6 +517,9 @@ fn parse_path(body: &[u8]) -> Result<String, String> {
 
 /// Answers `POST /api/sites/<name>/files/mkdir`.
 pub fn mkdir(wiring: &Wiring, name: &str, body: &[u8]) -> Response {
+    if let Some(refusal) = refuse_if_console(wiring, name) {
+        return refusal;
+    }
     let dir = match open_managed_dir(wiring, name) {
         Ok(dir) => dir,
         Err(refusal) => return refusal,
@@ -498,6 +551,9 @@ pub fn mkdir(wiring: &Wiring, name: &str, body: &[u8]) -> Response {
 /// arrives already buffered by the ordinary API path, capped at
 /// [`crate::MAX_BODY`].
 pub fn put_file(wiring: &Wiring, name: &str, query: &str, body: &[u8]) -> Response {
+    if let Some(refusal) = refuse_if_console(wiring, name) {
+        return refusal;
+    }
     if body.len() > MAX_BODY {
         // Unreachable today — `read_body` already refuses this before any
         // route sees the bytes — but stated rather than assumed, so a future
@@ -539,6 +595,9 @@ pub fn put_file(wiring: &Wiring, name: &str, query: &str, body: &[u8]) -> Respon
 
 /// Answers `DELETE /api/sites/<name>/files/entry?path=…`.
 pub fn delete_file(wiring: &Wiring, name: &str, query: &str) -> Response {
+    if let Some(refusal) = refuse_if_console(wiring, name) {
+        return refusal;
+    }
     let dir = match open_managed_dir(wiring, name) {
         Ok(dir) => dir,
         Err(refusal) => return refusal,

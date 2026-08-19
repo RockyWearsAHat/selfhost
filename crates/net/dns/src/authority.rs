@@ -317,6 +317,54 @@ impl Authority {
         answer
     }
 
+    /// Adopts a rebuilt zone set, in place, without dropping the listener.
+    ///
+    /// # Why this exists
+    ///
+    /// The zones are built once, from the config, at startup — and everything
+    /// that adds a *hostname* afterwards went unserved until somebody restarted
+    /// the daemon. That is not a hypothetical: the site API (and the MCP tools
+    /// above it) write a new site into `selfhost.config.toml`, the config watch
+    /// reloads the proxy's routing table within seconds, and the new hostname
+    /// was then routed by the proxy and unknown to DNS — a site that answers
+    /// perfectly to anyone who already knows where to send the request, and
+    /// resolves for nobody. A door that half-opens is worse than one that does
+    /// not, because it looks finished.
+    ///
+    /// # The serial is the whole subtlety
+    ///
+    /// A rebuilt zone carries a *freshly derived* SOA serial, which is today's
+    /// date-based default — and that is very often **lower** than the serial the
+    /// running zone has climbed to through apex-A updates and record edits. A
+    /// secondary silently ignores a zone whose serial went backwards, so
+    /// adopting the rebuilt serial verbatim would publish changes that no
+    /// secondary would ever pick up, invisibly. Each surviving origin therefore
+    /// keeps `max(old, new)` and is bumped once past it, which is the same rule
+    /// [`Authority::set_apex_a`] follows and for the same reason.
+    ///
+    /// A zone that has *gone* from the config is dropped, and one that has
+    /// appeared is served from its own derived serial. Returns the origins now
+    /// served, in the order they will be matched.
+    pub async fn adopt(&self, rebuilt: &Authority) -> Vec<String> {
+        let fresh: Vec<Zone> = rebuilt.0.zones.lock().await.clone();
+        let mut zones = self.0.zones.lock().await;
+
+        let carried: Vec<Zone> = fresh
+            .into_iter()
+            .map(|mut zone| {
+                if let Some(running) =
+                    zones.iter().find(|old| old.origin.eq_ignore_ascii_case(&zone.origin))
+                {
+                    zone.soa.serial = zone.soa.serial.max(running.soa.serial).saturating_add(1);
+                }
+                zone
+            })
+            .collect();
+
+        *zones = carried;
+        zones.iter().map(|zone| zone.origin.clone()).collect()
+    }
+
     /// Replaces the apex A of `origin` and bumps that zone's SOA serial in place.
     ///
     /// Returns the new serial, or `None` if no such zone. The serial only ever
@@ -421,6 +469,15 @@ impl Authority {
         out.extend(zone.ns_records());
         out.extend(zone.records.iter().cloned());
         Some(out)
+    }
+
+    /// The public address the derived records point at, as it stands now.
+    ///
+    /// The dynamic-IP updater owns this fact and moves it; a rebuild asks for it
+    /// rather than rediscovering it, because a second discovery would race the
+    /// updater and could publish an address it had already superseded.
+    pub async fn public_ip(&self) -> Option<Ipv4Addr> {
+        *self.0.public_ip.lock().await
     }
 
     /// The origins served, for startup logging and the doctor.
@@ -802,6 +859,56 @@ mod tests {
     /// The TC bit out of a raw response's flags byte.
     fn is_truncated(message: &[u8]) -> bool {
         message[2] & 0x02 != 0
+    }
+
+    /// An authority serving exactly `zones`, with no config behind it.
+    fn serving(zones: Vec<Zone>) -> Authority {
+        Authority(Arc::new(Inner::new(zones, Some(PUBLIC))))
+    }
+
+    #[tokio::test]
+    async fn adopting_a_rebuilt_zone_serves_the_hostname_that_was_added() {
+        // The defect this closes: a site added through the API is routed by the
+        // proxy within seconds and was unknown to DNS until a restart.
+        let running = serving(vec![example_zone()]);
+        let mut grown = example_zone();
+        grown.records.push(record("new.example.com", RecordData::A(PUBLIC)));
+
+        assert_eq!(running.adopt(&serving(vec![grown])).await, vec!["example.com".to_owned()]);
+
+        let raw = wire::encode_query(0x1234, "new.example.com", RecordType::A).unwrap();
+        let message = running.handle_query(&raw, false, WAN_PEER).await;
+        let response = wire::decode_response(&message).unwrap();
+        assert_eq!(response.code, ResponseCode::NoError);
+        assert_eq!(response.first_a(), Some(PUBLIC), "the new host resolves without a restart");
+    }
+
+    #[tokio::test]
+    async fn a_rebuilt_zones_serial_never_goes_backwards() {
+        // The silent failure this guards: a rebuilt zone derives today's
+        // date-based serial, which is routinely *lower* than the serial the
+        // running zone has climbed to through apex-A updates — and a secondary
+        // ignores a zone whose serial decreased, so the change would publish to
+        // nobody and say nothing about it.
+        let running = serving(vec![example_zone()]);
+        let climbed = running.set_apex_a("example.com", Ipv4Addr::new(203, 0, 113, 99)).await;
+        let climbed = climbed.expect("the zone is served");
+
+        let mut rebuilt = example_zone();
+        rebuilt.soa.serial = 1; // as low as a fresh derivation can possibly be
+        running.adopt(&serving(vec![rebuilt])).await;
+
+        let serial = running.0.zones.lock().await[0].soa.serial;
+        assert!(serial > climbed, "adopted serial {serial} must exceed the running {climbed}");
+    }
+
+    #[tokio::test]
+    async fn a_zone_removed_from_the_config_stops_being_served() {
+        let running = serving(vec![example_zone()]);
+        assert!(running.adopt(&serving(Vec::new())).await.is_empty());
+        let raw = wire::encode_query(0x1234, "example.com", RecordType::A).unwrap();
+        let message = running.handle_query(&raw, false, WAN_PEER).await;
+        assert_eq!(wire::decode_response(&message).unwrap().code, ResponseCode::Refused);
     }
 
     #[test]
