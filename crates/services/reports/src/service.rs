@@ -257,6 +257,7 @@ use crate::clock;
 use crate::limit::{Decision, Limiter, Meter, Rate};
 use crate::notify::{self, Mailbox};
 use crate::oauth::{self, OAuthError};
+use crate::ownership::{Owners, Plan};
 use crate::report::{self, Refusal, Report, project_key};
 use crate::sessions::{self, Sessions};
 use crate::store::{self, Store, StoreError};
@@ -505,6 +506,7 @@ struct AccountsRuntime {
     // instead, once, the first time they are reached.
     oauth_client: Result<oauth::HttpsClient, String>,
     verify: Verifications,
+    owners: Owners,
     mail_queue: Option<OutboundQueue>,
     limiter: Mutex<Limiter>,
 }
@@ -549,6 +551,7 @@ impl AccountsRuntime {
             .map(|provider| (provider.name.clone(), provider))
             .collect();
         let verify = Verifications::load(&config.data_dir);
+        let owners = Owners::load(&config.data_dir);
         let mail_queue = config
             .mail_data_dir
             .as_deref()
@@ -574,6 +577,7 @@ impl AccountsRuntime {
             oauth_providers,
             oauth_pending: oauth::Pending::new(),
             verify,
+            owners,
             mail_queue,
             limiter,
         }
@@ -587,7 +591,7 @@ impl std::fmt::Debug for AccountsRuntime {
     fn fmt(&self, out: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             out,
-            "AccountsRuntime {{ accounts: {:?}, sessions: {:?}, webauthn: {}, oauth_providers: {}, verify: {:?} }}",
+            "AccountsRuntime {{ accounts: {:?}, sessions: {:?}, webauthn: {}, oauth_providers: {}, verify: {:?}, owners: {:?} }}",
             self.accounts,
             self.sessions,
             if self.webauthn.is_some() {
@@ -597,6 +601,7 @@ impl std::fmt::Debug for AccountsRuntime {
             },
             self.oauth_providers.len(),
             self.verify,
+            self.owners,
         )
     }
 }
@@ -842,6 +847,15 @@ impl Service {
             .and_then(|runtime| self.caller(runtime, request));
         report.account_id = account.as_ref().map(|account| account.id.clone());
 
+        // The plan gate, before the write so a refusal costs nothing. Only a *fresh* defect can
+        // grow an owned service's meter, so only a fresh one is ever refused — another sighting
+        // of a known defect rewrites a file the service already holds.
+        if let Some(runtime) = &self.accounts {
+            if let Some(refused) = self.plan_refusal(runtime, &service, &report) {
+                return refused;
+            }
+        }
+
         match self.store.record(&report) {
             Ok(recorded) => {
                 if recorded.fresh {
@@ -867,7 +881,17 @@ impl Service {
                     ]),
                 )
             }
-            Err(StoreError::NoProject(message)) => refuse(Status::NOT_FOUND, &message),
+            // With accounts on, the sentence also says where "a registered account" goes.
+            Err(StoreError::NoProject(message)) => match &self.accounts {
+                Some(runtime) => refuse(
+                    Status::NOT_FOUND,
+                    &format!(
+                        "{message} — register at {}{}/ and create it there",
+                        runtime.config.public_base_url, self.config.route
+                    ),
+                ),
+                None => refuse(Status::NOT_FOUND, &message),
+            },
             Err(StoreError::Full(message)) => refuse(Status::SERVICE_UNAVAILABLE, &message),
             Err(error) => {
                 // The reporter is told the truth without being told this box's paths.
@@ -902,6 +926,215 @@ impl Service {
                 )
             }
         }
+    }
+
+    /// `POST <route>/services/create` — a signed-in account claims a new service and receives
+    /// its reader token, exactly once.
+    ///
+    /// Service names are already public through `GET <route>/projects`, so `409` for a taken
+    /// name is no new oracle. The count cap checked here is the caller's plan's; the box-wide
+    /// cap is [`crate::store::MAX_PROJECTS`], enforced where the directory is made.
+    fn services_create(
+        &self,
+        runtime: &AccountsRuntime,
+        request: &Request,
+        body: &[u8],
+    ) -> Response {
+        let Some(account) = self.caller(runtime, request) else {
+            return refuse(Status::UNAUTHORIZED, "sign in to create a service");
+        };
+        let Some(value) = parse_json_body(body) else {
+            return refuse(Status::BAD_REQUEST, "the body is not JSON");
+        };
+        let named = value.get("name").and_then(Json::as_str).unwrap_or_default();
+        let service = match project_key(named) {
+            Ok(service) => service,
+            Err(refusal) => return refuse(Status::BAD_REQUEST, refusal.message()),
+        };
+        if self.store.has_project(&service) || runtime.owners.owner_of(&service).is_some() {
+            // 409, the same shape the OAuth email conflict answers with.
+            return refuse(
+                Status(409),
+                &format!("`{service}` is taken — pick another name"),
+            );
+        }
+        let plan = Plan::parse(&account.plan);
+        if runtime.owners.owned_by(&account.id).len() >= plan.caps().services {
+            return refuse(
+                Status::FORBIDDEN,
+                &format!(
+                    "the {} plan holds {} services — retire one, or upgrade",
+                    plan.word(),
+                    plan.caps().services
+                ),
+            );
+        }
+        if let Err(error) = self.store.add_project(&service) {
+            return match error {
+                StoreError::Full(message) => refuse(Status::SERVICE_UNAVAILABLE, &message),
+                other => {
+                    eprintln!("[{}] reports: {other}", selfhost_mail::stamp());
+                    refuse(
+                        Status::INTERNAL_SERVER_ERROR,
+                        "the service could not be created",
+                    )
+                }
+            };
+        }
+        match runtime.owners.claim(&service, &account.id) {
+            Ok(token) => answer(
+                Status::OK,
+                Json::object([
+                    ("service", Json::string(&service)),
+                    ("readerToken", Json::string(&token)),
+                ]),
+            ),
+            Err(error) => {
+                eprintln!("[{}] reports: {error}", selfhost_mail::stamp());
+                refuse(
+                    Status::INTERNAL_SERVER_ERROR,
+                    "the service could not be claimed",
+                )
+            }
+        }
+    }
+
+    /// `POST <route>/services/rotate` — a fresh reader token for a service the caller owns,
+    /// invalidating the old one. Someone else's service and an unknown one get the same
+    /// `404`, the [`Self::withdraw`] rule: a wrong-owner attempt and a wrong name must look
+    /// the same.
+    fn services_rotate(
+        &self,
+        runtime: &AccountsRuntime,
+        request: &Request,
+        body: &[u8],
+    ) -> Response {
+        let Some(account) = self.caller(runtime, request) else {
+            return refuse(Status::UNAUTHORIZED, "sign in to rotate a reader token");
+        };
+        let Some(value) = parse_json_body(body) else {
+            return refuse(Status::BAD_REQUEST, "the body is not JSON");
+        };
+        let named = value.get("name").and_then(Json::as_str).unwrap_or_default();
+        let service = match project_key(named) {
+            Ok(service) => service,
+            Err(refusal) => return refuse(Status::BAD_REQUEST, refusal.message()),
+        };
+        match runtime.owners.rotate(&service, &account.id) {
+            Ok(Some(token)) => answer(
+                Status::OK,
+                Json::object([
+                    ("service", Json::string(&service)),
+                    ("readerToken", Json::string(&token)),
+                ]),
+            ),
+            Ok(None) => refuse(Status::NOT_FOUND, "no such service"),
+            Err(error) => {
+                eprintln!("[{}] reports: {error}", selfhost_mail::stamp());
+                refuse(
+                    Status::INTERNAL_SERVER_ERROR,
+                    "the token could not be rotated",
+                )
+            }
+        }
+    }
+
+    /// `GET <route>/me/usage` — what this account's services hold against its plan's caps,
+    /// measured from the record files themselves so the meter can never drift from the disk.
+    fn me_usage(&self, runtime: &AccountsRuntime, request: &Request) -> Response {
+        let Some(account) = self.caller(runtime, request) else {
+            return refuse(Status::UNAUTHORIZED, "sign in first");
+        };
+        let plan = Plan::parse(&account.plan);
+        let caps = plan.caps();
+        let mut total = store::Usage::default();
+        let services: Vec<Json> = runtime
+            .owners
+            .owned_by(&account.id)
+            .into_iter()
+            .map(|service| {
+                let usage = self.store.usage(&service).unwrap_or_default();
+                total.records += usage.records;
+                total.bytes = total.bytes.saturating_add(usage.bytes);
+                Json::object([
+                    ("service", Json::string(&service)),
+                    ("records", Json::Number(usage.records as f64)),
+                    ("bytes", Json::Number(usage.bytes as f64)),
+                ])
+            })
+            .collect();
+        answer(
+            Status::OK,
+            Json::object([
+                ("plan", Json::string(plan.word())),
+                ("services", Json::array(services)),
+                ("serviceCap", Json::Number(caps.services as f64)),
+                (
+                    "recordsPerService",
+                    Json::Number(caps.records_per_service as f64),
+                ),
+                (
+                    "bytesPerService",
+                    Json::Number(caps.bytes_per_service as f64),
+                ),
+                ("totalRecords", Json::Number(total.records as f64)),
+                ("totalBytes", Json::Number(total.bytes as f64)),
+            ]),
+        )
+    }
+
+    /// The refusal a fresh defect gets when `service` is owned and already at its owner's
+    /// plan caps — `None` when the filing may proceed.
+    ///
+    /// An unowned service — the operator's own, or one from before ownership existed — has no
+    /// plan and is metered by the box's global caps alone, exactly as before. An owner whose
+    /// account row has vanished counts as [`Plan::Free`], the fail-closed direction.
+    fn plan_refusal(
+        &self,
+        runtime: &AccountsRuntime,
+        service: &str,
+        report: &Report,
+    ) -> Option<Response> {
+        let owner = runtime.owners.owner_of(service)?;
+        let plan = Plan::parse(
+            &runtime
+                .accounts
+                .find_by_id(&owner)
+                .map(|account| account.plan)
+                .unwrap_or_default(),
+        );
+        let caps = plan.caps();
+        if self.store.get(service, &report.id()).is_ok() {
+            return None;
+        }
+        let usage = match self.store.usage(service) {
+            Ok(usage) => usage,
+            // The store's own answer to the filing will name the real problem.
+            Err(_) => return None,
+        };
+        if usage.records >= caps.records_per_service {
+            return Some(refuse(
+                Status::SERVICE_UNAVAILABLE,
+                &format!(
+                    "`{service}` is at the {} plan's limit of {} open reports — the owner can \
+                     close some, or upgrade",
+                    plan.word(),
+                    caps.records_per_service
+                ),
+            ));
+        }
+        if usage.bytes >= caps.bytes_per_service {
+            return Some(refuse(
+                Status::SERVICE_UNAVAILABLE,
+                &format!(
+                    "`{service}` is at the {} plan's limit of {} MB — the owner can close some \
+                     reports, or upgrade",
+                    plan.word(),
+                    caps.bytes_per_service / (1024 * 1024)
+                ),
+            ));
+        }
+        None
     }
 
     /// The account a request's session cookie names, if any — live, not expired, found. Used
@@ -1137,6 +1370,8 @@ impl Service {
                 | "passkey/register/finish"
                 | "passkey/login/start"
                 | "passkey/login/finish"
+                | "services/create"
+                | "services/rotate"
         ) || suffix.starts_with("oauth/")
         {
             if let Decision::Refuse(seconds) = self.admit(&runtime.limiter, client, now) {
@@ -1164,7 +1399,10 @@ impl Service {
         //
         // All five answered five hundred requests from one address before this pass, spending
         // nothing; `me` did it while replying `401` to a caller holding no credential at all.
-        if matches!(suffix, "me" | "mine" | "download" | "logout" | "capabilities") {
+        if matches!(
+            suffix,
+            "me" | "mine" | "me/usage" | "download" | "logout" | "capabilities"
+        ) {
             if let Some(refusal) = self.page_visit(client, now) {
                 return refusal;
             }
@@ -1190,6 +1428,13 @@ impl Service {
             "mine" if request.method == Method::Get => self.mine(runtime, request),
             "mine/withdraw" if request.method == Method::Post => {
                 self.withdraw(runtime, request, body)
+            }
+            "me/usage" if request.method == Method::Get => self.me_usage(runtime, request),
+            "services/create" if request.method == Method::Post => {
+                self.services_create(runtime, request, body)
+            }
+            "services/rotate" if request.method == Method::Post => {
+                self.services_rotate(runtime, request, body)
             }
             "passkey/register/start" if request.method == Method::Post => {
                 self.passkey_register_start(runtime, request, body)
@@ -1244,11 +1489,13 @@ impl Service {
             | "passkey/register/start"
             | "passkey/register/finish"
             | "passkey/login/start"
-            | "passkey/login/finish" => {
+            | "passkey/login/finish"
+            | "services/create"
+            | "services/rotate" => {
                 refuse(Status::METHOD_NOT_ALLOWED, "this endpoint takes POST")
             }
-            "verify" | "me" | "mine" | "download" | "capabilities" | "" | "index.html"
-            | "app.css" | "app.js" | "favicon.svg" => {
+            "verify" | "me" | "mine" | "me/usage" | "download" | "capabilities" | ""
+            | "index.html" | "app.css" | "app.js" | "favicon.svg" => {
                 refuse(Status::METHOD_NOT_ALLOWED, "this endpoint takes GET")
             }
             _ if suffix.starts_with("oauth/") => self.oauth_route(runtime, suffix, request),
@@ -2077,13 +2324,16 @@ impl Service {
         if request.method != Method::Get {
             return refuse(Status::METHOD_NOT_ALLOWED, "this endpoint takes GET");
         }
-        if let Some(refused) = self.check_token(request) {
-            return refused;
-        }
+        // The service is named before the credential is checked, because the credential may be
+        // scoped to it. Nothing leaks in the reorder: which services exist is public through
+        // `GET projects`, and a malformed query earns the same refusal either way.
         let project = match self.service_of(query, None) {
             Ok(project) => project,
             Err(refusal) => return refuse(Status::BAD_REQUEST, refusal.message()),
         };
+        if let Some(refused) = self.check_read_auth(request, &project) {
+            return refused;
+        }
         match self.store.list(&project) {
             Ok(entries) => answer(
                 Status::OK,
@@ -2106,9 +2356,6 @@ impl Service {
         if request.method != Method::Post {
             return refuse(Status::METHOD_NOT_ALLOWED, "this endpoint takes POST");
         }
-        if let Some(refused) = self.check_token(request) {
-            return refused;
-        }
         let asked = std::str::from_utf8(body)
             .ok()
             .and_then(|text| selfhost_json::parse(text).ok());
@@ -2119,6 +2366,9 @@ impl Service {
             Ok(project) => project,
             Err(refusal) => return refuse(Status::BAD_REQUEST, refusal.message()),
         };
+        if let Some(refused) = self.check_read_auth(request, &project) {
+            return refused;
+        }
         let Some(id) = value.get("id").and_then(Json::as_str) else {
             return refuse(Status::BAD_REQUEST, "`id` is required");
         };
@@ -2168,25 +2418,38 @@ impl Service {
         project_key(stated)
     }
 
-    /// Whether this request carries the owner's token.
+    /// Whether this request may read `service` — the owner's token opens every service, and a
+    /// service's own reader token ([`crate::ownership`]) opens exactly that one, which is what
+    /// lets the owner token stay the operator's alone however many people host services here.
     ///
-    /// A box with no token configured answers the reading routes with the same `404` an
-    /// unknown path gets: a route that cannot be used should not be a thing to probe.
-    fn check_token(&self, request: &Request) -> Option<Response> {
-        let Some(expected) = self.config.token.as_deref() else {
-            return Some(refuse(Status::NOT_FOUND, "no such endpoint"));
-        };
+    /// A box with neither an owner token nor the account subsystem answers the reading routes
+    /// with the same `404` an unknown path gets: a route that cannot be used should not be a
+    /// thing to probe. With accounts on, reader tokens can exist, so the routes exist and a
+    /// wrong credential is a plain uniform `401`. Every comparison is constant-time, and the
+    /// caller has already spent the reading allowance, so a guess stays priced.
+    fn check_read_auth(&self, request: &Request, service: &str) -> Option<Response> {
         let offered = request
             .headers
             .get_str("authorization")
             .and_then(|value| value.strip_prefix("Bearer ").map(str::to_string))
             .unwrap_or_default();
-        if constant_time_eq(offered.trim().as_bytes(), expected.as_bytes()) {
-            return None;
+        let offered = offered.trim();
+        if let Some(expected) = self.config.token.as_deref() {
+            if constant_time_eq(offered.as_bytes(), expected.as_bytes()) {
+                return None;
+            }
+        }
+        if let Some(runtime) = &self.accounts {
+            if runtime.owners.verify_reader(service, offered) {
+                return None;
+            }
+        }
+        if self.config.token.is_none() && self.accounts.is_none() {
+            return Some(refuse(Status::NOT_FOUND, "no such endpoint"));
         }
         Some(refuse(
             Status::UNAUTHORIZED,
-            "this endpoint needs the owner's token",
+            "this endpoint needs the owner's token or this service's reader token",
         ))
     }
 
@@ -5270,9 +5533,11 @@ mod tests {
         assert_eq!(refused.status, Status::TOO_MANY_REQUESTS);
     }
 
-    /// The whole of registering a service: file one report to it.
+    /// Creation is a registered act now: filing to a service nobody created is refused by
+    /// name, writes nothing — and, when the box has an account door, the sentence says where
+    /// to register.
     #[test]
-    fn filing_to_a_service_nobody_declared_brings_it_into_existence() {
+    fn filing_to_a_service_nobody_created_is_refused_and_names_the_door() {
         let service = service("new-service");
         let body = r#"{"project":"billing","kind":"bug","title":"t","detail":"d"}"#;
         let posted = request(&format!(
@@ -5286,16 +5551,22 @@ mod tests {
             Instant::now(),
             UNIX_EPOCH,
         );
-        assert_eq!(response.status, Status::OK, "{}", text(&response));
+        assert_eq!(response.status, Status::NOT_FOUND, "{}", text(&response));
         assert!(
-            text(&response).contains("\"filed\":\"report-"),
+            text(&response).contains("registered account"),
             "{}",
             text(&response)
         );
-        assert_eq!(service.store().list("billing").expect("list").len(), 1);
+        assert!(!service.store().has_project("billing"));
+
+        // With accounts on, the same refusal also says where "register" happens.
+        let with_accounts = service_with_accounts("new-service-door");
+        let refused = file(&with_accounts, body, "203.0.113.9");
+        assert_eq!(refused.status, Status::NOT_FOUND, "{}", text(&refused));
         assert!(
-            service.store().list("dx").expect("list").is_empty(),
-            "a new service's reports do not land in the default one"
+            text(&refused).contains("https://reports.example.com/report/"),
+            "{}",
+            text(&refused)
         );
     }
 
@@ -5303,6 +5574,7 @@ mod tests {
     #[test]
     fn the_query_names_the_service_and_the_body_does_not_override_it() {
         let service = service("query-wins");
+        service.store().add_project("billing").expect("project");
         let body = r#"{"project":"dx","kind":"bug","title":"t","detail":"d"}"#;
         let posted = request(&format!(
             "POST /report?billing&verbose=1 HTTP/1.1\r\nHost: x\r\nContent-Length: {}\r\n\r\n",
@@ -5620,5 +5892,202 @@ mod tests {
             "{}",
             String::from_utf8_lossy(&answered)
         );
+    }
+
+    fn get_with_bearer(target: &str, token: &str) -> Request {
+        request(&format!(
+            "GET {target} HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer {token}\r\n\r\n"
+        ))
+    }
+
+    /// The whole ownership story in one pass: a signed-in account creates a service, its
+    /// reader token opens exactly that service's feed, and the anonymous filing door to the
+    /// new service stays as open as every other's.
+    #[test]
+    fn creating_a_service_scopes_its_reader_token_to_that_service_alone() {
+        let service = service_with_accounts("svc-create");
+        let cookie = set_cookie(&register(&service, "owner@example.com", "password-1"));
+
+        let body = r#"{"name":"myapp"}"#;
+        let created = call(
+            &service,
+            &json_post_with_cookie("/report/services/create", body, &cookie),
+            body,
+        );
+        assert_eq!(created.status, Status::OK, "{}", text(&created));
+        let token = json_field(&text(&created), "readerToken");
+        assert_eq!(token.len(), 64, "{}", text(&created));
+
+        let filed = file(
+            &service,
+            r#"{"project":"myapp","kind":"bug","title":"t","detail":"d"}"#,
+            "203.0.113.9",
+        );
+        assert_eq!(filed.status, Status::OK, "{}", text(&filed));
+
+        let feed = call(&service, &get_with_bearer("/report/feed?myapp", &token), "");
+        assert_eq!(feed.status, Status::OK, "{}", text(&feed));
+        assert!(text(&feed).contains("\"reports\""), "{}", text(&feed));
+
+        let other = call(&service, &get_with_bearer("/report/feed?dx", &token), "");
+        assert_eq!(other.status, Status::UNAUTHORIZED, "{}", text(&other));
+
+        // A wrong method is a method refusal, never the accounts-off 404.
+        let wrong = call(&service, &get("/report/services/create"), "");
+        assert_eq!(wrong.status, Status::METHOD_NOT_ALLOWED, "{}", text(&wrong));
+        let wrong = call(
+            &service,
+            &json_post_with_cookie("/report/me/usage", "{}", &cookie),
+            "{}",
+        );
+        assert_eq!(wrong.status, Status::METHOD_NOT_ALLOWED, "{}", text(&wrong));
+    }
+
+    /// Creation is gated three ways: a session, an untaken name, and the plan's service count.
+    #[test]
+    fn service_creation_refuses_the_signed_out_the_taken_and_the_over_cap() {
+        let service = service_with_accounts("svc-refusals");
+        let body = r#"{"name":"myapp"}"#;
+        let signed_out = call(&service, &json_post("/report/services/create", body), body);
+        assert_eq!(signed_out.status, Status::UNAUTHORIZED, "{}", text(&signed_out));
+
+        let cookie = set_cookie(&register(&service, "owner@example.com", "password-1"));
+        let taken = r#"{"name":"dx"}"#;
+        let refused = call(
+            &service,
+            &json_post_with_cookie("/report/services/create", taken, &cookie),
+            taken,
+        );
+        assert_eq!(refused.status, Status(409), "{}", text(&refused));
+
+        let bad = r#"{"name":"a/../etc"}"#;
+        let refused = call(
+            &service,
+            &json_post_with_cookie("/report/services/create", bad, &cookie),
+            bad,
+        );
+        assert_eq!(refused.status, Status::BAD_REQUEST, "{}", text(&refused));
+
+        for nth in 0..crate::ownership::FREE_SERVICES {
+            let named = format!(r#"{{"name":"svc{nth}"}}"#);
+            let created = call(
+                &service,
+                &json_post_with_cookie("/report/services/create", &named, &cookie),
+                &named,
+            );
+            assert_eq!(created.status, Status::OK, "{}", text(&created));
+        }
+        let over = call(
+            &service,
+            &json_post_with_cookie("/report/services/create", body, &cookie),
+            body,
+        );
+        assert_eq!(over.status, Status::FORBIDDEN, "{}", text(&over));
+        assert!(text(&over).contains("free plan"), "{}", text(&over));
+    }
+
+    /// Rotation is the owner's alone — a stranger's attempt and an unknown name answer the
+    /// same `404` — and the old token dies the moment the new one is minted.
+    #[test]
+    fn rotating_a_reader_token_is_owner_only_and_kills_the_old_one() {
+        let service = service_with_accounts("svc-rotate");
+        let owner = set_cookie(&register(&service, "owner@example.com", "password-1"));
+        let stranger = set_cookie(&register(&service, "stranger@example.com", "password-2"));
+
+        let body = r#"{"name":"myapp"}"#;
+        let created = call(
+            &service,
+            &json_post_with_cookie("/report/services/create", body, &owner),
+            body,
+        );
+        let old = json_field(&text(&created), "readerToken");
+
+        let refused = call(
+            &service,
+            &json_post_with_cookie("/report/services/rotate", body, &stranger),
+            body,
+        );
+        assert_eq!(refused.status, Status::NOT_FOUND, "{}", text(&refused));
+
+        let rotated = call(
+            &service,
+            &json_post_with_cookie("/report/services/rotate", body, &owner),
+            body,
+        );
+        assert_eq!(rotated.status, Status::OK, "{}", text(&rotated));
+        let fresh = json_field(&text(&rotated), "readerToken");
+
+        let stale = call(&service, &get_with_bearer("/report/feed?myapp", &old), "");
+        assert_eq!(stale.status, Status::UNAUTHORIZED, "{}", text(&stale));
+        let live = call(&service, &get_with_bearer("/report/feed?myapp", &fresh), "");
+        assert_eq!(live.status, Status::OK, "{}", text(&live));
+    }
+
+    /// The meter and the gate: `me/usage` reads what the record files hold, and a fresh
+    /// defect past the free plan's record cap is refused while a sighting of a known defect
+    /// still lands — a sighting rewrites a file the service already holds.
+    #[test]
+    fn an_owned_service_is_metered_and_a_fresh_defect_over_the_cap_is_refused() {
+        let service = service_with_accounts("svc-cap");
+        let cookie = set_cookie(&register(&service, "owner@example.com", "password-1"));
+        let body = r#"{"name":"myapp"}"#;
+        let created = call(
+            &service,
+            &json_post_with_cookie("/report/services/create", body, &cookie),
+            body,
+        );
+        assert_eq!(created.status, Status::OK, "{}", text(&created));
+
+        // Fill to the free cap through the store directly — the HTTP door's own rate limiter
+        // is not what this test is about.
+        for nth in 0..crate::ownership::FREE_RECORDS {
+            let filed = Report {
+                project: "myapp".to_string(),
+                kind: crate::report::Kind::Bug,
+                title: format!("defect {nth}"),
+                detail: "d".to_string(),
+                route: String::new(),
+                repro: String::new(),
+                tool: String::new(),
+                platform: String::new(),
+                workspace: String::new(),
+                at: "2026-08-19T00:00:00Z".to_string(),
+                source: "abcd1234".to_string(),
+                account_id: None,
+            };
+            service.store().record(&filed).expect("filed");
+        }
+
+        let usage = call(&service, &get_with_cookie("/report/me/usage", &cookie), "");
+        assert_eq!(usage.status, Status::OK, "{}", text(&usage));
+        let parsed = selfhost_json::parse(&text(&usage)).expect("JSON");
+        assert_eq!(
+            parsed.get("totalRecords").and_then(Json::as_u64),
+            Some(crate::ownership::FREE_RECORDS as u64),
+            "{}",
+            text(&usage)
+        );
+        assert_eq!(
+            parsed.get("plan").and_then(Json::as_str),
+            Some("free"),
+            "{}",
+            text(&usage)
+        );
+
+        let fresh = file(
+            &service,
+            r#"{"project":"myapp","kind":"bug","title":"one too many","detail":"d"}"#,
+            "203.0.113.9",
+        );
+        assert_eq!(fresh.status, Status::SERVICE_UNAVAILABLE, "{}", text(&fresh));
+        assert!(text(&fresh).contains("free plan"), "{}", text(&fresh));
+
+        let sighting = file(
+            &service,
+            r#"{"project":"myapp","kind":"bug","title":"defect 0","detail":"again"}"#,
+            "203.0.113.10",
+        );
+        assert_eq!(sighting.status, Status::OK, "{}", text(&sighting));
+        assert!(text(&sighting).contains("\"known\":true"), "{}", text(&sighting));
     }
 }
