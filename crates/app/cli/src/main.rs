@@ -2528,7 +2528,7 @@ role = \"owner\"
         let broken = format!(
             "{with_site}\n[[sites]]\nname = \"b\"\ndomains = [\"example.com\"]\nstatic_root = \"./y\"\n"
         );
-        let (published, mut listening) =
+        let (published, listening) =
             tokio::sync::watch::channel(std::sync::Arc::new(config.clone()));
         write_config(&config_path, &broken, t0 + Duration::from_secs(1));
         check_and_reload(&server, &config_path, &dir, &mut last_modified, Some(&published));

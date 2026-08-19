@@ -36,6 +36,8 @@
 //! - [`clock`] — the two time formats the others write.
 //! - [`accounts`] — who filed a report and how they prove it later: email/password, an optional
 //!   passkey, an optional linked OAuth identity, all additive to the anonymous door above.
+//! - [`ownership`] — which account owns a service, the reader token scoped to that one
+//!   service, and what a plan's caps let it hold — the layer that makes the intake meterable.
 //! - [`sessions`] — the cookie that keeps an account signed in across visits.
 //! - [`webauthn`] — passkey registration and login for an account, mirrored from
 //!   `crates/admin/src/webauthn.rs`.
@@ -61,6 +63,7 @@ pub mod clock;
 pub mod limit;
 pub mod notify;
 pub mod oauth;
+pub mod ownership;
 pub mod report;
 pub mod service;
 pub mod sessions;
@@ -71,7 +74,8 @@ pub mod webauthn;
 pub use accounts::{Account, Accounts};
 pub use limit::{Limiter, Rate};
 pub use notify::Mailbox;
+pub use ownership::{Caps, Owned, Owners, Plan};
 pub use report::{Kind, Refusal, Report};
 pub use service::{Config, Service, bind, serve};
 pub use sessions::Sessions;
-pub use store::{Entry, Recorded, Store, StoreError};
+pub use store::{Entry, Recorded, Store, StoreError, Usage};
