@@ -107,6 +107,43 @@ pub use webauthn::Webauthn;
 /// being read rather than after.
 const MAX_BODY: usize = 64 * 1024;
 
+/// The larger cap for the one route whose body is a file rather than a
+/// document: `PUT /api/sites/<name>/files/entry`.
+///
+/// Chosen by [`body_limit`], and only for that route: every JSON route keeps
+/// [`MAX_BODY`], so nothing about accepting a site asset widens what a service
+/// definition or a people edit may send. 32 MiB covers HTML, CSS, JS bundles,
+/// images and fonts — real site content. The body is read before the request
+/// is authenticated (authentication happens in [`Api::handle`]), so
+/// [`body_limit`] grants this cap only when the request head carries an
+/// `Authorization` field at all — a sender with no credential to even claim is
+/// still refused at [`MAX_BODY`] without ever being buffered. A sender with a
+/// *bad* credential can make this daemon buffer one 32 MiB body before the 401,
+/// which is accepted: the admin listener is loopback-bound behind the console
+/// site's own network gate, not an anonymous public surface. See `site_api`'s
+/// module documentation for the streaming follow-up that would remove the
+/// buffering altogether.
+pub(crate) const SITE_UPLOAD_MAX_BODY: usize = 32 * 1024 * 1024;
+
+/// The body cap for one request: [`SITE_UPLOAD_MAX_BODY`] for a site file
+/// upload that at least claims a credential, [`MAX_BODY`] for everything else.
+///
+/// Matched on the raw path split exactly as [`Api::handle`] splits it, so the
+/// route that gets the wide cap is precisely the route whose handler was
+/// written for file-sized bodies, and no other spelling of the path reaches
+/// it.
+fn body_limit(request: &Request) -> usize {
+    if request.method != Method::Put || request.headers.get_str("authorization").is_none() {
+        return MAX_BODY;
+    }
+    let path = request.path();
+    let segments: Vec<&str> = path.split('/').filter(|segment| !segment.is_empty()).collect();
+    match segments.as_slice() {
+        ["api", "sites", _, "files", "entry"] => SITE_UPLOAD_MAX_BODY,
+        _ => MAX_BODY,
+    }
+}
+
 /// Default number of log lines returned when the caller does not say.
 const DEFAULT_LOG_LIMIT: usize = 500;
 
@@ -3611,7 +3648,7 @@ async fn read_body(
         Err(error) => return Err(problem(Status(400), &error.to_string())),
     };
 
-    if length as usize > MAX_BODY {
+    if length as usize > body_limit(request) {
         return Err(problem(Status(413), "request too large"));
     }
 

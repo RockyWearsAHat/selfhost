@@ -50,10 +50,12 @@
 //! connection layer *before* [`crate::Api::handle`] ever sees a body. Site
 //! file uploads here do **not** have that wiring yet: `PUT
 //! /api/sites/<name>/files/entry` receives the same already-buffered body
-//! every ordinary JSON route does, capped at [`crate::MAX_BODY`] (64 KiB). That
-//! is enough for HTML, CSS, JS and small images and not enough for a video or
-//! a large photo library. Closing that gap means giving site file uploads the
-//! same socket-level special case `storage_api`'s sessions have — a real
+//! every ordinary JSON route does, capped at [`crate::SITE_UPLOAD_MAX_BODY`]
+//! (32 MiB — this one route's own cap; every JSON route keeps
+//! [`crate::MAX_BODY`]'s 64 KiB). That is enough for HTML, CSS, JS, images,
+//! fonts and ordinary site assets, and not enough for a video or a large
+//! photo library. Closing that gap means giving site file uploads the same
+//! socket-level special case `storage_api`'s sessions have — a real
 //! follow-up, stated here rather than silently worked around with an
 //! undersized cap nobody documented.
 
@@ -66,7 +68,7 @@ use selfhost_storage::path;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
-use crate::{MAX_BODY, json, problem};
+use crate::{SITE_UPLOAD_MAX_BODY, json, problem};
 
 /// What this daemon needs to administer sites over the API: where the config
 /// lives, and where an API-created site's managed content lives.
@@ -447,32 +449,57 @@ fn not_found(name: &str, config: &Config) -> Response {
 // collision-checked primitive a share's routes use).
 // ---------------------------------------------------------------------------
 
-/// Opens a site's managed content directory, or the response a caller should
+/// Opens a site's static content directory, or the response a caller should
 /// see for why it could not be reached.
 ///
-/// A site with no managed content (an app-only site, or one whose `static`
+/// The directory opened is the site's own configured `static_root` — the
+/// exact tree the proxy serves — so these routes work for every static site:
+/// one created over this API (whose root is the managed
+/// `<data_dir>/sites/<name>/` this module allocated) and one an operator
+/// configured by hand before this API existed. The caller still never
+/// *chooses* a path — what is opened is what the config already names, chosen
+/// by whoever could edit the config — and every step below the root goes
+/// through [`Dir`]'s symlink-refusing descriptor walk, so managing a site's
+/// content cannot reach outside the tree the operator pointed the site at.
+///
+/// A site with no static content (an app-only site, or one whose `static`
 /// flag was never set) has no such directory, and that is reported as `404`
 /// rather than an empty listing: there is nothing here to list, mkdir into, or
 /// upload to, and pretending there is an empty directory would let a caller
-/// believe an upload had somewhere to land.
-fn open_managed_dir(wiring: &Wiring, name: &str) -> Result<Dir, Response> {
+/// believe an upload had somewhere to land. A *configured* root that does not
+/// exist on disk yet is different — the config already names it — so it is
+/// created rather than refused, which is what lets the first upload to a
+/// freshly configured site simply work.
+fn open_content_dir(wiring: &Wiring, name: &str) -> Result<Dir, Response> {
     if name.is_empty() || !name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-') {
         return Err(problem(Status(404), "no such site"));
     }
-    let root = wiring.managed_root(name);
-    Dir::open_root(&root).map_err(|error| match error {
-        OpenError::NotFound => problem(
+    let config = load(wiring)?;
+    let Some(site) = config.sites.iter().find(|site| site.name == name) else {
+        return Err(not_found(name, &config));
+    };
+    let Some(static_root) = &site.static_root else {
+        return Err(problem(
             Status(404),
-            "this site has no managed content directory — create it with \"static\": true",
-        ),
-        other => problem(Status(500), &format!("could not open this site's content: {other}")),
-    })
+            "this site has no static content directory — create it with \"static\": true, or give \
+             it a static_root in the config",
+        ));
+    };
+    // `static_root` is documented as relative to the config file; an absolute
+    // path (what this API's own `sites_add` writes) passes through `join`
+    // unchanged, so both spellings resolve to the tree the proxy serves.
+    let root = wiring.config_path.parent().unwrap_or(Path::new(".")).join(static_root);
+    std::fs::create_dir_all(&root).map_err(|error| {
+        problem(Status(500), &format!("could not create this site's content directory: {error}"))
+    })?;
+    Dir::open_root(&root)
+        .map_err(|error| problem(Status(500), &format!("could not open this site's content: {error}")))
 }
 
 /// Answers `GET /api/sites/<name>/files/list?path=…`. `path` is optional and
 /// defaults to the content root.
 pub fn list_files(wiring: &Wiring, name: &str, query: &str) -> Response {
-    let dir = match open_managed_dir(wiring, name) {
+    let dir = match open_content_dir(wiring, name) {
         Ok(dir) => dir,
         Err(refusal) => return refusal,
     };
@@ -520,7 +547,7 @@ pub fn mkdir(wiring: &Wiring, name: &str, body: &[u8]) -> Response {
     if let Some(refusal) = refuse_if_console(wiring, name) {
         return refusal;
     }
-    let dir = match open_managed_dir(wiring, name) {
+    let dir = match open_content_dir(wiring, name) {
         Ok(dir) => dir,
         Err(refusal) => return refusal,
     };
@@ -554,14 +581,14 @@ pub fn put_file(wiring: &Wiring, name: &str, query: &str, body: &[u8]) -> Respon
     if let Some(refusal) = refuse_if_console(wiring, name) {
         return refusal;
     }
-    if body.len() > MAX_BODY {
+    if body.len() > SITE_UPLOAD_MAX_BODY {
         // Unreachable today — `read_body` already refuses this before any
         // route sees the bytes — but stated rather than assumed, so a future
         // change to that cap cannot silently widen what this route accepts
         // without this line being touched too.
         return problem(Status(413), "request too large");
     }
-    let dir = match open_managed_dir(wiring, name) {
+    let dir = match open_content_dir(wiring, name) {
         Ok(dir) => dir,
         Err(refusal) => return refusal,
     };
@@ -598,7 +625,7 @@ pub fn delete_file(wiring: &Wiring, name: &str, query: &str) -> Response {
     if let Some(refusal) = refuse_if_console(wiring, name) {
         return refusal;
     }
-    let dir = match open_managed_dir(wiring, name) {
+    let dir = match open_content_dir(wiring, name) {
         Ok(dir) => dir,
         Err(refusal) => return refusal,
     };

@@ -1,7 +1,12 @@
 //! `selfhost mcp` — a Model Context Protocol server over stdio, so an AI agent
-//! (Claude, or anything else that speaks MCP) can manage this deployment's
-//! websites the way `selfhost site` already lets an operator at a keyboard
-//! do — from the agent's own machine, never from a keyboard on the box.
+//! (Claude, or anything else that speaks MCP) can operate this deployment —
+//! sites and their content, services and their deploys, the deployment's own
+//! self-update — the way the CLI already lets an operator at a keyboard do,
+//! from the agent's own machine, never from a keyboard on the box. What any
+//! one agent may actually do is decided entirely by its token's grants (see
+//! below), so binding this server is wiring, not authority: the full tool
+//! surface is advertised, and each call opens only if the far side's policy
+//! says that agent holds the capability the route demands.
 //!
 //! # What this is not
 //!
@@ -49,6 +54,7 @@
 use crate::remote_client::{Remote, RemoteClient};
 use selfhost_json::Json;
 use std::io::{BufRead, Write};
+use std::path::Path;
 
 /// The words this command accepts, and what each one is for.
 pub const USAGE: &str = "\
@@ -56,17 +62,47 @@ Usage
   selfhost mcp --host <admin-host>
 
 Starts a Model Context Protocol server on stdin/stdout, so an MCP client (an
-AI agent) can manage websites on <admin-host> — the same host you would give
-`--remote` — through tools it can list and call.
+AI agent) can operate <admin-host> — the same host you would give `--remote` —
+through tools it can list and call: sites and their content, services and
+their deploys, and the deployment's own self-update. Each call succeeds only
+if the agent's token was granted the capability that route demands (site.admin
+for sites, service.control for services and self-update, console.read for
+service reads); the whoami tool shows what a token holds.
 
 The credential is never a flag: it comes from SELFHOST_AGENT_TOKEN or
 ~/.selfhost/agent-token, an agent token minted with
-`selfhost agent add <name> --grant site.admin` on the box itself.
+`selfhost agent add <name> --grant site.admin,console.read,service.control`
+on the box itself.
 ";
 
-/// One tool argument: its JSON field name, a human description, and whether
-/// `tools/call` refuses without it.
-type Param = (&'static str, &'static str, bool);
+/// How a tool argument is typed: what its JSON Schema advertises, and what
+/// shapes [`call_tool`]'s readers accept.
+///
+/// Every reader is deliberately wider than its schema: an MCP client that
+/// stringifies a value it should have sent structurally — `"true"` for a
+/// boolean, `"a.com,b.com"` or a JSON-encoded array for a list — gets coerced
+/// rather than refused, because the alternative observed in practice was a
+/// tool that advertised an array and then failed every call that dared send
+/// one as text.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Kind {
+    /// A JSON string.
+    Text,
+    /// A JSON boolean; `"true"`/`"false"` strings are coerced.
+    Flag,
+    /// A JSON array of strings; one string, a comma-separated string, or a
+    /// JSON-encoded array arriving as a string are all coerced.
+    Words,
+    /// A JSON array of objects; a JSON-encoded array arriving as a string is
+    /// coerced.
+    Objects,
+    /// A JSON number; a numeric string is coerced.
+    Count,
+}
+
+/// One tool argument: its JSON field name, a human description, whether
+/// `tools/call` refuses without it, and its [`Kind`].
+type Param = (&'static str, &'static str, bool, Kind);
 
 /// One tool: its name, a human description, and its parameters.
 type Tool = (&'static str, &'static str, &'static [Param]);
@@ -74,65 +110,131 @@ type Tool = (&'static str, &'static str, &'static [Param]);
 /// The tools this server advertises, and what each one needs.
 ///
 /// `params` is turned into the JSON Schema `tools/list` answers with by
-/// [`tool_schema`].
+/// [`tool_schema`]. Together these cover the far side's whole operational
+/// surface an agent can be granted: sites and their content (`site.admin`),
+/// services and deploys (`service.control`, with reads under `console.read`),
+/// the deployment's own self-update, and `whoami` so an agent can see exactly
+/// which of these its token will open.
 const TOOLS: &[Tool] = &[
     ("sites_list", "List every site this deployment's proxy answers for.", &[]),
     (
         "sites_show",
         "Show one site's full definition: domains, whether it serves static content, and its app instances.",
-        &[("name", "The site's name.", true)],
+        &[("name", "The site's name.", true, Kind::Text)],
     ),
     (
         "sites_add",
         "Create a new site. Set static=true to get a managed content directory you can then upload files \
          into with sites_upload_file; give instances to route to a running application instead, or both.",
         &[
-            ("name", "A short name: letters, digits and dashes.", true),
-            ("domains", "Every hostname that should serve this site (JSON array of strings; the first is canonical).", true),
-            ("static", "Whether this site should have a managed static-content directory (boolean).", false),
-            ("spa", "Serve index.html for unmatched paths — needs static=true (boolean).", false),
-            ("instances", "Application backends as a JSON array of {\"node\":..,\"port\":..} objects.", false),
+            ("name", "A short name: letters, digits and dashes.", true, Kind::Text),
+            ("domains", "Every hostname that should serve this site; the first is canonical.", true, Kind::Words),
+            ("static", "Whether this site should have a managed static-content directory.", false, Kind::Flag),
+            ("spa", "Serve index.html for unmatched paths — needs static=true.", false, Kind::Flag),
+            ("instances", "Application backends as an array of {\"node\":..,\"port\":..} objects.", false, Kind::Objects),
         ],
     ),
     (
         "sites_add_domain",
         "Add one more hostname to an existing site — this is what a subdomain is: a hostname added to \
          the site that should answer for it, not a new site.",
-        &[("name", "The site's name.", true), ("hostname", "The hostname to add.", true)],
+        &[("name", "The site's name.", true, Kind::Text), ("hostname", "The hostname to add.", true, Kind::Text)],
     ),
     (
         "sites_remove_domain",
         "Remove one hostname from a site, leaving the site and its other hostnames in place.",
-        &[("name", "The site's name.", true), ("hostname", "The hostname to remove.", true)],
+        &[("name", "The site's name.", true, Kind::Text), ("hostname", "The hostname to remove.", true, Kind::Text)],
     ),
     (
         "sites_remove",
         "Unroute a site. This does not delete its content — only that content stops being served.",
-        &[("name", "The site's name.", true)],
+        &[("name", "The site's name.", true, Kind::Text)],
     ),
     (
         "sites_list_files",
-        "List the files and directories in a site's managed content, at an optional path within it.",
+        "List the files and directories in a site's static content, at an optional path within it.",
         &[
-            ("name", "The site's name.", true),
-            ("path", "Path within the site's content directory; omit for the top level.", false),
+            ("name", "The site's name.", true, Kind::Text),
+            ("path", "Path within the site's content directory; omit for the top level.", false, Kind::Text),
+        ],
+    ),
+    (
+        "sites_mkdir",
+        "Create one directory (with missing parents refused — create them one level at a time) in a \
+         site's static content.",
+        &[
+            ("name", "The site's name.", true, Kind::Text),
+            ("path", "Directory path within the site's content directory.", true, Kind::Text),
         ],
     ),
     (
         "sites_upload_file",
-        "Write one file into a site's managed content directory, creating or replacing it. \
-         The site must have been created with static=true.",
+        "Write one file into a site's static content, creating or replacing it. Give the bytes inline \
+         as \"content\", or name a file on this machine as \"localFile\" to send its bytes without \
+         them ever passing through the conversation.",
         &[
-            ("name", "The site's name.", true),
-            ("path", "Path within the site's content directory, e.g. \"index.html\" or \"assets/logo.png\".", true),
-            ("content", "The file's bytes as a UTF-8 string (for text) or base64 (set contentEncoding=\"base64\").", true),
-            ("contentEncoding", "\"base64\" for binary content; omit for plain UTF-8 text.", false),
+            ("name", "The site's name.", true, Kind::Text),
+            ("path", "Path within the site's content directory, e.g. \"index.html\" or \"assets/logo.png\".", true, Kind::Text),
+            ("content", "The file's bytes as a UTF-8 string (for text) or base64 (set contentEncoding=\"base64\").", false, Kind::Text),
+            ("contentEncoding", "\"base64\" for binary content; omit for plain UTF-8 text.", false, Kind::Text),
+            ("localFile", "Absolute path of a file on the machine running this MCP server to upload instead of \"content\".", false, Kind::Text),
+        ],
+    ),
+    (
+        "sites_upload_dir",
+        "Upload a whole directory tree from this machine into a site's static content: every directory \
+         is created and every file uploaded, skipping dotfiles. This is how a built site (a dist/ \
+         directory) is published in one call.",
+        &[
+            ("name", "The site's name.", true, Kind::Text),
+            ("localDir", "Absolute path of the directory on the machine running this MCP server.", true, Kind::Text),
+            ("path", "Target path within the site's content directory; omit for the top level.", false, Kind::Text),
         ],
     ),
     (
         "sites_delete_file",
-        "Delete one file or empty directory from a site's managed content.",
-        &[("name", "The site's name.", true), ("path", "Path within the site's content directory.", true)],
+        "Delete one file or empty directory from a site's static content.",
+        &[("name", "The site's name.", true, Kind::Text), ("path", "Path within the site's content directory.", true, Kind::Text)],
+    ),
+    ("services_list", "List every service this deployment supervises, with its state.", &[]),
+    (
+        "services_show",
+        "Show one service's definition and current state.",
+        &[("name", "The service's name.", true, Kind::Text)],
+    ),
+    (
+        "services_control",
+        "Start, stop or restart one supervised service.",
+        &[
+            ("name", "The service's name.", true, Kind::Text),
+            ("action", "One of \"start\", \"stop\" or \"restart\".", true, Kind::Text),
+        ],
+    ),
+    (
+        "services_logs",
+        "Read one service's recent log lines.",
+        &[
+            ("name", "The service's name.", true, Kind::Text),
+            ("limit", "How many lines (server caps at 5000; default 500).", false, Kind::Count),
+            ("from", "Line offset to start from; omit for the most recent.", false, Kind::Count),
+        ],
+    ),
+    (
+        "services_deploy",
+        "Tell one service's git watch that a push landed, so it fetches, rebuilds and restarts now.",
+        &[("name", "The service's name.", true, Kind::Text)],
+    ),
+    (
+        "self_update",
+        "Tell the deployment itself that a push landed on its own repository, so it fetches, rebuilds \
+         and restarts itself now.",
+        &[],
+    ),
+    (
+        "whoami",
+        "Show who this agent token is and exactly what it has been granted — the answer to \"why was \
+         that call refused\".",
+        &[],
     ),
 ];
 
@@ -308,15 +410,29 @@ fn tools_list_result() -> Json {
 }
 
 /// One tool's JSON Schema description.
-fn tool_schema(name: &str, description: &str, params: &[(&str, &str, bool)]) -> Json {
+fn tool_schema(name: &str, description: &str, params: &[Param]) -> Json {
     let properties: Vec<(String, Json)> = params
         .iter()
-        .map(|(field, description, _)| {
-            (field.to_string(), Json::object([("type", Json::string("string")), ("description", Json::string(*description))]))
+        .map(|(field, description, _, kind)| {
+            let mut fields = vec![("description".to_owned(), Json::string(*description))];
+            match kind {
+                Kind::Text => fields.push(("type".to_owned(), Json::string("string"))),
+                Kind::Flag => fields.push(("type".to_owned(), Json::string("boolean"))),
+                Kind::Count => fields.push(("type".to_owned(), Json::string("number"))),
+                Kind::Words => {
+                    fields.push(("type".to_owned(), Json::string("array")));
+                    fields.push(("items".to_owned(), Json::object([("type", Json::string("string"))])));
+                }
+                Kind::Objects => {
+                    fields.push(("type".to_owned(), Json::string("array")));
+                    fields.push(("items".to_owned(), Json::object([("type", Json::string("object"))])));
+                }
+            }
+            (field.to_string(), Json::object(fields.into_iter()))
         })
         .collect();
     let required: Vec<Json> =
-        params.iter().filter(|(_, _, required)| *required).map(|(field, _, _)| Json::string(*field)).collect();
+        params.iter().filter(|(_, _, required, _)| *required).map(|(field, _, _, _)| Json::string(*field)).collect();
     Json::object([
         ("name", Json::string(name)),
         ("description", Json::string(description)),
@@ -368,6 +484,67 @@ fn optional(arguments: &Json, field: &str) -> String {
     arguments.get(field).and_then(Json::as_str).unwrap_or("").to_owned()
 }
 
+/// Reads an optional boolean, coercing `"true"`/`"false"` strings.
+fn flag(arguments: &Json, field: &str) -> Result<Option<bool>, String> {
+    match arguments.get(field) {
+        None | Some(Json::Null) => Ok(None),
+        Some(Json::Bool(value)) => Ok(Some(*value)),
+        Some(Json::String(text)) if text == "true" => Ok(Some(true)),
+        Some(Json::String(text)) if text == "false" => Ok(Some(false)),
+        Some(_) => Err(format!("\"{field}\" must be true or false")),
+    }
+}
+
+/// Reads a required list of strings, accepting every shape a client has
+/// actually sent for one: a real array, one bare string, a comma-separated
+/// string, or a JSON-encoded array that arrived as a string.
+fn words(arguments: &Json, field: &str) -> Result<Vec<String>, String> {
+    let refuse = || format!("\"{field}\" must be an array of strings");
+    let of_array = |items: &[Json]| -> Result<Vec<String>, String> {
+        items.iter().map(|item| item.as_str().map(str::to_owned).ok_or_else(refuse)).collect()
+    };
+    let found = match arguments.get(field) {
+        None | Some(Json::Null) => return Ok(Vec::new()),
+        Some(Json::Array(items)) => of_array(items)?,
+        Some(Json::String(text)) => {
+            let parsed = text.trim_start().starts_with('[').then(|| selfhost_json::parse(text).ok()).flatten();
+            match parsed.as_ref().and_then(Json::as_array) {
+                Some(items) => of_array(items)?,
+                None => text.split(',').map(str::trim).filter(|w| !w.is_empty()).map(str::to_owned).collect(),
+            }
+        }
+        Some(_) => return Err(refuse()),
+    };
+    Ok(found)
+}
+
+/// Reads an optional array of objects, coercing a JSON-encoded array that
+/// arrived as a string.
+fn objects(arguments: &Json, field: &str) -> Result<Option<Json>, String> {
+    match arguments.get(field) {
+        None | Some(Json::Null) => Ok(None),
+        Some(found @ Json::Array(_)) => Ok(Some(found.clone())),
+        Some(Json::String(text)) => match selfhost_json::parse(text) {
+            Ok(parsed @ Json::Array(_)) => Ok(Some(parsed)),
+            _ => Err(format!("\"{field}\" must be an array")),
+        },
+        Some(_) => Err(format!("\"{field}\" must be an array")),
+    }
+}
+
+/// Reads an optional number, coercing a numeric string, rendered back as the
+/// query-string digits the far side parses.
+fn count(arguments: &Json, field: &str) -> Result<Option<u64>, String> {
+    match arguments.get(field) {
+        None | Some(Json::Null) => Ok(None),
+        Some(Json::Number(value)) if *value >= 0.0 => Ok(Some(*value as u64)),
+        Some(Json::String(text)) => {
+            text.trim().parse().map(Some).map_err(|_| format!("\"{field}\" must be a number"))
+        }
+        Some(_) => Err(format!("\"{field}\" must be a number")),
+    }
+}
+
 /// The whole of what one tool call does: build the request, ask the far side,
 /// and render the answer as the text a model reads.
 async fn call_tool(client: &RemoteClient, name: &str, arguments: &Json) -> Result<String, String> {
@@ -382,7 +559,29 @@ async fn call_tool(client: &RemoteClient, name: &str, arguments: &Json) -> Resul
             Ok(answer.to_text())
         }
         "sites_add" => {
-            let body = arguments.to_text();
+            // The body is rebuilt field by field rather than forwarded
+            // verbatim: forwarding meant a client that stringified `domains`
+            // shipped that string to the far side to fail there, and any
+            // stray argument travelled with it.
+            let site = required(arguments, "name")?;
+            let domains = words(arguments, "domains")?;
+            if domains.is_empty() {
+                return Err("\"domains\" needs at least one hostname".to_owned());
+            }
+            let mut fields = vec![
+                ("name".to_owned(), Json::string(&site)),
+                ("domains".to_owned(), Json::array(domains.iter().map(Json::string))),
+            ];
+            if let Some(wants_static) = flag(arguments, "static")? {
+                fields.push(("static".to_owned(), Json::Bool(wants_static)));
+            }
+            if let Some(spa) = flag(arguments, "spa")? {
+                fields.push(("spa".to_owned(), Json::Bool(spa)));
+            }
+            if let Some(instances) = objects(arguments, "instances")? {
+                fields.push(("instances".to_owned(), instances));
+            }
+            let body = Json::object(fields.into_iter()).to_text();
             let answer = client.request("POST", "/api/sites", Some(body.as_bytes())).await?;
             Ok(answer.to_text())
         }
@@ -420,16 +619,19 @@ async fn call_tool(client: &RemoteClient, name: &str, arguments: &Json) -> Resul
                 .await?;
             Ok(answer.to_text())
         }
+        "sites_mkdir" => {
+            let site = required(arguments, "name")?;
+            let path = required(arguments, "path")?;
+            let body = Json::object([("path", Json::string(&path))]).to_text();
+            let answer = client
+                .request("POST", &format!("/api/sites/{}/files/mkdir", encode(&site)), Some(body.as_bytes()))
+                .await?;
+            Ok(answer.to_text())
+        }
         "sites_upload_file" => {
             let site = required(arguments, "name")?;
             let path = required(arguments, "path")?;
-            let content = required(arguments, "content")?;
-            let encoding = optional(arguments, "contentEncoding");
-            let bytes = if encoding == "base64" {
-                decode_base64(&content)?
-            } else {
-                content.into_bytes()
-            };
+            let bytes = upload_bytes(arguments)?;
             let answer = client
                 .request(
                     "PUT",
@@ -437,6 +639,67 @@ async fn call_tool(client: &RemoteClient, name: &str, arguments: &Json) -> Resul
                     Some(&bytes),
                 )
                 .await?;
+            Ok(answer.to_text())
+        }
+        "sites_upload_dir" => {
+            let site = required(arguments, "name")?;
+            let local = required(arguments, "localDir")?;
+            let prefix = optional(arguments, "path");
+            upload_dir(client, &site, Path::new(&local), &prefix).await
+        }
+        "services_list" => {
+            let answer = client.get("/api/services").await?;
+            Ok(answer.to_text())
+        }
+        "services_show" => {
+            let service = required(arguments, "name")?;
+            let answer = client.get(&format!("/api/services/{}", encode(&service))).await?;
+            Ok(answer.to_text())
+        }
+        "services_control" => {
+            let service = required(arguments, "name")?;
+            let action = required(arguments, "action")?;
+            if !matches!(action.as_str(), "start" | "stop" | "restart") {
+                return Err(format!("\"action\" must be start, stop or restart, not \"{action}\""));
+            }
+            let answer = client
+                .request("POST", &format!("/api/services/{}/{}", encode(&service), encode(&action)), None)
+                .await?;
+            Ok(answer.to_text())
+        }
+        "services_logs" => {
+            let service = required(arguments, "name")?;
+            let mut query = String::new();
+            if let Some(limit) = count(arguments, "limit")? {
+                query.push_str(&format!("limit={limit}"));
+            }
+            if let Some(from) = count(arguments, "from")? {
+                if !query.is_empty() {
+                    query.push('&');
+                }
+                query.push_str(&format!("from={from}"));
+            }
+            let path = if query.is_empty() {
+                format!("/api/services/{}/logs", encode(&service))
+            } else {
+                format!("/api/services/{}/logs?{query}", encode(&service))
+            };
+            let answer = client.get(&path).await?;
+            Ok(answer.to_text())
+        }
+        "services_deploy" => {
+            let service = required(arguments, "name")?;
+            let answer = client
+                .request("POST", &format!("/api/services/{}/deploy", encode(&service)), None)
+                .await?;
+            Ok(answer.to_text())
+        }
+        "self_update" => {
+            let answer = client.request("POST", "/api/self-update/deploy", None).await?;
+            Ok(answer.to_text())
+        }
+        "whoami" => {
+            let answer = client.get("/api/whoami").await?;
             Ok(answer.to_text())
         }
         "sites_delete_file" => {
@@ -449,6 +712,147 @@ async fn call_tool(client: &RemoteClient, name: &str, arguments: &Json) -> Resul
         }
         other => Err(format!("unknown tool \"{other}\"")),
     }
+}
+
+/// The bytes one `sites_upload_file` call should send: inline `content`
+/// (UTF-8 or base64) or a file read from this machine — exactly one of the
+/// two, and the distinction is presence, not emptiness, so an empty file can
+/// still be uploaded.
+fn upload_bytes(arguments: &Json) -> Result<Vec<u8>, String> {
+    let content = arguments.get("content").and_then(Json::as_str);
+    let local = arguments.get("localFile").and_then(Json::as_str);
+    match (content, local) {
+        (Some(content), None) => {
+            if optional(arguments, "contentEncoding") == "base64" {
+                decode_base64(content)
+            } else {
+                Ok(content.as_bytes().to_vec())
+            }
+        }
+        (None, Some(local)) => std::fs::read(local)
+            .map_err(|error| format!("could not read {local} on this machine: {error}")),
+        (None, None) => Err("give either \"content\" or \"localFile\"".to_owned()),
+        (Some(_), Some(_)) => Err("give \"content\" or \"localFile\", not both".to_owned()),
+    }
+}
+
+/// Publishes one local directory tree into a site's static content — the
+/// whole point of running this server on the machine where a site gets built:
+/// a `dist/` directory becomes live content without one byte of it passing
+/// through the model's conversation.
+///
+/// Directories are created shallowest first (the far side's mkdir refuses
+/// missing parents) and a mkdir refusal is deliberately not fatal — the
+/// directory usually already exists from a previous run, and one that
+/// genuinely failed to appear fails loudly at the first file below it. Files
+/// upload in a stable order, so a failed run says exactly where it stopped.
+/// Entries whose names start with a dot are skipped: `.DS_Store` and `.git`
+/// are never site content.
+async fn upload_dir(
+    client: &RemoteClient,
+    site: &str,
+    local: &Path,
+    prefix: &str,
+) -> Result<String, String> {
+    let mut directories = Vec::new();
+    let mut files = Vec::new();
+    collect(local, String::new(), &mut directories, &mut files)?;
+    directories.sort();
+    files.sort();
+
+    let prefix = prefix.trim_matches('/');
+    let joined = |relative: &str| {
+        if prefix.is_empty() { relative.to_owned() } else { format!("{prefix}/{relative}") }
+    };
+
+    let mkdir = |path: String| async move {
+        let body = Json::object([("path", Json::string(path))]).to_text();
+        client
+            .request("POST", &format!("/api/sites/{}/files/mkdir", encode(site)), Some(body.as_bytes()))
+            .await
+    };
+
+    // The target prefix itself is built one level at a time, under the same
+    // missing-parents rule as everything below it.
+    let mut so_far = String::new();
+    for part in prefix.split('/').filter(|part| !part.is_empty()) {
+        if !so_far.is_empty() {
+            so_far.push('/');
+        }
+        so_far.push_str(part);
+        let _ = mkdir(so_far.clone()).await;
+    }
+    for directory in &directories {
+        let _ = mkdir(joined(directory)).await;
+    }
+
+    let mut sent = 0u64;
+    for (at, relative) in files.iter().enumerate() {
+        let bytes = std::fs::read(local.join(relative)).map_err(|error| {
+            format!(
+                "could not read {relative}: {error} — {at} of {} files were uploaded before it",
+                files.len()
+            )
+        })?;
+        eprintln!("selfhost mcp: uploading {relative} ({} bytes)", bytes.len());
+        client
+            .request(
+                "PUT",
+                &format!(
+                    "/api/sites/{}/files/entry?path={}",
+                    encode(site),
+                    encode(&joined(relative))
+                ),
+                Some(&bytes),
+            )
+            .await
+            .map_err(|error| {
+                format!(
+                    "uploading {relative} failed: {error} — {at} of {} files were uploaded before it",
+                    files.len()
+                )
+            })?;
+        sent += bytes.len() as u64;
+    }
+    Ok(Json::object([
+        ("uploadedFiles", Json::Number(files.len() as f64)),
+        ("createdDirectories", Json::Number(directories.len() as f64)),
+        ("bytes", Json::Number(sent as f64)),
+    ])
+    .to_text())
+}
+
+/// Walks `at`, collecting slash-joined relative directory and file paths.
+///
+/// Dot-entries are skipped, and symlinks are neither followed nor uploaded —
+/// the far side's own descriptor walk refuses them, so offering one could only
+/// manufacture a confusing failure late in an upload.
+fn collect(
+    at: &Path,
+    relative: String,
+    directories: &mut Vec<String>,
+    files: &mut Vec<String>,
+) -> Result<(), String> {
+    let entries = std::fs::read_dir(at)
+        .map_err(|error| format!("could not read {} on this machine: {error}", at.display()))?;
+    for entry in entries {
+        let entry =
+            entry.map_err(|error| format!("could not read {}: {error}", at.display()))?;
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if name.starts_with('.') {
+            continue;
+        }
+        let child = if relative.is_empty() { name } else { format!("{relative}/{name}") };
+        let kind =
+            entry.file_type().map_err(|error| format!("could not stat {child}: {error}"))?;
+        if kind.is_dir() {
+            directories.push(child.clone());
+            collect(&entry.path(), child, directories, files)?;
+        } else if kind.is_file() {
+            files.push(child);
+        }
+    }
+    Ok(())
 }
 
 /// Percent-encodes one path segment or query value for a request line.
@@ -590,6 +994,69 @@ mod tests {
             .and_then(Json::as_str)
             .unwrap();
         assert!(text.contains("name"), "{text}");
+    }
+
+    #[test]
+    fn the_schema_types_an_array_a_boolean_and_a_number_as_themselves() {
+        let listing = tools_list_result();
+        let tools = listing.get("tools").and_then(Json::as_array).expect("a tools array");
+        let of = |name: &str, field: &str| -> Json {
+            tools
+                .iter()
+                .find(|tool| tool.get("name").and_then(Json::as_str) == Some(name))
+                .and_then(|tool| tool.get("inputSchema"))
+                .and_then(|schema| schema.get("properties"))
+                .and_then(|properties| properties.get(field))
+                .cloned()
+                .expect("the field exists")
+        };
+        assert_eq!(of("sites_add", "domains").get("type").and_then(Json::as_str), Some("array"));
+        assert_eq!(of("sites_add", "static").get("type").and_then(Json::as_str), Some("boolean"));
+        assert_eq!(of("services_logs", "limit").get("type").and_then(Json::as_str), Some("number"));
+    }
+
+    #[test]
+    fn a_flag_accepts_a_boolean_and_coerces_its_stringification() {
+        let arguments = selfhost_json::parse(r#"{"a":true,"b":"false","c":"maybe"}"#).unwrap();
+        assert_eq!(flag(&arguments, "a"), Ok(Some(true)));
+        assert_eq!(flag(&arguments, "b"), Ok(Some(false)));
+        assert_eq!(flag(&arguments, "missing"), Ok(None));
+        assert!(flag(&arguments, "c").is_err());
+    }
+
+    #[test]
+    fn words_accept_every_shape_a_client_sends_a_list_as() {
+        let arguments = selfhost_json::parse(
+            r#"{"real":["a.com","b.com"],"bare":"a.com","commas":"a.com, b.com","encoded":"[\"a.com\",\"b.com\"]"}"#,
+        )
+        .unwrap();
+        let two = vec!["a.com".to_owned(), "b.com".to_owned()];
+        assert_eq!(words(&arguments, "real"), Ok(two.clone()));
+        assert_eq!(words(&arguments, "bare"), Ok(vec!["a.com".to_owned()]));
+        assert_eq!(words(&arguments, "commas"), Ok(two.clone()));
+        assert_eq!(words(&arguments, "encoded"), Ok(two));
+    }
+
+    #[test]
+    fn an_upload_needs_content_or_a_local_file_and_never_both() {
+        let neither = selfhost_json::parse(r#"{}"#).unwrap();
+        assert!(upload_bytes(&neither).is_err());
+        let both = selfhost_json::parse(r#"{"content":"x","localFile":"/tmp/x"}"#).unwrap();
+        assert!(upload_bytes(&both).is_err());
+        let inline = selfhost_json::parse(r#"{"content":"hello"}"#).unwrap();
+        assert_eq!(upload_bytes(&inline), Ok(b"hello".to_vec()));
+    }
+
+    #[test]
+    fn a_service_action_outside_the_three_is_refused_without_a_network_call() {
+        let params =
+            selfhost_json::parse(r#"{"name":"services_control","arguments":{"name":"web","action":"explode"}}"#)
+                .unwrap();
+        let remote = Remote::parse("example.test").unwrap();
+        let client = RemoteClient::new(remote, "agent:x:y".to_owned());
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let result = runtime.block_on(tools_call_result(&client, &params));
+        assert_eq!(result.get("isError").and_then(Json::as_bool), Some(true));
     }
 
     #[test]
