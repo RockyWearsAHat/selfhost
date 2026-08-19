@@ -223,9 +223,18 @@ impl People {
     /// [`PersonName`] cannot spell it, so no such entry can be written through
     /// the console; answering `none` here is what makes a hand-edited one inert
     /// as well.
+    ///
+    /// An agent is answered `none` too, and for the same shape of reason as the
+    /// machine: an agent's authority lives in `console.agents`
+    /// (`selfhost_admin::agent_store`), not here, so this registry has nothing
+    /// to say about one and must not be asked to guess. `crates/app/admin`'s
+    /// `Api::caller()` never routes an agent credential through this method —
+    /// it builds that `Caller` directly from the agent store's own lookup — so
+    /// this arm exists only to keep the match exhaustive and to fail safely if
+    /// a future caller ever does ask it the wrong question.
     pub fn grants_for(&self, identity: &Identity) -> Grants {
         match identity {
-            Identity::Owner | Identity::Machine => Grants::none(),
+            Identity::Owner | Identity::Machine | Identity::Agent(_) => Grants::none(),
             Identity::Person(name) => {
                 self.find(name).map(|person| person.grants).unwrap_or_else(Grants::none)
             }
