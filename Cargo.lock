@@ -304,6 +304,7 @@ dependencies = [
  "selfhost-dns",
  "selfhost-firewall",
  "selfhost-git",
+ "selfhost-home",
  "selfhost-http",
  "selfhost-identity",
  "selfhost-json",
@@ -378,6 +379,16 @@ version = "0.1.0"
 dependencies = [
  "selfhost-config",
  "selfhost-supervisor",
+ "tokio",
+]
+
+[[package]]
+name = "selfhost-home"
+version = "0.1.0"
+dependencies = [
+ "selfhost-config",
+ "selfhost-http",
+ "selfhost-json",
  "tokio",
 ]
 

@@ -28,10 +28,21 @@ secrets/
 selfhost.config.toml
 
 # Site content served by the proxy — the user's websites, not this project's
-# source. The one exception: sites/console is the web admin console's own SPA,
-# shipped with the project, so it stays tracked.
+# source. Two exceptions, and both are exceptions for the same reason: they are
+# hand-written SPAs belonging to this project, with no build step, so nothing
+# committed could regenerate them. sites/console is the web admin console;
+# sites/home is the smart-home dashboard.
+#
+# The rule this stanza has to keep getting right is in docs/principles.dx:
+# before ignoring a path, ask whether a fresh clone still works without it. A
+# cache is rebuilt from something that is committed; if nothing committed can
+# regenerate it, it is source, whatever directory it happens to sit in. This
+# repository has already paid for that lesson three times — the dx pack, the
+# public suffix list, and rui vendored by path — and a dashboard that silently
+# does not exist on the production box after a self-update would be the fourth.
 sites/*
 !sites/console/
+!sites/home/
 
 # OS noise
 .DS_Store
