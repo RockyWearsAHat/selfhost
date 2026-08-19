@@ -32,7 +32,7 @@
   <span class="wordmark">HOME</span>
   <span class="designation">DEVICE CONTROL</span>
   <span class="rule"></span>
-  <span class="micro mono" id="gen">#214</span>
+  <span class="micro mono readout" id="gen">#214</span>
   <span class="lampline">
     <span class="lamp ok"></span>
     <span class="stateword">OK</span>
@@ -47,21 +47,21 @@
   <div class="evidence">
     <div class="reading">
       <span class="micro">DEVICES</span>
-      <span class="mono">9</span>
+      <span class="mono readout">9</span>
     </div>
     <div class="reading">
       <span class="micro">ACTIVE</span>
-      <span class="mono">4</span>
+      <span class="mono readout">4</span>
     </div>
     <div class="reading">
       <span class="micro">UNREACHABLE</span>
-      <span class="mono">0</span>
+      <span class="mono readout">0</span>
     </div>
   </div>
 </section>
 
 <!-- LIGHTS deck: wide strip with scope, controls, palette, effects on one line. -->
-<section id="lights-deck">
+<section id="lights-deck" class="lit" style="--glow:#2FB3A5">
   <div class="section-rule">
     <h2>LIGHTS</h2>
   </div>
@@ -76,7 +76,7 @@
     <button class="btn small">OFF</button>
     <div class="slider">
       <input type="range" min="0" max="100" value="70" aria-label="Brightness">
-      <span class="value mono">70</span>
+      <span class="value mono readout">70</span>
     </div>
   </div>
   <div id="lights-palette" class="palette">
@@ -121,13 +121,19 @@
           <div class="tonearm"><span class="arm" style="--arm:7deg"></span><span class="pivot"></span></div>
         </div>
         <div class="deck-panel">
-          <div class="nowplaying">
-            <span class="track">Harvest Moon</span>
-            <span class="artist">Neil Young</span>
+          <div class="toprow">
+            <div class="nowplaying">
+              <span class="track">Harvest Moon</span>
+              <span class="artist">Neil Young</span>
+            </div>
+            <div class="vus">
+              <span class="vu"><span class="needle" style="--vu:-4deg"></span><span class="vu-tag">L</span></span>
+              <span class="vu"><span class="needle" style="--vu:16deg"></span><span class="vu-tag">R</span></span>
+            </div>
           </div>
           <div class="progress">
             <span class="bar"><span class="fill" style="width:38%"></span></span>
-            <span class="clock mono">1:54 / 5:03</span>
+            <span class="clock mono readout">1:54 / 5:03</span>
           </div>
           <div class="actions">
             <button class="btn" aria-label="Previous">&#9198;</button>
@@ -140,7 +146,7 @@
       <div class="slider">
         <span class="fieldlabel">VOLUME</span>
         <input type="range" min="0" max="100" value="40" aria-label="Volume">
-        <span class="value mono">40</span>
+        <span class="value mono readout">40</span>
       </div>
       <div class="grouprow">
         <span class="caption">Coordinating: Move follows this deck.</span>
@@ -158,7 +164,7 @@
       <div class="slider">
         <span class="fieldlabel">VOLUME</span>
         <input type="range" min="0" max="100" value="25" aria-label="Volume">
-        <span class="value mono">25</span>
+        <span class="value mono readout">25</span>
       </div>
       <div class="grouprow">
         <span class="caption">Grouped under Kitchen.</span>
@@ -173,7 +179,7 @@
   <div class="section-rule"><h2>LIVING ROOM</h2><span class="rule"></span><span class="micro">3 DEVICES</span></div>
   <div class="roomdevices">
     <!-- Couch Left light -->
-    <section class="plate device">
+    <section class="plate device lit" style="--glow:#2FB3A5">
       <div class="title-rule">
         <span class="title">Couch Left</span><span class="rule"></span>
         <span class="micro kind">LIGHT</span><span class="lamp ok"></span>
@@ -182,7 +188,7 @@
       <div class="swatchline">
         <span class="micro">COLOR</span>
         <span class="swatch" style="background: #2FB3A5;"></span>
-        <span class="micro mono">#2FB3A5</span>
+        <span class="micro mono readout">#2FB3A5</span>
       </div>
       <div class="controls">
         <div class="actions">
@@ -192,13 +198,13 @@
         <div class="slider">
           <span class="fieldlabel">BRIGHT</span>
           <input type="range" min="0" max="100" value="70" aria-label="Brightness">
-          <span class="value mono">70</span>
+          <span class="value mono readout">70</span>
         </div>
       </div>
     </section>
 
     <!-- Couch Right light -->
-    <section class="plate device">
+    <section class="plate device lit" style="--glow:#2FB3A5">
       <div class="title-rule">
         <span class="title">Couch Right</span><span class="rule"></span>
         <span class="micro kind">LIGHT</span><span class="lamp ok"></span>
@@ -207,7 +213,7 @@
       <div class="swatchline">
         <span class="micro">COLOR</span>
         <span class="swatch" style="background: #2FB3A5;"></span>
-        <span class="micro mono">#2FB3A5</span>
+        <span class="micro mono readout">#2FB3A5</span>
       </div>
       <div class="controls">
         <div class="actions">
@@ -217,7 +223,7 @@
         <div class="slider">
           <span class="fieldlabel">BRIGHT</span>
           <input type="range" min="0" max="100" value="70" aria-label="Brightness">
-          <span class="value mono">70</span>
+          <span class="value mono readout">70</span>
         </div>
       </div>
     </section>
@@ -267,7 +273,7 @@
         <div class="slider">
           <span class="fieldlabel">BRIGHT</span>
           <input type="range" min="0" max="100" value="50" aria-label="Brightness">
-          <span class="value mono">50</span>
+          <span class="value mono readout">50</span>
         </div>
       </div>
     </section>
@@ -308,7 +314,7 @@
         <div class="slider">
           <span class="fieldlabel">BRIGHT</span>
           <input type="range" min="0" max="100" value="0" disabled aria-label="Brightness">
-          <span class="value mono">0</span>
+          <span class="value mono readout">0</span>
         </div>
       </div>
     </section>
