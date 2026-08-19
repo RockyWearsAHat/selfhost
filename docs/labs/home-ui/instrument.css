@@ -1,0 +1,305 @@
+/* INSTRUMENT — the home app's own design system, diverged from the console's
+   THEATRE on the operator's directive (2026-08-19: "diverge from the selfhost
+   server UI and use RUI to its fullest potential PROPERLY").
+
+   The console is a machine's status board; the home app is a thing a person
+   holds in a dark kitchen. So: warm graphite instead of true black, depth by
+   light instead of hairline boxes, capsule-and-disc geometry instead of
+   square plates, one luminous verdigris accent, and human words first. Every
+   rule here is an implementation contract with rui — each visual device below
+   names the library capability that renders it:
+
+     · every surface gradient is VERTICAL only          (canvas.rs invariant)
+     · raised surfaces are lighter + a 1px top light    (sdf.rs Bevel)
+     · sunken wells are darker + a 1px bottom light     (Bevel, inverted)
+     · halos around lit things                          (sdf.rs Glow)
+     · discs, rings, capsules, arcs                     (SDF shape algebra)
+     · shadows ONLY under genuinely floating things     (canvas.rs SDF shadow)
+     · one accent role, status roles separate           (style.rs Tone)
+     · spacing on the 4-scale; type ramp of five        (theme.rs Metrics)
+     · tabular digits for readouts                      (text.rs)
+     · the platter's turn is the page's ONE loop        (paint.rs phase)
+
+   Status language: ok is a quiet moss lamp; amber and red appear only with
+   cause (pending/holdout, fault). The accent is never a status. */
+
+:root {
+  color-scheme: dark;
+
+  /* ground + surfaces: a warm graphite ramp — elevation is lightness */
+  --ground-hi:  #17181c;
+  --ground-lo:  #101114;
+  --plate-hi:   #222429;
+  --plate-lo:   #1a1c20;
+  --well-hi:    #131417;   /* sunken: darker, lit from below */
+  --well-lo:    #191b1f;
+  --vinyl:      #0b0c0e;
+  --toplight:   rgba(255, 253, 245, 0.07);  /* Bevel: the room's light */
+  --bottomlight:rgba(255, 253, 245, 0.045);
+
+  /* ink: warm ivory ramp (contrast ≥7 body, ≥4.5 muted on plate) */
+  --ink:    #eeede7;
+  --muted:  #a5a39a;
+  --faint:  #6d6c64;
+
+  /* the one accent: verdigris, with its glow and its own ink */
+  --accent:      #46c8b2;
+  --accent-hi:   #7fe0cf;
+  --accent-deep: #14554b;
+  --accent-ink:  #05231e;
+  --accent-glow: rgba(70, 200, 178, 0.22);
+
+  /* status roles — never the accent's job */
+  --ok:    #7fae62;
+  --warn:  #e0a458;
+  --bad:   #f2555a;
+  --idle:  #55564f;
+
+  --ui:   "Avenir Next", "Avenir", "Segoe UI", "Helvetica Neue", sans-serif;
+  --mono: ui-monospace, "SF Mono", "Menlo", "Cascadia Mono", monospace;
+
+  /* the 4-scale (theme.rs Metrics) */
+  --s1: 4px; --s2: 8px; --s3: 12px; --s4: 16px; --s5: 24px; --s6: 32px;
+
+  /* type ramp — five sizes, hierarchy by weight and ink, not new sizes */
+  --t-title: 19px;   /* device names */
+  --t-body:  14px;
+  --t-cap:   12.5px; /* captions, state sentences */
+  --t-micro: 10.5px; /* small-caps labels, tracked */
+  --t-clock: 12px;   /* tabular readouts */
+
+  --r-plate: 22px;   /* Round corners; SDF makes Cut cost the same */
+  --r-ctl:   999px;  /* capsules */
+}
+
+* { margin: 0; padding: 0; box-sizing: border-box; }
+[hidden] { display: none !important; }
+
+html, body { min-height: 100vh; }
+
+body {
+  background: linear-gradient(180deg, var(--ground-hi), var(--ground-lo) 70vh);
+  color: var(--ink);
+  font: var(--t-body)/1.5 var(--ui);
+  -webkit-font-smoothing: antialiased;
+  display: flex; justify-content: center;
+  padding: var(--s5) var(--s4) max(var(--s5), env(safe-area-inset-bottom));
+}
+
+button, input, select { font: inherit; color: inherit; }
+
+/* focus: keyboard-only, offset, never the selection mark (library-drawn) */
+:focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; border-radius: 6px; }
+::selection { background: var(--accent-deep); color: var(--ink); }
+
+main#rooms { width: 100%; max-width: 390px; display: flex; flex-direction: column; gap: var(--s5); }
+
+/* ---- room header: words and air, no ruled box ---- */
+.section-rule { display: flex; align-items: baseline; gap: var(--s3); padding: 0 var(--s1); }
+.section-rule h2 {
+  font-size: var(--t-micro); font-weight: 600; letter-spacing: 0.22em;
+  color: var(--muted); text-transform: uppercase;
+}
+.section-rule .rule { flex: 1; }
+.section-rule .micro { font: 500 var(--t-micro) var(--mono); letter-spacing: 0.08em; color: var(--faint); }
+
+.roomdevices { display: flex; flex-direction: column; gap: var(--s4); }
+
+/* ---- the plate: a raised surface, lit from above (Bevel), no border ---- */
+.plate {
+  background: linear-gradient(180deg, var(--plate-hi), var(--plate-lo));
+  border-radius: var(--r-plate);
+  box-shadow: inset 0 1px 0 var(--toplight);   /* the Bevel's top light */
+  padding: var(--s4) var(--s4) var(--s3);
+  display: flex; flex-direction: column; gap: var(--s3);
+}
+
+.title-rule { display: flex; align-items: center; gap: var(--s2); }
+.title-rule .title { font-size: var(--t-title); font-weight: 600; letter-spacing: -0.01em; }
+.title-rule .rule { flex: 1; }
+.title-rule .kind {
+  font-size: var(--t-micro); font-weight: 600; letter-spacing: 0.18em;
+  color: var(--faint); text-transform: uppercase;
+}
+
+/* lamps: a lit slot — Fill + Glow from one SDF. ok is moss and quiet;
+   "live" (this device is making sound now) is the accent, with its halo. */
+.lamp { width: 7px; height: 7px; border-radius: 50%; background: var(--idle); flex: none; }
+.lamp.ok   { background: var(--ok); }
+.lamp.live { background: var(--accent); box-shadow: 0 0 8px 1px var(--accent-glow); }
+.lamp.warn { background: var(--warn); box-shadow: 0 0 8px 1px rgba(224,164,88,.25); }
+.lamp.bad  { background: var(--bad);  box-shadow: 0 0 8px 1px rgba(242,85,90,.25); }
+
+.doing { font-size: var(--t-cap); color: var(--muted); }
+
+/* ---- the deck: platter in a sunken well + panel beside it ---- */
+.deck { display: grid; grid-template-columns: 148px 1fr; gap: var(--s4); align-items: center; }
+
+.platter-well {
+  position: relative; height: 148px;
+  background: linear-gradient(180deg, var(--well-hi), var(--well-lo));
+  border-radius: 18px;
+  box-shadow: inset 0 -1px 0 var(--bottomlight),      /* sunken Bevel */
+              inset 0 1px 2px rgba(0, 0, 0, 0.5);
+}
+
+/* the record: a disc SDF stack — vinyl Fill, groove ring Strokes, label
+   disc, spindle. The groove texture is concentric ring strokes in rui;
+   the repeating-radial-gradient here is that stack's stand-in. */
+.platter {
+  position: absolute; top: 16px; left: 14px; width: 112px; height: 112px; border-radius: 50%;
+  background:
+    repeating-radial-gradient(circle at 50% 50%,
+      var(--vinyl) 0 2.5px, #131417 2.5px 3.5px);
+  display: grid; place-items: center;
+}
+/* the light across the vinyl: one static vertical sheen (gradient is
+   vertical; the room's light does not spin with the record) */
+.platter::after {
+  content: ""; position: absolute; inset: 0; border-radius: 50%;
+  background: linear-gradient(180deg, rgba(255,253,245,0.07), transparent 42%, rgba(0,0,0,0.18));
+  pointer-events: none;
+}
+.disclabel {
+  width: 46px; height: 46px; border-radius: 50%;
+  background: linear-gradient(180deg, var(--accent-deep), #0e3f38);
+  color: var(--accent-hi);
+  display: grid; place-items: center;
+  font: 600 var(--t-micro) var(--ui); letter-spacing: 0.14em;
+}
+.spindle {
+  position: absolute; width: 5px; height: 5px; border-radius: 50%;
+  background: var(--ink); left: calc(50% - 2.5px); top: calc(50% - 2.5px);
+}
+
+/* playing: the platter turns — THE page's one loop (paint.rs phase) —
+   and the well shows a low verdigris halo under the record (Glow) */
+.deck.playing .platter { animation: spin 1.8s linear infinite; }  /* 33⅓ */
+.deck.playing .platter-well { box-shadow: inset 0 -1px 0 var(--bottomlight),
+  inset 0 1px 2px rgba(0,0,0,0.5), inset 0 0 24px var(--accent-glow); }
+@keyframes spin { to { transform: rotate(360deg); } }
+@media (prefers-reduced-motion: reduce) { .deck.playing .platter { animation: none; } }
+
+/* the tonearm: pivot cap top-right, capsule arm, resting head.
+   --arm is the arm's angle; parked (paused) it stands off the record. */
+.tonearm { position: absolute; top: 6px; right: 8px; width: 40%; height: 70%; pointer-events: none; }
+.tonearm .pivot {
+  position: absolute; top: 2px; right: 4px; width: 14px; height: 14px; border-radius: 50%;
+  background: linear-gradient(180deg, #34373d, #24262b);
+  box-shadow: inset 0 1px 0 var(--toplight);
+}
+.tonearm .arm {
+  position: absolute; top: 8px; right: 11px; width: 3px; height: 84px;
+  border-radius: 2px;
+  background: linear-gradient(180deg, #4a4e55, #33363c);
+  transform-origin: 1.5px 2px;
+  transform: rotate(var(--arm, 3deg));
+}
+.tonearm .arm::after {           /* the head */
+  content: ""; position: absolute; left: -2.5px; bottom: -7px;
+  width: 8px; height: 10px; border-radius: 3px;
+  background: linear-gradient(180deg, #5a5f67, #3a3d43);
+}
+
+/* ---- the panel: title, meters, progress, transport ---- */
+.deck-panel { display: flex; flex-direction: column; gap: var(--s3); min-width: 0; }
+
+.toprow { display: flex; align-items: flex-start; gap: var(--s2); }
+.nowplaying { min-width: 0; flex: 1; }
+.nowplaying .track {
+  display: block; font-size: var(--t-body); font-weight: 600;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.nowplaying .artist { display: block; font-size: var(--t-cap); color: var(--muted); }
+
+
+/* progress: a sunken groove, accent fill, glowing playhead (Glow) */
+.progress { display: flex; align-items: center; gap: var(--s2); }
+.progress .bar {
+  flex: 1; height: 5px; border-radius: 3px;
+  background: linear-gradient(180deg, #101114, #16181c);
+  box-shadow: inset 0 1px 1px rgba(0,0,0,.5), inset 0 -1px 0 var(--bottomlight);
+  position: relative;
+}
+.progress .fill {
+  position: absolute; inset: 0 auto 0 0; border-radius: 3px;
+  background: linear-gradient(180deg, var(--accent-hi), var(--accent));
+}
+.progress .fill::after {          /* the playhead dot with its halo */
+  content: ""; position: absolute; right: -3px; top: 50%; margin-top: -4.5px;
+  width: 9px; height: 9px; border-radius: 50%;
+  background: var(--accent-hi);
+  box-shadow: 0 0 8px 2px var(--accent-glow);
+}
+.deck:not(.playing) .progress .fill { background: #3c4046; }
+.deck:not(.playing) .progress .fill::after { background: #585d64; box-shadow: none; }
+
+.clock { font: 500 var(--t-clock) var(--mono); font-variant-numeric: tabular-nums; color: var(--muted); flex: none; }
+
+/* ---- transport: circular SDF buttons; play is the accent capsule ---- */
+.actions { display: flex; align-items: center; gap: var(--s2); }
+.btn {
+  border: 0; cursor: pointer;
+  min-width: 38px; height: 38px; border-radius: var(--r-ctl);
+  display: inline-grid; place-items: center;
+  background: linear-gradient(180deg, #2a2d33, #22252a);
+  box-shadow: inset 0 1px 0 var(--toplight);
+  color: var(--ink); font-size: 15px;
+  transition: transform 60ms ease, filter 60ms ease;
+}
+.btn:hover { filter: brightness(1.12); }          /* one value step up */
+.btn:active { transform: translateY(1px); filter: brightness(0.94); } /* sunken, same frame */
+.btn.primary {
+  min-width: 52px;
+  background: linear-gradient(180deg, var(--accent-hi), var(--accent));
+  color: var(--accent-ink);
+  box-shadow: inset 0 1px 0 rgba(255,255,255,.35), 0 0 14px var(--accent-glow);
+}
+.btn.small { min-width: 0; height: 30px; padding: 0 var(--s3); font-size: var(--t-micro); font-weight: 600; letter-spacing: .12em; }
+.btn[aria-pressed="true"] { background: linear-gradient(180deg, var(--accent-deep), #0e463e); color: var(--accent-hi); }
+.btn:disabled { opacity: 0.38; cursor: default; }
+.btn.ghost { background: transparent; box-shadow: inset 0 0 0 1px #2e3137; }
+
+/* ---- the volume: groove + capsule fill + beveled thumb ---- */
+.slider { display: flex; align-items: center; gap: var(--s3); }
+.fieldlabel {
+  font-size: var(--t-micro); font-weight: 600; letter-spacing: 0.18em;
+  color: var(--faint); text-transform: uppercase; flex: none; width: 58px;
+}
+.slider input[type="range"] { flex: 1; appearance: none; -webkit-appearance: none; height: 22px; background: none; }
+.slider input[type="range"]::-webkit-slider-runnable-track {
+  height: 5px; border-radius: 3px;
+  background: linear-gradient(180deg, #101114, #16181c);
+  box-shadow: inset 0 1px 1px rgba(0,0,0,.5), inset 0 -1px 0 var(--bottomlight);
+}
+.slider input[type="range"]::-webkit-slider-thumb {
+  -webkit-appearance: none; width: 18px; height: 18px; border-radius: 50%;
+  margin-top: -6.5px;
+  background: linear-gradient(180deg, #f5f4ee, #d9d7cf);
+  box-shadow: inset 0 1px 0 rgba(255,255,255,.8), 0 1px 3px rgba(0,0,0,.5);
+}
+.slider .value { font: 500 var(--t-clock) var(--mono); font-variant-numeric: tabular-nums; color: var(--ink); width: 24px; text-align: right; flex: none; }
+.slider .btn.small { flex: none; }
+
+/* ---- grouping ---- */
+.grouprow { display: flex; align-items: center; gap: var(--s2); min-height: 30px; }
+.grouprow .caption { flex: 1; font-size: var(--t-cap); color: var(--muted); }
+.grouprow select {
+  border: 0; border-radius: var(--r-ctl); height: 30px; padding: 0 var(--s3);
+  background: linear-gradient(180deg, #2a2d33, #22252a);
+  box-shadow: inset 0 1px 0 var(--toplight);
+  font-size: var(--t-cap); color: var(--ink);
+}
+
+/* the follower's badge: a still mini-disc — the record is elsewhere */
+.minidisc {
+  width: 26px; height: 26px; border-radius: 50%; flex: none;
+  background: repeating-radial-gradient(circle at 50% 50%, var(--vinyl) 0 1.5px, #16181c 1.5px 2.5px);
+  position: relative;
+}
+.minidisc::after {
+  content: ""; position: absolute; inset: 9px; border-radius: 50%;
+  background: var(--accent-deep);
+}
+.followrow { display: flex; align-items: center; gap: var(--s3); }
+.followrow .doing { flex: 1; }
