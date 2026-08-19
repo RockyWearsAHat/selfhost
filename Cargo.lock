@@ -341,6 +341,7 @@ dependencies = [
  "selfhost-firewall",
  "selfhost-http",
  "selfhost-json",
+ "selfhost-presence",
  "selfhost-screen",
  "selfhost-supervisor",
  "selfhost-ws",
@@ -435,6 +436,10 @@ dependencies = [
  "selfhost-ws",
  "tokio",
 ]
+
+[[package]]
+name = "selfhost-presence"
+version = "0.1.0"
 
 [[package]]
 name = "selfhost-proxy"

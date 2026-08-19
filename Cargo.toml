@@ -14,6 +14,7 @@ members = [
     "crates/foundation/config",
     "crates/foundation/identity",
     "crates/foundation/login",
+    "crates/foundation/presence",
     "crates/foundation/supervisor",
 
     # net — the wire. Protocols we own, byte for byte.
@@ -109,6 +110,7 @@ selfhost-json = { path = "crates/foundation/json" }
 selfhost-login = { path = "crates/foundation/login" }
 selfhost-mail = { path = "crates/services/mail" }
 selfhost-mesh = { path = "crates/services/mesh" }
+selfhost-presence = { path = "crates/foundation/presence" }
 selfhost-proxy = { path = "crates/app/proxy" }
 selfhost-reports = { path = "crates/services/reports" }
 selfhost-screen = { path = "crates/services/screen" }

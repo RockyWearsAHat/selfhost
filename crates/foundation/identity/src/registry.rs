@@ -7,13 +7,21 @@
 //! capabilities the operator has granted them. It is shaped deliberately —
 //! almost line for line — on `Passkeys` in `crates/admin/src/webauthn.rs`,
 //! which is the store this one sits beside and shares a lifecycle with. A
-//! cheap-clone handle over an `Arc<Mutex<Vec<_>>>`, because
-//! [`crate::Policy`]'s callers are clones of one API and a grant made through
-//! one of them must be visible through all. A missing file is an empty store.
-//! Persistence is a write to a temporary sibling followed by a rename, so a
-//! crash mid-write leaves the previous file rather than half of the new one.
-//! A non-revealing `Debug`, because a list of who has access to what is a
-//! target list even though it holds no secret.
+//! cheap-clone handle over an `Arc<Mutex<_>>`, because [`crate::Policy`]'s
+//! callers are clones of one API and a grant made through one of them must be
+//! visible through all. A missing file is an empty store. Persistence is a
+//! write to a temporary sibling followed by a rename, so a crash mid-write
+//! leaves the previous file rather than half of the new one. A non-revealing
+//! `Debug`, because a list of who has access to what is a target list even
+//! though it holds no secret.
+//!
+//! It departs from that store in one place, and the departure is the important
+//! sentence in this file: the handle is **not** a snapshot. It re-reads
+//! `console.people` whenever the file has changed underneath it, because the
+//! daemon is not the only writer — `selfhost people` is a separate process that
+//! writes this file directly and deliberately. See [`Stored`] for the defect
+//! that made the difference, and for why it mattered more here than it did in
+//! the invite store where the same shape was fixed first.
 //!
 //! And, most importantly, the same fail-closed reading of a file it cannot
 //! understand: a malformed `console.people` loads as **empty**, says so once on
@@ -139,8 +147,37 @@ pub struct Person {
 #[derive(Clone)]
 pub struct People {
     path: PathBuf,
-    entries: Arc<Mutex<Vec<Person>>>,
+    state: Arc<Mutex<Stored>>,
     write_private: PrivateWrite,
+}
+
+/// What the registry holds in memory: the entries, and enough about the file
+/// they were read from to notice somebody else rewriting it.
+///
+/// The second field is the whole of the fix for a defect this file shipped
+/// with. A registry handle is built **once**, when the daemon starts, and lives
+/// for the life of the process — but it is not the only writer. `selfhost
+/// people grant|allow|deny|forget` is a separate process that writes this same
+/// file directly and by design (`crates/app/cli/src/people_command.rs` states
+/// why: an operator must be able to fix permissions on a box whose console they
+/// cannot reach). With a plain snapshot, that other process's write was invisible
+/// to the running daemon until it was restarted, which made the CLI's own
+/// closing line — *takes effect on the daemon's next read of the registry* —
+/// untrue, and made the failure asymmetric in the dangerous direction: a
+/// **grant** that did not appear is an operator filing a bug, and a **revocation**
+/// that did not appear is somebody still holding a power that was taken away an
+/// hour ago.
+///
+/// `crates/app/admin/src/invite.rs` had the identical defect and was fixed in
+/// e50918a; this is the same shape applied to the file that decides what people
+/// may do, which is the one where it mattered more.
+struct Stored {
+    /// The registry as last read or written.
+    entries: Vec<Person>,
+    /// The modified time and length of the file those entries came from, or
+    /// `None` when the file was absent or unreadable. Compared before every
+    /// operation; a difference means re-read.
+    seen: Option<(SystemTime, u64)>,
 }
 
 impl People {
@@ -155,30 +192,14 @@ impl People {
     }
 
     /// Loads the registry, persisting through the writer the deployment owns.
+    ///
+    /// What this reads is a starting point, not a snapshot the handle keeps: see
+    /// [`Stored`] and [`Self::lock`] for why every operation re-reads a file that
+    /// has changed underneath it.
     pub fn with_writer(data_dir: &Path, write_private: PrivateWrite) -> Self {
         let path = Self::path_in(data_dir);
-        let entries = match std::fs::read_to_string(&path) {
-            Ok(text) => match parse_people(&text) {
-                Some(entries) => entries,
-                None => {
-                    eprintln!(
-                        "identity: {} is not a valid people file; every person holds nothing \
-                         until it is repaired or removed (the owner is unaffected)",
-                        path.display()
-                    );
-                    Vec::new()
-                }
-            },
-            Err(error) if error.kind() == io::ErrorKind::NotFound => Vec::new(),
-            Err(error) => {
-                eprintln!(
-                    "identity: could not read {}: {error}; every person holds nothing",
-                    path.display()
-                );
-                Vec::new()
-            }
-        };
-        Self { path, entries: Arc::new(Mutex::new(entries)), write_private }
+        let (entries, seen) = read_entries(&path);
+        Self { path, state: Arc::new(Mutex::new(Stored { entries, seen })), write_private }
     }
 
     /// Where the people file lives for a given data directory.
@@ -188,22 +209,22 @@ impl People {
 
     /// Whether nobody is registered.
     pub fn is_empty(&self) -> bool {
-        self.lock().is_empty()
+        self.lock().entries.is_empty()
     }
 
     /// How many people are registered.
     pub fn len(&self) -> usize {
-        self.lock().len()
+        self.lock().entries.len()
     }
 
     /// Everyone registered, for the console's people list.
     pub fn list(&self) -> Vec<Person> {
-        self.lock().clone()
+        self.lock().entries.clone()
     }
 
     /// The entry for one person, if they have one.
     pub fn find(&self, name: &PersonName) -> Option<Person> {
-        self.lock().iter().find(|entry| &entry.name == name).cloned()
+        self.lock().entries.iter().find(|entry| &entry.name == name).cloned()
     }
 
     /// What `identity` holds.
@@ -265,19 +286,21 @@ impl People {
     /// the operator's own authority, and no need for this method to defend
     /// against one.
     pub fn set_grants(&self, name: &PersonName, grants: Grants) -> io::Result<()> {
-        let mut entries = self.lock();
-        match entries.iter_mut().find(|entry| &entry.name == name) {
+        let mut state = self.lock();
+        match state.entries.iter_mut().find(|entry| &entry.name == name) {
             Some(entry) => entry.grants = grants,
             None => {
-                if entries.len() >= MAX_PEOPLE {
+                if state.entries.len() >= MAX_PEOPLE {
                     return Err(io::Error::other(format!(
                         "at most {MAX_PEOPLE} people may be registered"
                     )));
                 }
-                entries.push(Person { name: name.clone(), grants, added_unix: now_unix() });
+                state.entries.push(Person { name: name.clone(), grants, added_unix: now_unix() });
             }
         }
-        self.persist(&entries)
+        self.persist(&state.entries)?;
+        self.mark_written(&mut state);
+        Ok(())
     }
 
     /// Forgets a person entirely, persisting; false if they were unknown.
@@ -287,13 +310,14 @@ impl People {
     /// operator means "this person is gone", because an entry with no grants
     /// still renders as a row in the console.
     pub fn remove(&self, name: &PersonName) -> io::Result<bool> {
-        let mut entries = self.lock();
-        let before = entries.len();
-        entries.retain(|entry| &entry.name != name);
-        if entries.len() == before {
+        let mut state = self.lock();
+        let before = state.entries.len();
+        state.entries.retain(|entry| &entry.name != name);
+        if state.entries.len() == before {
             return Ok(false);
         }
-        self.persist(&entries)?;
+        self.persist(&state.entries)?;
+        self.mark_written(&mut state);
         Ok(true)
     }
 
@@ -315,14 +339,77 @@ impl People {
         std::fs::rename(&temporary, &self.path)
     }
 
-    /// The entries, with lock poisoning treated as fatal, as in
-    /// `crates/admin`'s session and passkey stores.
+    /// The entries as they are on disk **right now**, with lock poisoning
+    /// treated as fatal, as in `crates/admin`'s session and passkey stores.
     ///
     /// A poisoned lock means a panic happened while the registry was held;
     /// limping on with permissions in an unknown state is worse than stopping.
-    fn lock(&self) -> std::sync::MutexGuard<'_, Vec<Person>> {
-        self.entries.lock().expect("the people registry lock was poisoned")
+    ///
+    /// The re-read is not an optimisation and it is not caching: it is what
+    /// makes this handle answer for the file rather than for the moment it was
+    /// constructed. See [`Stored`] for the second writer that makes it
+    /// necessary. The cost is one `stat` per authorisation decision, paid so
+    /// that a revocation is a revocation.
+    fn lock(&self) -> std::sync::MutexGuard<'_, Stored> {
+        let mut state = self.state.lock().expect("the people registry lock was poisoned");
+        let current = file_stamp(&self.path);
+        if current != state.seen {
+            let (entries, seen) = read_entries(&self.path);
+            state.entries = entries;
+            state.seen = seen;
+        }
+        state
     }
+
+    /// Records what was just written, so the next operation does not re-read
+    /// this handle's own write back off the disk.
+    fn mark_written(&self, state: &mut Stored) {
+        state.seen = file_stamp(&self.path);
+    }
+}
+
+/// The file's identity for change detection: modified time and length.
+///
+/// `None` when the file is absent or cannot be stated, which is itself a value
+/// that compares unequal to a present file — so a registry whose file appears,
+/// or disappears, notices either way.
+fn file_stamp(path: &Path) -> Option<(SystemTime, u64)> {
+    let metadata = std::fs::metadata(path).ok()?;
+    Some((metadata.modified().ok()?, metadata.len()))
+}
+
+/// Reads and parses the people file, failing closed.
+///
+/// A missing file is an empty registry. A malformed one is *also* an empty
+/// registry — every person holds nothing, rather than some unknown subset of
+/// them holding something — and says so. The owner is unaffected either way:
+/// their authority does not come from this file.
+fn read_entries(path: &Path) -> (Vec<Person>, Option<(SystemTime, u64)>) {
+    // Stamp first, so a write landing between the read and the stat is noticed
+    // on the next call rather than being mistaken for what was just read.
+    let stamp = file_stamp(path);
+    let entries = match std::fs::read_to_string(path) {
+        Ok(text) => match parse_people(&text) {
+            Some(entries) => entries,
+            None => {
+                eprintln!(
+                    "identity: {} is not a valid people file; every person holds nothing \
+                     until it is repaired or removed (the owner is unaffected)",
+                    path.display()
+                );
+                Vec::new()
+            }
+        },
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Vec::new(),
+        Err(error) => {
+            eprintln!(
+                "identity: could not read {}: {error}; every person holds nothing",
+                path.display()
+            );
+            Vec::new()
+        }
+    };
+    (entries, stamp)
 }
 
 // Deliberately not a revealing `Debug`: the registry holds no secret, but who
@@ -330,7 +417,7 @@ impl People {
 // a shopping list.
 impl std::fmt::Debug for People {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "People({} registered)", self.lock().len())
+        write!(f, "People({} registered)", self.lock().entries.len())
     }
 }
 
@@ -425,6 +512,58 @@ mod tests {
 
     fn read_grants() -> Grants {
         Grants::new([Capability::FilesRead(ShareId::parse("vault").unwrap())]).unwrap()
+    }
+
+    #[test]
+    fn a_handle_answers_for_the_file_and_not_for_the_moment_it_was_built() {
+        // The defect this store shipped with, stated as the property that now
+        // holds. The daemon builds one `People` at start-up and keeps it for the
+        // life of the process; `selfhost people grant|deny|forget` is a
+        // *separate process* that writes this file directly and by design. A
+        // handle that snapshotted meant the running daemon never saw either
+        // half of that — and the dangerous half is not the grant that failed to
+        // appear, which an operator notices and reports. It is the revocation
+        // that failed to appear, which nobody notices, because everything keeps
+        // working exactly as it did before somebody's access was taken away.
+        let dir = scratch("second-writer");
+        let daemon = People::load(&dir);
+        daemon.set_grants(&person("Mom"), read_grants()).expect("the first write");
+        assert!(!daemon.grants_for(&Identity::parse("Mom").unwrap()).is_empty());
+
+        // The other process, holding its own handle over the same file.
+        let cli = People::load(&dir);
+        assert!(
+            !cli.grants_for(&Identity::parse("Mom").unwrap()).is_empty(),
+            "the second process should read what the first one wrote",
+        );
+
+        // It grants something new. The daemon must see it without a restart.
+        let widened =
+            Grants::new([Capability::ConsoleRead, Capability::FilesRead(ShareId::parse("vault").unwrap())]).unwrap();
+        cli.set_grants(&person("Mom"), widened).expect("the CLI's write");
+        assert!(
+            daemon.grants_for(&Identity::parse("Mom").unwrap()).holds(&Capability::ConsoleRead),
+            "a grant made by another process was invisible to the running daemon",
+        );
+
+        // And — the half that matters — it takes it all away again.
+        cli.set_grants(&person("Mom"), Grants::none()).expect("the revocation");
+        assert!(
+            daemon.grants_for(&Identity::parse("Mom").unwrap()).is_empty(),
+            "a revocation made by another process was still being honoured by the \
+             running daemon: the person kept every power that had just been taken away",
+        );
+
+        // Forgetting them entirely is the same property by the other route.
+        daemon.set_grants(&person("Mom"), read_grants()).expect("granted again");
+        assert!(cli.remove(&person("Mom")).expect("the CLI forgets them"));
+        assert!(
+            daemon.find(&person("Mom")).is_none(),
+            "a person forgotten by another process was still in the running daemon's registry",
+        );
+        assert!(daemon.is_empty());
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

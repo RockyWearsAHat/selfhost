@@ -531,6 +531,19 @@ impl Identity {
         matches!(self, Self::Agent(_))
     }
 
+    /// Whether this identity names one person.
+    ///
+    /// The predicate a per-person credential is checked against. Written here
+    /// rather than as a `matches!` at each call site because the interesting
+    /// property is what it is *not*: neither the owner nor the machine, both of
+    /// which are the deployment rather than somebody — and, as of
+    /// [`Identity::Agent`], not a trusted machine either. A `DevicePassword`
+    /// names a person and only a person; an agent token names a machine and
+    /// goes through [`Identity::is_agent`] instead.
+    pub fn is_person(&self) -> bool {
+        matches!(self, Self::Person(_))
+    }
+
     /// The word the audit log uses for this identity's *kind*.
     ///
     /// Written as its own field beside the name, so a person whose name merely

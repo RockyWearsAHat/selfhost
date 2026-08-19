@@ -61,6 +61,35 @@ pub fn verify(stored: &str, password: &str) -> bool {
     pbkdf2::verify(pbkdf2::PBKDF2_HMAC_SHA256, iterations, &salt, password.as_bytes(), &derived).is_ok()
 }
 
+/// Whether `stored` is a value [`verify`] could ever match a password against.
+///
+/// Shape only — the algorithm tag, four fields, an iteration count that parses
+/// and is non-zero, and two fields that decode as base64 with the right derived
+/// length. It says nothing about which password, and it is not a security check:
+/// [`verify`] answers `false` for a malformed hash either way.
+///
+/// It exists so that a store which *loads* credentials can refuse a document at
+/// load time rather than at use time. A hand-edited file with a plaintext
+/// password in the hash field otherwise parses fine, stores fine, and simply
+/// never matches anything — which is a support afternoon rather than an error.
+pub fn is_stored_hash(stored: &str) -> bool {
+    let mut parts = stored.split('$');
+    if parts.next() != Some("pbkdf2-sha256") {
+        return false;
+    }
+    let (Some(iterations), Some(salt_b64), Some(derived_b64), None) =
+        (parts.next(), parts.next(), parts.next(), parts.next())
+    else {
+        return false;
+    };
+    let (Ok(iterations), Ok(_salt), Ok(derived)) =
+        (iterations.parse::<u32>(), b64_decode(salt_b64), b64_decode(derived_b64))
+    else {
+        return false;
+    };
+    iterations > 0 && derived.len() == KEY_LEN
+}
+
 /// Encodes bytes as padded standard base64.
 pub fn b64_encode(data: &[u8]) -> String {
     const B64: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";

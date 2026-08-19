@@ -42,7 +42,7 @@
 //! at most [`MAX_TAIL_BYTES`], discarding the first line it lands in the middle
 //! of, and the caller may ask for at most [`MAX_LIMIT`] records.
 
-use selfhost_identity::audit::{AUDIT_FORMAT, AuditLog, unescape_field};
+use selfhost_identity::audit::{AUDIT_FORMAT, AUDIT_FORMAT_V1, AuditLog, unescape_field};
 use selfhost_json::Json;
 use std::io::{Read, Seek, SeekFrom};
 
@@ -76,9 +76,14 @@ pub struct Entry {
     pub who: String,
     /// What was presented: `bearer`, `password`, `passkey` or `session`.
     pub credential: String,
-    /// The capability that was decided, by its wire word.
-    pub capability: String,
-    /// The share or machine it named, empty for the capabilities that name
+    /// What the record is about, by its wire word: a capability that was
+    /// decided (`console.read`, `desktop.control`, …) or an act of authority
+    /// that no capability names (`authority.grants`, `authority.redeem`, …).
+    /// Read from `act=` on a version 2 line and from `capability=` on a
+    /// version 1 one.
+    pub act: String,
+    /// What it named: a share, a machine, or — for an authority act — the
+    /// person or credential it concerned. Empty for the words that name
     /// nothing.
     pub target: String,
     /// `allow` or `refuse`.
@@ -104,7 +109,12 @@ impl Entry {
             ("identity", Json::string(&self.identity)),
             ("who", Json::string(&self.who)),
             ("credential", Json::string(&self.credential)),
-            ("capability", Json::string(&self.capability)),
+            // Kept as `capability` on the wire even though the log's own
+            // column is now `act`: the console renders this field and an
+            // installed console is not upgraded in the same breath as the
+            // daemon. Renaming it here would blank a column in every browser
+            // that had not reloaded.
+            ("capability", Json::string(&self.act)),
             ("target", Json::string(&self.target)),
             ("outcome", Json::string(&self.outcome)),
             ("reason", Json::string(&self.reason)),
@@ -152,7 +162,12 @@ impl Tail {
 /// partly invention.
 pub fn parse_line(line: &str) -> Option<Entry> {
     let mut tokens = line.split(' ').filter(|token| !token.is_empty());
-    if tokens.next()? != AUDIT_FORMAT {
+    // Both format markers are accepted. Version 2 renamed `capability=` to
+    // `act=` because the field had started carrying acts that are not
+    // capabilities; nothing else changed, so refusing version 1 would blank an
+    // operator's existing trail to make a point about a column heading.
+    let marker = tokens.next()?;
+    if marker != AUDIT_FORMAT && marker != AUDIT_FORMAT_V1 {
         return None;
     }
 
@@ -161,7 +176,7 @@ pub fn parse_line(line: &str) -> Option<Entry> {
     let mut identity = None;
     let mut who = None;
     let mut credential = None;
-    let mut capability = None;
+    let mut act = None;
     let mut target = None;
     let mut outcome = None;
     let mut reason = None;
@@ -175,7 +190,9 @@ pub fn parse_line(line: &str) -> Option<Entry> {
             "identity" => identity = Some(value.to_owned()),
             "who" => who = Some(unescape_field(value)?),
             "credential" => credential = Some(value.to_owned()),
-            "capability" => capability = Some(unescape_field(value)?),
+            // `capability` is version 1's name for this field; `act` is
+            // version 2's. A line carries one or the other, never both.
+            "act" | "capability" => act = Some(unescape_field(value)?),
             "target" => target = Some(unescape_field(value)?),
             "outcome" => outcome = Some(value.to_owned()),
             "reason" => reason = Some(value.to_owned()),
@@ -193,7 +210,7 @@ pub fn parse_line(line: &str) -> Option<Entry> {
         identity: identity?,
         who: who?.0,
         credential: credential?,
-        capability: capability?.0,
+        act: act?.0,
         target: target?.0,
         outcome: outcome?,
         reason: reason?,
@@ -297,7 +314,7 @@ mod tests {
             at_unix: 1_754_000_000,
             identity: Identity::Owner,
             credential: Credential::Passkey,
-            capability: Capability::DesktopControl(node()),
+            act: selfhost_identity::audit::Act::Exercised(Capability::DesktopControl(node())),
             decision,
             detail: detail.to_owned(),
         }
@@ -312,7 +329,7 @@ mod tests {
         assert_eq!(entry.identity, "owner");
         assert_eq!(entry.who, "owner");
         assert_eq!(entry.credential, "passkey");
-        assert_eq!(entry.capability, "desktop.control");
+        assert_eq!(entry.act, "desktop.control");
         assert_eq!(entry.target, "alex-desktop");
         assert_eq!(entry.outcome, "allow");
         assert_eq!(entry.reason, "-");

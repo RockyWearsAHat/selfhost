@@ -38,6 +38,7 @@
 
 mod channel;
 mod client;
+mod gate;
 mod machines;
 mod nas;
 mod poller;
