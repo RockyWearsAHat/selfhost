@@ -977,4 +977,118 @@ static_root = \"./sites/blog\"
         assert!(!is_domains_key("domains_note = \"x\""));
         assert!(!is_domains_key("# domains = [\"a\"]"));
     }
+
+    /// Fixture with server, nodes, sites, DNS zones, and mail sections.
+    ///
+    /// Regression test for config-file overwrite concern: surgical edits must
+    /// not touch unrelated sections. Every section this fixture carries must
+    /// survive every site and domain operation byte for byte, proving the
+    /// surgical-edit promise holds even for sections the edit functions never
+    /// examine — like [dns] zones that should be hand-authored only.
+    const WITH_DNS_AND_MAIL: &str = "\
+version = 1
+
+[server]
+acme_email = \"a@b.com\"
+acme = \"self-signed\"
+
+[[nodes]]
+name = \"home\"
+role = \"owner\"
+
+# DNS section with a zone — hand-authored and never touched by site edits
+[dns]
+lan_ip = \"192.168.1.8\"
+dynamic_ip = true
+
+[[dns.zone]]
+domain = \"example.com\"
+
+[[dns.zone]]
+domain = \"lab.example.com\"
+
+# The sites section
+[[sites]]
+name = \"blog\"
+domains = [\"www.example.com\"]
+static_root = \"./sites/blog\"
+
+# Mail section with a hostname and domains
+[mail]
+hostname = \"mail.example.com\"
+domains = [\"example.com\", \"lab.example.com\"]
+# end of fixture — a fixed sentinel so the mail section's extent is
+# unambiguous even after a site block is appended past it
+";
+
+    #[test]
+    fn add_and_remove_site_preserves_unrelated_sections_byte_for_byte() {
+        // Helper: extract a section from text between a start marker and an end marker.
+        fn extract_section(text: &str, start_marker: &str, end_marker: &str) -> String {
+            let start = text.find(start_marker).unwrap_or(0);
+            let end = text[start..].find(end_marker)
+                .map(|offset| start + offset)
+                .unwrap_or(text.len());
+            text[start..end].to_string()
+        }
+
+        // Original file must parse successfully.
+        Config::parse(WITH_DNS_AND_MAIL).expect("fixture parses");
+
+        let original_dns = extract_section(WITH_DNS_AND_MAIL, "[dns]", "# The sites section");
+        let original_mail = extract_section(WITH_DNS_AND_MAIL, "[mail]", "# end of fixture");
+
+        // Add a site: [dns] and [mail] must be byte-for-byte identical.
+        let after_add = add_site(WITH_DNS_AND_MAIL, &static_site("api", "api.example.com"))
+            .expect("add_site must succeed");
+        Config::parse(&after_add).expect("result after add_site parses");
+
+        let after_add_dns = extract_section(&after_add, "[dns]", "# The sites section");
+        let after_add_mail = extract_section(&after_add, "[mail]", "# end of fixture");
+
+        assert_eq!(
+            original_dns, after_add_dns,
+            "add_site must preserve [dns] section exactly"
+        );
+        assert_eq!(
+            original_mail, after_add_mail,
+            "add_site must preserve [mail] section exactly"
+        );
+
+        // Add a domain to an existing site: [dns] and [mail] must survive unchanged.
+        let after_domain = add_domain(&after_add, "blog", "shop.example.com")
+            .expect("add_domain must succeed")
+            .expect("blog site exists");
+        Config::parse(&after_domain).expect("result after add_domain parses");
+
+        let after_domain_dns = extract_section(&after_domain, "[dns]", "# The sites section");
+        let after_domain_mail = extract_section(&after_domain, "[mail]", "# end of fixture");
+
+        assert_eq!(
+            original_dns, after_domain_dns,
+            "add_domain must preserve [dns] section exactly"
+        );
+        assert_eq!(
+            original_mail, after_domain_mail,
+            "add_domain must preserve [mail] section exactly"
+        );
+
+        // Remove a site: [dns] and [mail] unchanged.
+        let after_remove = remove_site(&after_domain, "api")
+            .expect("remove_site must succeed")
+            .expect("api site exists to remove");
+        Config::parse(&after_remove).expect("result after remove_site parses");
+
+        let after_remove_dns = extract_section(&after_remove, "[dns]", "# The sites section");
+        let after_remove_mail = extract_section(&after_remove, "[mail]", "# end of fixture");
+
+        assert_eq!(
+            original_dns, after_remove_dns,
+            "remove_site must preserve [dns] section exactly"
+        );
+        assert_eq!(
+            original_mail, after_remove_mail,
+            "remove_site must preserve [mail] section exactly"
+        );
+    }
 }
