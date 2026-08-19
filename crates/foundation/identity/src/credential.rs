@@ -174,6 +174,30 @@ pub enum Credential {
     /// Basic — a credential Finder and Explorer store in an operating system's
     /// keychain and replay on every single request for the life of a mount.
     Password,
+    /// One person's own storage password, verified against the entry they hold
+    /// in `<data_dir>/console.devicepw`, and presented on *this* request.
+    ///
+    /// The credential that exists because [`Credential::Password`] could not be
+    /// made to name anybody. A WebDAV client speaks HTTP authentication or
+    /// nothing — no cookie, no passkey — so a share mounted in Finder or Explorer
+    /// had exactly one door, and behind that door was the deployment's own
+    /// password. Everyone who could mount anything mounted *everything*, and the
+    /// per-share capabilities the policy already knew how to enforce had no
+    /// identity to enforce them against.
+    ///
+    /// It is a *person's*, so it names one: [`Credential::belongs_to`] admits it
+    /// only for [`Identity::Person`](crate::Identity::Person), and the policy
+    /// decides it by that person's grants like every other named credential. The
+    /// name is not decoration here — on this credential the Basic user name is
+    /// looked up rather than ignored, which is the whole change.
+    ///
+    /// It is nonetheless **unattended**, for exactly the reason
+    /// [`Credential::Password`] is: an operating system's keychain stores it at
+    /// mount time and replays it on every request for the life of the mount, with
+    /// nobody present. Naming a person is not the same as proving one is there,
+    /// and conflating those is how a mounted drive would end up holding a
+    /// keyboard. Only a passkey proves presence.
+    DevicePassword,
     /// A WebAuthn assertion from a registered passkey, presented on *this*
     /// request.
     ///
@@ -204,6 +228,7 @@ impl Credential {
         match self {
             Self::Bearer => "bearer",
             Self::Password => "password",
+            Self::DevicePassword => "device-password",
             Self::Passkey => "passkey",
             Self::Session(session) => match session.opened_by {
                 Opening::Password => "session.password",
@@ -223,7 +248,10 @@ impl Credential {
     pub fn is_deployment_wide(&self) -> bool {
         match self {
             Self::Bearer | Self::Password => true,
-            Self::Passkey => false,
+            // A person's own storage password. There is one per person and it is
+            // looked up under their name, so it answers *which person* — which
+            // is the whole of what this predicate asks.
+            Self::DevicePassword | Self::Passkey => false,
             Self::Session(session) => session.opened_by == Opening::Password,
         }
     }
@@ -246,6 +274,13 @@ impl Credential {
         match self {
             Self::Bearer => identity.is_machine(),
             Self::Password => identity.is_owner(),
+            // Narrower than the passkey's row, and deliberately: a device
+            // password is minted *for* an entry in the people registry, and the
+            // registry cannot spell the owner in any casing. There is therefore
+            // no such thing as the owner's device password, and admitting one
+            // here would be a second way to become the owner with a stored
+            // secret — which is the door this credential was added to close.
+            Self::DevicePassword => identity.is_person(),
             Self::Passkey => !identity.is_machine(),
             Self::Session(session) => match session.opened_by {
                 Opening::Password => identity.is_owner(),
@@ -293,7 +328,7 @@ impl Credential {
     ///   refusing every browser a keyboard for ever, which is not a stricter
     ///   rule, it is a broken feature.
     pub fn is_unattended(&self) -> bool {
-        matches!(self, Self::Bearer | Self::Password)
+        matches!(self, Self::Bearer | Self::Password | Self::DevicePassword)
     }
 
     /// One credential of every shape, for exhaustive tables.
@@ -309,6 +344,7 @@ impl Credential {
         vec![
             Self::Bearer,
             Self::Password,
+            Self::DevicePassword,
             Self::Passkey,
             Self::Session(Session::new(Opening::Password, opened_at)),
             Self::Session(Session::new(Opening::Passkey, opened_at)),
@@ -346,7 +382,7 @@ mod tests {
         words.sort_unstable();
         words.dedup();
         assert_eq!(words.len(), shapes.len(), "one word each, all distinct");
-        assert_eq!(shapes.len(), 5, "extend every_shape when a variant is added");
+        assert_eq!(shapes.len(), 6, "extend every_shape when a variant is added");
     }
 
     #[test]
@@ -355,6 +391,10 @@ mod tests {
         assert!(Credential::Bearer.is_deployment_wide());
         assert!(Credential::Password.is_deployment_wide());
         assert!(!Credential::Passkey.is_deployment_wide());
+        assert!(
+            !Credential::DevicePassword.is_deployment_wide(),
+            "there is one per person and it is looked up under their name"
+        );
         assert!(
             Credential::Session(Session::new(Opening::Password, now)).is_deployment_wide(),
             "there is one console password, so the session it minted names nobody"
@@ -370,6 +410,10 @@ mod tests {
         let now = moment();
         assert!(Credential::Bearer.is_unattended(), "a token in a file");
         assert!(Credential::Password.is_unattended(), "a password in a keychain, on every WebDAV request");
+        assert!(
+            Credential::DevicePassword.is_unattended(),
+            "naming a person is not proving one is there — the keychain replays this too"
+        );
         assert!(!Credential::Passkey.is_unattended(), "signed on hardware, this instant");
         for opening in Opening::EVERY {
             assert!(
@@ -388,10 +432,15 @@ mod tests {
         // two have to agree rather than restate each other. The load-bearing row
         // is the first: the token is the machine's and nobody else's, which is
         // what stops it from being the operator in the audit trail.
-        let expected: [(Credential, [bool; 3]); 5] = [
+        let expected: [(Credential, [bool; 3]); 6] = [
             //                                    owner, machine, person
             (Credential::Bearer, [false, true, false]),
             (Credential::Password, [true, false, false]),
+            // Narrower than the passkey's row: the people registry cannot spell
+            // the owner in any casing, so there is no owner's device password
+            // and admitting one would be a second way to become the owner with a
+            // stored secret.
+            (Credential::DevicePassword, [false, false, true]),
             (Credential::Passkey, [true, false, true]),
             (Credential::Session(Session::new(Opening::Password, now)), [true, false, false]),
             (Credential::Session(Session::new(Opening::Passkey, now)), [true, false, true]),
@@ -410,6 +459,10 @@ mod tests {
         let now = moment();
         assert!(Credential::Session(Session::new(Opening::Password, now)).is_a_password_login());
         assert!(!Credential::Password.is_a_password_login(), "that is the WebDAV mount");
+        assert!(
+            !Credential::DevicePassword.is_a_password_login(),
+            "and that is a person's WebDAV mount, which the demotion has no business reaching"
+        );
         assert!(!Credential::Bearer.is_a_password_login());
         assert!(!Credential::Passkey.is_a_password_login());
         assert!(!Credential::Session(Session::new(Opening::Passkey, now)).is_a_password_login());
