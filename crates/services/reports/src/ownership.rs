@@ -258,10 +258,8 @@ impl Owners {
         let mut matched = false;
         for entry in self.lock().iter() {
             let service_matches = constant_time_eq(entry.service.as_bytes(), service.as_bytes());
-            let digest_matches = constant_time_eq(
-                entry.reader_digest.as_bytes(),
-                offered_digest.as_bytes(),
-            );
+            let digest_matches =
+                constant_time_eq(entry.reader_digest.as_bytes(), offered_digest.as_bytes());
             matched |= service_matches && digest_matches;
         }
         matched
@@ -380,6 +378,19 @@ fn now_unix() -> u64 {
         .unwrap_or(0)
 }
 
+/// Restricts a file to its owner, where the platform has such a concept.
+fn restrict(path: &Path) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -427,7 +438,9 @@ mod tests {
         let dir = scratch("twice");
         let owners = Owners::load(&dir);
         owners.claim("myapp", "acct-1").expect("claim");
-        let refused = owners.claim("myapp", "acct-2").expect_err("already claimed");
+        let refused = owners
+            .claim("myapp", "acct-2")
+            .expect_err("already claimed");
         assert!(refused.contains("already claimed"), "{refused}");
     }
 
@@ -490,18 +503,5 @@ mod tests {
         assert!(free.records_per_service < pro.records_per_service);
         assert!(free.bytes_per_service < pro.bytes_per_service);
         assert!(pro.records_per_service <= crate::store::MAX_RECORDS);
-    }
-}
-
-/// Restricts a file to its owner, where the platform has such a concept.
-fn restrict(path: &Path) {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = path;
     }
 }
