@@ -1,0 +1,102 @@
+<!doctype html>
+<!-- Design comp: the honesty board — four states that separate an instrument
+     from a demo. Phone width. On INSTRUMENT, the home app's own design system.
+     Each plate shows a distinct device state: APPLYING, HOLDOUT, UNREACHABLE,
+     REGROUPING. No JavaScript, no external requests. -->
+<html lang="en"><head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>States — the honesty board.</title>
+<link rel="stylesheet" href="instrument.css">
+</head><body>
+
+<main id="rooms">
+<div class="room">
+
+  <!-- (1) APPLYING: Light plate, converging to set state, setmark pending. -->
+  <section class="plate device">
+    <div class="title-rule">
+      <span class="title">Bedside</span><span class="rule"></span>
+      <span class="kind">Light</span><span class="lamp pending"></span>
+    </div>
+    <p class="doing">Converging to off.</p>
+    <div class="port">
+      <div class="ring" style="--arc:0;"></div>
+      <div class="orb"></div>
+    </div>
+    <div class="seg">
+      <button aria-pressed="true" class="offside">OFF</button>
+      <button aria-pressed="false">ON</button>
+    </div>
+    <span class="setmark">
+      <span class="lamp pending"></span>
+      <span class="micro">SET 0% — APPLYING</span>
+    </span>
+    <span class="address mono">192.168.1.20 &middot; wiz</span>
+  </section>
+
+  <!-- (2) HOLDOUT: Same shape, device dissents after patience, setmark red. -->
+  <section class="plate device">
+    <div class="title-rule">
+      <span class="title">Desk</span><span class="rule"></span>
+      <span class="kind">Light</span><span class="lamp bad"></span>
+    </div>
+    <p class="doing">Told to turn off; the device still says on.</p>
+    <div class="port">
+      <div class="ring" style="--arc:0;"></div>
+      <div class="orb"></div>
+    </div>
+    <div class="seg">
+      <button aria-pressed="true" class="offside">OFF</button>
+      <button aria-pressed="false">ON</button>
+    </div>
+    <span class="setmark holdout">
+      <span class="lamp pending"></span>
+      <span class="micro">SET OFF — DEVICE SAYS ON, RETRYING</span>
+    </span>
+    <span class="address mono">192.168.1.21 &middot; wiz</span>
+  </section>
+
+  <!-- (3) UNREACHABLE: Dimmed plate, controls at server set values (seg ON, slider 60). -->
+  <section class="plate device gone">
+    <div class="title-rule">
+      <span class="title">Couch Left</span><span class="rule"></span>
+      <span class="kind">Light</span><span class="lamp idle"></span>
+    </div>
+    <p class="doing">Not answering.</p>
+    <p class="doing">Set state applies when it does.</p>
+    <div class="port">
+      <div class="ring" style="--arc:60;"></div>
+      <div class="orb"></div>
+    </div>
+    <div class="seg">
+      <button aria-pressed="false" class="offside">OFF</button>
+      <button aria-pressed="true">ON</button>
+    </div>
+    <div class="cap-bright">
+      <span class="fieldlabel">BRIGHT</span>
+      <input type="range" min="0" max="100" value="60" disabled aria-label="Brightness">
+      <span class="value">60</span>
+    </div>
+    <span class="address mono">192.168.1.18 &middot; wiz</span>
+  </section>
+
+  <!-- (4) SPEAKER REGROUPING: Speaker fell out of group, lamp pending, regrouping. -->
+  <section class="plate device">
+    <div class="title-rule">
+      <span class="title">Move</span><span class="rule"></span>
+      <span class="kind">Speaker</span><span class="lamp pending"></span>
+    </div>
+    <p class="doing">Move — was following Kitchen; regrouping.</p>
+    <div class="cap-volume">
+      <span class="fieldlabel">VOLUME</span>
+      <input type="range" min="0" max="100" value="40" aria-label="Volume">
+      <span class="value">40</span>
+      <button class="btn small ghost" aria-pressed="false">MUTE</button>
+    </div>
+    <span class="address mono">192.168.1.17 &middot; sonos</span>
+  </section>
+
+</div>
+</main>
+
+</body></html>

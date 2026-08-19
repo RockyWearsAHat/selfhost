@@ -1,0 +1,194 @@
+<!doctype html>
+<!-- Design comp: group light control, phone width. On INSTRUMENT.
+     The scope deck shows "All lights" with state "Three on, one turning off."
+     and controls for power, brightness, colour, temperature, and effects.
+     Four individual light plates below: Couch Left/Right with lit ports,
+     Bedside with pending mark, Desk off. -->
+<html lang="en"><head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>comp — lights</title>
+<link rel="stylesheet" href="instrument.css">
+</head><body>
+
+<main id="rooms">
+<div class="room">
+
+  <!-- Scope deck: controls for all lights in the "All" scope. -->
+  <section class="plate device">
+    <div class="title-rule">
+      <span class="title">All lights</span><span class="rule"></span>
+      <span class="kind">SCOPE</span><span class="lamp live"></span>
+    </div>
+    <p class="doing">Three on, one turning off.</p>
+
+    <!-- Power: ON | OFF segmented pair, ON pressed. -->
+    <div class="cap-power">
+      <span class="fieldlabel">Power</span>
+      <div class="seg">
+        <button aria-pressed="true">ON</button>
+        <button aria-pressed="false" class="offside">OFF</button>
+      </div>
+    </div>
+
+    <!-- Brightness: groove slider at 70 + tabular value. -->
+    <div class="cap-bright">
+      <span class="fieldlabel">Bright</span>
+      <input type="range" min="0" max="100" value="70" aria-label="Brightness">
+      <span class="value">70</span>
+    </div>
+
+    <div class="slider spectrum"><span class="fieldlabel">COLOR</span><input type="range" min="0" max="100" value="62" aria-label="Color"><span class="value mono readout">#2FB3A5</span></div>
+    <div class="slider temp"><span class="fieldlabel">TEMP</span><input type="range" min="0" max="100" value="20" aria-label="Temperature"><span class="value mono readout">2700K</span></div>
+
+    <!-- Colour: eight census chips, TEAL pressed, plus add button. -->
+    <div class="cap-color">
+      <span class="fieldlabel">Colour</span>
+      <button class="chip" style="--c:#E03A3F" aria-pressed="false" aria-label="Crimson"></button>
+      <button class="chip" style="--c:#FF7A2F" aria-pressed="false" aria-label="Ember"></button>
+      <button class="chip" style="--c:#FFB46B" aria-pressed="false" aria-label="Gold"></button>
+      <button class="chip" style="--c:#7FAE62" aria-pressed="false" aria-label="Moss"></button>
+      <button class="chip" style="--c:#2FB3A5" aria-pressed="true" aria-label="Teal"></button>
+      <button class="chip" style="--c:#4F9FE0" aria-pressed="false" aria-label="Sky"></button>
+      <button class="chip" style="--c:#8F6FE8" aria-pressed="false" aria-label="Violet"></button>
+      <button class="chip" style="--c:#E26FAE" aria-pressed="false" aria-label="Rose"></button>
+      <button class="chip add">+</button>
+    </div>
+
+    <!-- Temperature: four tempchip capsules with kelvin in mono. -->
+    <div class="cap-temp">
+      <span class="fieldlabel">White</span>
+      <button class="tempchip" style="--c:#FF9329" aria-pressed="false">Candle <span class="k">2200K</span></button>
+      <button class="tempchip" style="--c:#FFB46B" aria-pressed="false">Warm <span class="k">2700K</span></button>
+      <button class="tempchip" style="--c:#FFDCB8" aria-pressed="false">Neutral <span class="k">4000K</span></button>
+      <button class="tempchip" style="--c:#F5EFE6" aria-pressed="false">Day <span class="k">5500K</span></button>
+    </div>
+
+    <!-- Effects: a few small ghost pills, RELAX pressed. -->
+    <div class="cap-effects">
+      <span class="fieldlabel">Effect</span>
+      <button class="btn small ghost" aria-pressed="false">Fireplace</button>
+      <button class="btn small ghost" aria-pressed="false">Ocean</button>
+      <button class="btn small ghost" aria-pressed="false">Forest</button>
+      <button class="btn small ghost" aria-pressed="false">Sunset</button>
+      <button class="btn small ghost" aria-pressed="true">Relax</button>
+    </div>
+  </section>
+
+  <!-- Four individual light plates. -->
+  <div class="roomdevices">
+
+  <!-- Couch Left: lit port at 70%, teal; ON-pressed; cap-bright 70. -->
+  <section class="plate device">
+    <div class="title-rule">
+      <span class="title">Couch Left</span><span class="rule"></span>
+      <span class="kind">LIGHT</span><span class="lamp ok"></span>
+    </div>
+    <div class="followrow">
+      <div class="port lit" style="--arc:70; --arccol:#2FB3A5; --orb-hi:#3ecab9; --orb-lo:#1f8578; --orb-glow:rgba(70,200,178,0.22)">
+        <div class="ring"></div>
+        <div class="orb"></div>
+      </div>
+      <p class="doing">On — 70%, teal.</p>
+    </div>
+    <div class="cap-power">
+      <div class="seg">
+        <button aria-pressed="true">ON</button>
+        <button aria-pressed="false" class="offside">OFF</button>
+      </div>
+    </div>
+    <div class="cap-bright">
+      <span class="fieldlabel">Bright</span>
+      <input type="range" min="0" max="100" value="70" aria-label="Brightness">
+      <span class="value">70</span>
+    </div>
+    <div class="slider spectrum"><span class="fieldlabel">COLOR</span><input type="range" min="0" max="100" value="62" aria-label="Color"><span class="value mono readout">#2FB3A5</span></div>
+    <div class="slider temp"><span class="fieldlabel">TEMP</span><input type="range" min="0" max="100" value="20" aria-label="Temperature"><span class="value mono readout">2700K</span></div>
+    <span class="address mono">192.168.1.18 &middot; wiz</span>
+  </section>
+
+  <!-- Couch Right: lit port at 70%, teal; ON-pressed; cap-bright 70. -->
+  <section class="plate device">
+    <div class="title-rule">
+      <span class="title">Couch Right</span><span class="rule"></span>
+      <span class="kind">LIGHT</span><span class="lamp ok"></span>
+    </div>
+    <div class="followrow">
+      <div class="port lit" style="--arc:70; --arccol:#2FB3A5; --orb-hi:#3ecab9; --orb-lo:#1f8578; --orb-glow:rgba(70,200,178,0.22)">
+        <div class="ring"></div>
+        <div class="orb"></div>
+      </div>
+      <p class="doing">On — 70%, teal.</p>
+    </div>
+    <div class="cap-power">
+      <div class="seg">
+        <button aria-pressed="true">ON</button>
+        <button aria-pressed="false" class="offside">OFF</button>
+      </div>
+    </div>
+    <div class="cap-bright">
+      <span class="fieldlabel">Bright</span>
+      <input type="range" min="0" max="100" value="70" aria-label="Brightness">
+      <span class="value">70</span>
+    </div>
+    <div class="slider spectrum"><span class="fieldlabel">COLOR</span><input type="range" min="0" max="100" value="62" aria-label="Color"><span class="value mono readout">#2FB3A5</span></div>
+    <div class="slider temp"><span class="fieldlabel">TEMP</span><input type="range" min="0" max="100" value="20" aria-label="Temperature"><span class="value mono readout">2700K</span></div>
+    <span class="address mono">192.168.1.19 &middot; wiz</span>
+  </section>
+
+  <!-- Bedside: dark port; lamp.pending in title; OFF-pressed; setmark. -->
+  <section class="plate device">
+    <div class="title-rule">
+      <span class="title">Bedside</span><span class="rule"></span>
+      <span class="kind">LIGHT</span><span class="lamp pending"></span>
+    </div>
+    <div class="followrow">
+      <div class="port" style="--arc:0">
+        <div class="ring"></div>
+        <div class="orb"></div>
+      </div>
+      <p class="doing">Turning off.</p>
+    </div>
+    <div class="cap-power">
+      <div class="seg">
+        <button aria-pressed="false">ON</button>
+        <button aria-pressed="true" class="offside">OFF</button>
+      </div>
+    </div>
+    <div class="slider spectrum"><span class="fieldlabel">COLOR</span><input type="range" min="0" max="100" value="62" aria-label="Color"><span class="value mono readout">#2FB3A5</span></div>
+    <div class="slider temp"><span class="fieldlabel">TEMP</span><input type="range" min="0" max="100" value="20" aria-label="Temperature"><span class="value mono readout">2700K</span></div>
+    <div class="setmark">
+      <span class="lamp pending"></span>
+      <span class="micro">SET OFF — APPLYING</span>
+    </div>
+    <span class="address mono">192.168.1.20 &middot; wiz</span>
+  </section>
+
+  <!-- Desk: off and quiet; dark port; OFF-pressed; no other controls. -->
+  <section class="plate device">
+    <div class="title-rule">
+      <span class="title">Desk</span><span class="rule"></span>
+      <span class="kind">LIGHT</span><span class="lamp idle"></span>
+    </div>
+    <div class="followrow">
+      <div class="port" style="--arc:0">
+        <div class="ring"></div>
+        <div class="orb"></div>
+      </div>
+      <p class="doing">Off.</p>
+    </div>
+    <div class="cap-power">
+      <div class="seg">
+        <button aria-pressed="false">ON</button>
+        <button aria-pressed="true" class="offside">OFF</button>
+      </div>
+    </div>
+    <div class="slider spectrum"><span class="fieldlabel">COLOR</span><input type="range" min="0" max="100" value="62" aria-label="Color"><span class="value mono readout">#2FB3A5</span></div>
+    <div class="slider temp"><span class="fieldlabel">TEMP</span><input type="range" min="0" max="100" value="20" aria-label="Temperature"><span class="value mono readout">2700K</span></div>
+    <span class="address mono">192.168.1.21 &middot; wiz</span>
+  </section>
+
+  </div>
+
+</div>
+</main>
+</body></html>

@@ -1,0 +1,86 @@
+<!doctype html>
+<!-- The house panel: every device this deployment can see and drive, on one
+     page, served from the same machine that talks to them. Static skeleton;
+     app.js fills every reading and builds every room.
+
+     There is deliberately nothing here but the masthead, the bank, and an
+     empty container. A room is not a fact about this file — it is a fact about
+     what the hub answered a second ago, and a skeleton that named rooms in
+     markup would be a second place for them to be wrong. No build step, no
+     framework, no external request of any kind: the CSP below refuses them
+     outright, and every device name on this page arrives from a stranger's
+     firmware and reaches the DOM through textContent. -->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta http-equiv="Content-Security-Policy"
+      content="default-src 'none'; connect-src 'self'; style-src 'self'; script-src 'self'; img-src 'self'">
+<title>HOME — Device Control</title>
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+
+<!-- The masthead. A nameplate is not a reading, so it is unframed and sits
+     directly on the black under the ruler. One lamp and one word for the link:
+     whether this page is being told the truth right now. The generation is the
+     hub's own counter and is machine text, so it is set in the fixed-width
+     face beside the rule — it is also the number that decides whether anything
+     on this page is redrawn at all, so having it visible makes a page that has
+     silently stopped moving diagnosable from across the room. -->
+<header id="masthead">
+  <span class="wordmark">HOME</span>
+  <span class="designation">DEVICE CONTROL</span>
+  <span class="rule"></span>
+  <span id="gen" class="mono micro"></span>
+  <span id="link-sweep" class="sweep"></span>
+  <span id="link-lamp" class="lamp warn" hidden></span>
+  <span id="link-word" class="stateword warn">CONNECTING</span>
+</header>
+
+<!-- A refusal from the hub, in the hub's own sentence. There is no matching
+     success notice: a command that worked proves it by changing the reading it
+     was aimed at, one poll later, and a page that congratulated itself on every
+     volume nudge would be a page nobody reads the notices on. -->
+<div id="notice" class="alert problem" hidden>
+  <span class="flagbar"></span>
+  <span id="notice-text"></span>
+  <button id="notice-dismiss" class="btn ghost small" type="button" aria-label="Dismiss">&#215;</button>
+</div>
+
+<!-- The readout bank: what the whole house amounts to, in one line, with the
+     three numbers that line cannot say. The sentence stays because three
+     numbers do not tell you whether that is fine; the numbers stay because a
+     sentence cannot say 2/11. Exactly one figure is allowed to raise its
+     voice, and it is UNREACHABLE — a device that is merely off is not a fault,
+     and a colour spent on it is a colour the eye learns to skip. -->
+<section id="bank" class="plate">
+  <div class="bank-main">
+    <p id="condition"></p>
+    <p id="evidence" class="evidence" hidden>
+      <span class="reading"><span class="fieldlabel">DEVICES</span> <span id="ev-devices" class="mono"></span></span>
+      <span class="reading"><span class="fieldlabel">ACTIVE</span> <span id="ev-active" class="mono"></span></span>
+      <span class="reading"><span class="fieldlabel">UNREACHABLE</span> <span id="ev-gone" class="mono"></span></span>
+    </p>
+  </div>
+</section>
+
+<!-- Every room the hub reported, each introduced by its own section rule, each
+     holding the plates of the devices standing in it. Built entirely by
+     app.js and updated in place from then on. -->
+<main id="rooms"></main>
+
+<!-- Nothing to show, said precisely rather than left as a blank page: an empty
+     page and a page that has not loaded look identical, and only one of them
+     is worth waiting on. -->
+<div id="empty" class="empty" hidden>
+  <div>
+    <div class="reticle"><span class="dot"></span></div>
+    <p id="empty-text" class="caption centered"></p>
+  </div>
+</div>
+
+<script src="/app.js"></script>
+</body>
+</html>
