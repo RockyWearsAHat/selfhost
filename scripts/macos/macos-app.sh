@@ -33,7 +33,11 @@ INSTALL_DIR="/Applications"
 APP="${INSTALL_DIR}/${APP_NAME}.app"
 CLI_LINK="/usr/local/bin/selfhost"
 
-REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# Two levels, not one: this script moved from `scripts/` into `scripts/macos/`
+# in the 2026-08-16 reorganisation and kept the old climb, so every path built
+# from it pointed at `scripts/` — which `cargo` hid, because it walks up to find
+# a workspace, and only the file copies gave it away.
+REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 BUILD="${REPO}/target/macos-app"
 STAGED="${BUILD}/${APP_NAME}.app"
 
@@ -75,6 +79,39 @@ quit_console() {
   fi
 }
 
+# ---------------------------------------------------------------- icon
+
+# Renders every icon size into $1, from rui's own example.
+#
+# The icon is not stored in this repository — it is drawn by the same toolkit
+# that draws the console's interface. That toolkit left this workspace on
+# 2026-08-17 and is now a pinned git dependency, so `cargo run -p rui` no longer
+# resolves and this step failed for weeks with `package(s) rui not found`, taking
+# the whole install with it. Two places are tried, in this order:
+#
+#   1. The workspace, for a tree that has uncommented the `[patch]` block in
+#      Cargo.toml and is building rui from a clone beside this repository. That
+#      one is what the developer is editing, so it wins.
+#   2. The pinned revision cargo has already fetched, under CARGO_HOME. Built
+#      into this project's own build directory rather than into the checkout,
+#      which is a cache and not a place to write.
+draw_icon() {
+  local iconset="$1"
+  ( cd "$REPO" && cargo run --release --quiet -p rui --example icon -- --out "$iconset" ) \
+    >/dev/null 2>&1 && return 0
+
+  local rev source
+  rev="$(sed -n 's/.*rui\.git", rev = "\([0-9a-f]\{7\}\).*/\1/p' "${REPO}/Cargo.toml" | head -1)"
+  [[ -n "$rev" ]] || return 1
+  source="$(ls -d "${CARGO_HOME:-$HOME/.cargo}"/git/checkouts/rui-*/"$rev" 2>/dev/null | head -1)"
+  [[ -n "$source" ]] || return 1
+
+  cargo run --release --quiet \
+    --manifest-path "${source}/Cargo.toml" \
+    --target-dir "${BUILD}/rui-icon" \
+    --example icon -- --out "$iconset" >/dev/null 2>&1
+}
+
 # ---------------------------------------------------------------- build
 
 build_bundle() {
@@ -84,9 +121,18 @@ build_bundle() {
   say "Drawing the icon"
   local iconset="${BUILD}/selfhost.iconset"
   rm -rf "$iconset"
-  ( cd "$REPO" && cargo run --release --quiet -p rui --example icon -- --out "$iconset" >/dev/null )
-  iconutil --convert icns "$iconset" --output "${BUILD}/selfhost.icns"
-  note "$(ls "$iconset" | wc -l | tr -d ' ') sizes rendered, each at its own resolution"
+  if draw_icon "$iconset"; then
+    iconutil --convert icns "$iconset" --output "${BUILD}/selfhost.icns"
+    note "$(ls "$iconset" | wc -l | tr -d ' ') sizes rendered, each at its own resolution"
+  elif [[ -f "${APP}/Contents/Resources/selfhost.icns" ]]; then
+    # Keeping the one already installed rather than shipping a bundle with a
+    # generic icon. It is the same drawing — nothing about the mark changed —
+    # and the alternative is refusing to install a security fix over a picture.
+    cp "${APP}/Contents/Resources/selfhost.icns" "${BUILD}/selfhost.icns"
+    note "could not draw the icon; kept the one already installed"
+  else
+    die "cannot draw the icon and there is none installed to keep — see draw_icon"
+  fi
 
   say "Assembling ${APP_NAME}.app"
   rm -rf "$STAGED"

@@ -86,21 +86,44 @@
 //! — [`MAX_CONCURRENT_VERIFICATIONS`], below, which is what actually bounds the
 //! CPU an unauthenticated caller can make this process spend.
 //!
-//! # What this credential is allowed to do, which is not everything
+//! # Two doors, and the user name decides which
 //!
-//! A successful check produces [`selfhost_identity::Caller::password`] —
-//! `Credential::Password`, whose documentation in `crates/identity` says why it
-//! counts as **unattended**: an operating system's keychain stores it at mount
-//! time and replays it on every request for the life of the mount, with nobody
-//! present. The policy therefore refuses it the capabilities that drive the
-//! machine. That is not a rule this module implements; it is a rule this module
-//! must not quietly route around by minting some other caller, which is why
-//! [`authenticated`] returns the one constructor and takes no argument that
-//! could change it.
+//! For most of this module's life the Basic user name was read, used as part of
+//! the cache key, and otherwise ignored: there was one console password, so
+//! there was nothing to look a name up in. That is the door
+//! `docs/labs/nas-lab.dx` recorded as open — **the console password opened every
+//! share, for anybody who had it, and the per-share capabilities the policy
+//! already knew how to enforce had no identity to enforce them against.**
+//!
+//! [`Door`] closes it. A user name that names somebody in the people registry
+//! *who holds a device password* is checked against that person's own hash and
+//! mints that person's caller; every other name is checked against the console
+//! password and mints the owner's, exactly as before. The door is part of the
+//! cache key, for a reason [`Door`]'s own documentation states in full: without
+//! it, giving somebody a device password would retroactively turn a cached
+//! console-password decision into that person's.
+//!
+//! # What these credentials are allowed to do, which is not everything
+//!
+//! A successful check produces one of the two callers [`authenticated`] mints,
+//! and both carry an **unattended** credential — `Credential::Password` at the
+//! deployment's door, `Credential::DevicePassword` at a person's. `crates/identity`
+//! documents why: an operating system's keychain stores the secret at mount time
+//! and replays it on every request for the life of the mount, with nobody
+//! present. The policy therefore refuses both the capabilities that drive the
+//! machine. Naming a person is not the same as proving one is there — only a
+//! passkey does that — and a per-person credential must not be mistaken for
+//! presence just because it has a name on it.
+//!
+//! That is not a rule this module implements; it is a rule this module must not
+//! quietly route around by minting some other caller, which is why
+//! [`authenticated`] takes a [`Door`] — a value only this module's own
+//! [`Door::for_name`] can build — rather than an identity and a credential a
+//! call site chooses.
 
 use ring::hmac;
 use ring::rand::{SecureRandom, SystemRandom};
-use selfhost_identity::Caller;
+use selfhost_identity::{Caller, Credential, Grants, Identity, PersonName};
 use std::fmt;
 use std::sync::{Mutex, PoisonError};
 use std::time::{Duration, Instant};
@@ -244,6 +267,70 @@ pub fn parse_basic(header: Option<&str>) -> Option<Presented> {
     Some(Presented { user: user.to_string(), password: password.to_string() })
 }
 
+/// Which credential store a presented Basic credential is being checked against.
+///
+/// # Why the door is a value rather than a branch
+///
+/// A WebDAV client sends one `Authorization: Basic` header and this deployment
+/// now has two things it could be: the deployment's own console password, or one
+/// person's own storage password. Which one is decided by the user name — see
+/// [`Door::for_name`] — and the answer has to travel with the credential rather
+/// than being re-derived, for one reason that is not obvious and is the whole
+/// point of this type existing:
+///
+/// **The cache is keyed on the door as well as on the credential.** Without that,
+/// this sequence is an escalation. Somebody mounts a share as `Mom` with the
+/// console password at a moment when Mom holds no device password; the door is
+/// the deployment's, the console password verifies, and `(Mom, console-password)`
+/// is remembered as verified. The operator then gives Mom a device password. The
+/// door for `Mom` is now hers — but the cached entry still matches, and a lookup
+/// that did not include the door would answer `Verified` and mint *Mom's* caller
+/// for a request that presented the *deployment's* password. Folding the door
+/// into the fingerprint means the entry simply stops matching, and the next
+/// request pays for a verification against the right store.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Door {
+    /// The console password in `<data_dir>/console.passwd`. Opens as the owner.
+    Deployment,
+    /// This person's own entry in `<data_dir>/console.devicepw`. Opens as them,
+    /// holding exactly what the people registry says they hold.
+    Person(PersonName),
+}
+
+impl Door {
+    /// The door a Basic user name asks for.
+    ///
+    /// A name that parses as a person **and** is known to `holds_device_password`
+    /// is that person's door; everything else is the deployment's. Both halves
+    /// matter:
+    ///
+    /// - `PersonName::parse` already refuses every casing of `owner` and
+    ///   `machine`, so no user name can ask for a door that mints those.
+    /// - A person with no device password set falls through to the deployment's
+    ///   door, where the console password still opens the share **as the owner**.
+    ///   That is not a person being impersonated: the caller minted there is the
+    ///   owner, exactly as it was before this type existed, and it is what keeps
+    ///   giving somebody a registry entry from silently breaking the operator's
+    ///   own mount.
+    ///
+    /// The predicate is passed in rather than looked up here because this crate
+    /// holds no deployment state; `crates/admin` owns the store and asks.
+    pub fn for_name(user: &str, holds_device_password: impl FnOnce(&PersonName) -> bool) -> Self {
+        match PersonName::parse(user) {
+            Ok(name) if holds_device_password(&name) => Self::Person(name),
+            _ => Self::Deployment,
+        }
+    }
+
+    /// The person this door belongs to, if it belongs to one.
+    pub fn person(&self) -> Option<&PersonName> {
+        match self {
+            Self::Deployment => None,
+            Self::Person(name) => Some(name),
+        }
+    }
+}
+
 /// What a cache lookup found.
 ///
 /// A three-valued answer rather than an `Option<bool>` so a call site cannot
@@ -356,8 +443,8 @@ impl Credentials {
     /// Cheap: one HMAC and a scan of at most [`MAX_ENTRIES`] constant-time
     /// comparisons. This is the call that runs on every one of Finder's 500
     /// requests.
-    pub fn look_up(&self, presented: &Presented) -> Cached {
-        let fingerprint = self.fingerprint(presented);
+    pub fn look_up(&self, door: &Door, presented: &Presented) -> Cached {
+        let fingerprint = self.fingerprint(door, presented);
         let mut entries = self.lock();
         let now = Instant::now();
         entries.retain(|entry| entry.is_live(now));
@@ -380,8 +467,8 @@ impl Credentials {
     /// [`FAILURE_WINDOW`] — so an operator who mistyped a password once is not
     /// waiting on anything, and a client looping on a stale keychain entry is
     /// not costing a core.
-    pub fn throttled(&self, presented: &Presented) -> bool {
-        let fingerprint = self.fingerprint(presented);
+    pub fn throttled(&self, door: &Door, presented: &Presented) -> bool {
+        let fingerprint = self.fingerprint(door, presented);
         let entries = self.lock();
         let now = Instant::now();
         find(&entries, &fingerprint).is_some_and(|index| {
@@ -396,8 +483,8 @@ impl Credentials {
     /// A success clears the failure count — the credential is right, so
     /// whatever came before it was somebody typing. A failure extends the count
     /// inside the window and starts a new window once the old one has passed.
-    pub fn remember(&self, presented: &Presented, verified: bool) {
-        let fingerprint = self.fingerprint(presented);
+    pub fn remember(&self, door: &Door, presented: &Presented, verified: bool) {
+        let fingerprint = self.fingerprint(door, presented);
         let now = Instant::now();
         let mut entries = self.lock();
         entries.retain(|entry| entry.is_live(now));
@@ -468,13 +555,27 @@ impl Credentials {
         self.len() == 0
     }
 
-    /// The keyed fingerprint of a credential.
+    /// The keyed fingerprint of a credential, at one door.
     ///
-    /// User and password are joined by a NUL, which neither can contain: a
-    /// separator that could appear in either half would let `alice` with
-    /// password `x:y` and `alice:x` with password `y` share a cache entry.
-    fn fingerprint(&self, presented: &Presented) -> [u8; FINGERPRINT_BYTES] {
-        let mut message = Vec::with_capacity(presented.user.len() + presented.password.len() + 1);
+    /// Door, user and password are joined by NULs, which none of them can
+    /// contain: a separator that could appear in any part would let `alice` with
+    /// password `x:y` and `alice:x` with password `y` share a cache entry. The
+    /// door leads, and it is not decoration — see [`Door`] for the sequence in
+    /// which a fingerprint without it becomes an escalation.
+    fn fingerprint(&self, door: &Door, presented: &Presented) -> [u8; FINGERPRINT_BYTES] {
+        let door_tag = match door {
+            Door::Deployment => "deployment",
+            Door::Person(name) => name.as_str(),
+        };
+        let mut message =
+            Vec::with_capacity(door_tag.len() + presented.user.len() + presented.password.len() + 3);
+        // A leading marker for the *kind* of door, so a person could not be
+        // reached by naming a share `deployment` in some future scheme where the
+        // tag came from somewhere a caller can choose.
+        message.push(u8::from(door.person().is_some()));
+        message.push(0);
+        message.extend_from_slice(door_tag.as_bytes());
+        message.push(0);
         message.extend_from_slice(presented.user.as_bytes());
         message.push(0);
         message.extend_from_slice(presented.password.as_bytes());
@@ -546,16 +647,40 @@ fn oldest_index(entries: &[Entry]) -> Option<usize> {
         .map(|(index, _)| index)
 }
 
-/// The caller a successful WebDAV authentication produces.
+/// The caller a successful WebDAV authentication produces, at whichever door it
+/// was proved.
 ///
-/// One constructor, no arguments, no choice. `crates/identity` documents
-/// `Credential::Password` as **unattended** — a keychain replays it on every
-/// request for the life of a mount with nobody present — and the policy refuses
-/// it the capabilities that drive the machine on exactly that ground. A
-/// function here that could produce some other caller would be a way to
-/// mount a share and end up holding a keyboard.
-pub fn authenticated() -> Caller {
-    Caller::password()
+/// Two doors, two fixed (identity, credential) pairs, and no argument that could
+/// change either. That closure is the property worth keeping, and it is why this
+/// takes a [`Door`] — a value the caller cannot forge, since
+/// [`Door::for_name`] is the only thing that builds a `Door::Person` and it does
+/// so only for a name the deployment's own store says holds a device password —
+/// rather than an identity and a credential the call site picks:
+///
+/// - [`Door::Deployment`] mints [`Caller::password`]: `Identity::Owner` with
+///   `Credential::Password`, exactly as before per-person credentials existed.
+///   Grants are empty and never read; the owner's authority is not a grant set.
+/// - [`Door::Person`] mints `Identity::Person` with
+///   [`Credential::DevicePassword`], holding `grants` — what the people registry
+///   says that person holds, which for a share is
+///   `Capability::FilesRead`/`FilesWrite` on the shares the operator ticked. The
+///   per-share check in `crates/admin`'s `dav_api` was already written and
+///   already ran; until this door existed there was simply never a caller for it
+///   to refuse.
+///
+/// Both credentials are **unattended** — an operating system's keychain replays
+/// either one on every request for the life of a mount, with nobody present — so
+/// the policy refuses both the capabilities that drive the machine. Naming a
+/// person does not prove one is there.
+pub fn authenticated(door: &Door, grants: Grants) -> Caller {
+    match door {
+        Door::Deployment => Caller::password(),
+        Door::Person(name) => Caller::new(
+            Identity::Person(name.clone()),
+            Credential::DevicePassword,
+            grants,
+        ),
+    }
 }
 
 /// The `WWW-Authenticate` challenge value a `401` carries.
@@ -679,31 +804,31 @@ mod tests {
         let right = presented("owner", "correct horse");
         let wrong = presented("owner", "battery staple");
 
-        assert_eq!(cache.look_up(&right), Cached::Unknown);
-        cache.remember(&right, true);
-        assert_eq!(cache.look_up(&right), Cached::Verified);
+        assert_eq!(cache.look_up(&Door::Deployment, &right), Cached::Unknown);
+        cache.remember(&Door::Deployment, &right, true);
+        assert_eq!(cache.look_up(&Door::Deployment, &right), Cached::Verified);
 
         // A different password is a different credential, not a hit.
-        assert_eq!(cache.look_up(&wrong), Cached::Unknown);
-        cache.remember(&wrong, false);
-        assert_eq!(cache.look_up(&wrong), Cached::Rejected);
-        assert_eq!(cache.look_up(&right), Cached::Verified);
+        assert_eq!(cache.look_up(&Door::Deployment, &wrong), Cached::Unknown);
+        cache.remember(&Door::Deployment, &wrong, false);
+        assert_eq!(cache.look_up(&Door::Deployment, &wrong), Cached::Rejected);
+        assert_eq!(cache.look_up(&Door::Deployment, &right), Cached::Verified);
 
         // And a different user with the same password is a different credential
         // too, which the NUL separator is what guarantees.
-        assert_eq!(cache.look_up(&presented("intruder", "correct horse")), Cached::Unknown);
+        assert_eq!(cache.look_up(&Door::Deployment, &presented("intruder", "correct horse")), Cached::Unknown);
     }
 
     #[test]
     fn a_rotated_password_stops_working_at_once_rather_than_in_a_minute() {
         let cache = credentials();
         let old = presented("owner", "old");
-        cache.remember(&old, true);
-        assert_eq!(cache.look_up(&old), Cached::Verified);
+        cache.remember(&Door::Deployment, &old, true);
+        assert_eq!(cache.look_up(&Door::Deployment, &old), Cached::Verified);
 
         cache.invalidate();
         assert!(cache.is_empty());
-        assert_eq!(cache.look_up(&old), Cached::Unknown, "the next request pays for a verify");
+        assert_eq!(cache.look_up(&Door::Deployment, &old), Cached::Unknown, "the next request pays for a verify");
     }
 
     /// An unbounded table keyed on attacker-supplied credentials is a memory
@@ -712,7 +837,7 @@ mod tests {
     fn the_table_is_bounded_however_many_credentials_are_thrown_at_it() {
         let cache = credentials();
         for attempt in 0..(MAX_ENTRIES * 4) {
-            cache.remember(&presented("owner", &format!("guess-{attempt}")), false);
+            cache.remember(&Door::Deployment, &presented("owner", &format!("guess-{attempt}")), false);
             assert!(cache.len() <= MAX_ENTRIES);
         }
         assert_eq!(cache.len(), MAX_ENTRIES);
@@ -725,23 +850,23 @@ mod tests {
         let cache = credentials();
         let wrong = presented("owner", "wrong");
         let right = presented("owner", "right");
-        cache.remember(&right, true);
+        cache.remember(&Door::Deployment, &right, true);
 
         for _ in 0..MAX_FAILURES {
-            assert!(!cache.throttled(&wrong));
-            cache.remember(&wrong, false);
+            assert!(!cache.throttled(&Door::Deployment, &wrong));
+            cache.remember(&Door::Deployment, &wrong, false);
         }
-        assert!(cache.throttled(&wrong));
+        assert!(cache.throttled(&Door::Deployment, &wrong));
 
         // The credential that works is untouched — which is the whole reason
         // this counter exists instead of the console's global gate.
-        assert!(!cache.throttled(&right));
-        assert_eq!(cache.look_up(&right), Cached::Verified);
+        assert!(!cache.throttled(&Door::Deployment, &right));
+        assert_eq!(cache.look_up(&Door::Deployment, &right), Cached::Verified);
 
         // And a success clears the count, so an operator who mistyped is not
         // left waiting once they type it correctly.
-        cache.remember(&wrong, true);
-        assert!(!cache.throttled(&wrong));
+        cache.remember(&Door::Deployment, &wrong, true);
+        assert!(!cache.throttled(&Door::Deployment, &wrong));
     }
 
     /// A failure record outlives the ordinary entry TTL, or the throttle would
@@ -777,10 +902,131 @@ mod tests {
     /// which "helpfully" upgraded the caller fails loudly.
     #[test]
     fn a_webdav_mount_authenticates_as_the_unattended_password_caller() {
-        let caller = authenticated();
+        let caller = authenticated(&Door::Deployment, Grants::none());
         assert_eq!(caller.credential(), Credential::Password);
         assert_eq!(caller.identity(), &Identity::Owner);
         assert!(caller.credential().is_deployment_wide());
+    }
+
+    /// A person's own door: it names them, it carries what they were granted,
+    /// and it is still unattended.
+    #[test]
+    fn a_persons_mount_authenticates_as_that_person_with_their_own_grants() {
+        use selfhost_identity::{Capability, ShareId};
+        let mom = PersonName::parse("Mom").expect("a valid name");
+        let grants =
+            Grants::new([Capability::FilesRead(ShareId::parse("vault").unwrap())]).unwrap();
+        let caller = authenticated(&Door::Person(mom.clone()), grants);
+
+        assert_eq!(caller.identity(), &Identity::Person(mom));
+        assert_eq!(caller.credential(), Credential::DevicePassword);
+        assert!(
+            !caller.credential().is_deployment_wide(),
+            "this is the whole point: the credential answers which person"
+        );
+        assert!(
+            caller.credential().is_unattended(),
+            "a name is not presence — a keychain replays this on every request"
+        );
+        assert!(caller.grants().holds(&Capability::FilesRead(ShareId::parse("vault").unwrap())));
+    }
+
+    /// The user name chooses the door, and only a name the deployment vouches
+    /// for chooses a person's.
+    #[test]
+    fn the_door_is_chosen_by_the_name_and_only_the_store_can_open_a_persons() {
+        let known = |name: &PersonName| name.as_str() == "Mom";
+
+        assert_eq!(
+            Door::for_name("Mom", known),
+            Door::Person(PersonName::parse("Mom").unwrap()),
+            "a registered person who holds a device password"
+        );
+        assert_eq!(
+            Door::for_name("Dad", known),
+            Door::Deployment,
+            "a name with no device password falls through to the console password"
+        );
+        // The reserved names cannot be spelled as a person in any casing, so no
+        // user name can ask for a door that mints the owner or the machine.
+        for spelling in ["owner", "Owner", "OWNER", "machine", "Machine"] {
+            assert_eq!(
+                Door::for_name(spelling, |_| true),
+                Door::Deployment,
+                "{spelling} must never resolve to a person's door"
+            );
+        }
+        // And a name that is not a legal person name at all.
+        assert_eq!(Door::for_name("", |_| true), Door::Deployment);
+        assert_eq!(Door::for_name("Mom ", |_| true), Door::Deployment);
+    }
+
+    /// The escalation the door exists to prevent, asserted directly.
+    ///
+    /// Somebody mounts as `Mom` with the console password while Mom holds none;
+    /// the deployment's door verifies and the decision is cached. The operator
+    /// then gives Mom a device password, which moves her door. A cache that
+    /// ignored the door would answer `Verified` for the *person's* door on a
+    /// credential that was only ever proved against the *deployment's* — handing
+    /// Mom's caller to whoever holds the console password.
+    #[test]
+    fn a_decision_made_at_one_door_never_answers_for_the_other() {
+        let cache = credentials();
+        let mom = PersonName::parse("Mom").expect("a valid name");
+        let console_password = presented("Mom", "the console password");
+
+        // Before Mom has a device password: her name takes the deployment's
+        // door, and the console password verifies there.
+        cache.remember(&Door::Deployment, &console_password, true);
+        assert_eq!(cache.look_up(&Door::Deployment, &console_password), Cached::Verified);
+
+        // The operator gives Mom a device password. Her door moves.
+        assert_eq!(
+            cache.look_up(&Door::Person(mom.clone()), &console_password),
+            Cached::Unknown,
+            "the cached decision belongs to the door it was made at, and must not travel"
+        );
+
+        // The reverse direction too: a decision made at a person's door does not
+        // answer for the deployment's, so revoking a device password cannot leave
+        // a verified entry that the console door then honours.
+        let hers = presented("Mom", "her own device password");
+        cache.remember(&Door::Person(mom), &hers, true);
+        assert_eq!(cache.look_up(&Door::Deployment, &hers), Cached::Unknown);
+    }
+
+    /// Two people cannot share a cache entry, and neither can a person and the
+    /// deployment, even with identical user names and identical passwords.
+    #[test]
+    fn every_door_and_credential_pair_is_its_own_entry() {
+        let cache = credentials();
+        let same = || presented("Mom", "identical");
+        let mom = Door::Person(PersonName::parse("Mom").unwrap());
+        let dad = Door::Person(PersonName::parse("Dad").unwrap());
+
+        cache.remember(&mom, &same(), true);
+        assert_eq!(cache.look_up(&mom, &same()), Cached::Verified);
+        assert_eq!(cache.look_up(&dad, &same()), Cached::Unknown);
+        assert_eq!(cache.look_up(&Door::Deployment, &same()), Cached::Unknown);
+    }
+
+    /// The throttle is per door as well as per credential, so one person's
+    /// wrong password cannot be used to lock out the console door under the
+    /// same name.
+    #[test]
+    fn the_throttle_is_keyed_on_the_door_too() {
+        let cache = credentials();
+        let mom = Door::Person(PersonName::parse("Mom").unwrap());
+        let wrong = presented("Mom", "wrong");
+
+        for _ in 0..MAX_FAILURES {
+            cache.remember(&mom, &presented("Mom", "wrong"), false);
+        }
+        assert!(cache.throttled(&mom, &wrong));
+        assert!(
+            !cache.throttled(&Door::Deployment, &wrong),
+            "the operator's own door is untouched by somebody guessing at Mom's"
+        );
     }
 
     /// The hole the per-credential throttle cannot close: a caller who never
@@ -795,8 +1041,8 @@ mod tests {
         for attempt in 0..MAX_CONCURRENT_VERIFICATIONS {
             // Every one of these is a distinct credential: a cache miss, and
             // never throttled, exactly as an attacker would arrange.
-            assert_eq!(cache.look_up(&presented("owner", &format!("miss-{attempt}"))), Cached::Unknown);
-            assert!(!cache.throttled(&presented("owner", &format!("miss-{attempt}"))));
+            assert_eq!(cache.look_up(&Door::Deployment, &presented("owner", &format!("miss-{attempt}"))), Cached::Unknown);
+            assert!(!cache.throttled(&Door::Deployment, &presented("owner", &format!("miss-{attempt}"))));
             held.push(cache.verification_slot().await.expect("the ceiling is open"));
         }
         assert_eq!(held.len(), MAX_CONCURRENT_VERIFICATIONS);

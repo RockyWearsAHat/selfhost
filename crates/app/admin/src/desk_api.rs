@@ -387,6 +387,15 @@ pub fn fresh_enough(caller: &Caller, window: Duration, now: Instant) -> bool {
         },
         // Presented on this very request: nothing is fresher than that.
         Credential::Password | Credential::Passkey => true,
+        // Also presented on this request, and also with no login moment — but a
+        // device password is a WebDAV mount's credential and is never carried on
+        // a desktop route at all. It is answered `true` for consistency with the
+        // other credential presented per-request rather than per-session; what
+        // actually keeps it away from a keyboard is `Policy::decide`, which
+        // refuses every unattended credential `DesktopControl` unless the
+        // operator armed it. Freshness is not the gate here and must not be
+        // mistaken for one.
+        Credential::DevicePassword => true,
         // No login moment to be recent. Armed in config or refused by policy —
         // same reasoning for an agent's token as for the bearer token: both are
         // replayed by an unattended process, and `Policy::decide` already

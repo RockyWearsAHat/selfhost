@@ -64,12 +64,18 @@ The credential is never a flag: it comes from SELFHOST_AGENT_TOKEN or
 `selfhost agent add <name> --grant site.admin` on the box itself.
 ";
 
+/// One tool argument: its JSON field name, a human description, and whether
+/// `tools/call` refuses without it.
+type Param = (&'static str, &'static str, bool);
+
+/// One tool: its name, a human description, and its parameters.
+type Tool = (&'static str, &'static str, &'static [Param]);
+
 /// The tools this server advertises, and what each one needs.
 ///
-/// `(name, description, params)` — `params` is `(json_name, description,
-/// required)` for each argument, which [`tool_schema`] turns into the JSON
-/// Schema `tools/list` answers with.
-const TOOLS: &[(&str, &str, &[(&str, &str, bool)])] = &[
+/// `params` is turned into the JSON Schema `tools/list` answers with by
+/// [`tool_schema`].
+const TOOLS: &[Tool] = &[
     ("sites_list", "List every site this deployment's proxy answers for.", &[]),
     (
         "sites_show",

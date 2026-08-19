@@ -1,0 +1,18 @@
+[package]
+name = "selfhost-presence"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Ask the operating system to prove a person is at this machine, right now — Touch ID, or the account password behind it."
+
+[dependencies]
+
+[lints.rust]
+# The second crate in this workspace with FFI, and for the same reason as the
+# first: there is no safe path to a fingerprint sensor. Every `unsafe` block
+# lives in `macos.rs` behind the one function `lib.rs` exports, so everything
+# that decides *what to do about* an answer is ordinary safe Rust.
+unsafe_code = "allow"
+missing_docs = "warn"

@@ -126,10 +126,10 @@ fn write_atomically(path: &Path, text: &str) -> Result<(), Response> {
 fn site_json(site: &Site) -> Json {
     Json::object([
         ("name", Json::string(&site.name)),
-        ("domains", Json::array(site.domains.iter().map(|d| Json::string(d)))),
+        ("domains", Json::array(site.domains.iter().map(Json::string))),
         ("hasStaticContent", Json::Bool(site.static_root.is_some())),
         ("spa", Json::Bool(site.spa)),
-        ("appPaths", Json::array(site.app_paths.iter().map(|p| Json::string(p)))),
+        ("appPaths", Json::array(site.app_paths.iter().map(Json::string))),
         (
             "instances",
             Json::array(site.instances.iter().map(|instance| {

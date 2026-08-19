@@ -596,9 +596,71 @@ pub struct People {
     pub hide_pointer_noise: bool,
 }
 
+/// Whether a person has been proved to be at this computer.
+///
+/// # Why a link has a lock at all
+///
+/// Every credential this console holds is one software replays: a token in a
+/// file with mode `0600`, an `ssh` key with no passphrase on it, a machine
+/// remembered in a store. Each of them proves that somebody, once, set this
+/// computer up. None of them proves that the person now sitting at it is that
+/// somebody — so the Dock icon was a door onto a running deployment that opened
+/// for whoever pressed it, and the console reached the daemon before anybody had
+/// answered anything.
+///
+/// The lock is answered by the operating system rather than by this program: a
+/// fingerprint, or the account password behind it, in the system's own sheet.
+/// See [`selfhost_presence`]. It stands in front of *both* connection threads —
+/// nothing is dialled, no `ssh` is started and no token is read until it opens —
+/// which is what makes it a lock rather than a curtain drawn over a live link.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Lock {
+    /// Where the lock is.
+    pub state: LockState,
+    /// Why it is still shut, in the words of whoever refused.
+    pub trouble: Option<String>,
+    /// Set by the window when the person presses UNLOCK; taken by the gate.
+    ///
+    /// A flag rather than a [`Command`] because no daemon is involved and there
+    /// is nothing to send: the queue behind `Command` is drained by the poller,
+    /// and the poller is one of the two threads this lock is standing in front
+    /// of.
+    pub asked_again: bool,
+}
+
+/// The three places a lock can be.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum LockState {
+    /// Nobody has been proved to be here. **The default, deliberately.**
+    ///
+    /// A lock that opens when nothing has happened yet is not a lock. The one
+    /// console that starts unlocked is the one with no link at all — every frame
+    /// test and every reference frame — and it says so in one line rather than
+    /// inheriting it from a default that would also cover the real window.
+    #[default]
+    Shut,
+    /// The system's sheet is standing, waiting for a finger or a password.
+    Asking,
+    /// Somebody proved they are here. The threads may connect.
+    Open,
+}
+
+impl Lock {
+    /// Whether the connection may run.
+    pub fn open(&self) -> bool {
+        self.state == LockState::Open
+    }
+}
+
 /// Everything both threads can see.
 #[derive(Debug, Default)]
 pub struct Snapshot {
+    /// Whether anybody has proved they are at this computer.
+    ///
+    /// Read before anything else the window draws: a snapshot whose lock is shut
+    /// describes a machine nothing has connected to, and every plate below would
+    /// be drawing a blank as though it were a reading.
+    pub lock: Lock,
     /// Whether the daemon is answering.
     pub link: Link,
     /// Who this console's credential is, once `GET /api/whoami` has answered.
