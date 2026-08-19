@@ -203,8 +203,8 @@
 //! One box holds every service's reports, and which database a call means is the **bare query
 //! key** — `…/report?dx` — never a path segment and never `project=`. A path segment would make
 //! the proxy's routing prefix depend on the tenant; a named parameter would invite a second
-//! spelling of the same thing. A bare word is also the whole of registering a service: the
-//! first report filed to `…/report?billing` creates it ([`crate::store`] bounds that door).
+//! spelling of the same thing. A service must be registered and claimed by an operator before
+//! any reports can be filed to it ([`crate::store`] and [`crate::ownership`] enforce this).
 //!
 //! The reporter's own repository holds the other half of this contract, written from the wire
 //! outward: `docs/intake.dx` in the dx workspace. What is stated there is stated here in code
