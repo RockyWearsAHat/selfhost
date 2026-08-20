@@ -30,6 +30,7 @@
 use ring::digest::{SHA256, digest};
 use ring::rand::{SecureRandom, SystemRandom};
 use selfhost_json::Json;
+use std::collections::HashMap;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -125,10 +126,16 @@ pub struct Owned {
 }
 
 /// The ownership store rooted at one accounts data directory.
+///
+/// Keyed by service so `claim`/`owner_of`/`rotate` — the calls on the request path of every
+/// `feed`/`close` — are O(1) rather than a scan whose cost grows with how many services this
+/// box hosts. [`verify_reader`](Owners::verify_reader) is the deliberate exception: it still
+/// walks every entry (see its own doc), because a direct `get` there would leak through timing
+/// exactly what the scan exists to hide.
 #[derive(Clone)]
 pub struct Owners {
     path: PathBuf,
-    entries: Arc<Mutex<Vec<Owned>>>,
+    entries: Arc<Mutex<HashMap<String, Owned>>>,
 }
 
 impl Owners {
@@ -142,23 +149,23 @@ impl Owners {
         let path = data_dir.join(SERVICES_FILENAME);
         let entries = match std::fs::read_to_string(&path) {
             Ok(text) => match parse_owned(&text) {
-                Some(entries) => entries,
+                Some(entries) => keyed(entries),
                 None => {
                     eprintln!(
                         "reports: {} is not a valid service-ownership file; owned services are \
                          unreadable until it is repaired or removed",
                         path.display()
                     );
-                    Vec::new()
+                    HashMap::new()
                 }
             },
-            Err(error) if error.kind() == io::ErrorKind::NotFound => Vec::new(),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => HashMap::new(),
             Err(error) => {
                 eprintln!(
                     "reports: could not read {}: {error}; owned services are unreadable",
                     path.display()
                 );
-                Vec::new()
+                HashMap::new()
             }
         };
         Self {
@@ -176,7 +183,7 @@ impl Owners {
     /// be written.
     pub fn claim(&self, service: &str, owner: &str) -> Result<String, String> {
         let mut entries = self.lock();
-        if entries.iter().any(|entry| entry.service == service) {
+        if entries.contains_key(service) {
             return Err(format!("`{service}` is already claimed"));
         }
         if entries.len() >= crate::store::MAX_PROJECTS {
@@ -186,12 +193,15 @@ impl Owners {
             ));
         }
         let token = mint_token()?;
-        entries.push(Owned {
-            service: service.to_string(),
-            owner: owner.to_string(),
-            reader_digest: digest_hex(&token),
-            created_unix: now_unix(),
-        });
+        entries.insert(
+            service.to_string(),
+            Owned {
+                service: service.to_string(),
+                owner: owner.to_string(),
+                reader_digest: digest_hex(&token),
+                created_unix: now_unix(),
+            },
+        );
         self.persist(&entries)
             .map_err(|error| format!("could not write {}: {error}", self.path.display()))?;
         Ok(token)
@@ -201,10 +211,7 @@ impl Owners {
     /// operator's own — grandfathered, metered by the box's global caps alone.
     #[must_use]
     pub fn owner_of(&self, service: &str) -> Option<String> {
-        self.lock()
-            .iter()
-            .find(|entry| entry.service == service)
-            .map(|entry| entry.owner.clone())
+        self.lock().get(service).map(|entry| entry.owner.clone())
     }
 
     /// Every service `owner` holds, alphabetically.
@@ -212,7 +219,7 @@ impl Owners {
     pub fn owned_by(&self, owner: &str) -> Vec<String> {
         let mut services: Vec<String> = self
             .lock()
-            .iter()
+            .values()
             .filter(|entry| entry.owner == owner)
             .map(|entry| entry.service.clone())
             .collect();
@@ -220,10 +227,12 @@ impl Owners {
         services
     }
 
-    /// Every row, for the operator's own listing.
+    /// Every row, alphabetically by service, for the operator's own listing.
     #[must_use]
     pub fn entries(&self) -> Vec<Owned> {
-        self.lock().clone()
+        let mut entries: Vec<Owned> = self.lock().values().cloned().collect();
+        entries.sort_by(|left, right| left.service.cmp(&right.service));
+        entries
     }
 
     /// Rotates `service`'s reader token — only for its owner. `None` for an unknown service
@@ -234,12 +243,12 @@ impl Owners {
     /// A sentence when the random source refuses or the file cannot be written.
     pub fn rotate(&self, service: &str, owner: &str) -> Result<Option<String>, String> {
         let mut entries = self.lock();
-        let Some(entry) = entries
-            .iter_mut()
-            .find(|entry| entry.service == service && entry.owner == owner)
-        else {
+        let Some(entry) = entries.get_mut(service) else {
             return Ok(None);
         };
+        if entry.owner != owner {
+            return Ok(None);
+        }
         let token = mint_token()?;
         entry.reader_digest = digest_hex(&token);
         self.persist(&entries)
@@ -251,12 +260,16 @@ impl Owners {
     ///
     /// The whole table is walked and both comparisons accumulate rather than short-circuit —
     /// the stated project convention for credential lookups — so timing does not sort service
-    /// names into claimed and unclaimed.
+    /// names into claimed and unclaimed. This is the one lookup here that stays O(n) on
+    /// purpose: a HashMap `get` would answer "does this service exist" and "is this digest
+    /// right" at two different speeds, which is exactly the side channel the scan exists to
+    /// close. `claim`/`owner_of`/`rotate` have no such requirement — they run once per admin
+    /// action, never once per `feed`/`close` request — so they get the O(1) HashMap lookup.
     #[must_use]
     pub fn verify_reader(&self, service: &str, offered: &str) -> bool {
         let offered_digest = digest_hex(offered);
         let mut matched = false;
-        for entry in self.lock().iter() {
+        for entry in self.lock().values() {
             let service_matches = constant_time_eq(entry.service.as_bytes(), service.as_bytes());
             let digest_matches =
                 constant_time_eq(entry.reader_digest.as_bytes(), offered_digest.as_bytes());
@@ -267,22 +280,32 @@ impl Owners {
 
     /// Writes the store owner-only via a temporary file and rename, like every sibling
     /// credential store.
-    fn persist(&self, entries: &[Owned]) -> io::Result<()> {
+    fn persist(&self, entries: &HashMap<String, Owned>) -> io::Result<()> {
         if let Some(parent) = self.path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        let text = owned_to_json(entries).to_text();
+        let snapshot: Vec<Owned> = entries.values().cloned().collect();
+        let text = owned_to_json(&snapshot).to_text();
         let temporary = self.path.with_extension("json.tmp");
         std::fs::write(&temporary, &text)?;
         restrict(&temporary);
         std::fs::rename(&temporary, &self.path)
     }
 
-    fn lock(&self) -> std::sync::MutexGuard<'_, Vec<Owned>> {
+    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<String, Owned>> {
         self.entries
             .lock()
             .expect("the ownership store lock was poisoned")
     }
+}
+
+/// `entries`, keyed by service — `parse_owned` already refused a file with a duplicate service
+/// name, so this loses nothing.
+fn keyed(entries: Vec<Owned>) -> HashMap<String, Owned> {
+    entries
+        .into_iter()
+        .map(|entry| (entry.service.clone(), entry))
+        .collect()
 }
 
 // The digests are one-way, but the owner column is still a join from service names to account
