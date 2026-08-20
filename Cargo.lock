@@ -386,10 +386,12 @@ dependencies = [
 name = "selfhost-home"
 version = "0.1.0"
 dependencies = [
+ "rustls",
  "selfhost-config",
  "selfhost-http",
  "selfhost-json",
  "tokio",
+ "tokio-rustls",
 ]
 
 [[package]]

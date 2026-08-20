@@ -94,7 +94,7 @@
 //! temporary file is a sibling, not one in the system temp directory, because a
 //! rename across filesystems is a copy and is not atomic.
 
-use crate::device::{Device, DeviceId};
+use crate::device::{Capability, Device, DeviceId};
 use std::ffi::{OsStr, OsString};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
@@ -125,13 +125,28 @@ pub struct Entry {
     /// than deleting, because a discovered device that was deleted comes back
     /// on the next scan and the person has to hide it again forever.
     pub hidden: bool,
+    /// The pairing this box holds for the device, when its protocol needs one.
+    ///
+    /// Only a Fire TV uses this today: `crate::firetv` exchanges a PIN read off
+    /// the television's own screen for a token, and that token is what every
+    /// later key press carries. It is persisted rather than re-fetched because
+    /// the pairing lives on the *television* until somebody removes it there —
+    /// re-pairing on every start would put a PIN on a person's screen every
+    /// time this process restarted.
+    ///
+    /// It is a credential in a plain file, and the file is readable by whoever
+    /// can read the deployment's data directory. What it authorises is bounded
+    /// and worth stating: pressing buttons on one television on this LAN. It
+    /// grants no account access, survives no move to another network, and is
+    /// revoked by unpairing on the device.
+    pub token: Option<String>,
 }
 
 impl Entry {
     /// An entry that decides nothing, for a device just being spoken about.
     #[must_use]
     pub fn new(id: DeviceId) -> Self {
-        Entry { id, name: None, room: None, hidden: false }
+        Entry { id, name: None, room: None, hidden: false, token: None }
     }
 
     /// Whether this entry records no decision at all.
@@ -141,7 +156,7 @@ impl Entry {
     /// where a guest's phone appears once, and would say nothing when it did.
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.name.is_none() && self.room.is_none() && !self.hidden
+        self.name.is_none() && self.room.is_none() && !self.hidden && self.token.is_none()
     }
 }
 
@@ -252,6 +267,16 @@ impl Registry {
         if let Some(room) = &entry.room {
             device.room = Some(room.clone());
         }
+        // A pairing is a capability, not a preference, and this is the one
+        // place that knows about it. A Fire TV takes keys and transport only
+        // once somebody has read a PIN off its screen, so a television with a
+        // token on file grows those controls and one without keeps only the
+        // application and power controls its protocol offers unpaired. The
+        // page renders what a device advertises, so this is what stops it
+        // drawing a d-pad that would answer every press with a refusal.
+        if entry.token.is_some() && device.id.driver() == crate::dial::DRIVER {
+            *device = device.clone().advertise(&[Capability::Keys, Capability::Transport]);
+        }
     }
 
     /// Names a device, or clears the name with `None`.
@@ -291,6 +316,23 @@ impl Registry {
     #[must_use]
     pub fn hidden(&self, id: &DeviceId) -> bool {
         self.entry(id).is_some_and(|entry| entry.hidden)
+    }
+
+    /// Records the pairing this box holds for a device, or clears it.
+    ///
+    /// Clearing is what a failed command should do when the television reports
+    /// the pairing gone: keeping a token that is known not to work turns every
+    /// later press into the same slow refusal, and the page cannot offer to
+    /// pair again while a stale one is on file.
+    pub fn set_token(&mut self, id: &DeviceId, token: Option<String>) {
+        let token = token.filter(|token| !token.is_empty());
+        self.change(id, |entry| entry.token = token.clone());
+    }
+
+    /// The pairing on file for a device, if any.
+    #[must_use]
+    pub fn token(&self, id: &DeviceId) -> Option<&str> {
+        self.entry(id).and_then(|entry| entry.token.as_deref())
     }
 
     /// Every room a person has named, sorted and without duplicates.
@@ -373,6 +415,10 @@ fn write_line(entry: &Entry) -> String {
         line.push_str(" room=");
         line.push_str(&escape(room));
     }
+    if let Some(token) = &entry.token {
+        line.push_str(" token=");
+        line.push_str(&escape(token));
+    }
     line.push_str(if entry.hidden { " hidden=1" } else { " hidden=0" });
     line
 }
@@ -401,6 +447,7 @@ fn read_line(line: &str) -> Option<Entry> {
         match key {
             "name" => entry.name = Some(unescape(value)?),
             "room" => entry.room = Some(unescape(value)?),
+            "token" => entry.token = Some(unescape(value)?),
             "hidden" => {
                 entry.hidden = match value {
                     "0" => false,
@@ -524,6 +571,73 @@ mod tests {
         assert_eq!(read_line(&line).as_ref(), Some(entry), "line was {line:?}");
     }
 
+    /// A pairing survives the file, escapes included. Fire TV tokens are
+    /// URL-safe base64 and so contain `-` and `_`, which the format leaves
+    /// alone; the test uses a token with `=` in it anyway, because the escape
+    /// scheme and not the observed alphabet is what has to be right.
+    #[test]
+    fn a_pairing_token_round_trips() {
+        let entry = Entry {
+            id: DeviceId::new("dial", "uuid-a"),
+            name: None,
+            room: None,
+            hidden: false,
+            token: Some("z-1_ydta2Q==".to_owned()),
+        };
+        round_trips(&entry);
+        assert_eq!(write_line(&entry), "dial:uuid-a token=z-1_ydta2Q%3D%3D hidden=0");
+    }
+
+    /// An entry holding only a pairing is a decision and must not be pruned.
+    /// Getting this wrong would lose the token on the next save and put a PIN
+    /// back on somebody's screen.
+    #[test]
+    fn an_entry_holding_only_a_token_is_not_empty() {
+        let mut entry = Entry::new(id("a"));
+        assert!(entry.is_empty());
+        entry.token = Some("tok".to_owned());
+        assert!(!entry.is_empty());
+    }
+
+    /// A paired television grows the controls the pairing bought, and an
+    /// unpaired one does not. This is what stops the page drawing a d-pad
+    /// whose every press would be refused.
+    #[test]
+    fn a_pairing_grows_the_remote_and_nothing_else_does() {
+        use crate::device::{Capability, Kind};
+
+        let television = || {
+            Device::new(DeviceId::new(crate::dial::DRIVER, "uuid-a"), "Bedroom TV", Kind::Television)
+                .advertise(&[Capability::Apps, Capability::Power])
+        };
+
+        let mut registry = Registry::default();
+        let mut unpaired = television();
+        registry.apply(&mut unpaired);
+        assert!(!unpaired.can(Capability::Keys), "an unpaired television takes no keys");
+
+        registry.set_token(&television().id, Some("tok".to_owned()));
+        let mut paired = television();
+        registry.apply(&mut paired);
+        assert!(paired.can(Capability::Keys));
+        assert!(paired.can(Capability::Transport));
+        // Power was never gated on the pairing: a wake needs no token.
+        assert!(paired.can(Capability::Power));
+    }
+
+    /// A speaker is not given a d-pad because somebody once stored a token
+    /// against it. The driver is part of the condition, not just the token.
+    #[test]
+    fn a_token_on_a_non_television_grows_nothing() {
+        use crate::device::{Capability, Kind};
+
+        let mut registry = Registry::default();
+        let mut speaker = Device::new(id("rincon_a"), "Kitchen", Kind::Speaker);
+        registry.set_token(&id("rincon_a"), Some("tok".to_owned()));
+        registry.apply(&mut speaker);
+        assert!(!speaker.can(Capability::Keys));
+    }
+
     #[test]
     fn a_missing_file_loads_as_an_empty_registry() {
         let path = temp_path("missing");
@@ -553,6 +667,7 @@ mod tests {
             name: Some("Kitchen = Loud".to_owned()),
             room: Some("Kitchen=1".to_owned()),
             hidden: false,
+            token: None,
         };
         round_trips(&entry);
         assert!(!write_line(&entry).contains("= "));
@@ -568,6 +683,7 @@ mod tests {
             name: Some("Kitchen\nSpeaker\r\n".to_owned()),
             room: None,
             hidden: true,
+            token: None,
         };
         round_trips(&entry);
         let line = write_line(&entry);
@@ -582,6 +698,7 @@ mod tests {
             name: Some("Kitchen\tSpeaker".to_owned()),
             room: Some("\tBack Room ".to_owned()),
             hidden: false,
+            token: None,
         });
     }
 
@@ -589,11 +706,11 @@ mod tests {
     /// reads back as `Some("")`, while an absent field reads as `None`.
     #[test]
     fn an_empty_name_round_trips_and_is_not_an_absent_one() {
-        let empty = Entry { id: id("a"), name: Some(String::new()), room: None, hidden: false };
+        let empty = Entry { id: id("a"), name: Some(String::new()), room: None, hidden: false, token: None };
         round_trips(&empty);
         assert_eq!(write_line(&empty), "sonos:a name= hidden=0");
 
-        let absent = Entry { id: id("a"), name: None, room: None, hidden: true };
+        let absent = Entry { id: id("a"), name: None, room: None, hidden: true, token: None };
         round_trips(&absent);
         assert_eq!(write_line(&absent), "sonos:a hidden=1");
     }
@@ -609,6 +726,7 @@ mod tests {
             name: Some("Küche 🎧".to_owned()),
             room: Some("Büro\u{a0}".to_owned()),
             hidden: false,
+            token: None,
         };
         round_trips(&entry);
         let line = write_line(&entry);
@@ -623,6 +741,7 @@ mod tests {
             name: Some("Odd".to_owned()),
             room: None,
             hidden: false,
+            token: None,
         });
     }
 
