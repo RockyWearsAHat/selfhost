@@ -29,6 +29,7 @@
 //! | [`sonos`] | mixed | the Sonos protocol: topology, transport, volume, events |
 //! | [`wiz`] | mixed | the WiZ light protocol: JSON over UDP, discovery by broadcast |
 //! | [`dial`] | mixed | the DIAL protocol: a television's launch, stop and status |
+//! | [`firetv`] | mixed | the Fire TV remote API: keys, applications by package, and the wake |
 //! | [`discovery`] | no | finding what is on the network, by SSDP and a debug-bridge probe |
 //! | [`hub`] | no | the live state of the house, and the one place it is mutated |
 //! | [`api`] | yes | the JSON shape the browser sees, and the command vocabulary |
@@ -52,6 +53,7 @@ pub mod color;
 pub mod device;
 pub mod dial;
 pub mod discovery;
+pub mod firetv;
 pub mod hub;
 pub mod mcp;
 pub mod registry;

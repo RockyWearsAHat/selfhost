@@ -2,13 +2,25 @@
 //! of anybody.
 //!
 //! DIAL — Discovery and Launch, the protocol behind the "cast" button — is the
-//! entire zero-setup surface of a Fire TV, and that ceiling is measured rather
-//! than assumed (home-lab.dx §"The televisions, driven"): a targeted SSDP
-//! search showed both real televisions answer *only* the DIAL service urn.
-//! What DIAL delivers is exactly three things, per application: is it running,
-//! start it, stop it. No volume, no keys, no power — those need a different
-//! protocol and, on these devices, an operator action this project refuses to
-//! require.
+//! **floor** of a television: it delivers exactly three things per
+//! application — is it running, start it, stop it — and it needs nothing from
+//! anybody, which is what makes it the half that always works.
+//!
+//! It was once recorded here as the *ceiling* too, on the strength of a
+//! targeted SSDP search in which both real televisions answered only the DIAL
+//! service urn. **That was wrong, and the correction is worth carrying rather
+//! than quietly deleting.** The search was sound; the inference was not.
+//! Keys, transport, application-launch-by-package and a wake all live behind
+//! one DIAL application this module's own enumeration never asked for, because
+//! the enumeration asked only for *streaming* app names — see
+//! [`crate::firetv`], which is that surface, and home-lab.dx §"The ceiling was
+//! wrong". A television is therefore two protocols behind one capability set,
+//! and `crate::hub` is the one place that decides which of them owns a
+//! command.
+//!
+//! What genuinely is unreachable, and by physics rather than by protocol:
+//! **volume, mute and television power**, which the physical remote performs
+//! with its own infrared emitter. [`crate::firetv`] carries that measurement.
 //!
 //! The shape mirrors [`crate::wiz`]: a pure protocol half — request builders
 //! and parsers proved against captured responses — under a thin live half that
@@ -30,7 +42,7 @@
 //! device ([`crate::device::Device::location`]) so a refresh does not re-fetch
 //! the description it arrived with.
 
-use crate::device::{Capability, Command, Device, DeviceId, Kind};
+use crate::device::{Capability, Command, Device, DeviceId, Kind, Power};
 use crate::discovery::Found;
 use crate::soap;
 use crate::xml;
@@ -42,6 +54,16 @@ pub const DRIVER: &str = "dial";
 /// answer arrived without a `LOCATION` — the header is the authority and this
 /// is the measured fallback, both televisions stating `:60000/dd.xml`.
 pub const DESCRIPTION_PORT: u16 = 60000;
+
+/// The port a Fire TV serves its applications on.
+///
+/// A device states this itself in its `Application-URL` header and that
+/// statement is what [`television`] follows; this constant is the fallback for
+/// the one caller that has an address and no description in hand —
+/// [`crate::firetv::wake`], which has to reach the launch endpoint *before*
+/// anything has been fetched, because until it runs the remote service is not
+/// listening. Both real televisions state `:8009/apps/`.
+pub const APPS_PORT: u16 = 8009;
 
 /// The applications whose state a refresh asks about.
 ///
@@ -216,9 +238,15 @@ pub async fn television(found: &Found) -> Result<Device, String> {
     // way a Sonos's RINCON does; the address stands in only for a television
     // that answered without one.
     let key = found.key.clone().unwrap_or_else(|| found.address.clone());
+    // `Power` is advertised on every Fire TV and needs nothing from anybody:
+    // powering one on is a DIAL launch of `FireTVRemote`, which takes no token
+    // (`crate::firetv::wake`). Keys and transport are *not* advertised here,
+    // because those do need a pairing — the hub adds them for a television it
+    // holds a token for, which is what keeps the page showing controls that
+    // exist rather than controls that would refuse.
     let mut device =
         Device::new(DeviceId::new(DRIVER, &key), description.friendly_name, Kind::Television)
-            .advertise(&[Capability::Apps]);
+            .advertise(&[Capability::Apps, Capability::Power]);
     device.address = Some(found.address.clone());
     device.location = Some(apps);
     device.reachable = true;
@@ -249,6 +277,16 @@ pub async fn refresh(device: &mut Device) {
     }
     device.reachable = answered;
     device.state.app = running;
+    // What "on" means for a television, stated precisely because it is not
+    // what a reader might assume. A Fire TV stick that answers DIAL is powered
+    // and taking commands; whether its *television* is showing anything is a
+    // fact about an HDMI-CEC wire this box cannot read, and the household's
+    // own set obeys the standby half of that wire only sometimes. So this
+    // reports the stick and never guesses at the screen — and it stays
+    // `Unknown` rather than becoming `Off` when nothing answered, because a
+    // stick drawing power from the television's USB port simply disappears
+    // when the television does, and "gone" is not "off".
+    device.state.power = answered.then_some(Power::On);
 }
 
 /// Performs one command against one television.

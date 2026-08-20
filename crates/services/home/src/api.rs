@@ -254,6 +254,15 @@ pub enum Act {
     Room(Option<String>),
     /// Hide the device from the house, or show it again.
     Hide(bool),
+    /// Ask the device to put a pairing PIN on its own screen.
+    ///
+    /// Not a command to a device that can already be driven: it is how a
+    /// device *becomes* drivable, which is why it sits here beside the
+    /// registry words rather than in [`Command`], and why it is not
+    /// capability-gated. A television advertises no "can be paired".
+    Pair,
+    /// Hand back the PIN a person read off the screen, completing the pairing.
+    PairConfirm(String),
 }
 
 /// Reads an act out of a request body: the registry words, or a [`Command`].
@@ -285,6 +294,13 @@ pub fn act(body: &Json) -> Result<Act, Refusal> {
         // `off` are spellings of `power`.
         "hide" => Act::Hide(true),
         "show" => Act::Hide(false),
+        "pair" => Act::Pair,
+        // The PIN is four digits a person copied off a screen, so it is
+        // trimmed and its emptiness is a refusal rather than a cleared value —
+        // unlike `rename`, "pair with no PIN" is not a thing anybody means.
+        "pair_confirm" => Act::PairConfirm(
+            cleared().ok_or(Refusal::BadValue("the PIN shown on the television"))?,
+        ),
         _ => Act::Command(command(body)?),
     };
     Ok(act)
@@ -478,6 +494,31 @@ mod tests {
         );
         assert_eq!(parse_act(r#"{"command":"hide"}"#), Ok(Act::Hide(true)));
         assert_eq!(parse_act(r#"{"command":"show"}"#), Ok(Act::Hide(false)));
+    }
+
+    /// Pairing is two words, and the second needs its PIN. An empty PIN is a
+    /// refusal rather than a cleared value: unlike a name, "pair with no PIN"
+    /// is not something a person can mean.
+    #[test]
+    fn pairing_is_two_words_and_the_pin_is_required() {
+        assert_eq!(parse_act(r#"{"command":"pair"}"#), Ok(Act::Pair));
+        assert_eq!(
+            parse_act(r#"{"command":"pair_confirm","value":"2275"}"#),
+            Ok(Act::PairConfirm("2275".to_owned()))
+        );
+        // Read off a screen and typed by hand, so it arrives with whitespace.
+        assert_eq!(
+            parse_act(r#"{"command":"pair_confirm","value":" 2275 "}"#),
+            Ok(Act::PairConfirm("2275".to_owned()))
+        );
+        assert!(matches!(
+            parse_act(r#"{"command":"pair_confirm"}"#),
+            Err(Refusal::BadValue(_))
+        ));
+        assert!(matches!(
+            parse_act(r#"{"command":"pair_confirm","value":""}"#),
+            Err(Refusal::BadValue(_))
+        ));
     }
 
     /// Absent, empty and blank are all "clear" — the difference between "call

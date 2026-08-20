@@ -14,6 +14,11 @@ selfhost-json = { workspace = true }
 # `io-std` on top of the workspace set: the MCP surface speaks JSON-RPC over
 # this process's own stdio, which no other subsystem needs.
 tokio = { workspace = true, features = ["io-std"] }
+# The Fire TV remote API is HTTPS on a self-signed certificate, so this crate
+# needs a TLS client where every other protocol it speaks needs none. Pinned to
+# the workspace's `ring` provider like every other rustls user here.
+tokio-rustls = { workspace = true }
+rustls = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time"] }

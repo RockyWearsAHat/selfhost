@@ -42,6 +42,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use crate::device::{Command, Device, DeviceId};
 use crate::dial;
 use crate::discovery;
+use crate::firetv;
 use crate::registry::Registry;
 use crate::sonos;
 use crate::wiz;
@@ -161,15 +162,37 @@ impl Hub {
     pub async fn perform(&self, id: &DeviceId, command: Command) -> Result<(), String> {
         let (device, house) = {
             let devices = self.devices.lock().unwrap_or_else(|e| e.into_inner());
-            let device = devices
+            let mut device = devices
                 .get(id)
                 .cloned()
                 .ok_or_else(|| "There is no device with that name here.".to_owned())?;
             let house: Vec<Device> = devices.values().cloned().collect();
+            // The registry is overlaid *before* the capability gate below, and
+            // that ordering is the whole point. A pairing is a capability —
+            // `crate::registry::Registry::apply` is what gives a paired
+            // television its keys — and a gate reading the raw discovered
+            // device refuses a d-pad the page is, correctly, drawing. That is
+            // exactly the shape of the two defects in home-lab.dx §"Two
+            // defects the unit suite could not have found": the pieces were
+            // each right and the seam between them was not. It is applied here
+            // rather than at the map because `snapshot` and this route are the
+            // only two readers, and a device held pre-overlaid would make the
+            // hidden flag — a decision about a *view* — leak into commands.
+            let registry = self.registry.lock().unwrap_or_else(|e| e.into_inner());
+            registry.apply(&mut device);
             (device, house)
         };
 
-        if !device.reachable {
+        // A sleeping Fire TV stick answers no DIAL poll, so the last refresh
+        // marks it unreachable — and that is exactly the television
+        // `Power(true)` exists to revive. `drive_television`'s wake is a DIAL
+        // launch that needs no prior answer at all (crate::firetv's "Power,
+        // which is therefore asymmetric" section), so gating it on the stale
+        // `reachable` flag would refuse the one command whose entire job is to
+        // recover from the state that flag reports.
+        let wakes_a_sleeping_television =
+            device.id.driver() == dial::DRIVER && matches!(command, Command::Power(true));
+        if !device.reachable && !wakes_a_sleeping_television {
             return Err(device
                 .note
                 .clone()
@@ -196,7 +219,11 @@ impl Hub {
         let outcome = match device.id.driver() {
             sonos::DRIVER => sonos::perform(&device, &house, &command).await,
             wiz::DRIVER => wiz::perform(&device, &command).await,
-            dial::DRIVER => dial::perform(&device, &command).await,
+            // A television is two protocols behind one capability set. DIAL is
+            // the floor and needs nothing from anybody; the Fire TV remote API
+            // is what a pairing buys. `route_television` decides which of them
+            // a command belongs to and is the only place that knows.
+            dial::DRIVER => self.drive_television(&device, &command).await,
             other => Err(format!("Nothing here knows how to drive a {other}.")),
         };
 
@@ -208,6 +235,106 @@ impl Hub {
             self.refresh_one(id).await;
         }
         outcome
+    }
+
+    /// Sends one command to a television by whichever of its two protocols
+    /// owns it.
+    ///
+    /// The split is not arbitrary and is worth reading once. **DIAL** launches
+    /// and stops the applications it has registered, and needs no pairing —
+    /// which is why an unpaired television is still useful. **The remote API**
+    /// (`crate::firetv`) does the keys, the transport, sleeping the stick and
+    /// launching an application by *package* name, and every one of those
+    /// except the wake needs the token a person's PIN bought.
+    ///
+    /// Power is the asymmetric one and is routed here rather than in the
+    /// driver: turning a television **on** is a DIAL launch of `FireTVRemote`
+    /// with no token at all, so it works on a television nobody has paired;
+    /// turning it off is a `sleep` key and therefore needs one.
+    async fn drive_television(&self, device: &Device, command: &Command) -> Result<(), String> {
+        let Some(address) = device.address.as_deref() else {
+            return Err(format!("{} has no address to reach it on.", device.name));
+        };
+        let token = {
+            let registry = self.registry.lock().unwrap_or_else(|e| e.into_inner());
+            registry.token(&device.id).map(str::to_owned)
+        };
+
+        // The wake is the one command that never needs a pairing.
+        if matches!(command, Command::Power(true)) {
+            return firetv::wake(address).await;
+        }
+
+        let by_remote = match command {
+            Command::Key(_) | Command::Play | Command::Pause | Command::Power(false) => true,
+            // A package name is the remote API's vocabulary; a bare DIAL
+            // application name is DIAL's. `com.amazon.avod` is the case that
+            // matters — Prime Video is not DIAL-registered at all, so the dot
+            // is what routes it to the protocol that can actually launch it.
+            Command::Launch(name) => name.contains('.'),
+            _ => false,
+        };
+        if !by_remote {
+            return dial::perform(device, command).await;
+        }
+
+        let Some(token) = token else {
+            return Err(format!(
+                "{} has not been paired with this box yet, so it can only be turned on and \
+                 have applications launched. Pair it to get the remote.",
+                device.name
+            ));
+        };
+
+        let outcome = firetv::perform(address, &token, command).await;
+        // A television that has forgotten the pairing must not keep a token
+        // that is known not to work: every later press would take the same
+        // slow round trip to the same refusal, and the page could not offer to
+        // pair again while a stale one was on file.
+        if outcome.as_ref().is_err_and(|error| error.contains("paired again")) {
+            {
+                let mut registry = self.registry.lock().unwrap_or_else(|e| e.into_inner());
+                registry.set_token(&device.id, None);
+            }
+            let _ = self.save_registry();
+        }
+        outcome
+    }
+
+    /// Puts a pairing PIN on a television's screen, waking it first.
+    ///
+    /// Separate from [`Hub::perform`] because it is not a command to a device
+    /// that can already be driven — it is how a device *becomes* drivable, and
+    /// it is the only route in this crate that deliberately puts something on
+    /// a person's screen.
+    pub async fn begin_pairing(&self, id: &DeviceId) -> Result<(), String> {
+        let address = self.address_of(id)?;
+        firetv::begin_pairing(&address, "Self-Host").await
+    }
+
+    /// Exchanges a PIN a person read off the screen for a stored pairing.
+    pub async fn confirm_pairing(&self, id: &DeviceId, pin: &str) -> Result<(), String> {
+        let address = self.address_of(id)?;
+        let token = firetv::confirm(&address, pin).await?;
+        {
+            let mut registry = self.registry.lock().unwrap_or_else(|e| e.into_inner());
+            registry.set_token(id, Some(token));
+        }
+        self.save_registry().map_err(|error| error.to_string())?;
+        // The device grows its d-pad the moment the token lands, so the page
+        // should be told without waiting for the next sweep.
+        self.refresh_one(id).await;
+        Ok(())
+    }
+
+    /// Where a known device is, or a sentence saying why it cannot be reached.
+    fn address_of(&self, id: &DeviceId) -> Result<String, String> {
+        let devices = self.devices.lock().unwrap_or_else(|e| e.into_inner());
+        let device = devices.get(id).ok_or_else(|| "There is no device with that name here.".to_owned())?;
+        device
+            .address
+            .clone()
+            .ok_or_else(|| format!("{} has no address to reach it on.", device.name))
     }
 
     /// Renames a device, or clears the name back to what its protocol says.
@@ -258,12 +385,16 @@ impl Hub {
         use crate::api::Act;
         match act {
             Act::Command(command) => self.perform(id, command).await,
-            Act::Rename(_) | Act::Room(_) | Act::Hide(_) if !self.contains(id).await => {
+            Act::Rename(_) | Act::Room(_) | Act::Hide(_) | Act::Pair | Act::PairConfirm(_)
+                if !self.contains(id).await =>
+            {
                 Err("There is no device with that name here.".to_owned())
             }
             Act::Rename(name) => self.set_name(id, name).await.map_err(remember_failed),
             Act::Room(room) => self.set_room(id, room).await.map_err(remember_failed),
             Act::Hide(hidden) => self.set_hidden(id, hidden).await.map_err(remember_failed),
+            Act::Pair => self.begin_pairing(id).await,
+            Act::PairConfirm(pin) => self.confirm_pairing(id, &pin).await,
         }
     }
 
@@ -540,6 +671,23 @@ mod tests {
             .await
             .expect_err("must refuse");
         assert_eq!(error, "Kitchen did not answer.");
+    }
+
+    /// A sleeping Fire TV stick answers no DIAL poll and is therefore marked
+    /// unreachable by the last refresh — and `Power(true)` is precisely the
+    /// command that has to work anyway, because it is the DIAL wake that
+    /// revives the stick. Regression for the bug where the reachability gate
+    /// refused it before `drive_television` ever ran.
+    #[tokio::test]
+    async fn a_power_on_reaches_a_sleeping_television() {
+        let mut asleep = Device::new(DeviceId::new(dial::DRIVER, "uuid-a"), "Living Room", Kind::Television)
+            .advertise(&[Capability::Apps, Capability::Power]);
+        asleep.address = Some("192.168.1.12".into());
+        asleep.reachable = false;
+        let hub = Hub::for_test(vec![asleep]);
+        hub.perform(&DeviceId::new(dial::DRIVER, "uuid-a"), Command::Power(true))
+            .await
+            .expect("a power-on must reach a sleeping television");
     }
 
     #[tokio::test]

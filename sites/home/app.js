@@ -192,6 +192,19 @@ function deviceStatus(device) {
  *  to this page with is "what is the kitchen doing" and the answer to that is
  *  prose. The numbers are all repeated as dials underneath for anybody reading
  *  properly; this line is for the glance. */
+/** Whether to offer pairing: an application surface with no keys.
+ *
+ *  A Fire TV that nobody has paired advertises `apps` and `power` — it can be
+ *  turned on and told to launch things — and gains `keys` and `transport` only
+ *  once somebody has read a PIN off its own screen. So "can launch, cannot
+ *  press" is exactly the shape of an unpaired television, and it is the only
+ *  shape worth putting a PAIR button on: offering it to a paired set would put
+ *  a PIN on a screen for nothing, and offering it to a speaker would be
+ *  nonsense. A device that drives nothing at all is not offered it either. */
+function offersPairing(device) {
+  return has(device, "apps") && !has(device, "keys");
+}
+
 function deviceSentence(device) {
   if (!device || device.reachable !== true) return "The hub cannot reach it.";
   const s = device.state || {};
@@ -324,6 +337,20 @@ function roomsOf(devices) {
   if (unplaced) placed.push(unplaced);
   for (const group of placed) group.devices.sort(byName);
   return placed;
+}
+
+/** Every room a device on the page currently stands in, sorted and without
+ *  repeats — offered as suggestions on the room field so that labelling a
+ *  second lamp into "Kitchen" is a pick, not a retype liable to land as
+ *  "kitchen" and split the room in two on the page. Code-point order, for the
+ *  same reason `roomsOf` sorts that way. */
+function knownRooms(devices) {
+  const seen = new Set();
+  for (const device of devices) {
+    const room = typeof device.room === "string" ? device.room.trim() : "";
+    if (room) seen.add(room);
+  }
+  return Array.from(seen).sort();
 }
 
 /** What the whole house amounts to, in one line.
@@ -525,6 +552,13 @@ if (typeof document === "undefined") {
 
   check("a capability is what decides", [has(speaker, "transport"), has(speaker, "keys")], [true, false]);
   check("a device with no capability list drives nothing", has({ id: "a" }, "power"), false);
+  check("an unpaired television is offered the remote",
+    offersPairing({ id: "dial:a", capabilities: ["apps", "power"] }), true);
+  check("a paired television is not asked to pair again",
+    offersPairing({ id: "dial:a", capabilities: ["apps", "power", "keys", "transport"] }), false);
+  check("a speaker is never offered pairing", offersPairing(speaker), false);
+  check("a device that drives nothing is not offered pairing", offersPairing(dumb), false);
+
   check("a kind is a label", kindWord("television"), "TELEVISION");
   check("an unknown kind is shown as written", kindWord("kettle"), "KETTLE");
   check("no kind is still a word", kindWord(null), "DEVICE");
@@ -635,6 +669,12 @@ if (typeof document === "undefined") {
   check("devices inside a room are ordered by name",
     placed[1].devices.map((d) => d.name), ["Alpha", "Two"]);
   check("an empty house has no rooms", roomsOf([]), []);
+
+  check("known rooms are sorted and deduplicated",
+    knownRooms([{ room: "Study" }, { room: "Kitchen" }, { room: "Study" }]), ["Kitchen", "Study"]);
+  check("blank and absent rooms suggest nothing",
+    knownRooms([{ room: null }, { room: "  " }, { room: undefined }]), []);
+  check("an empty house suggests no rooms", knownRooms([]), []);
 
   check("condition while connecting outranks everything",
     condition("connecting", [speaker]), "Reaching the house");
@@ -1191,6 +1231,38 @@ function boot() {
     word.className = "stateword";
     head.append(name, rule, kind, lamp, word);
 
+    /* Labelling. Every known device may be renamed and placed in a room —
+       this is a decision about the page, not a command to the device, so it
+       is offered whether or not the device is reachable and whatever its
+       capabilities are: a lamp asleep in a box still deserves a name before
+       it comes back. It stands outside `controls` for exactly that reason —
+       `controls` disappears for a device with nothing to drive, and labelling
+       is not one of the things capabilities gate. */
+    const labelRow = document.createElement("div");
+    labelRow.className = "inline-form";
+    const labelText = document.createElement("span");
+    labelText.className = "fieldlabel";
+    labelText.textContent = "LABEL";
+    const nameInput = document.createElement("input");
+    nameInput.className = "mono";
+    nameInput.autocomplete = "off";
+    nameInput.spellcheck = false;
+    nameInput.placeholder = "name";
+    nameInput.maxLength = 80;
+    nameInput.setAttribute("aria-label", "Rename this device");
+    const roomInput = document.createElement("input");
+    roomInput.className = "mono";
+    roomInput.autocomplete = "off";
+    roomInput.spellcheck = false;
+    roomInput.placeholder = "room";
+    roomInput.maxLength = 80;
+    roomInput.setAttribute("aria-label", "The room this device stands in");
+    const roomList = document.createElement("datalist");
+    roomList.id = `roomlist-${id.replace(/[^A-Za-z0-9_-]/g, "_")}`;
+    roomInput.setAttribute("list", roomList.id);
+    const labelGo = buildButton("SAVE", "btn small");
+    labelRow.append(labelText, nameInput, roomInput, labelGo, roomList);
+
     const doing = document.createElement("p");
     doing.className = "doing";
     const note = document.createElement("p");
@@ -1317,6 +1389,34 @@ function boot() {
     appGo.hidden = false;
     appRow.append(appLabel, appInput, appGo);
 
+    /* Pairing. A Fire TV gives its d-pad, transport and sleep only to a client
+       that has been handed a PIN off the television's own screen, so an
+       unpaired set can be turned on and have applications launched and nothing
+       more. This row is the only control on the page that asks a person to
+       look at a different screen, which is why it says so in words instead of
+       just offering a button. */
+    const pairRow = document.createElement("div");
+    pairRow.className = "inline-form";
+    pairRow.hidden = true;
+    const pairLabel = document.createElement("span");
+    pairLabel.className = "fieldlabel";
+    pairLabel.textContent = "REMOTE";
+    const pairText = document.createElement("span");
+    pairText.className = "micro";
+    pairText.textContent = "Not paired — no keys.";
+    const pairStart = buildButton("PAIR", "btn small");
+    const pairInput = document.createElement("input");
+    pairInput.className = "mono";
+    pairInput.autocomplete = "off";
+    pairInput.spellcheck = false;
+    pairInput.placeholder = "PIN";
+    pairInput.maxLength = 8;
+    pairInput.hidden = true;
+    pairInput.setAttribute("aria-label", "The PIN shown on the television");
+    const pairGo = buildButton("CONFIRM", "btn small");
+    pairGo.hidden = true;
+    pairRow.append(pairLabel, pairText, pairStart, pairInput, pairGo);
+
     const colourRow = document.createElement("div");
     colourRow.className = "inline-form";
     colourRow.hidden = true;
@@ -1334,13 +1434,13 @@ function boot() {
     colourGo.hidden = false;
     colourRow.append(colourLabel, colourInput, colourGo);
 
-    controls.append(actions, volume.row, brightness.row, groupRow, keypad, keyrow, appRow, colourRow);
+    controls.append(actions, volume.row, brightness.row, groupRow, keypad, keyrow, appRow, pairRow, colourRow);
 
     const address = document.createElement("p");
     address.className = "address mono micro";
     address.hidden = true;
 
-    el.append(head, doing, note, nowplaying, progress, readings, controls, address);
+    el.append(head, labelRow, doing, note, nowplaying, progress, readings, controls, address);
 
     /* Handlers. Every one of them reads the device again through
        `deviceById` — see `buildButton`. */
@@ -1369,6 +1469,25 @@ function boot() {
       if (!wanted) { appInput.focus(); return; }
       send(id, { command: "launch", app: wanted });
     });
+    /* Pairing is two presses with a person walking to a television in
+       between, so the row keeps its own small state: PAIR asks for the PIN to
+       be drawn, and the field it reveals stays revealed until a confirm lands
+       or the device turns out to be paired after all. Nothing here is
+       remembered across a reload, because a PIN does not outlive one either. */
+    pairStart.addEventListener("click", () => {
+      pairText.textContent = "Look at the television — a PIN should appear.";
+      pairInput.hidden = false;
+      pairGo.hidden = false;
+      pairInput.focus();
+      send(id, { command: "pair" });
+    });
+    pairGo.addEventListener("click", () => {
+      const pin = pairInput.value.trim();
+      if (!pin) { pairInput.focus(); return; }
+      pairInput.value = "";
+      send(id, { command: "pair_confirm", value: pin });
+    });
+
     colourGo.addEventListener("click", () => {
       const wanted = usableHex(colourInput.value);
       // Refused here rather than by the hub: a round trip to be told that
@@ -1380,13 +1499,32 @@ function boot() {
       send(id, { command: "color", value: wanted });
     });
 
+    /* SAVE sends only the field that actually changed — a rename and a room
+       are two independent registry words, and a person who only touched the
+       room field should not also re-send a name that was never edited. An
+       emptied field is a real answer, not a no-op: it is how a custom name or
+       a room assignment is cleared back to the default, so it is compared
+       against the device's current value and not skipped for being blank. */
+    labelGo.addEventListener("click", () => {
+      const device = deviceById(id);
+      if (!device) return;
+      const wantedName = nameInput.value.trim();
+      const currentName = String(device.name || "");
+      if (wantedName !== currentName) send(id, { command: "rename", value: wantedName });
+      const wantedRoom = roomInput.value.trim();
+      const currentRoom = typeof device.room === "string" ? device.room.trim() : "";
+      if (wantedRoom !== currentRoom) send(id, { command: "room", value: wantedRoom });
+    });
+
     return {
       el, name, kind, lamp, word, doing, note, nowplaying, track, artist,
       progress, fill, clock, readings, source, app, battery, temp, colour, swatch,
       controls, actions, transport, mute, power, volume, brightness,
       groupRow, groupText, joinPick, join, leave, keypad, keyrow,
-      appRow, appInput, appGo, colourRow, colourInput, colourGo, address,
-      joinDrawn: "",
+      appRow, appInput, appGo, pairRow, pairText, pairStart, pairInput, pairGo,
+      colourRow, colourInput, colourGo, address,
+      labelRow, nameInput, roomInput, roomList, labelGo,
+      joinDrawn: "", roomsDrawn: "",
     };
   }
 
@@ -1418,6 +1556,30 @@ function boot() {
     const address = typeof device.address === "string" ? device.address.trim() : "";
     plate.address.hidden = address === "";
     plate.address.textContent = address;
+
+    /* The label fields. Renaming works whether or not the device is reachable
+       — see `hub.rs`'s reasoning, "renaming an unreachable lamp is legitimate"
+       — so neither field nor SAVE is disabled by `locked`. Each field is left
+       alone while a hand is in it: overwriting what somebody is mid-typing
+       with the server's last word is the same bug the slider hold exists to
+       prevent, in a plainer control. */
+    if (document.activeElement !== plate.nameInput) {
+      plate.nameInput.value = String(device.name || "");
+    }
+    if (document.activeElement !== plate.roomInput) {
+      plate.roomInput.value = typeof device.room === "string" ? device.room.trim() : "";
+    }
+    const rooms = knownRooms(state.devices);
+    const roomsKey = JSON.stringify(rooms);
+    if (roomsKey !== plate.roomsDrawn) {
+      plate.roomsDrawn = roomsKey;
+      plate.roomList.textContent = "";
+      for (const room of rooms) {
+        const option = document.createElement("option");
+        option.value = room;
+        plate.roomList.append(option);
+      }
+    }
 
     /* What is playing, and how far through it is. Both are hidden rather than
        blanked when there is nothing to say: an empty line where a title was is
@@ -1512,6 +1674,20 @@ function boot() {
     plate.appRow.hidden = !canApps;
     plate.appInput.disabled = locked;
     plate.appGo.disabled = locked;
+
+    /* The pairing offer, shown only where it means something: a set that can
+       launch applications but takes no keys is a Fire TV nobody has paired.
+       Once the keys arrive the row disappears rather than lingering as a
+       button that would put a PIN on a screen for no reason. */
+    const canPair = offersPairing(device);
+    plate.pairRow.hidden = !canPair;
+    plate.pairStart.disabled = locked;
+    plate.pairGo.disabled = locked;
+    if (!canPair) {
+      plate.pairInput.hidden = true;
+      plate.pairGo.hidden = true;
+      plate.pairText.textContent = "Not paired — no keys.";
+    }
 
     const canColour = has(device, "color");
     plate.colourRow.hidden = !canColour;

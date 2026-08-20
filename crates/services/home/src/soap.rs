@@ -378,7 +378,15 @@ fn get_request(authority: &str, path: &str) -> Vec<u8> {
 /// framing the speakers use can be exercised from a byte slice with no socket,
 /// no speaker, and no network in the test sandbox. Enforces
 /// [`MAX_RESPONSE_BYTES`] in every branch.
-async fn read_response<R>(stream: &mut R) -> Result<(u16, selfhost_http::Headers, Vec<u8>), SoapError>
+///
+/// Visible to the crate for the same reason [`http`] is: `crate::firetv`
+/// speaks HTTP/1.1 to a television, but over TLS, so it cannot ride [`http`]'s
+/// socket — it brings its own stream and borrows this framing rather than
+/// growing a second copy of chunked-transfer decoding. Being generic over the
+/// stream is what makes that free.
+pub(crate) async fn read_response<R>(
+    stream: &mut R,
+) -> Result<(u16, selfhost_http::Headers, Vec<u8>), SoapError>
 where
     R: AsyncRead + Unpin,
 {
