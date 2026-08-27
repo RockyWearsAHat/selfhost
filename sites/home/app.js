@@ -782,6 +782,23 @@ function boot() {
    * having to press it ten times to cross the range. */
   const VOLUME_STEP = 5;
 
+  /* Colour presets: the same eight stops the fallback spectrum slider's own
+   * track is drawn from (styles.css `.slider.spectrum`), so a chip and the
+   * gradient underneath the precise slider always agree on what "content"
+   * looks like — there is one palette on this page, not two. */
+  const COLOR_CHIPS = ["FF3B30", "FF9500", "FFE14D", "57D769", "2FB3A5", "3AA0FF", "7D5BFF", "FF4FA3"];
+
+  /* Colour-temperature presets, in kelvin, inside the wire's own clamp
+   * (api.rs: 1800–6500) and matching the temperature slider's gradient
+   * stops the same way the colour chips match the spectrum's. */
+  const TEMP_CHIPS = [
+    { k: 2200, hex: "FF9329" },
+    { k: 2700, hex: "FFB46B" },
+    { k: 3500, hex: "FFDCB8" },
+    { k: 4500, hex: "F5EFE6" },
+    { k: 6500, hex: "DFEEFC" },
+  ];
+
   /** Everything the page knows. The DOM is a function of this and nothing else. */
   const state = {
     link: "connecting",      // "connecting" | "connected" | "lost"
@@ -1172,6 +1189,155 @@ function boot() {
     return slider;
   }
 
+  /* ── the port and its bigger relatives ────────────────────────────── */
+
+  /** The small generic centrepiece: a thin ring showing one quantity (a
+   *  light's brightness, or simply lit/unlit) around a plain swatch. Used for
+   *  a light or a fixture — the ring is one arc, not a bezel with a scale, so
+   *  it reads as a quiet indicator rather than an instrument dial. */
+  function buildPort() {
+    const el = document.createElement("span");
+    el.className = "port";
+    const ring = document.createElement("span");
+    ring.className = "ring";
+    const orb = document.createElement("span");
+    orb.className = "orb";
+    el.append(ring, orb);
+    return { el, ring, orb };
+  }
+
+  /** A speaker's face: a small square mark beside the panel that carries what
+   *  is actually playing. No moving parts — this page's motion budget is
+   *  spent on the progress bar, which is a real reading, not on décor. */
+  function buildDeck() {
+    const el = document.createElement("div");
+    el.className = "deck";
+    const art = document.createElement("div");
+    art.className = "art";
+    const panel = document.createElement("div");
+    panel.className = "deck-panel";
+    el.append(art, panel);
+    return { el, art, panel };
+  }
+
+  /** A television's port: a screen well showing whatever DIAL last reported
+   *  running, or nothing. */
+  function buildScreenwell() {
+    const el = document.createElement("div");
+    el.className = "screenwell dark";
+    const appname = document.createElement("span");
+    appname.className = "appname";
+    const running = document.createElement("span");
+    running.className = "running";
+    running.textContent = "RUNNING";
+    el.append(appname, running);
+    return { el, appname, running };
+  }
+
+  /** A segmented ON | OFF pair for one boolean command, replacing a single
+   *  toggling button with two that each say plainly what pressing them does
+   *  and which one is currently true. */
+  function buildSeg(id, command) {
+    const el = document.createElement("div");
+    el.className = "seg";
+    el.hidden = true;
+    const on = buildButton("ON", "btn small");
+    on.hidden = false;
+    on.setAttribute("aria-pressed", "false");
+    const off = buildButton("OFF", "btn small offside");
+    off.hidden = false;
+    off.setAttribute("aria-pressed", "false");
+    on.addEventListener("click", () => send(id, { command, value: true }));
+    off.addEventListener("click", () => send(id, { command, value: false }));
+    el.append(on, off);
+    return { el, on, off };
+  }
+
+  /** The eight colour chips. One tap sends the same `color` command the
+   *  precise field below sends — a chip is a shortcut into it, not a
+   *  different control. */
+  function buildChips(id) {
+    const el = document.createElement("div");
+    el.className = "chips";
+    el.hidden = true;
+    const chips = COLOR_CHIPS.map((hex) => {
+      const chip = document.createElement("button");
+      chip.type = "button";
+      chip.className = "chip";
+      chip.style.setProperty("--c", `#${hex}`);
+      chip.setAttribute("aria-label", `Colour #${hex}`);
+      chip.setAttribute("aria-pressed", "false");
+      chip.addEventListener("click", () => send(id, { command: "color", value: hex }));
+      return { hex, el: chip };
+    });
+    el.append(...chips.map((c) => c.el));
+    return { el, chips };
+  }
+
+  /** The five colour-temperature presets, each a real `color_temp` command —
+   *  not a reading dial standing in for a control that does not exist. */
+  function buildTempChips(id) {
+    const el = document.createElement("div");
+    el.className = "tempchips";
+    el.hidden = true;
+    const chips = TEMP_CHIPS.map(({ k, hex }) => {
+      const chip = document.createElement("button");
+      chip.type = "button";
+      chip.className = "tempchip";
+      chip.style.setProperty("--c", `#${hex}`);
+      chip.setAttribute("aria-pressed", "false");
+      const kEl = document.createElement("span");
+      kEl.className = "k";
+      kEl.textContent = `${k}K`;
+      chip.append(kEl);
+      chip.addEventListener("click", () => send(id, { command: "color_temp", value: k }));
+      return { k, el: chip };
+    });
+    el.append(...chips.map((c) => c.el));
+    return { el, chips };
+  }
+
+  /** The d-pad: a ring of four directions and OK, laid out as a hand expects
+   *  to find it rather than as a row — see the keypad's original note on why
+   *  a direction pad in a line is one you press the wrong half of in the
+   *  dark. */
+  function buildDpad(id) {
+    const el = document.createElement("div");
+    el.className = "dpad";
+    const mk = (glyph, keyName, aria, cls) => {
+      const button = document.createElement("button");
+      button.type = "button";
+      button.className = cls;
+      button.textContent = glyph;
+      button.setAttribute("aria-label", aria);
+      button.addEventListener("click", () => send(id, { command: "key", name: keyName }));
+      return button;
+    };
+    const up = mk("▲", "up", "Up", "up");
+    const down = mk("▼", "down", "Down", "down");
+    const left = mk("◀", "left", "Left", "left");
+    const right = mk("▶", "right", "Right", "right");
+    const ok = mk("OK", "select", "Select", "okbtn");
+    el.append(up, down, left, right, ok);
+    return { el, buttons: [up, down, left, right, ok] };
+  }
+
+  /** BACK and HOME, stacked beside the d-pad rather than inside it — both are
+   *  keys a thumb reaches for without needing to be found by shape the way
+   *  the directions are. */
+  function buildKeycol(id) {
+    const el = document.createElement("div");
+    el.className = "keycol";
+    const back = buildButton("BACK", "btn small");
+    back.hidden = false;
+    back.addEventListener("click", () => send(id, { command: "key", name: "back" }));
+    const home = buildButton("HOME", "btn small");
+    home.hidden = false;
+    home.addEventListener("click", () => send(id, { command: "key", name: "home" }));
+    el.append(back, home);
+    return { el, back, home };
+  }
+
   /** The hold record for a control, refreshed from what is on screen once its
    *  echo window has closed — so a stale hold can never resurrect an old value
    *  the next time somebody touches the control. */
@@ -1229,7 +1395,38 @@ function boot() {
     lamp.className = "lamp idle";
     const word = document.createElement("span");
     word.className = "stateword";
-    head.append(name, rule, kind, lamp, word);
+    // Renaming a device is a real capability but not a reading anyone needs
+    // in view at a glance — it stays one tap away behind its own control
+    // rather than sitting open as a form under every plate on the page.
+    const editToggle = buildButton("✎", "btn ghost small edit-toggle");
+    editToggle.hidden = false;
+    editToggle.setAttribute("aria-label", "Rename this device or move its room");
+    editToggle.setAttribute("aria-expanded", "false");
+    head.append(name, rule, kind, lamp, word, editToggle);
+
+    /* The plate's face — its one visual centrepiece, chosen by capability and
+       never by brand. Exactly one of these three is ever shown; the others
+       are built and hidden, the same discipline every control on this plate
+       already follows. A device that is none of these three (a plug, a
+       sensor — `transport`, `apps` and every light capability all absent)
+       shows no face at all, which is the honest answer for something with
+       nothing to be a picture of. */
+    const deck = buildDeck();
+    deck.el.hidden = true;
+    const tvrow = document.createElement("div");
+    tvrow.className = "tvrow";
+    tvrow.hidden = true;
+    const screen = buildScreenwell();
+    const tvpanel = document.createElement("div");
+    tvpanel.className = "tvpanel";
+    tvrow.append(screen.el, tvpanel);
+    const headrow = document.createElement("div");
+    headrow.className = "headrow";
+    headrow.hidden = true;
+    const port = buildPort();
+    const headwho = document.createElement("div");
+    headwho.className = "who";
+    headrow.append(port.el, headwho);
 
     /* Labelling. Every known device may be renamed and placed in a room —
        this is a decision about the page, not a command to the device, so it
@@ -1240,6 +1437,7 @@ function boot() {
        is not one of the things capabilities gate. */
     const labelRow = document.createElement("div");
     labelRow.className = "inline-form";
+    labelRow.hidden = true;
     const labelText = document.createElement("span");
     labelText.className = "fieldlabel";
     labelText.textContent = "LABEL";
@@ -1269,9 +1467,9 @@ function boot() {
     note.className = "note warn-ink";
     note.hidden = true;
 
-    // What is playing. The title and the artist are somebody's words, so they
-    // are set in the interface face; the clock beside the bar is a machine
-    // reading and is not.
+    // What is playing, inside the deck's own panel. The title and the artist
+    // are somebody's words, so they are set in the interface face; the clock
+    // beside the bar is a machine reading and is not.
     const nowplaying = document.createElement("div");
     nowplaying.className = "nowplaying";
     nowplaying.hidden = true;
@@ -1292,25 +1490,19 @@ function boot() {
     const clock = document.createElement("span");
     clock.className = "clock mono";
     progress.append(bar, clock);
+    deck.panel.append(nowplaying, progress);
 
+    // Readings that are neither a control nor part of a port's own face —
+    // what a speaker is fed from, and what is left of a battery. Colour and
+    // colour-temperature are now shown by which chip is pressed rather than
+    // as a second copy of the same fact in text, and a running application's
+    // name lives in the screen well, not in a dial.
     const readings = document.createElement("div");
     readings.className = "readings";
     readings.hidden = true;
     const source = buildDial("SOURCE");
-    const app = buildDial("APP");
     const battery = buildDial("BATTERY");
-    // color_temp is advertised as a capability and the command set names no
-    // verb for it, so it is a reading and not a control. A knob that produced a
-    // 4xx every time it was turned would be worse than no knob.
-    const temp = buildDial("TEMPERATURE");
-    const colour = buildDial("COLOUR");
-    const swatchline = document.createElement("span");
-    swatchline.className = "swatchline";
-    const swatch = document.createElement("span");
-    swatch.className = "swatch";
-    swatchline.append(swatch, colour.value);
-    colour.el.append(swatchline);
-    readings.append(source.el, app.el, battery.el, temp.el, colour.el);
+    readings.append(source.el, battery.el);
 
     const controls = document.createElement("div");
     controls.className = "controls";
@@ -1318,11 +1510,15 @@ function boot() {
     const actions = document.createElement("div");
     actions.className = "actions";
     actions.hidden = true;
-    const transport = buildButton("PLAY", "btn primary");
-    const mute = buildButton("MUTE", "btn");
+    const prev = buildButton("⏮", "btn");
+    prev.setAttribute("aria-label", "Previous");
+    const transport = buildButton("▶", "btn primary");
+    const next = buildButton("⏭", "btn");
+    next.setAttribute("aria-label", "Next");
+    const mute = buildButton("MUTE", "btn small");
     mute.setAttribute("aria-pressed", "false");
-    const power = buildButton("TURN ON", "btn primary");
-    actions.append(transport, mute, power);
+    const power = buildSeg(id, "power");
+    actions.append(prev, transport, next, mute, power.el);
 
     const volume = buildSlider(id, {
       label: "VOLUME", aria: "Volume", command: "volume", stepCommand: "volume_step",
@@ -1347,31 +1543,9 @@ function boot() {
     const keypad = document.createElement("div");
     keypad.className = "keypad";
     keypad.hidden = true;
-    const keyrow = document.createElement("div");
-    keyrow.className = "keyrow";
-    keyrow.hidden = true;
-    const keyButton = (glyph, keyName, aria, className) => {
-      const button = document.createElement("button");
-      button.type = "button";
-      button.className = className || "btn small";
-      button.textContent = glyph;
-      button.setAttribute("aria-label", aria);
-      button.addEventListener("click", () => send(id, { command: "key", name: keyName }));
-      return button;
-    };
-    const gap = () => {
-      const cell = document.createElement("span");
-      cell.className = "gap";
-      return cell;
-    };
-    keypad.append(
-      gap(), keyButton("▲", "up", "Up"), gap(),
-      keyButton("◀", "left", "Left"),
-      keyButton("OK", "select", "Select", "btn small ok"),
-      keyButton("▶", "right", "Right"),
-      gap(), keyButton("▼", "down", "Down"), gap(),
-    );
-    keyrow.append(keyButton("BACK", "back", "Back"), keyButton("HOME", "home", "Home"));
+    const dpad = buildDpad(id);
+    const keycol = buildKeycol(id);
+    keypad.append(dpad.el, keycol.el);
 
     const appRow = document.createElement("div");
     appRow.className = "inline-form";
@@ -1417,12 +1591,19 @@ function boot() {
     pairGo.hidden = true;
     pairRow.append(pairLabel, pairText, pairStart, pairInput, pairGo);
 
+    // The chips are the quick, one-tap access to colour and temperature — the
+    // fallback field below them is the precise route to any of the sixteen
+    // million a chip cannot name, exactly the split the operator asked for
+    // between a shortcut and the control it stands in front of.
+    const chips = buildChips(id);
+    const tempChips = buildTempChips(id);
+
     const colourRow = document.createElement("div");
     colourRow.className = "inline-form";
     colourRow.hidden = true;
     const colourLabel = document.createElement("span");
     colourLabel.className = "fieldlabel";
-    colourLabel.textContent = "COLOUR";
+    colourLabel.textContent = "PRECISE";
     const colourInput = document.createElement("input");
     colourInput.className = "mono";
     colourInput.autocomplete = "off";
@@ -1434,16 +1615,22 @@ function boot() {
     colourGo.hidden = false;
     colourRow.append(colourLabel, colourInput, colourGo);
 
-    controls.append(actions, volume.row, brightness.row, groupRow, keypad, keyrow, appRow, pairRow, colourRow);
+    controls.append(
+      actions, volume.row, brightness.row, groupRow,
+      chips.el, tempChips.el, colourRow, keypad, appRow, pairRow,
+    );
 
     const address = document.createElement("p");
     address.className = "address mono micro";
     address.hidden = true;
 
-    el.append(head, labelRow, doing, note, nowplaying, progress, readings, controls, address);
+    el.append(head, deck.el, tvrow, headrow, labelRow, doing, note, readings, controls, address);
 
     /* Handlers. Every one of them reads the device again through
-       `deviceById` — see `buildButton`. */
+       `deviceById` — see `buildButton`. Prev, next, mute and both seg
+       buttons are the same shape: read the device, send one command. */
+    prev.addEventListener("click", () => send(id, { command: "previous" }));
+    next.addEventListener("click", () => send(id, { command: "next" }));
     transport.addEventListener("click", () => {
       const device = deviceById(id);
       if (!device) return;
@@ -1454,11 +1641,6 @@ function boot() {
       const device = deviceById(id);
       if (!device) return;
       send(id, { command: "mute", value: !(device.state && device.state.muted) });
-    });
-    power.addEventListener("click", () => {
-      const device = deviceById(id);
-      if (!device) return;
-      send(id, { command: "power", value: !(device.state && device.state.power === "on") });
     });
     join.addEventListener("click", () => {
       if (joinPick.value) send(id, { command: "join", target: joinPick.value });
@@ -1505,6 +1687,13 @@ function boot() {
        emptied field is a real answer, not a no-op: it is how a custom name or
        a room assignment is cleared back to the default, so it is compared
        against the device's current value and not skipped for being blank. */
+    editToggle.addEventListener("click", () => {
+      const opening = labelRow.hidden;
+      labelRow.hidden = !opening;
+      editToggle.setAttribute("aria-expanded", String(opening));
+      editToggle.classList.toggle("active", opening);
+      if (opening) nameInput.focus();
+    });
     labelGo.addEventListener("click", () => {
       const device = deviceById(id);
       if (!device) return;
@@ -1517,12 +1706,14 @@ function boot() {
     });
 
     return {
-      el, name, kind, lamp, word, doing, note, nowplaying, track, artist,
-      progress, fill, clock, readings, source, app, battery, temp, colour, swatch,
-      controls, actions, transport, mute, power, volume, brightness,
-      groupRow, groupText, joinPick, join, leave, keypad, keyrow,
+      el, name, kind, lamp, word, editToggle,
+      deck, tvrow, screen, headrow, port, headwho,
+      doing, note, nowplaying, track, artist, progress, fill, clock,
+      readings, source, battery,
+      controls, actions, prev, transport, next, mute, power, volume, brightness,
+      groupRow, groupText, joinPick, join, leave, keypad, dpad, keycol,
       appRow, appInput, appGo, pairRow, pairText, pairStart, pairInput, pairGo,
-      colourRow, colourInput, colourGo, address,
+      chips, tempChips, colourRow, colourInput, colourGo, address,
       labelRow, nameInput, roomInput, roomList, labelGo,
       joinDrawn: "", roomsDrawn: "",
     };
@@ -1581,10 +1772,27 @@ function boot() {
       }
     }
 
+    /* The plate's face. Exactly one of the three — chosen by capability,
+       never by kind or brand, the same rule the whole page is built on.
+       `apps` outranks `transport`: a paired television advertises both (it
+       gains `transport` for play/pause on whatever is on screen — see
+       hub.rs's `drive_television`), and it is still a screen, not a deck. A
+       pure transport device — everything today's Sonos driver is — is the
+       only thing the record ever stands in for. */
+    const canApps = has(device, "apps");
+    const canTransport = has(device, "transport");
+    const isDeck = canTransport && !canApps;
+    const isLightLike = !isDeck && !canApps
+      && (has(device, "brightness") || has(device, "color") || has(device, "color_temp"));
+
+    plate.deck.el.hidden = !isDeck;
+    plate.tvrow.hidden = !canApps;
+    plate.headrow.hidden = !isLightLike;
+
     /* What is playing, and how far through it is. Both are hidden rather than
        blanked when there is nothing to say: an empty line where a title was is
        a plate that looks like it failed to load one. */
-    const title = has(device, "transport") && typeof s.title === "string" ? s.title.trim() : "";
+    const title = canTransport && typeof s.title === "string" ? s.title.trim() : "";
     plate.nowplaying.hidden = title === "";
     if (title !== "") {
       plate.track.textContent = title;
@@ -1592,47 +1800,75 @@ function boot() {
       plate.artist.hidden = by === "";
       plate.artist.textContent = by;
     }
-    const fraction = has(device, "transport") ? progressFraction(s.position_secs, s.duration_secs) : null;
+    const fraction = canTransport ? progressFraction(s.position_secs, s.duration_secs) : null;
     plate.progress.hidden = fraction === null;
     if (fraction !== null) {
       plate.fill.style.width = `${(fraction * 100).toFixed(1)}%`;
       plate.clock.textContent = `${clockText(s.position_secs)} / ${clockText(s.duration_secs)}`;
     }
+    if (isDeck) plate.deck.el.classList.toggle("playing", isPlaying(device));
 
-    /* The dials. Each one appears only when the device has that reading, and
-       the bar itself disappears when none of them do — an empty machined bar
-       is furniture reporting nothing. */
+    /* The screen well: what DIAL last reported running, or nothing. */
+    if (canApps) {
+      const appText = typeof s.app === "string" ? s.app.trim() : "";
+      plate.screen.appname.textContent = appText || "—";
+      plate.screen.running.hidden = appText === "";
+      plate.screen.el.classList.toggle("dark", appText === "");
+    }
+
+    /* The light's port: the brightness as the ring's arc, the light's own
+       colour — never the accent's — filling the orb once it is known. The
+       reading beside it states in numbers what the ring can only imply. */
+    if (isLightLike) {
+      const brightPct = clampInt(finiteNumber(s.brightness), 0, 100);
+      const hex = usableHex(s.color);
+      const lit = reachable && s.power === "on";
+      plate.port.el.style.setProperty("--arc", String(has(device, "brightness") ? brightPct : (lit ? 100 : 0)));
+      plate.port.el.classList.toggle("lit", lit);
+      plate.port.orb.classList.toggle("colored", lit && hex !== null);
+      if (lit && hex !== null) {
+        plate.port.el.style.setProperty("--glow", `#${hex}`);
+        plate.port.orb.style.setProperty("--glow", `#${hex}`);
+      } else {
+        plate.port.el.style.removeProperty("--glow");
+        plate.port.orb.style.removeProperty("--glow");
+      }
+      const bits = [];
+      if (has(device, "brightness") && lit) bits.push(percentText(s.brightness));
+      const kelvin = finiteNumber(s.color_temp);
+      if (has(device, "color_temp") && lit && kelvin !== null) bits.push(`${Math.round(kelvin)}K`);
+      plate.headwho.textContent = bits.join(" · ");
+    }
+
+    /* A lit bulb's whole plate reports what the room now looks like. */
+    const roomHex = isLightLike && reachable && s.power === "on" ? usableHex(s.color) : null;
+    plate.el.classList.toggle("lit", roomHex !== null);
+    if (roomHex !== null) plate.el.style.setProperty("--glow", `#${roomHex}`);
+    else plate.el.style.removeProperty("--glow");
+
+    /* The readings that remain machine facts rather than part of a face:
+       what a speaker is fed from, and what is left of a battery. */
     const sourceText = typeof s.source === "string" ? s.source.trim() : "";
     plate.source.el.hidden = sourceText === "";
     plate.source.value.textContent = sourceText;
-
-    const appText = typeof s.app === "string" ? s.app.trim() : "";
-    plate.app.el.hidden = appText === "";
-    plate.app.value.textContent = appText;
 
     const batteryReading = batteryText(s);
     plate.battery.el.hidden = batteryReading === "";
     plate.battery.value.textContent = batteryReading;
     plate.battery.value.className = batteryLow(s) ? "mono bad-ink" : "mono";
 
-    const tempReading = finiteNumber(s.color_temp);
-    plate.temp.el.hidden = tempReading === null;
-    plate.temp.value.textContent = tempReading === null ? "" : `${Math.round(tempReading)}K`;
-
-    const hex = usableHex(s.color);
-    plate.colour.el.hidden = hex === null;
-    if (hex !== null) {
-      plate.colour.value.textContent = hex;
-      plate.swatch.style.background = `#${hex}`;
-    }
-    plate.readings.hidden = [plate.source, plate.app, plate.battery, plate.temp, plate.colour]
-      .every((dial) => dial.el.hidden);
+    plate.readings.hidden = plate.source.el.hidden && plate.battery.el.hidden;
 
     /* The controls this device's capabilities justify, and nothing else. */
-    const canTransport = has(device, "transport");
+    plate.prev.hidden = !isDeck;
+    plate.prev.disabled = locked;
+    plate.next.hidden = !isDeck;
+    plate.next.disabled = locked;
     plate.transport.hidden = !canTransport;
     plate.transport.disabled = locked;
-    plate.transport.textContent = s.transport === "playing" ? "PAUSE" : "PLAY";
+    const playingNow = s.transport === "playing";
+    plate.transport.textContent = playingNow ? "⏸" : "▶";
+    plate.transport.setAttribute("aria-label", playingNow ? "Pause" : "Play");
 
     const canMute = has(device, "mute");
     plate.mute.hidden = !canMute;
@@ -1640,9 +1876,11 @@ function boot() {
     plate.mute.setAttribute("aria-pressed", s.muted ? "true" : "false");
 
     const canPower = has(device, "power");
-    plate.power.hidden = !canPower;
-    plate.power.disabled = locked;
-    plate.power.textContent = s.power === "on" ? "TURN OFF" : "TURN ON";
+    plate.power.el.hidden = !canPower;
+    plate.power.on.disabled = locked;
+    plate.power.off.disabled = locked;
+    plate.power.on.setAttribute("aria-pressed", s.power === "on" ? "true" : "false");
+    plate.power.off.setAttribute("aria-pressed", s.power === "off" ? "true" : "false");
     plate.actions.hidden = !canTransport && !canMute && !canPower;
 
     updateSlider(plate.volume, has(device, "volume"), finiteNumber(s.volume), locked);
@@ -1665,12 +1903,10 @@ function boot() {
 
     const canKeys = has(device, "keys");
     plate.keypad.hidden = !canKeys;
-    plate.keyrow.hidden = !canKeys;
-    for (const button of [...plate.keypad.children, ...plate.keyrow.children]) {
-      if (button.tagName === "BUTTON") button.disabled = locked;
+    for (const button of [...plate.dpad.buttons, plate.keycol.back, plate.keycol.home]) {
+      button.disabled = locked;
     }
 
-    const canApps = has(device, "apps");
     plate.appRow.hidden = !canApps;
     plate.appInput.disabled = locked;
     plate.appGo.disabled = locked;
@@ -1690,9 +1926,23 @@ function boot() {
     }
 
     const canColour = has(device, "color");
+    const currentHex = usableHex(s.color);
+    plate.chips.el.hidden = !canColour;
+    for (const chip of plate.chips.chips) {
+      chip.el.disabled = locked;
+      chip.el.setAttribute("aria-pressed", currentHex === chip.hex ? "true" : "false");
+    }
     plate.colourRow.hidden = !canColour;
     plate.colourInput.disabled = locked;
     plate.colourGo.disabled = locked;
+
+    const canTemp = has(device, "color_temp");
+    const currentK = finiteNumber(s.color_temp);
+    plate.tempChips.el.hidden = !canTemp;
+    for (const chip of plate.tempChips.chips) {
+      chip.el.disabled = locked;
+      chip.el.setAttribute("aria-pressed", currentK !== null && Math.round(currentK) === chip.k ? "true" : "false");
+    }
 
     /* A device that advertises nothing gets no control block at all. An empty
        one is invisible but not weightless — it still takes a row of the
