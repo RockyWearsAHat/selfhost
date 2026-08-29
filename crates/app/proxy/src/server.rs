@@ -2001,6 +2001,19 @@ where
 }
 
 /// Forwards a request to a healthy instance and relays the answer.
+///
+/// # The upgrade path
+///
+/// A request [`upgrade::looks_like_upgrade`] recognises is not the ordinary
+/// case this function otherwise handles: the hop-by-hop strip below would
+/// drop `Connection`/`Upgrade` themselves, and the hardcoded `Connection:
+/// close` would tell the instance to refuse the handshake outright. Both are
+/// skipped on this path — the client's own `Connection`/`Upgrade` fields
+/// (everything else hop-by-hop still stripped) go to the instance untouched
+/// — and once the head is sent, framing stops being HTTP's business at all:
+/// [`splice_upgrade`] parses the instance's answer only far enough to see
+/// whether it agreed, then moves opaque bytes until either side closes,
+/// exactly as [`relay_console_api`] already does for the admin API.
 async fn forward<S>(
     runtime: &SiteRuntime,
     request: &Request,
@@ -2011,6 +2024,8 @@ async fn forward<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
+    let is_upgrade = upgrade::looks_like_upgrade(request);
+
     if let Ok(selfhost_http::BodyLength::Fixed(length)) = request.body_length()
         && length > MAX_FORWARD_BODY_BYTES
     {
@@ -2046,8 +2061,11 @@ where
     for field in request.headers.iter() {
         let name = field.name();
         // Hop-by-hop fields describe this connection, not the message, and must
-        // not be passed along. Framing fields are re-derived below.
-        if is_hop_by_hop(name) || name.eq_ignore_ascii_case("content-length") {
+        // not be passed along — except `Connection`/`Upgrade` themselves on a
+        // handshake, which the instance needs to see spelled out below.
+        if (is_hop_by_hop(name) && !(is_upgrade && (name.eq_ignore_ascii_case("connection") || name.eq_ignore_ascii_case("upgrade"))))
+            || name.eq_ignore_ascii_case("content-length")
+        {
             continue;
         }
         head.extend_from_slice(name.as_bytes());
@@ -2058,7 +2076,9 @@ where
 
     head.extend_from_slice(format!("X-Forwarded-For: {}\r\n", peer.ip()).as_bytes());
     head.extend_from_slice(b"X-Forwarded-Proto: https\r\n");
-    head.extend_from_slice(b"Connection: close\r\n");
+    if !is_upgrade {
+        head.extend_from_slice(b"Connection: close\r\n");
+    }
     if let Some(length) = request.headers.get_str("content-length") {
         head.extend_from_slice(format!("Content-Length: {length}\r\n").as_bytes());
     }
@@ -2066,13 +2086,19 @@ where
 
     upstream.write_all(&head).await?;
 
-    // Relay a request body, if the framing said there is one.
+    // Relay a request body, if the framing said there is one. A handshake
+    // carries none — `looks_like_upgrade` requires GET — so this never races
+    // the upgrade below.
     if let Ok(selfhost_http::BodyLength::Fixed(length)) = request.body_length() {
         if length > 0 {
             relay_body(leftover, stream, &mut upstream, length).await?;
         }
     }
     upstream.flush().await?;
+
+    if is_upgrade {
+        return splice_upgrade(&mut upstream, leftover, stream, peer, request).await;
+    }
 
     // The upstream's response is relayed byte for byte, so its own framing
     // reaches the client untouched and the two cannot disagree.
