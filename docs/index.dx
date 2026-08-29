@@ -1,1 +1,77 @@
-~ dx1 53efa092d57a6d10e280f8aa94f922ba340f9c132eb8578058e0b9fba9ca91b5
+# Self-Host Project Index
+
+## Charter
+
+Self-Host is a unified personal infrastructure system that integrates VPN, mail, identity, asset management, and remote access into a single coherent platform. The system runs on a personal machine with a public IP address and provides secure, multi-user access to personal services and resources.
+
+The charter establishes Self-Host as the authoritative platform for:
+- **VPN & Network**: Secure peer-to-peer mesh networking with WireGuard and identity-based access control
+- **Mail Infrastructure**: Full IMAP/SMTP email system with standards compliance
+- **Identity & Permissions**: Fine-grained role-based access control and secure authentication
+- **Asset Management**: Configuration, storage, and lifecycle management of personal infrastructure
+- **Remote Access**: Secure remote desktop, NAS mounting, and terminal access
+
+## Architecture Layers
+
+Self-Host is organized into 5 crate layers, each with clear dependencies:
+
+```
+┌─────────────────────────────────────────┐
+│ App Layer                               │
+│ (CLI, Web UI, Desktop Apps)             │
+└──────────────┬──────────────────────────┘
+               │
+┌──────────────▼──────────────────────────┐
+│ UI Layer                                │
+│ (Web components, frontend frameworks)   │
+└──────────────┬──────────────────────────┘
+               │
+┌──────────────▼──────────────────────────┐
+│ Services Layer                          │
+│ (Business logic: VPN, mail, identity)   │
+└──────────────┬──────────────────────────┘
+               │
+┌──────────────▼──────────────────────────┐
+│ Net Layer                               │
+│ (Networking primitives, protocols)      │
+└──────────────┬──────────────────────────┘
+               │
+┌──────────────▼──────────────────────────┐
+│ Foundation Layer                        │
+│ (Crypto, storage, core utilities)       │
+└─────────────────────────────────────────┘
+```
+
+### Layer Responsibilities
+
+- **Foundation**: Cryptography, persistent storage, serialization, error handling
+- **Net**: Protocol implementations, socket management, codec definitions
+- **Services**: Business logic, state machines, domain entities (VPN peers, mail accounts, permissions)
+- **UI**: Web components, styling, interaction patterns for desktop and web interfaces
+- **App**: CLI commands, web servers, container deployment, release binaries
+
+## Active Worklist
+
+Current work tracked in this project:
+
+1. **SARA Gateway**: Identity verification and service access gateway
+2. **VPN Console**: Web-based interface for peer management and routing configuration
+3. **Mail IMAP**: IMAP protocol implementation and mailbox support
+4. **Reports UI**: Analytics and audit logging frontend
+5. **NAS UI**: Network-attached storage management interface
+
+## Navigation
+
+- **principles.dx** — Design principles and decision-making framework
+- **architecture.dx** — Deep module design and internal structure
+- **surfaces.dx** — Public APIs and external integration points
+- **roadmap.md** — Feature prioritization and release planning
+- **SECURITY.md** — Security guidelines and checklist
+
+## Reading Guide
+
+Start here for a high-level overview. For deep dives:
+1. Review the **charter** to understand the project mission
+2. Study the **architecture layers** to grasp the module structure
+3. Check the **active worklist** to see current priorities
+4. Navigate to specialized documents for specific domains
