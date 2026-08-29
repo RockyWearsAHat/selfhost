@@ -5,7 +5,7 @@
 //! the shared [`Activity`] busy while it works, and leaves a result the next
 //! frame reads.
 
-use crate::app::{Activity, CONSOLE_HOST, CONSOLE_URL};
+use crate::app::{Activity, CONSOLE_URL, GATED_HOSTS, SARA_URL};
 use crate::dns::RESPONDER_PORT;
 use crate::keys;
 use std::path::{Path, PathBuf};
@@ -44,22 +44,36 @@ pub fn rotate(activity: Arc<Mutex<Activity>>) {
 
 /// Ensures the console route is installed, then opens the console in the browser.
 pub fn open_console(activity: Arc<Mutex<Activity>>) {
-    if !set_busy(&activity, "Opening console…") {
+    open_gated(activity, CONSOLE_URL, "Opened the admin console.")
+}
+
+/// Ensures the console route is installed, then opens the SARA gateway.
+///
+/// Shares the same route as the console: the tunnel and the loopback 443 gate
+/// are host-agnostic, so the only thing that differs per gated host is which
+/// name the split-DNS responder answers for.
+pub fn open_sara(activity: Arc<Mutex<Activity>>) {
+    open_gated(activity, SARA_URL, "Opened SARA.")
+}
+
+/// Ensures the route is installed, then opens `url` in the browser.
+fn open_gated(activity: Arc<Mutex<Activity>>, url: &'static str, done: &'static str) {
+    if !set_busy(&activity, "Opening…") {
         return;
     }
     std::thread::spawn(move || {
-        let outcome = ensure_console_route().and_then(|()| open_url());
-        finish(&activity, outcome.map(|()| "Opened the admin console.".to_string()), |_| {});
+        let outcome = ensure_console_route().and_then(|()| open_url(url));
+        finish(&activity, outcome.map(|()| done.to_string()), |_| {});
     });
 }
 
-/// Ensures everything the portless console URL needs, in one privileged prompt.
+/// Ensures everything the portless gated URLs need, in one privileged prompt.
 ///
-/// Three pieces make `https://admin.rockywearsahat.com/` land on the tunnel: the
+/// Three pieces make each host in [`GATED_HOSTS`] land on the tunnel: its
 /// scoped resolver file (pointing the host at the app's split-DNS responder),
 /// a clean `/etc/hosts` (the legacy hosts-line mechanism removed), and the
 /// console gate — a root LaunchDaemon holding `127.0.0.1:443` and splicing it
-/// to the tunnel's local end. When all three are already exact, nothing runs
+/// to the tunnel's local end. When everything is already exact, nothing runs
 /// and nothing prompts; otherwise one `osascript` administrator prompt installs
 /// them together and verifies the gate actually listens before reporting done.
 fn ensure_console_route() -> Result<(), String> {
@@ -72,22 +86,25 @@ fn ensure_console_route() -> Result<(), String> {
 
 /// Whether the installed route matches this build exactly.
 ///
-/// Exactness is byte equality — resolver file, plist, and gate binary — plus a
-/// hosts file free of the legacy console line, so an upgrade or a hand-edit
-/// re-triggers the one-time install. Files only: the daemon itself is
-/// launchd-kept (`KeepAlive`), and the installer is the step that proves the
-/// listener; a user who booted the gate out on purpose is not fought here.
+/// Exactness is byte equality — every gated host's resolver file, the plist,
+/// and the gate binary — plus a hosts file free of any gated host's legacy
+/// line, so an upgrade, a hand-edit, or adding a new gated host re-triggers
+/// the one-time install. Files only: the daemon itself is launchd-kept
+/// (`KeepAlive`), and the installer is the step that proves the listener; a
+/// user who booted the gate out on purpose is not fought here.
 fn console_route_current(gate: &Path) -> bool {
-    let resolver_ok = std::fs::read_to_string(resolver_path())
-        .map(|current| current == resolver_body())
-        .unwrap_or(false);
+    let resolvers_ok = GATED_HOSTS.iter().all(|host| {
+        std::fs::read_to_string(resolver_path(host))
+            .map(|current| current == resolver_body())
+            .unwrap_or(false)
+    });
     let plist_ok =
         std::fs::read_to_string(GATE_PLIST).map(|current| current == gate_plist()).unwrap_or(false);
     let gate_ok = match (std::fs::read(gate), std::fs::read(GATE_BIN)) {
         (Ok(bundled), Ok(installed)) => bundled == installed,
         _ => false,
     };
-    resolver_ok && plist_ok && gate_ok && !hosts_has_legacy_line()
+    resolvers_ok && plist_ok && gate_ok && !GATED_HOSTS.iter().any(|host| hosts_has_legacy_line(host))
 }
 
 /// Runs the one-time privileged install for the whole console route.
@@ -121,12 +138,15 @@ fn install_console_route(gate: &Path) -> Result<(), String> {
     }
 }
 
-/// The scoped resolver file for the console host.
-fn resolver_path() -> String {
-    format!("/etc/resolver/{CONSOLE_HOST}")
+/// The scoped resolver file for a gated host.
+fn resolver_path(host: &str) -> String {
+    format!("/etc/resolver/{host}")
 }
 
-/// What the resolver file must say: the app's responder, on its loopback port.
+/// What every resolver file must say: the app's responder, on its loopback port.
+///
+/// Identical for every gated host — the responder itself is what tells hosts
+/// apart (see [`crate::dns`]) — so one body serves all of them.
 fn resolver_body() -> String {
     format!("nameserver 127.0.0.1\nport {RESPONDER_PORT}\n")
 }
@@ -167,9 +187,20 @@ fn gate_plist() -> String {
 /// running proxy. The cache flush comes last so the resolver switch and the
 /// gate go live together.
 fn install_script(gate: &Path) -> String {
-    let resolver_path = resolver_path();
     let resolver_printf = resolver_body().replace('\n', "\\n");
-    let host_pattern = CONSOLE_HOST.replace('.', "\\.");
+    let resolver_steps: String = GATED_HOSTS
+        .iter()
+        .map(|host| {
+            let resolver_path = resolver_path(host);
+            let host_pattern = host.replace('.', "\\.");
+            format!(
+                "printf '{resolver_printf}' > '{resolver_path}'\n\
+                 chown root:wheel '{resolver_path}'\n\
+                 chmod 644 '{resolver_path}'\n\
+                 [ ! -f /etc/hosts ] || /usr/bin/sed -i '' -E -e '/^127\\.0\\.0\\.1[[:space:]]+{host_pattern}[[:space:]]*(#.*)?$/d' -e '/^127\\.0\\.0\\.1[[:space:]]/s/[[:space:]]+{host_pattern}([[:space:]]|$)/\\1/g' /etc/hosts\n"
+            )
+        })
+        .collect();
     let plist = gate_plist();
     let gate = sh_quote(gate);
     format!(
@@ -177,11 +208,7 @@ fn install_script(gate: &Path) -> String {
 # One-time privileged console-route install, staged and run by SelfHost VPN.
 set -e
 mkdir -p /etc/resolver /Library/PrivilegedHelperTools
-printf '{resolver_printf}' > '{resolver_path}'
-chown root:wheel '{resolver_path}'
-chmod 644 '{resolver_path}'
-[ ! -f /etc/hosts ] || /usr/bin/sed -i '' -E -e '/^127\.0\.0\.1[[:space:]]+{host_pattern}[[:space:]]*(#.*)?$/d' -e '/^127\.0\.0\.1[[:space:]]/s/[[:space:]]+{host_pattern}([[:space:]]|$)/\1/g' /etc/hosts
-cp {gate} '{GATE_BIN}'
+{resolver_steps}cp {gate} '{GATE_BIN}'
 chown root:wheel '{GATE_BIN}'
 chmod 755 '{GATE_BIN}'
 cat > '{GATE_PLIST}' <<'PLIST'
@@ -205,14 +232,14 @@ killall -HUP mDNSResponder
     )
 }
 
-/// Whether `/etc/hosts` still carries the legacy console mapping.
-fn hosts_has_legacy_line() -> bool {
+/// Whether `/etc/hosts` still carries the legacy mapping for `host`.
+fn hosts_has_legacy_line(host: &str) -> bool {
     let hosts = std::fs::read_to_string("/etc/hosts").unwrap_or_default();
     hosts.lines().any(|line| {
         let line = line.trim();
         !line.starts_with('#')
             && line.starts_with("127.0.0.1")
-            && line.split_whitespace().skip(1).any(|host| host == CONSOLE_HOST)
+            && line.split_whitespace().skip(1).any(|candidate| candidate == host)
     })
 }
 
@@ -239,10 +266,10 @@ fn sh_quote(path: &Path) -> String {
     format!("'{}'", path.display().to_string().replace('\'', r"'\''"))
 }
 
-/// Opens the console URL in the default browser.
-fn open_url() -> Result<(), String> {
+/// Opens `url` in the default browser.
+fn open_url(url: &str) -> Result<(), String> {
     let status = Command::new("open")
-        .arg(CONSOLE_URL)
+        .arg(url)
         .status()
         .map_err(|error| format!("could not open the browser: {error}"))?;
     if status.success() { Ok(()) } else { Err("the browser did not open".into()) }
@@ -309,6 +336,7 @@ mod tests {
         let script = install_script(Path::new("/tmp/gate"));
         for step in [
             "printf 'nameserver 127.0.0.1\\nport 53535\\n' > '/etc/resolver/admin.rockywearsahat.com'",
+            "printf 'nameserver 127.0.0.1\\nport 53535\\n' > '/etc/resolver/sara.rockywearsahat.com'",
             "/etc/hosts",
             "cp '/tmp/gate' '/Library/PrivilegedHelperTools/com.selfhost.console-gate'",
             "launchctl bootstrap system",
