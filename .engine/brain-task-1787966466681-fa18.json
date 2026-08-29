@@ -1,0 +1,200 @@
+{
+  "ProjectPath": "/Users/alexwaldmann/Desktop/Self-Host",
+  "Owner": "",
+  "Repo": "",
+  "Brief": "You are preparing the project at /Users/alexwaldmann/Desktop/Self-Host for autonomous work. Before SARA starts dispatching worklist items to you and others, verify and document:\n\n1. **Environment**: The project builds and runs cleanly in isolation. Check PATH, credentials (.env if needed), system dependencies, installed packages.\n2. **Credentials \u0026 Secrets**: Any API keys, GitHub tokens, or credentials needed are in place and working. Verify with a quick test if possible.\n3. **Build System**: The build (npm install, cargo build, poetry install, etc.) completes without errors. Document the build command.\n4. **Test Suite**: Run the existing test suite if one exists. Fix any pre-existing failures (they block detection of new breakage).\n5. **Development Setup**: Editor config, linters, formatters, git hooks all working. Commit setup changes if any were needed.\n6. **Documentation**: index.dx or README clearly states:\n   - How to build and test this project\n   - Where to find the actual code entry points\n   - What the main moving parts are\n   - Any project-specific rules or conventions\n\nDo not implement features or fix bugs — setup is verification only. If something is broken or unclear, fix it enough that the next worker gets a clean slate. Commit your work (or note what you could not fix). When done, say \"Setup complete\" to mark this project ready.",
+  "requirements": {
+    "prd": "",
+    "design": ""
+  },
+  "plan": [
+    {
+      "index": 1,
+      "title": "Scaffold index.dx with project charter and worklist structure",
+      "body": "Module: docs/index.dx. Failing test: `index.dx` is empty (hash-only). Minimal impl: Add charter section (what the project is), layer diagram (5-crate levels), and empty worklist section. Refactor: Link to principles.dx, architecture.dx, surfaces.dx for navigation.",
+      "acceptance": "`grep -c \"charter\\|worklist\\|principles\" index.dx` \u003e= 3.",
+      "done": false,
+      "attempts": 0,
+      "updatedAt": "2026-08-29T01:30:14Z"
+    },
+    {
+      "index": 2,
+      "title": "Verify workspace builds cleanly with no compiler errors",
+      "body": "Module: Cargo.toml, all 25 crates. Failing test: `cargo check --workspace 2\u003e\u00261 | grep -i error` exits nonzero. Minimal impl: Run `cargo check --workspace` once; capture output + pass/fail. Refactor: Cache result, diff on re-run.",
+      "acceptance": "`cargo check --workspace 2\u003e\u00261 | tail -1` shows \"Finished\" with no \"error\".",
+      "done": false,
+      "attempts": 0,
+      "updatedAt": "2026-08-29T01:30:14Z"
+    },
+    {
+      "index": 3,
+      "title": "Run unit test suite and record baseline pass count",
+      "body": "Module: All crates, test modules. Failing test: `cargo test --lib 2\u003e\u00261 | grep -i fail` shows any failure. Minimal impl: Run `cargo test --lib --workspace`, capture \"test result\" line. Refactor: Parse count, store in .engine/test-baseline.txt.",
+      "acceptance": "`cargo test --lib --workspace 2\u003e\u00261 | grep \"test result\"` shows \"ok\" and \u003e= 3000 tests.",
+      "done": false,
+      "attempts": 0,
+      "updatedAt": "2026-08-29T01:30:14Z"
+    },
+    {
+      "index": 4,
+      "title": "Verify clippy linter passes with no warnings on all targets",
+      "body": "Module: All crates, clippy config. Failing test: `cargo clippy --workspace --all-targets 2\u003e\u00261 | grep -i warning` shows output. Minimal impl: Run clippy, capture warnings or \"Checking\" lines. Refactor: Make clippy strict (deny warnings in a profile).",
+      "acceptance": "`cargo clippy --workspace --all-targets 2\u003e\u00261 | grep \"warning:\"` is empty.",
+      "done": false,
+      "attempts": 0,
+      "updatedAt": "2026-08-29T01:30:14Z"
+    },
+    {
+      "index": 5,
+      "title": "Create pre-commit git hook to run clippy and tests before push",
+      "body": "Module: .git/hooks/pre-push. Failing test: Hook does not exist or is not executable. Minimal impl: Write hook that runs `cargo clippy --workspace --all-targets` and `cargo test --lib --workspace` (abort on failure). Refactor: Parameterize with allow-skip env var for emergency pushes.",
+      "acceptance": "`ls -l .git/hooks/pre-push` is executable; hook runs and rejects push if clippy or tests fail.",
+      "done": false,
+      "attempts": 0,
+      "updatedAt": "2026-08-29T01:30:14Z"
+    },
+    {
+      "index": 6,
+      "title": "Build release binary and verify CLI entry points work",
+      "body": "Module: crates/app/cli, target/release/selfhost. Failing test: `cargo build --release -p selfhost-cli` fails or binary not found. Minimal impl: Run release build, verify binary at target/release/selfhost exists and is executable. Refactor: Add strip/optimize profile (already in Cargo.toml).",
+      "acceptance": "`target/release/selfhost --version` outputs \"0.1.0\".",
+      "done": false,
+      "attempts": 0,
+      "updatedAt": "2026-08-29T01:30:14Z"
+    },
+    {
+      "index": 7,
+      "title": "Run selfhost daemon locally and prove 80/443 binding and health check",
+      "body": "Module: crates/app/cli (daemon), crates/app/proxy. Failing test: Daemon does not start or `selfhost health` fails. Minimal impl: Create minimal config at `.engine/demo/selfhost.config.toml`, run daemon, call `selfhost health` from another terminal. Refactor: Capture daemon PID, clean shutdown on test end.",
+      "acceptance": "`selfhost health` shows four \"pass\" or \"ok\" results and exits 0; daemon exits cleanly on Ctrl-C.",
+      "done": false,
+      "attempts": 0,
+      "updatedAt": "2026-08-29T01:30:14Z"
+    },
+    {
+      "index": 8,
+      "title": "Verify documentation completeness: getting-started, principles, security checklist",
+      "body": "Module: docs/getting-started.md, docs/principles.dx, docs/SECURITY.md. Failing test: Key sections missing or links broken. Minimal impl: Check each file exists and has required sections (see step 2 list). Refactor: Parse dx documents and verify section references are resolvable.",
+      "acceptance": "`test -f docs/{getting-started.md,principles.dx,SECURITY.md}` all pass; `grep -l \"STOP — read before\" docs/SECURITY.md` matches.",
+      "done": false,
+      "attempts": 0,
+      "updatedAt": "2026-08-29T01:30:14Z"
+    },
+    {
+      "index": 9,
+      "title": "Update CLAUDE.md to document build, test, and environment setup steps",
+      "body": "Module: CLAUDE.md, setup/verification section. Failing test: CLAUDE.md has no \"build\" or \"test\" section. Minimal impl: Add sections: \"Build: cargo build --release -p selfhost-cli\", \"Test: cargo test --lib --workspace\", \"Verify: selfhost health\". Refactor: Link to relevant crates, add troubleshooting.",
+      "acceptance": "`grep -c \"cargo build\\|cargo test\\|selfhost health\" CLAUDE.md` \u003e= 3.",
+      "done": false,
+      "attempts": 0,
+      "updatedAt": "2026-08-29T01:30:14Z"
+    },
+    {
+      "index": 10,
+      "title": "Document live URL or local binding in .engine/live-url.txt after daemon boots",
+      "body": "Module: .engine/, daemon binding. Failing test: No `.engine/live-url.txt` or it is empty. Minimal impl: Run daemon, capture binding from startup log, echo to file. Refactor: Include health-check status and daemon PID.",
+      "acceptance": "`cat .engine/live-url.txt` shows \"https://127.0.0.1:8443\" or \"http://127.0.0.1:8080\" (loopback as expected).",
+      "done": false,
+      "attempts": 0,
+      "updatedAt": "2026-08-29T01:30:14Z"
+    },
+    {
+      "index": 11,
+      "title": "Commit setup verification and all changes to vpn-sara-gate branch",
+      "body": "Module: git, repo root. Failing test: Untracked files remain or commit fails. Minimal impl: `git add` index.dx, CLAUDE.md, .engine/test-baseline.txt, .git/hooks/pre-push; commit with msg \"setup: verify environment, document worklist and build steps\". Refactor: Squash into single clean commit.",
+      "acceptance": "`git log -1 --oneline` shows \"setup: verify environment...\" and `git status` shows no uncommitted changes.",
+      "done": false,
+      "attempts": 0,
+      "updatedAt": "2026-08-29T01:30:14Z"
+    }
+  ],
+  "teams": {
+    "team-frontend-1": {
+      "id": "team-frontend-1",
+      "role": "frontend",
+      "assigned_steps": [
+        1,
+        2
+      ],
+      "status": "running",
+      "depends_on": null,
+      "started_at": "2026-08-28T19:30:14.217601-06:00",
+      "completed_at": "0001-01-01T00:00:00Z"
+    },
+    "team-frontend-3": {
+      "id": "team-frontend-3",
+      "role": "frontend",
+      "assigned_steps": [
+        5
+      ],
+      "status": "running",
+      "depends_on": null,
+      "started_at": "2026-08-28T19:30:14.20257-06:00",
+      "completed_at": "0001-01-01T00:00:00Z"
+    },
+    "team-frontend-5": {
+      "id": "team-frontend-5",
+      "role": "frontend",
+      "assigned_steps": [
+        8
+      ],
+      "status": "running",
+      "depends_on": null,
+      "started_at": "2026-08-28T19:30:14.205844-06:00",
+      "completed_at": "0001-01-01T00:00:00Z"
+    },
+    "team-general-0": {
+      "id": "team-general-0",
+      "role": "general",
+      "assigned_steps": [
+        0
+      ],
+      "status": "running",
+      "depends_on": null,
+      "started_at": "2026-08-28T19:30:14.207325-06:00",
+      "completed_at": "0001-01-01T00:00:00Z"
+    },
+    "team-general-2": {
+      "id": "team-general-2",
+      "role": "general",
+      "assigned_steps": [
+        3,
+        4
+      ],
+      "status": "running",
+      "depends_on": null,
+      "started_at": "2026-08-28T19:30:14.219088-06:00",
+      "completed_at": "0001-01-01T00:00:00Z"
+    },
+    "team-general-4": {
+      "id": "team-general-4",
+      "role": "general",
+      "assigned_steps": [
+        6,
+        7
+      ],
+      "status": "running",
+      "depends_on": null,
+      "started_at": "2026-08-28T19:30:14.204908-06:00",
+      "completed_at": "0001-01-01T00:00:00Z"
+    },
+    "team-general-6": {
+      "id": "team-general-6",
+      "role": "general",
+      "assigned_steps": [
+        9,
+        10
+      ],
+      "status": "running",
+      "depends_on": null,
+      "started_at": "2026-08-28T19:30:14.206504-06:00",
+      "completed_at": "0001-01-01T00:00:00Z"
+    }
+  },
+  "outer_iterations": 1,
+  "started_at": "2026-08-28T19:21:06.683834-06:00",
+  "updated_at": "2026-08-28T19:30:14.219088-06:00",
+  "completed_at": "0001-01-01T00:00:00Z",
+  "session_id_prefix": "task-1787966466681-fa18",
+  "state_slug": "task-1787966466681-fa18"
+}

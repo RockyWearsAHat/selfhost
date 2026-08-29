@@ -1,0 +1,94 @@
+{
+  "version": "v1",
+  "requestId": "1787967155741536000-0",
+  "sessionId": "task-1787966466681-fa18-team-team-general-0-step-0",
+  "projectPath": "/Users/alexwaldmann/Desktop/Self-Host",
+  "objective": {
+    "statement": "Continue working on this step.",
+    "priority": "high"
+  },
+  "scope": {
+    "inScope": [
+      "Continue working on this step."
+    ],
+    "outScope": [
+      "Deploy/publish actions unless explicit publish intent evidence is present"
+    ]
+  },
+  "constraints": [
+    "Preserve existing behavior unless user requests a behavior change",
+    "Run project-appropriate verification before completion",
+    "Do not deploy/publish without explicit intent evidence"
+  ],
+  "successCriteria": {
+    "items": [
+      "Continue working on this step"
+    ],
+    "completionDefinition": "all success criteria met and verification passes"
+  },
+  "projectProfile": {
+    "projectPath": "/Users/alexwaldmann/Desktop/Self-Host",
+    "type": "web-app",
+    "doneDefinition": [
+      "Review this diff:",
+      "diff --git a/",
+      "index 4230eec",
+      "0fba16e 100644",
+      "@@ -1,5 +1,6 @@",
+      "crates/ui/rui/rui"
+    ],
+    "deployTarget": "local",
+    "verification": {
+      "usesPlaywright": true,
+      "startCmd": "pnpm dev",
+      "checkURL": "http://localhost:3000",
+      "port": 3000,
+      "checkCmds": null
+    },
+    "liveCheckCmd": "curl -sf http://localhost:3000",
+    "executionIntent": {
+      "publishIntent": "none",
+      "publishEvidence": null
+    },
+    "workingBehaviors": [
+      "User can review this diff:",
+      "User can diff --git a/",
+      "User can index 4230eec",
+      "User can 0fba16e 100644",
+      "User can @@ -1,5 +1,6 @@",
+      "User can crates/ui/rui/rui"
+    ]
+  },
+  "executionIntent": {
+    "publishIntent": "none",
+    "publishEvidence": null
+  },
+  "style": {
+    "explicitStyleProvided": false,
+    "assumedStyle": "convention-safe default",
+    "assumptionNoticeSent": {
+      "chat": true,
+      "discord": true
+    }
+  },
+  "continuity": {
+    "completedSteps": [
+      "request intake captured",
+      "pre-start expansion generated",
+      "latest summary updated"
+    ],
+    "nextStep": "execute highest-priority implementation step and run verification",
+    "knownRisks": [
+      "publish/deploy is denied until explicit evidence is provided"
+    ],
+    "unresolvedQuestions": null
+  },
+  "observability": {
+    "canaryEnabled": false,
+    "killSwitches": [
+      "publish-intent-gate",
+      "minimal-chat-policy"
+    ],
+    "traceId": "1787967155741536000-0"
+  }
+}

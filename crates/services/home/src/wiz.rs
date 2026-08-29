@@ -145,7 +145,7 @@ pub fn set_pilot(command: &Command) -> Result<String, String> {
         Command::Power(on) => Json::object([("state", Json::Bool(*on))]),
         Command::Brightness(level) => Json::object([(
             "dimming",
-            Json::Number(f64::from((*level).max(DIMMING_FLOOR).min(100))),
+            Json::Number(f64::from((*level).clamp(DIMMING_FLOOR, 100))),
         )]),
         Command::ColorTemp(kelvin) => Json::object([(
             "temp",

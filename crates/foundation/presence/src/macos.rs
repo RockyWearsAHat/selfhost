@@ -54,7 +54,6 @@ const DEVICE_OWNER: isize = 2;
 const PATIENCE: Duration = Duration::from_secs(600);
 
 #[link(name = "LocalAuthentication", kind = "framework")]
-#[link(name = "Foundation", kind = "framework")]
 unsafe extern "C" {
     fn objc_getClass(name: *const c_char) -> Id;
     fn sel_registerName(name: *const c_char) -> Sel;
