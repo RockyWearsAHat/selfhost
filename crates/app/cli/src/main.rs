@@ -911,6 +911,13 @@ async fn serve_everything(
         }
     })?;
 
+    let url = format!("http://{address}");
+    let url_file = project_dir.join(".engine").join("live-url.txt");
+    if let Some(parent) = url_file.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let _ = std::fs::write(&url_file, &url);
+
     println!("selfhost daemon");
     println!("  control api  http://{address}");
     println!("  token        {}", Token::path_in(&data_dir).display());

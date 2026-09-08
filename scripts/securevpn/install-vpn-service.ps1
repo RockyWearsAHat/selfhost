@@ -1,27 +1,51 @@
-# install-vpn-service.ps1 - run the Secure-VPN server as a boot service on the box.
+# install-vpn-service.ps1 - run a Secure-VPN forwarder as a boot service on the box.
 #
 # The Secure-VPN server (github.com/RockyWearsAHat/Secure-VPN, vendored under
 # C:\ProgramData\selfhost\securevpn) accepts mutually-authenticated, encrypted
-# connections on TCP 8443 and forwards each to the selfhost proxy on
-# 127.0.0.1:443. It is the ONLY public door to the admin console: the console
-# site (rockywearsahat.com) is gated to loopback in the proxy, so the box's own
-# tunnel exit is the sole source address that may reach it.
+# connections on one listen port and forwards each session to one fixed
+# (host, port) target. `server.py`'s own flags are named --ssh-host/--ssh-port
+# because SSH forwarding was the program's original demo shape (see its
+# SSH_SETUP.md) — this script repoints those same flags at whatever target the
+# deployment needs. One instance is the ONLY public door to the admin console
+# (default: TargetPort 443, the selfhost proxy) — the console site
+# (rockywearsahat.com) is gated to loopback in the proxy, so that instance's
+# tunnel exit is the sole source address that may reach it. A second instance,
+# same identity and roster, same pinned client key, pointed at 127.0.0.1:22
+# instead, is SSH-02's sanctioned remote-SSH path (see docs/SECURITY.md) — one
+# more forwarded target behind the same audited tunnel, not a second VPN
+# product.
+#
+# Multiple instances distinguish themselves by -Name: each gets its own
+# Scheduled Task (selfhost-vpn-<Name>) and firewall rule (SecureVPN <port>),
+# all sharing the same vendored server.py, key directory and roster file — a
+# peer enrolled once is enrolled for every forwarded target, and revoking them
+# (deleting their roster entry) revokes every target at once.
 #
 # Security model (see docs/VPN.md):
-#   - 8443 answers nothing without the client's pre-shared Ed25519 key - silent
-#     to scanners.
+#   - Each listen port answers nothing without the client's pre-shared Ed25519
+#     key - silent to scanners.
 #   - Keys live in C:\ProgramData\selfhost\securevpn\keys, locked to
 #     Administrators+SYSTEM (no inheritance). The private key is never printed.
 #   - Runs as a Scheduled Task (SYSTEM, at startup, auto-restart) exactly like the
-#     other selfhost tasks; NOT named 'selfhost-*' so the firewall reconciler
-#     leaves its rule alone.
+#     other selfhost tasks; the firewall reconciler only ever touches firewall
+#     rules, never Scheduled Tasks, so each instance's task name (selfhost-vpn
+#     or selfhost-vpn-<Name>) is unaffected either way. Its firewall rule name
+#     ('SecureVPN <port>') is what must never start with 'selfhost-' — that
+#     prefix is what the reconciler adopts and deletes on sight.
 #
 # Usage (run over SSH as administrator):
-#   .\install-vpn-service.ps1 [-Python <path>] [-VpnDir <path>]
+#   .\install-vpn-service.ps1 [-Name <suffix>] [-Python <path>] [-VpnDir <path>] `
+#       [-ListenPort <port>] [-TargetHost <host>] [-TargetPort <port>]
+#
+#   Console (default, unchanged):
+#     .\install-vpn-service.ps1
+#   SSH, same box, same roster, different door:
+#     .\install-vpn-service.ps1 -Name ssh -ListenPort 8444 -TargetHost 127.0.0.1 -TargetPort 22
 #
 # Idempotent: re-running re-registers the task and refreshes the firewall rule.
 
 param(
+  [string]$Name = "",
   [string]$Python = "",
   [string]$VpnDir = "C:\ProgramData\selfhost\securevpn",
   [int]$ListenPort = 8443,
@@ -30,7 +54,7 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
-$taskName = 'selfhost-vpn'
+$taskName = if ($Name) { "selfhost-vpn-$Name" } else { 'selfhost-vpn' }
 $keyDir   = Join-Path $VpnDir 'keys'
 $server   = Join-Path $VpnDir 'server.py'
 
@@ -57,10 +81,10 @@ foreach ($f in @('server.key', 'client.pub')) {
   }
 }
 
-# --- 3. Firewall: inbound allow TCP 8443 (NOT 'selfhost-' prefixed) -----------
+# --- 3. Firewall: inbound allow TCP $ListenPort (NOT 'selfhost-' prefixed) ----
 # The selfhost firewall reconciler adopts and deletes any rule whose name starts
 # 'selfhost-'. Keep this rule outside that namespace so it is never withdrawn.
-$fwName = 'SecureVPN 8443'
+$fwName = "SecureVPN $ListenPort"
 if (-not (Get-NetFirewallRule -DisplayName $fwName -ErrorAction SilentlyContinue)) {
   New-NetFirewallRule -DisplayName $fwName -Direction Inbound -Action Allow `
     -Protocol TCP -LocalPort $ListenPort | Out-Null
@@ -74,7 +98,7 @@ if (-not (Get-NetFirewallRule -DisplayName $fwName -ErrorAction SilentlyContinue
 # SYSTEM task has no console, and the server prints Unicode status marks).
 # `-X utf8` forces UTF-8 stdio so those marks cannot raise UnicodeEncodeError
 # on a cp1252 console and abort a connection handler; `-u` keeps the log live.
-$logFile = Join-Path $VpnDir 'vpn.log'
+$logFile = Join-Path $VpnDir $(if ($Name) { "vpn-$Name.log" } else { 'vpn.log' })
 $pyArgs  = "-X utf8 -u `"$server`" --host 0.0.0.0 --port $ListenPort --ssh-host $TargetHost --ssh-port $TargetPort --key-dir `"$keyDir`" --identity server --peer client"
 $cmdLine = "/c `"`"$Python`" $pyArgs >> `"$logFile`" 2>&1`""
 $action  = New-ScheduledTaskAction -Execute "$env:SystemRoot\System32\cmd.exe" -Argument $cmdLine -WorkingDirectory $VpnDir
