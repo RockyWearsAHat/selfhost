@@ -83,5 +83,13 @@ docs/SECURITY.md
 # The lab rebuilds it on every run; nothing in it is source.
 /gen/
 
-# Claude Code personal project settings
+# Claude Code runtime and cache (internal state, not reproducible)
+.cache/
+.engine/
 .claude/settings.local.json
+# dx: the local index is rebuildable from .doc/repo.dxcp
+.doc/index.db
+.doc/index.db-wal
+.doc/index.db-shm
+.doc/coverage.jsonl
+.doc/local.dxcp

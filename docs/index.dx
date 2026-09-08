@@ -11,20 +11,6 @@ The charter establishes Self-Host as the authoritative platform for:
 - **Asset Management**: Configuration, storage, and lifecycle management of personal infrastructure
 - **Remote Access**: Secure remote desktop, NAS mounting, and terminal access
 
-## Understanding
-
-Self-Host is a Rust supervisor for long-lived processes on the Windows machine. It starts and keeps running any program on the system—MongoDB, a NAS daemon, Git host, or SARA's own services—and tracks whether each one is healthy, restarted, or permanently failed.
-
-The five crates organize as layers: foundation (crypto, storage, config parsing), net (sockets and protocols), services (business logic and state machines), ui (web components), and app (CLI and servers). A service is declared in a TOML file specifying its program, arguments, working directory, and environment. Services are not written to `selfhost.config.toml`—that file is hand-maintained and describes only the server address, nodes, and reverse-proxy sites. Instead, services live in `data/services.toml`, written only by the daemon when the console installs one, so comments in the hand-maintained config survive being parsed and serialized back.
-
-Each service has a state machine with nine states: Stopped, Disabled, Starting, Running (with pid and uptime), Stopping, Exited (with exit code), Backoff (waiting with retry countdown and attempt count), GaveUp (failed too many times; requires explicit start from the operator), and Unstartable (a bad program path or permission). The `needs_attention()` method returns true only for GaveUp and Unstartable—the states that mean a person should know. A service in GaveUp stops being restarted, and nothing automatically consumes the alert.
-
-Health checks are done by calling `try_wait()` on the process, which checks only whether the process exists. There is no port check, no HTTP probe, no heartbeat. A service holding its socket but deadlocked reads as Running forever. The restart policy defaults are: restart delay 5 seconds, maximum 5 restarts, exponential backoff doubling from 5 seconds up to a 300-second cap, and the restart counter resets once the service has stayed up longer than (restart_delay × max_restarts) or 30 seconds, whichever is longer. A clean exit does not trigger a restart by default; the policy is OnFailure.
-
-Sites are declared as `[[sites]]` blocks in `selfhost.config.toml`, with two shapes: a proxy to a local port (like `forge → 4004` or `sara → 4477` with allowed_cidrs restricting access to loopback) or a static_root plus spa flag for a static or single-page application. No services are declared in that file; services are managed entirely through the admin API on port 9191.
-
-The supervisor builds cleanly on Rust. Tests cannot compile on macOS—the `selfhost-presence` crate links Objective-C LocalAuthentication symbols that fail on arm64. Main is 17 commits ahead of origin, and there are 16 local branches.
-
 ## Architecture Layers
 
 Self-Host is organized into 5 crate layers, each with clear dependencies:
@@ -64,7 +50,7 @@ Self-Host is organized into 5 crate layers, each with clear dependencies:
 - **UI**: Web components, styling, interaction patterns for desktop and web interfaces
 - **App**: CLI commands, web servers, container deployment, release binaries
 
-## Worklist
+## Active Worklist
 
 Current work tracked in this project:
 

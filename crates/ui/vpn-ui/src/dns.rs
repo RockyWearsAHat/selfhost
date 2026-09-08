@@ -1,13 +1,14 @@
-//! The split-DNS responder behind the console's scoped resolver.
+//! The split-DNS responder behind the gated hosts' scoped resolvers.
 //!
-//! macOS is pointed at this responder by `/etc/resolver/admin.rockywearsahat.com`
-//! (installed by the console action in [`crate::actions`]): while the app runs,
-//! the console host resolves to loopback, so the portless console URL reaches
-//! the tunnel's local end instead of the public box. Per `docs/SECURITY.md` the
-//! listener is loopback-only — it binds `127.0.0.1`, answers exactly one name,
-//! and REFUSES every other question, so it can never serve as an open resolver.
+//! macOS is pointed at this responder by one `/etc/resolver/<host>` file per
+//! entry in [`crate::app::GATED_HOSTS`] (installed by the actions in
+//! [`crate::actions`]): while the app runs, each gated host resolves to
+//! loopback, so its portless URL reaches the tunnel's local end instead of the
+//! public box. Per `docs/SECURITY.md` the listener is loopback-only — it binds
+//! `127.0.0.1`, answers exactly the fixed set of gated hosts, and REFUSES every
+//! other question, so it can never serve as an open resolver.
 
-use crate::app::{Activity, CONSOLE_HOST};
+use crate::app::{Activity, GATED_HOSTS};
 use selfhost_dns::wire::{
     self, Query, Record, RecordData, RecordType, ResponseCode, ResponseFlags,
 };
@@ -73,12 +74,12 @@ fn serve(socket: &UdpSocket, running: &AtomicBool) {
 
 /// Builds the one answer this responder gives.
 ///
-/// `A` for the console host is `127.0.0.1`; any other type for that host (AAAA
+/// `A` for a gated host is `127.0.0.1`; any other type for that host (AAAA
 /// included) is an empty authoritative NOERROR, telling the resolver there is
 /// no such record and to fall back to v4; every other name is REFUSED — this is
-/// a one-name stub, not a resolver.
+/// a fixed-set stub, not a resolver.
 fn reply(query: &Query) -> Vec<u8> {
-    if !query.name.eq_ignore_ascii_case(CONSOLE_HOST) {
+    if !GATED_HOSTS.iter().any(|host| query.name.eq_ignore_ascii_case(host)) {
         let flags = ResponseFlags { authoritative: false, truncated: false };
         return wire::encode_response(query, ResponseCode::Refused, flags, &[], &[], &[]);
     }
@@ -116,17 +117,19 @@ mod tests {
     }
 
     #[test]
-    fn a_query_answers_loopback() {
-        let response = decode_response(&ask(RecordType::A, CONSOLE_HOST)).expect("reply decodes");
-        assert!(matches!(response.code, ResponseCode::NoError));
-        assert_eq!(response.answers.len(), 1);
-        assert_eq!(response.first_a(), Some(Ipv4Addr::LOCALHOST));
+    fn a_query_answers_loopback_for_every_gated_host() {
+        for host in GATED_HOSTS {
+            let response = decode_response(&ask(RecordType::A, host)).expect("reply decodes");
+            assert!(matches!(response.code, ResponseCode::NoError));
+            assert_eq!(response.answers.len(), 1);
+            assert_eq!(response.first_a(), Some(Ipv4Addr::LOCALHOST));
+        }
     }
 
     #[test]
     fn aaaa_query_answers_empty_noerror() {
         let response =
-            decode_response(&ask(RecordType::Aaaa, CONSOLE_HOST)).expect("reply decodes");
+            decode_response(&ask(RecordType::Aaaa, GATED_HOSTS[0])).expect("reply decodes");
         assert!(matches!(response.code, ResponseCode::NoError));
         assert!(response.answers.is_empty());
     }
@@ -151,7 +154,7 @@ mod tests {
 
         let client = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).expect("client binds");
         client.set_read_timeout(Some(Duration::from_secs(2))).expect("timeout sets");
-        let question = encode_query(99, CONSOLE_HOST, RecordType::A).expect("query encodes");
+        let question = encode_query(99, GATED_HOSTS[0], RecordType::A).expect("query encodes");
         client.send_to(&question, address).expect("query sends");
 
         let mut buffer = [0_u8; 512];
