@@ -147,9 +147,9 @@ async fn update(
             Ok(ran) => {
                 // Left stopped on purpose: starting a service on a tree whose
                 // build failed runs the previous build against the new code.
-                return failed(supervisor, name, "build", ran.complaint()).await;
+                return build_failed(supervisor, name, ran.complaint()).await;
             }
-            Err(error) => return failed(supervisor, name, "build", error.to_string()).await,
+            Err(error) => return build_failed(supervisor, name, error.to_string()).await,
         }
     }
 
@@ -207,6 +207,17 @@ async fn failed(
     note(supervisor, name, format!("{step} failed: {reason}")).await;
     note(supervisor, name, "the service is left stopped; fix the cause and start it").await;
     Outcome::Failed { step, reason }
+}
+
+/// Same as [`failed`], for the one step whose failure a caller must be able to
+/// tell apart from an ordinary stop without grepping this service's log: the
+/// build. Sets [`ServiceState::BuildFailed`] on top of writing the usual
+/// tagged lines, so `services_show`/`services_list` — both the CLI's and the
+/// MCP tool's — surface the reason directly.
+async fn build_failed(supervisor: &Supervisor, name: &str, reason: String) -> Outcome {
+    let outcome = failed(supervisor, name, "build", reason.clone()).await;
+    supervisor.mark_build_failed(name, reason).await;
+    outcome
 }
 
 /// Writes one tagged line into a service's captured output.
@@ -286,6 +297,26 @@ mod tests {
             "a no-op poll must not write anything: {:?}",
             logs.lines
         );
+    }
+
+    #[tokio::test]
+    async fn a_failed_build_leaves_a_distinguishable_state_not_just_a_log_line() {
+        let supervisor = Supervisor::new(std::env::temp_dir());
+        let mut spec = ServiceSpec::new("build-fails", "/bin/true");
+        spec.start_mode = StartMode::Manual;
+        let mut watch = watch();
+        // A command that always exits non-zero, without depending on a real
+        // working copy existing on disk.
+        watch.post_pull = Some(vec!["false".into()]);
+        spec.git = Some(watch.clone());
+        supervisor.install(spec.clone()).await;
+
+        let outcome = build_failed(&supervisor, "build-fails", "exit 1".to_owned()).await;
+        assert_eq!(outcome, Outcome::Failed { step: "build", reason: "exit 1".into() });
+
+        let status = supervisor.status("build-fails").await.expect("installed");
+        assert_eq!(status.state, ServiceState::BuildFailed { reason: "exit 1".into() });
+        assert!(status.state.needs_attention(), "a build failure must ask for attention");
     }
 
     #[tokio::test]

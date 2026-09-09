@@ -1965,6 +1965,9 @@ pub(crate) fn present(state: &ServiceState) -> (Status, bool, String) {
             (Status::Bad, true, format!("gave up after {attempts} attempts · {reason}"))
         }
         ServiceState::Unstartable { reason } => (Status::Bad, true, reason.clone()),
+        ServiceState::BuildFailed { reason } => {
+            (Status::Bad, true, format!("build failed · {reason}"))
+        }
     }
 }
 
