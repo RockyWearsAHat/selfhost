@@ -1336,7 +1336,7 @@ impl Api {
             Route::Install(name) => self.install(name, body).await,
             Route::Uninstall(name) => self.uninstall(name).await,
             Route::Logs(name) => self.logs(name, query).await,
-            Route::DeployNow(name) => self.deploy_now(name).await,
+            Route::DeployNow(name) => self.deploy_now(name, body).await,
             Route::SelfUpdateNow => self.self_update_now(),
             Route::Act(name, action) => self.act(name, action).await,
             Route::MintTicket => self.mint_ticket(request, &caller, body),
@@ -2999,7 +2999,7 @@ impl Api {
     /// webhook handler, in turn tying up the pusher's HTTP client — for as
     /// long as the build takes. The outcome lands where every other
     /// deployment's does: the service's own `[git]`-tagged output.
-    async fn deploy_now(&self, name: &str) -> Response {
+    async fn deploy_now(&self, name: &str, body: &[u8]) -> Response {
         let Some(spec) = self.supervisor.spec(name).await else {
             return problem(Status(404), "no such service");
         };
@@ -3007,9 +3007,23 @@ impl Api {
             return problem(Status(404), "this service has no active git watch to deploy from");
         };
 
+        // `force: true` — sent by `services_deploy` and by a person asking to
+        // redeploy right now — skips the ordinary "nothing to do" answer for an
+        // unmoved branch and re-runs the update and build regardless. Absent
+        // (the webhook relay's own call, and anything else that predates this
+        // field) behaves exactly as before: only a moved branch acts.
+        let force = parse_json_body(body)
+            .and_then(|value| value.get("force").and_then(Json::as_bool))
+            .unwrap_or(false);
+
         let supervisor = self.supervisor.clone();
         tokio::spawn(async move {
-            let _ = selfhost_git::check_once(&supervisor, &spec, &watch).await;
+            let outcome = if force {
+                selfhost_git::check_once_forced(&supervisor, &spec, &watch).await
+            } else {
+                selfhost_git::check_once(&supervisor, &spec, &watch).await
+            };
+            let _ = outcome;
         });
 
         json(

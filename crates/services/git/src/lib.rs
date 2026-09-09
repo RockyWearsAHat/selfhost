@@ -191,25 +191,47 @@ pub async fn check_once(
     spec: &ServiceSpec,
     watch: &GitWatch,
 ) -> Result<Outcome, String> {
-    check_once_with_credential(supervisor, spec, watch, None).await
+    check_once_with_credential(supervisor, spec, watch, None, false).await
+}
+
+/// Same as [`check_once`], but re-runs the update and build even when the
+/// branch tip has not moved.
+///
+/// This is specifically the "someone asked for a redeploy right now" path —
+/// [`crate::deploy`]'s stop/pull/build/start sequence runs again against
+/// whatever the branch currently points at, which matters when the working
+/// copy's *code* is unchanged but its *build output* needs redoing (a stale
+/// `node_modules`, a fixed build script that produced a
+/// [`selfhost_supervisor::state::ServiceState::BuildFailed`] last time). It is
+/// never what the background poller calls on its own timer — an unattended
+/// poll must still treat an unmoved branch as nothing to do, or "redeploy"
+/// and "check" become the same word.
+pub async fn check_once_forced(
+    supervisor: &Supervisor,
+    spec: &ServiceSpec,
+    watch: &GitWatch,
+) -> Result<Outcome, String> {
+    check_once_with_credential(supervisor, spec, watch, None, true).await
 }
 
 /// Same as [`check_once`], but `credential` — a freshly-minted authenticated
 /// URL for `watch.repository`, if the caller has one — is used for the actual
 /// `git` transfer in place of `watch.repository`. Never logged: see
-/// `plan::repository_url`'s doc for why.
+/// `plan::repository_url`'s doc for why. `force` skips the "nothing to do"
+/// short-circuit exactly as [`check_once_forced`] does.
 async fn check_once_with_credential(
     supervisor: &Supervisor,
     spec: &ServiceSpec,
     watch: &GitWatch,
     credential: Option<&str>,
+    force: bool,
 ) -> Result<Outcome, String> {
     let base = supervisor.base_dir().to_path_buf();
     let path = deploy::working_copy(&base, watch);
 
     let local = local_commit(&path, &base).await;
     let remote = remote_commit(watch, &base, credential).await?;
-    let step = plan::decide(watch, local.as_deref(), &remote);
+    let step = plan::decide_forced(watch, local.as_deref(), &remote, force);
 
     // A disabled service is one somebody switched off deliberately. Updating its
     // working copy would be harmless; starting it again would override that
@@ -295,6 +317,7 @@ impl Poller {
                 &self.spec,
                 &self.watch,
                 credential.as_deref(),
+                false,
             )
             .await
             .map(|_| ());
