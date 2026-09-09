@@ -59,6 +59,7 @@ Letting somebody in
 A capability is a word, and a target after a colon where it takes one:
   console.read       everything the console shows, and nothing it does
   service.control    start/stop/install/deploy services, reconcile the firewall
+  services.admin     define what a service runs: its repository, build/serve command, port
   files.read:<share> list and download from one share
   files.write:<share> upload, rename and delete in one share (implies read)
   files.admin        every share, the SMB export state, and reconciling it
