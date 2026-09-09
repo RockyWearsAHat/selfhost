@@ -278,18 +278,17 @@ repository = "https://github.com/you/selfhost.git"
 branch = "main"
 ```
 
-The daemon polls the branch (every 60 s by default), and a push fetches,
-rebuilds, and restarts every selfhost process — no SSH needed again. It only
-ever fast-forwards: modified tracked files or local commits in the deployment
+Add `webhook_secret` to `[self_update]` (or configure `[github_app]` with this
+repository installed) and a push fetches, rebuilds, and restarts every
+selfhost process within about a second — no SSH needed. It only ever
+fast-forwards: modified tracked files or local commits in the deployment
 refuse the update rather than being discarded, and a failed build rolls back
 and leaves the old build running.
 
-Add `webhook_secret` to `[self_update]` (or, since 2026-09-09, configure
-`[github_app]` with this repository installed) and a push is noticed
-immediately instead of waiting out the poll interval — either just moves the
-next check earlier, never replaces it, so the poll keeps working as the
-safety net either way. See `docs/SECURITY.md` SEC-08 for the security
-tradeoffs between the two.
+This is the only automatic trigger — there is no background poll behind it.
+With neither `webhook_secret` nor `[github_app]` configured, or if a delivery
+is ever missed, `POST /api/self-update/deploy` (the admin API's manual door)
+is what checks the branch and updates on demand.
 
 ## 9. Serve files from it (a share)
 

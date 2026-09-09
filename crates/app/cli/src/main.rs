@@ -959,9 +959,9 @@ async fn serve_everything(
 
     supervisor.load(&catalog).await;
 
-    // When a GitHub App is configured, a watched service whose repository it
-    // has installed is fetched over an authenticated HTTPS URL minted fresh
-    // per poll, rather than needing a static SSH deploy key — see
+    // When a GitHub App is configured, a service whose repository it has
+    // installed is fetched over an authenticated HTTPS URL minted fresh for
+    // each deploy, rather than needing a static SSH deploy key — see
     // `selfhost_github_app::AppCredentialSource`. A repository the App does
     // not track (or no `[github_app]` at all) falls back to today's
     // unauthenticated/SSH behavior unchanged.
@@ -975,15 +975,6 @@ async fn serve_everything(
             Some(std::sync::Arc::new(selfhost_github_app::AppCredentialSource::new(credentials, store))
                 as std::sync::Arc<dyn selfhost_git::CredentialSource>)
         });
-
-    // Stated rather than assumed: a branch that is silently not being watched
-    // looks exactly like one that has not been pushed to.
-    let watches = selfhost_git::Watches::default();
-    match watches.load_with_credentials(&supervisor, &catalog, github_credentials.clone()).await {
-        0 => {}
-        1 => println!("\nwatching 1 git branch for deployments"),
-        watched => println!("\nwatching {watched} git branches for deployments"),
-    }
 
     // Stated for the same reason: a deployment that believes it self-updates
     // but does not is indistinguishable from one nobody has pushed to.
@@ -1003,12 +994,11 @@ async fn serve_everything(
                  (deploys within seconds)"
             ),
             false => println!(
-                "  push         not configured — set self_update.webhook_secret and add the \
-                 same secret to the repository's webhook to deploy on push instead of \
-                 on the timer"
+                "  push         not configured — set self_update.webhook_secret (or configure \
+                 [github_app]) so a push updates this deployment automatically; until then, \
+                 `POST /api/self-update/deploy` is the only way to check for one"
             ),
         }
-        println!("  safety net   re-checks every {}s regardless", update.interval_secs);
     }
 
     // The firewall the daemon drives for the public listeners. Built from config,
@@ -1086,7 +1076,7 @@ async fn serve_everything(
 
     // Console auth is read once here: a `selfhost console-password` run takes
     // effect at the next daemon restart.
-    let mut api = Api::new(supervisor.clone(), store, token, watches.clone(), firewall.clone())
+    let mut api = Api::new(supervisor.clone(), store, token, firewall.clone())
         .with_github_credentials(github_credentials.clone())
         .with_console_auth(&data_dir)
         // `selfhost agent add|list|revoke` writes `console.agents` directly,
@@ -1390,10 +1380,6 @@ async fn serve_everything(
     if let Err(error) = selfhost_config::home::forget(&project_dir) {
         eprintln!("warning: could not remove the record of this daemon ({error})");
     }
-
-    // Watches first: one that polled through the shutdown could start a
-    // deployment of a service that is in the middle of being stopped.
-    watches.shutdown().await;
 
     // The firewall rules are deliberately left in place: a firewall protecting
     // the host should outlive the daemon that set it, so a restart — or a crash —

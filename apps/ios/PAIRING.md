@@ -110,7 +110,7 @@ null = signal), `retryInSecs`+`attempt` (backoff), `attempts`+`reason`
 `ServiceSpec`: `name`, `displayName`, `description`, `program`, `args`, `env`,
 `cwd`, `node`, `startMode`, `restart` (`never|on-failure|always`),
 `restartDelaySecs`, `maxRestarts`, `stopTimeoutSecs`, `stopCommand`, `git`
-(nullable: `repository`, `branch`, `path`, `intervalSecs`, `enabled`,
+(nullable: `repository`, `branch`, `path`, `enabled`,
 `autoUpdate`, `postPull`).
 
 The app also parses `PUT /api/services/{name}` error shapes but does not install

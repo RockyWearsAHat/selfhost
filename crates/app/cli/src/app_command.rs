@@ -154,7 +154,6 @@ pub fn show(
     println!("  working copy {}", git.path.display());
     println!("  repository   {}", git.repository);
     println!("  branch       {}", git.branch);
-    println!("  check interval {}s", git.interval_secs);
     if git.auto_update {
         println!("  auto-update  enabled");
     }
@@ -180,7 +179,7 @@ pub fn show(
     }
 
     println!(
-        "\nTo deploy or update: push to the {} branch and wait for the watch interval,",
+        "\nTo deploy or update: push to the {} branch (if a webhook is wired up),",
         git.branch
     );
     match on {
@@ -543,7 +542,6 @@ fn compose(spec: &ServiceSpec, site: Option<&Site>, config: &Config) -> Result<A
     );
     app.branch = watch.branch.clone();
     app.build = watch.post_pull.clone();
-    app.interval_secs = watch.interval_secs;
     app.checkout = Some(watch.path.clone());
     app.env = spec.env.clone();
     if let Some(site) = site {

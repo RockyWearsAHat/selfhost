@@ -826,7 +826,6 @@ mod tests {
             selfhost_supervisor::Supervisor::new(scratch.path()),
             crate::Store::new(scratch.path()),
             crate::Token::load_or_create(scratch.path()).expect("a token"),
-            selfhost_git::Watches::default(),
             selfhost_firewall::Manager::for_config(&config),
         );
         (api, scratch)

@@ -105,7 +105,6 @@ fn api(name: &str) -> (Api, Scratch) {
         Supervisor::new(scratch.path()),
         Store::new(scratch.path()),
         Token::load_or_create(scratch.path()).expect("the token just written"),
-        selfhost_git::Watches::default(),
         selfhost_firewall::Manager::for_config(&minimal_config()),
     );
     (api, scratch)
