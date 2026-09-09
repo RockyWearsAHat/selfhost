@@ -247,6 +247,14 @@ const TOOLS: &[Tool] = &[
         ],
     ),
     (
+        "services_remove",
+        "Remove a service's definition from the catalogue entirely, stopping it first if it is running. \
+         Unlike services_control (which only starts, stops or restarts a service that stays defined), \
+         this erases what the service runs — its program, build and serve commands, repository — so it \
+         requires the services.admin grant, the same one services_add and services_repo_configure need.",
+        &[("name", "The service's name.", true, Kind::Text)],
+    ),
+    (
         "services_repo_configure",
         "Install a repository already tracked by the GitHub App (see repo list) as a running \
          service — the same install services_add does, but starting from a tracked owner/repo \
@@ -476,7 +484,7 @@ services_deploy only re-runs a service that is already correctly defined.\n\
 you do not have to know its build command by heart — pass fromManifest=true to \
 services_repo_configure to read it. This is opt-in on purpose: the manifest lives in a \
 repository someone else can push to, so it is never read unless you ask for it.\n\
-4. services_add/services_repo_configure need the services.admin grant; \
+4. services_add/services_repo_configure/services_remove need the services.admin grant; \
 services_control (start/stop/restart) needs only service.control. Call whoami to see \
 exactly what this token has, if a call is refused.\n\
 5. self_update redeploys this daemon's own repository; services_deploy redeploys one \
@@ -839,6 +847,11 @@ async fn call_tool(client: &RemoteClient, name: &str, arguments: &Json) -> Resul
             let answer = client
                 .request("PUT", &format!("/api/services/{}", encode(&app.name)), Some(body.as_bytes()))
                 .await?;
+            Ok(answer.to_text())
+        }
+        "services_remove" => {
+            let service = required(arguments, "name")?;
+            let answer = client.request("DELETE", &format!("/api/services/{}", encode(&service)), None).await?;
             Ok(answer.to_text())
         }
         "services_repo_configure" => {
@@ -1364,5 +1377,24 @@ mod tests {
             tools.iter().filter_map(|tool| tool.get("name").and_then(Json::as_str)).collect();
         assert!(names.contains(&"services_add"), "{names:?}");
         assert!(names.contains(&"services_repo_configure"), "{names:?}");
+    }
+
+    #[test]
+    fn services_remove_is_advertised_and_calls_delete() {
+        let listing = tools_list_result();
+        let tools = listing.get("tools").and_then(Json::as_array).expect("a tools array");
+        let names: Vec<&str> =
+            tools.iter().filter_map(|tool| tool.get("name").and_then(Json::as_str)).collect();
+        assert!(names.contains(&"services_remove"), "{names:?}");
+
+        let params =
+            selfhost_json::parse(r#"{"name":"services_remove","arguments":{}}"#).unwrap();
+        let remote = Remote::parse("example.test").unwrap();
+        let client = RemoteClient::new(remote, "agent:x:y".to_owned());
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let result = runtime.block_on(tools_call_result(&client, &params));
+        // Missing "name" is refused before any network call, same as every
+        // other name-bearing tool.
+        assert_eq!(result.get("isError").and_then(Json::as_bool), Some(true));
     }
 }

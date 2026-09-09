@@ -660,11 +660,13 @@ impl<'a> Route<'a> {
             // build and serve commands, the repository it deploys from — so it
             // asks for `ServicesAdmin` rather than `ServiceControl`: control
             // over an already-defined service is a smaller trust decision than
-            // deciding what that service runs in the first place. Everything
-            // else here only operates a definition that already exists.
-            Self::Install(_) => Demand::Held(Capability::ServicesAdmin),
-            Self::Uninstall(_)
-            | Self::DeployNow(_)
+            // deciding what that service runs in the first place. Uninstalling
+            // erases that same definition (the catalogue entry, not merely the
+            // running process) and is at least as consequential as writing it,
+            // so it asks for the same grant as `Install`. Everything else here
+            // only operates a definition that already exists.
+            Self::Install(_) | Self::Uninstall(_) => Demand::Held(Capability::ServicesAdmin),
+            Self::DeployNow(_)
             | Self::SelfUpdateNow
             | Self::Act(_, _)
             | Self::FirewallReconcile => Demand::Held(Capability::ServiceControl),
