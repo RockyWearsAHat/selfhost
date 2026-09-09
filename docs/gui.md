@@ -210,26 +210,29 @@ cwd = "checkouts/levelup"
 repository = "git@github.com:RockyWearsAHat/lvl-up-longboarding.git"
 branch = "main"
 path = "checkouts/levelup"
-interval_secs = 60
 post_pull = ["npm", "ci"]
 ```
 
-**Polling first, and still the only path that cannot fail silently.** A webhook
-is an event that has to arrive, and it does not arrive when the network
-hiccups, when the hook was configured against a URL form the sender does not
-use, or when nobody configured one at all — each of them silently. Polling a
-remote ref costs one small request per interval and cannot fail silently: a
-poll either answers with a commit or reports why it could not. This is the one
-design decision carried over from `windows-service-manager`, which learned it
-the same way.
+**The webhook is the only automatic trigger.** Earlier revisions of this
+project polled the remote branch on a timer, on the reasoning that a webhook
+is an event that has to arrive and can fail to, silently, when the network
+hiccups or the hook is misconfigured. A poll cannot fail silently the same
+way — but it also spends a hosting provider's rate limit on every watched
+repository, forever, to guard against a failure a real GitHub App
+installation (signed, and retried by GitHub itself on failure) rarely has. The
+poll was removed for that reason: `crates/services/github-app` receives at
+`/.selfhost/webhook/app` in `crates/app/proxy/src/server.rs`, verifies each
+delivery's signature, and nudges the same deploy path a manual deploy uses —
+`selfhost repo configure` is what turns a repository the App can see into a
+service with an active watch; see `selfhost repo --help`.
 
-A webhook now exists (`crates/services/github-app`, receiving at
-`/.selfhost/webhook/app` in `crates/app/proxy/src/server.rs`), and it is
-exactly the kind of addition that sentence always allowed: a push nudges the
-same deploy path the poller drives, making it happen *sooner*, but the poll
-keeps running underneath it — a dropped delivery is caught on the next
-interval regardless. `selfhost repo configure` is what turns a repository the
-App can see into a service with an active watch; see `selfhost repo --help`.
+**The manual door is the fallback, not a safety net that runs by itself.**
+`POST /api/services/<name>/deploy` (the console's deploy button, or
+`selfhost repo deploy`) runs the identical check-and-deploy sequence on
+demand — for a repository the App has not been installed on, or a delivery an
+operator confirms was missed. Nothing checks for a missed delivery
+automatically; if the webhook silently stops arriving and nobody notices, the
+service silently stops redeploying until somebody presses the button.
 
 **Stopped, then updated, then started — never restarted.** Updating a working
 copy under a running process rewrites the files it is executing, and a process
@@ -1149,8 +1152,8 @@ the working copy, and started it again on the new commit.
 files, desktops and people, which is what the control API serves; the
 sites-and-certificates view waits on an API that reports them. There is no view
 for a Git watch either: a watched service reports every deployment into its own
-output, which the console already tails, but the branch and interval are only
-editable in `data/services.toml` or over the API. And the console's *start the
+output, which the console already tails, but the branch is only editable in
+`data/services.toml` or over the API. And the console's *start the
 capture agent* button has nothing to call — `selfhost_admin::Fleet` has no
 operator-start method, so the only way to clear a surrendered agent today is to
 clear the kill switch. The daemon side of that is already wired and tested; it
