@@ -249,6 +249,63 @@ impl ServiceStatus {
     }
 }
 
+/// The fixed marker a redacted environment value is replaced with — the same
+/// `***` a terminal caller already sees from `selfhost app show` (see
+/// `crates/app/cli/src/app_command.rs`), so a value redacted here and one
+/// redacted there read identically rather than inventing a second convention.
+pub const REDACTED: &str = "***";
+
+/// Every env var whose value this API sends as-is rather than as [`REDACTED`]:
+/// none of them, by key, look like a credential — but a value that itself
+/// carries embedded userinfo (`scheme://user:pass@host`, e.g. a Mongo
+/// connection string) is caught regardless of what its key is named.
+///
+/// Same philosophy as `webhookSecretSet` just above: a caller learns whether a
+/// value is set and roughly what it's named, never what it is. A service's
+/// environment is exactly as sensitive as a webhook secret — often more, since
+/// it is where a database password or a third-party API token actually lives —
+/// so the admin API applies the identical write-only-once-set discipline here,
+/// not just the CLI's own terminal-log defense (`app_command.rs`'s masking,
+/// which now calls this same function instead of re-checking the rule itself).
+pub fn redact_env(env: &std::collections::BTreeMap<String, String>) -> std::collections::BTreeMap<String, String> {
+    env.iter()
+        .map(|(key, value)| {
+            let redacted = is_secret_shaped(key, value);
+            (key.clone(), if redacted { REDACTED.to_owned() } else { value.clone() })
+        })
+        .collect()
+}
+
+/// Whether one env var looks like a credential: its key names one (case
+/// insensitively containing `TOKEN`, `SECRET`, `KEY`, `PASSWORD`, `PASS` or
+/// `CREDENTIAL`), or its value has the shape of a URI with embedded userinfo
+/// (`scheme://user:pass@host`) regardless of what its key is called — a
+/// `MONGO_URI` carrying `mongodb://user:pass@host` is exactly as much a
+/// credential as a key literally named `PASSWORD`.
+fn is_secret_shaped(key: &str, value: &str) -> bool {
+    const KEY_MARKERS: [&str; 6] = ["TOKEN", "SECRET", "KEY", "PASSWORD", "PASS", "CREDENTIAL"];
+    let upper = key.to_uppercase();
+    if KEY_MARKERS.iter().any(|marker| upper.contains(marker)) {
+        return true;
+    }
+    looks_like_uri_with_userinfo(value)
+}
+
+/// Whether a string has the `scheme://user:pass@host` shape: a `://`
+/// separator, then an `@` before the next `/`, with a `:` between them — the
+/// shape a connection string embeds a password in.
+fn looks_like_uri_with_userinfo(value: &str) -> bool {
+    let Some((_, after_scheme)) = value.split_once("://") else { return false };
+    let authority = match after_scheme.split_once('/') {
+        Some((authority, _)) => authority,
+        None => after_scheme,
+    };
+    match authority.split_once('@') {
+        Some((userinfo, _)) => userinfo.contains(':'),
+        None => false,
+    }
+}
+
 /// A service definition as it goes over the wire.
 ///
 /// Hand-written rather than derived because the wire format is a contract with
@@ -261,7 +318,7 @@ pub fn spec_to_json(spec: &selfhost_config::ServiceSpec) -> Json {
         ("description", Json::string(&spec.description)),
         ("program", Json::string(spec.program.display().to_string())),
         ("args", Json::array(spec.args.iter().map(Json::string))),
-        ("env", Json::object(spec.env.iter().map(|(k, v)| (k.clone(), Json::string(v))))),
+        ("env", Json::object(redact_env(&spec.env).iter().map(|(k, v)| (k.clone(), Json::string(v))))),
         ("startMode", Json::string(start_mode_name(spec.start_mode))),
         ("restart", Json::string(restart_name(spec.restart))),
         ("restartDelaySecs", Json::Number(spec.restart_delay_secs as f64)),
@@ -306,7 +363,8 @@ fn watch_to_json(watch: &selfhost_config::GitWatch) -> Json {
         // Never the value itself: a webhook secret is a credential, and this codebase's
         // convention (the OAuth client secret's own `oauth list`, the console password) is that
         // a credential is write-only once set — a caller learns *whether* one is configured,
-        // never what it is, even over the loopback admin API.
+        // never what it is, even over the loopback admin API. `redact_env` above applies the
+        // identical philosophy to a service's environment variables.
         ("webhookSecretSet", Json::Bool(watch.webhook_secret.is_some())),
     ])
 }
@@ -431,6 +489,51 @@ pub fn restart_from(name: &str) -> Option<RestartPolicy> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn redact_env_masks_a_secret_shaped_key() {
+        let mut env = std::collections::BTreeMap::new();
+        env.insert("JWT_SECRET".to_owned(), "sekrit".to_owned());
+        let redacted = redact_env(&env);
+        assert_eq!(redacted.get("JWT_SECRET"), Some(&REDACTED.to_owned()));
+    }
+
+    #[test]
+    fn redact_env_leaves_an_ordinary_key_alone() {
+        let mut env = std::collections::BTreeMap::new();
+        env.insert("PORT".to_owned(), "5050".to_owned());
+        env.insert("NODE_ENV".to_owned(), "production".to_owned());
+        let redacted = redact_env(&env);
+        assert_eq!(redacted.get("PORT"), Some(&"5050".to_owned()));
+        assert_eq!(redacted.get("NODE_ENV"), Some(&"production".to_owned()));
+    }
+
+    #[test]
+    fn redact_env_catches_embedded_credentials_by_value_shape_alone() {
+        let mut env = std::collections::BTreeMap::new();
+        env.insert("MONGO_URI".to_owned(), "mongodb://user:hunter2@db.internal:27017/app".to_owned());
+        let redacted = redact_env(&env);
+        assert_eq!(redacted.get("MONGO_URI"), Some(&REDACTED.to_owned()));
+    }
+
+    #[test]
+    fn redact_env_does_not_flag_a_uri_with_no_userinfo() {
+        let mut env = std::collections::BTreeMap::new();
+        env.insert("BASE_URL".to_owned(), "https://example.com/app".to_owned());
+        let redacted = redact_env(&env);
+        assert_eq!(redacted.get("BASE_URL"), Some(&"https://example.com/app".to_owned()));
+    }
+
+    #[test]
+    fn spec_to_json_redacts_env_on_the_wire() {
+        let mut spec = selfhost_config::ServiceSpec::new("web", "/usr/bin/web");
+        spec.env.insert("IG_GRAPH_APP_SECRET".to_owned(), "abc123".to_owned());
+        spec.env.insert("PORT".to_owned(), "8080".to_owned());
+        let text = spec_to_json(&spec).to_text();
+        assert!(!text.contains("abc123"), "{text}");
+        assert!(text.contains("***"), "{text}");
+        assert!(text.contains("8080"), "{text}");
+    }
 
     #[test]
     fn a_service_definition_round_trips_over_the_wire() {

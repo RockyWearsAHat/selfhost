@@ -166,15 +166,16 @@ pub fn show(
 
     if !app.env.is_empty() {
         println!("  environment:");
-        for (key, value) in &app.env {
-            // Do not display sensitive values in full — a token appearing
-            // in a terminal log or shell history defeats the whole point of
-            // keeping it in a file and off the command line.
-            if key.to_uppercase().contains("TOKEN") || key.to_uppercase().contains("SECRET") {
-                println!("    {}=***", key);
-            } else {
-                println!("    {}={}", key, value);
-            }
+        // Redaction is the same rule the admin API now applies server-side
+        // (`selfhost_supervisor::state::redact_env`) — shared, not
+        // reimplemented, so a key that counts as secret-shaped never gets a
+        // second, drifting definition. Applied again here too: a token or
+        // connection string appearing in a terminal log or shell history
+        // defeats the whole point of keeping it in a file and off the
+        // command line, even though the server already keeps the raw value
+        // from ever reaching this process.
+        for (key, value) in selfhost_supervisor::state::redact_env(&app.env) {
+            println!("    {}={}", key, value);
         }
     }
 
