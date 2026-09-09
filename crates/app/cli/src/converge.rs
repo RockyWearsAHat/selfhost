@@ -804,6 +804,7 @@ mod tests {
             dns: None,
             mail: None,
             self_update: None,
+            github_app: None,
             shares: Vec::new(),
             desktop: None,
             mesh: None,

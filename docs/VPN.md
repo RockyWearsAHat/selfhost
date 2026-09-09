@@ -110,7 +110,7 @@ hand-rolled ciphers. Do **not** reimplement its crypto.
 | Upstream | the implementation | `https://github.com/RockyWearsAHat/Secure-VPN.git` — the operator's own project, all of it including `server.py`. This is the source of truth for both ends. |
 | Repo | a stamped snapshot | `scripts/securevpn/app/` — `crypto_core.py`, `protocol.py`, `client.py`, `key_manager.py`, `config.py`, vendored 2026-08-17 with SHA-256 digests so an installed copy can be checked against a reviewed one rather than assumed equal. Its `protocol.py` is already a commit behind upstream. |
 | Mac | keys | `~/.securevpn/keys` — `client.key` (private), `server.pub` (pins the server). No server private key here. |
-| Mac | portless-URL plumbing | Scoped resolver `/etc/resolver/admin.rockywearsahat.com` + vpn-ui's split-DNS responder (`127.0.0.1:53535`) + launchd-managed loopback 443 gate. See *Using it*. |
+| Mac | portless-URL plumbing | Scoped resolver files for gated hosts (admin, sara, ai) + vpn-ui's split-DNS responder (`127.0.0.1:53535`) + launchd-managed loopback 443 gate. See *Using it*. |
 
 ## Using it
 
@@ -121,13 +121,14 @@ the console password. The console is reachable only while the tunnel runs.
 Three Mac-side, loopback-only pieces make the portless URL work:
 
 - **Scoped resolver** — a one-time privileged setup (one admin prompt) installs
-  `/etc/resolver/admin.rockywearsahat.com` containing `nameserver 127.0.0.1` and
-  `port 53535`, so macOS sends lookups for that one name — and no other — to the
-  responder below. The same setup deletes the legacy
-  `127.0.0.1 admin.rockywearsahat.com` line from `/etc/hosts` (the old
-  mechanism) and installs the launchd-managed 443 gate.
-- **Split-DNS responder** — vpn-ui answers on `127.0.0.1:53535`:
-  `A admin.rockywearsahat.com = 127.0.0.1`, an empty `NOERROR` for `AAAA`, and
+  scoped resolver files for each gated host (`/etc/resolver/admin.rockywearsahat.com`,
+  `/etc/resolver/sara.rockywearsahat.com`, `/etc/resolver/ai.rockywearsahat.com`)
+  each containing `nameserver 127.0.0.1` and `port 53535`, so macOS sends lookups
+  for those three names to the responder below. The same setup deletes legacy
+  /etc/hosts lines for all gated hosts and installs the launchd-managed 443 gate.
+- **Split-DNS responder** — vpn-ui answers on `127.0.0.1:53535` for three gated
+  hosts: `A admin.rockywearsahat.com = 127.0.0.1`, `A sara.rockywearsahat.com = 127.0.0.1`,
+  `A ai.rockywearsahat.com = 127.0.0.1`; an empty `NOERROR` for `AAAA` queries; and
   `REFUSED` for any other name. It never forwards, caches, or answers for
   anything else.
 - **Loopback 443 gate** — `com.selfhost.console-gate`, a root LaunchDaemon
