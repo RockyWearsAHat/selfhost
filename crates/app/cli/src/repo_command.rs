@@ -29,9 +29,26 @@
 //! exactly the trap `app deploy`'s module docs describe for redeploys, and
 //! worse here because nothing was ever safely running to protect. So
 //! `configure` refuses cleanly when no daemon answers, rather than guessing.
+//!
+//! # Why `--from-manifest` is an explicit flag, never automatic
+//!
+//! A repository can carry its own `selfhost.toml` ([`selfhost_config::RepoManifest`])
+//! naming how it builds and serves, so a person or an agent reconfiguring it
+//! does not have to reconstruct that knowledge by hand or from memory — the
+//! gap that produced `docs/incidents/2026-09-08-ai-studio-checkout-divergence.md`.
+//! But reading it changes *who* gets to decide what shell commands this
+//! daemon executes: `build`/`serve` are read from a file whoever can push to
+//! the tracked repository controls, not from this operator's own CLI
+//! invocation or their own `selfhost.config.toml`. Folding it in the moment a
+//! clone happens to contain one would mean push access to a repository is
+//! quietly equivalent to command-execution access on this box. So nothing in
+//! [`fetch_manifest`] or [`fold_manifest`] runs unless `--from-manifest` (or
+//! the MCP tool's equivalent `from_manifest: true`) was given explicitly —
+//! consistent with this project's posture in `docs/SECURITY.md` of making
+//! trust boundaries explicit rather than automatic.
 
 use selfhost_app_deploy::AppSpec;
-use selfhost_config::Config;
+use selfhost_config::{Config, RepoManifest};
 use selfhost_github_app::{InstallationState, Store, TrackedRepo};
 use std::net::SocketAddr;
 use std::path::Path;
@@ -58,14 +75,22 @@ Usage
   selfhost repo logs <owner>/<repo> [--lines N]   Webhook receipts and, if a
                                                   service is configured, its
                                                   process log (default: 50)
-  selfhost repo configure <owner>/<repo> --node <node> --port <port>
-                          --serve <cmd...> [--build <cmd...>]
-                          [--domain <host>]...
+  selfhost repo configure <owner>/<repo> --node <node> [--port <port>]
+                          [--serve <cmd...>] [--build <cmd...>]
+                          [--domain <host>]... [--from-manifest]
                                                   Install a tracked repo as a
                                                   running application
 
 `configure` always asks the running daemon — see the module docs for why there
 is no local-only path here, unlike `selfhost app deploy`.
+
+--from-manifest reads `selfhost.toml` from the tip of the repo's branch and
+uses it to fill in --serve/--build/--port/env/health-path that were not given
+explicitly on the command line — an explicit flag always wins over the
+manifest. This is opt-in and never automatic: see the module docs for why a
+manifest committed to someone else's repository is a bigger trust boundary
+than a flag you typed yourself, and is never read without asking for it by
+name.
 
 Private repositories are cloned over plain HTTPS in this release; the GitHub
 App's installation token is not wired into the clone yet (a follow-up).
@@ -358,21 +383,28 @@ fn configure(arguments: &[String], config: &Config, data_dir: &Path) -> Result<(
     let node = value_of(arguments, "--node")
         .ok_or_else(|| format!("repo configure needs --node <name>\n\n{USAGE}"))?;
     let port = value_of(arguments, "--port")
-        .ok_or_else(|| format!("repo configure needs --port <number>\n\n{USAGE}"))?
-        .parse::<u16>()
-        .map_err(|_| "--port: not a number between 1 and 65535".to_owned())?;
+        .map(|value| {
+            value.parse::<u16>().map_err(|_| "--port: not a number between 1 and 65535".to_owned())
+        })
+        .transpose()?;
     let serve = words_after(arguments, "--serve");
-    if serve.is_empty() {
-        return Err(format!(
-            "repo configure needs --serve <command...> — this release does not inspect a remote \
-             repository's tree to guess one; that needs an extra network round trip this \
-             increment does not add\n\n{USAGE}"
-        ));
-    }
     let build = words_after(arguments, "--build");
     let domains = values_of(arguments, "--domain");
+    let from_manifest = arguments.iter().any(|argument| argument == "--from-manifest");
 
-    let app = compose_configure(&owner, &repo, &node, port, serve, build, domains)?;
+    let manifest = if from_manifest {
+        Some(fetch_manifest(&owner, &repo, DEFAULT_MANIFEST_BRANCH)?.ok_or_else(|| {
+            format!(
+                "--from-manifest was given, but {owner}/{repo} has no {} at the tip of \"{}\"",
+                selfhost_config::manifest::MANIFEST_FILENAME,
+                DEFAULT_MANIFEST_BRANCH
+            )
+        })?)
+    } else {
+        None
+    };
+
+    let app = compose_with_manifest(&owner, &repo, &node, port, serve, build, domains, manifest.as_ref())?;
 
     let node_names: Vec<&str> = config.nodes.iter().map(|n| n.name.as_str()).collect();
     let problems: Vec<String> = app
@@ -407,6 +439,11 @@ fn configure(arguments: &[String], config: &Config, data_dir: &Path) -> Result<(
 /// token is explicitly out of scope for this increment (see the module docs
 /// and `USAGE`), so a private repo configured here needs its checkout made
 /// reachable some other way (a deploy key, a public mirror) until that lands.
+///
+/// A thin, no-manifest wrapper over [`compose_with_manifest`], kept only for
+/// its tests' own readability now that `configure()` itself calls the more
+/// general function directly.
+#[cfg(test)]
 fn compose_configure(
     owner: &str,
     repo: &str,
@@ -416,12 +453,140 @@ fn compose_configure(
     build: Vec<String>,
     domains: Vec<String>,
 ) -> Result<AppSpec, String> {
+    compose_with_manifest(owner, repo, node, Some(port), serve, build, domains, None)
+}
+
+/// The branch a manifest is read from when `--from-manifest`/
+/// `from_manifest: true` names no other — the same default
+/// [`selfhost_config::git::DEFAULT_BRANCH`] gives a watch that does not name one.
+const DEFAULT_MANIFEST_BRANCH: &str = selfhost_config::git::DEFAULT_BRANCH;
+
+/// Composes the [`AppSpec`] `repo configure` (and `services_add`/
+/// `services_repo_configure`, the MCP tools that reach this same function so
+/// there is exactly one place this composition happens) installs, folding a
+/// [`RepoManifest`] in when one is given.
+///
+/// An explicit CLI flag / tool argument always wins over the manifest's value
+/// for the same field — this project's existing convention for composing a
+/// spec from more than one source. `port` is the one field that must end up
+/// `Some` from *some* source or this refuses: an application with no port has
+/// nothing for the proxy to forward to. `serve` is the same: empty on both
+/// sides refuses rather than installing a service that starts and immediately
+/// exits.
+pub fn compose_with_manifest(
+    owner: &str,
+    repo: &str,
+    node: &str,
+    port: Option<u16>,
+    serve: Vec<String>,
+    build: Vec<String>,
+    domains: Vec<String>,
+    manifest: Option<&RepoManifest>,
+) -> Result<AppSpec, String> {
+    let effective_serve = if !serve.is_empty() {
+        serve
+    } else {
+        manifest.map(|m| m.serve.clone()).unwrap_or_default()
+    };
+    if effective_serve.is_empty() {
+        return Err(
+            "no --serve command given, and none was found in a manifest — this release does \
+             not inspect a remote repository's tree to guess one; that needs an extra network \
+             round trip this increment does not add"
+                .to_owned(),
+        );
+    }
+
+    let effective_port = port
+        .or_else(|| manifest.and_then(|m| m.port))
+        .ok_or_else(|| "no --port given, and the manifest does not name one".to_owned())?;
+
     let repository = format!("https://github.com/{owner}/{repo}.git");
-    let mut app = AppSpec::new(repo, domains, repository, serve, node, port);
+    let mut app = AppSpec::new(repo, domains, repository, effective_serve, node, effective_port);
+
     if !build.is_empty() {
         app.build = Some(build);
+    } else if let Some(manifest) = manifest {
+        app.build = manifest.build.clone();
     }
+
+    if let Some(manifest) = manifest {
+        for (key, value) in &manifest.env {
+            app.env.entry(key.clone()).or_insert_with(|| value.clone());
+        }
+        if let Some(health_path) = &manifest.health_path {
+            app.health.path = health_path.clone();
+        }
+    }
+
     Ok(app)
+}
+
+/// Fetches and validates `selfhost.toml` from the tip of `branch` in
+/// `owner/repo`'s plain HTTPS clone — the same clone-URL shape and the same
+/// "private repos need a follow-up" limitation [`compose_configure`]'s own
+/// documentation already states.
+///
+/// `Ok(None)` when the repository has no manifest at that ref, which is not
+/// an error: a manifest is optional, and `--from-manifest` without one is
+/// what the caller of this function turns into its own refusal. Never called
+/// unless a caller has already decided to trust this repository's manifest —
+/// see this module's documentation for why that decision is never made here.
+pub fn fetch_manifest(owner: &str, repo: &str, branch: &str) -> Result<Option<RepoManifest>, String> {
+    let repository = format!("https://github.com/{owner}/{repo}.git");
+    let checkout = std::env::temp_dir().join(format!(
+        "selfhost-manifest-{owner}-{repo}-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&checkout);
+
+    // The same global options `selfhost_git::plan::global_options` sets for
+    // every invocation this deployment makes: `ext::` is never a usable
+    // transport, and no credential helper configured for this account leaks
+    // into a clone of somebody else's repository.
+    let status = std::process::Command::new("git")
+        .args([
+            "-c",
+            "protocol.ext.allow=never",
+            "-c",
+            "credential.helper=",
+            "clone",
+            "--quiet",
+            "--depth",
+            "1",
+            "--single-branch",
+            "--branch",
+            branch,
+            "--",
+            &repository,
+        ])
+        .arg(&checkout)
+        .status()
+        .map_err(|error| format!("could not run git: {error}"))?;
+    if !status.success() {
+        return Err(format!(
+            "could not clone {owner}/{repo} at \"{branch}\" to read its manifest"
+        ));
+    }
+
+    let manifest_path = checkout.join(selfhost_config::manifest::MANIFEST_FILENAME);
+    let result = if manifest_path.is_file() {
+        std::fs::read_to_string(&manifest_path)
+            .map_err(|error| format!("could not read {}: {error}", manifest_path.display()))
+            .and_then(|text| {
+                RepoManifest::parse(&text).map(Some).map_err(|error| {
+                    format!(
+                        "{owner}/{repo} at \"{branch}\": {} is invalid:\n{error}",
+                        selfhost_config::manifest::MANIFEST_FILENAME
+                    )
+                })
+            })
+    } else {
+        Ok(None)
+    };
+
+    let _ = std::fs::remove_dir_all(&checkout);
+    result
 }
 
 /// Installs a composed application through the running daemon's admin API,
@@ -516,7 +681,8 @@ fn values_of(arguments: &[String], name: &str) -> Vec<String> {
 /// argument that merely starts with `-` — is what lets a served or built
 /// command carry its own single-dash flags (`-s dist -l $PORT`, `-p 3000`,
 /// `npm run build -- --mode production`) without truncating silently.
-const CONFIGURE_FLAGS: &[&str] = &["--node", "--port", "--serve", "--build", "--domain"];
+const CONFIGURE_FLAGS: &[&str] =
+    &["--node", "--port", "--serve", "--build", "--domain", "--from-manifest"];
 
 /// Every word following the first occurrence of `name`, up to the next
 /// recognized `repo configure` flag (see [`CONFIGURE_FLAGS`]) or the end of
@@ -541,6 +707,7 @@ fn words_after(arguments: &[String], name: &str) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeMap;
     use selfhost_config::ServiceSpec;
     use selfhost_github_app::Installation;
 
@@ -680,6 +847,119 @@ mod tests {
 
         assert_eq!(app.domains, vec!["blog.example.com".to_owned()]);
         assert_eq!(app.build, Some(vec!["npm".to_owned(), "ci".to_owned()]));
+    }
+
+    // --- manifest folding ---
+
+    fn manifest() -> RepoManifest {
+        RepoManifest {
+            serve: vec!["node".into(), "server.js".into()],
+            build: Some(vec!["npm".into(), "ci".into()]),
+            port: Some(4040),
+            env: BTreeMap::from([("NODE_ENV".into(), "production".into())]),
+            health_path: Some("/healthz".into()),
+        }
+    }
+
+    #[test]
+    fn with_no_cli_flags_the_whole_manifest_is_used() {
+        let app = compose_with_manifest(
+            "octocat",
+            "hello-world",
+            "home",
+            None,
+            vec![],
+            vec![],
+            vec![],
+            Some(&manifest()),
+        )
+        .expect("composes from the manifest alone");
+
+        assert_eq!(app.serve, vec!["node".to_owned(), "server.js".to_owned()]);
+        assert_eq!(app.build, Some(vec!["npm".to_owned(), "ci".to_owned()]));
+        assert_eq!(app.port, 4040);
+        assert_eq!(app.env.get("NODE_ENV").map(String::as_str), Some("production"));
+        assert_eq!(app.health.path, "/healthz");
+    }
+
+    #[test]
+    fn an_explicit_flag_always_wins_over_the_manifest() {
+        let app = compose_with_manifest(
+            "octocat",
+            "hello-world",
+            "home",
+            Some(9090),
+            vec!["npx".into(), "serve".into()],
+            vec![],
+            vec![],
+            Some(&manifest()),
+        )
+        .expect("composes");
+
+        // The explicit port and serve command win...
+        assert_eq!(app.port, 9090);
+        assert_eq!(app.serve, vec!["npx".to_owned(), "serve".to_owned()]);
+        // ...but a field nothing on the command line named still comes from
+        // the manifest.
+        assert_eq!(app.build, Some(vec!["npm".to_owned(), "ci".to_owned()]));
+    }
+
+    #[test]
+    fn no_serve_from_either_source_is_refused() {
+        let error = compose_with_manifest(
+            "octocat", "hello-world", "home", Some(9090), vec![], vec![], vec![], None,
+        )
+        .expect_err("nothing named how to serve the application");
+        assert!(error.contains("--serve"), "{error}");
+    }
+
+    #[test]
+    fn no_port_from_either_source_is_refused() {
+        let mut bare_manifest = manifest();
+        bare_manifest.port = None;
+        let error = compose_with_manifest(
+            "octocat",
+            "hello-world",
+            "home",
+            None,
+            vec![],
+            vec![],
+            vec![],
+            Some(&bare_manifest),
+        )
+        .expect_err("nothing named a port");
+        assert!(error.contains("--port"), "{error}");
+    }
+
+    #[test]
+    fn without_a_manifest_behaviour_is_unchanged() {
+        // The byte-for-byte-unchanged guarantee `--from-manifest`'s module
+        // docs promise: no manifest given, same result `compose_configure`
+        // already produced before this module knew what a manifest was.
+        let with_manifest = compose_with_manifest(
+            "octocat",
+            "hello-world",
+            "home",
+            Some(5050),
+            vec!["node".into(), "server.js".into()],
+            vec![],
+            vec![],
+            None,
+        )
+        .expect("composes");
+        let without = compose_configure(
+            "octocat",
+            "hello-world",
+            "home",
+            5050,
+            vec!["node".into(), "server.js".into()],
+            vec![],
+            vec![],
+        )
+        .expect("composes");
+        assert_eq!(with_manifest.serve, without.serve);
+        assert_eq!(with_manifest.port, without.port);
+        assert_eq!(with_manifest.build, without.build);
     }
 
     // --- flag parsing ---

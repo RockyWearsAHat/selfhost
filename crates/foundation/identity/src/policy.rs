@@ -706,8 +706,17 @@ impl Policy {
 fn the_machine_may(want: &Capability) -> bool {
     match want {
         // What the native console reads and drives over its SSH tunnel.
+        // `ServicesAdmin` sits beside `ServiceControl` here rather than with
+        // the withheld half: the bearer token already installs and starts an
+        // arbitrary program via `ServiceControl` (the CLI's `app deploy` and
+        // `repo configure` both run locally as this identity), so granting it
+        // the *definition* of what a service runs narrows nothing that was
+        // not already true of it — the same "narrowing, not a boundary"
+        // reasoning this function's own documentation gives for
+        // `ServiceControl` itself.
         Capability::ConsoleRead
         | Capability::ServiceControl
+        | Capability::ServicesAdmin
         | Capability::FilesRead(_)
         | Capability::FilesWrite(_)
         | Capability::DesktopView(_)
