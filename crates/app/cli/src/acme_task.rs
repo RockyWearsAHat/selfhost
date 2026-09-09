@@ -393,6 +393,7 @@ mod tests {
             dns: None,
             mail,
             self_update: None,
+            github_app: None,
             shares: vec![],
             desktop: None,
             mesh: None,

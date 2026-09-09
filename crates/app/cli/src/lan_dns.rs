@@ -327,6 +327,7 @@ mod tests {
             dns,
             mail: None,
             self_update: None,
+            github_app: None,
             shares: vec![],
             desktop: None,
             mesh: None,

@@ -19,6 +19,12 @@ selfhost-mail = { workspace = true }
 # already-built, already-tested pieces of `selfhost-admin` rather than a
 # second copy of either.
 selfhost-admin = { workspace = true }
+# The GitHub-App-events webhook receiver (`/.selfhost/webhook/app`) parses
+# deliveries with this crate's pure `webhook::parse_event` and persists
+# installation/repo state with its `Store` — auth+parse+record only; minting
+# an installation token or cloning a repo is a later increment's job, not
+# this proxy's (see the `github_app_installations` field's doc in server.rs).
+selfhost-github-app = { workspace = true }
 tokio = { workspace = true }
 tokio-rustls = { workspace = true }
 rustls = { workspace = true }
