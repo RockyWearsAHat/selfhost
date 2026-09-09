@@ -445,8 +445,42 @@ fn initialize_result() -> Json {
             "serverInfo",
             Json::object([("name", Json::string("selfhost")), ("version", Json::string("1"))]),
         ),
+        ("instructions", Json::string(SERVER_INSTRUCTIONS)),
     ])
 }
+
+/// Orientation for an agent that has never used this server before, surfaced
+/// through MCP's `initialize.instructions` field rather than left to be
+/// discovered inside one tool's own description.
+///
+/// This exists because of a real incident: an agent debugging a broken
+/// deployment reached for raw SSH and an interactive `gh auth login` before
+/// ever calling `services_logs`, and separately, nothing told it that
+/// `selfhost.toml` (read via `services_repo_configure`'s `fromManifest`) was
+/// the way to hand this daemon a build/serve command instead of guessing one.
+/// Both were individually documented on the relevant tool, but nothing said
+/// "read this first" — an agent has no reason to open a specific tool's
+/// description before it knows that tool is the one it needs.
+const SERVER_INSTRUCTIONS: &str = "\
+This server manages services and sites on one selfhost deployment. Typical workflow:\n\
+\n\
+1. Something looks broken? Call services_show and services_logs BEFORE touching SSH \
+or any credential tooling (gh auth, ssh-add, etc.) — most failures are visible here \
+(a build step's error, a service left stopped) and none of them are fixed by \
+re-authenticating anything. Never SSH directly to a box's port 22; a box's SSH is only \
+reachable through its own Secure-VPN tunnel, and a direct attempt will simply time out.\n\
+2. Defining or fixing what a service runs (its repository, build/serve command, port) \
+is services_add or services_repo_configure, not a file edit or a redeploy — \
+services_deploy only re-runs a service that is already correctly defined.\n\
+3. A repository can carry its own selfhost.toml (serve/build/port/env/health_path) so \
+you do not have to know its build command by heart — pass fromManifest=true to \
+services_repo_configure to read it. This is opt-in on purpose: the manifest lives in a \
+repository someone else can push to, so it is never read unless you ask for it.\n\
+4. services_add/services_repo_configure need the services.admin grant; \
+services_control (start/stop/restart) needs only service.control. Call whoami to see \
+exactly what this token has, if a call is refused.\n\
+5. self_update redeploys this daemon's own repository; services_deploy redeploys one \
+managed service. Both always force a rebuild rather than only checking for new commits.";
 
 /// The `tools/list` result: every tool in [`TOOLS`], as MCP's schema shape.
 fn tools_list_result() -> Json {
