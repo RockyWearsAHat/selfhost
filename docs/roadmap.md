@@ -153,6 +153,33 @@ for a **private** repository — `repo configure` only composes a plain HTTPS
 clone URL today, so a private repo needs its checkout made reachable some
 other way (a deploy key, a public mirror) until that lands.
 
+**A repository can now describe its own build and serve commands.** A
+`selfhost.toml` at the repository root (`selfhost_config::RepoManifest`:
+`serve`, `build`, `port`, `env`, `health_path`) lets `selfhost repo configure
+--from-manifest` fill in what was not given on the command line — an explicit
+`--serve`/`--build`/`--port` flag always wins over the manifest's value. This
+is opt-in only, never automatic: reading a manifest without being asked would
+mean anyone with push access to the tracked repository gets to name shell
+commands this daemon executes, which is a materially bigger trust boundary
+than an operator's own flags. Two MCP tools reach the same path for an agent:
+`services_add` installs a service directly (a repository, a serve/build
+command, a node and a port — the same composition `repo configure` uses,
+never a second one), and `services_repo_configure` does the `--from-manifest`
+form for a repository the GitHub App already tracks. Both require the new
+`services.admin` grant, which is deliberately distinct from the pre-existing
+`service.control`: starting or restarting an already-defined service is a far
+smaller trust decision than defining what a service runs in the first place —
+see `crates/foundation/identity/src/capability.rs`'s `Capability::ServicesAdmin`
+for the reasoning, and
+`docs/incidents/2026-09-08-ai-studio-checkout-divergence.md` for the gap that
+motivated all of this. A failed build step also now leaves a service in a
+distinguishable `ServiceState::BuildFailed { reason }` rather than an ordinary
+`Stopped`, so `services_show`/`services_list` (CLI and MCP alike) surface it
+directly; and `services_deploy`'s MCP tool, and the admin API's
+`POST /api/services/<name>/deploy` route with `{"force": true}`, re-run the
+build even when the branch tip has not moved — for the explicit "redeploy this
+now" case, never for the background poller's own checks.
+
 ## Known limitations in what is already built
 
 Written down so they are decisions rather than surprises.
