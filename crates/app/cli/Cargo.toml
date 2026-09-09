@@ -28,6 +28,7 @@ selfhost-storage = { workspace = true }
 selfhost-ws = { workspace = true }
 selfhost-firewall = { workspace = true }
 selfhost-git = { workspace = true }
+selfhost-github-app = { workspace = true }
 selfhost-mail = { workspace = true }
 selfhost-mesh = { workspace = true }
 selfhost-proxy = { workspace = true }

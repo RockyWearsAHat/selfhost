@@ -46,6 +46,19 @@ pub const ACME_CHALLENGE_PREFIX: &str = "/.well-known/acme-challenge/";
 /// [`serve_webhook`] for the rest.
 pub const WEBHOOK_PREFIX: &str = "/.selfhost/webhook/";
 
+/// The fixed path for GitHub App event deliveries (`installation`,
+/// `installation_repositories`, `push`, ...).
+///
+/// Deliberately **not** under [`WEBHOOK_PREFIX`]'s trailing-segment scheme —
+/// that scheme names *one service* per path, and a GitHub App delivery names
+/// no service at all; the account and repository it concerns are fields in
+/// the verified body, read by [`serve_app_webhook`]. A fixed path also means
+/// it can never collide with a service name the way `SELF_UPDATE_WEBHOOK_NAME`
+/// is reserved against; see `docs/SECURITY.md`'s "gate deliberately exempts"
+/// paragraph for why this is still safe to leave unauthenticated-until-the-
+/// signature-check, exactly like the per-service webhook path.
+pub const APP_WEBHOOK_PATH: &str = "/.selfhost/webhook/app";
+
 /// The most request-body bytes read for a webhook.
 ///
 /// A push payload is a few kilobytes; this is generous headroom without being
@@ -164,6 +177,32 @@ pub struct Server {
     /// `services.toml` fresh, and which this field has to be given deliberately
     /// because `[self_update]` lives in the config rather than the catalogue.
     self_update_secret: RwLock<Option<String>>,
+    /// The secret that authenticates a delivery to `/.selfhost/webhook/app`
+    /// (`X-Hub-Signature-256`, GitHub's HMAC over the raw body).
+    ///
+    /// Same locking and reload semantics as `self_update_secret`, mirrored
+    /// deliberately: a `[github_app].webhook_secret` set or rotated by a
+    /// config edit has to take effect on the next delivery, not at the next
+    /// restart. `None` when `[github_app]` is absent or carries no secret —
+    /// [`serve_app_webhook`] then answers every delivery with the same 404 a
+    /// bad signature gets, exactly as the per-service webhook path does.
+    github_app_webhook_secret: RwLock<Option<String>>,
+    /// Persistence for which GitHub accounts have installed this App and
+    /// which repositories are selected — `None` when `[github_app]` is
+    /// absent, matching `mail`'s "opt-in, not a startup failure" posture.
+    ///
+    /// **What this field is not:** a token minter or a git client. Minting an
+    /// installation access token (`selfhost_github_app::InstallationTokenCache`)
+    /// and cloning/pulling a repository are a later increment's job — this
+    /// webhook receiver's own job is auth (verify the signature), parse
+    /// (`selfhost_github_app::webhook::parse_event`) and record (this store).
+    /// A token cache belongs beside whatever actually opens a network
+    /// connection to `api.github.com` and clones with the result — the
+    /// deploy step in `app-deploy`, or a future `selfhost-github-deploy`
+    /// crate — not in the process that terminates the public listener,
+    /// mirroring how `relay_deploy` above never mints a git credential
+    /// itself either; it only relays to the admin API that does the work.
+    github_app_installations: Option<selfhost_github_app::Store>,
     /// The mail store and credential check, shared with `mail_task`'s own
     /// SMTP/IMAP listeners rather than opened a second time here.
     ///
@@ -219,6 +258,7 @@ impl Server {
     pub fn build(config: &Config, project_dir: &std::path::Path) -> Self {
         let (routes, sites) = Self::routing(config, project_dir);
         let data_dir = project_dir.join(&config.server.data_dir);
+        let github_installations_path = selfhost_github_app::store_path(&data_dir);
         Self {
             routes: RwLock::new(routes),
             sites: RwLock::new(sites),
@@ -233,6 +273,11 @@ impl Server {
                 .map(|address| address.port())
                 .unwrap_or(443),
             self_update_secret: RwLock::new(Self::self_update_secret(config)),
+            github_app_webhook_secret: RwLock::new(Self::github_app_webhook_secret(config)),
+            github_app_installations: config.github_app.as_ref().map(|_| {
+                selfhost_github_app::Store::load(github_installations_path)
+                    .expect("Store::load never touches disk and cannot fail")
+            }),
             mail: RwLock::new(None),
         }
     }
@@ -302,6 +347,17 @@ impl Server {
             .and_then(|update| update.webhook_secret.clone())
     }
 
+    /// The configured GitHub-App-events webhook secret, if this deployment
+    /// has one.
+    ///
+    /// Mirrors [`Server::self_update_secret`] exactly: an absent
+    /// `[github_app]` section, or one present with no `webhook_secret`,
+    /// yields `None`, and [`serve_app_webhook`] answers every delivery the
+    /// same uninformative 404 either way.
+    fn github_app_webhook_secret(config: &Config) -> Option<String> {
+        config.github_app.as_ref().and_then(|app| app.webhook_secret.clone())
+    }
+
     /// Rebuilds the routing table from a freshly reloaded config and swaps it
     /// in, live.
     ///
@@ -321,6 +377,8 @@ impl Server {
             Self::pacc_documents(config);
         *self.self_update_secret.write().unwrap_or_else(|poisoned| poisoned.into_inner()) =
             Self::self_update_secret(config);
+        *self.github_app_webhook_secret.write().unwrap_or_else(|poisoned| poisoned.into_inner()) =
+            Self::github_app_webhook_secret(config);
     }
 
     /// The automatic-configuration document each mail domain publishes, keyed
@@ -668,6 +726,10 @@ where
     // Checked ahead of everything below, over both schemes, for the same
     // reason the ACME exemption is: a platform concern that happens to be
     // reached at a site's own hostname, not that site's content.
+    if request.path() == APP_WEBHOOK_PATH {
+        return serve_app_webhook(server, request, leftover, stream).await;
+    }
+
     if request.path().starts_with(WEBHOOK_PREFIX) {
         return serve_webhook(server, request, leftover, stream).await;
     }
@@ -1140,6 +1202,203 @@ where
     };
     write_response(stream, response, false).await?;
     Ok(Outcome::MustClose)
+}
+
+/// Verifies a GitHub App event delivery and records what it says.
+///
+/// Mirrors [`serve_webhook`]'s shape closely on purpose — same body-size cap,
+/// same signature check, same byte-identical 404 on a bad or missing
+/// signature — but this route's job stops at auth+parse+record: it never
+/// mints a token and never clones anything (see `Server::github_app_installations`'s
+/// doc for where that belongs). A `push` for a repository this box has an
+/// actual deploy config for is the one case that reaches further, and it
+/// reaches through the exact same [`relay_deploy`] call [`serve_webhook`]
+/// uses, adapted only to resolve the target service by `owner/repo` instead
+/// of a URL path segment.
+async fn serve_app_webhook<S>(
+    server: &Server,
+    request: &Request,
+    leftover: &mut Vec<u8>,
+    stream: &mut S,
+) -> io::Result<Outcome>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    if request.method != Method::Post {
+        write_response(stream, Response::error_page(Status::NOT_FOUND), false).await?;
+        return Ok(Outcome::MustClose);
+    }
+
+    let length = match request.body_length() {
+        Ok(selfhost_http::BodyLength::Fixed(length)) if length > 0 && length <= WEBHOOK_MAX_BODY => {
+            length
+        }
+        _ => {
+            write_response(stream, Response::error_page(Status::BAD_REQUEST), false).await?;
+            return Ok(Outcome::MustClose);
+        }
+    };
+
+    let body = take_body(leftover, stream, length).await?;
+
+    // No `[github_app]` configured and a bad signature both answer the same
+    // way — the same reasoning [`serve_webhook`]'s no-secret branch gives.
+    let Some(secret) =
+        server.github_app_webhook_secret.read().unwrap_or_else(|poisoned| poisoned.into_inner()).clone()
+    else {
+        write_response(stream, Response::error_page(Status::NOT_FOUND), false).await?;
+        return Ok(Outcome::MustClose);
+    };
+
+    let presented = request.headers.get_str("x-hub-signature-256").and_then(|value| value.strip_prefix("sha256="));
+    let verified = presented.is_some_and(|hex| signature_matches(&secret, &body, hex));
+    if !verified {
+        // Byte-identical to `serve_webhook`'s bad-signature 404.
+        write_response(stream, Response::error_page(Status::NOT_FOUND), false).await?;
+        return Ok(Outcome::MustClose);
+    }
+
+    let event_header = request.headers.get_str("x-github-event").unwrap_or_default().to_owned();
+
+    // `WebhookDelivery::event` is `&'static str` because `selfhost_github_app`
+    // never persists a delivery log itself (see its own module doc — "a later
+    // increment appends these to a log file"); this route logs the same
+    // information (`event`, `signature_valid`, and the parsed summary or
+    // parse error) as a line via `eprintln!` rather than constructing that
+    // struct with a leaked or fabricated `'static` string for one field a
+    // log line does not need typed at all.
+    let status = match selfhost_github_app::webhook::parse_event(&event_header, &body) {
+        Ok(event) => {
+            let summary = selfhost_github_app::webhook::summarize(&event);
+            eprintln!("[proxy] github-app: {summary} (event={event_header}, signature_valid=true)");
+            handle_app_event(server, event, &summary).await
+        }
+        Err(error) => {
+            eprintln!(
+                "[proxy] github-app: delivery failed to parse (event={event_header}, signature_valid=true): {error}"
+            );
+            Status::BAD_REQUEST
+        }
+    };
+
+    let response = Response::bytes(status, "application/json", b"{\"accepted\":true}".to_vec())
+        .unwrap_or_else(|_| Response::error_page(Status::INTERNAL_SERVER_ERROR));
+    write_response(stream, response, false).await?;
+    Ok(Outcome::MustClose)
+}
+
+/// Acts on one parsed [`selfhost_github_app::webhook::GithubEvent`], returning
+/// the status to answer GitHub with.
+async fn handle_app_event(
+    server: &Server,
+    event: selfhost_github_app::webhook::GithubEvent,
+    summary: &selfhost_github_app::webhook::GithubEventSummary,
+) -> Status {
+    use selfhost_github_app::webhook::{GithubEvent, InstallationAction};
+
+    let Some(store) = &server.github_app_installations else {
+        eprintln!("[proxy] github-app: {summary} (no [github_app] installation store configured)");
+        return Status::OK;
+    };
+
+    match event {
+        GithubEvent::Installation(installation) => match installation.action {
+            InstallationAction::Created => {
+                if let Err(error) =
+                    store.upsert_installation(installation.installation_id, &installation.account_login)
+                {
+                    eprintln!("[proxy] github-app: could not record installation: {error}");
+                    return Status::INTERNAL_SERVER_ERROR;
+                }
+                Status(201)
+            }
+            InstallationAction::Deleted => {
+                if let Err(error) = store.remove_installation(installation.installation_id) {
+                    eprintln!("[proxy] github-app: could not remove installation: {error}");
+                    return Status::INTERNAL_SERVER_ERROR;
+                }
+                Status::OK
+            }
+            InstallationAction::Other(action) => {
+                eprintln!("[proxy] github-app: installation action \"{action}\" for {} — no-op", installation.account_login);
+                Status::OK
+            }
+        },
+        GithubEvent::InstallationRepositories(event) => {
+            if !event.repositories_added.is_empty() {
+                if let Err(error) = store.add_repos(event.installation_id, &event.repositories_added) {
+                    eprintln!("[proxy] github-app: could not add repos: {error}");
+                    return Status::INTERNAL_SERVER_ERROR;
+                }
+            }
+            if !event.repositories_removed.is_empty() {
+                if let Err(error) = store.remove_repos(event.installation_id, &event.repositories_removed) {
+                    eprintln!("[proxy] github-app: could not remove repos: {error}");
+                    return Status::INTERNAL_SERVER_ERROR;
+                }
+            }
+            Status::OK
+        }
+        GithubEvent::Push(push) => {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::SystemTime::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            if let Err(error) = store.record_push(&push.owner, &push.repo, now) {
+                eprintln!("[proxy] github-app: could not record push: {error}");
+                return Status::INTERNAL_SERVER_ERROR;
+            }
+
+            match lookup_service_for_repo(server, &push.owner, &push.repo) {
+                Some(name) => match relay_deploy(server, &name).await {
+                    Ok(deploy_status) => {
+                        eprintln!(
+                            "[proxy] github-app: push {}/{} {} -> deploy {name} ({deploy_status})",
+                            push.owner, push.repo, push.git_ref
+                        );
+                        deploy_status
+                    }
+                    Err(error) => {
+                        eprintln!("[proxy] github-app: push for {}/{}: could not reach the admin API: {error}", push.owner, push.repo);
+                        Status::BAD_GATEWAY
+                    }
+                },
+                None => {
+                    eprintln!(
+                        "[proxy] github-app: push for {}/{}, installed but no deploy config yet",
+                        push.owner, push.repo
+                    );
+                    Status(202)
+                }
+            }
+        }
+        GithubEvent::Unhandled(kind) => {
+            eprintln!("[proxy] github-app: {summary} (kind={kind}) — no-op");
+            Status::OK
+        }
+    }
+}
+
+/// Finds the service in the daemon's catalogue whose active git watch tracks
+/// `owner/repo`, if any.
+///
+/// Reads `services.toml` directly, the same way and for the same freshness
+/// reason [`lookup_webhook_secret`] does — a service's deploy config wired up
+/// through the console after this App was installed must be found on the very
+/// next push, not the next restart. Matched by the watch's `repository` URL
+/// ending in `owner/repo` (optionally `.git`), case-insensitively, since a
+/// `GitWatch` stores a full clone URL rather than a bare `owner/repo` pair.
+fn lookup_service_for_repo(server: &Server, owner: &str, repo: &str) -> Option<String> {
+    let store = selfhost_admin::Store::new(&server.data_dir);
+    let catalog = store.load(&[]).ok()?;
+    catalog
+        .services
+        .iter()
+        .find(|spec| {
+            spec.active_watch()
+                .is_some_and(|watch| selfhost_github_app::repository_matches(&watch.repository, owner, repo))
+        })
+        .map(|spec| spec.name.clone())
 }
 
 /// Whether a webhook's trailing path segment is safe to use as a service name.
@@ -2185,6 +2444,7 @@ mod tests {
             dns: None,
             mail: None,
             self_update: None,
+            github_app: None,
             shares: vec![],
             desktop: None,
             mesh: None,
@@ -2836,6 +3096,261 @@ mod tests {
         let relayed = accepted.await.expect("the fake admin task did not panic");
         assert!(relayed.starts_with("POST /api/services/levelup/deploy HTTP/1.1"), "{relayed}");
         assert!(relayed.contains("Authorization: Bearer "), "{relayed}");
+    }
+
+    /// A `Server` like [`server_over`], with `[github_app]` present and its
+    /// webhook secret set.
+    fn server_with_github_app(data_dir: &std::path::Path, admin_bind: &str, secret: Option<&str>) -> Server {
+        let mut config = config_with(vec![site("api", &["api.example.com"])]);
+        config.server.data_dir = PathBuf::from(".");
+        config.server.admin_bind = admin_bind.to_owned();
+        config.github_app = Some(selfhost_config::GithubApp {
+            app_id: 4606064,
+            private_key_path: "secrets/github-app.private-key.pem".into(),
+            webhook_secret: secret.map(str::to_owned),
+        });
+        Server::build(&config, data_dir)
+    }
+
+    /// A GitHub-App-events webhook request head plus its declared body,
+    /// parsed the way the connection loop would parse a real socket's head —
+    /// mirrors [`webhook_request`], adding the `X-GitHub-Event` header that
+    /// route needs and pointing at the fixed [`APP_WEBHOOK_PATH`] rather than
+    /// a per-service one.
+    fn app_webhook_request(event: &str, body: &str, signature: Option<&str>) -> (Request, Vec<u8>) {
+        let mut head = format!(
+            "POST {APP_WEBHOOK_PATH} HTTP/1.1\r\nHost: api.example.com\r\n\
+             X-GitHub-Event: {event}\r\nContent-Length: {}\r\n",
+            body.len()
+        );
+        if let Some(signature) = signature {
+            head.push_str(&format!("X-Hub-Signature-256: sha256={signature}\r\n"));
+        }
+        head.push_str("\r\n");
+        let request = Request::parse(head.as_bytes()).expect("a well-formed head parses").request;
+        (request, body.as_bytes().to_vec())
+    }
+
+    /// Sends `request` through `serve_app_webhook` over an in-memory duplex
+    /// and returns the response text — mirrors [`webhook_response`].
+    async fn app_webhook_response(server: &Server, request: &Request, body: &[u8]) -> String {
+        let (mut client, mut server_side) = tokio::io::duplex(8192);
+        let mut leftover = body.to_vec();
+        serve_app_webhook(server, request, &mut leftover, &mut server_side).await.expect("no I/O error");
+        drop(server_side);
+        let mut response = Vec::new();
+        client.read_to_end(&mut response).await.expect("read the response back");
+        String::from_utf8_lossy(&response).into_owned()
+    }
+
+    #[tokio::test]
+    async fn an_app_webhook_with_a_bad_signature_is_byte_identical_to_the_service_webhooks_404() {
+        let dir = ScratchDataDir::new("app-badsig");
+        let server = server_with_github_app(&dir.0, "127.0.0.1:1", Some("s3cret"));
+        let (request, body) = app_webhook_request("installation", "{}", Some("00"));
+
+        let response = app_webhook_response(&server, &request, &body).await;
+        let (request2, body2) = webhook_request("nonexistent", "{}", Some("00"));
+        let baseline = webhook_response(&server, &request2, &body2).await;
+
+        assert!(response.starts_with("HTTP/1.1 404"), "{response}");
+        assert_eq!(response, baseline, "must be byte-identical to the per-service 404");
+    }
+
+    #[tokio::test]
+    async fn an_app_webhook_with_no_signature_header_is_refused() {
+        let dir = ScratchDataDir::new("app-nosig");
+        let server = server_with_github_app(&dir.0, "127.0.0.1:1", Some("s3cret"));
+        let (request, body) = app_webhook_request("installation", "{}", None);
+
+        let response = app_webhook_response(&server, &request, &body).await;
+        assert!(response.starts_with("HTTP/1.1 404"), "{response}");
+    }
+
+    #[tokio::test]
+    async fn an_app_webhook_without_github_app_configured_is_a_404() {
+        let dir = ScratchDataDir::new("app-unconfigured");
+        let server = server_over(&dir.0, "127.0.0.1:1");
+        let body = "{}";
+        let key = ring::hmac::Key::new(ring::hmac::HMAC_SHA256, b"s3cret");
+        let signature = hex_encode(ring::hmac::sign(&key, body.as_bytes()).as_ref());
+        let (request, body) = app_webhook_request("installation", body, Some(&signature));
+
+        let response = app_webhook_response(&server, &request, &body).await;
+        assert!(response.starts_with("HTTP/1.1 404"), "{response}");
+    }
+
+    /// Builds a correctly-signed installation `created` request and its body.
+    fn signed_installation_created(secret: &str) -> (Request, Vec<u8>) {
+        let body = r#"{
+            "action": "created",
+            "installation": { "id": 42, "account": { "login": "octocat", "type": "User" } },
+            "repositories": []
+        }"#;
+        let key = ring::hmac::Key::new(ring::hmac::HMAC_SHA256, secret.as_bytes());
+        let signature = hex_encode(ring::hmac::sign(&key, body.as_bytes()).as_ref());
+        app_webhook_request("installation", body, Some(&signature))
+    }
+
+    #[tokio::test]
+    async fn a_correctly_signed_installation_created_event_is_recorded_and_answered() {
+        let dir = ScratchDataDir::new("app-install-created");
+        let server = server_with_github_app(&dir.0, "127.0.0.1:1", Some("s3cret"));
+        let (request, body) = signed_installation_created("s3cret");
+
+        let response = app_webhook_response(&server, &request, &body).await;
+        assert!(response.starts_with("HTTP/1.1 201"), "{response}");
+
+        let store = server.github_app_installations.as_ref().expect("store configured");
+        let state = store.state().expect("read state back");
+        assert_eq!(state.installations.len(), 1);
+        assert_eq!(state.installations[0].account_login, "octocat");
+    }
+
+    #[tokio::test]
+    async fn an_installation_deleted_event_removes_the_installation() {
+        let dir = ScratchDataDir::new("app-install-deleted");
+        let server = server_with_github_app(&dir.0, "127.0.0.1:1", Some("s3cret"));
+        let (created, created_body) = signed_installation_created("s3cret");
+        app_webhook_response(&server, &created, &created_body).await;
+
+        let body = r#"{
+            "action": "deleted",
+            "installation": { "id": 42, "account": { "login": "octocat", "type": "User" } }
+        }"#;
+        let key = ring::hmac::Key::new(ring::hmac::HMAC_SHA256, b"s3cret");
+        let signature = hex_encode(ring::hmac::sign(&key, body.as_bytes()).as_ref());
+        let (request, body) = app_webhook_request("installation", body, Some(&signature));
+
+        let response = app_webhook_response(&server, &request, &body).await;
+        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+
+        let store = server.github_app_installations.as_ref().expect("store configured");
+        assert!(store.state().expect("read state back").installations.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_push_for_a_tracked_but_unconfigured_repo_is_accepted_with_no_deploy_attempted() {
+        // No admin API is even listening at this address, so a deploy attempt
+        // would surface as a 502 — proving `lookup_service_for_repo` found
+        // nothing and never called `relay_deploy` at all.
+        let dir = ScratchDataDir::new("app-push-unconfigured");
+        let server = server_with_github_app(&dir.0, "127.0.0.1:1", Some("s3cret"));
+        let (created, created_body) = signed_installation_created("s3cret");
+        app_webhook_response(&server, &created, &created_body).await;
+
+        let body = r#"{
+            "ref": "refs/heads/main",
+            "before": "0000000000000000000000000000000000000000",
+            "after": "abc",
+            "repository": { "id": 1, "full_name": "octocat/hello-world" }
+        }"#;
+        let key = ring::hmac::Key::new(ring::hmac::HMAC_SHA256, b"s3cret");
+        let signature = hex_encode(ring::hmac::sign(&key, body.as_bytes()).as_ref());
+        let (request, body) = app_webhook_request("push", body, Some(&signature));
+
+        let response = app_webhook_response(&server, &request, &body).await;
+        assert!(response.starts_with("HTTP/1.1 202"), "{response}");
+    }
+
+    #[tokio::test]
+    async fn a_push_for_a_configured_repo_reaches_the_same_relay_deploy_path_as_a_service_webhook() {
+        // Proves `handle_app_event`'s push branch reaches the identical
+        // `relay_deploy` call the per-service webhook uses: the fake admin API
+        // below is the same seam `a_correctly_signed_webhook_is_relayed_...`
+        // exercises, and it sees the same `/api/services/<name>/deploy`
+        // request line.
+        let dir = ScratchDataDir::new("app-push-configured");
+        // A watch whose `repository` names the exact repo the push event
+        // names, so `lookup_service_for_repo` finds it by owner/repo.
+        let mut spec = selfhost_config::ServiceSpec::new("levelup", "/bin/true");
+        let mut watch =
+            selfhost_config::GitWatch::new("https://github.com/octocat/hello-world.git", "checkouts/site");
+        watch.webhook_secret = Some("irrelevant-to-this-path".to_owned());
+        spec.git = Some(watch);
+        selfhost_admin::Store::new(&dir.0).upsert(spec).await.expect("write the catalogue");
+        selfhost_admin::Token::load_or_create(&dir.0).expect("plant a token to read back");
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind a fake admin port");
+        let admin_bind = listener.local_addr().expect("a bound address");
+        let accepted = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("one connection");
+            let mut buffer = Vec::new();
+            let mut chunk = [0u8; 512];
+            loop {
+                let read = stream.read(&mut chunk).await.expect("read the relayed request");
+                if read == 0 {
+                    break;
+                }
+                buffer.extend_from_slice(&chunk[..read]);
+                if buffer.ends_with(b"\r\n\r\n") {
+                    break;
+                }
+            }
+            stream
+                .write_all(b"HTTP/1.1 202 Accepted\r\nContent-Length: 2\r\n\r\n{}")
+                .await
+                .expect("answer the relay");
+            stream.flush().await.expect("flush the answer");
+            String::from_utf8_lossy(&buffer).into_owned()
+        });
+
+        let server = server_with_github_app(&dir.0, &admin_bind.to_string(), Some("s3cret"));
+        let body = r#"{
+            "ref": "refs/heads/main",
+            "before": "0000000000000000000000000000000000000000",
+            "after": "abc",
+            "repository": { "id": 1, "full_name": "octocat/hello-world" }
+        }"#;
+        let key = ring::hmac::Key::new(ring::hmac::HMAC_SHA256, b"s3cret");
+        let signature = hex_encode(ring::hmac::sign(&key, body.as_bytes()).as_ref());
+        let (request, body) = app_webhook_request("push", body, Some(&signature));
+
+        let response = app_webhook_response(&server, &request, &body).await;
+        assert!(response.starts_with("HTTP/1.1 202"), "{response}");
+
+        let relayed = accepted.await.expect("the fake admin task did not panic");
+        assert!(relayed.starts_with("POST /api/services/levelup/deploy HTTP/1.1"), "{relayed}");
+    }
+
+    #[tokio::test]
+    async fn an_unhandled_event_kind_is_a_no_op_200() {
+        let dir = ScratchDataDir::new("app-unhandled");
+        let server = server_with_github_app(&dir.0, "127.0.0.1:1", Some("s3cret"));
+        let body = "{}";
+        let key = ring::hmac::Key::new(ring::hmac::HMAC_SHA256, b"s3cret");
+        let signature = hex_encode(ring::hmac::sign(&key, body.as_bytes()).as_ref());
+        let (request, body) = app_webhook_request("pull_request", body, Some(&signature));
+
+        let response = app_webhook_response(&server, &request, &body).await;
+        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+    }
+
+    #[tokio::test]
+    async fn dispatch_routes_the_fixed_app_path_and_not_a_prefix_match() {
+        let dir = ScratchDataDir::new("app-dispatch");
+        let mut config = config_with(vec![site("api", &["api.example.com"])]);
+        config.server.data_dir = PathBuf::from(".");
+        config.server.admin_bind = "127.0.0.1:1".to_owned();
+        config.github_app = Some(selfhost_config::GithubApp {
+            app_id: 4606064,
+            private_key_path: "secrets/github-app.private-key.pem".into(),
+            webhook_secret: Some("s3cret".into()),
+        });
+        let server = Server::build(&config, &dir.0);
+
+        let body = "{}";
+        let key = ring::hmac::Key::new(ring::hmac::HMAC_SHA256, b"s3cret");
+        let signature = hex_encode(ring::hmac::sign(&key, body.as_bytes()).as_ref());
+        let head = format!(
+            "POST {APP_WEBHOOK_PATH} HTTP/1.1\r\nHost: api.example.com\r\n\
+             X-GitHub-Event: pull_request\r\nX-Hub-Signature-256: sha256={signature}\r\n\
+             Content-Length: {}\r\n\r\n",
+            body.len()
+        );
+        let response = dispatch_bytes(&server, &head, "203.0.113.9:5000", true, body.as_bytes()).await;
+        let text = String::from_utf8_lossy(&response);
+        assert!(text.starts_with("HTTP/1.1 200"), "{text}");
     }
 
     /// `site()` with the VPN network gate applied.

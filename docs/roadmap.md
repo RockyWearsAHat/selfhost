@@ -130,13 +130,28 @@ operator's behalf — `BatchMode=yes` turns each question `ssh` would have asked
 into a failure, and the console turns that failure into the one command that
 fixes it. See [`gui.md`](gui.md#reaching-a-daemon-on-another-machine).
 
-**Git deployment is done.** A service can carry a branch to watch; when the
-branch moves, the daemon stops the service, updates the working copy, runs the
-build step, and starts it again. Polling, not webhooks — see
-[`gui.md`](gui.md#deploying-from-a-branch) for why, and for what is left: a
-webhook receiver that only makes a poll happen *sooner*, and an OAuth device
-flow for private repositories that the daemon user's SSH key does not already
-reach.
+**Git deployment is done, by poll and now by webhook too.** A service can carry
+a branch to watch; when the branch moves, the daemon stops the service, updates
+the working copy, runs the build step, and starts it again. See
+[`gui.md`](gui.md#deploying-from-a-branch) for why polling was the first
+mechanism.
+
+**A GitHub App webhook receiver is also done.** `crates/services/github-app`
+authenticates as a GitHub App and `crates/app/proxy/src/server.rs` answers
+`/.selfhost/webhook/app`: it verifies each delivery's signature, records which
+accounts have installed the App and which repositories it can see
+(`selfhost_github_app::Store`, at `<data_dir>/github-installations.toml`), and
+on a `push` event nudges the same deploy path the poller uses — so a
+webhook-configured application redeploys within seconds of a push rather than
+waiting out its interval. `selfhost repo <list|logs|configure>` is the CLI's
+front door onto that store: `list` shows every tracked repo and what it
+deploys as, `logs` shows a repo's webhook receipt and process log, and
+`configure` turns a tracked repo into a running application (always through a
+running daemon — see that command's module docs for why). What is left: an
+OAuth device flow, or wiring the App's own installation token into the clone,
+for a **private** repository — `repo configure` only composes a plain HTTPS
+clone URL today, so a private repo needs its checkout made reachable some
+other way (a deploy key, a public mirror) until that lands.
 
 ## Known limitations in what is already built
 
@@ -154,7 +169,7 @@ Written down so they are decisions rather than surprises.
 - **No response compression.** The matcher logic exists in `mime::is_compressible`
   but nothing calls it. Low priority for a video-heavy site, where most bytes are
   already compressed.
-- **No rate limiting.** The biggest remaining gap before public exposure.
+- **Login rate limiting** is implemented via FailureGate. Other request types lack per-endpoint rate limiting.
 - **A relayed WebDAV `PUT` has no deadline after its head.** It streams
   uncapped by design — quotas and the in-flight ceiling are storage's job, and
   the in-flight ceiling *is* enforced (`crates/services/storage/src/quota.rs`, called on
@@ -168,7 +183,7 @@ Written down so they are decisions rather than surprises.
   off until a file says otherwise.
 - **Nothing publishes the DNS-SD records** a browsable share derives, and Windows
   has no mDNS responder to publish them with even when something does.
-- **`selfhost desktop status` answers from the config alone** and cannot see a
+- **`selfhost desktop status` probes system capabilities** (display count, platform grants) in addition to reading config, and cannot see a
   running daemon; `doctor` is the command that asks one.
 
 ## Things not to do

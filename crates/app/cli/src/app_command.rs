@@ -284,7 +284,7 @@ async fn carry_out(
 }
 
 /// Why the running daemon did not take the deployment.
-enum Daemon {
+pub(crate) enum Daemon {
     /// Nothing is listening on the admin address at all.
     ///
     /// Kept apart from every other failure because it is the only one that means
@@ -297,16 +297,36 @@ enum Daemon {
 
 /// Asks a running daemon to deploy one service, over loopback.
 ///
-/// The same shape `doctor`'s `ask_daemon` uses and for the same reason: one
-/// request, `Connection: close`, read to the end. The bearer token is read from
-/// the data directory rather than the environment because this is the *local*
-/// daemon, whose token is a file this machine owns.
-///
 /// `name` goes into the request line unescaped, which is safe for exactly one
 /// reason worth stating: it is a name read back out of the catalogue, and
 /// `Store::load` refuses a catalogue whose service names are not the portable
 /// alphabet `ServiceSpec::check` demands. It is never a string the caller typed.
 async fn ask_daemon(name: &str, address: SocketAddr, data_dir: &Path) -> Result<(), Daemon> {
+    let raw = admin_request("POST", &format!("/api/services/{name}/deploy"), &[], address, data_dir).await?;
+    accepted(&raw).map_err(Daemon::Said)
+}
+
+/// Sends one request to the local daemon's admin API over loopback, and
+/// returns its raw HTTP response bytes.
+///
+/// The one place this deployment's CLI dials its own daemon: `app deploy`'s
+/// `ask_daemon` above and `selfhost repo configure` (in `repo_command`) both
+/// go through this rather than each opening its own socket and re-reading the
+/// token file, which is the kind of duplication that drifts — one call site
+/// gets a timeout fix or a clearer error message and the other quietly does
+/// not.
+///
+/// One request, `Connection: close`, read to the end — the same shape
+/// `doctor`'s `ask_daemon` uses. The bearer token is read from the data
+/// directory rather than the environment because this is the *local* daemon,
+/// whose token is a file this machine owns.
+pub(crate) async fn admin_request(
+    method: &str,
+    path: &str,
+    body: &[u8],
+    address: SocketAddr,
+    data_dir: &Path,
+) -> Result<Vec<u8>, Daemon> {
     let exchange = async {
         let mut stream = match TcpStream::connect(address).await {
             Ok(stream) => stream,
@@ -322,25 +342,36 @@ async fn ask_daemon(name: &str, address: SocketAddr, data_dir: &Path) -> Result<
             }
         };
 
-        let path = Token::path_in(data_dir);
-        let token = std::fs::read_to_string(&path).map_err(|error| {
+        let token_path = Token::path_in(data_dir);
+        let token = std::fs::read_to_string(&token_path).map_err(|error| {
             Daemon::Said(format!(
                 "the daemon on {address} is running but its token at {} could not be read \
-                 ({error}), so this deployment cannot be asked for",
-                path.display()
+                 ({error}), so this cannot be asked for",
+                token_path.display()
             ))
         })?;
-        let token = crate::remote_client::usable(token.trim(), &path.display().to_string())
+        let token = crate::remote_client::usable(token.trim(), &token_path.display().to_string())
             .map_err(Daemon::Said)?;
 
-        let request = format!(
-            "POST /api/services/{name}/deploy HTTP/1.1\r\nHost: {address}\r\n\
-             Authorization: Bearer {token}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+        let mut request = format!(
+            "{method} {path} HTTP/1.1\r\nHost: {address}\r\nAuthorization: Bearer {token}\r\n\
+             Content-Length: {}\r\nConnection: close\r\n",
+            body.len()
         );
+        if !body.is_empty() {
+            request.push_str("Content-Type: application/json\r\n");
+        }
+        request.push_str("\r\n");
         stream
             .write_all(request.as_bytes())
             .await
             .map_err(|error| Daemon::Said(format!("the daemon closed the connection: {error}")))?;
+        if !body.is_empty() {
+            stream
+                .write_all(body)
+                .await
+                .map_err(|error| Daemon::Said(format!("the daemon closed the connection: {error}")))?;
+        }
 
         let mut raw = Vec::new();
         stream
@@ -350,13 +381,9 @@ async fn ask_daemon(name: &str, address: SocketAddr, data_dir: &Path) -> Result<
         Ok(raw)
     };
 
-    let raw = tokio::time::timeout(DAEMON_DEADLINE, exchange)
-        .await
-        .map_err(|_| {
-            Daemon::Said(format!("the daemon on {address} did not answer within {}s", DAEMON_DEADLINE.as_secs()))
-        })??;
-
-    accepted(&raw).map_err(Daemon::Said)
+    tokio::time::timeout(DAEMON_DEADLINE, exchange).await.map_err(|_| {
+        Daemon::Said(format!("the daemon on {address} did not answer within {}s", DAEMON_DEADLINE.as_secs()))
+    })?
 }
 
 /// Reads the daemon's answer to a deployment request.
@@ -365,7 +392,7 @@ async fn ask_daemon(name: &str, address: SocketAddr, data_dir: &Path) -> Result<
 /// out by name: it means the daemon is running a catalogue that does not have
 /// this service in it, which is a different problem from a bad token and sends
 /// the operator somewhere else entirely.
-fn accepted(raw: &[u8]) -> Result<(), String> {
+pub(crate) fn accepted(raw: &[u8]) -> Result<(), String> {
     let parsed = selfhost_http::IncomingResponse::parse(raw)
         .map_err(|error| format!("the daemon's answer is not a response: {error}"))?;
     let status = parsed.response.status;

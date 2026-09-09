@@ -33,6 +33,7 @@ mod oui;
 mod people_command;
 mod proxyware;
 mod remote_client;
+mod repo_command;
 mod self_update;
 mod reports_command;
 mod service_install;
@@ -155,6 +156,15 @@ Commands
                              the branch tip; with no daemon running it updates,
                              builds and swaps here, rolling the working copy back
                              if the build fails
+  repo <list|logs|configure> Repositories the GitHub App is installed on and
+                             tracking. `list` shows each one and what it
+                             deploys as; `logs <owner>/<repo> [--lines N]`
+                             shows its webhook receipt and, if configured, its
+                             process log; `configure <owner>/<repo> --node
+                             <node> --port <port> --serve <cmd...> [--build
+                             <cmd...>] [--domain <host>]...` installs it as a
+                             running application through the daemon, after
+                             which pushes deploy it automatically
   share <list|usage|ls>      The shares this box serves, what each one holds,
                              and what is inside one
   sync push <local-path> <share>:<path> [--apply]
@@ -303,6 +313,7 @@ fn main() -> ExitCode {
         "hairpin" => hairpin_command(&arguments),
         "services" => services_command(),
         "app" => load().and_then(|(config, dir)| app_command::run(&arguments, &config, &dir)),
+        "repo" => load().and_then(|(config, dir)| repo_command::run(&arguments, &config, &dir)),
         "share" => load().and_then(|(config, dir)| share_command::share(&arguments, &config, &dir)),
         "sync" => load().and_then(|(config, dir)| share_command::sync(&arguments, &config, &dir)),
         "storage" => {

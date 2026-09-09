@@ -85,6 +85,7 @@ impl Config {
         self.check_dns(&mut problems);
         self.check_mail(&mut problems);
         self.check_self_update(&mut problems);
+        self.check_github_app(&mut problems);
         self.check_shares(&mut problems);
         self.check_desktop(&mut problems);
         self.check_home(&mut problems);
@@ -149,6 +150,16 @@ impl Config {
     fn check_self_update(&self, problems: &mut Vec<Problem>) {
         if let Some(update) = &self.self_update {
             update.check("self_update", problems);
+        }
+    }
+
+    /// The GitHub App section, when present, must name a real App id and a
+    /// key-file location. Delegated to [`crate::github_app::GithubApp::check`],
+    /// exactly as the other opt-in sections validate through their own schema
+    /// modules. Absent `[github_app]` validates nothing — the feature is opt-in.
+    fn check_github_app(&self, problems: &mut Vec<Problem>) {
+        if let Some(github_app) = &self.github_app {
+            github_app.check("github_app", problems);
         }
     }
 
@@ -758,6 +769,7 @@ mod tests {
             dns: None,
             mail: None,
             self_update: None,
+            github_app: None,
             shares: vec![],
             desktop: None,
             mesh: None,
