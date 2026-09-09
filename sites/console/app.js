@@ -188,7 +188,7 @@ function problemTarget(field) {
     "restart_delay_secs": "f-delay", "max_restarts": "f-maxrestarts",
     "stop_timeout_secs": "f-stoptimeout", "stop_command": "f-stopcmd",
     "git.repository": "f-git-repo", "git.branch": "f-git-branch",
-    "git.path": "f-git-path", "git.interval_secs": "f-git-interval",
+    "git.path": "f-git-path",
     "git.post_pull": "f-git-postpull",
   };
   return map[path] || null;
@@ -2055,7 +2055,7 @@ if (typeof document === "undefined") {
   check("lines parse", parseLines(" a \n\nb\n"), ["a", "b"]);
 
   check("problem maps snake_case", problemTarget("service.restart_delay_secs"), "f-delay");
-  check("problem maps git", problemTarget("service.git.interval_secs"), "f-git-interval");
+  check("problem maps git", problemTarget("service.git.branch"), "f-git-branch");
   check("unknown problem is general", problemTarget("service.mystery"), null);
 
   const open = exposureOf({ port: 443, proto: "tcp", scope: "internet", tag: "https", applied: true });
@@ -4058,7 +4058,7 @@ function boot() {
         const flags = `${watch.enabled === false ? " · paused" : ""}${watch.autoUpdate === false ? " · manual deploys" : ""}`;
         block.append(defRow("GIT",
           `${watch.repository} @ ${watch.branch || "main"} → ${watch.path}`
-          + ` · every ${Number(watch.intervalSecs) || 60}s${flags}`, true));
+          + `${flags}`, true));
       }
     } else {
       block.append(defRow("START MODE", startModes[service.startMode] || String(service.startMode || "")));
@@ -4232,7 +4232,6 @@ function boot() {
     $("f-git-repo").value = "";
     $("f-git-branch").value = "";
     $("f-git-path").value = "";
-    $("f-git-interval").value = "";
     $("f-git-enabled").checked = true;
     $("f-git-auto").checked = true;
     $("f-git-postpull").value = "";
@@ -4265,7 +4264,6 @@ function boot() {
     $("f-git-repo").value = watch ? watch.repository || "" : "";
     $("f-git-branch").value = watch ? watch.branch || "" : "";
     $("f-git-path").value = watch ? watch.path || "" : "";
-    $("f-git-interval").value = watch && watch.intervalSecs !== undefined ? String(watch.intervalSecs) : "";
     $("f-git-enabled").checked = watch ? watch.enabled !== false : true;
     $("f-git-auto").checked = watch ? watch.autoUpdate !== false : true;
     $("f-git-postpull").value = watch && Array.isArray(watch.postPull) ? watch.postPull.join("\n") : "";
@@ -4340,15 +4338,6 @@ function boot() {
       const watch = { repository: repo, path };
       const branch = $("f-git-branch").value.trim();
       if (branch) watch.branch = branch;
-      const interval = $("f-git-interval").value.trim();
-      if (interval) {
-        const value = Number(interval);
-        if (!Number.isInteger(value) || value < 1) {
-          problems.push({ field: "service.git.interval_secs", message: "must be a whole number of seconds" });
-        } else {
-          watch.intervalSecs = value;
-        }
-      }
       watch.enabled = $("f-git-enabled").checked;
       watch.autoUpdate = $("f-git-auto").checked;
       const postPull = parseLines($("f-git-postpull").value);
