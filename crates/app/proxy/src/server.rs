@@ -177,6 +177,17 @@ pub struct Server {
     /// `services.toml` fresh, and which this field has to be given deliberately
     /// because `[self_update]` lives in the config rather than the catalogue.
     self_update_secret: RwLock<Option<String>>,
+    /// The `[self_update]` repository/branch this deployment watches, if the
+    /// watch is enabled — read by [`handle_app_event`] so a push delivered
+    /// through the GitHub App path (`/.selfhost/webhook/app`) can recognize
+    /// "this push is selfhost's own repo" and reuse the exact same
+    /// [`relay_deploy`] call `/.selfhost/webhook/self` makes, rather than a
+    /// second implementation of "what counts as our own repo."
+    ///
+    /// Same lock and reload semantics as `self_update_secret`, and filtered
+    /// by `enabled` for the same reason: switching `[self_update]` off must
+    /// close both trigger paths, not just the bespoke-secret one.
+    self_update_watch: RwLock<Option<selfhost_config::git::SelfUpdate>>,
     /// The secret that authenticates a delivery to `/.selfhost/webhook/app`
     /// (`X-Hub-Signature-256`, GitHub's HMAC over the raw body).
     ///
@@ -273,6 +284,7 @@ impl Server {
                 .map(|address| address.port())
                 .unwrap_or(443),
             self_update_secret: RwLock::new(Self::self_update_secret(config)),
+            self_update_watch: RwLock::new(Self::self_update_watch(config)),
             github_app_webhook_secret: RwLock::new(Self::github_app_webhook_secret(config)),
             github_app_installations: config.github_app.as_ref().map(|_| {
                 selfhost_github_app::Store::load(github_installations_path)
@@ -347,6 +359,16 @@ impl Server {
             .and_then(|update| update.webhook_secret.clone())
     }
 
+    /// The `[self_update]` watch itself, if this deployment has one enabled.
+    ///
+    /// Mirrors [`Server::self_update_secret`]'s `enabled` filter exactly —
+    /// see its doc — but hands back the watch rather than just its secret,
+    /// for [`handle_app_event`] to match a push's `owner/repo`/branch
+    /// against.
+    fn self_update_watch(config: &Config) -> Option<selfhost_config::git::SelfUpdate> {
+        config.self_update.clone().filter(|update| update.enabled)
+    }
+
     /// The configured GitHub-App-events webhook secret, if this deployment
     /// has one.
     ///
@@ -377,6 +399,8 @@ impl Server {
             Self::pacc_documents(config);
         *self.self_update_secret.write().unwrap_or_else(|poisoned| poisoned.into_inner()) =
             Self::self_update_secret(config);
+        *self.self_update_watch.write().unwrap_or_else(|poisoned| poisoned.into_inner()) =
+            Self::self_update_watch(config);
         *self.github_app_webhook_secret.write().unwrap_or_else(|poisoned| poisoned.into_inner()) =
             Self::github_app_webhook_secret(config);
     }
@@ -1347,6 +1371,48 @@ async fn handle_app_event(
             if let Err(error) = store.record_push(&push.owner, &push.repo, now) {
                 eprintln!("[proxy] github-app: could not record push: {error}");
                 return Status::INTERNAL_SERVER_ERROR;
+            }
+
+            // A push to selfhost's OWN watched repo/branch is handled first and
+            // separately from the service catalogue below: `[self_update]`
+            // lives in config, not `services.toml`, so it is not something
+            // `lookup_service_for_repo` could ever find. This is purely an
+            // additional TRIGGER for the identical effect
+            // `/.selfhost/webhook/self` already produces — the same
+            // `relay_deploy(server, SELF_UPDATE_WEBHOOK_NAME)` call, which
+            // ultimately pokes the same `Nudge` the interval poll waits on
+            // (see `selfhost_admin`'s `POST /api/self-update/deploy` and
+            // `selfhost_git::Nudge`'s doc for why a nudge only ever moves the
+            // next check earlier and never replaces it). Self-update's own
+            // fetch/build/restart logic is untouched by this branch.
+            let self_update_watch = server
+                .self_update_watch
+                .read()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone();
+            if let Some(watch) = self_update_watch {
+                let branch_matches = push.git_ref == format!("refs/heads/{}", watch.branch);
+                if selfhost_github_app::repository_matches(&watch.repository, &push.owner, &push.repo)
+                    && branch_matches
+                {
+                    return match relay_deploy(server, selfhost_config::git::SELF_UPDATE_WEBHOOK_NAME).await
+                    {
+                        Ok(deploy_status) => {
+                            eprintln!(
+                                "[proxy] github-app: push {}/{} {} -> self-update ({deploy_status})",
+                                push.owner, push.repo, push.git_ref
+                            );
+                            deploy_status
+                        }
+                        Err(error) => {
+                            eprintln!(
+                                "[proxy] github-app: push for {}/{}: self-update relay could not reach the admin API: {error}",
+                                push.owner, push.repo
+                            );
+                            Status::BAD_GATEWAY
+                        }
+                    };
+                }
             }
 
             match lookup_service_for_repo(server, &push.owner, &push.repo) {
@@ -3311,6 +3377,142 @@ mod tests {
 
         let relayed = accepted.await.expect("the fake admin task did not panic");
         assert!(relayed.starts_with("POST /api/services/levelup/deploy HTTP/1.1"), "{relayed}");
+    }
+
+    /// A `Server` like [`server_with_github_app`], with `[self_update]` also
+    /// present and enabled, watching `repository`/`branch`.
+    fn server_with_github_app_and_self_update(
+        data_dir: &std::path::Path,
+        admin_bind: &str,
+        repository: &str,
+        branch: &str,
+    ) -> Server {
+        let mut config = config_with(vec![site("api", &["api.example.com"])]);
+        config.server.data_dir = PathBuf::from(".");
+        config.server.admin_bind = admin_bind.to_owned();
+        config.github_app = Some(selfhost_config::GithubApp {
+            app_id: 4606064,
+            private_key_path: "secrets/github-app.private-key.pem".into(),
+            webhook_secret: Some("s3cret".into()),
+        });
+        let mut update = selfhost_config::git::SelfUpdate::new(repository);
+        update.branch = branch.to_owned();
+        // Deliberately no `webhook_secret` on `[self_update]`: this proves the
+        // App-routed trigger works even when the bespoke self-update secret
+        // was never set, which is exactly the "fewer long-lived secrets"
+        // point of adding this path.
+        config.self_update = Some(update);
+        Server::build(&config, data_dir)
+    }
+
+    #[tokio::test]
+    async fn a_push_to_the_self_update_repo_and_branch_relays_to_self_update_not_a_service() {
+        // Proves point (a): a push verified through the App webhook, for the
+        // box's own `[self_update]` repository/branch, reaches the identical
+        // trigger `/.selfhost/webhook/self` uses — `relay_deploy` with the
+        // reserved `SELF_UPDATE_WEBHOOK_NAME`, landing on
+        // `/api/self-update/deploy`, never `/api/services/...`.
+        let dir = ScratchDataDir::new("app-push-self-update");
+        selfhost_admin::Token::load_or_create(&dir.0).expect("plant a token to read back");
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind a fake admin port");
+        let admin_bind = listener.local_addr().expect("a bound address");
+        let accepted = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("one connection");
+            let mut buffer = Vec::new();
+            let mut chunk = [0u8; 512];
+            loop {
+                let read = stream.read(&mut chunk).await.expect("read the relayed request");
+                if read == 0 {
+                    break;
+                }
+                buffer.extend_from_slice(&chunk[..read]);
+                if buffer.ends_with(b"\r\n\r\n") {
+                    break;
+                }
+            }
+            stream
+                .write_all(b"HTTP/1.1 202 Accepted\r\nContent-Length: 2\r\n\r\n{}")
+                .await
+                .expect("answer the relay");
+            stream.flush().await.expect("flush the answer");
+            String::from_utf8_lossy(&buffer).into_owned()
+        });
+
+        let server = server_with_github_app_and_self_update(
+            &dir.0,
+            &admin_bind.to_string(),
+            "https://github.com/octocat/selfhost.git",
+            "main",
+        );
+        let body = r#"{
+            "ref": "refs/heads/main",
+            "before": "0000000000000000000000000000000000000000",
+            "after": "abc",
+            "repository": { "id": 1, "full_name": "octocat/selfhost" }
+        }"#;
+        let key = ring::hmac::Key::new(ring::hmac::HMAC_SHA256, b"s3cret");
+        let signature = hex_encode(ring::hmac::sign(&key, body.as_bytes()).as_ref());
+        let (request, body) = app_webhook_request("push", body, Some(&signature));
+
+        let response = app_webhook_response(&server, &request, &body).await;
+        assert!(response.starts_with("HTTP/1.1 202"), "{response}");
+
+        let relayed = accepted.await.expect("the fake admin task did not panic");
+        assert!(relayed.starts_with("POST /api/self-update/deploy HTTP/1.1"), "{relayed}");
+    }
+
+    #[tokio::test]
+    async fn a_push_to_some_other_repo_does_not_trigger_self_update() {
+        // Point (b): `[self_update]` is configured, but the push names a
+        // different repo — no admin API is even listening, so a self-update
+        // deploy attempt would surface as a 502; the accepted 202 here proves
+        // `lookup_service_for_repo` (not self-update) handled it, and found
+        // no matching service either.
+        let dir = ScratchDataDir::new("app-push-not-self-update");
+        let server = server_with_github_app_and_self_update(
+            &dir.0,
+            "127.0.0.1:1",
+            "https://github.com/octocat/selfhost.git",
+            "main",
+        );
+        let body = r#"{
+            "ref": "refs/heads/main",
+            "before": "0000000000000000000000000000000000000000",
+            "after": "abc",
+            "repository": { "id": 1, "full_name": "octocat/hello-world" }
+        }"#;
+        let key = ring::hmac::Key::new(ring::hmac::HMAC_SHA256, b"s3cret");
+        let signature = hex_encode(ring::hmac::sign(&key, body.as_bytes()).as_ref());
+        let (request, body) = app_webhook_request("push", body, Some(&signature));
+
+        let response = app_webhook_response(&server, &request, &body).await;
+        assert!(response.starts_with("HTTP/1.1 202"), "{response}");
+    }
+
+    #[tokio::test]
+    async fn a_push_to_the_self_update_repo_on_a_different_branch_does_not_trigger_self_update() {
+        // Same repo, wrong branch: must fall through to the service lookup
+        // (which finds nothing here) rather than relaying to self-update.
+        let dir = ScratchDataDir::new("app-push-self-update-wrong-branch");
+        let server = server_with_github_app_and_self_update(
+            &dir.0,
+            "127.0.0.1:1",
+            "https://github.com/octocat/selfhost.git",
+            "main",
+        );
+        let body = r#"{
+            "ref": "refs/heads/feature-branch",
+            "before": "0000000000000000000000000000000000000000",
+            "after": "abc",
+            "repository": { "id": 1, "full_name": "octocat/selfhost" }
+        }"#;
+        let key = ring::hmac::Key::new(ring::hmac::HMAC_SHA256, b"s3cret");
+        let signature = hex_encode(ring::hmac::sign(&key, body.as_bytes()).as_ref());
+        let (request, body) = app_webhook_request("push", body, Some(&signature));
+
+        let response = app_webhook_response(&server, &request, &body).await;
+        assert!(response.starts_with("HTTP/1.1 202"), "{response}");
     }
 
     #[tokio::test]

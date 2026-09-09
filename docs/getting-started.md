@@ -284,6 +284,13 @@ ever fast-forwards: modified tracked files or local commits in the deployment
 refuse the update rather than being discarded, and a failed build rolls back
 and leaves the old build running.
 
+Add `webhook_secret` to `[self_update]` (or, since 2026-09-09, configure
+`[github_app]` with this repository installed) and a push is noticed
+immediately instead of waiting out the poll interval — either just moves the
+next check earlier, never replaces it, so the poll keeps working as the
+safety net either way. See `docs/SECURITY.md` SEC-08 for the security
+tradeoffs between the two.
+
 ## 9. Serve files from it (a share)
 
 A share is a directory this box serves to *you*, over three doors that do not
