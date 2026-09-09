@@ -202,8 +202,22 @@ pub enum Capability {
     /// Read the console: the service list, a service's state and logs, the
     /// firewall's state. Everything the console *shows* and nothing it does.
     ConsoleRead,
-    /// Start, stop, restart, install, uninstall and deploy services.
+    /// Start, stop, restart, uninstall and deploy already-defined services.
     ServiceControl,
+    /// Define what a service *is*: install a new one (its program, its build
+    /// and serve commands, the repository it deploys from) or overwrite an
+    /// existing definition.
+    ///
+    /// Split out from [`Capability::ServiceControl`] rather than folded into
+    /// it because the two fail differently: control over an already-defined
+    /// service is bounded by whatever program that definition already names,
+    /// while this capability *writes* the definition — it decides what a
+    /// deploy's build and serve steps will execute. Granting an agent the
+    /// ability to restart a known-good service is a much smaller trust
+    /// decision than granting it the ability to say what that service runs in
+    /// the first place, which is the gap
+    /// `docs/incidents/2026-09-08-ai-studio-checkout-divergence.md` exposed.
+    ServicesAdmin,
     /// List and download from one share.
     FilesRead(ShareId),
     /// Upload to, rename in and delete from one share.
@@ -277,6 +291,7 @@ impl Capability {
         match self {
             Self::ConsoleRead => "console.read",
             Self::ServiceControl => "service.control",
+            Self::ServicesAdmin => "services.admin",
             Self::FilesRead(_) => "files.read",
             Self::FilesWrite(_) => "files.write",
             Self::FilesAdmin => "files.admin",
@@ -326,6 +341,7 @@ impl Capability {
         match self {
             Self::ConsoleRead
             | Self::ServiceControl
+            | Self::ServicesAdmin
             | Self::FilesRead(_)
             | Self::FilesWrite(_)
             | Self::FilesAdmin
@@ -350,6 +366,7 @@ impl Capability {
         match self {
             Self::ConsoleRead
             | Self::ServiceControl
+            | Self::ServicesAdmin
             | Self::FilesAdmin
             | Self::NodeAdmin
             | Self::SiteAdmin
@@ -380,6 +397,7 @@ impl Capability {
         match (word, target) {
             ("console.read", None) => Some(Self::ConsoleRead),
             ("service.control", None) => Some(Self::ServiceControl),
+            ("services.admin", None) => Some(Self::ServicesAdmin),
             ("files.admin", None) => Some(Self::FilesAdmin),
             ("node.admin", None) => Some(Self::NodeAdmin),
             ("site.admin", None) => Some(Self::SiteAdmin),
@@ -412,6 +430,7 @@ impl Capability {
         vec![
             Self::ConsoleRead,
             Self::ServiceControl,
+            Self::ServicesAdmin,
             Self::FilesRead(share.clone()),
             Self::FilesWrite(share.clone()),
             Self::FilesAdmin,
@@ -500,7 +519,7 @@ mod tests {
     #[test]
     fn every_capability_round_trips_through_its_wire_form() {
         let shapes = Capability::every_shape(&share(), &node());
-        assert_eq!(shapes.len(), 12, "extend every_shape when a variant is added");
+        assert_eq!(shapes.len(), 13, "extend every_shape when a variant is added");
         for capability in &shapes {
             let text = capability.to_string();
             assert_eq!(

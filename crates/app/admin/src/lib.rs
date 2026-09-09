@@ -657,8 +657,14 @@ impl<'a> Route<'a> {
             Self::ShareMkdir(id) | Self::ShareRename(id) | Self::ShareDelete(id) | Self::BeginSession(id) | Self::QuerySession(id, _) | Self::FinishSession(id, _) => {
                 storage_api::demand(id, storage_api::Wants::Write)
             }
-            Self::Install(_)
-            | Self::Uninstall(_)
+            // Installing writes the service's *definition* — its program, its
+            // build and serve commands, the repository it deploys from — so it
+            // asks for `ServicesAdmin` rather than `ServiceControl`: control
+            // over an already-defined service is a smaller trust decision than
+            // deciding what that service runs in the first place. Everything
+            // else here only operates a definition that already exists.
+            Self::Install(_) => Demand::Held(Capability::ServicesAdmin),
+            Self::Uninstall(_)
             | Self::DeployNow(_)
             | Self::SelfUpdateNow
             | Self::Act(_, _)

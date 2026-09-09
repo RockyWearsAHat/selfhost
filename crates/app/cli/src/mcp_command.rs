@@ -96,6 +96,9 @@ enum Kind {
     /// A JSON array of objects; a JSON-encoded array arriving as a string is
     /// coerced.
     Objects,
+    /// A JSON object mapping strings to strings (e.g. environment variables);
+    /// a JSON-encoded object arriving as a string is coerced.
+    Map,
     /// A JSON number; a numeric string is coerced.
     Count,
 }
@@ -221,8 +224,49 @@ const TOOLS: &[Tool] = &[
     ),
     (
         "services_deploy",
-        "Tell one service's git watch that a push landed, so it fetches, rebuilds and restarts now.",
+        "Tell one service's git watch that a push landed, so it fetches, rebuilds and restarts now. \
+         Always forces the update and build to run again even if the branch tip has not moved.",
         &[("name", "The service's name.", true, Kind::Text)],
+    ),
+    (
+        "services_add",
+        "Install a new service that runs a git-deployed application: its program, build and serve \
+         commands, the repository it deploys from, and the node and port it runs on. Requires the \
+         services.admin grant, distinct from service.control — this defines what a service runs, \
+         rather than merely starting or stopping one that is already defined.",
+        &[
+            ("name", "Service name: letters, digits, dot, dash and underscore.", true, Kind::Text),
+            ("repository", "The git repository to deploy from, e.g. \"owner/repo\" or a full URL.", true, Kind::Text),
+            ("branch", "The branch to watch. Defaults to \"main\".", false, Kind::Text),
+            ("serve", "The command that starts the server, as an array: program first, then its arguments.", true, Kind::Words),
+            ("build", "A build command run before serve starts, if the application needs one.", false, Kind::Words),
+            ("port", "The port the server binds and the proxy forwards to.", true, Kind::Count),
+            ("node", "The node that runs this service.", true, Kind::Text),
+            ("domains", "Hostnames that should route to this application, if any.", false, Kind::Words),
+            ("env", "Extra environment variables for the process, as an object.", false, Kind::Map),
+        ],
+    ),
+    (
+        "services_repo_configure",
+        "Install a repository already tracked by the GitHub App (see repo list) as a running \
+         service — the same install services_add does, but starting from a tracked owner/repo \
+         rather than an arbitrary git URL. Set fromManifest=true to read selfhost.toml from the \
+         tip of the branch and fill in serve/build/port/env/health-path that were not given \
+         explicitly; an explicit argument always wins over the manifest. fromManifest is never \
+         assumed — it is a deliberate opt-in, because the manifest lives in a repository someone \
+         else can push to. Requires the services.admin grant.",
+        &[
+            ("owner", "The repository owner (the \"owner\" of \"owner/repo\").", true, Kind::Text),
+            ("repo", "The repository name (the \"repo\" of \"owner/repo\").", true, Kind::Text),
+            ("branch", "The branch to watch and, with fromManifest, to read selfhost.toml from. Defaults to \"main\".", false, Kind::Text),
+            ("fromManifest", "Read selfhost.toml from the repository and fold it in — see the tool description.", false, Kind::Flag),
+            ("serve", "The command that starts the server. Required unless fromManifest supplies one.", false, Kind::Words),
+            ("build", "A build command run before serve starts, if any.", false, Kind::Words),
+            ("port", "The port the server binds. Required unless fromManifest supplies one.", false, Kind::Count),
+            ("node", "The node that runs this service.", true, Kind::Text),
+            ("domains", "Hostnames that should route to this application, if any.", false, Kind::Words),
+            ("env", "Extra environment variables for the process, as an object.", false, Kind::Map),
+        ],
     ),
     (
         "self_update",
@@ -427,6 +471,7 @@ fn tool_schema(name: &str, description: &str, params: &[Param]) -> Json {
                     fields.push(("type".to_owned(), Json::string("array")));
                     fields.push(("items".to_owned(), Json::object([("type", Json::string("object"))])));
                 }
+                Kind::Map => fields.push(("type".to_owned(), Json::string("object"))),
             }
             (field.to_string(), Json::object(fields))
         })
@@ -530,6 +575,34 @@ fn objects(arguments: &Json, field: &str) -> Result<Option<Json>, String> {
         },
         Some(_) => Err(format!("\"{field}\" must be an array")),
     }
+}
+
+/// Reads an optional string-to-string map (e.g. `env`), coercing a
+/// JSON-encoded object that arrived as a string — the same allowance
+/// [`objects`] makes for an array.
+fn string_map(arguments: &Json, field: &str) -> Result<std::collections::BTreeMap<String, String>, String> {
+    let refuse = || format!("\"{field}\" must be an object of strings");
+    let of_object = |entries: &std::collections::BTreeMap<String, Json>| -> Result<std::collections::BTreeMap<String, String>, String> {
+        entries
+            .iter()
+            .map(|(k, v)| v.as_str().map(|v| (k.clone(), v.to_owned())).ok_or_else(refuse))
+            .collect()
+    };
+    match arguments.get(field) {
+        None | Some(Json::Null) => Ok(std::collections::BTreeMap::new()),
+        Some(Json::Object(entries)) => of_object(entries),
+        Some(Json::String(text)) => match selfhost_json::parse(text) {
+            Ok(Json::Object(entries)) => of_object(&entries),
+            _ => Err(refuse()),
+        },
+        Some(_) => Err(refuse()),
+    }
+}
+
+/// A required port number in range, from a [`count`]-shaped argument.
+fn port(arguments: &Json, field: &str) -> Result<u16, String> {
+    let value = count(arguments, field)?.ok_or_else(|| format!("\"{field}\" is required"))?;
+    u16::try_from(value).map_err(|_| format!("\"{field}\" must be between 1 and 65535"))
 }
 
 /// Reads an optional number, coercing a numeric string, rendered back as the
@@ -689,8 +762,110 @@ async fn call_tool(client: &RemoteClient, name: &str, arguments: &Json) -> Resul
         }
         "services_deploy" => {
             let service = required(arguments, "name")?;
+            // An agent calling this tool is always asking "redeploy this
+            // right now" — never "check whether anything changed" — so this
+            // always forces the update and build to run even if the branch
+            // tip has not moved since the last deploy. See
+            // `selfhost_git::check_once_forced`'s documentation for why the
+            // background poller never does the same.
+            let body = Json::object([("force", Json::Bool(true))]).to_text();
             let answer = client
-                .request("POST", &format!("/api/services/{}/deploy", encode(&service)), None)
+                .request(
+                    "POST",
+                    &format!("/api/services/{}/deploy", encode(&service)),
+                    Some(body.as_bytes()),
+                )
+                .await?;
+            Ok(answer.to_text())
+        }
+        "services_add" => {
+            let name = required(arguments, "name")?;
+            let repository = required(arguments, "repository")?;
+            let branch = optional(arguments, "branch");
+            let serve = words(arguments, "serve")?;
+            if serve.is_empty() {
+                return Err("\"serve\" needs at least one word".to_owned());
+            }
+            let build = words(arguments, "build")?;
+            let node = required(arguments, "node")?;
+            let port = port(arguments, "port")?;
+            let domains = words(arguments, "domains")?;
+            let env = string_map(arguments, "env")?;
+
+            let mut app = selfhost_app_deploy::AppSpec::new(&name, domains, repository, serve, node, port);
+            if !branch.is_empty() {
+                app.branch = branch;
+            }
+            if !build.is_empty() {
+                app.build = Some(build);
+            }
+            app.env = env;
+
+            let body = selfhost_supervisor::state::spec_to_json(&app.service()).to_text();
+            let answer = client
+                .request("PUT", &format!("/api/services/{}", encode(&app.name)), Some(body.as_bytes()))
+                .await?;
+            Ok(answer.to_text())
+        }
+        "services_repo_configure" => {
+            let owner = required(arguments, "owner")?;
+            let repo = required(arguments, "repo")?;
+            let branch = optional(arguments, "branch");
+            let branch_for_manifest =
+                if branch.is_empty() { selfhost_config::git::DEFAULT_BRANCH.to_owned() } else { branch.clone() };
+            let from_manifest = flag(arguments, "fromManifest")?.unwrap_or(false);
+            let serve = words(arguments, "serve")?;
+            let build = words(arguments, "build")?;
+            let node = required(arguments, "node")?;
+            let port = count(arguments, "port")?
+                .map(|value| {
+                    u16::try_from(value).map_err(|_| "\"port\" must be between 1 and 65535".to_owned())
+                })
+                .transpose()?;
+            let domains = words(arguments, "domains")?;
+            let env = string_map(arguments, "env")?;
+
+            // A clone that shells out to `git`, so it runs on a blocking
+            // thread rather than stalling this server's single-threaded
+            // runtime for however long the clone takes.
+            let manifest = if from_manifest {
+                let (task_owner, task_repo, task_branch) =
+                    (owner.clone(), repo.clone(), branch_for_manifest.clone());
+                let fetched = tokio::task::spawn_blocking(move || {
+                    crate::repo_command::fetch_manifest(&task_owner, &task_repo, &task_branch)
+                })
+                .await
+                .map_err(|error| format!("could not fetch the manifest: {error}"))??;
+                Some(fetched.ok_or_else(|| {
+                    format!(
+                        "fromManifest was set, but {owner}/{repo} has no {} at the tip of \"{branch_for_manifest}\"",
+                        selfhost_config::manifest::MANIFEST_FILENAME
+                    )
+                })?)
+            } else {
+                None
+            };
+
+            let mut app = crate::repo_command::compose_with_manifest(
+                &owner,
+                &repo,
+                &node,
+                port,
+                serve,
+                build,
+                domains,
+                manifest.as_ref(),
+            )?;
+            if !branch.is_empty() {
+                app.branch = branch;
+            }
+            for (key, value) in env {
+                app.env.entry(key).or_insert(value);
+            }
+
+            let body = selfhost_supervisor::state::spec_to_json(&app.service()).to_text();
+            let answer = client
+                .request("PUT", &format!("/api/services/{}", encode(&app.name)), Some(body.as_bytes()))
                 .await?;
             Ok(answer.to_text())
         }
@@ -1092,5 +1267,68 @@ mod tests {
     #[test]
     fn a_well_shaped_agent_token_is_accepted() {
         assert!(validate_agent_token_shape("agent:claude-mac:abc123").is_ok());
+    }
+
+    #[test]
+    fn string_map_accepts_a_real_object_and_a_json_encoded_string() {
+        let real = selfhost_json::parse(r#"{"env":{"A":"1","B":"2"}}"#).unwrap();
+        let mut expected = std::collections::BTreeMap::new();
+        expected.insert("A".to_owned(), "1".to_owned());
+        expected.insert("B".to_owned(), "2".to_owned());
+        assert_eq!(string_map(&real, "env"), Ok(expected.clone()));
+
+        let encoded = selfhost_json::parse(r#"{"env":"{\"A\":\"1\",\"B\":\"2\"}"}"#).unwrap();
+        assert_eq!(string_map(&encoded, "env"), Ok(expected));
+
+        let missing = selfhost_json::parse(r#"{}"#).unwrap();
+        assert_eq!(string_map(&missing, "env"), Ok(std::collections::BTreeMap::new()));
+    }
+
+    #[test]
+    fn a_port_in_range_is_accepted_and_out_of_range_is_refused() {
+        let good = selfhost_json::parse(r#"{"port":5050}"#).unwrap();
+        assert_eq!(port(&good, "port"), Ok(5050));
+
+        let too_big = selfhost_json::parse(r#"{"port":99999}"#).unwrap();
+        assert!(port(&too_big, "port").is_err());
+
+        let missing = selfhost_json::parse(r#"{}"#).unwrap();
+        assert!(port(&missing, "port").is_err());
+    }
+
+    #[test]
+    fn services_add_without_serve_is_refused_without_a_network_call() {
+        let params = selfhost_json::parse(
+            r#"{"name":"services_add","arguments":{"name":"app","repository":"https://example.com/r.git","node":"home","port":5050}}"#,
+        )
+        .unwrap();
+        let remote = Remote::parse("example.test").unwrap();
+        let client = RemoteClient::new(remote, "agent:x:y".to_owned());
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let result = runtime.block_on(tools_call_result(&client, &params));
+        assert_eq!(result.get("isError").and_then(Json::as_bool), Some(true));
+    }
+
+    #[test]
+    fn services_repo_configure_without_a_manifest_or_serve_and_port_is_refused() {
+        let params = selfhost_json::parse(
+            r#"{"name":"services_repo_configure","arguments":{"owner":"octocat","repo":"hello-world","node":"home"}}"#,
+        )
+        .unwrap();
+        let remote = Remote::parse("example.test").unwrap();
+        let client = RemoteClient::new(remote, "agent:x:y".to_owned());
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let result = runtime.block_on(tools_call_result(&client, &params));
+        assert_eq!(result.get("isError").and_then(Json::as_bool), Some(true));
+    }
+
+    #[test]
+    fn both_new_service_tools_and_services_admin_are_advertised() {
+        let listing = tools_list_result();
+        let tools = listing.get("tools").and_then(Json::as_array).expect("a tools array");
+        let names: Vec<&str> =
+            tools.iter().filter_map(|tool| tool.get("name").and_then(Json::as_str)).collect();
+        assert!(names.contains(&"services_add"), "{names:?}");
+        assert!(names.contains(&"services_repo_configure"), "{names:?}");
     }
 }
