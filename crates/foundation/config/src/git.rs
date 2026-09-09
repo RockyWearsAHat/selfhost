@@ -1,31 +1,29 @@
 //! Watching a Git branch so a push redeploys a service.
 //!
 //! A [`GitWatch`] attached to a [`ServiceSpec`](crate::ServiceSpec) says: keep a
-//! working copy of this branch on disk, and when the branch moves, update the
-//! copy, run the build step, and restart the service.
+//! working copy of this branch on disk, and when a GitHub App webhook reports
+//! that it moved, update the copy, run the build step, and restart the
+//! service.
 //!
-//! # Two triggers, and why neither is allowed to be the only one
+//! # The webhook is the only automatic trigger
 //!
-//! **A webhook is the fast path.** A push reaches this box in the time one HTTP
-//! request takes, so a deployment starts within a second of the commit landing
-//! rather than up to a whole interval later.
+//! A push reaches this box in the time one HTTP request takes, so a deployment
+//! starts within a second of the commit landing. There is deliberately no
+//! poll underneath it any more: a background timer that re-checks every
+//! service's remote on a schedule spends a hosting provider's rate limit on
+//! every watched repository, on every deployment, forever, to guard against a
+//! webhook delivery failure that a real GitHub App installation (signed,
+//! retried by GitHub on failure) rarely has. What remains for that case is the
+//! manual door: `POST /api/services/<name>/deploy` (`selfhost repo deploy`,
+//! the console's deploy button) drives the identical check-and-deploy
+//! sequence on demand, for a repository the webhook has not yet been wired to
+//! or a delivery that an operator confirms was missed.
 //!
-//! **A poll is the floor under it.** A webhook is an event that has to arrive,
-//! and it does not arrive when the network hiccups, when the hook was pointed at
-//! a URL form the sender does not use, or when nobody configured one at all.
-//! Every one of those failures is silent, which is the worst property a
-//! deployment trigger can have. A poll cannot fail silently: it either answers
-//! with a commit or reports why it could not.
-//!
-//! So both run, and the webhook is never permitted to become the only path — it
-//! makes a poll happen *sooner*, it does not replace one. That is also what
-//! makes the webhook safe to expose: the poll it triggers reads the real branch
-//! tip with `git ls-remote` before acting, so the request body is never trusted
-//! for *what* to deploy. A forged request can only make a legitimate deployment
-//! happen earlier; it can never deploy something that is not at the branch tip.
-//!
-//! Because the webhook carries the latency, the poll interval is a safety net
-//! rather than the mechanism, and [`DEFAULT_INTERVAL_SECS`] is set accordingly.
+//! The webhook is still safe to expose for the same reason it always was: it
+//! never carries a commit to trust. It reads the real branch tip with
+//! `git ls-remote` before acting, so a forged request can only make a
+//! legitimate deployment happen; it can never deploy something that is not at
+//! the branch tip.
 //!
 //! # Why the working copy is separate from the service's directory
 //!
@@ -39,24 +37,6 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
 use crate::validate::Problem;
-
-/// The shortest poll interval that is allowed.
-///
-/// A remote-ref check is cheap but it is not free, and a one-second poll against
-/// a hosting provider is how an account meets a rate limit. Ten seconds is far
-/// below any interval a person would choose deliberately, so this only ever
-/// catches a mistake or a zero left in by a config that omitted the field.
-pub const MIN_INTERVAL_SECS: u64 = 10;
-
-/// How often a branch is checked, when the config does not say.
-///
-/// Five minutes, not one: with a webhook configured the poll is the *safety
-/// net* under it, not the thing that notices a push, so its job is to catch a
-/// hook that never arrived rather than to keep latency down. A push with a
-/// working webhook deploys in about a second regardless of this number, and a
-/// deployment with no webhook still never sits more than this long behind its
-/// branch.
-pub const DEFAULT_INTERVAL_SECS: u64 = 300;
 
 /// The branch a watch follows when the config does not name one.
 pub const DEFAULT_BRANCH: &str = "main";
@@ -84,10 +64,6 @@ pub struct GitWatch {
     /// the same way and can be the same directory.
     pub path: PathBuf,
 
-    /// Seconds between checks of the remote branch.
-    #[serde(default = "default_interval")]
-    pub interval_secs: u64,
-
     /// Whether this watch runs at all.
     ///
     /// Kept rather than deleted so a watch can be switched off during an incident
@@ -97,9 +73,10 @@ pub struct GitWatch {
 
     /// Whether a moved branch is deployed, or only reported.
     ///
-    /// `false` still polls and still records what it found in the service's
-    /// output, which is what makes "is this branch ahead of what is deployed?"
-    /// answerable without granting the daemon permission to act on it.
+    /// `false` still checks on a trigger and still records what it found in
+    /// the service's output, which is what makes "is this branch ahead of
+    /// what is deployed?" answerable without granting the daemon permission
+    /// to act on it.
     #[serde(default = "default_true")]
     pub auto_update: bool,
 
@@ -114,21 +91,21 @@ pub struct GitWatch {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub post_pull: Option<Vec<String>>,
 
-    /// A shared secret that lets a push notify this watch's poll to run now,
-    /// instead of waiting out `interval_secs`.
+    /// A shared secret that authenticates a push notifying this watch that
+    /// its branch moved.
     ///
-    /// `None` (the default) leaves this watch poll-only — nothing about
-    /// polling changes, and the webhook path refuses any request naming it.
-    /// Set only from this daemon's own, never-committed config; a hosting
+    /// `None` (the default) leaves this watch with no automatic trigger at
+    /// all — the webhook path refuses any request naming it, and the only way
+    /// to deploy is the manual `POST /api/services/<name>/deploy` door. Set
+    /// only from this daemon's own, never-committed config; a hosting
     /// provider's webhook UI is told the same value so it can sign what it
     /// sends.
     ///
-    /// This secret authenticates *who may ask for an earlier poll* — it is
-    /// not what makes a deployment safe. The poll it triggers always reads
-    /// the real branch tip with `git ls-remote` before doing anything, so
-    /// even a forged request can only make a legitimate deployment happen
-    /// sooner; it can never deploy content that is not actually at the tip of
-    /// the watched branch.
+    /// This secret authenticates *who may report a push* — it is not what
+    /// makes a deployment safe. The check it triggers always reads the real
+    /// branch tip with `git ls-remote` before doing anything, so even a
+    /// forged request can never deploy content that is not actually at the
+    /// tip of the watched branch.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub webhook_secret: Option<String>,
 }
@@ -145,9 +122,10 @@ pub const DEFAULT_SELF_BUILD: &[&str] = &["cargo", "build", "--release", "-p", "
 /// copy, which is why this is its own type rather than a `GitWatch` with a
 /// hard-coded path.
 ///
-/// How an update lands is the daemon's business (`selfhost daemon` polls,
-/// fetches, builds, and exits for its service manager to restart it); this type
-/// only says what to watch and how often.
+/// How an update lands is the daemon's business (`selfhost daemon` fetches,
+/// builds, and exits for its service manager to restart it, on a webhook
+/// delivery or a manual `POST /api/self-update/deploy`); this type only says
+/// what to watch.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SelfUpdate {
     /// The repository this deployment is a clone of.
@@ -160,10 +138,6 @@ pub struct SelfUpdate {
     #[serde(default = "default_branch")]
     pub branch: String,
 
-    /// Seconds between checks of the remote branch.
-    #[serde(default = "default_interval")]
-    pub interval_secs: u64,
-
     /// Whether the watch runs at all — kept, like [`GitWatch::enabled`], so it
     /// can be switched off during an incident without being retyped after.
     #[serde(default = "default_true")]
@@ -175,8 +149,8 @@ pub struct SelfUpdate {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub build: Option<Vec<String>>,
 
-    /// A shared secret that lets a push update this deployment *now*, instead
-    /// of waiting out `interval_secs`.
+    /// A shared secret that authenticates a push notifying this deployment
+    /// that it should update now.
     ///
     /// The same mechanism, guarantees and threat model as
     /// [`GitWatch::webhook_secret`] — read that field's documentation, it is the
@@ -185,8 +159,8 @@ pub struct SelfUpdate {
     /// reserved: it names this section, never a service, so a service called
     /// `self` cannot claim it.
     ///
-    /// `None` (the default) leaves self-update poll-only, and the reserved path
-    /// answers exactly as an unknown one does.
+    /// `None` (the default) leaves self-update with no automatic trigger, and
+    /// the reserved path answers exactly as an unknown one does.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub webhook_secret: Option<String>,
 }
@@ -203,7 +177,6 @@ impl SelfUpdate {
         Self {
             repository: repository.into(),
             branch: default_branch(),
-            interval_secs: DEFAULT_INTERVAL_SECS,
             enabled: true,
             build: None,
             webhook_secret: None,
@@ -223,7 +196,6 @@ impl SelfUpdate {
     pub fn as_watch(&self) -> GitWatch {
         let mut watch = GitWatch::new(self.repository.clone(), ".");
         watch.branch = self.branch.clone();
-        watch.interval_secs = self.interval_secs;
         watch.enabled = self.enabled;
         watch
     }
@@ -237,15 +209,6 @@ impl SelfUpdate {
         if let Some(message) = branch_problem(&self.branch) {
             problems.push(Problem { field: format!("{at}.branch"), message });
         }
-        if self.interval_secs < MIN_INTERVAL_SECS {
-            problems.push(Problem {
-                field: format!("{at}.interval_secs"),
-                message: format!(
-                    "must be at least {MIN_INTERVAL_SECS}; a shorter interval spends the \
-                     hosting provider's rate limit without noticing a push any sooner"
-                ),
-            });
-        }
         if self.build.as_ref().is_some_and(|command| command.is_empty()) {
             problems.push(Problem {
                 field: format!("{at}.build"),
@@ -255,7 +218,8 @@ impl SelfUpdate {
         if self.webhook_secret.as_deref().is_some_and(str::is_empty) {
             problems.push(Problem {
                 field: format!("{at}.webhook_secret"),
-                message: "is present but empty; omit it entirely to leave self-update poll-only"
+                message: "is present but empty; omit it entirely to leave self-update without \
+                          a webhook trigger"
                     .into(),
             });
         }
@@ -264,10 +228,6 @@ impl SelfUpdate {
 
 fn default_branch() -> String {
     DEFAULT_BRANCH.to_owned()
-}
-
-fn default_interval() -> u64 {
-    DEFAULT_INTERVAL_SECS
 }
 
 fn default_true() -> bool {
@@ -281,7 +241,6 @@ impl GitWatch {
             repository: repository.into(),
             branch: default_branch(),
             path: path.into(),
-            interval_secs: DEFAULT_INTERVAL_SECS,
             enabled: true,
             auto_update: true,
             post_pull: None,
@@ -289,7 +248,7 @@ impl GitWatch {
         }
     }
 
-    /// Whether this watch should be polled at all.
+    /// Whether this watch is switched on at all.
     pub fn is_active(&self) -> bool {
         self.enabled
     }
@@ -338,16 +297,6 @@ impl GitWatch {
             });
         }
 
-        if self.interval_secs < MIN_INTERVAL_SECS {
-            problems.push(Problem {
-                field: format!("{at}.interval_secs"),
-                message: format!(
-                    "must be at least {MIN_INTERVAL_SECS}; a shorter interval spends the \
-                     hosting provider's rate limit without noticing a push any sooner"
-                ),
-            });
-        }
-
         if self.post_pull.as_ref().is_some_and(|command| command.is_empty()) {
             problems.push(Problem {
                 field: format!("{at}.post_pull"),
@@ -359,7 +308,8 @@ impl GitWatch {
         if self.webhook_secret.as_deref().is_some_and(str::is_empty) {
             problems.push(Problem {
                 field: format!("{at}.webhook_secret"),
-                message: "is present but empty; omit it entirely to leave this watch poll-only"
+                message: "is present but empty; omit it entirely to leave this watch with no \
+                          webhook trigger"
                     .into(),
             });
         }
@@ -463,7 +413,6 @@ mod tests {
         let watch = GitWatch::new("https://github.com/owner/repo.git", "checkouts/site");
         assert!(problems_of(&watch).is_empty());
         assert_eq!(watch.branch, "main");
-        assert_eq!(watch.interval_secs, DEFAULT_INTERVAL_SECS);
         assert!(watch.enabled && watch.auto_update);
     }
 
@@ -514,14 +463,6 @@ mod tests {
             watch.branch = good.into();
             assert!(problems_of(&watch).is_empty(), "refused {good:?}");
         }
-    }
-
-    #[test]
-    fn a_poll_faster_than_the_floor_is_refused_with_the_reason() {
-        let mut watch = GitWatch::new("https://example.com/r.git", "site");
-        watch.interval_secs = 1;
-        let problems = problems_of(&watch);
-        assert!(problems.iter().any(|p| p.message.contains("rate limit")), "{problems:?}");
     }
 
     #[test]

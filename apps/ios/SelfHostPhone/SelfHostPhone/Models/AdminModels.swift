@@ -228,8 +228,6 @@ struct GitWatch: Decodable, Equatable {
     let branch: String
     /// Where the working copy lives, relative to the daemon's data directory.
     let path: String
-    /// Seconds between polls.
-    let intervalSecs: UInt64
     /// Whether the watch is switched on.
     let enabled: Bool
     /// Whether a moved branch is deployed automatically.
