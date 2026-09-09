@@ -205,9 +205,10 @@ pub fn whoami_json(caller: &Caller) -> Json {
 /// because this table is what a client draws from before it has a
 /// [`Capability`] to ask, and `honoured_word` below is what stops the two
 /// disagreeing.
-pub const VOCABULARY: [(&str, Option<&str>, bool); 12] = [
+pub const VOCABULARY: [(&str, Option<&str>, bool); 13] = [
     ("console.read", None, true),
     ("service.control", None, true),
+    ("services.admin", None, true),
     ("files.read", Some("share"), true),
     ("files.write", Some("share"), true),
     ("files.admin", None, true),
