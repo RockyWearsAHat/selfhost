@@ -409,7 +409,7 @@ async fn update_working_copy(
     let watch = spec.watch();
 
     if !fresh {
-        for args in [plan::fetch_args(&watch, checkout), plan::reset_args(checkout)] {
+        for args in [plan::fetch_args(&watch, checkout, None), plan::reset_args(checkout)] {
             run_git(&args, base, "update").await?;
         }
         return Ok(());
@@ -434,7 +434,7 @@ async fn update_working_copy(
         return Err(("update", format!("cannot create {}: {error}", parent.display())));
     }
 
-    run_git(&plan::clone_args(&watch, checkout), base, "clone").await
+    run_git(&plan::clone_args(&watch, checkout, None), base, "clone").await
 }
 
 /// Runs one `git` command, mapping both a non-zero exit and a failure to run into

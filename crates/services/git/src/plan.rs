@@ -28,15 +28,33 @@ fn global_options() -> Vec<String> {
     ]
 }
 
+/// The URL a `git` invocation should actually use: `authenticated` when one was
+/// minted for this poll, `watch.repository` otherwise.
+///
+/// Kept separate from `watch.repository` everywhere a URL might be logged —
+/// `authenticated` carries a live installation token in its userinfo, and
+/// `watch.repository` is what error messages and the service's own output are
+/// allowed to print. Never let an `authenticated` value reach a `format!` that
+/// isn't building `git` arguments.
+fn repository_url(watch: &GitWatch, authenticated: Option<&str>) -> String {
+    match authenticated {
+        Some(url) => url.to_owned(),
+        None => watch.repository.trim().to_owned(),
+    }
+}
+
 /// Arguments for asking the remote what commit a branch points at.
 ///
 /// `--exit-code` is what turns "that branch does not exist" into a failure
 /// instead of an empty answer that reads exactly like "nothing has changed".
-pub fn ls_remote_args(watch: &GitWatch) -> Vec<String> {
+///
+/// `authenticated`, when given, is used in place of `watch.repository` — see
+/// [`repository_url`].
+pub fn ls_remote_args(watch: &GitWatch, authenticated: Option<&str>) -> Vec<String> {
     let mut args = global_options();
     args.push("ls-remote".into());
     args.push("--exit-code".into());
-    args.push(watch.repository.trim().to_owned());
+    args.push(repository_url(watch, authenticated));
     args.push(watch.remote_ref());
     args
 }
@@ -45,29 +63,77 @@ pub fn ls_remote_args(watch: &GitWatch) -> Vec<String> {
 ///
 /// `--single-branch` because a deployment needs one branch, and cloning every
 /// branch of a large repository is bandwidth spent on history nobody will read.
-pub fn clone_args(watch: &GitWatch, into: &Path) -> Vec<String> {
+///
+/// `authenticated`, when given, is used in place of `watch.repository` — see
+/// [`repository_url`].
+pub fn clone_args(watch: &GitWatch, into: &Path, authenticated: Option<&str>) -> Vec<String> {
     let mut args = global_options();
     args.push("clone".into());
     args.push("--single-branch".into());
     args.push("--branch".into());
     args.push(watch.branch.clone());
     args.push("--".into());
-    args.push(watch.repository.trim().to_owned());
+    args.push(repository_url(watch, authenticated));
     args.push(into.display().to_string());
     args
 }
 
 /// Arguments for fetching the watched branch into an existing working copy.
-pub fn fetch_args(watch: &GitWatch, at: &Path) -> Vec<String> {
+///
+/// `authenticated`, when given, is used in place of `watch.repository` — see
+/// [`repository_url`].
+pub fn fetch_args(watch: &GitWatch, at: &Path, authenticated: Option<&str>) -> Vec<String> {
     let mut args = global_options();
     args.push("-C".into());
     args.push(at.display().to_string());
     args.push("fetch".into());
     args.push("--prune".into());
     args.push("--".into());
-    args.push(watch.repository.trim().to_owned());
+    args.push(repository_url(watch, authenticated));
     args.push(watch.remote_ref());
     args
+}
+
+/// Splits a `github.com` remote — SSH (`git@github.com:owner/repo.git`) or
+/// HTTPS (`https://github.com/owner/repo.git`, with or without a `.git` suffix
+/// or trailing slash) — into its owner and repository name.
+///
+/// `None` for anything else: a non-`github.com` host, a malformed URL, or a
+/// URL missing either segment. This is the gate for whether a repository is
+/// even worth asking the GitHub App about — an installation token is only ever
+/// useful for a `github.com` remote.
+pub fn parse_github_owner_repo(repository: &str) -> Option<(String, String)> {
+    let repository = repository.trim();
+    let path = if let Some(rest) = repository.strip_prefix("git@github.com:") {
+        rest
+    } else if let Some(rest) = repository.strip_prefix("ssh://git@github.com/") {
+        rest
+    } else if let Some(rest) = repository.strip_prefix("https://github.com/") {
+        rest
+    } else if let Some(rest) = repository.strip_prefix("http://github.com/") {
+        rest
+    } else {
+        return None;
+    };
+
+    let path = path.trim_end_matches('/').strip_suffix(".git").unwrap_or(path.trim_end_matches('/'));
+    let (owner, repo) = path.split_once('/')?;
+    if owner.is_empty() || repo.is_empty() || repo.contains('/') {
+        return None;
+    }
+    Some((owner.to_owned(), repo.to_owned()))
+}
+
+/// Builds the authenticated HTTPS URL `git` should fetch from, given a
+/// short-lived GitHub App installation token.
+///
+/// `x-access-token` is GitHub's documented username for this: any string
+/// works as the username when the password is an installation token, and
+/// `x-access-token` is what GitHub's own docs use, so a URL that leaks into a
+/// stray log line is at least recognizable as what it is rather than
+/// mistaken for a personal credential.
+pub fn authenticated_url(owner: &str, repo: &str, token: &str) -> String {
+    format!("https://x-access-token:{token}@github.com/{owner}/{repo}.git")
 }
 
 /// Arguments for moving the working copy onto what was just fetched.
@@ -265,9 +331,9 @@ mod tests {
     fn every_invocation_disables_the_transport_that_runs_commands() {
         let at = PathBuf::from("/data/site");
         for args in [
-            ls_remote_args(&watch()),
-            clone_args(&watch(), &at),
-            fetch_args(&watch(), &at),
+            ls_remote_args(&watch(), None),
+            clone_args(&watch(), &at, None),
+            fetch_args(&watch(), &at, None),
             reset_args(&at),
             head_args(&at),
         ] {
@@ -280,7 +346,7 @@ mod tests {
 
     #[test]
     fn the_remote_is_asked_for_the_fully_qualified_branch_and_must_find_it() {
-        let args = ls_remote_args(&watch());
+        let args = ls_remote_args(&watch(), None);
         assert!(args.contains(&"--exit-code".to_owned()), "an absent branch must fail, not read as unchanged");
         assert_eq!(args.last().map(String::as_str), Some("refs/heads/main"));
     }
@@ -290,10 +356,63 @@ mod tests {
         // The URL is validated before it gets here, so this is the second lock on
         // the same door: even a URL starting with a dash lands as a repository.
         let at = PathBuf::from("/data/site");
-        for args in [clone_args(&watch(), &at), fetch_args(&watch(), &at)] {
+        for args in [clone_args(&watch(), &at, None), fetch_args(&watch(), &at, None)] {
             let end = args.iter().position(|a| a == "--").expect("a separator");
             assert!(args[end + 1..].iter().any(|a| a.contains("github.com")), "{args:?}");
         }
+    }
+
+    #[test]
+    fn an_authenticated_url_replaces_the_configured_repository_in_every_arg_builder() {
+        let at = PathBuf::from("/data/site");
+        let token_url = "https://x-access-token:ghs_secret@github.com/owner/repo.git";
+        for args in [
+            ls_remote_args(&watch(), Some(token_url)),
+            clone_args(&watch(), &at, Some(token_url)),
+            fetch_args(&watch(), &at, Some(token_url)),
+        ] {
+            assert!(args.contains(&token_url.to_owned()), "{args:?}");
+            assert!(!args.iter().any(|a| a == "https://github.com/owner/repo.git"), "{args:?}");
+        }
+    }
+
+    #[test]
+    fn ssh_and_https_github_remotes_yield_the_same_owner_and_repo() {
+        for repository in [
+            "git@github.com:RockyWearsAHat/ai-studio.git",
+            "ssh://git@github.com/RockyWearsAHat/ai-studio.git",
+            "https://github.com/RockyWearsAHat/ai-studio.git",
+            "https://github.com/RockyWearsAHat/ai-studio",
+            "https://github.com/RockyWearsAHat/ai-studio/",
+            "http://github.com/RockyWearsAHat/ai-studio.git",
+        ] {
+            assert_eq!(
+                parse_github_owner_repo(repository),
+                Some(("RockyWearsAHat".to_owned(), "ai-studio".to_owned())),
+                "{repository}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_non_github_remote_has_no_owner_and_repo() {
+        assert_eq!(parse_github_owner_repo("https://example.com/owner/repo.git"), None);
+        assert_eq!(parse_github_owner_repo("git@example.com:owner/repo.git"), None);
+    }
+
+    #[test]
+    fn a_malformed_github_remote_has_no_owner_and_repo() {
+        assert_eq!(parse_github_owner_repo("https://github.com/onlyowner"), None);
+        assert_eq!(parse_github_owner_repo("https://github.com/"), None);
+        assert_eq!(parse_github_owner_repo("git@github.com:owner/nested/repo.git"), None);
+    }
+
+    #[test]
+    fn the_authenticated_url_carries_the_token_as_the_https_password() {
+        assert_eq!(
+            authenticated_url("RockyWearsAHat", "ai-studio", "ghs_abc123"),
+            "https://x-access-token:ghs_abc123@github.com/RockyWearsAHat/ai-studio.git"
+        );
     }
 
     #[test]

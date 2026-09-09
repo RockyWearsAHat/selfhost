@@ -78,11 +78,16 @@ pub fn working_copy(base_dir: &Path, watch: &GitWatch) -> PathBuf {
 ///
 /// Returns what happened, having already written every step into the service's
 /// captured output.
+///
+/// `credential`, when given, is a freshly-minted authenticated URL for
+/// `watch.repository` (see [`plan::authenticated_url`]) — used for the actual
+/// `git` transfer in place of `watch.repository`, never logged.
 pub async fn carry_out(
     supervisor: &Supervisor,
     spec: &ServiceSpec,
     watch: &GitWatch,
     step: &Step,
+    credential: Option<&str>,
 ) -> Outcome {
     let name = &spec.name;
     match step {
@@ -93,7 +98,7 @@ pub async fn carry_out(
         }
         Step::Clone { to } | Step::Deploy { to, .. } => {
             note(supervisor, name, step.describe()).await;
-            update(supervisor, spec, watch, to).await
+            update(supervisor, spec, watch, to, credential).await
         }
     }
 }
@@ -104,6 +109,7 @@ async fn update(
     spec: &ServiceSpec,
     watch: &GitWatch,
     commit: &str,
+    credential: Option<&str>,
 ) -> Outcome {
     let name = &spec.name;
     let base = supervisor.base_dir().to_path_buf();
@@ -130,7 +136,7 @@ async fn update(
         }
     }
 
-    if let Err(reason) = fetch_into(&path, watch, &base).await {
+    if let Err(reason) = fetch_into(&path, watch, &base, credential).await {
         return failed(supervisor, name, "update", reason).await;
     }
 
@@ -156,9 +162,9 @@ async fn update(
 ///
 /// Clones when there is nothing there yet, and fetches then hard-resets when
 /// there is. Returns the reason on failure, already fit to show an operator.
-async fn fetch_into(path: &Path, watch: &GitWatch, base: &Path) -> Result<(), String> {
+async fn fetch_into(path: &Path, watch: &GitWatch, base: &Path, credential: Option<&str>) -> Result<(), String> {
     if path.join(".git").is_dir() {
-        for args in [plan::fetch_args(watch, path), plan::reset_args(path)] {
+        for args in [plan::fetch_args(watch, path, credential), plan::reset_args(path)] {
             match run::git(&args, base, TRANSFER_TIMEOUT).await {
                 Ok(ran) if ran.succeeded() => {}
                 Ok(ran) => return Err(ran.complaint()),
@@ -184,7 +190,7 @@ async fn fetch_into(path: &Path, watch: &GitWatch, base: &Path) -> Result<(), St
         return Err(format!("cannot create {}: {error}", parent.display()));
     }
 
-    match run::git(&plan::clone_args(watch, path), base, TRANSFER_TIMEOUT).await {
+    match run::git(&plan::clone_args(watch, path, credential), base, TRANSFER_TIMEOUT).await {
         Ok(ran) if ran.succeeded() => Ok(()),
         Ok(ran) => Err(ran.complaint()),
         Err(error) => Err(error.to_string()),
@@ -256,7 +262,7 @@ mod tests {
             .await
             .expect("a file to protect");
 
-        let error = fetch_into(&occupied, &watch(), &base).await.expect_err("should refuse");
+        let error = fetch_into(&occupied, &watch(), &base, None).await.expect_err("should refuse");
         assert!(error.contains("not a git working copy"), "{error}");
         assert!(occupied.join("important.txt").exists(), "it must not have been destroyed");
 
@@ -271,7 +277,7 @@ mod tests {
         spec.git = Some(watch());
         supervisor.install(spec.clone()).await;
 
-        let outcome = carry_out(&supervisor, &spec, &watch(), &Step::UpToDate).await;
+        let outcome = carry_out(&supervisor, &spec, &watch(), &Step::UpToDate, None).await;
         assert_eq!(outcome, Outcome::NothingToDo);
 
         let logs = supervisor.logs("site", 0, 100).await.expect("the service exists");
@@ -292,7 +298,7 @@ mod tests {
         let mut watch = watch();
         watch.auto_update = false;
         let step = Step::Behind { from: Some("1111111".into()), to: "2222222".into() };
-        assert_eq!(carry_out(&supervisor, &spec, &watch, &step).await, Outcome::Reported);
+        assert_eq!(carry_out(&supervisor, &spec, &watch, &step, None).await, Outcome::Reported);
 
         let logs = supervisor.logs("reporting", 0, 100).await.expect("the service exists");
         let text: String = logs.lines.iter().map(|line| line.text.clone()).collect();

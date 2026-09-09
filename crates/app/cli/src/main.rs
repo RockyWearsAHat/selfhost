@@ -959,10 +959,27 @@ async fn serve_everything(
 
     supervisor.load(&catalog).await;
 
+    // When a GitHub App is configured, a watched service whose repository it
+    // has installed is fetched over an authenticated HTTPS URL minted fresh
+    // per poll, rather than needing a static SSH deploy key — see
+    // `selfhost_github_app::AppCredentialSource`. A repository the App does
+    // not track (or no `[github_app]` at all) falls back to today's
+    // unauthenticated/SSH behavior unchanged.
+    let github_credentials: Option<std::sync::Arc<dyn selfhost_git::CredentialSource>> =
+        config.github_app.as_ref().and_then(|app| {
+            let store = selfhost_github_app::Store::load(selfhost_github_app::store_path(&data_dir)).ok()?;
+            let credentials = selfhost_github_app::AppCredentials {
+                app_id: app.app_id,
+                private_key_pkcs8_pem_path: data_dir.join(&app.private_key_path),
+            };
+            Some(std::sync::Arc::new(selfhost_github_app::AppCredentialSource::new(credentials, store))
+                as std::sync::Arc<dyn selfhost_git::CredentialSource>)
+        });
+
     // Stated rather than assumed: a branch that is silently not being watched
     // looks exactly like one that has not been pushed to.
     let watches = selfhost_git::Watches::default();
-    match watches.load(&supervisor, &catalog).await {
+    match watches.load_with_credentials(&supervisor, &catalog, github_credentials.clone()).await {
         0 => {}
         1 => println!("\nwatching 1 git branch for deployments"),
         watched => println!("\nwatching {watched} git branches for deployments"),
@@ -1070,6 +1087,7 @@ async fn serve_everything(
     // Console auth is read once here: a `selfhost console-password` run takes
     // effect at the next daemon restart.
     let mut api = Api::new(supervisor.clone(), store, token, watches.clone(), firewall.clone())
+        .with_github_credentials(github_credentials.clone())
         .with_console_auth(&data_dir)
         // `selfhost agent add|list|revoke` writes `console.agents` directly,
         // in this same data directory; this is what lets the daemon verify

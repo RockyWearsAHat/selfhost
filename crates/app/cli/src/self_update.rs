@@ -134,7 +134,7 @@ async fn poll_once(update: &SelfUpdate, project_dir: &Path) -> Result<Progress, 
     let watch = update.as_watch();
 
     let remote = {
-        let ran = git(&plan::ls_remote_args(&watch), project_dir, LS_REMOTE_TIMEOUT).await?;
+        let ran = git(&plan::ls_remote_args(&watch, None), project_dir, LS_REMOTE_TIMEOUT).await?;
         plan::commit_for_ref(&ran, &watch.remote_ref())
             .ok_or_else(|| format!("{} has no branch {}", update.repository, update.branch))?
     };
@@ -169,7 +169,7 @@ async fn poll_once(update: &SelfUpdate, project_dir: &Path) -> Result<Progress, 
         plan::short(&local),
         plan::short(&remote)
     );
-    git(&plan::fetch_args(&watch, project_dir), project_dir, TRANSFER_TIMEOUT).await?;
+    git(&plan::fetch_args(&watch, project_dir, None), project_dir, TRANSFER_TIMEOUT).await?;
 
     // Only ever fast-forward. A local HEAD that is not an ancestor of the
     // fetched tip holds commits the branch does not — a developer working in

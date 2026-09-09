@@ -61,7 +61,7 @@ pub mod upgrade;
 pub mod webauthn;
 
 use selfhost_firewall::Manager;
-use selfhost_git::{Nudge, Watches};
+use selfhost_git::{CredentialSource, Nudge, Watches};
 use selfhost_http::{Body, Method, Request, Response, Status};
 use selfhost_identity::{Caller, Capability, Grants, Opening, People, PersonName, Policy};
 
@@ -154,6 +154,11 @@ pub struct Api {
     store: Arc<Store>,
     token: Token,
     watches: Watches,
+    /// A source of authenticated fetch URLs for a service just installed or
+    /// updated through this API, so a repository the GitHub App tracks is
+    /// watched with the same credentials the daemon's startup watch uses —
+    /// see [`Api::with_github_credentials`].
+    github_credentials: Option<Arc<dyn CredentialSource>>,
     firewall: Manager,
     /// The signal that asks the self-update watcher to check its branch now.
     ///
@@ -859,6 +864,7 @@ impl Api {
             store: Arc::new(store),
             token,
             watches,
+            github_credentials: None,
             firewall,
             self_update: None,
             console: None,
@@ -887,6 +893,16 @@ impl Api {
     /// the honest report for a deployment nobody has enrolled an agent on.
     pub fn with_agents(mut self, data_dir: &Path) -> Self {
         self.agents = Some(agent_store::AgentStore::in_dir(data_dir));
+        self
+    }
+
+    /// Gives a service installed or updated through this API (`PUT
+    /// /api/services/<name>`) the same GitHub App-backed fetch credentials
+    /// the daemon's own startup watch uses, so a repository the App tracks
+    /// does not need a static SSH deploy key regardless of whether its watch
+    /// started at boot or was added live.
+    pub fn with_github_credentials(mut self, credentials: Option<Arc<dyn CredentialSource>>) -> Self {
+        self.github_credentials = credentials;
         self
     }
 
@@ -2904,7 +2920,7 @@ impl Api {
         self.supervisor.install(spec.clone()).await;
         // After the install, not before: a watch polling a service the supervisor
         // has not been given yet would find nothing to stop or start.
-        self.watches.follow(&self.supervisor, &spec).await;
+        self.watches.follow_with_credentials(&self.supervisor, &spec, self.github_credentials.clone()).await;
 
         match self.supervisor.status(name).await {
             Some(status) => json(Status(200), status.to_json()),

@@ -391,6 +391,7 @@ dependencies = [
  "ring",
  "rustls",
  "rustls-pemfile",
+ "selfhost-git",
  "selfhost-http",
  "selfhost-json",
  "serde",
