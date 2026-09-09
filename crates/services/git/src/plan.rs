@@ -307,7 +307,25 @@ impl Step {
 /// the feature off and one that turns the *watching* off, and only the first is
 /// useful for answering "is production behind?".
 pub fn decide(watch: &GitWatch, local: Option<&str>, remote: &str) -> Step {
+    decide_forced(watch, local, remote, false)
+}
+
+/// Same as [`decide`], but `force` skips the "already on the branch's commit"
+/// short-circuit: an unmoved branch still produces a [`Step::Deploy`] rather
+/// than [`Step::UpToDate`].
+///
+/// This is specifically the "someone asked for a redeploy right now" case
+/// (`services_deploy`'s `force: true`, `selfhost repo configure`'s explicit
+/// redeploy) — never what a background poll passes, because an unattended poll
+/// that redeployed on every tick regardless of whether anything moved would
+/// make "poll" and "redeploy" the same word. A watch with no working copy yet
+/// (`local: None`) ignores `force` and still clones exactly as [`decide`]
+/// would: there is no previous build to redo.
+pub fn decide_forced(watch: &GitWatch, local: Option<&str>, remote: &str, force: bool) -> Step {
     match local {
+        Some(local) if local == remote && force => {
+            Step::Deploy { from: Some(local.to_owned()), to: remote.to_owned() }
+        }
         Some(local) if local == remote => Step::UpToDate,
         Some(local) if watch.auto_update => {
             Step::Deploy { from: Some(local.to_owned()), to: remote.to_owned() }
@@ -525,6 +543,38 @@ mod tests {
         assert!(!decide(&watch, None, "2222222").acts());
         // But an unmoved branch is still simply up to date.
         assert_eq!(decide(&watch, Some("2222222"), "2222222"), Step::UpToDate);
+    }
+
+    #[test]
+    fn an_unmoved_branch_deploys_anyway_when_forced() {
+        // The forced counterpart of `an_unmoved_branch_does_nothing_at_all`:
+        // an explicit "redeploy this now" must actually redo the build, even
+        // when the branch tip is exactly where it already was.
+        let step = decide_forced(&watch(), Some("abc1234abc"), "abc1234abc", true);
+        assert_eq!(step, Step::Deploy { from: Some("abc1234abc".into()), to: "abc1234abc".into() });
+        assert!(step.acts(), "a forced redeploy must actually run the build step again");
+    }
+
+    #[test]
+    fn force_changes_nothing_when_the_branch_already_moved() {
+        // Forcing is only meant to skip the "nothing to do" short-circuit, not
+        // to change what a moved branch already decides.
+        assert_eq!(
+            decide_forced(&watch(), Some("1111111"), "2222222", true),
+            decide(&watch(), Some("1111111"), "2222222")
+        );
+    }
+
+    #[test]
+    fn force_does_not_invent_a_working_copy_that_does_not_exist() {
+        // There is no previous build to redo, so a forced first-time watch
+        // clones exactly as an ordinary one would.
+        assert_eq!(decide_forced(&watch(), None, "2222222", true), decide(&watch(), None, "2222222"));
+    }
+
+    #[test]
+    fn an_unforced_decision_is_unchanged() {
+        assert_eq!(decide_forced(&watch(), Some("2222222"), "2222222", false), Step::UpToDate);
     }
 
     #[test]
