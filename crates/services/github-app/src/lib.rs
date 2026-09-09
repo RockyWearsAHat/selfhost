@@ -25,6 +25,7 @@
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
+pub mod credentials;
 pub mod jwt;
 pub mod store;
 pub mod token;
@@ -33,6 +34,7 @@ pub mod webhook;
 
 use std::path::PathBuf;
 
+pub use credentials::AppCredentialSource;
 pub use store::{
     Installation, InstallationState, Store, StoreError, TrackedRepo, parse_owner_repo, repository_matches,
     store_path,

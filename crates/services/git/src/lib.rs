@@ -43,6 +43,8 @@ pub mod run;
 use selfhost_config::{GitWatch, ServiceCatalog, ServiceSpec};
 use selfhost_supervisor::Supervisor;
 use std::collections::BTreeMap;
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Mutex;
@@ -51,6 +53,25 @@ use tokio::task::JoinHandle;
 pub use deploy::Outcome;
 pub use nudge::Nudge;
 pub use plan::Step;
+
+/// A source of short-lived, authenticated fetch URLs for a watch's
+/// repository, so a private `github.com` repository can be pulled without a
+/// static SSH deploy key.
+///
+/// Implemented outside this crate by whoever holds the GitHub App's
+/// installation store and token cache (`selfhost_github_app`) — this crate
+/// only asks "do you have a URL for this repository?" and gets back `None`
+/// when there is nothing to add, which leaves today's unauthenticated/SSH
+/// behaviour exactly as it was for any repository the App does not track.
+/// Kept as a trait rather than a concrete dependency so this crate does not
+/// need to know about GitHub Apps at all — see `crate::plan::parse_github_owner_repo`
+/// for the one thing it does need to recognize about a repository string.
+pub trait CredentialSource: Send + Sync {
+    /// Returns a fresh authenticated HTTPS URL for `repository` (a watch's
+    /// configured remote, in either SSH or HTTPS form), or `None` if this
+    /// source has nothing for it.
+    fn authenticated_url(&self, repository: &str) -> Pin<Box<dyn Future<Output = Option<String>> + Send + '_>>;
+}
 
 /// Every watch currently being polled, one task each.
 ///
@@ -73,9 +94,20 @@ impl Watches {
     /// a deployment that silently is not being watched is the failure this whole
     /// module exists to prevent, so the count is stated rather than assumed.
     pub async fn load(&self, supervisor: &Supervisor, catalog: &ServiceCatalog) -> usize {
+        self.load_with_credentials(supervisor, catalog, None).await
+    }
+
+    /// Same as [`Watches::load`], but every poller consults `credentials` (when
+    /// given) for an authenticated URL before each fetch.
+    pub async fn load_with_credentials(
+        &self,
+        supervisor: &Supervisor,
+        catalog: &ServiceCatalog,
+        credentials: Option<Arc<dyn CredentialSource>>,
+    ) -> usize {
         let mut started = 0;
         for spec in &catalog.services {
-            if self.follow(supervisor, spec).await {
+            if self.follow_with_credentials(supervisor, spec, credentials.clone()).await {
                 started += 1;
             }
         }
@@ -92,6 +124,18 @@ impl Watches {
     /// flight is for a definition that no longer exists, and its child processes
     /// are killed with it rather than left running against a stale checkout.
     pub async fn follow(&self, supervisor: &Supervisor, spec: &ServiceSpec) -> bool {
+        self.follow_with_credentials(supervisor, spec, None).await
+    }
+
+    /// Same as [`Watches::follow`], but the poller consults `credentials` (when
+    /// given) for an authenticated URL before each fetch — see
+    /// [`CredentialSource`].
+    pub async fn follow_with_credentials(
+        &self,
+        supervisor: &Supervisor,
+        spec: &ServiceSpec,
+        credentials: Option<Arc<dyn CredentialSource>>,
+    ) -> bool {
         let mut tasks = self.tasks.lock().await;
         if let Some(previous) = tasks.remove(&spec.name) {
             previous.abort();
@@ -105,6 +149,7 @@ impl Watches {
             supervisor: supervisor.clone(),
             spec: spec.clone(),
             watch: watch.clone(),
+            credentials,
         };
         tasks.insert(spec.name.clone(), tokio::spawn(poller.run()));
         true
@@ -146,11 +191,24 @@ pub async fn check_once(
     spec: &ServiceSpec,
     watch: &GitWatch,
 ) -> Result<Outcome, String> {
+    check_once_with_credential(supervisor, spec, watch, None).await
+}
+
+/// Same as [`check_once`], but `credential` — a freshly-minted authenticated
+/// URL for `watch.repository`, if the caller has one — is used for the actual
+/// `git` transfer in place of `watch.repository`. Never logged: see
+/// `plan::repository_url`'s doc for why.
+async fn check_once_with_credential(
+    supervisor: &Supervisor,
+    spec: &ServiceSpec,
+    watch: &GitWatch,
+    credential: Option<&str>,
+) -> Result<Outcome, String> {
     let base = supervisor.base_dir().to_path_buf();
     let path = deploy::working_copy(&base, watch);
 
     let local = local_commit(&path, &base).await;
-    let remote = remote_commit(watch, &base).await?;
+    let remote = remote_commit(watch, &base, credential).await?;
     let step = plan::decide(watch, local.as_deref(), &remote);
 
     // A disabled service is one somebody switched off deliberately. Updating its
@@ -166,7 +224,7 @@ pub async fn check_once(
         ));
     }
 
-    Ok(deploy::carry_out(supervisor, spec, watch, &step).await)
+    Ok(deploy::carry_out(supervisor, spec, watch, &step, credential).await)
 }
 
 /// The commit a working copy is on, or `None` if there is not one yet.
@@ -179,8 +237,8 @@ async fn local_commit(path: &std::path::Path, base: &std::path::Path) -> Option<
 }
 
 /// The commit a watched remote branch points at.
-async fn remote_commit(watch: &GitWatch, base: &std::path::Path) -> Result<String, String> {
-    let ran = run::git(&plan::ls_remote_args(watch), base, run::LS_REMOTE_TIMEOUT)
+async fn remote_commit(watch: &GitWatch, base: &std::path::Path, credential: Option<&str>) -> Result<String, String> {
+    let ran = run::git(&plan::ls_remote_args(watch, credential), base, run::LS_REMOTE_TIMEOUT)
         .await
         .map_err(|error| format!("cannot check {}: {error}", watch.repository))?;
 
@@ -206,6 +264,9 @@ struct Poller {
     supervisor: Supervisor,
     spec: ServiceSpec,
     watch: GitWatch,
+    /// Where to ask for an authenticated URL before each fetch, if anywhere —
+    /// see [`CredentialSource`].
+    credentials: Option<Arc<dyn CredentialSource>>,
 }
 
 impl Poller {
@@ -225,7 +286,19 @@ impl Poller {
         let mut last_complaint: Option<String> = None;
 
         loop {
-            match check_once(&self.supervisor, &self.spec, &self.watch).await.map(|_| ()) {
+            let credential = match &self.credentials {
+                Some(source) => source.authenticated_url(&self.watch.repository).await,
+                None => None,
+            };
+            let outcome = check_once_with_credential(
+                &self.supervisor,
+                &self.spec,
+                &self.watch,
+                credential.as_deref(),
+            )
+            .await
+            .map(|_| ());
+            match outcome {
                 Ok(()) => {
                     if last_complaint.take().is_some() {
                         deploy::note(&self.supervisor, &self.spec.name, "the branch is reachable again")

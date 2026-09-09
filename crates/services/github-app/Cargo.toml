@@ -8,6 +8,7 @@ repository.workspace = true
 description = "Authenticates as a GitHub App (JWT signing) and mints short-lived installation access tokens, in memory only."
 
 [dependencies]
+selfhost-git = { workspace = true }
 selfhost-http = { workspace = true }
 selfhost-json = { workspace = true }
 tokio = { workspace = true }
