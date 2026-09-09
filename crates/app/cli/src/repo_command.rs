@@ -511,17 +511,31 @@ fn values_of(arguments: &[String], name: &str) -> Vec<String> {
     values
 }
 
-/// Every word following the first occurrence of `name`, up to the next flag
-/// (an argument starting with `-`) or the end of the arguments.
+/// The `repo configure` options that can follow a `--serve`/`--build` command
+/// line. Stopping at one of these specific names — rather than at any
+/// argument that merely starts with `-` — is what lets a served or built
+/// command carry its own single-dash flags (`-s dist -l $PORT`, `-p 3000`,
+/// `npm run build -- --mode production`) without truncating silently.
+const CONFIGURE_FLAGS: &[&str] = &["--node", "--port", "--serve", "--build", "--domain"];
+
+/// Every word following the first occurrence of `name`, up to the next
+/// recognized `repo configure` flag (see [`CONFIGURE_FLAGS`]) or the end of
+/// the arguments.
 ///
 /// `--serve` and `--build` each take a whole command line, not one value —
-/// `--serve node server.js` needs both words, and stopping at the next `--`
-/// flag is how the boundary is found without a second delimiter to type.
+/// `--serve node server.js` needs both words. Stopping at a *known* flag name
+/// instead of any leading `-` is deliberate: the served/built command is
+/// someone else's CLI, and commands like `npx serve -s dist -l $PORT` are the
+/// normal case, not the exception.
 fn words_after(arguments: &[String], name: &str) -> Vec<String> {
     let Some(at) = arguments.iter().position(|argument| argument == name) else {
         return Vec::new();
     };
-    arguments[at + 1..].iter().take_while(|argument| !argument.starts_with('-')).cloned().collect()
+    arguments[at + 1..]
+        .iter()
+        .take_while(|argument| !CONFIGURE_FLAGS.contains(&argument.as_str()))
+        .cloned()
+        .collect()
 }
 
 #[cfg(test)]
@@ -679,6 +693,22 @@ mod tests {
                 .collect();
         assert_eq!(words_after(&arguments, "--serve"), vec!["node".to_owned(), "server.js".to_owned()]);
         assert_eq!(words_after(&arguments, "--build"), vec!["npm".to_owned(), "ci".to_owned()]);
+    }
+
+    #[test]
+    fn a_served_commands_own_single_dash_flags_are_not_mistaken_for_repo_configure_flags() {
+        let arguments: Vec<String> = [
+            "repo", "configure", "o/r", "--serve", "npx", "serve", "-s", "dist", "-l", "$PORT", "--domain",
+            "example.com",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        assert_eq!(
+            words_after(&arguments, "--serve"),
+            vec!["npx".to_owned(), "serve".to_owned(), "-s".to_owned(), "dist".to_owned(), "-l".to_owned(), "$PORT".to_owned()]
+        );
+        assert_eq!(values_of(&arguments, "--domain"), vec!["example.com".to_owned()]);
     }
 
     #[test]
