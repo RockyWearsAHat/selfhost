@@ -130,20 +130,25 @@ operator's behalf — `BatchMode=yes` turns each question `ssh` would have asked
 into a failure, and the console turns that failure into the one command that
 fixes it. See [`gui.md`](gui.md#reaching-a-daemon-on-another-machine).
 
-**Git deployment is done, by poll and now by webhook too.** A service can carry
-a branch to watch; when the branch moves, the daemon stops the service, updates
-the working copy, runs the build step, and starts it again. See
-[`gui.md`](gui.md#deploying-from-a-branch) for why polling was the first
-mechanism.
+**Git deployment is done, by webhook.** A service can carry a branch to watch;
+when a push to it is reported, the daemon stops the service, updates the
+working copy, runs the build step, and starts it again. There is no
+background poll behind it any more — see
+[`gui.md`](gui.md#deploying-from-a-branch) for why polling was tried first and
+removed once webhook delivery from a real GitHub App proved reliable enough on
+its own; the manual `POST /api/services/<name>/deploy` (and the console's
+deploy button) is the fallback for a repository the webhook has not been
+wired to.
 
 **A GitHub App webhook receiver is also done.** `crates/services/github-app`
 authenticates as a GitHub App and `crates/app/proxy/src/server.rs` answers
 `/.selfhost/webhook/app`: it verifies each delivery's signature, records which
 accounts have installed the App and which repositories it can see
 (`selfhost_github_app::Store`, at `<data_dir>/github-installations.toml`), and
-on a `push` event nudges the same deploy path the poller uses — so a
-webhook-configured application redeploys within seconds of a push rather than
-waiting out its interval. `selfhost repo <list|logs|configure>` is the CLI's
+on a `push` event nudges the same deploy path the manual button uses — so a
+webhook-configured application redeploys within seconds of a push, and a
+missed delivery is caught only by an operator pressing that button, not by a
+timer. `selfhost repo <list|logs|configure>` is the CLI's
 front door onto that store: `list` shows every tracked repo and what it
 deploys as, `logs` shows a repo's webhook receipt and process log, and
 `configure` turns a tracked repo into a running application (always through a

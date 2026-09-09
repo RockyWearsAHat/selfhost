@@ -1,19 +1,23 @@
 //! Updating selfhost itself when its own repository moves.
 //!
 //! The `[self_update]` section of the config names the repository this
-//! deployment is a clone of. When that branch moves, the daemon fetches,
-//! hard-resets the project directory, runs the build, swaps the binary in, and
-//! exits so the service manager restarts the new build.
+//! deployment is a clone of. When a push to that branch is reported, the
+//! daemon fetches, hard-resets the project directory, runs the build, swaps
+//! the binary in, and exits so the service manager restarts the new build.
 //!
 //! # What makes it notice
 //!
-//! Two triggers, for the reason `selfhost_config::git` sets out in full: a
-//! webhook carries the latency (a push deploys in about a second) and the poll
-//! interval underneath it is the safety net that catches a hook which never
-//! arrived. The webhook arrives here as a [`Nudge`] — a signal carrying nothing
-//! at all — so the request body can never influence *what* gets deployed. Both
-//! triggers run the identical check: read the real branch tip with
-//! `git ls-remote`, compare it to `HEAD`, act only on a genuine difference.
+//! Exactly one trigger: a [`Nudge`] — a signal carrying nothing at all, so the
+//! request body can never influence *what* gets deployed — poked by the
+//! GitHub App webhook (`/.selfhost/webhook/app`) or the legacy
+//! `self_update.webhook_secret` webhook (`/.selfhost/webhook/self`) on a
+//! verified push, or by an operator's own `POST /api/self-update/deploy`.
+//! There is no timer underneath it: see `selfhost_config::git`'s module docs
+//! for why a poll safety net was removed rather than kept. Every nudge runs
+//! the identical check: read the real branch tip with `git ls-remote`,
+//! compare it to `HEAD`, act only on a genuine difference. A deployment with
+//! no webhook configured and nobody pressing the manual button simply never
+//! updates automatically — the manual door is the fallback, not a poll.
 //!
 //! # Who restarts whom
 //!
@@ -80,17 +84,16 @@ enum Progress {
 /// Watches the daemon's own repository and installs what a push delivers.
 ///
 /// Pends forever when the section is absent or disabled, so it can occupy a
-/// `select!` arm unconditionally. Otherwise it checks whenever `nudge` is poked
-/// *or* the configured interval elapses — whichever comes first — and returns
-/// only after an update has been fetched, built, and swapped in. Errors and
-/// skips are reported to stderr and retried, never fatal. The returned commit
-/// is what runs the moment the caller exits with [`RESTART_EXIT`] and the
-/// service manager restarts the process.
+/// `select!` arm unconditionally. Otherwise it checks only when `nudge` is
+/// poked, and returns only after an update has been fetched, built, and
+/// swapped in. Errors and skips are reported to stderr and retried, never
+/// fatal. The returned commit is what runs the moment the caller exits with
+/// [`RESTART_EXIT`] and the service manager restarts the process.
 ///
-/// The two triggers are deliberately indistinguishable from here: both run
-/// [`poll_once`], which reads the branch tip itself. Nothing about a check
-/// depends on *why* it started, so the webhook cannot deploy anything the
-/// timer would not have deployed a few minutes later.
+/// Every check runs [`poll_once`], which reads the branch tip itself rather
+/// than trusting anything the nudge carried — nothing about a check depends
+/// on *why* it started, so a forged nudge can never deploy anything other
+/// than what is really at the tip of the watched branch.
 pub async fn watch_own_repository(
     update: Option<SelfUpdate>,
     project_dir: PathBuf,
@@ -99,9 +102,6 @@ pub async fn watch_own_repository(
     let Some(update) = update.filter(|u| u.enabled) else { return std::future::pending().await };
     sweep_aside();
 
-    let mut ticker = tokio::time::interval(Duration::from_secs(
-        update.interval_secs.max(selfhost_config::git::MIN_INTERVAL_SECS),
-    ));
     // A repeated failure (an unreachable remote, a dirty tree left dirty) would
     // otherwise say the same thing every interval, forever.
     let mut already_said = String::new();
@@ -109,13 +109,8 @@ pub async fn watch_own_repository(
         // A nudge that lands *during* a check is remembered by `Nudge`, so the
         // push that arrives mid-build is not lost — it is served by the very
         // next pass round this loop.
-        let pushed = tokio::select! {
-            _ = ticker.tick() => false,
-            _ = nudge.poked() => true,
-        };
-        if pushed {
-            println!("self-update: a push was announced; checking now");
-        }
+        nudge.poked().await;
+        println!("self-update: a push was announced; checking now");
         match poll_once(&update, &project_dir).await {
             Ok(Progress::UpToDate) => already_said.clear(),
             Ok(Progress::Updated { to }) => return to,

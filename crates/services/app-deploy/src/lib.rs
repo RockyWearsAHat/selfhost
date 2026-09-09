@@ -51,7 +51,6 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use selfhost_config::git::DEFAULT_INTERVAL_SECS;
 use selfhost_config::{
     GitWatch, Health, Instance, Problem, RestartPolicy, ServiceSpec, Site, StartMode,
 };
@@ -93,8 +92,6 @@ pub struct AppSpec {
     pub node: String,
     /// The port the server binds and the proxy forwards to.
     pub port: u16,
-    /// Seconds between checks of the remote branch, for the background watch.
-    pub interval_secs: u64,
     /// Extra environment for the backend, on top of the injected `PORT`.
     pub env: BTreeMap<String, String>,
     /// How the route's instance is health-checked.
@@ -128,7 +125,6 @@ impl AppSpec {
             build: None,
             node: node.into(),
             port,
-            interval_secs: DEFAULT_INTERVAL_SECS,
             env: BTreeMap::new(),
             health: Health::default(),
             canonical_redirect: true,
@@ -147,16 +143,15 @@ impl AppSpec {
             .unwrap_or_else(|| PathBuf::from("checkouts").join(&self.name))
     }
 
-    /// The Git watch that keeps the working copy on the branch tip.
+    /// The Git watch driven by a push.
     ///
-    /// Its `post_pull` is the build step, so the background poller in
-    /// [`selfhost_git`] can also redeploy on a push — with that crate's
-    /// stop-first guarantee. The stronger no-downtime-on-a-failed-build guarantee
-    /// is [`deploy`]'s, for a deployment an operator asked for.
+    /// Its `post_pull` is the build step, so a webhook-triggered check in
+    /// [`selfhost_git`] can also redeploy — with that crate's stop-first
+    /// guarantee. The stronger no-downtime-on-a-failed-build guarantee is
+    /// [`deploy`]'s, for a deployment an operator asked for.
     pub fn watch(&self) -> GitWatch {
         let mut watch = GitWatch::new(self.repository.trim(), self.checkout_path());
         watch.branch = self.branch.clone();
-        watch.interval_secs = self.interval_secs;
         watch.post_pull = self.build.clone();
         watch
     }

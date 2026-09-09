@@ -87,9 +87,9 @@ including what is unverified, and `docs/SECURITY.md` §3.7 is the specification
 they answer to.
 
 Selfhost also updates *itself*: an opt-in `[self_update]` section names the
-repository this deployment is a clone of, the daemon polls the branch, and a
-push fetches, rebuilds, and restarts every selfhost process — no SSH required.
-It only ever fast-forwards (local commits and modified tracked files refuse the
+repository this deployment is a clone of, and when a push to it is reported by
+a webhook, the daemon fetches, rebuilds, and restarts every selfhost process —
+no SSH required. It only ever fast-forwards (local commits and modified tracked files refuse the
 deployment rather than being discarded), a failed build rolls back and leaves
 the old build running, and the restart is just an exit: launchd, systemd, or the
 Windows Scheduled Task brings the new binary up.

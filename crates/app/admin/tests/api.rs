@@ -16,23 +16,10 @@ const PASSWORD: &str = "hunter2";
 
 /// An API over a scratch directory, plus the directory that cleans it up.
 fn api(name: &str) -> (Api, ScratchDir) {
-    let (api, _watches, dir) = api_with_watches(name);
-    (api, dir)
-}
-
-/// The same, keeping hold of the watch set so a test can see what it follows.
-fn api_with_watches(name: &str) -> (Api, selfhost_git::Watches, ScratchDir) {
     let dir = ScratchDir::new(name);
     let token = write_token(dir.path(), TOKEN);
-    let watches = selfhost_git::Watches::default();
-    let api = Api::new(
-        Supervisor::new(dir.path()),
-        Store::new(dir.path()),
-        token,
-        watches.clone(),
-        firewall_manager(),
-    );
-    (api, watches, dir)
+    let api = Api::new(Supervisor::new(dir.path()), Store::new(dir.path()), token, firewall_manager());
+    (api, dir)
 }
 
 /// A firewall manager over a minimal, unmanaged config.
@@ -62,7 +49,7 @@ fn firewall_manager() -> selfhost_firewall::Manager {
 }
 
 /// A service definition carrying a Git watch, as JSON.
-fn watched_body(name: &str, interval: u64) -> String {
+fn watched_body(name: &str) -> String {
     Json::object([
         ("name", Json::string(name)),
         ("program", Json::string("/bin/true")),
@@ -72,7 +59,6 @@ fn watched_body(name: &str, interval: u64) -> String {
             Json::object([
                 ("repository", Json::string("https://github.com/owner/repo.git")),
                 ("path", Json::string("checkouts/site")),
-                ("intervalSecs", Json::Number(interval as f64)),
             ]),
         ),
     ])
@@ -489,39 +475,44 @@ async fn an_unknown_endpoint_is_a_404() {
 }
 
 #[tokio::test]
-async fn installing_a_watched_service_starts_watching_it_there_and_then() {
-    // Not at the next daemon restart: a service installed from the console that
-    // is not polled until somebody reboots the daemon looks exactly like one
-    // whose branch nobody has pushed to.
-    let (api, watches, _dir) = api_with_watches("install-watch");
-    let (status, _) = send(&api, "PUT", "/api/services/site", &watched_body("site", 60)).await;
+async fn installing_a_watched_service_is_accepted() {
+    let (api, _dir) = api("install-watch");
+    let (status, _) = send(&api, "PUT", "/api/services/site", &watched_body("site")).await;
     assert_eq!(status, 200);
-    assert_eq!(watches.count().await, 1);
 
     let (status, _) = send(&api, "DELETE", "/api/services/site", "").await;
     assert_eq!(status, 200);
-    assert_eq!(watches.count().await, 0, "a watch must not outlive its service");
 }
 
 #[tokio::test]
 async fn a_service_whose_watch_is_invalid_is_refused_with_the_offending_field() {
-    let (api, watches, _dir) = api_with_watches("bad-watch");
-    let (status, body) = send(&api, "PUT", "/api/services/site", &watched_body("site", 1)).await;
+    let (api, _dir) = api("bad-watch");
+    let body = Json::object([
+        ("name", Json::string("site")),
+        ("program", Json::string("/bin/true")),
+        (
+            "git",
+            Json::object([
+                ("repository", Json::string("https://github.com/owner/repo.git")),
+                ("path", Json::string("checkouts/site")),
+                ("branch", Json::string("--upload-pack=evil")),
+            ]),
+        ),
+    ])
+    .to_text();
+    let (status, body) = send(&api, "PUT", "/api/services/site", &body).await;
     assert_eq!(status, 422);
 
     let problems = body.get("problems").and_then(Json::as_array).expect("problems").to_vec();
     assert!(
-        problems
-            .iter()
-            .any(|p| p.get("field").and_then(Json::as_str) == Some("service.git.interval_secs")),
+        problems.iter().any(|p| p.get("field").and_then(Json::as_str) == Some("service.git.branch")),
         "{problems:?}"
     );
-    assert_eq!(watches.count().await, 0, "a refused service must not be watched");
 }
 
 #[tokio::test]
 async fn a_repository_url_that_would_run_a_command_is_refused_by_the_api() {
-    let (api, _watches, _dir) = api_with_watches("evil-watch");
+    let (api, _dir) = api("evil-watch");
     let body = Json::object([
         ("name", Json::string("site")),
         ("program", Json::string("/bin/true")),
@@ -552,13 +543,14 @@ async fn deploying_a_service_with_no_git_watch_is_a_404() {
 }
 
 #[tokio::test]
-async fn deploying_a_watched_service_is_accepted_without_waiting_for_the_poll_interval() {
+async fn deploying_a_watched_service_is_accepted() {
     // 202, not 200 — this reports the deployment was accepted, mirroring every
     // other action route; it does not await the stop/pull/build/start sequence,
-    // which can take as long as the build step allows.
-    let (api, watches, _dir) = api_with_watches("deploy-watched");
-    send(&api, "PUT", "/api/services/site", &watched_body("site", 60)).await;
-    assert_eq!(watches.count().await, 1);
+    // which can take as long as the build step allows. There is no background
+    // poller to wait out any more — this is driven directly by the webhook
+    // relay or the operator's own button.
+    let (api, _dir) = api("deploy-watched");
+    send(&api, "PUT", "/api/services/site", &watched_body("site")).await;
 
     let (status, body) = send(&api, "POST", "/api/services/site/deploy", "").await;
     assert_eq!(status, 202);

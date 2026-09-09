@@ -180,11 +180,11 @@ impl ServiceSpec {
         }
     }
 
-    /// The Git watch that should be polled for this service, if there is one.
+    /// The Git watch this service deploys from, if it has one and it is on.
     ///
     /// Answers `None` for a watch that is switched off, so no caller has to
-    /// remember to check `enabled` — forgetting it would poll a repository the
-    /// operator deliberately stopped watching.
+    /// remember to check `enabled` — forgetting it would deploy a repository
+    /// the operator deliberately stopped watching.
     pub fn active_watch(&self) -> Option<&GitWatch> {
         self.git.as_ref().filter(|watch| watch.is_active())
     }
@@ -582,12 +582,12 @@ program = "/bin/api"
     fn a_services_git_watch_is_validated_with_it_and_reported_under_its_own_path() {
         let mut spec = ServiceSpec::new("site", "/usr/bin/node");
         let mut watch = crate::GitWatch::new("https://example.com/r.git", "site");
-        watch.interval_secs = 0;
+        watch.branch = "--upload-pack=evil".into();
         spec.git = Some(watch);
 
         let problems = problems_of(&catalog(vec![spec]), &[]);
         assert!(
-            problems.iter().any(|p| p.field == "service[0].git.interval_secs"),
+            problems.iter().any(|p| p.field == "service[0].git.branch"),
             "{problems:?}"
         );
     }

@@ -91,7 +91,6 @@ fn console_api(name: &str) -> (Api, Sessions, People, ScratchDir) {
         Supervisor::new(dir.path()),
         Store::new(dir.path()),
         Token::load_or_create(dir.path()).expect("a token"),
-        selfhost_git::Watches::default(),
         firewall_manager(),
     )
     .with_console_auth_parts(ConsolePassword::load(dir.path()), sessions.clone())

@@ -276,7 +276,6 @@ fn watch_to_json(watch: &selfhost_config::GitWatch) -> Json {
         ("repository", Json::string(&watch.repository)),
         ("branch", Json::string(&watch.branch)),
         ("path", Json::string(watch.path.display().to_string())),
-        ("intervalSecs", Json::Number(watch.interval_secs as f64)),
         ("enabled", Json::Bool(watch.enabled)),
         ("autoUpdate", Json::Bool(watch.auto_update)),
         (
@@ -311,9 +310,6 @@ fn watch_from_json(value: &Json) -> Option<selfhost_config::GitWatch> {
     {
         watch.branch = branch.to_owned();
     }
-    if let Some(interval) = value.get("intervalSecs").and_then(Json::as_u64) {
-        watch.interval_secs = interval;
-    }
     if let Some(Json::Bool(enabled)) = value.get("enabled") {
         watch.enabled = *enabled;
     }
@@ -328,8 +324,7 @@ fn watch_from_json(value: &Json) -> Option<selfhost_config::GitWatch> {
     // the secret by supplying `webhookSecret` (the plaintext value, once, the same "add it again
     // to rotate it" shape `reports oauth add` and `console-password` already use); omitting it
     // — like every other field here — takes `GitWatch::new`'s default of `None`, so a caller
-    // resupplies the whole watch on every change, exactly as it already must for `branch` or
-    // `intervalSecs`.
+    // resupplies the whole watch on every change, exactly as it already must for `branch`.
     if let Some(secret) = value.get("webhookSecret").and_then(Json::as_str)
         && !secret.is_empty()
     {
@@ -543,7 +538,6 @@ mod tests {
         let mut spec = selfhost_config::ServiceSpec::new("site", "/usr/bin/node");
         let mut watch = selfhost_config::GitWatch::new("git@github.com:owner/repo.git", "checkouts/site");
         watch.branch = "release".into();
-        watch.interval_secs = 120;
         watch.auto_update = false;
         watch.post_pull = Some(vec!["npm".into(), "ci".into()]);
         spec.git = Some(watch);
@@ -570,11 +564,6 @@ mod tests {
         .unwrap();
         let watch = spec_from_json(&value).and_then(|s| s.git).expect("a watch");
         assert_eq!(watch.branch, selfhost_config::git::DEFAULT_BRANCH);
-        // The constant, not the number it happens to hold: this asserts that an
-        // omitted field takes *the* default, which is the contract. Pinning the
-        // literal made this fail when the default moved for a reason that has
-        // nothing to do with JSON parsing.
-        assert_eq!(watch.interval_secs, selfhost_config::git::DEFAULT_INTERVAL_SECS);
         assert!(watch.enabled && watch.auto_update);
     }
 

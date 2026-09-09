@@ -1,9 +1,17 @@
-//! Watching Git branches, so a push redeploys the service built from it.
+//! Deploying a service when a Git branch it watches moves.
 //!
-//! One task per watched service polls its branch, and when the branch moves it
-//! stops the service, updates the working copy, runs the build step, and starts
-//! the service again. What each of those means is in [`plan`] (what to run, and
-//! what the answer means), [`run`] (running it), and [`deploy`] (the sequence).
+//! [`check_once`] is the whole of a deployment check: read the remote branch
+//! tip, compare it to the working copy, and if it moved, stop the service,
+//! update the working copy, run the build step, and start the service again.
+//! What each of those means is in [`plan`] (what to run, and what the answer
+//! means), [`run`] (running it), and [`deploy`] (the sequence).
+//!
+//! There is no background poller here any more. `check_once` is driven
+//! entirely on demand: by the GitHub App webhook (`/.selfhost/webhook/app`,
+//! wired in `crates/app/proxy`) on a verified `push`, or by an operator's own
+//! `POST /api/services/<name>/deploy` (`selfhost_admin::Api::deploy_now`). See
+//! `selfhost_config::git`'s module docs for why a timer no longer runs
+//! underneath those two triggers.
 //!
 //! # Why `git` is a program here rather than a protocol we implement
 //!
@@ -23,12 +31,11 @@
 //! # Shape
 //!
 //! ```no_run
-//! use selfhost_git::Watches;
+//! use selfhost_git::check_once;
 //! use selfhost_supervisor::Supervisor;
 //!
-//! # async fn example(supervisor: Supervisor, catalog: selfhost_config::ServiceCatalog) {
-//! let watches = Watches::default();
-//! watches.load(&supervisor, &catalog).await;
+//! # async fn example(supervisor: Supervisor, spec: selfhost_config::ServiceSpec, watch: selfhost_config::GitWatch) {
+//! check_once(&supervisor, &spec, &watch).await.ok();
 //! # }
 //! ```
 
@@ -40,15 +47,10 @@ pub mod nudge;
 pub mod plan;
 pub mod run;
 
-use selfhost_config::{GitWatch, ServiceCatalog, ServiceSpec};
+use selfhost_config::{GitWatch, ServiceSpec};
 use selfhost_supervisor::Supervisor;
-use std::collections::BTreeMap;
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::Arc;
-use std::time::Duration;
-use tokio::sync::Mutex;
-use tokio::task::JoinHandle;
 
 pub use deploy::Outcome;
 pub use nudge::Nudge;
@@ -73,119 +75,14 @@ pub trait CredentialSource: Send + Sync {
     fn authenticated_url(&self, repository: &str) -> Pin<Box<dyn Future<Output = Option<String>> + Send + '_>>;
 }
 
-/// Every watch currently being polled, one task each.
-///
-/// Cheap to clone, like the supervisor: the daemon and the control API hold the
-/// same set rather than two that can disagree about what is being watched.
-///
-/// The set is keyed by service name, and installing a service replaces its task
-/// rather than adding a second one. Two tasks polling one branch would both see
-/// it move and both start a deployment, and the second would find the first's
-/// working copy half-updated.
-#[derive(Debug, Clone, Default)]
-pub struct Watches {
-    tasks: Arc<Mutex<BTreeMap<String, JoinHandle<()>>>>,
-}
-
-impl Watches {
-    /// Starts a poller for every service in a catalogue that has an active watch.
-    ///
-    /// Returns how many are now being watched, which the daemon prints at startup:
-    /// a deployment that silently is not being watched is the failure this whole
-    /// module exists to prevent, so the count is stated rather than assumed.
-    pub async fn load(&self, supervisor: &Supervisor, catalog: &ServiceCatalog) -> usize {
-        self.load_with_credentials(supervisor, catalog, None).await
-    }
-
-    /// Same as [`Watches::load`], but every poller consults `credentials` (when
-    /// given) for an authenticated URL before each fetch.
-    pub async fn load_with_credentials(
-        &self,
-        supervisor: &Supervisor,
-        catalog: &ServiceCatalog,
-        credentials: Option<Arc<dyn CredentialSource>>,
-    ) -> usize {
-        let mut started = 0;
-        for spec in &catalog.services {
-            if self.follow_with_credentials(supervisor, spec, credentials.clone()).await {
-                started += 1;
-            }
-        }
-        started
-    }
-
-    /// Watches one service, replacing any watch already running for it.
-    ///
-    /// Answers whether it is now being polled — `false` for a service with no
-    /// watch, or one whose watch is switched off.
-    ///
-    /// A replacement aborts the previous task, which may be mid-deployment. That
-    /// is the intended reading of "the definition changed": the deployment in
-    /// flight is for a definition that no longer exists, and its child processes
-    /// are killed with it rather than left running against a stale checkout.
-    pub async fn follow(&self, supervisor: &Supervisor, spec: &ServiceSpec) -> bool {
-        self.follow_with_credentials(supervisor, spec, None).await
-    }
-
-    /// Same as [`Watches::follow`], but the poller consults `credentials` (when
-    /// given) for an authenticated URL before each fetch — see
-    /// [`CredentialSource`].
-    pub async fn follow_with_credentials(
-        &self,
-        supervisor: &Supervisor,
-        spec: &ServiceSpec,
-        credentials: Option<Arc<dyn CredentialSource>>,
-    ) -> bool {
-        let mut tasks = self.tasks.lock().await;
-        if let Some(previous) = tasks.remove(&spec.name) {
-            previous.abort();
-        }
-
-        let Some(watch) = spec.active_watch() else {
-            return false;
-        };
-
-        let poller = Poller {
-            supervisor: supervisor.clone(),
-            spec: spec.clone(),
-            watch: watch.clone(),
-            credentials,
-        };
-        tasks.insert(spec.name.clone(), tokio::spawn(poller.run()));
-        true
-    }
-
-    /// Stops watching one service. Returns whether it was being watched.
-    pub async fn forget(&self, name: &str) -> bool {
-        match self.tasks.lock().await.remove(name) {
-            Some(task) => {
-                task.abort();
-                true
-            }
-            None => false,
-        }
-    }
-
-    /// How many services are being watched.
-    pub async fn count(&self) -> usize {
-        self.tasks.lock().await.len()
-    }
-
-    /// Stops every watch.
-    pub async fn shutdown(&self) {
-        let taken = std::mem::take(&mut *self.tasks.lock().await);
-        for task in taken.into_values() {
-            task.abort();
-        }
-    }
-}
-
 /// Checks a watched branch once and acts on what it finds.
 ///
-/// This is the whole of what a poll does, exposed on its own so that a
-/// deployment can be driven directly — by a test, and by whatever asks for one
-/// on demand later — without waiting out an interval. The error is what to tell
-/// the operator, already phrased for them.
+/// This is the whole of a deployment check, called directly by whatever asked
+/// for one: the GitHub App webhook route, on a verified push, or the manual
+/// `POST /api/services/<name>/deploy`/`POST /api/self-update/deploy` doors.
+/// There is no background task that calls this on a timer any more — see the
+/// module docs. The error is what to tell the operator, already phrased for
+/// them.
 pub async fn check_once(
     supervisor: &Supervisor,
     spec: &ServiceSpec,
@@ -198,7 +95,12 @@ pub async fn check_once(
 /// URL for `watch.repository`, if the caller has one — is used for the actual
 /// `git` transfer in place of `watch.repository`. Never logged: see
 /// `plan::repository_url`'s doc for why.
-async fn check_once_with_credential(
+///
+/// Exposed so a caller that holds a [`CredentialSource`] (the control API,
+/// wiring the GitHub App's installation token) can authenticate a check
+/// triggered by a webhook or a manual deploy, exactly as the removed
+/// background poller once did.
+pub async fn check_once_with_credential(
     supervisor: &Supervisor,
     spec: &ServiceSpec,
     watch: &GitWatch,
@@ -259,71 +161,6 @@ async fn remote_commit(watch: &GitWatch, base: &std::path::Path, credential: Opt
     })
 }
 
-/// The task that polls one service's branch.
-struct Poller {
-    supervisor: Supervisor,
-    spec: ServiceSpec,
-    watch: GitWatch,
-    /// Where to ask for an authenticated URL before each fetch, if anywhere —
-    /// see [`CredentialSource`].
-    credentials: Option<Arc<dyn CredentialSource>>,
-}
-
-impl Poller {
-    /// Polls until the task is aborted or the service disappears.
-    ///
-    /// The first poll happens immediately rather than after one interval. A daemon
-    /// that was down while the branch moved should deploy when it comes back, not
-    /// a minute later — and on a watch checked hourly, "not yet" is a long time to
-    /// look like nothing is working.
-    async fn run(self) {
-        let interval = Duration::from_secs(
-            self.watch.interval_secs.max(selfhost_config::git::MIN_INTERVAL_SECS),
-        );
-        // A failure repeated every interval would fill the log with one fact. The
-        // last one is remembered so only a *change* is worth a line — including
-        // the change back to working.
-        let mut last_complaint: Option<String> = None;
-
-        loop {
-            let credential = match &self.credentials {
-                Some(source) => source.authenticated_url(&self.watch.repository).await,
-                None => None,
-            };
-            let outcome = check_once_with_credential(
-                &self.supervisor,
-                &self.spec,
-                &self.watch,
-                credential.as_deref(),
-            )
-            .await
-            .map(|_| ());
-            match outcome {
-                Ok(()) => {
-                    if last_complaint.take().is_some() {
-                        deploy::note(&self.supervisor, &self.spec.name, "the branch is reachable again")
-                            .await;
-                    }
-                }
-                Err(reason) => {
-                    if last_complaint.as_deref() != Some(reason.as_str()) {
-                        deploy::note(&self.supervisor, &self.spec.name, &reason).await;
-                        last_complaint = Some(reason);
-                    }
-                }
-            }
-
-            // A service that has been uninstalled has nothing to deploy to, and
-            // its task would otherwise poll a remote forever.
-            if self.supervisor.status(&self.spec.name).await.is_none() {
-                return;
-            }
-            tokio::time::sleep(interval).await;
-        }
-    }
-
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -332,72 +169,11 @@ mod tests {
     fn watched_service(name: &str) -> ServiceSpec {
         let mut spec = ServiceSpec::new(name, "/bin/true");
         spec.start_mode = StartMode::Manual;
-        // A branch that does not exist: the poller reports it and keeps polling,
-        // which is what these tests want — a task that stays alive and touches
-        // nothing on disk.
-        let mut watch = GitWatch::new("https://example.invalid/repo.git", "checkouts/site");
-        watch.interval_secs = 3_600;
+        // A branch that does not exist: check_once reports it rather than
+        // touching anything on disk.
+        let watch = GitWatch::new("https://example.invalid/repo.git", "checkouts/site");
         spec.git = Some(watch);
         spec
-    }
-
-    #[tokio::test]
-    async fn only_services_with_an_active_watch_are_polled() {
-        let supervisor = Supervisor::new(std::env::temp_dir());
-        let watches = Watches::default();
-
-        let plain = ServiceSpec::new("plain", "/bin/true");
-        supervisor.install(plain.clone()).await;
-        assert!(!watches.follow(&supervisor, &plain).await);
-
-        let mut switched_off = watched_service("off");
-        switched_off.git.as_mut().expect("a watch").enabled = false;
-        supervisor.install(switched_off.clone()).await;
-        assert!(!watches.follow(&supervisor, &switched_off).await);
-
-        let watched = watched_service("site");
-        supervisor.install(watched.clone()).await;
-        assert!(watches.follow(&supervisor, &watched).await);
-        assert_eq!(watches.count().await, 1);
-
-        watches.shutdown().await;
-        assert_eq!(watches.count().await, 0);
-    }
-
-    #[tokio::test]
-    async fn installing_a_service_again_replaces_its_watch_rather_than_adding_one() {
-        // Two pollers on one branch would both see it move and both deploy, and
-        // the second would find the first's working copy half-updated.
-        let supervisor = Supervisor::new(std::env::temp_dir());
-        let watches = Watches::default();
-        let spec = watched_service("site");
-        supervisor.install(spec.clone()).await;
-
-        watches.follow(&supervisor, &spec).await;
-        watches.follow(&supervisor, &spec).await;
-        assert_eq!(watches.count().await, 1);
-
-        assert!(watches.forget("site").await);
-        assert!(!watches.forget("site").await);
-        assert_eq!(watches.count().await, 0);
-    }
-
-    #[tokio::test]
-    async fn a_catalogue_is_loaded_and_says_how_many_are_watched() {
-        let supervisor = Supervisor::new(std::env::temp_dir());
-        let catalog = ServiceCatalog {
-            version: 1,
-            services: vec![
-                watched_service("one"),
-                ServiceSpec::new("two", "/bin/true"),
-                watched_service("three"),
-            ],
-        };
-        supervisor.load(&catalog).await;
-
-        let watches = Watches::default();
-        assert_eq!(watches.load(&supervisor, &catalog).await, 2);
-        watches.shutdown().await;
     }
 
     #[tokio::test]

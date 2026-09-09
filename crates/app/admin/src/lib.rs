@@ -61,7 +61,7 @@ pub mod upgrade;
 pub mod webauthn;
 
 use selfhost_firewall::Manager;
-use selfhost_git::{CredentialSource, Nudge, Watches};
+use selfhost_git::{CredentialSource, Nudge};
 use selfhost_http::{Body, Method, Request, Response, Status};
 use selfhost_identity::{Caller, Capability, Grants, Opening, People, PersonName, Policy};
 
@@ -153,7 +153,6 @@ pub struct Api {
     supervisor: Supervisor,
     store: Arc<Store>,
     token: Token,
-    watches: Watches,
     /// A source of authenticated fetch URLs for a service just installed or
     /// updated through this API, so a repository the GitHub App tracks is
     /// watched with the same credentials the daemon's startup watch uses —
@@ -839,31 +838,20 @@ fn session_granted(user: &str) -> Json {
 const CONSOLE_HEADER: &str = "x-selfhost-console";
 
 impl Api {
-    /// Builds the API over a supervisor, the catalogue it persists to, and the
-    /// set of Git watches that follow the services in it.
+    /// Builds the API over a supervisor and the catalogue it persists to.
     ///
-    /// The watches are held here because installing a service is what decides
-    /// whether it is watched: a definition that gains a branch has to start being
-    /// polled at that moment, and one that is uninstalled has to stop. Leaving
-    /// that to the daemon's startup would mean a service installed from the
-    /// console is only deployed after the next daemon restart, which is exactly
-    /// the silent half-working state this feature exists to avoid.
+    /// A service's Git watch, if it has one, is driven only on demand — by the
+    /// GitHub App webhook or by [`Api::deploy_now`] — so there is no watcher
+    /// task to start or stop here as services are installed or removed.
     ///
     /// The firewall `Manager` is the same cheap-clone handle the daemon holds and
     /// reconciles on a timer, so `GET /api/firewall` reports the very state the
     /// daemon is driving — not a second view that could disagree with it.
-    pub fn new(
-        supervisor: Supervisor,
-        store: Store,
-        token: Token,
-        watches: Watches,
-        firewall: Manager,
-    ) -> Self {
+    pub fn new(supervisor: Supervisor, store: Store, token: Token, firewall: Manager) -> Self {
         Self {
             supervisor,
             store: Arc::new(store),
             token,
-            watches,
             github_credentials: None,
             firewall,
             self_update: None,
@@ -2918,9 +2906,6 @@ impl Api {
         }
 
         self.supervisor.install(spec.clone()).await;
-        // After the install, not before: a watch polling a service the supervisor
-        // has not been given yet would find nothing to stop or start.
-        self.watches.follow_with_credentials(&self.supervisor, &spec, self.github_credentials.clone()).await;
 
         match self.supervisor.status(name).await {
             Some(status) => json(Status(200), status.to_json()),
@@ -2932,10 +2917,6 @@ impl Api {
         if !self.supervisor.remove(name).await {
             return problem(Status(404), "no such service");
         }
-        // A watch outliving its service would keep pulling into a working copy
-        // nothing runs from, and would report deployments of a service that is
-        // no longer installed.
-        self.watches.forget(name).await;
         if let Err(error) = self.store.remove(name).await {
             return problem(Status(500), &format!("could not save the catalogue: {error}"));
         }
@@ -2975,17 +2956,18 @@ impl Api {
         )
     }
 
-    /// Drives this service's git watch right now, instead of waiting out its
-    /// poll interval.
+    /// Drives this service's git watch right now — the only two ways it ever
+    /// runs, there being no background poller any more.
     ///
     /// This is the trusted side of the webhook feature: the proxy's public
     /// webhook path, after verifying a push's signature against the watch's
     /// own secret, calls this loopback route with the same bearer token every
-    /// other request here needs. Nothing about the deployment itself is
-    /// special-cased — it runs [`selfhost_git::check_once`], the identical
-    /// stop/pull/build/start sequence the background poller runs, which is
-    /// why an earlier check can never deploy anything other than what is
-    /// really at the tip of the watched branch.
+    /// other request here needs. It is also what `selfhost repo deploy` and the
+    /// console's deploy button call directly. Nothing about the deployment
+    /// itself is special-cased — it runs
+    /// [`selfhost_git::check_once_with_credential`], which reads the real
+    /// branch tip before acting, so a call here can never deploy anything
+    /// other than what is really at the tip of the watched branch.
     ///
     /// Spawned rather than awaited, for the same reason [`Api::act`] reports
     /// acceptance rather than completion: a build step can run long enough
@@ -3002,8 +2984,15 @@ impl Api {
         };
 
         let supervisor = self.supervisor.clone();
+        let credentials = self.github_credentials.clone();
         tokio::spawn(async move {
-            let _ = selfhost_git::check_once(&supervisor, &spec, &watch).await;
+            let credential = match &credentials {
+                Some(source) => source.authenticated_url(&watch.repository).await,
+                None => None,
+            };
+            let _ =
+                selfhost_git::check_once_with_credential(&supervisor, &spec, &watch, credential.as_deref())
+                    .await;
         });
 
         json(

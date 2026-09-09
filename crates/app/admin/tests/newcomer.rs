@@ -1139,7 +1139,6 @@ async fn deployment_with_sessions(name: &str) -> (Api, ScratchDir, Sessions) {
         Supervisor::new(dir.path()),
         Store::new(dir.path()),
         token,
-        selfhost_git::Watches::default(),
         firewall_manager(),
     )
     .with_console_auth_parts(ConsolePassword::load(dir.path()), sessions.clone())
