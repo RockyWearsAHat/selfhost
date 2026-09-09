@@ -17,6 +17,7 @@ pub mod desktop;
 pub mod dns;
 pub mod edit;
 pub mod git;
+pub mod github_app;
 pub mod home;
 pub mod house;
 pub mod mail;
@@ -38,6 +39,7 @@ pub use cidr::Cidr;
 pub use desktop::Desktop;
 pub use dns::{Dns, RecordConfig, SoaConfig, ZoneConfig};
 pub use git::{GitWatch, SelfUpdate};
+pub use github_app::GithubApp;
 pub use house::Home;
 pub use mail::{DkimConfig, Mail, MailBind, Mailbox, Relay};
 pub use mesh::Mesh;
@@ -74,6 +76,11 @@ pub struct Config {
     /// itself — fetch, rebuild, restart. Absent → no self-update.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub self_update: Option<SelfUpdate>,
+    /// The GitHub App this deployment authenticates as, for a future
+    /// increment's deploy bot. Absent → the feature does not exist: no
+    /// webhook route, no installation store.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub github_app: Option<GithubApp>,
     /// Directories this machine serves over the console site, WebDAV and — where
     /// asked for — SMB. Empty means none: a share is declared, never discovered.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -611,6 +618,7 @@ mod tests {
             dns: None,
             mail: None,
             self_update: None,
+            github_app: None,
             shares: vec![],
             desktop: None,
             mesh: None,
@@ -652,6 +660,7 @@ mod tests {
             dns: None,
             mail: None,
             self_update: None,
+            github_app: None,
             shares: vec![],
             desktop: None,
             mesh: None,

@@ -214,14 +214,22 @@ interval_secs = 60
 post_pull = ["npm", "ci"]
 ```
 
-**Polling, not webhooks.** A webhook is an event that has to arrive, and it does
-not arrive when the network hiccups, when the hook was configured against a URL
-form the sender does not use, or when nobody configured one at all — each of them
-silently. Polling a remote ref costs one small request per interval and cannot
-fail silently: a poll either answers with a commit or reports why it could not.
-A webhook can be added later as a way to make a poll happen *sooner*; it is not
-allowed to become the only path. This is the one design decision carried over
-from `windows-service-manager`, which learned it the same way.
+**Polling first, and still the only path that cannot fail silently.** A webhook
+is an event that has to arrive, and it does not arrive when the network
+hiccups, when the hook was configured against a URL form the sender does not
+use, or when nobody configured one at all — each of them silently. Polling a
+remote ref costs one small request per interval and cannot fail silently: a
+poll either answers with a commit or reports why it could not. This is the one
+design decision carried over from `windows-service-manager`, which learned it
+the same way.
+
+A webhook now exists (`crates/services/github-app`, receiving at
+`/.selfhost/webhook/app` in `crates/app/proxy/src/server.rs`), and it is
+exactly the kind of addition that sentence always allowed: a push nudges the
+same deploy path the poller drives, making it happen *sooner*, but the poll
+keeps running underneath it — a dropped delivery is caught on the next
+interval regardless. `selfhost repo configure` is what turns a repository the
+App can see into a service with an active watch; see `selfhost repo --help`.
 
 **Stopped, then updated, then started — never restarted.** Updating a working
 copy under a running process rewrites the files it is executing, and a process
@@ -257,8 +265,11 @@ Private repositories authenticate with the daemon user's own SSH key; no
 credential is stored in the catalogue, because a secret in a file the daemon
 rewrites and the console displays is a secret that leaks.
 
-**Not built:** a webhook receiver, and an OAuth device flow for repositories the
-daemon's key does not already reach.
+**Not built:** an OAuth device flow, or wiring the GitHub App's own installation
+token into the clone, for a *private* repository added through `selfhost repo
+configure` — that command only composes a plain HTTPS clone URL today, so a
+private repo needs its checkout made reachable some other way (the daemon
+user's own SSH key, as above, or a deploy key) until that lands.
 
 ## What a service is
 
@@ -1118,12 +1129,13 @@ everything so far has been built and tested on a Mac. They are the first thing
 to exercise when the Windows machine arrives, and `cargo run -p rui --example
 counter` on each is the cheapest way to do it.
 
-**The desktop stream has never crossed a real socket.** `crates/ui/console/src/
+**The desktop stream has been verified live on Windows.** `crates/ui/console/src/
 channel.rs` writes the RFC 6455 client handshake by hand, verifies the accept
 key, refuses a subprotocol it does not know, decodes masked frames, assembles
 tiles onto a surface and fits each completed frame on its own thread — all of it
-unit-tested, and no byte of it has reached a real agent. The first live run is
-the thing to watch: the handshake, then the first `Hello`.
+unit-tested, and verified crossing a real socket with live applications. A
+capture session from ALEX-DESKTOP running Rainbow Six Siege logged 707 frames
+and 28.8 MB in one session.
 
 **The SSH transport and Git deployment are built, and verified live.** The
 console opened a tunnel as a managed child, showed a live daemon's services

@@ -304,6 +304,7 @@ dependencies = [
  "selfhost-dns",
  "selfhost-firewall",
  "selfhost-git",
+ "selfhost-github-app",
  "selfhost-home",
  "selfhost-http",
  "selfhost-identity",
@@ -381,6 +382,22 @@ dependencies = [
  "selfhost-config",
  "selfhost-supervisor",
  "tokio",
+]
+
+[[package]]
+name = "selfhost-github-app"
+version = "0.1.0"
+dependencies = [
+ "ring",
+ "rustls",
+ "rustls-pemfile",
+ "selfhost-http",
+ "selfhost-json",
+ "serde",
+ "tokio",
+ "tokio-rustls",
+ "toml",
+ "webpki-roots",
 ]
 
 [[package]]
@@ -463,6 +480,7 @@ dependencies = [
  "rustls-pemfile",
  "selfhost-admin",
  "selfhost-config",
+ "selfhost-github-app",
  "selfhost-http",
  "selfhost-mail",
  "selfhost-ws",

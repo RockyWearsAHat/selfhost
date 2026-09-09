@@ -420,12 +420,9 @@ space as a real verdict. `doctor` tells them apart, but the usual cause is
 querying through a large public resolver like `8.8.8.8` or `1.1.1.1`, which
 Spamhaus rejects outright.
 
-If `doctor` warns that it could not determine your system resolver, point it at
-your router or ISP resolver:
-
-```sh
-selfhost doctor --resolver 192.168.1.1
-```
+If `doctor` warns that it could not determine your system resolver, the `doctor`
+command uses your system resolver and cannot be overridden. Verify your system
+resolver is correctly configured in `/etc/resolv.conf` or network settings.
 
 ## Checking the config alone
 

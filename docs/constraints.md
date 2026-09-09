@@ -21,28 +21,29 @@ are themselves worth having on record.
 | ISP | FirstDigital Communications (AS13415), Salt Lake City | `ipinfo.io` |
 | CGNAT | **no** — routable address | — |
 | NAT layers | **one** — the router holds the public IP directly now | router UPnP WAN address matches the address seen outbound; the second-router hop described below is gone |
-| outbound :25 | **blocked** | see "Outbound port 25 is blocked" below — measured from the box, not guessed from a single tool's verdict |
+| outbound :25 | **open** | measured open as of 2026-08-12 by `selfhost doctor --deep`; see section below for historical context |
 | outbound :587, :465, :443, :53(tcp) | open | `Test-NetConnection -Port <port>` from the box |
 | inbound :80, :443, :25, :587 | open, port-forwarded | `scripts/windows/forward-soap.ps1`; verified live by Let's Encrypt's own validators reaching the box from outside, and by SMTP/submission connecting from off the LAN |
 
-### Outbound port 25 is blocked — confirmed, not assumed
+### Outbound port 25 — measured as blocked (2026-08-07), later found open (2026-08-12)
 
-Three independent signals, not one tool's say-so:
+**Status as of 2026-08-12:** `selfhost doctor --deep` now measures port 25 open and
+establishes live SMTP handshakes through to both `gmail-smtp-in.l.google.com` and
+`outlook-com.olc.protection.outlook.com`, confirming connectivity from `172.83.6.109`.
 
-1. ICMP ping to Gmail's and Outlook's mail exchangers succeeds (~10ms) — general
-   routing is fine.
-2. A TCP connection attempt to either one's port 25 does not get refused
-   (instant RST) — it **hangs for 85+ seconds** before the OS gives up
+**Earlier measurement (2026-08-07, now superseded):** Three independent signals
+suggested port 25 was blocked at that time:
+
+1. ICMP ping to Gmail's and Outlook's mail exchangers succeeded (~10ms) — general
+   routing was fine.
+2. A TCP connection attempt to either one's port 25 did not get refused
+   (instant RST) — it **hung for 85+ seconds** before the OS gave up
    (`Measure-Command { Test-NetConnection -Port 25 }` → ~86.7s). A silent drop,
    not a rejection.
-3. No local Windows Firewall outbound rule blocks port 25 — checked directly.
+3. No local Windows Firewall outbound rule blocked port 25 — checked directly.
 
-ICMP-fine-but-TCP/25-silently-dropped, on two unrelated destinations, with
-nothing local doing it, is the standard signature of an ISP transparently
-blackholing outbound SMTP — normal practice for consumer connections, meant to
-stop spam from compromised home devices. It is fixable only by asking the ISP
-(see the mail section below), or bypassed entirely by sending through a
-`[mail.relay]` smarthost instead of direct MX delivery.
+The status changed between these measurements; do not assume the earlier behavior
+persists.
 
 ### The double NAT is gone; one hop now
 
@@ -89,7 +90,7 @@ measured above, not assumed.
 
 **Inbound mail is unaffected by any of this**: port 25 is open inbound (verified
 by a real SMTP conversation completing from off the LAN) and the MX can be
-pointed here — see the DNS records in `docs/roadmap.md`'s evidence trail. Only
+pointed here — see the DNS records in the "The site being hosted" section above. Only
 *sending directly* is blocked.
 
 ### 2026-07-26 findings, for the record (address `172.83.7.210`, now retired)

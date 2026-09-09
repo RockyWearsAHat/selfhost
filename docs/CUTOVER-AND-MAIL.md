@@ -125,9 +125,8 @@ young. That rule exists because of what 2026-08-12 found: document, digest, and
 `A` record all correct, and the host still served the `rcgen` self-signed
 fallback, because the mail certificate was three days old and nothing compared
 its names to the order's. Resolved the same night — all six orders reissued,
-the mail certificate now naming `mail`/`imap`/`smtp`/`ua-auto-config` and valid
-to 2026-11-10 (`autodiscover` joined the same set later, when EWS/ActiveSync
-shipped — same rule, same reissue path, no repeat of the gap).
+the mail certificate now naming all five prefixes (`mail`/`imap`/`smtp`/`ua-auto-config`/`autodiscover`) and valid
+to 2026-11-10.
 
 **2026-08-13 — `doctor --deep` kept reporting the same hosts as self-signed
 after that, and it was `doctor` that was wrong, not the certificate.** The
