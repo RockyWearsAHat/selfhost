@@ -52,6 +52,19 @@ pub enum ServiceState {
         /// What the operating system said, phrased for the operator.
         reason: String,
     },
+    /// Stopped because a deploy's build step failed.
+    ///
+    /// Distinct from [`Self::Stopped`] for the same reason [`Self::GaveUp`] is
+    /// distinct from it: both report no running process, but one of them is a
+    /// deployment an operator or an agent needs to go fix, and the other is
+    /// nothing more than "not asked to run". A caller that rendered both as
+    /// "stopped" would have to go read `[git]`-tagged log lines to find out
+    /// which one this was — exactly the gap `services_show`/`services_list`
+    /// exist to close.
+    BuildFailed {
+        /// What the build step said, already fit to show an operator.
+        reason: String,
+    },
 }
 
 impl ServiceState {
@@ -65,7 +78,7 @@ impl ServiceState {
     /// Drives the console's summary tile, so the answer is "would a person want
     /// to know" rather than "is a process absent".
     pub fn needs_attention(&self) -> bool {
-        matches!(self, Self::GaveUp { .. } | Self::Unstartable { .. })
+        matches!(self, Self::GaveUp { .. } | Self::Unstartable { .. } | Self::BuildFailed { .. })
     }
 
     /// The wire discriminant, which is also the console's table label source.
@@ -80,6 +93,7 @@ impl ServiceState {
             Self::Backoff { .. } => "backoff",
             Self::GaveUp { .. } => "gave-up",
             Self::Unstartable { .. } => "unstartable",
+            Self::BuildFailed { .. } => "build-failed",
         }
     }
 
@@ -95,6 +109,7 @@ impl ServiceState {
             Self::Backoff { .. } => "Restarting",
             Self::GaveUp { .. } => "Gave up",
             Self::Unstartable { .. } => "Cannot start",
+            Self::BuildFailed { .. } => "Build failed",
         }
     }
 
@@ -121,6 +136,7 @@ impl ServiceState {
                 fields.push(("reason", Json::string(reason)));
             }
             Self::Unstartable { reason } => fields.push(("reason", Json::string(reason))),
+            Self::BuildFailed { reason } => fields.push(("reason", Json::string(reason))),
             Self::Stopped | Self::Disabled | Self::Starting | Self::Stopping => {}
         }
         Json::object(fields)
@@ -152,6 +168,7 @@ impl ServiceState {
                 reason: text("reason"),
             },
             "unstartable" => Self::Unstartable { reason: text("reason") },
+            "build-failed" => Self::BuildFailed { reason: text("reason") },
             _ => return None,
         })
     }
@@ -474,6 +491,22 @@ mod tests {
     }
 
     #[test]
+    fn a_build_failure_is_distinguishable_from_an_ordinary_stop() {
+        // Both report no running process. Only one means "an agent or an
+        // operator needs to go look at the build output", and a caller that
+        // rendered them the same way would have to grep `[git]` log lines to
+        // tell them apart.
+        let stopped = ServiceState::Stopped;
+        let build_failed = ServiceState::BuildFailed { reason: "npm ci: exit 1".into() };
+
+        assert!(!stopped.needs_attention());
+        assert!(build_failed.needs_attention());
+        assert_ne!(stopped.label(), build_failed.label());
+        assert_ne!(stopped.tag(), build_failed.tag());
+        assert!(!build_failed.is_live());
+    }
+
+    #[test]
     fn liveness_covers_the_transitional_states() {
         assert!(ServiceState::Starting.is_live());
         assert!(ServiceState::Running { pid: 1, uptime_secs: 0 }.is_live());
@@ -497,6 +530,7 @@ mod tests {
             ServiceState::Backoff { retry_in_secs: 20, attempt: 2 },
             ServiceState::GaveUp { attempts: 5, reason: "exit 1".into() },
             ServiceState::Unstartable { reason: "not found".into() },
+            ServiceState::BuildFailed { reason: "npm ci: exit 1".into() },
         ];
         for state in states {
             let text = state.to_json().to_text();

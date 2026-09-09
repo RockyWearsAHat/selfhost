@@ -656,8 +656,14 @@ impl<'a> Route<'a> {
             Self::ShareMkdir(id) | Self::ShareRename(id) | Self::ShareDelete(id) | Self::BeginSession(id) | Self::QuerySession(id, _) | Self::FinishSession(id, _) => {
                 storage_api::demand(id, storage_api::Wants::Write)
             }
-            Self::Install(_)
-            | Self::Uninstall(_)
+            // Installing writes the service's *definition* — its program, its
+            // build and serve commands, the repository it deploys from — so it
+            // asks for `ServicesAdmin` rather than `ServiceControl`: control
+            // over an already-defined service is a smaller trust decision than
+            // deciding what that service runs in the first place. Everything
+            // else here only operates a definition that already exists.
+            Self::Install(_) => Demand::Held(Capability::ServicesAdmin),
+            Self::Uninstall(_)
             | Self::DeployNow(_)
             | Self::SelfUpdateNow
             | Self::Act(_, _)
@@ -1318,7 +1324,7 @@ impl Api {
             Route::Install(name) => self.install(name, body).await,
             Route::Uninstall(name) => self.uninstall(name).await,
             Route::Logs(name) => self.logs(name, query).await,
-            Route::DeployNow(name) => self.deploy_now(name).await,
+            Route::DeployNow(name) => self.deploy_now(name, body).await,
             Route::SelfUpdateNow => self.self_update_now(),
             Route::Act(name, action) => self.act(name, action).await,
             Route::MintTicket => self.mint_ticket(request, &caller, body),
@@ -2975,13 +2981,22 @@ impl Api {
     /// webhook handler, in turn tying up the pusher's HTTP client — for as
     /// long as the build takes. The outcome lands where every other
     /// deployment's does: the service's own `[git]`-tagged output.
-    async fn deploy_now(&self, name: &str) -> Response {
+    async fn deploy_now(&self, name: &str, body: &[u8]) -> Response {
         let Some(spec) = self.supervisor.spec(name).await else {
             return problem(Status(404), "no such service");
         };
         let Some(watch) = spec.active_watch().cloned() else {
             return problem(Status(404), "this service has no active git watch to deploy from");
         };
+
+        // `force: true` — sent by `services_deploy` and by a person asking to
+        // redeploy right now — skips the ordinary "nothing to do" answer for an
+        // unmoved branch and re-runs the update and build regardless. Absent
+        // (the webhook relay's own call, and anything else that predates this
+        // field) behaves exactly as before: only a moved branch acts.
+        let force = parse_json_body(body)
+            .and_then(|value| value.get("force").and_then(Json::as_bool))
+            .unwrap_or(false);
 
         let supervisor = self.supervisor.clone();
         let credentials = self.github_credentials.clone();
@@ -2990,9 +3005,14 @@ impl Api {
                 Some(source) => source.authenticated_url(&watch.repository).await,
                 None => None,
             };
-            let _ =
-                selfhost_git::check_once_with_credential(&supervisor, &spec, &watch, credential.as_deref())
-                    .await;
+            let _ = selfhost_git::check_once_with_credential(
+                &supervisor,
+                &spec,
+                &watch,
+                credential.as_deref(),
+                force,
+            )
+            .await;
         });
 
         json(

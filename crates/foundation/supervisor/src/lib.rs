@@ -279,6 +279,26 @@ impl Supervisor {
         }
     }
 
+    /// Marks a service as stopped because a deploy's build step failed —
+    /// distinct from an ordinary [`ServiceState::Stopped`], because the two
+    /// need completely different reactions from an operator or an agent, and
+    /// a caller that only checked "is a process running" cannot tell them
+    /// apart. Returns whether the service exists.
+    ///
+    /// The service is left in this state until the next successful deploy or
+    /// an explicit start; a start attempt against it behaves exactly as it
+    /// would against [`ServiceState::Stopped`] — this only changes what is
+    /// *reported*, not the supervisor's willingness to run the program.
+    pub async fn mark_build_failed(&self, name: &str, reason: impl Into<String>) -> bool {
+        match self.services.lock().await.get(name) {
+            Some(handle) => {
+                handle.shared.set(ServiceState::BuildFailed { reason: reason.into() }).await;
+                true
+            }
+            None => false,
+        }
+    }
+
     /// Stops every service and forgets them all.
     ///
     /// Called on daemon shutdown so children stop the way their specs ask,

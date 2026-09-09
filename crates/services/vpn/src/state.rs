@@ -100,6 +100,10 @@ impl RelayState {
                 ),
             },
             Some(ServiceState::Unstartable { reason }) => Self::Failed { reason: reason.clone() },
+            // A relay is never git-deployed today, so this cannot occur in
+            // practice, but the match must still be exhaustive: treated as a
+            // failure like any other stopped-with-a-reason state.
+            Some(ServiceState::BuildFailed { reason }) => Self::Failed { reason: reason.clone() },
         }
     }
 
