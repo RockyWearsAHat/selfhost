@@ -18,6 +18,12 @@ path = "src/main.rs"
 name = "selfhost-console-gate"
 path = "src/bin/console-gate.rs"
 
+# The Secure-VPN Mac auto-updater: run once at login/boot by a per-user
+# LaunchAgent the app installs. See the bin's module doc and docs/VPN.md.
+[[bin]]
+name = "securevpn-updater"
+path = "src/bin/securevpn-updater.rs"
+
 [dependencies]
 rui = { workspace = true }
 selfhost-dns = { workspace = true }

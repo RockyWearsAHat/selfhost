@@ -28,11 +28,17 @@ pub const SARA_URL: &str = "https://sara.rockywearsahat.com/";
 /// The SARA gateway host: answered by the split-DNS responder, mapped to loopback.
 pub const SARA_HOST: &str = "sara.rockywearsahat.com";
 
+/// The AI Studio URL, reached portless through the same loopback 443 gate.
+pub const AI_URL: &str = "https://ai.rockywearsahat.com/";
+
+/// The AI Studio host: answered by the split-DNS responder, mapped to loopback.
+pub const AI_HOST: &str = "ai.rockywearsahat.com";
+
 /// Every host the split-DNS responder answers for and the resolver install
 /// routes to loopback. The console gate itself is host-agnostic (a byte
 /// passthrough on `127.0.0.1:443`), so adding a gated site here is the only
 /// step needed to route it through the tunnel.
-pub const GATED_HOSTS: &[&str] = &[CONSOLE_HOST, SARA_HOST];
+pub const GATED_HOSTS: &[&str] = &[CONSOLE_HOST, SARA_HOST, AI_HOST];
 
 /// What a slow, off-thread action is doing and what it last said.
 #[derive(Default)]
@@ -218,6 +224,10 @@ fn controls(link: &Link) -> El<Panel> {
             button("Open SARA")
                 .disabled(!up)
                 .on_click(|panel: &mut Panel| actions::open_sara(panel.activity_handle()))
+                .h(30.0),
+            button("Open AI Studio")
+                .disabled(!up)
+                .on_click(|panel: &mut Panel| actions::open_ai_studio(panel.activity_handle()))
                 .h(30.0),
         ))
         .gap(8.0),

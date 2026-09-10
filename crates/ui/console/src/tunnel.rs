@@ -265,7 +265,11 @@ pub fn fetch_token(spec: &TunnelSpec, remote_path: &str) -> Result<String, Strin
     }
 
     let complaint = String::from_utf8_lossy(&output.stderr);
-    let first = complaint.lines().find(|line| !line.trim().is_empty()).unwrap_or("ssh failed");
+    let first = complaint
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty() && !is_advisory_banner(line))
+        .unwrap_or("ssh failed");
     Err(match advice_for(&complaint) {
         Some(advice) => format!("{first}\n{advice}"),
         None => format!(
@@ -446,6 +450,20 @@ fn sleep_while_running(delay: Duration, running: &Arc<AtomicBool>) {
     }
 }
 
+/// Whether a line is one of `ssh`'s own advisory banners rather than a
+/// complaint about why the connection failed.
+///
+/// OpenSSH now prints an unprompted `** WARNING: …` banner about missing
+/// post-quantum key exchange on every connection to a server that lacks it —
+/// informational, not an error, and printed before anything else on stderr.
+/// [`first_complaint`] has to see past it to whatever `ssh` actually failed
+/// on, the same way it already sees past blank lines. OpenSSH's `@@@ …@@@`
+/// banners (host key changed, etc.) are left alone: those *are* the
+/// complaint.
+fn is_advisory_banner(line: &str) -> bool {
+    line.starts_with("**")
+}
+
 /// The line worth showing out of everything `ssh` said.
 fn first_complaint(kept: &Arc<Mutex<Vec<String>>>) -> String {
     let lines = match kept.lock() {
@@ -455,7 +473,7 @@ fn first_complaint(kept: &Arc<Mutex<Vec<String>>>) -> String {
     lines
         .iter()
         .map(|line| line.trim())
-        .find(|line| !line.is_empty())
+        .find(|line| !line.is_empty() && !is_advisory_banner(line))
         .unwrap_or("the tunnel closed")
         .to_owned()
 }
@@ -588,6 +606,32 @@ mod tests {
     #[test]
     fn a_tunnel_that_said_nothing_still_reports_something() {
         assert_eq!(first_complaint(&Arc::new(Mutex::new(Vec::new()))), "the tunnel closed");
+    }
+
+    #[test]
+    fn the_post_quantum_banner_is_not_mistaken_for_the_complaint() {
+        // OpenSSH now prints this unprompted, ahead of anything else on stderr,
+        // for any server that lacks a PQ key exchange algorithm. It must not
+        // bury the real reason the tunnel failed, and it must not itself be
+        // reported as if it were a fatal error.
+        let kept = Arc::new(Mutex::new(vec![
+            "** WARNING: connection is not using a post-quantum key exchange algorithm.".into(),
+            "** This session may be vulnerable to \"store now, decrypt later\" attacks.".into(),
+            "** The server may need to be upgraded. See https://openssh.com/pq.html".into(),
+            "rocky@server: Permission denied (publickey).".into(),
+        ]));
+        assert_eq!(first_complaint(&kept), "rocky@server: Permission denied (publickey).");
+    }
+
+    #[test]
+    fn a_tunnel_that_only_warned_about_post_quantum_still_reports_something() {
+        // If the banner is genuinely all `ssh` said (e.g. it was killed before
+        // saying anything else), that must not be reported as the complaint —
+        // it isn't one.
+        let kept = Arc::new(Mutex::new(vec![
+            "** WARNING: connection is not using a post-quantum key exchange algorithm.".into(),
+        ]));
+        assert_eq!(first_complaint(&kept), "the tunnel closed");
     }
 
     /// A stand-in for `ssh` that stays running until it is killed, and records

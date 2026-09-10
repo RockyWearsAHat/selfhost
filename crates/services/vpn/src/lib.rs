@@ -92,11 +92,13 @@ pub mod keys;
 pub mod roster;
 pub mod runner;
 pub mod state;
+pub mod updater;
 
 pub use attribution::{Attributed, Attribution, Unanswered, who_arrived_at};
 pub use keys::KeyReport;
 pub use roster::{Enrolled, Rejected, Roster};
 pub use runner::{Install, Launch, service_name};
+pub use updater::Updater;
 pub use state::{RelayState, RelaySummary};
 
 use selfhost_config::vpn::Relay;

@@ -349,6 +349,24 @@ handshake_timeout_secs = 30         # a slow drip must not hold a slot for ever
                                     # The port is how the identity survives the forward — see
                                     # docs/labs/vpn-lab.dx. Something local must listen on it.
                                     # Omit the line to share `forward` and name nobody.
+
+# A second relay, same identity and roster shape, pointed at SSH instead of the
+# proxy — SSH-02's sanctioned remote-SSH path (docs/SECURITY.md). Not a second
+# VPN product: same vetted implementation, same key model, one more forwarded
+# target. Naming it \"ssh\" is what makes its supervised service vpn-ssh,
+# matching `scripts/securevpn/install-vpn-service.ps1 -Name ssh`.
+[[vpn]]
+name = \"ssh\"
+backend = \"secure-vpn\"
+enabled = false
+public = true
+listen = \"0.0.0.0:8444\"            # a distinct port from the console relay's 8443
+forward = \"127.0.0.1:22\"           # the box's own sshd, loopback-only either way
+
+  [[vpn.peers]]
+  name = \"alex-mac\"
+  person = \"Alex\"
+  public_key = \"3xJ7Nn4x0Qm2vQe1Zr8sT5uYw9Ab2Cd4Ef6Gh8Ij0Kw=\"
 ";
 
 /// One `[[vpn]]` block: a door, and who may come through it.
