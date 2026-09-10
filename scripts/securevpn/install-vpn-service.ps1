@@ -93,39 +93,63 @@ if (-not (Get-NetFirewallRule -DisplayName $fwName -ErrorAction SilentlyContinue
   Write-Output "Firewall rule present: $fwName"
 }
 
-# --- 4. Register the scheduled task ------------------------------------------
-# Launched through cmd so stdout/stderr land in a real log file (a detached
-# SYSTEM task has no console, and the server prints Unicode status marks).
-# `-X utf8` forces UTF-8 stdio so those marks cannot raise UnicodeEncodeError
-# on a cp1252 console and abort a connection handler; `-u` keeps the log live.
-$logFile = Join-Path $VpnDir $(if ($Name) { "vpn-$Name.log" } else { 'vpn.log' })
-$pyArgs  = "-X utf8 -u `"$server`" --host 0.0.0.0 --port $ListenPort --ssh-host $TargetHost --ssh-port $TargetPort --key-dir `"$keyDir`" --identity server --peer client"
-$cmdLine = "/c `"`"$Python`" $pyArgs >> `"$logFile`" 2>&1`""
-$action  = New-ScheduledTaskAction -Execute "$env:SystemRoot\System32\cmd.exe" -Argument $cmdLine -WorkingDirectory $VpnDir
-$trigger = New-ScheduledTaskTrigger -AtStartup
-$principal = New-ScheduledTaskPrincipal -UserId 'SYSTEM' -LogonType ServiceAccount -RunLevel Highest
-# ExecutionTimeLimit of zero means *no limit*, and it is not a preference: leave
-# it out and Task Scheduler applies its own default of 72 hours and kills the
-# server three days after it starts, with the task still sitting in `Ready`. That
-# is what happened to `selfhost-lan-dns` on 2026-08-16, and this task is the same
-# shape of risk — a VPN killed every three days takes the admin console's only
-# reachable route with it.
+# --- 4. Scheduled Task registration - SUPERSEDED, kept only for reference ----
+# As of the vpn-console/vpn-ssh/vpn-updater supervisor services
+# (crates/services/vpn/src/runner.rs, crates/services/vpn/src/updater.rs),
+# this relay is no longer started through a Windows Scheduled Task. Task
+# Scheduler has a confirmed bug on this box: a triggered task can be
+# registered, show `Ready`/`Running`, and yet never actually launch the child
+# process - discovered the hard way on `selfhost-lan-dns` (see the
+# ExecutionTimeLimit note that used to live on the block below) and treated
+# ever since as a reason not to trust it for anything on the console's only
+# reachable route. The supervisor sidesteps the whole class of failure by
+# spawning the child directly, in-process, where a failure to start is a
+# `ServiceState` the daemon itself observes rather than a task silently
+# sitting `Ready` with nothing behind it. Use `selfhost vpn up <console|ssh>`
+# (or the console's service page) to start this relay now; this script still
+# vets Python and the keys (steps 1-2) and the firewall rule (step 3), which
+# are still needed either way.
 #
-# `selfhost service check` audits this task's settings against the one
-# authoritative statement of them (crates/app/cli/src/service_install.rs), and
-# the running daemon re-checks every six hours and repairs drift, whichever path
-# created the task. It never touches what the task *runs*: the action below
-# starts a Python program from another repository and is nobody else's business.
-$settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries `
-  -StartWhenAvailable -MultipleInstances IgnoreNew `
-  -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 1) -ExecutionTimeLimit ([TimeSpan]::Zero)
+# The block below is left commented out, not deleted, so the exact invocation
+# a Scheduled Task used to run - and the ExecutionTimeLimit trap it fell into
+# - stays legible for whoever eventually retires the last Task-Scheduler-based
+# selfhost-* task and wants one worked example of what to check for.
+#
+# # Launched through cmd so stdout/stderr land in a real log file (a detached
+# # SYSTEM task has no console, and the server prints Unicode status marks).
+# # `-X utf8` forces UTF-8 stdio so those marks cannot raise UnicodeEncodeError
+# # on a cp1252 console and abort a connection handler; `-u` keeps the log live.
+# $logFile = Join-Path $VpnDir $(if ($Name) { "vpn-$Name.log" } else { 'vpn.log' })
+# $pyArgs  = "-X utf8 -u `"$server`" --host 0.0.0.0 --port $ListenPort --ssh-host $TargetHost --ssh-port $TargetPort --key-dir `"$keyDir`" --identity server --peer client"
+# $cmdLine = "/c `"`"$Python`" $pyArgs >> `"$logFile`" 2>&1`""
+# $action  = New-ScheduledTaskAction -Execute "$env:SystemRoot\System32\cmd.exe" -Argument $cmdLine -WorkingDirectory $VpnDir
+# $trigger = New-ScheduledTaskTrigger -AtStartup
+# $principal = New-ScheduledTaskPrincipal -UserId 'SYSTEM' -LogonType ServiceAccount -RunLevel Highest
+# # ExecutionTimeLimit of zero means *no limit*, and it is not a preference: leave
+# # it out and Task Scheduler applies its own default of 72 hours and kills the
+# # server three days after it starts, with the task still sitting in `Ready`. That
+# # is what happened to `selfhost-lan-dns` on 2026-08-16, and this task is the same
+# # shape of risk — a VPN killed every three days takes the admin console's only
+# # reachable route with it.
+# #
+# # `selfhost service check` audits this task's settings against the one
+# # authoritative statement of them (crates/app/cli/src/service_install.rs), and
+# # the running daemon re-checks every six hours and repairs drift, whichever path
+# # created the task. It never touches what the task *runs*: the action below
+# # starts a Python program from another repository and is nobody else's business.
+# $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries `
+#   -StartWhenAvailable -MultipleInstances IgnoreNew `
+#   -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 1) -ExecutionTimeLimit ([TimeSpan]::Zero)
+#
+# Register-ScheduledTask -TaskName $taskName -Action $action -Trigger $trigger `
+#   -Principal $principal -Settings $settings -Force | Out-Null
+# Start-ScheduledTask -TaskName $taskName
+# Start-Sleep -Seconds 3
+#
+# $state = (Get-ScheduledTask -TaskName $taskName).State
+# Write-Output "Scheduled task '$taskName' = $state"
+# $listening = Get-NetTCPConnection -State Listen -LocalPort $ListenPort -ErrorAction SilentlyContinue
+# if ($listening) { Write-Output "Listening on ${ListenPort}: OK" } else { Write-Output "WARNING: nothing listening on $ListenPort yet - check the task's last run" }
 
-Register-ScheduledTask -TaskName $taskName -Action $action -Trigger $trigger `
-  -Principal $principal -Settings $settings -Force | Out-Null
-Start-ScheduledTask -TaskName $taskName
-Start-Sleep -Seconds 3
-
-$state = (Get-ScheduledTask -TaskName $taskName).State
-Write-Output "Scheduled task '$taskName' = $state"
-$listening = Get-NetTCPConnection -State Listen -LocalPort $ListenPort -ErrorAction SilentlyContinue
-if ($listening) { Write-Output "Listening on ${ListenPort}: OK" } else { Write-Output "WARNING: nothing listening on $ListenPort yet - check the task's last run" }
+Write-Output "Python and keys verified; firewall rule ensured for port $ListenPort."
+Write-Output "Start this relay with the supervisor, not this script: 'selfhost vpn up $(if ($Name) { $Name } else { 'console' })'"

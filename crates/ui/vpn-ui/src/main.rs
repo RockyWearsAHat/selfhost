@@ -63,6 +63,12 @@ fn run(args: Vec<String>) -> Result<(), String> {
 /// Opens the window, keeps the key rotating and the console's name answered,
 /// and runs until it is closed.
 fn open() -> Result<(), String> {
+    // Installs/refreshes the Secure-VPN Mac auto-updater's login/boot
+    // LaunchAgent. This needs no privileged prompt (a per-user LaunchAgent,
+    // not a LaunchDaemon), so it runs unconditionally and silently on every
+    // launch rather than behind a button — see actions::ensure_updater_agent.
+    actions::ensure_updater_agent();
+
     let running = Arc::new(AtomicBool::new(true));
     let panel = Panel::new(Endpoint::default(), Arc::clone(&running));
 

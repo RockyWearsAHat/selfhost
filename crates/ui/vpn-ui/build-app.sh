@@ -20,6 +20,12 @@ cp "$root/target/release/$bin" "$app/Contents/MacOS/$bin"
 # The console gate rides in the bundle so the app's one-time privileged setup
 # can install it as the com.selfhost.console-gate LaunchDaemon (docs/VPN.md).
 cp "$root/target/release/selfhost-console-gate" "$app/Contents/MacOS/selfhost-console-gate"
+# The Secure-VPN Mac auto-updater and the script it runs ride in the bundle so
+# the app can silently install/refresh the com.selfhost.securevpn-updater
+# LaunchAgent on every launch (docs/VPN.md).
+cp "$root/target/release/securevpn-updater" "$app/Contents/MacOS/securevpn-updater"
+cp "$root/scripts/securevpn/mac-auto-update.sh" "$app/Contents/Resources/mac-auto-update.sh"
+chmod +x "$app/Contents/Resources/mac-auto-update.sh"
 
 cat > "$app/Contents/Info.plist" <<'PLIST'
 <?xml version="1.0" encoding="UTF-8"?>
