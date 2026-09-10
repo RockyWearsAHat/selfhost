@@ -431,6 +431,35 @@ impl Relays {
         Ok(self.state_of(relay, roster).await)
     }
 
+    /// Brings up every relay declared `enabled = true`, into *this* `Relays`'
+    /// own supervisor.
+    ///
+    /// This is the daemon-boot half of the fix for the bug `docs/VPN.md`
+    /// records: `selfhost vpn up <name>` used to be the only way to start a
+    /// relay, and it installed the relay into a `Supervisor` owned by the
+    /// one-shot CLI process — so the relay's Job Object (on Windows) died the
+    /// instant that process exited, seconds later. Calling this once, from
+    /// `serve_everything`'s own long-lived `Supervisor`, gives every enabled
+    /// relay the same lifetime as every other supervised service (mail, the
+    /// git-watched apps, `vpn-updater`): as long as the daemon itself runs.
+    ///
+    /// One relay's failure does not stop the rest: a bad roster on `console`
+    /// must not also keep `ssh` down. Every outcome is returned, in relay
+    /// order, so the caller can log or print each one; a relay that is not
+    /// `enabled` is skipped entirely rather than reported as an error, since
+    /// leaving it off is the deployment's own choice (`VpnError::NotEnabled`
+    /// is for an operator typing `up` by hand, not for this sweep).
+    pub async fn start_enabled(&self) -> Vec<(String, Result<RelayState, VpnError>)> {
+        let mut outcomes = Vec::new();
+        for relay in &self.relays {
+            if !relay.enabled {
+                continue;
+            }
+            outcomes.push((relay.name.clone(), self.up(&relay.name).await));
+        }
+        outcomes
+    }
+
     /// Takes a relay down.
     ///
     /// A relay that was never installed is already down, and that is not an
@@ -767,6 +796,49 @@ pub(crate) mod tests {
         .expect("the tunnel process stops");
         assert!(!down.is_live(), "{down:?}");
         assert_eq!(subject.state("console").await.expect("known"), RelayState::Down);
+
+        subject.supervisor().shutdown().await;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn start_enabled_installs_and_starts_every_enabled_relay_into_this_supervisor() {
+        // The regression this exists for: a relay started only by a one-shot
+        // CLI process dies with that process (Windows Job Object kill-on-close).
+        // `start_enabled` is what the daemon calls at boot instead, into its own
+        // long-lived supervisor — so proving the relay lands there, running, is
+        // exactly what closes the gap.
+        let dir = scratch("start-enabled");
+        // `armed_relay`'s key material is written under a path derived from its
+        // (default) name, so it keeps that name here rather than being renamed
+        // after its keys are already on disk.
+        let enabled = armed_relay(&dir);
+        let mut disabled = forwarding_relay();
+        disabled.name = "down-one".to_owned();
+        // `disabled.enabled` defaults to `false` from `Relay::new`.
+        let subject = relays(&dir, fake_install(&dir), vec![enabled, disabled]);
+
+        let outcomes = subject.start_enabled().await;
+        assert_eq!(outcomes.len(), 1, "only the enabled relay is attempted: {outcomes:?}");
+        let (name, result) = &outcomes[0];
+        assert_eq!(name, "console");
+        result.as_ref().expect("the enabled, fully-keyed relay starts");
+
+        let service = service_name("console");
+        let up = await_state(subject.supervisor(), &service, Duration::from_secs(5), |state| {
+            state.is_live()
+        })
+        .await
+        .expect("the tunnel process starts under this Relays' own supervisor");
+        assert!(matches!(up, ServiceState::Running { .. }), "{up:?}");
+
+        // The disabled relay was never installed at all — not even as a
+        // stopped service — because installing something nobody armed would
+        // be a second, silent way to bind a socket.
+        assert!(
+            subject.supervisor().status(&service_name("down-one")).await.is_none(),
+            "a disabled relay must not be installed by the boot-time sweep"
+        );
 
         subject.supervisor().shutdown().await;
         let _ = std::fs::remove_dir_all(&dir);

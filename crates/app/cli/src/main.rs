@@ -959,6 +959,62 @@ async fn serve_everything(
 
     supervisor.load(&catalog).await;
 
+    // Secure-VPN relays declared `[[vpn]]` with `enabled = true`.
+    //
+    // This is the fix for a bug found live on 2026-09-09: `selfhost vpn up
+    // <name>` built its own throwaway `Supervisor`, installed the relay into
+    // it, and started it — but that CLI process exits within about a second
+    // of printing the relay's state, and on Windows the relay was in that
+    // process's Job Object. Closing the Job Object kills every process still
+    // in it, so the relay died seconds after `vpn up` reported it running.
+    // Every other supervised service (mail, git-watched apps) never had this
+    // problem because it is installed into *this* `supervisor` — the one
+    // `serve_everything` builds once and keeps for the life of the daemon
+    // process — rather than into one built fresh by a one-shot command.
+    //
+    // Wiring relays in here, the same way `supervisor.load(&catalog)` just
+    // did for every other service, gives an enabled relay that same lifetime:
+    // as long as the daemon runs. A config edit (`enabled = true`/`false`,
+    // added or removed peers) takes effect at the daemon's next restart —
+    // the same convention `[desktop]`, `[dns]` and `[[shares]]` already use
+    // above and below this block; there is no live-reconcile path for `[[vpn]]`
+    // and none is added here. `selfhost vpn up`/`down` remain available as
+    // manual, foreground-lifetime tools for diagnosis (see their own --help).
+    if !config.vpn.is_empty() {
+        let vpn_relays = selfhost_vpn::Relays::new(
+            supervisor.clone(),
+            &data_dir,
+            selfhost_vpn::Install::vendored(),
+            config.vpn.clone(),
+        );
+        for (name, outcome) in vpn_relays.start_enabled().await {
+            match outcome {
+                Ok(state) => println!("\nvpn relay \"{name}\": {}", state.label()),
+                Err(error) => eprintln!(
+                    "\nwarning: vpn relay \"{name}\" did not start: {error}\n  fix it and run \
+                     `selfhost vpn up {name}` by hand, or restart the daemon once it is fixed"
+                ),
+            }
+        }
+
+        // `vpn-updater` owns the Secure-VPN GitWatch (see
+        // `crates/services/vpn/src/updater.rs`) and is a fixed, one-shot
+        // meta-service (`RestartPolicy::Never`, starts as `Exited`), not
+        // per-relay — so there is nothing to arm per relay and nothing to
+        // start now. It is registered here whenever at least one relay is
+        // declared, but only if the operator has not already added their own
+        // `vpn-updater` entry to `data/services.toml` (via the console or
+        // `services_add`) — that entry is the one place a `webhook_secret`
+        // can live (see `docs/VPN.md`), and `supervisor.load(&catalog)` above
+        // already installed it. Installing the bare vendored definition on
+        // top of it here would silently erase that secret every restart.
+        let already_catalogued =
+            catalog.services.iter().any(|spec| spec.name == selfhost_vpn::updater::SERVICE_NAME);
+        if !already_catalogued {
+            supervisor.install(selfhost_vpn::Updater::vendored().service()).await;
+        }
+    }
+
     // When a GitHub App is configured, a service whose repository it has
     // installed is fetched over an authenticated HTTPS URL minted fresh for
     // each deploy, rather than needing a static SSH deploy key — see

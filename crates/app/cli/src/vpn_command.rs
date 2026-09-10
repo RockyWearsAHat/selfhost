@@ -18,7 +18,21 @@
 //!   The plan-before-acting shape this codebase uses for the firewall and for SMB;
 //!   lets an operator see exactly what would run.
 //! - **`vpn up <name>`** — bring a relay up. Prints its state after starting.
-//! - **`vpn down <name>`** — take a relay down.
+//!   **Manual and foreground-lifetime**, not persistence: this builds a
+//!   throwaway `Supervisor` scoped to this one CLI invocation. On Windows the
+//!   relay lands in that process's Job Object, so the relay dies within
+//!   seconds of this command exiting — it does *not* keep running in the
+//!   background. Since 2026-09-09, every relay with `enabled = true` is
+//!   started automatically by the daemon itself at boot, into its own
+//!   long-lived supervisor (see `serve_everything` in `crates/app/cli/src/main.rs`
+//!   and `docs/VPN.md`); reach for `vpn up` only for manual diagnosis of a
+//!   relay the daemon is not (yet) running, or one deliberately left
+//!   `enabled = false`. A config change (`enabled`, peers, keys) takes
+//!   effect at the daemon's next restart, not on this command.
+//! - **`vpn down <name>`** — take a relay down. Same caveat in reverse: this
+//!   stops whatever the *daemon's* supervisor is running, immediately, and a
+//!   daemon still declaring the relay `enabled = true` will not bring it back
+//!   up until it is restarted.
 //! - **`vpn who <address>`** — who arrived at a loopback socket on any relay.
 //!
 //! # Why the CLI loads the relays
@@ -164,6 +178,13 @@ fn up_relay(arguments: &[String], config: &Config, project_dir: &Path) -> Result
 
     println!("relay          {name}");
     println!("state          {}", state.label());
+    println!(
+        "\nnote: this installed the relay into a Supervisor scoped to this command, not the \
+         running daemon's own. If a daemon is running with this relay's `enabled = true` in \
+         config, it already started this relay itself at boot and this was redundant; if not, \
+         this relay stops again the moment this process exits (Windows kills it immediately via \
+         its Job Object — see docs/VPN.md)."
+    );
 
     Ok(())
 }
