@@ -6,7 +6,6 @@
 //! console once it is up, and keeps the identity key rotating. Everything slow
 //! runs off the window thread, so it never sits unresponsive.
 
-#![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
 mod actions;

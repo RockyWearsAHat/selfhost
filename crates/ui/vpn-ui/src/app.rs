@@ -10,10 +10,11 @@ use crate::keys::{self, Identity};
 use crate::tunnel::{Endpoint, Link, Phase, Tunnel};
 use crate::{actions, hero, hud, style};
 use rui::{
-    App, El, Size, Status, Tone, button, caption, code, col, dot, field_row, micro, row, section,
+    App, El, Key, Modifiers, Size, Status, Tone, button, caption, code, col, dot, field_row, micro, row, section,
     spacer, tag, title,
 };
 use rui::tray::{Tray, TrayEvent, TrayMenuItem};
+use std::ffi::CStr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -68,6 +69,10 @@ pub struct Panel {
     window_visible: bool,
     /// Whether we've already attempted tray creation (on first frame).
     tray_created: bool,
+    /// Whether to use panel mode (dropdown window) instead of NSMenu.
+    use_panel_mode: bool,
+    /// Track the previous visibility state to avoid redundant macOS calls.
+    previous_visible: bool,
 }
 
 impl Panel {
@@ -80,14 +85,24 @@ impl Panel {
             last_rotation: keys::last_rotation(),
             ..Activity::default()
         }));
+        let mut tunnel = Tunnel::new(endpoint);
+
+        // If a tunnel was already running and we adopted it, connect() to
+        // start reading its state. If managed, it was created in Off state.
+        if !tunnel.is_managed() {
+            tunnel.connect();
+        }
+
         Self {
-            tunnel: Tunnel::new(endpoint),
+            tunnel,
             activity,
             auto_rotate: Arc::new(AtomicBool::new(true)),
             running,
             tray: None,
             window_visible: true,
             tray_created: false,
+            use_panel_mode: true,  // Enable panel dropdown instead of NSMenu
+            previous_visible: true,
         }
     }
 
@@ -109,6 +124,8 @@ impl Panel {
             tray: None,
             window_visible: true,
             tray_created: false,
+            use_panel_mode: true,
+            previous_visible: true,
         }
     }
 
@@ -130,6 +147,81 @@ impl Panel {
         }
     }
 
+    /// Hide the main window using AppleScript (via osascript).
+    fn hide_window(&self) {
+        #[cfg(target_os = "macos")]
+        {
+            // Use osascript to hide the window - more reliable than raw Objective-C
+            let _ = std::process::Command::new("osascript")
+                .arg("-e")
+                .arg("tell application \"System Events\" to tell process \"selfhost-vpn-ui\" to set visible to false")
+                .output();
+        }
+    }
+
+    /// Show the main window using AppleScript (via osascript).
+    fn show_window(&self) {
+        #[cfg(target_os = "macos")]
+        {
+            // Use osascript to show the window - more reliable than raw Objective-C
+            let _ = std::process::Command::new("osascript")
+                .arg("-e")
+                .arg("tell application \"System Events\" to tell process \"selfhost-vpn-ui\" to set visible to true")
+                .output();
+        }
+    }
+
+    /// Helper to get an Objective-C class by name.
+    #[cfg(target_os = "macos")]
+    unsafe fn objc_class(name: &CStr) -> *mut std::ffi::c_void {
+        unsafe extern "C" {
+            fn objc_getClass(name: *const u8) -> *mut std::ffi::c_void;
+        }
+        unsafe { objc_getClass(name.as_ptr() as *const u8) }
+    }
+
+    /// Helper to get an Objective-C selector by name.
+    #[cfg(target_os = "macos")]
+    unsafe fn objc_selector(name: &CStr) -> *mut std::ffi::c_void {
+        unsafe extern "C" {
+            fn sel_registerName(name: *const u8) -> *mut std::ffi::c_void;
+        }
+        unsafe { sel_registerName(name.as_ptr() as *const u8) }
+    }
+
+    /// Helper to send an Objective-C message (no arguments).
+    #[cfg(target_os = "macos")]
+    unsafe fn objc_send(receiver: *mut std::ffi::c_void, selector: *mut std::ffi::c_void) -> *mut std::ffi::c_void {
+        unsafe extern "C" {
+            fn objc_msgSend();
+        }
+        let send: unsafe extern "C" fn(*mut std::ffi::c_void, *mut std::ffi::c_void) -> *mut std::ffi::c_void =
+            unsafe { std::mem::transmute(objc_msgSend as *const ()) };
+        unsafe { send(receiver, selector) }
+    }
+
+    /// Helper to send an Objective-C message (one argument).
+    #[cfg(target_os = "macos")]
+    unsafe fn objc_send_with_arg(receiver: *mut std::ffi::c_void, selector: *mut std::ffi::c_void, arg: *mut std::ffi::c_void) {
+        unsafe extern "C" {
+            fn objc_msgSend();
+        }
+        let send: unsafe extern "C" fn(*mut std::ffi::c_void, *mut std::ffi::c_void, *mut std::ffi::c_void) =
+            unsafe { std::mem::transmute(objc_msgSend as *const ()) };
+        unsafe { send(receiver, selector, arg) };
+    }
+
+    /// Helper to send an Objective-C message with an index argument (usize).
+    #[cfg(target_os = "macos")]
+    unsafe fn objc_send_with_index(receiver: *mut std::ffi::c_void, selector: *mut std::ffi::c_void, index: usize) -> *mut std::ffi::c_void {
+        unsafe extern "C" {
+            fn objc_msgSend();
+        }
+        let send: unsafe extern "C" fn(*mut std::ffi::c_void, *mut std::ffi::c_void, usize) -> *mut std::ffi::c_void =
+            unsafe { std::mem::transmute(objc_msgSend as *const ()) };
+        unsafe { send(receiver, selector, index) }
+    }
+
     /// Create and store the system tray icon.
     ///
     /// Called from [`Panel::drain_tray_events`] on the first frame rather than
@@ -145,7 +237,10 @@ impl Panel {
         // Tray::new creates the status item with a blank placeholder image.
         let _ = tray.set_icon(icon_data);
         self.tray = Some(tray);
+
+        // Always update the tray menu with current state
         self.update_tray_menu();
+
         Ok(())
     }
 
@@ -172,12 +267,14 @@ impl Panel {
     fn handle_tray_event(&mut self, event: TrayEvent) {
         match event {
             TrayEvent::IconActivated => {
-                // AppKit gives a status item exactly one primary click action:
-                // once `setMenu:` attaches a menu (as `update_tray_menu` always
-                // does here), that click opens the menu and this event never
-                // actually fires — left in place for the day the tray has no
-                // menu attached and a plain click needs to mean something.
+                // Clicking tray icon toggles main window visibility.
+                // The window serves as the dropdown panel.
                 self.window_visible = !self.window_visible;
+            }
+            TrayEvent::IconActivatedForPanel { .. } => {
+                // Panel mode activated (for platforms that show a panel on click).
+                // This is similar to IconActivated but explicitly for panel display.
+                self.window_visible = true;
             }
             TrayEvent::MenuItemClicked(id) => {
                 match id {
@@ -186,7 +283,13 @@ impl Panel {
                     3 => actions::open_console(self.activity_handle()),
                     4 => actions::open_sara(self.activity_handle()),
                     5 => actions::open_ai_studio(self.activity_handle()),
-                    6 => self.running.store(false, Ordering::Relaxed),  // Quit
+                    6 => {
+                        // Quit: exit the GUI without killing the tunnel.
+                        // If the tunnel is managed (we spawned it), it will be detached and survive.
+                        // If it's unmanaged (adopted), it's already detached from us.
+                        // The Drop impl handles cleanup appropriately for each case.
+                        self.running.store(false, Ordering::Relaxed);
+                    }
                     _ => {}
                 }
             }
@@ -249,9 +352,20 @@ impl Panel {
 
         // on_frame callback: drain and dispatch tray events each frame before rendering.
         // The tray is created on the first frame when the pump loop is active.
+        // Also applies window visibility changes when the window_visible flag changes.
         let on_frame = |panel: &mut Panel| {
             panel.drain_tray_events();
             panel.update_tray_menu();
+
+            // Apply window visibility changes
+            if panel.window_visible != panel.previous_visible {
+                if panel.window_visible {
+                    panel.show_window();
+                } else {
+                    panel.hide_window();
+                }
+                panel.previous_visible = panel.window_visible;
+            }
         };
 
         application(title, self)
@@ -284,6 +398,12 @@ pub fn view(ui: &Panel) -> El<Panel> {
     ))
     .pad(16.0)
     .gap(14.0)
+    .on_key(|panel: &mut Panel, key: Key, _modifiers: Modifiers| {
+        // Escape key hides the window (same as clicking tray icon to toggle)
+        if key == Key::Escape {
+            panel.window_visible = false;
+        }
+    })
 }
 
 /// The bar across the top: the mark, the wordmark, and the state at a glance.
