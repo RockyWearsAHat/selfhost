@@ -14,7 +14,6 @@ use rui::{
     spacer, tag, title,
 };
 use rui::tray::{Tray, TrayEvent, TrayMenuItem};
-use std::ffi::CStr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -69,8 +68,6 @@ pub struct Panel {
     window_visible: bool,
     /// Whether we've already attempted tray creation (on first frame).
     tray_created: bool,
-    /// Whether to use panel mode (dropdown window) instead of NSMenu.
-    use_panel_mode: bool,
     /// Track the previous visibility state to avoid redundant macOS calls.
     previous_visible: bool,
 }
@@ -101,7 +98,6 @@ impl Panel {
             tray: None,
             window_visible: true,
             tray_created: false,
-            use_panel_mode: true,  // Enable panel dropdown instead of NSMenu
             previous_visible: true,
         }
     }
@@ -124,7 +120,6 @@ impl Panel {
             tray: None,
             window_visible: true,
             tray_created: false,
-            use_panel_mode: true,
             previous_visible: true,
         }
     }
@@ -169,57 +164,6 @@ impl Panel {
                 .arg("tell application \"System Events\" to tell process \"selfhost-vpn-ui\" to set visible to true")
                 .output();
         }
-    }
-
-    /// Helper to get an Objective-C class by name.
-    #[cfg(target_os = "macos")]
-    unsafe fn objc_class(name: &CStr) -> *mut std::ffi::c_void {
-        unsafe extern "C" {
-            fn objc_getClass(name: *const u8) -> *mut std::ffi::c_void;
-        }
-        unsafe { objc_getClass(name.as_ptr() as *const u8) }
-    }
-
-    /// Helper to get an Objective-C selector by name.
-    #[cfg(target_os = "macos")]
-    unsafe fn objc_selector(name: &CStr) -> *mut std::ffi::c_void {
-        unsafe extern "C" {
-            fn sel_registerName(name: *const u8) -> *mut std::ffi::c_void;
-        }
-        unsafe { sel_registerName(name.as_ptr() as *const u8) }
-    }
-
-    /// Helper to send an Objective-C message (no arguments).
-    #[cfg(target_os = "macos")]
-    unsafe fn objc_send(receiver: *mut std::ffi::c_void, selector: *mut std::ffi::c_void) -> *mut std::ffi::c_void {
-        unsafe extern "C" {
-            fn objc_msgSend();
-        }
-        let send: unsafe extern "C" fn(*mut std::ffi::c_void, *mut std::ffi::c_void) -> *mut std::ffi::c_void =
-            unsafe { std::mem::transmute(objc_msgSend as *const ()) };
-        unsafe { send(receiver, selector) }
-    }
-
-    /// Helper to send an Objective-C message (one argument).
-    #[cfg(target_os = "macos")]
-    unsafe fn objc_send_with_arg(receiver: *mut std::ffi::c_void, selector: *mut std::ffi::c_void, arg: *mut std::ffi::c_void) {
-        unsafe extern "C" {
-            fn objc_msgSend();
-        }
-        let send: unsafe extern "C" fn(*mut std::ffi::c_void, *mut std::ffi::c_void, *mut std::ffi::c_void) =
-            unsafe { std::mem::transmute(objc_msgSend as *const ()) };
-        unsafe { send(receiver, selector, arg) };
-    }
-
-    /// Helper to send an Objective-C message with an index argument (usize).
-    #[cfg(target_os = "macos")]
-    unsafe fn objc_send_with_index(receiver: *mut std::ffi::c_void, selector: *mut std::ffi::c_void, index: usize) -> *mut std::ffi::c_void {
-        unsafe extern "C" {
-            fn objc_msgSend();
-        }
-        let send: unsafe extern "C" fn(*mut std::ffi::c_void, *mut std::ffi::c_void, usize) -> *mut std::ffi::c_void =
-            unsafe { std::mem::transmute(objc_msgSend as *const ()) };
-        unsafe { send(receiver, selector, index) }
     }
 
     /// Create and store the system tray icon.
