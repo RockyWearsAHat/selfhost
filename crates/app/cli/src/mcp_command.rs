@@ -56,6 +56,12 @@ use selfhost_json::Json;
 use std::io::{BufRead, Write};
 use std::path::Path;
 
+/// The host the `report` tool files against when `reportHost` is not given —
+/// this deployment's public site, where the report intake is actually mounted
+/// (`app_paths = ["/report"]`), which is a different site from the admin API
+/// host this server's `--host` names.
+const DEFAULT_REPORT_HOST: &str = "rockywearsahat.com";
+
 /// The words this command accepts, and what each one is for.
 pub const USAGE: &str = "\
 Usage
@@ -287,6 +293,24 @@ const TOOLS: &[Tool] = &[
         "Show who this agent token is and exactly what it has been granted — the answer to \"why was \
          that call refused\".",
         &[],
+    ),
+    (
+        "report",
+        "File a bug, suggestion, or observation about this deployment's own code (selfhost itself) \
+         against this box's report intake, the same open POST /report?<project> door dx's own \
+         reporting uses. Needs no grant -- the intake is open by design, bounded on its own side. \
+         Defaults kind to \"bug\" and project to \"selfhost\"; give project only to file against a \
+         different registered service on this box.",
+        &[
+            ("title", "One line naming the defect. Part of the report's identity.", true, Kind::Text),
+            ("detail", "What you did, what you expected, and what happened instead.", true, Kind::Text),
+            ("kind", "\"bug\", \"suggestion\", or \"observation\". Defaults to \"bug\".", false, Kind::Text),
+            ("route", "The command, tool, or surface involved. Part of the report's identity.", false, Kind::Text),
+            ("repro", "The smallest sequence that shows it, when you have one.", false, Kind::Text),
+            ("project", "Which registered service this is about. Defaults to \"selfhost\".", false, Kind::Text),
+            ("workspace", "The name (not path) of the folder you were working in.", false, Kind::Text),
+            ("reportHost", "The host serving the report intake. Defaults to this deployment's public site.", false, Kind::Text),
+        ],
     ),
 ];
 
@@ -924,6 +948,40 @@ async fn call_tool(client: &RemoteClient, name: &str, arguments: &Json) -> Resul
             let answer = client.get("/api/whoami").await?;
             Ok(answer.to_text())
         }
+        "report" => {
+            let title = required(arguments, "title")?;
+            let detail = required(arguments, "detail")?;
+            let kind = optional(arguments, "kind");
+            let kind = if kind.is_empty() { "bug".to_owned() } else { kind };
+            let route = optional(arguments, "route");
+            let repro = optional(arguments, "repro");
+            let workspace = optional(arguments, "workspace");
+            let project = optional(arguments, "project");
+            let project = if project.is_empty() { "selfhost".to_owned() } else { project };
+            // The report intake is mounted on the deployment's public site
+            // (rockywearsahat.com, app_paths = ["/report"]), not on the admin
+            // API host this server's --host names — those are two different
+            // sites, and the admin host's proxy does not route this path. An
+            // explicit reportHost lets this reach a different box entirely.
+            let report_host = optional(arguments, "reportHost");
+            let report_host = if report_host.is_empty() { DEFAULT_REPORT_HOST.to_owned() } else { report_host };
+            let body = Json::object([
+                ("kind", Json::string(&kind)),
+                ("title", Json::string(&title)),
+                ("detail", Json::string(&detail)),
+                ("route", Json::string(&route)),
+                ("repro", Json::string(&repro)),
+                ("tool", Json::string("selfhost-mcp report")),
+                ("workspace", Json::string(&workspace)),
+            ])
+            .to_text();
+            let report_remote = Remote::parse(&report_host)?;
+            let report_client = RemoteClient::new(report_remote, String::new());
+            let answer = report_client
+                .request("POST", &format!("/report?{}", encode(&project)), Some(body.as_bytes()))
+                .await?;
+            Ok(answer.to_text())
+        }
         "sites_delete_file" => {
             let site = required(arguments, "name")?;
             let path = required(arguments, "path")?;
@@ -1377,6 +1435,22 @@ mod tests {
             tools.iter().filter_map(|tool| tool.get("name").and_then(Json::as_str)).collect();
         assert!(names.contains(&"services_add"), "{names:?}");
         assert!(names.contains(&"services_repo_configure"), "{names:?}");
+    }
+
+    #[test]
+    fn report_is_advertised_and_missing_fields_are_refused_without_a_network_call() {
+        let listing = tools_list_result();
+        let tools = listing.get("tools").and_then(Json::as_array).expect("a tools array");
+        let names: Vec<&str> =
+            tools.iter().filter_map(|tool| tool.get("name").and_then(Json::as_str)).collect();
+        assert!(names.contains(&"report"), "{names:?}");
+
+        let params = selfhost_json::parse(r#"{"name":"report","arguments":{}}"#).unwrap();
+        let remote = Remote::parse("example.test").unwrap();
+        let client = RemoteClient::new(remote, "agent:x:y".to_owned());
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let result = runtime.block_on(tools_call_result(&client, &params));
+        assert_eq!(result.get("isError").and_then(Json::as_bool), Some(true));
     }
 
     #[test]

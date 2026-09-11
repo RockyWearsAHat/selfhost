@@ -124,6 +124,12 @@ hand-rolled ciphers. Do **not** reimplement its crypto.
 
 **`vpn up`/`vpn down` remain, and are documented as manual, foreground-lifetime tools.** They still build their own one-shot `Supervisor` — that has not changed — but their `--help` text and their printed output now say plainly that a relay `vpn up` starts lives only as long as that command's own process (on Windows, killed by Job Object closure within seconds of the command returning), and that since this fix an `enabled = true` relay is already started by the daemon at boot. Reach for `vpn up`/`down` to diagnose a relay the daemon is not running, or one deliberately left disabled — not to keep a relay up in the background.
 
+**Python PATH resolution issue, discovered and fixed today.** During the cutover to daemon-supervised relays, `vpn-console` and `vpn-ssh` initially landed in state `unstartable`/`backoff`. The daemon's service process launched relays by running a bare `python` command (no full path) — `crates/services/vpn/src/runner.rs`'s `Install::vendored()` on Windows. The box's system-wide (Machine-scope) PATH environment variable contained a stale entry (`C:\Python311\`, which does not exist on disk) and no entry for the *actual* installed Python (`C:\Users\Alex\AppData\Local\Programs\Python\Python312\`, which has the required packages: `cryptography`, `mlkem768`). When the daemon tried to spawn a relay, `python` failed to resolve with Windows error 1920 ("could not start python: The file cannot be accessed by the system"). **Fix applied:** prepended `C:\Users\Alex\AppData\Local\Programs\Python\Python312\` and its `Scripts` subfolder to the box's system-wide PATH, then restarted the daemon. Machine-scope PATH changes take effect only for newly-started processes. This is a durable, box-level fix not stored in git — it persists across reboots and would need reapplication only if the box's PATH is ever reset. Worth flagging for future diagnostics of "vpn relay unstartable": check the daemon's actual visible PATH, not just whether `python.exe` exists somewhere on disk.
+
+**vpn-updater is registered but unarmed.** The auto-update meta-service for Secure-VPN is installed on the box (confirmed via `GET /api/services`, state `stopped`/`exited` — correct for a `RestartPolicy::Never` one-shot). However, it is not yet operational: no `webhook_secret` has been configured (the only place this lives is in `data/services.toml`'s `vpn-updater` entry), and the GitHub App has not yet been confirmed to have the Secure-VPN repository installed. Until an operator supplies both, pushes to the Secure-VPN repo do not trigger automatic updates. The design is code-complete and deployed but operationally dormant — a clearly-scoped next step, not a bug.
+
+**Secure-VPN crypto and sshd key exchange are separate protocol layers; sshd upgraded to post-quantum KEX today.** Secure-VPN itself provides encryption and authentication for the tunnel (hybrid X25519+ML-KEM-768 handshake). The SSH protocol inside the tunnel (sshd on the box's loopback 22, reachable only via the `vpn-ssh` relay's forward on port 8444) uses its own separate key exchange algorithms, independent of and layered on top of Secure-VPN — the VPN just forwards SSH's bytes opaquely. The box's sshd was Microsoft Win32-OpenSSH 9.5.4.1 (built-in Windows Optional Feature), which had zero post-quantum KEX algorithms available (`ssh -Q kex` on that build showed no `sntrup761x25519` or `mlkem768x25519`, versus the Mac client's OpenSSH 10.3 which has both). **Upgraded sshd.exe and supporting binaries to Microsoft Win32-OpenSSH 10.0.0.0p2-Preview** (official vendor build from github.com/PowerShell/Win32-OpenSSH, incorporating upstream OpenSSH 10.0p2 — not custom/hand-rolled crypto). Verified live via `ssh -v` from the Mac: the connection now negotiates `kex algorithm mlkem768x25519-sha256`, and the client's "not using a post-quantum key exchange algorithm" warning is gone. The original 9.5.4.1 binaries are backed up at `C:\Users\Alex\Downloads\OpenSSH-backup-20260909` on the box for rollback if needed. Note: the release used is tagged "Preview" upstream, not GA/stable — worth a periodic check for a stable release with the same PQ support to migrate to later.
+
 ## Using it
 
 Open the SelfHostVPN app (`crates/ui/vpn-ui`), **Connect**, then **Open Admin
@@ -219,3 +225,64 @@ explain *why* the code is shaped this way:
   `/api/services` -> `200`.
 - Other sites (`blog`, `mayr`, `lvlup`) and webhooks unaffected.
 - Concurrency: 60/60 requests at 10-way parallel through the tunnel.
+
+## Verified 2026-09-09 — Mac client repin + app rebuild, end-to-end state
+
+**Note on how this section was written**: dx_append and dx_edit both reported success
+against this document while silently failing to persist any change (the raw
+`docs/VPN.md` file's mtime never advanced; only the small `docs/VPN.md.dx` pointer
+file changed) — filed as dx bugs report-81241c0c and report-3feccada. This section was
+added with a direct file edit instead, the only way left to get it written at all.
+
+**Correction to the plan this pass was asked to verify**: the plan/done blocks named
+(`plan-stated-intent-not-yet-done-mac-client-repin-to-v2-app-rebuild-2026-09-09-2`,
+`paragraph-59`, `numbered-list-60`) do **not exist anywhere in this document** — no
+earlier turn in this task actually appended them, despite the documentation-first
+mandate above requiring it. Nothing in `~/.securevpn/app` was ever committed to the
+plan's stated target (`289324b`) either. This section states what is actually true as
+of this verification, replacing the missing ones.
+
+**Secure-VPN client checkout (`~/.securevpn/app`, separate non-dx repo)** — re-checked live:
+
+- `git status --short` still shows: `M crypto_core.py`, `M protocol.py`, `?? mlkem768/`.
+- `git log -1` HEAD is still `437108e` ("Many peers, enrolled without restarting the
+  tunnel") — the pre-hybrid-handshake / protocol-v1 commit. It was **never reset or
+  committed to `289324b`** (protocol v2, fixed KAT bug) as the plan called for. The
+  working tree is exactly the same dirty, mixed state recorded before this task started.
+- Despite that, `python3 client.py rockywearsahat.com --port 8443 --local-port 12443`
+  run fresh right now still succeeds: `✓ Handshake complete, server authenticated,
+  secure tunnel ready`, and the local SSH proxy comes up on `127.0.0.1:12443`. This
+  works *only* because the uncommitted `protocol.py`/`crypto_core.py` modifications
+  already are the v2 (289324b-content) files — the handshake is riding on uncommitted
+  working-tree state, not a clean commit. A `git stash`, `git checkout .`, or any
+  accidental revert of this tree would silently drop back to v1 and break the handshake
+  against the box (which is permanently v2 now) with no warning until the next connect
+  attempt.
+- `mlkem768` still imports cleanly from
+  `/Library/Frameworks/Python.framework/Versions/3.12/lib/python3.12/site-packages/mlkem768/__init__.py`.
+- Rebuilding the Mac apps did **not** touch this checkout — confirmed, `git status` is
+  unchanged from before that work.
+
+**Mac apps** — both executables now carry today's date, confirmed live:
+
+- `/Applications/SelfHostVPN.app/Contents/MacOS/selfhost-vpn-ui` — Sep 9 23:36.
+- `/Applications/Selfhost Console.app/Contents/MacOS/selfhost-console` — Sep 9 23:36.
+- Both are rebuilt against today's `crates/ui/vpn-ui` / `crates/ui/console` changes.
+  Not independently checkable headlessly (GUI apps, no stdout/stderr on launch).
+
+**Closed, 2026-09-09 (later the same day):** the "one accidental commit away from
+breaking" risk above is resolved. `~/.securevpn/app` was cleanly checked out to
+`289324b` (`git checkout 289324b -- .` then `git checkout 289324b`) — `git status`
+reports nothing dirty, no leftover uncommitted files, and `mlkem768/` is now the real
+checked-out crate directory that commit carries, not a stray debug artifact. Re-verified
+after the clean checkout: `mlkem768`'s own KAT suite (`cargo test --release` in
+`mlkem768/`) passes (3/3), and a live handshake against `rockywearsahat.com:8443`
+succeeds — "Handshake complete, server authenticated, secure tunnel ready" — confirming
+the client is durably on v2, matching the box's two permanently-v2 relays, with no
+dependency on an uncommitted working tree surviving.
+
+**ONE remaining manual step for the human**: open `/Applications/SelfHostVPN.app` and
+`/Applications/Selfhost Console.app` and confirm on screen that Connect / the console
+UI actually work — that cannot be verified headlessly. Everything below the GUI layer
+(client repo state, protocol version, both app binaries rebuilt from current source) is
+now verified.
