@@ -13,6 +13,7 @@ use rui::{
     App, El, Size, Status, Tone, button, caption, code, col, dot, field_row, micro, row, section,
     spacer, tag, title,
 };
+use rui::tray::{Tray, TrayEvent, TrayMenuItem};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -61,6 +62,12 @@ pub struct Panel {
     activity: Arc<Mutex<Activity>>,
     auto_rotate: Arc<AtomicBool>,
     running: Arc<AtomicBool>,
+    /// The system tray icon, created in on_frame during the first loop iteration.
+    tray: Option<Tray>,
+    /// Whether the window is currently visible.
+    window_visible: bool,
+    /// Whether we've already attempted tray creation (on first frame).
+    tray_created: bool,
 }
 
 impl Panel {
@@ -78,6 +85,9 @@ impl Panel {
             activity,
             auto_rotate: Arc::new(AtomicBool::new(true)),
             running,
+            tray: None,
+            window_visible: true,
+            tray_created: false,
         }
     }
 
@@ -96,6 +106,9 @@ impl Panel {
             activity,
             auto_rotate: Arc::new(AtomicBool::new(true)),
             running: Arc::new(AtomicBool::new(true)),
+            tray: None,
+            window_visible: true,
+            tray_created: false,
         }
     }
 
@@ -117,14 +130,139 @@ impl Panel {
         }
     }
 
+    /// Create and store the system tray icon.
+    /// This runs on the main thread when the pump loop is active.
+    pub fn create_tray(&mut self) -> Result<(), String> {
+        eprintln!("DEBUG: create_tray() called");
+        let icon_data = include_bytes!("../assets/tray-icon.png");
+        eprintln!("DEBUG: About to call Tray::new()");
+        let tray = Tray::new(icon_data, "SelfHost VPN")
+            .map_err(|e| {
+                eprintln!("DEBUG: Tray::new() failed: {:?}", e);
+                format!("Tray creation failed: {:?}", e)
+            })?;
+        eprintln!("DEBUG: Tray::new() succeeded");
+        // Set the actual icon image (Tray::new creates with a blank placeholder)
+        let _ = tray.set_icon(icon_data);
+        eprintln!("DEBUG: Tray icon set, storing tray");
+        self.tray = Some(tray);
+        self.update_tray_menu();
+        eprintln!("DEBUG: Tray menu updated, create_tray() returning Ok");
+        Ok(())
+    }
+
+    /// Drain and dispatch tray events each frame.
+    /// Called from on_frame callback, integrated into the UI frame loop.
+    /// Creates the tray on the first call (when the pump loop is active).
+    pub fn drain_tray_events(&mut self) {
+        // Create the tray on the first frame after the pump loop starts.
+        if !self.tray_created {
+            eprintln!("DEBUG: drain_tray_events() - first call, attempting tray creation");
+            match self.create_tray() {
+                Ok(()) => eprintln!("DEBUG: Tray creation succeeded"),
+                Err(e) => eprintln!("DEBUG: Tray creation failed: {}", e),
+            }
+            self.tray_created = true;
+        }
+
+        if let Some(ref tray) = self.tray {
+            for event in tray.drain_events() {
+                self.handle_tray_event(event);
+            }
+        }
+    }
+
+    /// Handle a single tray event, dispatching to the same handlers as UI buttons.
+    fn handle_tray_event(&mut self, event: TrayEvent) {
+        match event {
+            TrayEvent::IconActivated => {
+                eprintln!("DEBUG: Tray icon activated");
+                // Toggle window visibility on tray icon click
+                self.window_visible = !self.window_visible;
+                // TODO: Wire up actual window show/hide via rui window API
+            }
+            TrayEvent::MenuItemClicked(id) => {
+                eprintln!("DEBUG: Tray menu item clicked: {}", id);
+                match id {
+                    1 => self.tunnel.connect(),
+                    2 => self.tunnel.disconnect(),
+                    3 => actions::open_console(self.activity_handle()),
+                    4 => actions::open_sara(self.activity_handle()),
+                    5 => actions::open_ai_studio(self.activity_handle()),
+                    6 => self.running.store(false, Ordering::Relaxed),  // Quit
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    /// Update the tray menu based on current tunnel state.
+    /// This mirrors the window's own button states.
+    fn update_tray_menu(&self) {
+        if let Some(ref tray) = self.tray {
+            let link = self.tunnel.link();
+            let up = link.phase.is_up();
+            let reaching = link.phase.is_reaching();
+
+            let menu = vec![
+                TrayMenuItem {
+                    id: 1,
+                    label: "Connect".into(),
+                    enabled: !up && !reaching,
+                    selected: false,
+                },
+                TrayMenuItem {
+                    id: 2,
+                    label: if up { "Disconnect".into() } else { "Cancel".into() },
+                    enabled: up || reaching,
+                    selected: false,
+                },
+                TrayMenuItem {
+                    id: 3,
+                    label: "Open Console".into(),
+                    enabled: up,
+                    selected: false,
+                },
+                TrayMenuItem {
+                    id: 4,
+                    label: "Open SARA".into(),
+                    enabled: up,
+                    selected: false,
+                },
+                TrayMenuItem {
+                    id: 5,
+                    label: "Open AI Studio".into(),
+                    enabled: up,
+                    selected: false,
+                },
+                TrayMenuItem {
+                    id: 6,
+                    label: "Quit".into(),
+                    enabled: true,
+                    selected: false,
+                },
+            ];
+            let _ = tray.set_menu(menu);
+        }
+    }
+
     /// Opens the window and runs it until it is closed.
     pub fn run(self, title: String) -> Result<(), rui::Error> {
         let running = Arc::clone(&self.running);
+
+        // on_frame callback: drain and dispatch tray events each frame before rendering.
+        // The tray is created on the first frame when the pump loop is active.
+        let on_frame = |panel: &mut Panel| {
+            panel.drain_tray_events();
+            panel.update_tray_menu();
+        };
+
         application(title, self)
             .size(430.0, 620.0)
             .min_size(380.0, 560.0)
             .idle_timeout(std::time::Duration::from_millis(200))
             .while_running(move |_| running.load(Ordering::Relaxed))
+            .on_frame(on_frame)
             .run()
     }
 }

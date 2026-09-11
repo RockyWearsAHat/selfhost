@@ -134,7 +134,7 @@ selfhost-ws = { path = "crates/net/ws" }
 # unattended, so a moving dependency would let unreviewed interface changes onto
 # it without anyone deciding. Bumping `rev` is therefore a deliberate commit that
 # shows up in review, which is the whole point.
-rui = { git = "https://github.com/RockyWearsAHat/rui.git", rev = "4e0d0eb9aeb0a2117b59cea2eee69cdd10ca9f68", package = "rui-native" }
+rui = { git = "https://github.com/RockyWearsAHat/rui.git", rev = "7a2e7c91836738cf864cc20036f4fd6a5eca2a71", package = "rui-native" }
 
 # The release profile is what the self-updater rebuilds on every push, so its
 # job is to be *fast to rebuild*, not to squeeze the last percent of runtime
@@ -151,8 +151,8 @@ rui = { git = "https://github.com/RockyWearsAHat/rui.git", rev = "4e0d0eb9aeb0a2
 #
 #     git clone https://github.com/RockyWearsAHat/rui.git ../rui
 #
-# [patch."https://github.com/RockyWearsAHat/rui.git"]
-# rui = { path = "../rui" }
+[patch."https://github.com/RockyWearsAHat/rui.git"]
+rui = { path = "../rui", package = "rui-native" }
 #
 # Uncommented, this file no longer builds on a machine without `../rui` — which
 # includes the production box. So: uncomment to work, push the rui change to its
