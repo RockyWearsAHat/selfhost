@@ -6,6 +6,12 @@
 //! console once it is up, and keeps the identity key rotating. Everything slow
 //! runs off the window thread, so it never sits unresponsive.
 
+// `deny` rather than `forbid`: `tunnel.rs`'s process-detachment path needs one
+// explicit, `#[allow]`ed `unsafe` block (`pre_exec` to call `setsid()`, the
+// only way to make the Secure-VPN client survive this app's own process
+// exiting) — `forbid` can never be locally overridden, so it would have
+// meant either no detachment or a silently-dropped guarantee elsewhere.
+#![deny(unsafe_code)]
 #![warn(missing_docs)]
 
 mod actions;
