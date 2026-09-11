@@ -6,17 +6,48 @@
 //! from, and [`Tunnel::disconnect`] stops it. Nothing here blocks the window:
 //! the child's output is read on its own thread and left in a mutex the view
 //! reads once per frame, exactly as the console reads its poller.
+//!
+//! # Staying connected once the user has asked to be
+//!
+//! This is a connectable/disconnectable client, like an ordinary VPN toggle —
+//! not an always-on background daemon — but between those two presses it must
+//! not need a human to notice a drop and click Connect again. `wanted` records
+//! which state the user last asked for; `connect()` sets it and spawns the
+//! client once, and a supervising thread (mirroring
+//! [`crate::tunnel`]'s counterpart in `crates/ui/console`, `keep_open`) watches
+//! for the child exiting on its own and respawns it with the same
+//! [exponential backoff](retry_delay) the console tunnel already uses, for as
+//! long as `wanted` stays true. `disconnect()` clears `wanted` first, which is
+//! exactly what tells that thread an exit is intentional rather than a drop to
+//! recover from.
 
 use std::io::{BufRead, BufReader};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
-use std::time::Instant;
+use std::time::{Duration, Instant};
+
+/// The longest wait between attempts to bring a dropped tunnel back.
+///
+/// Same ceiling as the console's own tunnel (`crates/ui/console/src/tunnel.rs`)
+/// — a dropped connection should feel like a blip, not a thing the user has to
+/// notice and fix by hand, but a wrong key or an unreachable server should not
+/// spend a machine's evening asking every second either.
+const MAX_RETRY: Duration = Duration::from_secs(30);
+
+/// How long to wait before the next attempt, after `failures` in a row.
+///
+/// Doubles, and stops doubling at [`MAX_RETRY`].
+fn retry_delay(failures: u32) -> Duration {
+    let seconds = 1u64 << failures.min(6);
+    Duration::from_secs(seconds).min(MAX_RETRY)
+}
 
 /// Where the client, its interpreter, and its keys live, and what it connects to.
 ///
 /// One place so a move (a different endpoint, a relocated install) is one edit.
+#[derive(Clone)]
 pub struct Endpoint {
     /// The VPN server hostname the client dials (resolves to the box).
     pub server_host: String,
@@ -80,13 +111,16 @@ impl Default for Link {
     }
 }
 
-/// The running (or not) tunnel: the child process and the state it reports.
+/// The running (or not) tunnel: whether the user wants it up, and the
+/// supervising thread that keeps it that way while they do.
 pub struct Tunnel {
     endpoint: Endpoint,
     shared: Arc<Mutex<Link>>,
-    child: Option<Child>,
-    reader: Option<JoinHandle<()>>,
-    alive: Arc<AtomicBool>,
+    /// What the user last asked for. `connect()` sets this before spawning the
+    /// supervisor; `disconnect()` clears it first — that ordering is what lets
+    /// the supervisor tell an intentional stop from a drop to recover from.
+    wanted: Arc<AtomicBool>,
+    supervisor: Option<JoinHandle<()>>,
 }
 
 impl Tunnel {
@@ -95,9 +129,8 @@ impl Tunnel {
         Self {
             endpoint,
             shared: Arc::new(Mutex::new(Link::default())),
-            child: None,
-            reader: None,
-            alive: Arc::new(AtomicBool::new(false)),
+            wanted: Arc::new(AtomicBool::new(false)),
+            supervisor: None,
         }
     }
 
@@ -107,9 +140,8 @@ impl Tunnel {
         Self {
             endpoint,
             shared: Arc::new(Mutex::new(link)),
-            child: None,
-            reader: None,
-            alive: Arc::new(AtomicBool::new(false)),
+            wanted: Arc::new(AtomicBool::new(false)),
+            supervisor: None,
         }
     }
 
@@ -121,87 +153,183 @@ impl Tunnel {
         }
     }
 
-    /// Launches the client and starts reading what it says.
+    /// Marks the tunnel wanted and starts the thread that keeps it up.
     ///
-    /// Idempotent from the window's side: calling it while already running does
-    /// nothing, so a double-press cannot spawn a second client.
+    /// Idempotent from the window's side: calling it while already running (or
+    /// already trying to recover from a drop) does nothing, so a double-press
+    /// cannot spawn a second client. Unlike the one-shot spawn this replaces,
+    /// the tunnel does not simply report `Failed` and stop the moment the
+    /// client exits on its own — the supervisor thread notices, waits out a
+    /// backoff, and tries again for as long as `disconnect()` has not been
+    /// called, exactly as an ordinary VPN client would.
     pub fn connect(&mut self) {
-        if self.child.is_some() {
+        if self.wanted.swap(true, Ordering::SeqCst) {
             return;
         }
-        let home = std::env::var("HOME").unwrap_or_default();
-        let python = format!("{home}/.securevpn/venv/bin/python");
-        let client = format!("{home}/.securevpn/app/client.py");
-        let keydir = format!("{home}/.securevpn/keys");
-
-        let mut command = Command::new(python);
-        command
-            .arg("-u")
-            .arg(client)
-            .arg(&self.endpoint.server_host)
-            .arg("--port")
-            .arg(self.endpoint.server_port.to_string())
-            .arg("--local-host")
-            .arg("127.0.0.1")
-            .arg("--local-port")
-            .arg(self.endpoint.local_port.to_string())
-            .arg("--identity")
-            .arg("client")
-            .arg("--peer")
-            .arg("server")
-            .env("SECUREVPN_KEY_DIR", keydir)
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-
         set(&self.shared, |link| {
             *link = Link { phase: Phase::Dialling, ..Link::default() };
         });
-
-        let mut child = match command.spawn() {
-            Ok(child) => child,
-            Err(error) => {
-                set(&self.shared, |link| {
-                    link.phase = Phase::Failed(format!("could not start the client: {error}"));
-                });
-                return;
-            }
-        };
-
-        // Read stdout and stderr on one thread each, merged into the same Link.
-        self.alive.store(true, Ordering::Relaxed);
-        let mut handles = Vec::new();
-        for stream in [child.stdout.take().map(Reader::Out), child.stderr.take().map(Reader::Err)] {
-            let Some(reader) = stream else { continue };
-            let shared = Arc::clone(&self.shared);
-            let alive = Arc::clone(&self.alive);
-            handles.push(std::thread::spawn(move || read_output(reader, shared, alive)));
-        }
-        // One join handle is enough to wait on; keep the first, detach the rest.
-        self.reader = handles.into_iter().next();
-        self.child = Some(child);
+        let endpoint = self.endpoint.clone();
+        let shared = Arc::clone(&self.shared);
+        let wanted = Arc::clone(&self.wanted);
+        self.supervisor = Some(
+            std::thread::Builder::new()
+                .name("selfhost-vpn-tunnel".into())
+                .spawn(move || keep_open(&real_python(), &endpoint, &shared, &wanted))
+                .expect("the operating system refused to start a thread"),
+        );
     }
 
     /// Stops the client and returns the tunnel to [`Phase::Off`].
+    ///
+    /// Clearing `wanted` first is what tells the supervisor thread this exit
+    /// is intentional rather than a drop it should recover from.
     pub fn disconnect(&mut self) {
-        self.alive.store(false, Ordering::Relaxed);
-        if let Some(mut child) = self.child.take() {
-            let _ = child.kill();
-            let _ = child.wait();
-        }
-        if let Some(reader) = self.reader.take() {
-            let _ = reader.join();
+        self.wanted.store(false, Ordering::SeqCst);
+        if let Some(supervisor) = self.supervisor.take() {
+            let _ = supervisor.join();
         }
         set(&self.shared, |link| {
             *link = Link::default();
         });
     }
-
 }
 
 impl Drop for Tunnel {
     fn drop(&mut self) {
         self.disconnect();
     }
+}
+
+/// Brings the tunnel up, and brings it back whenever it drops on its own.
+///
+/// Mirrors `crates/ui/console/src/tunnel.rs`'s `keep_open`: loop while
+/// `wanted` stays true, spawn the client, wait for it to either exit or for
+/// `wanted` to go false, and on an unwanted exit back off before retrying.
+/// A connection that made it to [`Phase::Up`] before dropping resets the
+/// failure count — a laptop waking from sleep should retry quickly, not
+/// inherit a long backoff from whatever came before it woke.
+fn keep_open(python: &str, endpoint: &Endpoint, shared: &Arc<Mutex<Link>>, wanted: &Arc<AtomicBool>) {
+    let mut failures = 0u32;
+
+    while wanted.load(Ordering::SeqCst) {
+        set(shared, |link| {
+            *link = Link { phase: Phase::Dialling, ..Link::default() };
+        });
+
+        let mut child = match spawn_client(python, endpoint) {
+            Ok(child) => child,
+            Err(error) => {
+                set(shared, |link| {
+                    link.phase = Phase::Failed(format!("could not start the client: {error}"));
+                });
+                failures = failures.saturating_add(1);
+                sleep_while_wanted(retry_delay(failures), wanted);
+                continue;
+            }
+        };
+
+        let alive = Arc::new(AtomicBool::new(true));
+        let mut handles = Vec::new();
+        for stream in [child.stdout.take().map(Reader::Out), child.stderr.take().map(Reader::Err)] {
+            let Some(reader) = stream else { continue };
+            let reader_shared = Arc::clone(shared);
+            let reader_alive = Arc::clone(&alive);
+            handles.push(std::thread::spawn(move || read_output(reader, reader_shared, reader_alive)));
+        }
+
+        // Wait for the child to exit on its own, or for the user to disconnect.
+        loop {
+            if !wanted.load(Ordering::SeqCst) {
+                alive.store(false, Ordering::SeqCst);
+                let _ = child.kill();
+                let _ = child.wait();
+                break;
+            }
+            match child.try_wait() {
+                Ok(Some(_status)) => {
+                    alive.store(false, Ordering::SeqCst);
+                    break;
+                }
+                Ok(None) => std::thread::sleep(Duration::from_millis(200)),
+                Err(_) => {
+                    alive.store(false, Ordering::SeqCst);
+                    break;
+                }
+            }
+        }
+        for handle in handles {
+            let _ = handle.join();
+        }
+
+        if !wanted.load(Ordering::SeqCst) {
+            return;
+        }
+
+        // The client exited without being asked to. Reset the backoff if it
+        // had gotten as far as carrying traffic — that was a real connection
+        // that dropped, not a persistent reason to fail — otherwise count it
+        // as another failure in a row.
+        let reached_up = matches!(
+            shared.lock().map(|link| link.phase.clone()).unwrap_or(Phase::Off),
+            Phase::Up
+        );
+        failures = if reached_up { 0 } else { failures.saturating_add(1) };
+        set(shared, |link| {
+            if !matches!(link.phase, Phase::Failed(_)) {
+                link.phase = Phase::Failed("the tunnel dropped".into());
+            }
+            link.since = None;
+        });
+        sleep_while_wanted(retry_delay(failures), wanted);
+    }
+}
+
+/// Sleeps for `duration`, waking early if the user disconnects.
+///
+/// Coarse polling rather than a condvar: this only ever waits a handful of
+/// seconds, and the tunnel's other threads are already built the same way.
+fn sleep_while_wanted(duration: Duration, wanted: &Arc<AtomicBool>) {
+    let deadline = Instant::now() + duration;
+    while wanted.load(Ordering::SeqCst) && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(200).min(deadline - Instant::now()));
+    }
+}
+
+/// Where the real client, its interpreter, and its keys live.
+///
+/// Named apart from [`spawn_client`] so a test can substitute a stub in
+/// `python`'s place without touching `HOME` or any real Secure-VPN install.
+fn real_python() -> String {
+    let home = std::env::var("HOME").unwrap_or_default();
+    format!("{home}/.securevpn/venv/bin/python")
+}
+
+/// Launches the Secure-VPN client for `endpoint` via `python`, wired for
+/// [`read_output`].
+fn spawn_client(python: &str, endpoint: &Endpoint) -> std::io::Result<Child> {
+    let home = std::env::var("HOME").unwrap_or_default();
+    let client = format!("{home}/.securevpn/app/client.py");
+    let keydir = format!("{home}/.securevpn/keys");
+
+    Command::new(python)
+        .arg("-u")
+        .arg(client)
+        .arg(&endpoint.server_host)
+        .arg("--port")
+        .arg(endpoint.server_port.to_string())
+        .arg("--local-host")
+        .arg("127.0.0.1")
+        .arg("--local-port")
+        .arg(endpoint.local_port.to_string())
+        .arg("--identity")
+        .arg("client")
+        .arg("--peer")
+        .arg("server")
+        .env("SECUREVPN_KEY_DIR", keydir)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
 }
 
 /// Which of the child's streams a line came from.
@@ -336,5 +464,149 @@ mod tests {
         interpret("Connecting to VPN server at ...", &mut link);
         assert_eq!(link.phase, Phase::Up);
         assert_eq!(link.since, when, "the up-time must not reset");
+    }
+
+    #[test]
+    fn retries_back_off_and_then_stop_growing() {
+        assert_eq!(retry_delay(0), Duration::from_secs(1));
+        assert_eq!(retry_delay(1), Duration::from_secs(2));
+        assert_eq!(retry_delay(3), Duration::from_secs(8));
+        assert_eq!(retry_delay(9), MAX_RETRY, "a wrong key must not be retried forever faster");
+        assert_eq!(retry_delay(u32::MAX), MAX_RETRY, "and the shift must not overflow");
+    }
+
+    /// A stand-in for the Python client that counts how many times it was
+    /// started (one line per launch in `runs`), prints the marker line
+    /// [`interpret`] treats as "up", then exits immediately — a stand-in for a
+    /// tunnel that connects and then drops on its own.
+    #[cfg(unix)]
+    fn stub_client_that_drops(name: &str) -> (String, std::path::PathBuf) {
+        use std::io::Write;
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = std::env::temp_dir().join(format!("selfhost-vpn-tunnel-test-{name}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("a scratch directory");
+
+        let runs = dir.join("runs");
+        std::fs::write(&runs, "").expect("seed the run count");
+        let script = dir.join("stub-python");
+        let mut file = std::fs::File::create(&script).expect("the stub");
+        write!(
+            file,
+            "#!/bin/sh\necho x >> {}\necho '\\xe2\\x9c\\x93 Local SSH proxy listening on 127.0.0.1:1'\nexit 0\n",
+            runs.display()
+        )
+        .expect("writing the stub");
+        drop(file);
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))
+            .expect("making the stub executable");
+
+        (script.display().to_string(), runs)
+    }
+
+    /// A stand-in for the Python client that stays running until killed, so a
+    /// test can assert `disconnect()` actually stops it rather than leaving a
+    /// process (and a forwarded port) behind.
+    #[cfg(unix)]
+    fn stub_client_that_stays(name: &str) -> (String, std::path::PathBuf) {
+        use std::io::Write;
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = std::env::temp_dir().join(format!("selfhost-vpn-tunnel-test-{name}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("a scratch directory");
+
+        let pid_file = dir.join("pid");
+        let script = dir.join("stub-python");
+        let mut file = std::fs::File::create(&script).expect("the stub");
+        write!(
+            file,
+            "#!/bin/sh\necho $$ > {}\necho '\\xe2\\x9c\\x93 Local SSH proxy listening on 127.0.0.1:1'\nexec sleep 60\n",
+            pid_file.display()
+        )
+        .expect("writing the stub");
+        drop(file);
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))
+            .expect("making the stub executable");
+
+        (script.display().to_string(), pid_file)
+    }
+
+    #[cfg(unix)]
+    fn alive(pid: &str) -> bool {
+        std::process::Command::new("kill")
+            .args(["-0", pid])
+            .status()
+            .expect("kill is available")
+            .success()
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_client_that_drops_on_its_own_is_relaunched_without_being_asked() {
+        // This is the whole point of the supervisor: the old one-shot
+        // Tunnel::connect() would report Failed once and stop. A tunnel that
+        // behaves like an actual VPN must not need a human to notice and press
+        // Connect again for an ordinary drop.
+        let (python, runs) = stub_client_that_drops("relaunch");
+        let shared = Arc::new(Mutex::new(Link::default()));
+        let wanted = Arc::new(AtomicBool::new(true));
+        let endpoint = Endpoint::default();
+
+        let thread = {
+            let (shared, wanted) = (Arc::clone(&shared), Arc::clone(&wanted));
+            std::thread::spawn(move || keep_open(&python, &endpoint, &shared, &wanted))
+        };
+
+        // Each run is near-instant (backoff after the first failure would be at
+        // least a second), so a couple of real seconds is enough to see several.
+        let deadline = Instant::now() + Duration::from_secs(3);
+        let mut runs_seen = 0usize;
+        while Instant::now() < deadline {
+            runs_seen = std::fs::read_to_string(&runs).map(|s| s.lines().count()).unwrap_or(0);
+            if runs_seen >= 2 {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(runs_seen >= 2, "the client should have been relaunched at least once, saw {runs_seen}");
+
+        wanted.store(false, Ordering::SeqCst);
+        thread.join().expect("the supervisor thread should stop");
+        let _ = std::fs::remove_dir_all(runs.parent().expect("the scratch directory"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn disconnecting_stops_the_client_instead_of_relaunching_it() {
+        let (python, pid_file) = stub_client_that_stays("disconnect");
+        let shared = Arc::new(Mutex::new(Link::default()));
+        let wanted = Arc::new(AtomicBool::new(true));
+        let endpoint = Endpoint::default();
+
+        let thread = {
+            let (shared, wanted) = (Arc::clone(&shared), Arc::clone(&wanted));
+            std::thread::spawn(move || keep_open(&python, &endpoint, &shared, &wanted))
+        };
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !pid_file.exists() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let pid = std::fs::read_to_string(&pid_file).expect("the stub wrote its pid");
+        let pid = pid.trim().to_owned();
+        assert!(alive(&pid), "the stub should be running");
+
+        wanted.store(false, Ordering::SeqCst);
+        thread.join().expect("the supervisor thread should stop");
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while alive(&pid) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(!alive(&pid), "disconnect must not leave the client running");
+
+        let _ = std::fs::remove_dir_all(pid_file.parent().expect("the scratch directory"));
     }
 }
