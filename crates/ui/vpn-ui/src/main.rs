@@ -23,6 +23,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 use tunnel::{Endpoint, Link, Phase};
+use rui::tray::{Tray, TrayMenuItem, TrayEvent};
 
 /// How often the auto-rotation thread wakes to check whether a week has passed.
 const ROTATE_CHECK: Duration = Duration::from_secs(3600);
@@ -82,12 +83,52 @@ fn open() -> Result<(), String> {
     // The split-DNS responder backs the /etc/resolver file for the console host.
     let responder = dns::spawn(Arc::clone(&running), panel.activity_handle());
 
-    let outcome = panel.run("SelfHost VPN".into()).map_err(|error| error.to_string());
+    // Create the tray icon (optional; fails gracefully if unavailable).
+    let tray = create_tray().ok();
+
+    // Run the window (blocking until closed).
+    let _outcome = panel.run("SelfHost VPN".into()).map_err(|error| error.to_string());
+
+    // If tray exists, keep it responsive in the background until Quit is clicked.
+    // Note: Since panel was moved by run(), we can only respond to Quit.
+    // A future enhancement would require rui to avoid consuming panel.
+    if let Some(ref tray_icon) = tray {
+        let menu = vec![TrayMenuItem {
+            id: 5,
+            label: "Quit".into(),
+            enabled: true,
+            selected: false,
+        }];
+        let _ = tray_icon.set_menu(menu);
+
+        loop {
+            std::thread::sleep(Duration::from_millis(100));
+
+            for event in tray_icon.drain_events() {
+                if let TrayEvent::MenuItemClicked(5) = event {
+                    running.store(false, Ordering::Relaxed);
+                    break;
+                }
+            }
+
+            if !running.load(Ordering::Relaxed) {
+                break;
+            }
+        }
+    }
 
     running.store(false, Ordering::Relaxed);
     let _ = rotor.join();
     let _ = responder.join();
-    outcome
+    Ok(())
+}
+
+/// Creates a tray icon with a simple placeholder image.
+fn create_tray() -> Result<Tray, String> {
+    // A minimal 16x16 PNG: transparent background with a small white dot.
+    // This is a valid PNG, generated offline and embedded.
+    let icon_data = include_bytes!("../assets/tray-icon.png");
+    Tray::new(icon_data, "SelfHost VPN").map_err(|e| format!("{:?}", e))
 }
 
 /// The background thread that keeps the identity key fresh.
