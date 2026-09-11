@@ -93,3 +93,4 @@ docs/SECURITY.md
 .doc/index.db-shm
 .doc/coverage.jsonl
 .doc/local.dxcp
+__pycache__/

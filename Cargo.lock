@@ -427,9 +427,15 @@ dependencies = [
 ]
 
 [[package]]
-name = "rui"
+name = "rui-native"
 version = "0.1.0"
-source = "git+https://github.com/RockyWearsAHat/rui.git?rev=67ed27b4e92fdd88585e2ec69bb244fa6f6cee07#67ed27b4e92fdd88585e2ec69bb244fa6f6cee07"
+source = "git+https://github.com/RockyWearsAHat/rui.git?rev=4e0d0eb9aeb0a2117b59cea2eee69cdd10ca9f68#4e0d0eb9aeb0a2117b59cea2eee69cdd10ca9f68"
+dependencies = [
+ "js-sys",
+ "wasm-bindgen",
+ "web-sys",
+ "web-time",
+]
 
 [[package]]
 name = "rustls"
@@ -575,7 +581,7 @@ name = "selfhost-console"
 version = "0.1.0"
 dependencies = [
  "ring",
- "rui",
+ "rui-native",
  "selfhost-config",
  "selfhost-desk",
  "selfhost-firewall",
@@ -802,7 +808,7 @@ dependencies = [
 name = "selfhost-vpn-ui"
 version = "0.1.0"
 dependencies = [
- "rui",
+ "rui-native",
  "selfhost-dns",
 ]
 
@@ -1109,6 +1115,26 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "81941cd78d0c92026c33e5e01312845a4cb1e9af3407f9134b100dd03144103e"
 dependencies = [
  "unicode-ident",
+]
+
+[[package]]
+name = "web-sys"
+version = "0.3.105"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9fbddc4a036f00ec4f18c83445bd3115cb306a91da554919a099d9222fe4a7f8"
+dependencies = [
+ "js-sys",
+ "wasm-bindgen",
+]
+
+[[package]]
+name = "web-time"
+version = "1.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5a6580f308b1fad9207618087a65c04e7a10bc77e02c8e84e9b00dd4b12fa0bb"
+dependencies = [
+ "js-sys",
+ "wasm-bindgen",
 ]
 
 [[package]]
