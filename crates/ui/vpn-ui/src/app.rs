@@ -57,7 +57,7 @@ pub struct Activity {
 
 /// Everything the window is and can do.
 pub struct Panel {
-    tunnel: Tunnel,
+    pub tunnel: Tunnel,
     activity: Arc<Mutex<Activity>>,
     auto_rotate: Arc<AtomicBool>,
     running: Arc<AtomicBool>,

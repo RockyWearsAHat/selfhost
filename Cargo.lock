@@ -429,7 +429,7 @@ dependencies = [
 [[package]]
 name = "rui"
 version = "0.1.0"
-source = "git+https://github.com/RockyWearsAHat/rui.git?rev=80e3003563c26952e4d63c52d8eb8f5052cb463c#80e3003563c26952e4d63c52d8eb8f5052cb463c"
+source = "git+https://github.com/RockyWearsAHat/rui.git?rev=67ed27b4e92fdd88585e2ec69bb244fa6f6cee07#67ed27b4e92fdd88585e2ec69bb244fa6f6cee07"
 
 [[package]]
 name = "rustls"
