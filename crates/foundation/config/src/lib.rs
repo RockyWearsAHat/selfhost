@@ -21,6 +21,7 @@ pub mod github_app;
 pub mod home;
 pub mod house;
 pub mod mail;
+pub mod maintenance;
 pub mod manifest;
 pub mod mesh;
 pub mod pacc;
@@ -43,6 +44,7 @@ pub use git::{GitWatch, SelfUpdate};
 pub use github_app::GithubApp;
 pub use house::Home;
 pub use mail::{DkimConfig, Mail, MailBind, Mailbox, Relay};
+pub use maintenance::{Maintenance, MaintenancePeer};
 pub use manifest::RepoManifest;
 pub use mesh::Mesh;
 pub use service::{RestartPolicy, ServiceCatalog, ServiceSpec, StartMode};
@@ -112,6 +114,11 @@ pub struct Config {
     /// it is a default.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub vpn: Vec<vpn::Relay>,
+    /// Scheduled host maintenance and graceful reboot. Absent means the host
+    /// does not perform scheduled reboots — the daemon binds no scheduler and
+    /// the doctor's maintenance section is skipped. Maintenance is opt-in.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub maintenance: Option<Maintenance>,
 }
 
 /// The smallest valid deployment, used by every module's example test as the
@@ -626,6 +633,7 @@ mod tests {
             mesh: None,
             home: None,
             vpn: Vec::new(),
+            maintenance: None,
         };
 
         assert_eq!(
@@ -668,6 +676,7 @@ mod tests {
             mesh: None,
             home: None,
             vpn: Vec::new(),
+            maintenance: None,
         };
 
         let map = config.host_map();

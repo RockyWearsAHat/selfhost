@@ -939,6 +939,7 @@ mod tests {
             mesh: None,
             home: None,
             vpn: Vec::new(),
+            maintenance: None,
         }
     }
 

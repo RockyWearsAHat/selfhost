@@ -35,6 +35,9 @@ selfhost-login = { workspace = true }
 # worker dials in, and this crate only ever accepts what the daemon already
 # serves on loopback.
 selfhost-mesh = { workspace = true }
+# Scheduled host maintenance and graceful reboot. Present when the daemon has a
+# [maintenance] config section and wires the scheduler via Api::with_maintenance.
+selfhost-maintenance = { workspace = true }
 # The NAS engine. Every rule about what a path may reach and what a caller may
 # do with it lives there and is tested there without a socket; this crate
 # supplies the socket, the runtime and the capability decision.
