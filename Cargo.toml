@@ -151,8 +151,8 @@ rui = { git = "https://github.com/RockyWearsAHat/rui.git", rev = "7a2e7c91836738
 #
 #     git clone https://github.com/RockyWearsAHat/rui.git ../rui
 #
-[patch."https://github.com/RockyWearsAHat/rui.git"]
-rui = { path = "../rui", package = "rui-native" }
+# [patch."https://github.com/RockyWearsAHat/rui.git"]
+# rui = { path = "../rui", package = "rui-native" }
 #
 # Uncommented, this file no longer builds on a machine without `../rui` — which
 # includes the production box. So: uncomment to work, push the rui change to its
