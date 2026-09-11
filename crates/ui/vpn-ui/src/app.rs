@@ -131,37 +131,33 @@ impl Panel {
     }
 
     /// Create and store the system tray icon.
-    /// This runs on the main thread when the pump loop is active.
+    ///
+    /// Called from [`Panel::drain_tray_events`] on the first frame rather than
+    /// before `panel.run()` starts: AppKit's run loop and `NSApplication`
+    /// are not actually active until the pump loop begins, so an
+    /// `NSStatusItem` created any earlier reports success but is never drawn
+    /// or registered — confirmed live (an `osascript` accessibility check
+    /// found no status item at all) before this was moved here.
     pub fn create_tray(&mut self) -> Result<(), String> {
-        eprintln!("DEBUG: create_tray() called");
         let icon_data = include_bytes!("../assets/tray-icon.png");
-        eprintln!("DEBUG: About to call Tray::new()");
         let tray = Tray::new(icon_data, "SelfHost VPN")
-            .map_err(|e| {
-                eprintln!("DEBUG: Tray::new() failed: {:?}", e);
-                format!("Tray creation failed: {:?}", e)
-            })?;
-        eprintln!("DEBUG: Tray::new() succeeded");
-        // Set the actual icon image (Tray::new creates with a blank placeholder)
+            .map_err(|e| format!("Tray creation failed: {:?}", e))?;
+        // Tray::new creates the status item with a blank placeholder image.
         let _ = tray.set_icon(icon_data);
-        eprintln!("DEBUG: Tray icon set, storing tray");
         self.tray = Some(tray);
         self.update_tray_menu();
-        eprintln!("DEBUG: Tray menu updated, create_tray() returning Ok");
         Ok(())
     }
 
     /// Drain and dispatch tray events each frame.
-    /// Called from on_frame callback, integrated into the UI frame loop.
-    /// Creates the tray on the first call (when the pump loop is active).
+    ///
+    /// Called from the `on_frame` callback, so a click reaches
+    /// [`Self::handle_tray_event`] on the same thread and the same cadence as
+    /// every other state change the window's own buttons already produce —
+    /// there is no second, parallel update path for tray-driven actions.
     pub fn drain_tray_events(&mut self) {
-        // Create the tray on the first frame after the pump loop starts.
         if !self.tray_created {
-            eprintln!("DEBUG: drain_tray_events() - first call, attempting tray creation");
-            match self.create_tray() {
-                Ok(()) => eprintln!("DEBUG: Tray creation succeeded"),
-                Err(e) => eprintln!("DEBUG: Tray creation failed: {}", e),
-            }
+            let _ = self.create_tray();
             self.tray_created = true;
         }
 
@@ -176,13 +172,14 @@ impl Panel {
     fn handle_tray_event(&mut self, event: TrayEvent) {
         match event {
             TrayEvent::IconActivated => {
-                eprintln!("DEBUG: Tray icon activated");
-                // Toggle window visibility on tray icon click
+                // AppKit gives a status item exactly one primary click action:
+                // once `setMenu:` attaches a menu (as `update_tray_menu` always
+                // does here), that click opens the menu and this event never
+                // actually fires — left in place for the day the tray has no
+                // menu attached and a plain click needs to mean something.
                 self.window_visible = !self.window_visible;
-                // TODO: Wire up actual window show/hide via rui window API
             }
             TrayEvent::MenuItemClicked(id) => {
-                eprintln!("DEBUG: Tray menu item clicked: {}", id);
                 match id {
                     1 => self.tunnel.connect(),
                     2 => self.tunnel.disconnect(),
