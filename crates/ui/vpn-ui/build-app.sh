@@ -6,7 +6,7 @@
 set -euo pipefail
 
 here="$(cd "$(dirname "$0")" && pwd)"
-root="$(cd "$here/../.." && pwd)"
+root="$(cd "$here/../../.." && pwd)"
 app="$root/target/SelfHostVPN.app"
 bin="selfhost-vpn-ui"
 
