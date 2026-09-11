@@ -22,6 +22,7 @@
 //! recover from.
 
 use std::io::{BufRead, BufReader};
+use std::os::unix::process::CommandExt;
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -121,16 +122,24 @@ pub struct Tunnel {
     /// the supervisor tell an intentional stop from a drop to recover from.
     wanted: Arc<AtomicBool>,
     supervisor: Option<JoinHandle<()>>,
+    /// True if this instance spawned and supervises the tunnel.
+    /// False if this instance adopted a pre-existing tunnel.
+    managed: bool,
 }
 
 impl Tunnel {
     /// A tunnel that is not yet running, dialling `endpoint` when connected.
+    ///
+    /// Detects if a tunnel is already running; if so, creates an unmanaged tunnel
+    /// that will not kill the process on Drop.
     pub fn new(endpoint: Endpoint) -> Self {
+        let managed = !detect_existing_tunnel(&endpoint);
         Self {
             endpoint,
             shared: Arc::new(Mutex::new(Link::default())),
             wanted: Arc::new(AtomicBool::new(false)),
             supervisor: None,
+            managed,
         }
     }
 
@@ -142,6 +151,7 @@ impl Tunnel {
             shared: Arc::new(Mutex::new(link)),
             wanted: Arc::new(AtomicBool::new(false)),
             supervisor: None,
+            managed: true,
         }
     }
 
@@ -151,6 +161,11 @@ impl Tunnel {
             Ok(link) => link.clone(),
             Err(poisoned) => poisoned.into_inner().clone(),
         }
+    }
+
+    /// Whether this instance is managing the tunnel (spawned it) or adopted a pre-existing one.
+    pub fn is_managed(&self) -> bool {
+        self.managed
     }
 
     /// Marks the tunnel wanted and starts the thread that keeps it up.
@@ -172,10 +187,11 @@ impl Tunnel {
         let endpoint = self.endpoint.clone();
         let shared = Arc::clone(&self.shared);
         let wanted = Arc::clone(&self.wanted);
+        let managed = self.managed;
         self.supervisor = Some(
             std::thread::Builder::new()
                 .name("selfhost-vpn-tunnel".into())
-                .spawn(move || keep_open(&real_python(), &endpoint, &shared, &wanted))
+                .spawn(move || keep_open(&real_python(), &endpoint, &shared, &wanted, managed))
                 .expect("the operating system refused to start a thread"),
         );
     }
@@ -197,7 +213,18 @@ impl Tunnel {
 
 impl Drop for Tunnel {
     fn drop(&mut self) {
-        self.disconnect();
+        // Only kill the tunnel if we're the one managing it.
+        // If we adopted a pre-existing tunnel, let it run.
+        if self.managed {
+            self.disconnect();
+        } else {
+            // For adopted tunnels, just clear the supervisor handle
+            // without killing the process.
+            self.wanted.store(false, Ordering::SeqCst);
+            if let Some(supervisor) = self.supervisor.take() {
+                let _ = supervisor.join();
+            }
+        }
     }
 }
 
@@ -209,7 +236,10 @@ impl Drop for Tunnel {
 /// A connection that made it to [`Phase::Up`] before dropping resets the
 /// failure count — a laptop waking from sleep should retry quickly, not
 /// inherit a long backoff from whatever came before it woke.
-fn keep_open(python: &str, endpoint: &Endpoint, shared: &Arc<Mutex<Link>>, wanted: &Arc<AtomicBool>) {
+///
+/// If `detach` is true, spawns the client in a new process session so it
+/// survives the parent's exit. If false, spawns it normally.
+fn keep_open(python: &str, endpoint: &Endpoint, shared: &Arc<Mutex<Link>>, wanted: &Arc<AtomicBool>, detach: bool) {
     let mut failures = 0u32;
 
     while wanted.load(Ordering::SeqCst) {
@@ -217,7 +247,11 @@ fn keep_open(python: &str, endpoint: &Endpoint, shared: &Arc<Mutex<Link>>, wante
             *link = Link { phase: Phase::Dialling, ..Link::default() };
         });
 
-        let mut child = match spawn_client(python, endpoint) {
+        let mut child = match if detach {
+            spawn_client_detached(python, endpoint)
+        } else {
+            spawn_client(python, endpoint)
+        } {
             Ok(child) => child,
             Err(error) => {
                 set(shared, |link| {
@@ -242,8 +276,16 @@ fn keep_open(python: &str, endpoint: &Endpoint, shared: &Arc<Mutex<Link>>, wante
         loop {
             if !wanted.load(Ordering::SeqCst) {
                 alive.store(false, Ordering::SeqCst);
-                let _ = child.kill();
-                let _ = child.wait();
+                // Only kill non-detached clients. Detached clients (when managed=true)
+                // must survive app exit for Feature 1 (tunnel persists after app quit).
+                if !detach {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                } else {
+                    // For detached clients, just abandon them. They run in their own
+                    // process session and will survive when the parent process exits.
+                    drop(child);
+                }
                 break;
             }
             match child.try_wait() {
@@ -305,6 +347,27 @@ fn real_python() -> String {
     format!("{home}/.securevpn/venv/bin/python")
 }
 
+/// Detects whether a tunnel is already running by checking if the local port is listening.
+///
+/// Returns `true` if a connection to `127.0.0.1:{endpoint.local_port}` succeeds,
+/// indicating a tunnel is already active. This avoids spawning a second client that
+/// would fail with EADDRINUSE.
+fn detect_existing_tunnel(endpoint: &Endpoint) -> bool {
+    use std::net::TcpStream;
+    use std::time::Duration;
+
+    match TcpStream::connect_timeout(
+        &format!("127.0.0.1:{}", endpoint.local_port).parse().unwrap(),
+        Duration::from_millis(100),
+    ) {
+        Ok(stream) => {
+            let _ = stream;
+            true
+        }
+        Err(_) => false,
+    }
+}
+
 /// Launches the Secure-VPN client for `endpoint` via `python`, wired for
 /// [`read_output`].
 fn spawn_client(python: &str, endpoint: &Endpoint) -> std::io::Result<Child> {
@@ -330,6 +393,46 @@ fn spawn_client(python: &str, endpoint: &Endpoint) -> std::io::Result<Child> {
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
+}
+
+/// Spawns the Secure-VPN client in a new process session so it survives the parent's exit.
+///
+/// On Unix/macOS, this calls `setsid()` in a `pre_exec()` closure to make the child
+/// the leader of its own process group. This detaches it from the parent's session,
+/// ensuring the child survives when the parent exits.
+#[allow(unsafe_code)]
+fn spawn_client_detached(python: &str, endpoint: &Endpoint) -> std::io::Result<Child> {
+    use nix::unistd::setsid;
+    use std::io;
+
+    let home = std::env::var("HOME").unwrap_or_default();
+    let client = format!("{home}/.securevpn/app/client.py");
+    let keydir = format!("{home}/.securevpn/keys");
+
+    // SAFETY: pre_exec is safe to call here; the closure only executes in the
+    // child process after fork() but before exec(), so no other threads interfere.
+    unsafe {
+        Ok(Command::new(python)
+            .arg("-u")
+            .arg(client)
+            .arg(&endpoint.server_host)
+            .arg("--port")
+            .arg(endpoint.server_port.to_string())
+            .arg("--local-host")
+            .arg("127.0.0.1")
+            .arg("--local-port")
+            .arg(endpoint.local_port.to_string())
+            .arg("--identity")
+            .arg("client")
+            .arg("--peer")
+            .arg("server")
+            .env("SECUREVPN_KEY_DIR", keydir)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            // Detach from parent's process group
+            .pre_exec(|| setsid().map(|_| ()).map_err(|e| io::Error::from_raw_os_error(e as i32)))
+            .spawn()?)
+    }
 }
 
 /// Which of the child's streams a line came from.
@@ -556,7 +659,7 @@ mod tests {
 
         let thread = {
             let (shared, wanted) = (Arc::clone(&shared), Arc::clone(&wanted));
-            std::thread::spawn(move || keep_open(&python, &endpoint, &shared, &wanted))
+            std::thread::spawn(move || keep_open(&python, &endpoint, &shared, &wanted, false))
         };
 
         // Each run is near-instant (backoff after the first failure would be at
@@ -587,7 +690,7 @@ mod tests {
 
         let thread = {
             let (shared, wanted) = (Arc::clone(&shared), Arc::clone(&wanted));
-            std::thread::spawn(move || keep_open(&python, &endpoint, &shared, &wanted))
+            std::thread::spawn(move || keep_open(&python, &endpoint, &shared, &wanted, false))
         };
 
         let deadline = Instant::now() + Duration::from_secs(5);
