@@ -161,38 +161,28 @@ else
   log "no venv at $VENV yet — the wheel will install the next time join-mac.sh runs"
 fi
 
-# ── 4. Best-effort restart. Never fatal: the code on disk is already correct
-#      and verified above, so a restart that cannot complete just means the
-#      OLD process keeps serving the tunnel until the next one. ───────────────
+# ── 4. Deliberately NOT restarting a running tunnel. ──────────────────────────
 #
-# NOTE ON RESTART: the client binds 127.0.0.1:443, which needs root, so the
-# running process (if any) was started under sudo — most likely by
-# join-mac.sh, interactively, in a session this LaunchAgent does not share.
-# This step therefore only ever uses NON-INTERACTIVE sudo (`-n`): if this
-# machine has no passwordless-sudo rule for this exact restart, `sudo -n`
-# simply fails and this step logs that and exits 0 (the update itself already
-# succeeded) rather than popping a password prompt, which would violate the
-# "fully silent" requirement. A human who wants restarts to be silent too
-# must add that sudoers rule themselves — this script does not attempt to.
-if pgrep -f "client.py.*--identity" >/dev/null 2>&1; then
-  log "a tunnel is running — attempting a non-interactive restart"
-  if sudo -n pkill -f "client.py.*--identity" 2>>"$LOG"; then
-    sleep 1
-    if sudo -n "$VENV/bin/python" -u "$APP/client.py" "${SECUREVPN_SERVER:-172.83.6.109}" \
-        --port "${SECUREVPN_PORT:-8443}" --local-port 443 \
-        --identity "${SECUREVPN_IDENTITY:-$(id -un)}" --peer server --key-dir "$VPN_HOME/keys" \
-        >>"$VPN_HOME/tunnel.log" 2>&1 & then
-      log "tunnel restarted on the updated client"
-    else
-      log "NOTE: could not restart the tunnel (no passwordless sudo configured for this) — \
-the update is complete on disk; restart the app/tunnel by hand to pick it up"
-    fi
-  else
-    log "NOTE: no passwordless sudo for the restart step — the update is complete on disk; \
-restart the app/tunnel by hand (or the SelfHostVPN app's Connect button) to pick it up"
-  fi
-else
-  log "no tunnel currently running — the update takes effect next time one is started"
-fi
+# CHANGED: this step used to `pkill` any running client.py and relaunch it by
+# hand, on the theory that an update should take effect immediately. That is
+# exactly the wrong trade for a live SSH/VPN session: it is a forced, visible
+# disconnect for the sake of adopting new code a few minutes sooner. Since
+# `crates/ui/vpn-ui/src/tunnel.rs` grew its own supervisor (a dropped tunnel
+# is relaunched automatically, with backoff, until the user disconnects), the
+# two would now race on top of that: a `pkill` here fires at the same instant
+# the app's own supervisor notices the drop and relaunches its child, and both
+# sides can end up trying to bind the same local port at once.
+#
+# The correct zero-downtime behaviour is simpler: touch nothing that is
+# currently connected. The verified new code is already on disk (steps 2-3
+# proved it before this line ever ran) and Python only reads client.py at
+# process start, so a live process keeps running its already-loaded old code
+# — uninterrupted — until it reconnects for any ordinary reason (a real drop,
+# sleep/wake, a manual disconnect/reconnect, or the next login). At that
+# point `spawn_client`/`join-mac.sh` launches a fresh interpreter, which reads
+# whatever is on disk *then* — the update. No connection is ever killed by
+# this script to make that happen sooner.
+log "update installed; a running tunnel (if any) keeps its current connection and \
+picks up this code on its own next reconnect — nothing was restarted"
 
 log "done"
