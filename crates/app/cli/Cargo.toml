@@ -30,6 +30,7 @@ selfhost-firewall = { workspace = true }
 selfhost-git = { workspace = true }
 selfhost-github-app = { workspace = true }
 selfhost-mail = { workspace = true }
+selfhost-maintenance = { workspace = true }
 selfhost-mesh = { workspace = true }
 selfhost-proxy = { workspace = true }
 selfhost-reports = { workspace = true }

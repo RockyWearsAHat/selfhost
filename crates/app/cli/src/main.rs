@@ -56,7 +56,7 @@ use std::net::{Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::net::TcpListener;
 
 /// How often the daemon re-checks the host firewall for drift.
@@ -1132,6 +1132,18 @@ async fn serve_everything(
 
     // Console auth is read once here: a `selfhost console-password` run takes
     // effect at the next daemon restart.
+    // Build or prepare the maintenance scheduler before wiring it to the API.
+    // If [maintenance] is present, it will be wired below; if absent, the
+    // API answers with default maintenance state (no reboot scheduled).
+    let maintenance_scheduler: Option<Arc<selfhost_maintenance::MaintenanceScheduler>> = config
+        .maintenance
+        .as_ref()
+        .map(|maintenance_config| {
+            Arc::new(selfhost_maintenance::MaintenanceScheduler::new(
+                maintenance_config.clone(),
+            ))
+        });
+
     let mut api = Api::new(supervisor.clone(), store, token, firewall.clone())
         .with_github_credentials(github_credentials.clone())
         .with_console_auth(&data_dir)
@@ -1149,6 +1161,10 @@ async fn serve_everything(
     // watcher that is not running would report a deployment nobody is doing.
     if config.self_update.as_ref().is_some_and(|update| update.enabled) {
         api = api.with_self_update(self_update_nudge.clone());
+    }
+    // Wire the maintenance scheduler if one was created above.
+    if let Some(scheduler) = &maintenance_scheduler {
+        api = api.with_maintenance(Arc::clone(scheduler));
     }
     // Passkey (biometric) login is scoped to the console site's canonical
     // hostname — the WebAuthn relying-party id. Config is the only honest
@@ -1371,6 +1387,28 @@ async fn serve_everything(
         println!("  site  {} → {} ({instances} instance(s))", site.canonical(), site.name);
     }
     println!("\nCtrl-C to stop.");
+
+    // Spawn the maintenance scheduler task if the scheduler was created above.
+    // The scheduler polls at the configured time and initiates the reboot
+    // sequence (drain, then reboot). The task runs in the background and is
+    // never awaited here — it simply lives as long as the daemon does.
+    if let Some(scheduler) = &maintenance_scheduler {
+        let status = scheduler.status();
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let secs_until_next = if status.next_reboot > now {
+            status.next_reboot - now
+        } else {
+            0
+        };
+        println!(
+            "\nmaintenance scheduler enabled, next reboot in {} seconds (at unix {})",
+            secs_until_next, status.next_reboot
+        );
+        let _ = scheduler.spawn_task();
+    }
 
     let mut updated_to: Option<String> = None;
     let outcome = tokio::select! {

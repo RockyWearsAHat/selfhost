@@ -91,6 +91,7 @@ impl Config {
         self.check_home(&mut problems);
         self.check_mesh(&mut problems);
         self.check_vpn(&mut problems);
+        self.check_maintenance(&mut problems);
 
         if problems.is_empty() { Ok(()) } else { Err(ConfigError::Invalid(problems)) }
     }
@@ -351,6 +352,19 @@ impl Config {
                     }
                 }
             }
+        }
+    }
+
+    /// Scheduled maintenance, when configured, must name valid reboot times
+    /// and peers.
+    ///
+    /// Delegated to [`crate::maintenance::Maintenance::check`] so the schema
+    /// and its rules live together, exactly as DNS and mail validate through
+    /// their own schema modules. Absent `[maintenance]` validates nothing —
+    /// maintenance is opt-in.
+    fn check_maintenance(&self, problems: &mut Vec<Problem>) {
+        if let Some(maintenance) = &self.maintenance {
+            maintenance.check("maintenance", problems);
         }
     }
 
@@ -775,6 +789,7 @@ mod tests {
             mesh: None,
             home: None,
             vpn: Vec::new(),
+            maintenance: None,
         }
     }
 

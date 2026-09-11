@@ -64,6 +64,7 @@ use selfhost_firewall::Manager;
 use selfhost_git::{CredentialSource, Nudge};
 use selfhost_http::{Body, Method, Request, Response, Status};
 use selfhost_identity::{Caller, Capability, Grants, Opening, People, PersonName, Policy};
+use selfhost_maintenance;
 
 /// What a deployment with no permission registry answers on every people route.
 ///
@@ -279,6 +280,12 @@ pub struct Api {
     /// answer as though this build did not serve it — the honest report for a
     /// daemon nobody has wired a config path into.
     sites: Option<site_api::Wiring>,
+    /// The maintenance scheduler for graceful reboots.
+    ///
+    /// `None` until a daemon with `[maintenance]` config has wired it via
+    /// [`Api::with_maintenance`], and `None` makes `GET /api/maintenance/status`
+    /// answer with a default state (not in maintenance, no last reboot recorded).
+    maintenance: Option<Arc<selfhost_maintenance::MaintenanceScheduler>>,
 }
 
 /// Cookie-session authentication, present once [`Api::with_console_auth`] has
@@ -504,6 +511,8 @@ enum Route<'a> {
     SiteFilePut(&'a str),
     /// `DELETE /api/sites/<name>/files/entry?path=…`
     SiteFileDelete(&'a str),
+    /// `GET /api/maintenance/status`
+    MaintenanceStatus,
 }
 
 impl<'a> Route<'a> {
@@ -607,6 +616,7 @@ impl<'a> Route<'a> {
             (Method::Post, ["api", "sites"]) => Some(Self::SiteAdd),
             (Method::Get, ["api", "sites", name]) => Some(Self::SiteShow(name)),
             (Method::Delete, ["api", "sites", name]) => Some(Self::SiteRemove(name)),
+            (Method::Get, ["api", "maintenance", "status"]) => Some(Self::MaintenanceStatus),
             _ => None,
         }
     }
@@ -644,7 +654,8 @@ impl<'a> Route<'a> {
             | Self::MintTicket
             | Self::DesktopSettings
             | Self::DesktopNodes
-            | Self::Shares => Demand::Held(Capability::ConsoleRead),
+            | Self::Shares
+            | Self::MaintenanceStatus => Demand::Held(Capability::ConsoleRead),
             // Per-node and per-share, so the target has to be a name the
             // vocabulary can hold. One that is not names nothing this
             // deployment serves, and refusing it as though it were somebody
@@ -877,6 +888,7 @@ impl Api {
             peers: None,
             agents: None,
             sites: None,
+            maintenance: None,
         }
     }
 
@@ -946,6 +958,18 @@ impl Api {
     /// `[self_update]` section.
     pub fn with_self_update(mut self, nudge: Nudge) -> Self {
         self.self_update = Some(nudge);
+        self
+    }
+
+    /// Records the maintenance scheduler for graceful reboots.
+    ///
+    /// Takes the *same* [`selfhost_maintenance::MaintenanceScheduler`] the
+    /// daemon has running, so the API can query its current state. Without this
+    /// call `GET /api/maintenance/status` answers with a default state (no active
+    /// maintenance, no last reboot recorded), which is the honest report for a
+    /// deployment with no `[maintenance]` section.
+    pub fn with_maintenance(mut self, scheduler: Arc<selfhost_maintenance::MaintenanceScheduler>) -> Self {
+        self.maintenance = Some(scheduler);
         self
     }
 
@@ -1367,6 +1391,7 @@ impl Api {
             Route::SiteFileMkdir(name) => self.sites_file_mkdir(name, body),
             Route::SiteFilePut(name) => self.sites_file_put(name, query, body),
             Route::SiteFileDelete(name) => self.sites_file_delete(name, query),
+            Route::MaintenanceStatus => self.maintenance_status(),
         }
     }
 
@@ -3066,6 +3091,32 @@ impl Api {
                 problem(Status(500), &format!("could not reconcile the firewall: {error}"))
             }
         }
+    }
+
+    /// Returns the current maintenance scheduler state.
+    ///
+    /// If no maintenance scheduler is wired (deployment has no `[maintenance]`
+    /// config), returns a default state with `in_maintenance: false`, no last
+    /// reboot recorded, and a next reboot time far in the future. Otherwise
+    /// returns the scheduler's current state: when it last rebooted (if ever),
+    /// and when the next reboot is scheduled.
+    fn maintenance_status(&self) -> Response {
+        let state = self
+            .maintenance
+            .as_ref()
+            .map(|s| s.status())
+            .unwrap_or_else(|| {
+                selfhost_maintenance::MaintenanceState::new(
+                    false,
+                    None,
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_secs() + (365 * 86400), // One year in the future
+                )
+            });
+
+        json(Status(200), state.to_json())
     }
 }
 
