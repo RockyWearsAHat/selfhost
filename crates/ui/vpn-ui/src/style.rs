@@ -4,12 +4,45 @@
 //! The look is sculpted, not assembled from box-flags — the ground and every
 //! instrument are signed-distance shapes painted with fields and lit with
 //! additive glow (see rui's `sdf` module and `SHAPING.md`). This file owns the
-//! palette, hands it to rui once through [`rui::App::theme`], and paints the
-//! ground: a deep void, a radial reactor-glow behind the hero, a perspective
-//! grid receding to a horizon, and fine scanlines.
+//! palette, hands it to rui once through [`rui::App::theme`], owns the spacing
+//! scale every layout in the crate draws from, and paints the ground: a deep
+//! void, a radial reactor-glow behind the hero in the tunnel's own hue, a
+//! perspective grid receding to a horizon, and fine scanlines.
 
 use rui::{Appearance, Canvas, Color, CornerStyle, FontId, Palette, Point, Theme};
 use rui::{Sculpt, circle, radial};
+
+// ---- the spacing scale ------------------------------------------------------
+
+/// The one 4-based spacing scale the panel is laid out on.
+///
+/// Every gap and every pad in the crate names one of these rather than a
+/// number of its own, so the rhythm down the window is one rhythm. Control
+/// heights live beside them for the same reason.
+pub mod space {
+    /// The tightest gap: between a value and its unit, a word and its line.
+    pub const XS: f32 = 4.0;
+    /// The gap between things that belong together: rows of one list.
+    pub const S: f32 = 8.0;
+    /// A panel's inner padding, and the gap between one block and the next.
+    pub const M: f32 = 12.0;
+    /// The window's margin.
+    pub const L: f32 = 16.0;
+    /// The height of the one control the window is mostly for.
+    pub const PRIMARY_HEIGHT: f32 = 36.0;
+    /// The height of a route row: a tick, a name, a host, a chevron.
+    pub const ROW_HEIGHT: f32 = 28.0;
+    /// The height of the readout strip.
+    pub const STRIP_HEIGHT: f32 = 38.0;
+    /// The height of one labelled field row, as rui's `field_row` reserves it.
+    pub const FIELD_HEIGHT: f32 = 20.0;
+    /// The height reserved for the footer's one line.
+    pub const FOOTER_HEIGHT: f32 = 12.0;
+    /// The switch's footprint.
+    pub const SWITCH_WIDTH: f32 = 38.0;
+    /// See [`SWITCH_WIDTH`].
+    pub const SWITCH_HEIGHT: f32 = 18.0;
+}
 
 // ---- the holographic palette, as raw colours the sculptors paint with -------
 
@@ -71,19 +104,30 @@ pub fn theme(_appearance: Appearance, ui_font: FontId, mono_font: FontId) -> The
     Theme::new(Appearance::Dark, ui_font, mono_font).with_palette(HUD).with_corners(CornerStyle::Cut)
 }
 
-/// The atmosphere behind everything: void wash, a reactor-glow bloom high on the
-/// window behind the hero, a perspective grid receding to a horizon, scanlines.
-pub fn ground(canvas: &mut Canvas, _theme: &Theme) {
+/// The atmosphere behind everything: void wash, a reactor-glow bloom high on
+/// the window behind the hero in the tunnel's own hue, a perspective grid
+/// receding to a horizon, scanlines.
+///
+/// `kind` is the state the hero is drawn in, so the light the window is lit by
+/// is the light its reactors give off: cyan up, amber while reaching, red when
+/// broken, and a cold slate wash when there is nothing running at all.
+pub fn ground(canvas: &mut Canvas, _theme: &Theme, kind: Hue) {
     canvas.clear_vertical(VOID, VOID_DEEP);
     let bounds = canvas.bounds();
 
     // The reactor-glow: a broad radial bloom seated where the hero sits, so the
     // whole panel reads as lit from its own core.
-    let glow_center = Point::new(bounds.center().x, bounds.y + bounds.h * 0.28);
-    let bloom = circle(glow_center, bounds.w * 0.62);
+    let (light, strength) = match kind {
+        Hue::Up => (CYAN, 0.17),
+        Hue::Reaching => (AMBER, 0.13),
+        Hue::Failed => (RED, 0.12),
+        Hue::Off => (SLATE, 0.10),
+    };
+    let glow_center = Point::new(bounds.center().x, bounds.y + bounds.h * 0.26);
+    let bloom = circle(glow_center, bounds.w * 0.64);
     canvas.sculpt(
         &bloom,
-        &radial(glow_center, 0.0, bounds.w * 0.62, CYAN.fade(0.16), CYAN.with_alpha(0)),
+        &radial(glow_center, 0.0, bounds.w * 0.64, light.fade(strength), light.with_alpha(0)),
         Sculpt::Fill,
     );
 
@@ -124,7 +168,7 @@ pub fn hue(kind: Hue) -> Color {
 }
 
 /// The four state hues the panel is ever drawn in.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Hue {
     /// Connected — the signature cyan.
     Up,
@@ -134,4 +178,47 @@ pub enum Hue {
     Failed,
     /// Down — cold slate.
     Off,
+}
+
+impl Hue {
+    /// The hue a tunnel phase is drawn in.
+    pub fn of(phase: &crate::tunnel::Phase) -> Self {
+        use crate::tunnel::Phase;
+        match phase {
+            Phase::Off => Hue::Off,
+            Phase::Dialling | Phase::Authenticated => Hue::Reaching,
+            Phase::Up => Hue::Up,
+            Phase::Failed(_) => Hue::Failed,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_palette_is_legible() {
+        // rui's own contrast gate, asserted here so a palette tweak that dims
+        // the labels fails a test rather than a reviewer's eyes.
+        HUD.assert_legible("hud");
+    }
+
+    #[test]
+    fn every_state_hue_is_its_own_colour() {
+        // The three live hues must be told apart at a glance, and the cold
+        // one must be visibly colder than all of them.
+        let distance = |a: Color, b: Color| {
+            let channel = |x: u8, y: u8| (x as f32 - y as f32).powi(2);
+            (channel(a.r, b.r) + channel(a.g, b.g) + channel(a.b, b.b)).sqrt()
+        };
+        let live = [(Hue::Up, CYAN), (Hue::Reaching, AMBER), (Hue::Failed, RED)];
+        for (i, (a, ca)) in live.iter().enumerate() {
+            assert_eq!(hue(*a), *ca);
+            for (b, cb) in &live[i + 1..] {
+                assert!(distance(*ca, *cb) > 90.0, "{a:?} and {b:?} are too close to tell apart");
+            }
+            assert!(ca.luminance() > SLATE.luminance(), "{a:?} must outshine the cold hue");
+        }
+    }
 }

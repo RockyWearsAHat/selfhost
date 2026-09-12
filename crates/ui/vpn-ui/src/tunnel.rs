@@ -89,6 +89,17 @@ impl Phase {
     pub fn is_reaching(&self) -> bool {
         matches!(self, Phase::Dialling | Phase::Authenticated)
     }
+
+    /// Whether the tunnel is still asked for: every phase but [`Phase::Off`].
+    ///
+    /// A [`Phase::Failed`] tunnel is one the supervisor is waiting out a
+    /// backoff on before it dials again ([`keep_open`]), not one that has
+    /// given up — the only thing that ends it is [`Tunnel::disconnect`]. So
+    /// the control a window offers against it is Cancel, never Connect, and
+    /// [`Tunnel::connect`] on a failed tunnel is correctly a no-op.
+    pub fn is_wanted(&self) -> bool {
+        !matches!(self, Phase::Off)
+    }
 }
 
 /// What the tunnel last reported — the whole of what the window draws.
@@ -161,6 +172,13 @@ impl Tunnel {
             Ok(link) => link.clone(),
             Err(poisoned) => poisoned.into_inner().clone(),
         }
+    }
+
+    /// A read handle on the same link the window draws, for a painter that
+    /// runs outside the view — the ground, which is painted before the frame's
+    /// tree exists and tints itself by the tunnel's state.
+    pub fn watch(&self) -> Arc<Mutex<Link>> {
+        Arc::clone(&self.shared)
     }
 
     /// Whether this instance is managing the tunnel (spawned it) or adopted a pre-existing one.
