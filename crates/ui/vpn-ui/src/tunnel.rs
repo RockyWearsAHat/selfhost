@@ -177,8 +177,21 @@ impl Tunnel {
     /// client exits on its own — the supervisor thread notices, waits out a
     /// backoff, and tries again for as long as `disconnect()` has not been
     /// called, exactly as an ordinary VPN client would.
+    ///
+    /// An *adopted* tunnel (`!self.managed`, [`Tunnel::new`] found the local
+    /// port already answering) is the one exception: something else is
+    /// already listening there, so spawning here would only ever collide with
+    /// it — `EADDRINUSE`, immediately, on every retry, forever. There is
+    /// nothing to supervise in that case; the port already answering is
+    /// itself the evidence the tunnel is up.
     pub fn connect(&mut self) {
         if self.wanted.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        if !self.managed {
+            set(&self.shared, |link| {
+                *link = Link { phase: Phase::Up, since: Some(Instant::now()), ..Link::default() };
+            });
             return;
         }
         set(&self.shared, |link| {

@@ -14,8 +14,106 @@ use rui::{
     spacer, tag, title,
 };
 use rui::tray::{Tray, TrayEvent, TrayMenuItem};
+use rui::{PanelWindow, panel_window::{PanelOptions, Widget}};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+
+/// The tag a mini-panel button reports itself back with when clicked.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MiniAction {
+    /// Connect, Disconnect, or Cancel, whichever the tunnel's current phase calls for.
+    Primary,
+    /// Open the admin console.
+    Console,
+    /// Quit, after confirming the tunnel will be torn down.
+    Quit,
+}
+
+impl MiniAction {
+    fn from_tag(tag: i64) -> Option<Self> {
+        match tag {
+            1 => Some(MiniAction::Primary),
+            2 => Some(MiniAction::Console),
+            3 => Some(MiniAction::Quit),
+            _ => None,
+        }
+    }
+}
+
+/// The compact dropdown panel a tray click opens: the real controls, just
+/// small — not the placeholder empty window this replaces, and not the
+/// full-size main window either.
+struct MiniPanel {
+    window: PanelWindow,
+    status: Widget,
+    primary: Widget,
+    quit: Widget,
+}
+
+/// The mini panel's fixed footprint, in points.
+const MINI_WIDTH: f64 = 240.0;
+const MINI_HEIGHT: f64 = 132.0;
+
+/// Builds the mini panel's controls once. Actions are reported through
+/// `actions` rather than captured directly: the click arrives on an AppKit
+/// callback with no reference to the running [`Panel`], so it is queued and
+/// drained on the next frame exactly as tray clicks already are.
+fn build_mini_panel(actions: Arc<Mutex<Vec<MiniAction>>>) -> Result<MiniPanel, String> {
+    let options = PanelOptions::new(0.0, 0.0, MINI_WIDTH, MINI_HEIGHT);
+    let window = PanelWindow::new(options).map_err(|e| format!("{e:?}"))?;
+    let _ = window.add_label(12.0, 104.0, 180.0, 18.0, "SELFHOST VPN");
+    let status =
+        window.add_label(12.0, 82.0, MINI_WIDTH - 24.0, 18.0, "OFFLINE").map_err(|e| format!("{e:?}"))?;
+    let primary =
+        window.add_button(12.0, 46.0, MINI_WIDTH - 24.0, 26.0, "Connect", 1).map_err(|e| format!("{e:?}"))?;
+    let _ = window.add_button(12.0, 12.0, (MINI_WIDTH - 32.0) / 2.0, 26.0, "Console", 2);
+    let quit = window
+        .add_button(12.0 + (MINI_WIDTH - 32.0) / 2.0 + 8.0, 12.0, (MINI_WIDTH - 32.0) / 2.0, 26.0, "Quit", 3)
+        .map_err(|e| format!("{e:?}"))?;
+    window
+        .on_action(move |tag| {
+            if let Some(action) = MiniAction::from_tag(tag) {
+                if let Ok(mut queue) = actions.lock() {
+                    queue.push(action);
+                }
+            }
+        })
+        .map_err(|e| format!("{e:?}"))?;
+    Ok(MiniPanel { window, status, primary, quit })
+}
+
+/// Redraws the mini panel's status line and primary button for the current
+/// link state. Cheap and idempotent, so calling it every frame is fine.
+fn refresh_mini_panel(mini: &MiniPanel, link: &Link) {
+    let up = link.phase.is_up();
+    let reaching = link.phase.is_reaching();
+    let _ = mini.window.set_text(&mini.status, state_word(link));
+    let primary_label = if up { "Disconnect" } else if reaching { "Cancel" } else { "Connect" };
+    let _ = mini.window.set_text(&mini.primary, primary_label);
+    let _ = mini.window.set_enabled(&mini.quit, true);
+}
+
+/// Asks, via a native dialog, whether the user really wants to quit — quitting
+/// tears the tunnel down, unlike the old detach-and-leave-it-running Quit.
+/// Returns `true` only if the user picked the destructive button.
+fn confirm_quit() -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        let status = std::process::Command::new("osascript")
+            .arg("-e")
+            .arg(
+                "display dialog \"Quitting will disconnect the tunnel and end your VPN session.\" \
+                 with title \"Quit SelfHost VPN\" buttons {\"Cancel\", \"Quit\"} \
+                 default button \"Cancel\" cancel button \"Cancel\" with icon caution",
+            )
+            .status();
+        return matches!(status, Ok(status) if status.success());
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        true
+    }
+}
 
 /// The console URL, reached portless through the loopback 443 gate.
 pub const CONSOLE_URL: &str = "https://admin.rockywearsahat.com/";
@@ -70,6 +168,16 @@ pub struct Panel {
     tray_created: bool,
     /// Track the previous visibility state to avoid redundant macOS calls.
     previous_visible: bool,
+    /// The mini dropdown panel, built lazily the first time it is shown.
+    mini: Option<MiniPanel>,
+    /// Whether the panel should be shown or hidden.
+    panel_should_show: bool,
+    /// The tray icon's screen position from the last event.
+    panel_anchor_pos: Option<(f64, f64)>,
+    /// Button presses from the mini panel, queued by its `on_action`
+    /// callback (an AppKit thread with no reference to this `Panel`) and
+    /// drained on the next frame.
+    mini_actions: Arc<Mutex<Vec<MiniAction>>>,
 }
 
 impl Panel {
@@ -99,6 +207,10 @@ impl Panel {
             window_visible: true,
             tray_created: false,
             previous_visible: true,
+            mini: None,
+            panel_should_show: false,
+            panel_anchor_pos: None,
+            mini_actions: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
@@ -121,6 +233,10 @@ impl Panel {
             window_visible: true,
             tray_created: false,
             previous_visible: true,
+            mini: None,
+            panel_should_show: false,
+            panel_anchor_pos: None,
+            mini_actions: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
@@ -176,14 +292,21 @@ impl Panel {
     /// found no status item at all) before this was moved here.
     pub fn create_tray(&mut self) -> Result<(), String> {
         let icon_data = include_bytes!("../assets/tray-icon.png");
-        let tray = Tray::new(icon_data, "SelfHost VPN")
+        let tray = Tray::new_with_panel(icon_data, "SelfHost VPN")
             .map_err(|e| format!("Tray creation failed: {:?}", e))?;
         // Tray::new creates the status item with a blank placeholder image.
         let _ = tray.set_icon(icon_data);
+
         self.tray = Some(tray);
 
-        // Always update the tray menu with current state
+        // Always update the tray menu with current state (before enabling panel mode)
         self.update_tray_menu();
+
+        // Enable panel mode for the tray icon AFTER setting the menu
+        if let Some(ref mut tray) = self.tray {
+            let _ = tray.set_panel_mode(true);
+            eprintln!("TRAY: Panel mode enabled");
+        }
 
         Ok(())
     }
@@ -201,7 +324,12 @@ impl Panel {
         }
 
         if let Some(ref tray) = self.tray {
-            for event in tray.drain_events() {
+            let events = tray.drain_events();
+            if !events.is_empty() {
+                eprintln!("TRAY: Received {} events", events.len());
+            }
+            for event in events {
+                eprintln!("TRAY: Event: {:?}", event);
                 self.handle_tray_event(event);
             }
         }
@@ -211,14 +339,22 @@ impl Panel {
     fn handle_tray_event(&mut self, event: TrayEvent) {
         match event {
             TrayEvent::IconActivated => {
-                // Clicking tray icon toggles main window visibility.
-                // The window serves as the dropdown panel.
-                self.window_visible = !self.window_visible;
+                eprintln!("TRAY: IconActivated event received");
+                // In panel mode, convert to panel activation
+                if self.mini.is_some() || self.panel_should_show {
+                    eprintln!("TRAY: Converting IconActivated to panel activation");
+                    self.panel_should_show = !self.panel_should_show;
+                } else {
+                    // Clicking tray icon toggles main window visibility.
+                    // The window serves as the dropdown panel.
+                    self.window_visible = !self.window_visible;
+                }
             }
-            TrayEvent::IconActivatedForPanel { .. } => {
-                // Panel mode activated (for platforms that show a panel on click).
-                // This is similar to IconActivated but explicitly for panel display.
-                self.window_visible = true;
+            TrayEvent::IconActivatedForPanel { screen_position } => {
+                // Panel mode activated: toggle the panel window
+                self.panel_should_show = !self.panel_should_show;
+                self.panel_anchor_pos = Some(screen_position);
+                eprintln!("TRAY: IconActivatedForPanel event received, panel_should_show={}", self.panel_should_show);
             }
             TrayEvent::MenuItemClicked(id) => {
                 match id {
@@ -227,15 +363,52 @@ impl Panel {
                     3 => actions::open_console(self.activity_handle()),
                     4 => actions::open_sara(self.activity_handle()),
                     5 => actions::open_ai_studio(self.activity_handle()),
-                    6 => {
-                        // Quit: exit the GUI without killing the tunnel.
-                        // If the tunnel is managed (we spawned it), it will be detached and survive.
-                        // If it's unmanaged (adopted), it's already detached from us.
-                        // The Drop impl handles cleanup appropriately for each case.
-                        self.running.store(false, Ordering::Relaxed);
+                    6 => self.quit_with_confirmation(),
+                    9999 => {
+                        // Panel trigger: toggle panel visibility
+                        eprintln!("TRAY: Panel trigger (id=9999) clicked");
+                        self.panel_should_show = !self.panel_should_show;
                     }
                     _ => {}
                 }
+            }
+        }
+    }
+
+    /// Warns that quitting ends the VPN session, and only on an explicit
+    /// "Quit" actually disconnects the tunnel and stops the app.
+    ///
+    /// Unlike the old detach-and-leave-running Quit, a confirmed quit here
+    /// tears the tunnel down: the operator asked for "upon accept, exit and
+    /// terminate session", so this Quit is no longer the same button as the
+    /// managed-tunnel survival feature — it is a deliberate end of the session.
+    fn quit_with_confirmation(&mut self) {
+        if !confirm_quit() {
+            return;
+        }
+        self.tunnel.disconnect();
+        self.running.store(false, Ordering::Relaxed);
+    }
+
+    /// Drain and dispatch mini-panel button presses, queued off-thread by
+    /// [`build_mini_panel`]'s `on_action` callback.
+    fn drain_mini_actions(&mut self) {
+        let pending: Vec<MiniAction> = match self.mini_actions.lock() {
+            Ok(mut queue) => queue.drain(..).collect(),
+            Err(_) => Vec::new(),
+        };
+        for action in pending {
+            match action {
+                MiniAction::Primary => {
+                    let link = self.tunnel.link();
+                    if link.phase.is_up() || link.phase.is_reaching() {
+                        self.tunnel.disconnect();
+                    } else {
+                        self.tunnel.connect();
+                    }
+                }
+                MiniAction::Console => actions::open_console(self.activity_handle()),
+                MiniAction::Quit => self.quit_with_confirmation(),
             }
         }
     }
@@ -296,10 +469,18 @@ impl Panel {
 
         // on_frame callback: drain and dispatch tray events each frame before rendering.
         // The tray is created on the first frame when the pump loop is active.
-        // Also applies window visibility changes when the window_visible flag changes.
+        // Also applies window visibility changes when the window_visible flag changes,
+        // and manages the panel window lifecycle.
         let on_frame = |panel: &mut Panel| {
             panel.drain_tray_events();
-            panel.update_tray_menu();
+            panel.drain_mini_actions();
+            // Not panel.update_tray_menu() here: that rebuilds the tray's real
+            // NSMenu (Connect/Disconnect/Quit as text items), which is exactly
+            // the old dropdown the mini panel now replaces. Calling it every
+            // frame was clobbering panel mode's single-item menu right back to
+            // the full list moments after create_tray() set panel mode up,
+            // which is why the tray kept showing the text menu instead of
+            // opening the mini panel.
 
             // Apply window visibility changes
             if panel.window_visible != panel.previous_visible {
@@ -310,11 +491,35 @@ impl Panel {
                 }
                 panel.previous_visible = panel.window_visible;
             }
+
+            // Manage the mini panel's lifecycle: built once on first show,
+            // then just shown/hidden/repositioned/refreshed after that.
+            if panel.panel_should_show {
+                if panel.mini.is_none() {
+                    match build_mini_panel(Arc::clone(&panel.mini_actions)) {
+                        Ok(mini) => panel.mini = Some(mini),
+                        Err(error) => eprintln!("PANEL: failed to build the mini panel: {error}"),
+                    }
+                }
+                if let Some(mini) = &panel.mini {
+                    if let Some((x, y)) = panel.panel_anchor_pos {
+                        let _ = mini.window.set_position(x - MINI_WIDTH / 2.0, y - MINI_HEIGHT - 8.0);
+                    }
+                    refresh_mini_panel(mini, &panel.tunnel.link());
+                    let _ = mini.window.show();
+                }
+            } else if let Some(mini) = &panel.mini {
+                let _ = mini.window.hide();
+            }
         };
 
         application(title, self)
             .size(430.0, 620.0)
             .min_size(380.0, 560.0)
+            // The red close button hides the window, not the app: the tray
+            // icon and the tunnel it supervises must survive it. Only a
+            // confirmed Quit (see quit_with_confirmation) clears `running`.
+            .close_hides(true)
             .idle_timeout(std::time::Duration::from_millis(200))
             .while_running(move |_| running.load(Ordering::Relaxed))
             .on_frame(on_frame)
@@ -343,9 +548,13 @@ pub fn view(ui: &Panel) -> El<Panel> {
     .pad(16.0)
     .gap(14.0)
     .on_key(|panel: &mut Panel, key: Key, _modifiers: Modifiers| {
-        // Escape key hides the window (same as clicking tray icon to toggle)
+        // Escape key hides the window or closes the panel (same as clicking tray icon to toggle)
         if key == Key::Escape {
-            panel.window_visible = false;
+            if panel.panel_should_show {
+                panel.panel_should_show = false;
+            } else {
+                panel.window_visible = false;
+            }
         }
     })
 }
