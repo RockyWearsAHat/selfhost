@@ -46,13 +46,15 @@ impl MiniAction {
 struct MiniPanel {
     window: PanelWindow,
     status: Widget,
+    detail: Widget,
     primary: Widget,
     quit: Widget,
+    last_word: std::cell::Cell<&'static str>,
 }
 
 /// The mini panel's fixed footprint, in points.
-const MINI_WIDTH: f64 = 240.0;
-const MINI_HEIGHT: f64 = 132.0;
+const MINI_WIDTH: f64 = 248.0;
+const MINI_HEIGHT: f64 = 156.0;
 
 /// Builds the mini panel's controls once. Actions are reported through
 /// `actions` rather than captured directly: the click arrives on an AppKit
@@ -61,15 +63,27 @@ const MINI_HEIGHT: f64 = 132.0;
 fn build_mini_panel(actions: Arc<Mutex<Vec<MiniAction>>>) -> Result<MiniPanel, String> {
     let options = PanelOptions::new(0.0, 0.0, MINI_WIDTH, MINI_HEIGHT);
     let window = PanelWindow::new(options).map_err(|e| format!("{e:?}"))?;
-    let _ = window.add_label(12.0, 104.0, 180.0, 18.0, "SELFHOST VPN");
-    let status =
-        window.add_label(12.0, 82.0, MINI_WIDTH - 24.0, 18.0, "OFFLINE").map_err(|e| format!("{e:?}"))?;
-    let primary =
-        window.add_button(12.0, 46.0, MINI_WIDTH - 24.0, 26.0, "Connect", 1).map_err(|e| format!("{e:?}"))?;
-    let _ = window.add_button(12.0, 12.0, (MINI_WIDTH - 32.0) / 2.0, 26.0, "Console", 2);
-    let quit = window
-        .add_button(12.0 + (MINI_WIDTH - 32.0) / 2.0 + 8.0, 12.0, (MINI_WIDTH - 32.0) / 2.0, 26.0, "Quit", 3)
+    let pad = 14.0;
+    let inner = MINI_WIDTH - pad * 2.0;
+
+    let _ = window.add_label(pad, MINI_HEIGHT - 30.0, inner - 14.0, 18.0, "SELFHOST VPN");
+    let status = window
+        .add_label(pad, MINI_HEIGHT - 52.0, inner, 20.0, "OFFLINE")
         .map_err(|e| format!("{e:?}"))?;
+    let _ = window.set_text_color(&status, (0.55, 0.58, 0.63));
+    let detail = window
+        .add_label(pad, MINI_HEIGHT - 72.0, inner, 16.0, "rockywearsahat.com:8443")
+        .map_err(|e| format!("{e:?}"))?;
+    let _ = window.set_text_color(&detail, (0.5, 0.5, 0.53));
+
+    let primary = window
+        .add_button(pad, 44.0, inner, 28.0, "Connect", 1)
+        .map_err(|e| format!("{e:?}"))?;
+    let half = (inner - 8.0) / 2.0;
+    let _ = window.add_button(pad, 12.0, half, 26.0, "Console", 2);
+    let quit =
+        window.add_button(pad + half + 8.0, 12.0, half, 26.0, "Quit", 3).map_err(|e| format!("{e:?}"))?;
+
     window
         .on_action(move |tag| {
             if let Some(action) = MiniAction::from_tag(tag) {
@@ -79,18 +93,43 @@ fn build_mini_panel(actions: Arc<Mutex<Vec<MiniAction>>>) -> Result<MiniPanel, S
             }
         })
         .map_err(|e| format!("{e:?}"))?;
-    Ok(MiniPanel { window, status, primary, quit })
+    Ok(MiniPanel { window, status, detail, primary, quit, last_word: std::cell::Cell::new("") })
 }
 
 /// Redraws the mini panel's status line and primary button for the current
-/// link state. Cheap and idempotent, so calling it every frame is fine.
+/// link state.
+///
+/// Every `set_text`/`set_text_color` call round-trips into AppKit, so this
+/// skips them entirely once the state word stops changing — the common case,
+/// since the panel is only ever open a few seconds at a time and the tunnel's
+/// phase rarely flips within that window.
 fn refresh_mini_panel(mini: &MiniPanel, link: &Link) {
+    let word = state_word(link);
+    if mini.last_word.get() == word {
+        return;
+    }
+    mini.last_word.set(word);
+
     let up = link.phase.is_up();
     let reaching = link.phase.is_reaching();
-    let _ = mini.window.set_text(&mini.status, state_word(link));
+    let _ = mini.window.set_text(&mini.status, word);
+    let _ = mini.window.set_text_color(&mini.status, status_rgb(link));
     let primary_label = if up { "Disconnect" } else if reaching { "Cancel" } else { "Connect" };
     let _ = mini.window.set_text(&mini.primary, primary_label);
     let _ = mini.window.set_enabled(&mini.quit, true);
+    let _ = mini.window.set_text(&mini.detail, "rockywearsahat.com:8443");
+}
+
+/// The status word's color, matching the main window's [`status_of`]/[`Tone`]
+/// mapping but as plain sRGB — the mini panel's labels are native AppKit
+/// controls, not `rui` elements, so they take raw color rather than a `Tone`.
+fn status_rgb(link: &Link) -> (f32, f32, f32) {
+    match link.phase {
+        Phase::Off => (0.55, 0.58, 0.63),
+        Phase::Dialling | Phase::Authenticated => (0.85, 0.62, 0.2),
+        Phase::Up => (0.25, 0.75, 0.55),
+        Phase::Failed(_) => (0.88, 0.35, 0.35),
+    }
 }
 
 /// Asks, via a native dialog, whether the user really wants to quit — quitting
@@ -520,6 +559,12 @@ impl Panel {
             // icon and the tunnel it supervises must survive it. Only a
             // confirmed Quit (see quit_with_confirmation) clears `running`.
             .close_hides(true)
+            // The hero's only motion is ambient (a slow breathing glow, a
+            // gentle packet flow) — nothing here is a gesture being tracked,
+            // so the default 8ms/125fps animation cadence is pure waste. 50ms
+            // (20fps) is still visibly smooth for something that changes over
+            // multiple seconds, and is most of this app's idle CPU cost.
+            .animation_interval(std::time::Duration::from_millis(50))
             .idle_timeout(std::time::Duration::from_millis(200))
             .while_running(move |_| running.load(Ordering::Relaxed))
             .on_frame(on_frame)
