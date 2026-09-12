@@ -155,14 +155,36 @@ fn render(dir: &str) -> Result<(), String> {
     ];
 
     for (name, link) in states {
-        let mut application = app::application("SelfHost VPN", Panel::demo(link));
-        let canvas = application.render(430, 620, 2.0, rui::Appearance::Dark, &mut fonts);
-        let pixels = rui::image::rgba(&canvas);
-        let png = rui::image::png(canvas.width(), canvas.height(), &pixels)
-            .ok_or("the frame could not be encoded")?;
-        let path = format!("{dir}/vpn-{name}.png");
-        std::fs::write(&path, png).map_err(|error| format!("cannot write {path}: {error}"))?;
-        println!("wrote {path}");
+        // Every state at the window's default size, and the busiest one at
+        // the smallest size it can be resized to — the frame where a label
+        // that was going to truncate does.
+        let mut frames = vec![(name.to_string(), app::WINDOW_WIDTH as u32, app::WINDOW_HEIGHT as u32)];
+        if link.phase.is_up() {
+            frames.push((format!("{name}-min"), app::MIN_WIDTH as u32, app::MIN_HEIGHT as u32));
+        }
+        for (name, width, height) in frames {
+            write_frame(dir, &name, Panel::demo(link.clone()), width, height, &mut fonts)?;
+        }
     }
+    Ok(())
+}
+
+/// Draws one frame of `panel` at `width`×`height` (2× for the review) to
+/// `<dir>/vpn-<name>.png`.
+fn write_frame(
+    dir: &str,
+    name: &str,
+    panel: Panel,
+    width: u32,
+    height: u32,
+    fonts: &mut rui::shell::LoadedFonts,
+) -> Result<(), String> {
+    let mut application = app::application("SelfHost VPN", panel);
+    let canvas = application.render(width, height, 2.0, rui::Appearance::Dark, fonts);
+    let pixels = rui::image::rgba(&canvas);
+    let png = rui::image::png(canvas.width(), canvas.height(), &pixels).ok_or("the frame could not be encoded")?;
+    let path = format!("{dir}/vpn-{name}.png");
+    std::fs::write(&path, png).map_err(|error| format!("cannot write {path}: {error}"))?;
+    println!("wrote {path}");
     Ok(())
 }

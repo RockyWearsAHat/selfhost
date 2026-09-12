@@ -7,11 +7,13 @@
 //! window never blocks on the network or a password prompt.
 
 use crate::keys::{self, Identity};
+use crate::style::space;
 use crate::tunnel::{Endpoint, Link, Phase, Tunnel};
 use crate::{actions, hero, hud, style};
+use rui::style::Length;
 use rui::{
-    App, El, Key, Modifiers, Size, Status, Tone, button, caption, code, col, dot, field_row, micro, row, section,
-    spacer, tag, title,
+    App, El, Key, Modifiers, Role, Size, Status, Tone, button, caption, code, col, dot, field_row, micro, row,
+    section, spacer, text, title,
 };
 use rui::tray::{Tray, TrayEvent, TrayMenuItem};
 use rui::{PanelWindow, panel_window::{PanelOptions, Widget}};
@@ -138,14 +140,31 @@ fn refresh_mini_panel(mini: &MiniPanel, link: &Link) {
     }
     mini.last_word.set(word);
 
-    let up = link.phase.is_up();
-    let reaching = link.phase.is_reaching();
     let _ = mini.window.set_text(&mini.status, word);
     let _ = mini.window.set_text_color(&mini.status, status_rgb(link));
-    let primary_label = if up { "Disconnect" } else if reaching { "Cancel" } else { "Connect" };
-    let _ = mini.window.set_text(&mini.primary, primary_label);
+    let _ = mini.window.set_text(&mini.primary, primary_label(link));
     let _ = mini.window.set_enabled(&mini.quit, true);
-    let _ = mini.window.set_text(&mini.detail, "rockywearsahat.com:8443");
+    let _ = mini.window.set_text(&mini.detail, &endpoint_label());
+}
+
+/// What the one primary control says, in the window, the mini panel and the
+/// tray alike: Connect when nothing is asked for, Disconnect once the tunnel
+/// is up, and Cancel for every phase in between — dialling, authenticating,
+/// and a failure the supervisor is about to retry (see [`Phase::is_wanted`]).
+fn primary_label(link: &Link) -> &'static str {
+    if link.phase.is_up() {
+        "Disconnect"
+    } else if link.phase.is_wanted() {
+        "Cancel"
+    } else {
+        "Connect"
+    }
+}
+
+/// The endpoint as the window says it: host and port, as machine text.
+fn endpoint_label() -> String {
+    let endpoint = Endpoint::default();
+    format!("{}:{}", endpoint.server_host, endpoint.server_port)
 }
 
 /// The status word's color, matching the main window's [`status_of`]/[`Tone`]
@@ -485,8 +504,7 @@ impl Panel {
         for action in pending {
             match action {
                 MiniAction::Primary => {
-                    let link = self.tunnel.link();
-                    if link.phase.is_up() || link.phase.is_reaching() {
+                    if self.tunnel.link().phase.is_wanted() {
                         self.tunnel.disconnect();
                     } else {
                         self.tunnel.connect();
@@ -506,19 +524,19 @@ impl Panel {
         if let Some(ref tray) = self.tray {
             let link = self.tunnel.link();
             let up = link.phase.is_up();
-            let reaching = link.phase.is_reaching();
+            let wanted = link.phase.is_wanted();
 
             let menu = vec![
                 TrayMenuItem {
                     id: 1,
                     label: "Connect".into(),
-                    enabled: !up && !reaching,
+                    enabled: !wanted,
                     selected: false,
                 },
                 TrayMenuItem {
                     id: 2,
                     label: if up { "Disconnect".into() } else { "Cancel".into() },
-                    enabled: up || reaching,
+                    enabled: wanted,
                     selected: false,
                 },
                 TrayMenuItem {
@@ -605,8 +623,8 @@ impl Panel {
         };
 
         application(title, self)
-            .size(430.0, 620.0)
-            .min_size(380.0, 560.0)
+            .size(WINDOW_WIDTH, WINDOW_HEIGHT)
+            .min_size(MIN_WIDTH, MIN_HEIGHT)
             // The red close button hides the window, not the app: the tray
             // icon and the tunnel it supervises must survive it. Only a
             // confirmed Quit (see quit_with_confirmation) clears `running`.
@@ -640,25 +658,64 @@ impl Panel {
 }
 
 /// The panel as an application, in its own theme and ground.
+///
+/// The ground is painted before the frame's tree exists, so it reads the
+/// tunnel's state through a handle of its own ([`Tunnel::watch`]) and tints
+/// its reactor-bloom by it: the window is lit by the same light the hero gives
+/// off.
 pub fn application(title: impl Into<String>, panel: Panel) -> App<Panel> {
-    App::new(title, panel, view).theme(style::theme).ground(style::ground)
+    let watched = panel.tunnel.watch();
+    App::new(title, panel, view).theme(style::theme).ground(move |canvas, theme| {
+        let kind = match watched.lock() {
+            Ok(link) => style::Hue::of(&link.phase),
+            Err(poisoned) => style::Hue::of(&poisoned.into_inner().phase),
+        };
+        style::ground(canvas, theme, kind)
+    })
 }
 
+/// The window's width when it opens, in points.
+pub const WINDOW_WIDTH: f32 = 430.0;
+/// The window's height when it opens: the content plus a generous field for
+/// the hero, which is the one block that grows.
+pub const WINDOW_HEIGHT: f32 = 660.0;
+/// The narrowest the window may be dragged: every label still fits, proven by
+/// the frame tests below.
+pub const MIN_WIDTH: f32 = 380.0;
+/// The shortest the window may be dragged: every row of every section is still
+/// whole, with the hero at exactly [`hero::HERO_MIN`].
+pub const MIN_HEIGHT: f32 = 620.0;
+
 /// The whole window, as one description.
+///
+/// Top to bottom, in the order the eye is meant to travel: the instrument (the
+/// hero and, under it, the state word, the endpoint and one line of plain
+/// words), the one thing to do about it (the primary control), where the
+/// tunnel leads (the routes), how it is doing (the readouts), and — demoted to
+/// the foot — the keys it runs on. Every block holds its geometry across the
+/// four states: the hero's height depends on the window alone, the primary
+/// control never moves, and the route rows stay where they are, dimmed rather
+/// than gone.
 pub fn view(ui: &Panel) -> El<Panel> {
     let link = ui.tunnel.link();
     let activity = ui.activity();
     let auto = ui.auto_rotate.load(Ordering::Relaxed);
     col((
         masthead(&link),
-        hud::glass_panel(hero::tunnel_hero(&link)).align(rui::Align::Stretch),
-        link_readout(&link),
-        controls(&link),
+        instrument(&link),
+        primary(&link),
+        routes(&link),
+        readouts(&link),
         keys_panel(&activity, auto),
         footer(&activity),
     ))
-    .pad(16.0)
-    .gap(14.0)
+    .pad(space::L)
+    .gap(space::M)
+    // The window answers Escape, so it states what it is for anything that
+    // cannot see it — a group that takes the keyboard is not allowed to stay
+    // an anonymous group.
+    .role(Role::Dialog)
+    .label("SelfHost VPN")
     .on_key(|panel: &mut Panel, key: Key, _modifiers: Modifiers| {
         // Escape key hides the window or closes the panel (same as clicking tray icon to toggle)
         if key == Key::Escape {
@@ -681,83 +738,134 @@ fn masthead(link: &Link) -> El<Panel> {
         dot(status_of(link), 4.0),
         micro(state_word(link)).color(word_tone(link)).tracking(1.5),
     ))
-    .gap(8.0)
-    .h(26.0)
+    .gap(space::S)
+    .h(22.0)
     .align(rui::Align::Center)
 }
 
-/// The link readout: where it goes, how it is, how long, how much.
-///
-/// Every state draws the same four rows — a reading that is not there yet shows
-/// a dash, and a failure's reason folds into the STATUS row — so the panel
-/// holds its geometry and the controls below it never move.
-fn link_readout(link: &Link) -> El<Panel> {
-    let reason = match &link.phase {
-        Phase::Failed(reason) => Some(caption(reason.clone()).color(Tone::ink(Status::Bad))),
-        _ => None,
-    };
-    let up = match link.since {
-        Some(since) => caption(duration(since.elapsed())).color(Tone::Text),
-        None => caption("—").color(Tone::Muted),
-    };
-    let traffic = format!("up {}   down {}", bytes(link.tx), bytes(link.rx));
-    let rows = col((
-        field_row("ENDPOINT", code("rockywearsahat.com:8443").color(Tone::Text)),
-        field_row(
-            "STATUS",
-            row((tag(status_of(link), state_word(link).to_lowercase()), reason, spacer().grow()))
-                .gap(8.0)
+/// The instrument: the hero in a glass panel lit by the tunnel's hue, and
+/// directly under it the state block — the state word set large and lit like
+/// a reactor core, the endpoint in machine text on the same line, and one
+/// line of plain words saying what the state means right now (a failure's own
+/// reason, in red, when it has one). The one block that grows: whatever height
+/// the window has beyond its content opens up in the hero.
+fn instrument(link: &Link) -> El<Panel> {
+    let hue = style::hue(style::Hue::of(&link.phase));
+    let lit = !matches!(link.phase, Phase::Off);
+    let word_color = if lit { hue } else { style::INK };
+    hud::glass_panel_lit(
+        col((
+            hero::tunnel_hero(link).grow(),
+            col((
+                row((
+                    hud::state_word(state_title(link), word_color, lit),
+                    spacer().grow(),
+                    code(endpoint_label()).color(Tone::Muted),
+                ))
+                .gap(space::S)
                 .align(rui::Align::Center),
-        ),
-        field_row("UP", up),
-        field_row("TRAFFIC", code(traffic).color(Tone::Muted)),
-    ))
-    .gap(6.0);
-    hud::glass_panel(col((section("LINK", None), rows)).gap(10.0)).align(rui::Align::Stretch)
+                caption(explanation(link)).color(explanation_tone(link)),
+            ))
+            .gap(2.0)
+            .pad_x(space::XS),
+        ))
+        .gap(space::XS),
+        hue,
+    )
+    .align(rui::Align::Stretch)
+    .grow()
 }
 
-/// The connect control and the console button.
+/// The one control the window is mostly for, full width, in the same place
+/// in every state.
 ///
-/// Disconnecting a healthy tunnel is routine, so Disconnect is a quiet button —
-/// red belongs to Failed alone. The console button explains its own disablement
-/// with a micro hint on a line the row reserves in every state.
-fn controls(link: &Link) -> El<Panel> {
-    let up = link.phase.is_up();
-    let reaching = link.phase.is_reaching();
-
-    let primary = if up {
-        button("Disconnect").on_click(|panel: &mut Panel| panel.tunnel.disconnect())
-    } else if reaching {
-        button("Cancel").on_click(|panel: &mut Panel| panel.tunnel.disconnect())
+/// Connect wears the accent: it is the action the window exists to offer.
+/// Disconnect and Cancel are quiet: taking a healthy tunnel down is routine,
+/// and red belongs to Failed alone. A failed tunnel offers Cancel, not
+/// Connect, because the supervisor is still retrying it (see
+/// [`Phase::is_wanted`]) and a Connect that did nothing would be a lie.
+fn primary(link: &Link) -> El<Panel> {
+    let control = if link.phase.is_wanted() {
+        button(primary_label(link)).on_click(|panel: &mut Panel| panel.tunnel.disconnect())
     } else {
-        button("Connect").primary().on_click(|panel: &mut Panel| panel.tunnel.connect())
+        // The one lit control: filled with the accent and casting its own
+        // halo, the way the reactor cores do, so the thing to press is the
+        // thing that glows.
+        button(primary_label(link))
+            .primary()
+            .glow(7.0, Tone::Exact(style::CYAN.fade(0.2)))
+            .on_click(|panel: &mut Panel| panel.tunnel.connect())
     };
-    let hint = if up { String::new() } else { "connect first".into() };
+    control.h(space::PRIMARY_HEIGHT).w(Length::Fill(1.0))
+}
 
+/// Where the tunnel leads: one glass row per gated site, each a full-width
+/// control with a reactor tick, the name, the host it answers at, and a
+/// chevron.
+///
+/// The rows are drawn in every state and dimmed when the tunnel is down — the
+/// list is a fact about the tunnel, not a menu that appears when it is up —
+/// and the section's own note says why they wait. The note names no button:
+/// while dialling, and after a failure, the only control on screen is Cancel.
+fn routes(link: &Link) -> El<Panel> {
+    let up = link.phase.is_up();
+    let note = if up { "through the tunnel" } else { "available once connected" };
     col((
-        row((
-            primary.grow().h(30.0),
-            button("Open Console")
-                .disabled(!up)
-                .on_click(|panel: &mut Panel| actions::open_console(panel.activity_handle()))
-                .h(30.0),
-            button("Open SARA")
-                .disabled(!up)
-                .on_click(|panel: &mut Panel| actions::open_sara(panel.activity_handle()))
-                .h(30.0),
-            button("Open AI Studio")
-                .disabled(!up)
-                .on_click(|panel: &mut Panel| actions::open_ai_studio(panel.activity_handle()))
-                .h(30.0),
+        section("ROUTES", Some(note.into())),
+        col((
+            route("Admin Console", CONSOLE_HOST, up, |panel| actions::open_console(panel.activity_handle())),
+            route("SARA", SARA_HOST, up, |panel| actions::open_sara(panel.activity_handle())),
+            route("AI Studio", AI_HOST, up, |panel| actions::open_ai_studio(panel.activity_handle())),
         ))
-        .gap(8.0),
-        row((spacer().grow(), micro(hint).color(Tone::Muted).tracking(1.0))).h(12.0),
+        .gap(3.0),
     ))
-    .gap(4.0)
+    .gap(space::S)
+}
+
+/// One route row. Named "Open …" for anything that cannot see the chevron.
+///
+/// The ink is the same ink in every state, faded when the route cannot be
+/// opened — unavailable means dimmer, not a different grey — and the tick and
+/// chevron dim by the same amount, so the whole row goes quiet as one thing.
+fn route(name: &str, host: &str, up: bool, open: fn(&mut Panel)) -> El<Panel> {
+    hud::glass_row((
+        hud::reactor_tick(up),
+        text(name).color(hud::ink(style::INK, up)),
+        spacer().grow(),
+        code(host).color(hud::ink(style::MUTED, up)),
+        hud::chevron(up),
+    ))
+    .reactive()
+    .role(Role::Button)
+    .label(format!("Open {name}"))
+    .disabled(!up)
+    .on_click(open)
+}
+
+/// The readout strip: bytes each way and how long the link has been up, in
+/// three hairline-separated glass cells that keep their places in every
+/// state. A value the window does not have yet is "—", never a number.
+fn readouts(link: &Link) -> El<Panel> {
+    let uptime = match link.since {
+        Some(since) => duration(since.elapsed()),
+        None => "—".into(),
+    };
+    row((
+        hud::readout("SENT", bytes(link.tx)),
+        hud::seam(),
+        hud::readout("RECEIVED", bytes(link.rx)),
+        hud::seam(),
+        hud::readout("UPTIME", uptime),
+    ))
+    .h(space::STRIP_HEIGHT)
+    .fill(Tone::Exact(style::GLASS))
+    .border(1.0, Tone::Exact(style::EDGE.fade(0.22)))
+    .round(rui::style::Radius::Cut(6.0))
+    .clip()
 }
 
 /// The keys panel: which identities are live, when they last rotated, the
-/// rotate control, and the automatic-rotation switch.
+/// rotate control, and the weekly-rotation switch.
 fn keys_panel(activity: &Activity, auto: bool) -> El<Panel> {
     let client = activity.client.as_ref().map(|id| id.fingerprint.clone()).unwrap_or_else(|| "—".into());
     let server = activity.server.as_ref().map(|id| id.fingerprint.clone()).unwrap_or_else(|| "—".into());
@@ -765,30 +873,36 @@ fn keys_panel(activity: &Activity, auto: bool) -> El<Panel> {
 
     hud::glass_panel(col((
         section("KEYS", Some("ed25519".into())),
-        field_row("CLIENT", code(client).color(Tone::Text)),
-        field_row("SERVER", code(server).color(Tone::Text)),
-        field_row("ROTATED", rotated_reading(activity.last_rotation.as_deref())),
+        col((
+            field_row("CLIENT", code(client).color(Tone::Text)),
+            field_row("SERVER", code(server).color(Tone::Text)),
+            field_row("ROTATED", rotated_reading(activity.last_rotation.as_deref())),
+        ))
+        .gap(2.0)
+        // Held at three rows' height, so a short window cannot fold a row.
+        .min_h(3.0 * space::FIELD_HEIGHT + 4.0),
         row((
             button("Rotate now")
                 .disabled(busy)
                 .on_click(|panel: &mut Panel| {
                     actions::rotate(panel.activity_handle());
                 })
-                .h(28.0),
+                .h(26.0),
             spacer().grow(),
-            micro("AUTO").color(Tone::Muted).tracking(1.5),
+            caption("Auto-rotate weekly"),
             switch(auto),
         ))
-        .gap(6.0)
+        .gap(space::S)
+        .min_h(26.0)
         .align(rui::Align::Center),
-        micro("Session keys rotate every connection; the identity key weekly.").color(Tone::Muted),
     ))
-    .gap(10.0))
+    .gap(6.0))
     .align(rui::Align::Stretch)
 }
 
-/// The ROTATED reading: the age up front in human units, amber once the weekly
-/// deadline nears, with the raw record demoted to a dim line beside it.
+/// The ROTATED reading: the age up front in human units, with the raw record
+/// demoted to a dim line beside it. Amber only with its cause on screen: once
+/// the weekly rotation is overdue the reading says so, in the same breath.
 fn rotated_reading(raw: Option<&str>) -> El<Panel> {
     let Some(raw) = raw else {
         return caption("not yet").color(Tone::Muted);
@@ -799,15 +913,15 @@ fn rotated_reading(raw: Option<&str>) -> El<Panel> {
         .unwrap_or(0);
     match keys::parse_epoch(raw) {
         Some(then) => {
-            let tone =
-                if keys::rotation_stale(then, now) { Tone::ink(Status::Warn) } else { Tone::Text };
-            row((
-                caption(keys::rotation_age(then, now)).color(tone),
-                micro(raw.to_string()).color(Tone::Idle),
-                spacer().grow(),
-            ))
-            .gap(8.0)
-            .align(rui::Align::Center)
+            let age = keys::rotation_age(then, now);
+            let (reading, tone) = if keys::rotation_stale(then, now) {
+                (format!("{age} · overdue"), Tone::ink(Status::Warn))
+            } else {
+                (age, Tone::Text)
+            };
+            row((caption(reading).color(tone), micro(raw.to_string()).color(Tone::Idle), spacer().grow()))
+                .gap(space::S)
+                .align(rui::Align::Center)
         }
         None => caption(raw.to_string()).color(Tone::Muted),
     }
@@ -818,12 +932,14 @@ fn rotated_reading(raw: Option<&str>) -> El<Panel> {
 /// `on` is read by the view and captured here, because a custom-drawn element
 /// cannot reach the application state itself; the click flips the real flag.
 fn switch(on: bool) -> El<Panel> {
-    rui::draw(Size::new(38.0, 18.0), move |painter, rect| hud::paint_switch(painter, rect, on))
-        .w(38.0)
-        .h(18.0)
-        .role(rui::Role::Button)
-        .selected(on)
-        .label("Automatic key rotation")
+    rui::draw(Size::new(space::SWITCH_WIDTH, space::SWITCH_HEIGHT), move |painter, rect| {
+        hud::paint_switch(painter, rect, on)
+    })
+    .w(space::SWITCH_WIDTH)
+    .h(space::SWITCH_HEIGHT)
+    .role(rui::Role::Button)
+    .selected(on)
+    .label("Auto-rotate weekly")
     .on_click(|panel: &mut Panel| {
         let now = !panel.auto_rotate.load(Ordering::Relaxed);
         panel.auto_rotate.store(now, Ordering::Relaxed);
@@ -831,7 +947,8 @@ fn switch(on: bool) -> El<Panel> {
 }
 
 /// The footer: what an action is doing, or what it last said. Blank when idle —
-/// the console button carries its own "connect first" hint.
+/// the routes section carries its own note. One line is reserved in every
+/// state, so a notice arriving never shifts the window.
 fn footer(activity: &Activity) -> El<Panel> {
     let line = if let Some(busy) = &activity.busy {
         micro(format!("• {busy}")).color(Tone::ink(Status::Warn))
@@ -841,7 +958,7 @@ fn footer(activity: &Activity) -> El<Panel> {
     } else {
         micro(String::new()).color(Tone::Muted)
     };
-    row((line, spacer().grow())).h(16.0)
+    row((line, spacer().grow())).h(space::FOOTER_HEIGHT)
 }
 
 // ----- small formatting helpers -------------------------------------------
@@ -856,7 +973,8 @@ fn status_of(link: &Link) -> Status {
     }
 }
 
-/// The state word shown in the masthead and the status tag.
+/// The state word in capitals, as the masthead, the tray and the mini panel
+/// show it.
 fn state_word(link: &Link) -> &'static str {
     match link.phase {
         Phase::Off => "OFFLINE",
@@ -864,6 +982,43 @@ fn state_word(link: &Link) -> &'static str {
         Phase::Authenticated => "AUTHENTICATED",
         Phase::Up => "CONNECTED",
         Phase::Failed(_) => "FAILED",
+    }
+}
+
+/// The state word as the instrument sets it: one word, sentence case, large.
+fn state_title(link: &Link) -> &'static str {
+    match link.phase {
+        Phase::Off => "Offline",
+        Phase::Dialling => "Dialling",
+        Phase::Authenticated => "Authenticated",
+        Phase::Up => "Connected",
+        Phase::Failed(_) => "Failed",
+    }
+}
+
+/// The line under the state word: what the state means, in plain words. It
+/// does not repeat the word above it — the word says *what*, the endpoint
+/// says *where*, and this line says what is happening about it. A failure's
+/// own reason is the line, with the one word that explains why the control
+/// under it says Cancel: the supervisor is still retrying (see
+/// [`Phase::is_wanted`]).
+fn explanation(link: &Link) -> String {
+    match &link.phase {
+        Phase::Off => "Not connected".into(),
+        Phase::Dialling => "Reaching the box…".into(),
+        Phase::Authenticated => "Box verified — bringing the tunnel up…".into(),
+        Phase::Up => "Secure tunnel to the box".into(),
+        Phase::Failed(reason) => format!("{reason} · retrying"),
+    }
+}
+
+/// The explanation's ink: muted prose, except a failure's reason, which is
+/// red — the one line in the window that is a cause, set in the colour of
+/// the state it explains.
+fn explanation_tone(link: &Link) -> Tone {
+    match link.phase {
+        Phase::Failed(_) => Tone::ink(Status::Bad),
+        _ => Tone::Muted,
     }
 }
 
@@ -919,5 +1074,220 @@ mod tests {
         assert_eq!(duration(std::time::Duration::from_secs(9)), "9s");
         assert_eq!(duration(std::time::Duration::from_secs(125)), "2m 05s");
         assert_eq!(duration(std::time::Duration::from_secs(7800)), "2h 10m");
+    }
+
+    #[test]
+    fn every_way_of_naming_the_primary_control_agrees() {
+        // The window, the mini panel and the tray all take their word from
+        // one function, and that function follows the tunnel's own idea of
+        // "wanted": Failed is a tunnel still being tried, so it offers Cancel.
+        assert_eq!(primary_label(&Link::default()), "Connect");
+        assert_eq!(primary_label(&Link { phase: Phase::Dialling, ..Link::default() }), "Cancel");
+        assert_eq!(primary_label(&Link { phase: Phase::Authenticated, ..Link::default() }), "Cancel");
+        assert_eq!(primary_label(&Link { phase: Phase::Failed("x".into()), ..Link::default() }), "Cancel");
+        assert_eq!(primary_label(&Link { phase: Phase::Up, ..Link::default() }), "Disconnect");
+    }
+
+    // -----------------------------------------------------------------------
+    // The window, driven through a real frame
+    // -----------------------------------------------------------------------
+
+    use rui::testing::Harness;
+
+    /// The window's default size and the smallest it may be resized to, as
+    /// `Panel::run` sets them. Every frame test runs at both, because a label
+    /// that fits at 430 units is not a label that fits.
+    const SIZES: [(f32, f32); 2] = [(WINDOW_WIDTH, WINDOW_HEIGHT), (MIN_WIDTH, MIN_HEIGHT)];
+
+    /// The five phases the window is ever in, named so a failure says which.
+    fn states() -> Vec<(&'static str, Link)> {
+        vec![
+            ("offline", Link::default()),
+            ("dialling", Link { phase: Phase::Dialling, ..Link::default() }),
+            ("authenticated", Link { phase: Phase::Authenticated, ..Link::default() }),
+            (
+                "connected",
+                Link {
+                    phase: Phase::Up,
+                    since: std::time::Instant::now().checked_sub(std::time::Duration::from_secs(384)),
+                    tx: 51_314,
+                    rx: 1_283_004,
+                    ..Link::default()
+                },
+            ),
+            ("failed", Link { phase: Phase::Failed("Connection refused".into()), ..Link::default() }),
+        ]
+    }
+
+    /// One of [`states`], by name.
+    fn state(name: &str) -> Link {
+        states().into_iter().find(|(n, _)| *n == name).map(|(_, link)| link).expect("a named state")
+    }
+
+    /// A harness on the window as it is actually built — its own theme and
+    /// ground — rather than the same tree under the library's defaults.
+    fn window(link: Link, (width, height): (f32, f32)) -> Harness<Panel> {
+        Harness::with_app(application("SelfHost VPN", Panel::demo(link))).size(width, height)
+    }
+
+    #[test]
+    fn every_state_is_reachable_named_and_ordered() {
+        for (name, link) in states() {
+            for size in SIZES {
+                println!("auditing {name} at {size:?}");
+                let mut harness = window(link.clone(), size);
+                harness.assert_accessible();
+                harness.assert_tab_order();
+            }
+        }
+    }
+
+    #[test]
+    fn the_primary_control_never_moves_between_states() {
+        // The one control the window is for keeps its place and its size
+        // whatever the tunnel is doing, so a hand that has learned where it
+        // is finds it there whether it now says Connect, Cancel or Disconnect.
+        for size in SIZES {
+            let mut rects = Vec::new();
+            for (name, link) in states() {
+                let label = primary_label(&link);
+                let mut harness = window(link, size);
+                harness.frame();
+                let rect = harness.rect_of(label).unwrap_or_else(|| panic!("{name} draws no {label}"));
+                rects.push((name, rect));
+            }
+            let (first, reference) = rects[0];
+            for (name, rect) in &rects[1..] {
+                assert_eq!(
+                    (rect.x, rect.y, rect.w, rect.h),
+                    (reference.x, reference.y, reference.w, reference.h),
+                    "at {size:?} the primary control moved between {first} and {name}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_failure_says_why_and_offers_cancel() {
+        for size in SIZES {
+            let mut harness = window(state("failed"), size);
+            harness.frame();
+            assert!(harness.shows("Failed"), "the state word");
+            assert!(harness.shows("Connection refused · retrying"), "and the reason under it, with why Cancel");
+            assert!(harness.shows("Cancel"), "the primary control is Cancel");
+            assert!(!harness.shows("Connect"), "and not a Connect that does nothing");
+            assert!(harness.shows("available once connected"), "the routes carry one shared note");
+        }
+    }
+
+    #[test]
+    fn the_instrument_carries_the_endpoint_and_the_captions_in_every_state() {
+        for (name, link) in states() {
+            let mut harness = window(link, SIZES[1]);
+            harness.frame();
+            assert!(harness.shows("rockywearsahat.com:8443"), "{name} shows the endpoint");
+            assert!(harness.shows("THIS MAC"), "{name} keeps the near caption");
+            assert!(harness.shows("THE BOX"), "{name} keeps the far caption");
+            assert!(harness.shows("Auto-rotate weekly"), "{name} names the switch in plain words");
+        }
+        let mut harness = window(state("connected"), SIZES[0]);
+        harness.frame();
+        assert!(harness.shows("through the tunnel"));
+        assert!(!harness.shows("available once connected"));
+    }
+
+    #[test]
+    fn every_route_and_key_control_is_drawn_in_every_state() {
+        // Rows reserve their slots: a route that cannot be opened is dimmed,
+        // not gone, so the list is the same list in every state.
+        for (name, link) in states() {
+            let mut harness = window(link, SIZES[1]);
+            harness.frame();
+            for label in ["Admin Console", "SARA", "AI Studio", CONSOLE_HOST, SARA_HOST, AI_HOST, "Rotate now", "ROUTES", "KEYS"] {
+                assert!(harness.shows(label), "{name} at the smallest window draws {label}");
+            }
+            for label in ["SENT", "RECEIVED", "UPTIME", "CLIENT", "SERVER", "ROTATED"] {
+                assert!(harness.shows(label), "{name} at the smallest window draws {label}");
+            }
+        }
+    }
+
+    #[test]
+    fn nothing_is_drawn_outside_the_window_at_its_smallest() {
+        // Every probe on every state, at the minimum size, sits inside the
+        // page margin — a label that only fits because a longer neighbour
+        // happened to be short at 430 units is caught here.
+        let (width, height) = SIZES[1];
+        for (name, link) in states() {
+            let mut harness = window(link, (width, height));
+            harness.frame();
+            for probe in harness.probes() {
+                if probe.rect.w >= width {
+                    continue;
+                }
+                assert!(
+                    probe.rect.x + probe.rect.w <= width - space::L + 0.5,
+                    "{name} draws {:?} into the right margin: {:?}",
+                    probe.text,
+                    probe.rect
+                );
+                assert!(
+                    probe.rect.y + probe.rect.h <= height + 0.5,
+                    "{name} draws {:?} below the window: {:?}",
+                    probe.text,
+                    probe.rect
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn no_two_labels_collide_at_the_smallest_window() {
+        // A window shorter than its content takes the missing height off
+        // content-sized blocks, and two labels end up drawn through each
+        // other — which the margin test above cannot see, since both are
+        // still inside the page.
+        for (name, link) in states() {
+            let mut harness = window(link, SIZES[1]);
+            harness.frame();
+            let labels: Vec<(String, rui::Rect)> = harness
+                .probes()
+                .iter()
+                .filter_map(|probe| {
+                    let text = probe.text.as_deref()?.trim();
+                    (!text.is_empty()).then(|| (text.to_string(), probe.rect))
+                })
+                .collect();
+            for (i, (a, ra)) in labels.iter().enumerate() {
+                for (b, rb) in &labels[i + 1..] {
+                    let apart = ra.x + ra.w <= rb.x
+                        || rb.x + rb.w <= ra.x
+                        || ra.y + ra.h <= rb.y
+                        || rb.y + rb.h <= ra.y;
+                    assert!(apart, "{name} at the smallest window draws {a:?} through {b:?}: {ra:?} vs {rb:?}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn the_hero_is_the_block_that_grows() {
+        // The instrument is taller at the default size than at the smallest,
+        // and everything under it keeps its own height: the extra room the
+        // window has goes to the hero and nowhere else.
+        let mut small = window(state("connected"), SIZES[1]);
+        small.frame();
+        let mut large = window(state("connected"), SIZES[0]);
+        large.frame();
+        let routes_small = small.rect_of("ROUTES").expect("routes");
+        let routes_large = large.rect_of("ROUTES").expect("routes");
+        let keys_small = small.rect_of("KEYS").expect("keys");
+        let keys_large = large.rect_of("KEYS").expect("keys");
+        let grew = routes_large.y - routes_small.y;
+        assert!(grew > 20.0, "the hero took the window's extra height ({grew})");
+        assert!(
+            ((keys_large.y - routes_large.y) - (keys_small.y - routes_small.y)).abs() < 0.5,
+            "the blocks under the hero kept their spacing"
+        );
     }
 }
