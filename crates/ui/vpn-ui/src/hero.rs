@@ -1,14 +1,13 @@
 //! The panel's one bold instrument: the tunnel drawn as an energy conduit
 //! between two arc-reactor nodes.
 //!
-//! It is the whole status at a glance, and moves only while reaching — a
-//! settled state (dormant, up, failed) costs nothing to sit in. Each end is
+//! It is the whole status at a glance and the only thing that moves. Each end is
 //! a reactor — concentric rings, a spinning tick collar, a radiant core — and
 //! the link between them is a beam that carries luminous packets from this
 //! machine to the box. Dormant, the reactors are cold and the beam is dim.
-//! Reaching, packets stream amber and the collars spin. Up, everything holds
-//! steady cyan. Failed, the beam ruptures. Every mark is a sculpted
-//! signed-distance shape lit with additive glow — not a box with flags.
+//! Reaching, packets stream amber. Up, everything runs cyan and the cores
+//! breathe. Failed, the beam ruptures. Every mark is a sculpted signed-distance
+//! shape lit with additive glow — not a box with flags.
 
 use crate::style::{self, CYAN_BRIGHT};
 use crate::tunnel::{Link, Phase};
@@ -46,7 +45,7 @@ enum Motion {
     Off,
     /// Dialling/authenticating — amber packets seeking the box.
     Reaching,
-    /// Up — full cyan, steady (not animated: see [`paint`]'s `reaching`).
+    /// Up — full cyan flow, cores breathing.
     Up,
     /// Broken — a red, ruptured beam.
     Failed,
@@ -92,22 +91,19 @@ impl Motion {
 fn paint(painter: &mut Painter<'_>, rect: rui::Rect, motion: Motion) {
     let color = style::hue(motion.hue());
     let charge = motion.charge();
-    // Only Reaching animates. A phase requested is a frame requested — and on
-    // this renderer a frame requested is a full relayout and repaint of the
-    // *whole* window, continuously, for as long as anything asks for one (see
-    // Surface::draw in rui's shell/mod.rs): measured at a real, sustained
-    // double-digit percent of a CPU core, just for a purely decorative
-    // breathing glow on an otherwise idle, already-connected window. Off,
-    // Up, and Failed are all settled states with nothing actually happening,
-    // so none of them ask for a phase and the window goes fully idle the
-    // instant it reaches one. Reaching is the one state where continuous
-    // motion earns its cost: it is transient (a connection attempt resolves
-    // in seconds) and the motion itself is the useful information — "still
-    // working," not merely decorative.
-    let reaching = matches!(motion, Motion::Reaching);
-    let breath = 1.0;
-    let spin = if reaching { painter.phase("spin", 9.0) } else { 0.0 };
-    let flow = if reaching { painter.phase("flow", 1.6) } else { 0.0 };
+    // Up breathes; everything else holds steady. Off asks for no phases at all:
+    // a phase requested is a frame requested, and a dormant window draws none.
+    //
+    // A phase requested is also, on this renderer, a full relayout-and-paint of
+    // the whole window every frame for as long as it runs (see Surface::draw
+    // in rui's shell/mod.rs) — real, measured CPU. The animation cadence
+    // itself is tuned down for exactly that reason (see the App builder in
+    // app.rs's Panel::run: animation_interval, idle_timeout), rather than by
+    // cutting the motion someone is actually looking at. A window that is not
+    // visible does not pay this at all — rui skips the redraw entirely then.
+    let breath = if matches!(motion, Motion::Up) { 0.7 + 0.3 * wave(painter.phase("breath", 3.4)) } else { 1.0 };
+    let spin = if matches!(motion, Motion::Off) { 0.0 } else { painter.phase("spin", 9.0) };
+    let flow = if matches!(motion, Motion::Up | Motion::Reaching) { painter.phase("flow", 1.6) } else { 0.0 };
 
     let mid = rect.y + rect.h * 0.48;
     let inset = 34.0;
@@ -201,5 +197,10 @@ fn conduit(painter: &mut Painter<'_>, a: Point, b: Point, color: rui::Color, cha
         painter.sculpt(&circle(p, 2.6), &solid(CYAN_BRIGHT), Sculpt::Fill);
         painter.sculpt(&circle(p, 2.6), &solid(color), Sculpt::Glow { radius: 7.0, intensity: 0.95 });
     }
+}
+
+/// A 0..1 breathing curve from a 0..1 looping phase.
+fn wave(phase: f32) -> f32 {
+    (phase * TAU).sin() * 0.5 + 0.5
 }
 
