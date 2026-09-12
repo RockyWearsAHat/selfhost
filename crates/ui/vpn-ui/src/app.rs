@@ -162,18 +162,17 @@ fn status_rgb(link: &Link) -> (f32, f32, f32) {
 /// Asks, via a native dialog, whether the user really wants to quit — quitting
 /// tears the tunnel down, unlike the old detach-and-leave-it-running Quit.
 /// Returns `true` only if the user picked the destructive button.
+///
+/// A real `NSAlert` (see [`crate::macos_native::confirm_quit_native`]) rather
+/// than `osascript -e 'display dialog ...'`: the old call needed nothing from
+/// the system beyond drawing a window either, but any `osascript` failure —
+/// including one this app never diagnosed — read as `Ok(status) if
+/// status.success()` being false, which this function silently treated as
+/// "Cancel". That is exactly the reported "Quit does nothing".
 fn confirm_quit() -> bool {
     #[cfg(target_os = "macos")]
     {
-        let status = std::process::Command::new("osascript")
-            .arg("-e")
-            .arg(
-                "display dialog \"Quitting will disconnect the tunnel and end your VPN session.\" \
-                 with title \"Quit SelfHost VPN\" buttons {\"Cancel\", \"Quit\"} \
-                 default button \"Cancel\" cancel button \"Cancel\" with icon caution",
-            )
-            .status();
-        return matches!(status, Ok(status) if status.success());
+        crate::macos_native::confirm_quit_native()
     }
     #[cfg(not(target_os = "macos"))]
     {
@@ -324,27 +323,35 @@ impl Panel {
         }
     }
 
-    /// Hide the main window using AppleScript (via osascript).
-    fn hide_window(&self) {
+    /// Hide the main window: a direct AppKit call, not a shell-out.
+    ///
+    /// Used to run `osascript -e 'tell application "System Events" ...'`,
+    /// which needs Automation permission this app has likely never been
+    /// granted — a permission prompt the button should never need at all,
+    /// since this is the app's own window, in its own process.
+    /// [`crate::macos_native::set_main_window_visible`] asks `NSApplication`
+    /// directly instead.
+    fn hide_window(&self, title: &str) {
         #[cfg(target_os = "macos")]
         {
-            // Use osascript to hide the window - more reliable than raw Objective-C
-            let _ = std::process::Command::new("osascript")
-                .arg("-e")
-                .arg("tell application \"System Events\" to tell process \"selfhost-vpn-ui\" to set visible to false")
-                .output();
+            crate::macos_native::set_main_window_visible(title, false);
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = title;
         }
     }
 
-    /// Show the main window using AppleScript (via osascript).
-    fn show_window(&self) {
+    /// Show the main window: a direct AppKit call, not a shell-out. See
+    /// [`Panel::hide_window`].
+    fn show_window(&self, title: &str) {
         #[cfg(target_os = "macos")]
         {
-            // Use osascript to show the window - more reliable than raw Objective-C
-            let _ = std::process::Command::new("osascript")
-                .arg("-e")
-                .arg("tell application \"System Events\" to tell process \"selfhost-vpn-ui\" to set visible to true")
-                .output();
+            crate::macos_native::set_main_window_visible(title, true);
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = title;
         }
     }
 
@@ -532,12 +539,16 @@ impl Panel {
     /// Opens the window and runs it until it is closed.
     pub fn run(self, title: String) -> Result<(), rui::Error> {
         let running = Arc::clone(&self.running);
+        // Cloned before `title` moves into `application(title, self)` below;
+        // the window's title is how hide/show finds the right `NSWindow`
+        // among `NSApplication.windows` (see `macos_native::set_main_window_visible`).
+        let frame_title = title.clone();
 
         // on_frame callback: drain and dispatch tray events each frame before rendering.
         // The tray is created on the first frame when the pump loop is active.
         // Also applies window visibility changes when the window_visible flag changes,
         // and manages the panel window lifecycle.
-        let on_frame = |panel: &mut Panel| {
+        let on_frame = move |panel: &mut Panel| {
             panel.drain_tray_events();
             panel.drain_mini_actions();
             // Not panel.update_tray_menu() here: that rebuilds the tray's real
@@ -551,9 +562,9 @@ impl Panel {
             // Apply window visibility changes
             if panel.window_visible != panel.previous_visible {
                 if panel.window_visible {
-                    panel.show_window();
+                    panel.show_window(&frame_title);
                 } else {
-                    panel.hide_window();
+                    panel.hide_window(&frame_title);
                 }
                 panel.previous_visible = panel.window_visible;
             }
