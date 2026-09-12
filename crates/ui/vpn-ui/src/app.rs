@@ -586,15 +586,20 @@ impl Panel {
             // icon and the tunnel it supervises must survive it. Only a
             // confirmed Quit (see quit_with_confirmation) clears `running`.
             .close_hides(true)
-            // 10fps (100ms) looked visibly stuttery for motion this
-            // continuous (a breathing glow, a spinning collar) — the eye
-            // notices well before "changes over whole seconds" stops being
-            // true. 33ms (~30fps) is smooth; the real CPU win here is not
-            // this number, it's hero.rs only asking for a phase at all while
-            // Up/Reaching, and rui skipping the redraw entirely while the
-            // window is hidden — both unaffected by how smooth this looks
-            // while someone is actually watching it.
-            .animation_interval(std::time::Duration::from_millis(33))
+            // Measured (not guessed): this renderer rebuilds and repaints the
+            // *entire* window from scratch on every animated frame — there is
+            // no dirty-rect or per-element cache, so "smooth" and "cheap" are
+            // in direct, physical tension here, and no interval alone gets
+            // both. 16ms asks for a real 60fps; actual measured cadence comes
+            // in a bit under that (scheduling/pump overhead), which is smooth
+            // enough to not read as choppy. It costs more CPU while the
+            // window is open and something is actually animating (Up,
+            // Reaching) than a slower interval would — that cost is real and
+            // was traded for here on purpose, in favor of not looking broken.
+            // Everything else already found stays free regardless of this
+            // number: a hidden window draws nothing, and Off/Failed still
+            // animate nothing at all.
+            .animation_interval(std::time::Duration::from_millis(16))
             // This is what governs how promptly a background-thread change
             // (the tunnel's Activity, the UP duration's own clock) reaches the
             // screen when nothing else is asking for a frame — every idle_due
