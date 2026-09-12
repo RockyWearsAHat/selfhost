@@ -586,20 +586,12 @@ impl Panel {
             // icon and the tunnel it supervises must survive it. Only a
             // confirmed Quit (see quit_with_confirmation) clears `running`.
             .close_hides(true)
-            // Measured (not guessed): this renderer rebuilds and repaints the
-            // *entire* window from scratch on every animated frame — there is
-            // no dirty-rect or per-element cache, so "smooth" and "cheap" are
-            // in direct, physical tension here, and no interval alone gets
-            // both. 16ms asks for a real 60fps; actual measured cadence comes
-            // in a bit under that (scheduling/pump overhead), which is smooth
-            // enough to not read as choppy. It costs more CPU while the
-            // window is open and something is actually animating (Up,
-            // Reaching) than a slower interval would — that cost is real and
-            // was traded for here on purpose, in favor of not looking broken.
-            // Everything else already found stays free regardless of this
-            // number: a hidden window draws nothing, and Off/Failed still
-            // animate nothing at all.
-            .animation_interval(std::time::Duration::from_millis(16))
+            // rui's animated frames now replay only the hero's own small
+            // canvas (see its fast path: App::has_animated_draws /
+            // Surface::draw) instead of repainting the whole window, so this
+            // is a genuine smoothness dial rather than a CPU one — a real
+            // 120fps ask, not a compromise against cost.
+            .animation_fps(120)
             // This is what governs how promptly a background-thread change
             // (the tunnel's Activity, the UP duration's own clock) reaches the
             // screen when nothing else is asking for a frame — every idle_due
