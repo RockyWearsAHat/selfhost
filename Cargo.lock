@@ -453,7 +453,7 @@ dependencies = [
 [[package]]
 name = "rui-native"
 version = "0.1.0"
-source = "git+https://github.com/RockyWearsAHat/rui.git?rev=6cf242f74deec21f3e01187976ab4b563ce9b646#6cf242f74deec21f3e01187976ab4b563ce9b646"
+source = "git+https://github.com/RockyWearsAHat/rui.git?rev=5730871d0eae38fd9d2dd58ffd287414308692f1#5730871d0eae38fd9d2dd58ffd287414308692f1"
 dependencies = [
  "js-sys",
  "wasm-bindgen",
