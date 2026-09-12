@@ -79,10 +79,10 @@ impl Motion {
     /// How energised the reactors are, 0..1 — drives glow and core brightness.
     fn charge(self) -> f32 {
         match self {
-            Motion::Off => 0.12,
-            Motion::Reaching => 0.7,
+            Motion::Off => 0.08,
+            Motion::Reaching => 0.75,
             Motion::Up => 1.0,
-            Motion::Failed => 0.35,
+            Motion::Failed => 0.42,
         }
     }
 }
@@ -118,9 +118,23 @@ fn paint(painter: &mut Painter<'_>, rect: rui::Rect, motion: Motion) {
     reactor(painter, right, r, color, charge * breath, -spin, motion);
 }
 
-/// One arc-reactor: outer ring, inner ring, a spinning tick collar, a radiant
-/// core, all lit additively in proportion to `charge`.
+/// One arc-reactor: an outer halo, an outer ring, a spinning tick collar, an
+/// inner ring turning the other way, and a radiant core with a specular
+/// glint — all lit additively in proportion to `charge`.
 fn reactor(painter: &mut Painter<'_>, c: Point, r: f32, color: rui::Color, charge: f32, spin: f32, motion: Motion) {
+    // A faint outer halo of long dashes, contra-rotating slowly at half rate —
+    // the "outermost gear" that reads as depth behind the main ring, at the
+    // cost of no new phase (it rides the existing `spin`).
+    let halo = r * 1.22;
+    let halo_ticks = 8;
+    for i in 0..halo_ticks {
+        let ang = spin * -0.5 * TAU + (i as f32 / halo_ticks as f32) * TAU;
+        let (dx, dy) = (ang.cos(), ang.sin());
+        let inner = Point::new(c.x + dx * (halo - 2.0), c.y + dy * (halo - 2.0));
+        let outer = Point::new(c.x + dx * (halo + 2.0), c.y + dy * (halo + 2.0));
+        painter.sculpt(&capsule(inner, outer, 0.9), &solid(color.fade(0.12 + 0.28 * charge)), Sculpt::Fill);
+    }
+
     // Outer ring — always drawn, brighter with charge.
     painter.sculpt(&ring(c, r, 1.4), &solid(color.fade(0.35 + 0.55 * charge)), Sculpt::Stroke { width: 1.4 });
     if charge > 0.2 {
@@ -129,24 +143,34 @@ fn reactor(painter: &mut Painter<'_>, c: Point, r: f32, color: rui::Color, charg
     // Inner ring.
     painter.sculpt(&ring(c, r * 0.60, 1.0), &solid(color.fade(0.25 + 0.5 * charge)), Sculpt::Stroke { width: 1.0 });
 
-    // Spinning tick collar — twelve short radial bars turning with `spin`.
+    // Spinning tick collar — twelve short radial bars turning with `spin`,
+    // every third one brighter so the collar reads as machined, not uniform.
     let ticks = 12;
     let collar = r * 0.82;
     for i in 0..ticks {
         let ang = spin * TAU + (i as f32 / ticks as f32) * TAU;
         let (dx, dy) = (ang.cos(), ang.sin());
-        let inner = Point::new(c.x + dx * (collar - 2.5), c.y + dy * (collar - 2.5));
-        let outer = Point::new(c.x + dx * (collar + 2.5), c.y + dy * (collar + 2.5));
-        let lit = if matches!(motion, Motion::Off) { 0.3 } else { 0.4 + 0.6 * charge };
-        painter.sculpt(&capsule(inner, outer, 1.1), &solid(color.fade(lit)), Sculpt::Fill);
+        let accent = i % 3 == 0;
+        let len = if accent { 3.2 } else { 2.5 };
+        let inner = Point::new(c.x + dx * (collar - len), c.y + dy * (collar - len));
+        let outer = Point::new(c.x + dx * (collar + len), c.y + dy * (collar + len));
+        let base = if matches!(motion, Motion::Off) { 0.3 } else { 0.4 + 0.6 * charge };
+        let lit = if accent { (base * 1.3).min(1.0) } else { base };
+        painter.sculpt(&capsule(inner, outer, if accent { 1.3 } else { 1.0 }), &solid(color.fade(lit)), Sculpt::Fill);
     }
 
-    // The core — a radial well from white-hot to the hue, and its bloom.
+    // The core — a radial well from white-hot to the hue, its bloom, and a
+    // small off-centre specular glint so it reads as a lit sphere rather
+    // than a flat disc. The glint is a fixed offset (no extra phase).
     let core_r = r * 0.34;
     let hot = CYAN_BRIGHT.mix(color, 1.0 - charge);
     painter.sculpt(&circle(c, core_r), &radial(c, 0.0, core_r, hot, color.fade(0.2)), Sculpt::Fill);
     if charge > 0.15 {
         painter.sculpt(&circle(c, core_r * 0.9), &solid(color), Sculpt::Glow { radius: 9.0 * charge, intensity: 0.75 * charge });
+    }
+    if charge > 0.3 {
+        let glint_c = Point::new(c.x - core_r * 0.32, c.y - core_r * 0.38);
+        painter.sculpt(&circle(glint_c, core_r * 0.24), &solid(CYAN_BRIGHT.fade(0.6 * charge)), Sculpt::Fill);
     }
 }
 
@@ -184,18 +208,31 @@ fn conduit(painter: &mut Painter<'_>, a: Point, b: Point, color: rui::Color, cha
         return;
     }
 
-    // Live beam: gradient core + additive bloom.
+    // Live beam: a slim hot core line under the broad gradient bloom, so the
+    // conduit reads as a taut wire of light rather than a soft bar.
     painter.sculpt(&capsule(a, b, 3.0), &linear(a, b, color.fade(0.45), color.fade(0.8)), Sculpt::Fill);
     painter.sculpt(&capsule(a, b, 3.0), &solid(color), Sculpt::Glow { radius: 7.0 * charge, intensity: 0.5 * charge });
+    painter.sculpt(&capsule(a, b, 1.0), &solid(CYAN_BRIGHT.fade(0.5 * charge)), Sculpt::Fill);
 
-    // Packets streaming from this machine to the box.
+    // Packets streaming from this machine to the box — four, at varying sizes
+    // and phase offsets so the flow reads as irregular traffic rather than a
+    // metronome, each dragging a short fading trail. All reuse the single
+    // `flow` phase already paid for; no extra animated element is added.
     let span = b.x - a.x;
-    for k in 0..3 {
-        let t = (flow + k as f32 / 3.0).fract();
+    let packets: [(f32, f32); 4] = [(0.00, 1.15), (0.27, 0.75), (0.52, 1.5), (0.78, 0.9)];
+    for (offset, scale) in packets {
+        let t = (flow + offset).fract();
         let x = a.x + span * t;
         let p = Point::new(x, a.y);
-        painter.sculpt(&circle(p, 2.6), &solid(CYAN_BRIGHT), Sculpt::Fill);
-        painter.sculpt(&circle(p, 2.6), &solid(color), Sculpt::Glow { radius: 7.0, intensity: 0.95 });
+        let rad = 2.6 * scale;
+
+        // A short trail behind the packet (toward `a`), fading with distance.
+        let trail_len = 9.0 * scale;
+        let tail = Point::new((x - trail_len).max(a.x), a.y);
+        painter.sculpt(&capsule(tail, p, rad * 0.55), &linear(tail, p, color.with_alpha(0), color.fade(0.55)), Sculpt::Fill);
+
+        painter.sculpt(&circle(p, rad), &solid(CYAN_BRIGHT), Sculpt::Fill);
+        painter.sculpt(&circle(p, rad), &solid(color), Sculpt::Glow { radius: 7.0 * scale, intensity: 0.95 });
     }
 }
 

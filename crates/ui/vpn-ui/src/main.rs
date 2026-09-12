@@ -20,6 +20,8 @@ mod dns;
 mod hero;
 mod hud;
 mod keys;
+#[cfg(target_os = "macos")]
+mod macos_native;
 mod style;
 mod tunnel;
 
