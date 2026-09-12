@@ -559,13 +559,21 @@ impl Panel {
             // icon and the tunnel it supervises must survive it. Only a
             // confirmed Quit (see quit_with_confirmation) clears `running`.
             .close_hides(true)
-            // The hero's only motion is ambient (a slow breathing glow, a
-            // gentle packet flow) — nothing here is a gesture being tracked,
-            // so the default 8ms/125fps animation cadence is pure waste. 50ms
-            // (20fps) is still visibly smooth for something that changes over
-            // multiple seconds, and is most of this app's idle CPU cost.
-            .animation_interval(std::time::Duration::from_millis(50))
-            .idle_timeout(std::time::Duration::from_millis(200))
+            // Reaching is the only state hero.rs still animates (see its
+            // paint()) — a brief, transient window where continuous motion is
+            // actually informative. Nothing here is a gesture being tracked,
+            // so the default 8ms/125fps cadence is pure waste; 100ms (10fps)
+            // is still smooth for something that changes over whole seconds.
+            .animation_interval(std::time::Duration::from_millis(100))
+            // This is what governs how promptly a background-thread change
+            // (the tunnel's Activity, the UP duration's own clock) reaches the
+            // screen when nothing else is asking for a frame — every idle_due
+            // tick draws one, whether or not anything actually changed, so it
+            // is this app's whole idle CPU floor once the hero has nothing to
+            // animate. A once-a-second "6m 04s" clock does not need better
+            // than one-second resolution; 900ms keeps it looking live without
+            // paying for a redraw it can't show anyone yet.
+            .idle_timeout(std::time::Duration::from_millis(900))
             .while_running(move |_| running.load(Ordering::Relaxed))
             .on_frame(on_frame)
             .run()
