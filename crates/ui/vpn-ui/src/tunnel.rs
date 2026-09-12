@@ -251,7 +251,10 @@ impl Drop for Tunnel {
 /// inherit a long backoff from whatever came before it woke.
 ///
 /// If `detach` is true, spawns the client in a new process session so it
-/// survives the parent's exit. If false, spawns it normally.
+/// survives this *process* dying unexpectedly (a crash, a force-quit) — not
+/// so it survives an intentional `disconnect()`/Quit from within the app,
+/// which always kills it regardless of `detach` (see the `!wanted` branch
+/// below).
 fn keep_open(python: &str, endpoint: &Endpoint, shared: &Arc<Mutex<Link>>, wanted: &Arc<AtomicBool>, detach: bool) {
     let mut failures = 0u32;
 
@@ -289,16 +292,29 @@ fn keep_open(python: &str, endpoint: &Endpoint, shared: &Arc<Mutex<Link>>, wante
         loop {
             if !wanted.load(Ordering::SeqCst) {
                 alive.store(false, Ordering::SeqCst);
-                // Only kill non-detached clients. Detached clients (when managed=true)
-                // must survive app exit for Feature 1 (tunnel persists after app quit).
-                if !detach {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                } else {
-                    // For detached clients, just abandon them. They run in their own
-                    // process session and will survive when the parent process exits.
-                    drop(child);
-                }
+                // Always kill on an intentional disconnect, detached or not.
+                //
+                // `detach` (a new process session via `setsid`) exists so the
+                // client survives this *process* dying unexpectedly — a crash,
+                // a force-quit from Activity Monitor — not so it survives a
+                // graceful disconnect the app asked for on purpose. Those are
+                // different questions, and conflating them here was a real,
+                // severe bug: for a detached (managed) tunnel, this used to
+                // `drop(child)` — abandoning the handle without killing the
+                // process — and then fall through to `handle.join()` on the
+                // stdout/stderr reader threads below, which block on their
+                // next `read()` until the pipe's write end closes. That write
+                // end is held by the client process, which this had just
+                // decided *not* to kill — so those reads had nothing to wake
+                // them until the still-running client happened to print
+                // another line on its own, which could be seconds or minutes
+                // away. That is the actual mechanism behind "Disconnect is
+                // laggy" and "Quit is laggy": both call this same path, and
+                // both were blocking the calling thread on a join that had no
+                // deterministic end. Killing the child first, unconditionally,
+                // is what makes the reader threads see EOF right away.
+                let _ = child.kill();
+                let _ = child.wait();
                 break;
             }
             match child.try_wait() {
@@ -306,7 +322,16 @@ fn keep_open(python: &str, endpoint: &Endpoint, shared: &Arc<Mutex<Link>>, wante
                     alive.store(false, Ordering::SeqCst);
                     break;
                 }
-                Ok(None) => std::thread::sleep(Duration::from_millis(200)),
+                // 20ms, not 200ms: this is also the poll granularity for
+                // noticing `disconnect()` was called (the `!wanted` check
+                // above runs at the top of every one of these iterations),
+                // and `Tunnel::disconnect()` blocks its caller — the UI
+                // thread — on this same loop's supervisor thread exiting.
+                // 200ms of that was a real, felt part of "Disconnect is
+                // laggy"; a cheap `try_wait()` syscall 50 times a second
+                // while a client is actively running costs nothing worth
+                // trading for a fifth of a second of a frozen button.
+                Ok(None) => std::thread::sleep(Duration::from_millis(20)),
                 Err(_) => {
                     alive.store(false, Ordering::SeqCst);
                     break;
@@ -344,10 +369,14 @@ fn keep_open(python: &str, endpoint: &Endpoint, shared: &Arc<Mutex<Link>>, wante
 ///
 /// Coarse polling rather than a condvar: this only ever waits a handful of
 /// seconds, and the tunnel's other threads are already built the same way.
+/// 20ms rather than 200ms for the same reason as the other poll in this
+/// file: `Tunnel::disconnect()`/`Cancel` blocks its caller (the UI thread) on
+/// this loop noticing `wanted` went false, so the poll granularity here is
+/// directly how laggy that button feels.
 fn sleep_while_wanted(duration: Duration, wanted: &Arc<AtomicBool>) {
     let deadline = Instant::now() + duration;
     while wanted.load(Ordering::SeqCst) && Instant::now() < deadline {
-        std::thread::sleep(Duration::from_millis(200).min(deadline - Instant::now()));
+        std::thread::sleep(Duration::from_millis(20).min(deadline - Instant::now()));
     }
 }
 
@@ -722,6 +751,55 @@ mod tests {
             std::thread::sleep(Duration::from_millis(20));
         }
         assert!(!alive(&pid), "disconnect must not leave the client running");
+
+        let _ = std::fs::remove_dir_all(pid_file.parent().expect("the scratch directory"));
+    }
+
+    /// The regression this session's actual bug was: a *detached* (managed)
+    /// client used to be left running on disconnect (`drop(child)` instead of
+    /// killing it), which then made the reader-thread `join()`s below block
+    /// on a pipe that would never see EOF — the real mechanism behind
+    /// "Disconnect is laggy" and "Quit is laggy", both of which call this
+    /// same path. Runs the whole disconnect on a timeout: without the fix,
+    /// this test does not merely assert a wrong answer, it hangs.
+    #[cfg(unix)]
+    #[test]
+    fn disconnecting_a_detached_client_still_kills_it_promptly() {
+        let (python, pid_file) = stub_client_that_stays("disconnect-detached");
+        let shared = Arc::new(Mutex::new(Link::default()));
+        let wanted = Arc::new(AtomicBool::new(true));
+        let endpoint = Endpoint::default();
+
+        let thread = {
+            let (shared, wanted) = (Arc::clone(&shared), Arc::clone(&wanted));
+            // `detach: true` — the managed/production path, not the `false`
+            // every other test in this file uses.
+            std::thread::spawn(move || keep_open(&python, &endpoint, &shared, &wanted, true))
+        };
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !pid_file.exists() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let pid = std::fs::read_to_string(&pid_file).expect("the stub wrote its pid");
+        let pid = pid.trim().to_owned();
+        assert!(alive(&pid), "the stub should be running");
+
+        let disconnect_started = Instant::now();
+        wanted.store(false, Ordering::SeqCst);
+        thread.join().expect("the supervisor thread should stop");
+        assert!(
+            disconnect_started.elapsed() < Duration::from_secs(2),
+            "disconnecting a detached client took {:?} — it should be near-instant, \
+             not bounded only by the client happening to print another line",
+            disconnect_started.elapsed()
+        );
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while alive(&pid) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(!alive(&pid), "disconnecting a detached client must still kill it");
 
         let _ = std::fs::remove_dir_all(pid_file.parent().expect("the scratch directory"));
     }
