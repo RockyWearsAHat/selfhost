@@ -63,26 +63,36 @@ const MINI_HEIGHT: f64 = 156.0;
 fn build_mini_panel(actions: Arc<Mutex<Vec<MiniAction>>>) -> Result<MiniPanel, String> {
     let options = PanelOptions::new(0.0, 0.0, MINI_WIDTH, MINI_HEIGHT);
     let window = PanelWindow::new(options).map_err(|e| format!("{e:?}"))?;
+    // The main window's own palette (style.rs), not a fresh guess — this is
+    // the same dark ground and cyan accent the full window uses, so the
+    // dropdown reads as the same app rather than a generic system panel.
+    let _ = window.style(VOID, 14.0, EDGE, 1.0);
+
     let pad = 14.0;
     let inner = MINI_WIDTH - pad * 2.0;
 
-    let _ = window.add_label(pad, MINI_HEIGHT - 30.0, inner - 14.0, 18.0, "SELFHOST VPN");
+    if let Ok(title) = window.add_label(pad, MINI_HEIGHT - 30.0, inner - 14.0, 18.0, "SELFHOST VPN") {
+        let _ = window.set_text_color(&title, INK);
+    }
     let status = window
         .add_label(pad, MINI_HEIGHT - 52.0, inner, 20.0, "OFFLINE")
         .map_err(|e| format!("{e:?}"))?;
-    let _ = window.set_text_color(&status, (0.55, 0.58, 0.63));
     let detail = window
         .add_label(pad, MINI_HEIGHT - 72.0, inner, 16.0, "rockywearsahat.com:8443")
         .map_err(|e| format!("{e:?}"))?;
-    let _ = window.set_text_color(&detail, (0.5, 0.5, 0.53));
+    let _ = window.set_text_color(&detail, MUTED);
 
     let primary = window
         .add_button(pad, 44.0, inner, 28.0, "Connect", 1)
         .map_err(|e| format!("{e:?}"))?;
+    let _ = window.set_button_tint(&primary, CYAN_DEEP, true);
     let half = (inner - 8.0) / 2.0;
-    let _ = window.add_button(pad, 12.0, half, 26.0, "Console", 2);
+    if let Ok(console) = window.add_button(pad, 12.0, half, 26.0, "Console", 2) {
+        let _ = window.set_button_tint(&console, EDGE, false);
+    }
     let quit =
         window.add_button(pad + half + 8.0, 12.0, half, 26.0, "Quit", 3).map_err(|e| format!("{e:?}"))?;
+    let _ = window.set_button_tint(&quit, RED, false);
 
     window
         .on_action(move |tag| {
@@ -93,8 +103,26 @@ fn build_mini_panel(actions: Arc<Mutex<Vec<MiniAction>>>) -> Result<MiniPanel, S
             }
         })
         .map_err(|e| format!("{e:?}"))?;
-    Ok(MiniPanel { window, status, detail, primary, quit, last_word: std::cell::Cell::new("") })
+    let mini = MiniPanel { window, status, detail, primary, quit, last_word: std::cell::Cell::new("") };
+    // The status label's own tint needs setting once outside refresh (which
+    // only runs on a state *change*, and a freshly built panel has none yet).
+    let _ = mini.window.set_text_color(&mini.status, SLATE);
+    Ok(mini)
 }
+
+/// The main window's own palette (`style.rs`), as plain sRGB — the mini
+/// panel's controls are native AppKit, not `rui` elements, so they take raw
+/// color rather than a `rui::Color`/`Tone`. Kept numerically identical to
+/// `style.rs` so the two surfaces never drift apart by feel.
+const VOID: (f32, f32, f32) = (0x04 as f32 / 255.0, 0x07 as f32 / 255.0, 0x0d as f32 / 255.0);
+const CYAN: (f32, f32, f32) = (0x3a as f32 / 255.0, 0xe1 as f32 / 255.0, 0xff as f32 / 255.0);
+const CYAN_DEEP: (f32, f32, f32) = (0x0b as f32 / 255.0, 0x4f as f32 / 255.0, 0x66 as f32 / 255.0);
+const AMBER: (f32, f32, f32) = (0xff as f32 / 255.0, 0xb4 as f32 / 255.0, 0x54 as f32 / 255.0);
+const RED: (f32, f32, f32) = (0xff as f32 / 255.0, 0x4d as f32 / 255.0, 0x5a as f32 / 255.0);
+const SLATE: (f32, f32, f32) = (0x54 as f32 / 255.0, 0x64 as f32 / 255.0, 0x72 as f32 / 255.0);
+const INK: (f32, f32, f32) = (0xe3 as f32 / 255.0, 0xf1 as f32 / 255.0, 0xf7 as f32 / 255.0);
+const MUTED: (f32, f32, f32) = (0x6d as f32 / 255.0, 0x84 as f32 / 255.0, 0x91 as f32 / 255.0);
+const EDGE: (f32, f32, f32) = (0x49 as f32 / 255.0, 0xc7 as f32 / 255.0, 0xe6 as f32 / 255.0);
 
 /// Redraws the mini panel's status line and primary button for the current
 /// link state.
@@ -121,14 +149,13 @@ fn refresh_mini_panel(mini: &MiniPanel, link: &Link) {
 }
 
 /// The status word's color, matching the main window's [`status_of`]/[`Tone`]
-/// mapping but as plain sRGB — the mini panel's labels are native AppKit
-/// controls, not `rui` elements, so they take raw color rather than a `Tone`.
+/// mapping (and [`hero::hue`]'s) but as plain sRGB.
 fn status_rgb(link: &Link) -> (f32, f32, f32) {
     match link.phase {
-        Phase::Off => (0.55, 0.58, 0.63),
-        Phase::Dialling | Phase::Authenticated => (0.85, 0.62, 0.2),
-        Phase::Up => (0.25, 0.75, 0.55),
-        Phase::Failed(_) => (0.88, 0.35, 0.35),
+        Phase::Off => SLATE,
+        Phase::Dialling | Phase::Authenticated => AMBER,
+        Phase::Up => CYAN,
+        Phase::Failed(_) => RED,
     }
 }
 
@@ -559,12 +586,15 @@ impl Panel {
             // icon and the tunnel it supervises must survive it. Only a
             // confirmed Quit (see quit_with_confirmation) clears `running`.
             .close_hides(true)
-            // Reaching is the only state hero.rs still animates (see its
-            // paint()) — a brief, transient window where continuous motion is
-            // actually informative. Nothing here is a gesture being tracked,
-            // so the default 8ms/125fps cadence is pure waste; 100ms (10fps)
-            // is still smooth for something that changes over whole seconds.
-            .animation_interval(std::time::Duration::from_millis(100))
+            // 10fps (100ms) looked visibly stuttery for motion this
+            // continuous (a breathing glow, a spinning collar) — the eye
+            // notices well before "changes over whole seconds" stops being
+            // true. 33ms (~30fps) is smooth; the real CPU win here is not
+            // this number, it's hero.rs only asking for a phase at all while
+            // Up/Reaching, and rui skipping the redraw entirely while the
+            // window is hidden — both unaffected by how smooth this looks
+            // while someone is actually watching it.
+            .animation_interval(std::time::Duration::from_millis(33))
             // This is what governs how promptly a background-thread change
             // (the tunnel's Activity, the UP duration's own clock) reaches the
             // screen when nothing else is asking for a frame — every idle_due
