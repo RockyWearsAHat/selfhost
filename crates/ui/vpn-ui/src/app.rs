@@ -436,7 +436,9 @@ impl Panel {
                     3 => actions::open_console(self.activity_handle()),
                     4 => actions::open_sara(self.activity_handle()),
                     5 => actions::open_ai_studio(self.activity_handle()),
-                    6 => self.quit_with_confirmation(),
+                    6 => {
+                        self.quit_with_confirmation();
+                    }
                     9999 => {
                         // Panel trigger: toggle panel visibility
                         eprintln!("TRAY: Panel trigger (id=9999) clicked");
@@ -449,18 +451,28 @@ impl Panel {
     }
 
     /// Warns that quitting ends the VPN session, and only on an explicit
-    /// "Quit" actually disconnects the tunnel and stops the app.
+    /// "Quit" actually disconnects the tunnel and stops the app. Answers
+    /// whether it did.
     ///
     /// Unlike the old detach-and-leave-running Quit, a confirmed quit here
     /// tears the tunnel down: the operator asked for "upon accept, exit and
     /// terminate session", so this Quit is no longer the same button as the
     /// managed-tunnel survival feature — it is a deliberate end of the session.
-    fn quit_with_confirmation(&mut self) {
+    ///
+    /// The one shutdown, behind three doors: the tray menu's Quit, the mini
+    /// panel's Quit, and the platform's own — Command-Q, the Dock's Quit, an
+    /// AppleEvent — which rui hands to [`App::on_quit`] (see [`Panel::run`]).
+    /// Before that seam existed, Command-Q closed the window from inside
+    /// AppKit's `applicationShouldTerminate:`, and under `close_hides` a
+    /// closed window is only a hidden one: Quit behaved exactly like the red
+    /// button, and the tray, the tunnel and the process all stayed.
+    fn quit_with_confirmation(&mut self) -> bool {
         if !confirm_quit() {
-            return;
+            return false;
         }
         self.tunnel.disconnect();
         self.running.store(false, Ordering::Relaxed);
+        true
     }
 
     /// Drain and dispatch mini-panel button presses, queued off-thread by
@@ -481,7 +493,9 @@ impl Panel {
                     }
                 }
                 MiniAction::Console => actions::open_console(self.activity_handle()),
-                MiniAction::Quit => self.quit_with_confirmation(),
+                MiniAction::Quit => {
+                    self.quit_with_confirmation();
+                }
             }
         }
     }
@@ -614,6 +628,13 @@ impl Panel {
             .idle_timeout(std::time::Duration::from_millis(900))
             .while_running(move |_| running.load(Ordering::Relaxed))
             .on_frame(on_frame)
+            // Command-Q, the Dock's Quit and an AppleEvent quit all arrive
+            // here, on the loop's thread, and take the same door the tray and
+            // mini-panel Quit buttons do — the dialog, then the teardown —
+            // instead of the close-every-window path that `close_hides` above
+            // had quietly turned into "hide". `true` only once the person
+            // confirmed and the tunnel is down; Cancel leaves everything up.
+            .on_quit(|panel: &mut Panel| panel.quit_with_confirmation())
             .run()
     }
 }
