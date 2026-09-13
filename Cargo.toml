@@ -134,7 +134,7 @@ selfhost-ws = { path = "crates/net/ws" }
 # unattended, so a moving dependency would let unreviewed interface changes onto
 # it without anyone deciding. Bumping `rev` is therefore a deliberate commit that
 # shows up in review, which is the whole point.
-rui = { git = "https://github.com/RockyWearsAHat/rui.git", rev = "5169220cf46e0b46deccfcb4d3f5f704f595b0d0", package = "rui-native" }
+rui = { git = "https://github.com/RockyWearsAHat/rui.git", rev = "53d291b325e94f57c68cbef220bd6b300f249d04", package = "rui-native" }
 
 # The release profile is what the self-updater rebuilds on every push, so its
 # job is to be *fast to rebuild*, not to squeeze the last percent of runtime

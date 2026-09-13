@@ -551,18 +551,32 @@ pub(crate) fn interpret(line: &str, link: &mut Link) {
     {
         link.phase = Phase::Failed(link.last.clone());
         link.since = None;
-    } else if let Some((tx, rx)) = parse_closed(line) {
-        link.tx += tx;
-        link.rx += rx;
+    } else if let Some((tx, rx)) = parse_live_stats(line) {
+        link.tx = tx;
+        link.rx = rx;
     }
 }
 
 /// Pulls the byte counts out of a "Connection closed (TX: n bytes, RX: n bytes)".
 ///
 /// Returns `None` for any other line, so a normal log line adds nothing.
+///
+/// No longer used by `interpret`, but kept for potential per-connection debugging.
+#[allow(dead_code)]
 pub(crate) fn parse_closed(line: &str) -> Option<(u64, u64)> {
     let tx = after(line, "TX: ")?;
     let rx = after(line, "RX: ")?;
+    Some((tx, rx))
+}
+
+/// Pulls the running totals out of a "LIVE_STATS TX_TOTAL=n RX_TOTAL=n" line,
+/// printed periodically by the Secure-VPN client while it is up — see
+/// `client.py`'s `_report_live_stats`. Unlike `parse_closed`, these are
+/// snapshots of the grand total so far, not a delta to add — `interpret`
+/// assigns them rather than accumulating.
+pub(crate) fn parse_live_stats(line: &str) -> Option<(u64, u64)> {
+    let tx = after(line, "TX_TOTAL=")?;
+    let rx = after(line, "RX_TOTAL=")?;
     Some((tx, rx))
 }
 
@@ -606,10 +620,13 @@ mod tests {
     }
 
     #[test]
-    fn throughput_accumulates_from_closed_connections() {
+    fn throughput_is_set_from_live_stats_lines() {
         let mut link = Link::default();
-        interpret("[127.0.0.1:5000] Connection closed (TX: 50134 bytes, RX: 78 bytes)", &mut link);
-        interpret("[127.0.0.1:5001] Connection closed (TX: 12000 bytes, RX: 22 bytes)", &mut link);
+        interpret("LIVE_STATS TX_TOTAL=50134 RX_TOTAL=78", &mut link);
+        assert_eq!(link.tx, 50134);
+        assert_eq!(link.rx, 78);
+        // A newer LIVE_STATS line should replace, not accumulate
+        interpret("LIVE_STATS TX_TOTAL=62134 RX_TOTAL=100", &mut link);
         assert_eq!(link.tx, 62134);
         assert_eq!(link.rx, 100);
     }

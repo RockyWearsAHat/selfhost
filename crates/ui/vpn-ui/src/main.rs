@@ -28,7 +28,7 @@ mod tunnel;
 use app::Panel;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tunnel::{Endpoint, Link, Phase};
 
 /// How often the auto-rotation thread wakes to check whether a week has passed.
@@ -99,6 +99,28 @@ fn open() -> Result<(), String> {
     Ok(())
 }
 
+/// The real on-disk key age, as an `Instant` an hour, a day, or five weeks in
+/// the past — so `Instant::elapsed()` from process start reads the key's true
+/// staleness instead of resetting to zero every time this app relaunches.
+/// Falls back to "now" (treats the key as freshly rotated) when there is no
+/// recorded rotation yet, or it cannot be parsed — the same as before this
+/// fix, which is the safe default: never rotate unexpectedly on faith in an
+/// unreadable timestamp.
+fn last_rotation_instant() -> Instant {
+    let now = Instant::now();
+    let Some(recorded) = keys::last_rotation() else {
+        return now;
+    };
+    let Some(recorded_epoch) = keys::parse_epoch(&recorded) else {
+        return now;
+    };
+    let Ok(now_epoch) = SystemTime::now().duration_since(UNIX_EPOCH) else {
+        return now;
+    };
+    let age_secs = now_epoch.as_secs().saturating_sub(recorded_epoch.max(0) as u64);
+    now.checked_sub(Duration::from_secs(age_secs)).unwrap_or(now)
+}
+
 /// The background thread that keeps the identity key fresh.
 ///
 /// It rotates when the key is older than a week and the switch is on. A rotation
@@ -110,7 +132,7 @@ fn spawn_auto_rotation(
     running: Arc<AtomicBool>,
 ) -> std::thread::JoinHandle<()> {
     std::thread::spawn(move || {
-        let mut last = Instant::now();
+        let mut last = last_rotation_instant();
         while running.load(Ordering::Relaxed) {
             // Sleep in short steps so closing the window does not wait an hour.
             let mut waited = Duration::ZERO;
