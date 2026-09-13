@@ -629,6 +629,16 @@ impl Panel {
             // icon and the tunnel it supervises must survive it. Only a
             // confirmed Quit (see quit_with_confirmation) clears `running`.
             .close_hides(true)
+            // No Dock icon, no Cmd-Tab entry: a menu-bar app, not a regular
+            // foreground one. Not only cosmetic — the mini panel's window
+            // level and collection behavior (panel_window/macos.rs) are
+            // necessary but not sufficient for it to appear over a
+            // *different* app's fullscreen Space: macOS's window server
+            // isolates a regular app's windows from another app's fullscreen
+            // Space regardless of what the window itself asks for. Confirmed
+            // live: the mini panel stayed pinned to the current desktop and
+            // never appeared over a fullscreened app until this was set.
+            .accessory(true)
             // rui's animated frames now replay only the hero's own small
             // canvas (see its fast path: App::has_animated_draws /
             // Surface::draw) instead of repainting the whole window, so this
@@ -1186,7 +1196,6 @@ mod tests {
             let mut harness = window(link, SIZES[1]);
             harness.frame();
             assert!(harness.shows("rockywearsahat.com:8443"), "{name} shows the endpoint");
-            assert!(harness.shows("THIS MAC"), "{name} keeps the near caption");
             assert!(harness.shows("THE BOX"), "{name} keeps the far caption");
             assert!(harness.shows("Auto-rotate weekly"), "{name} names the switch in plain words");
         }

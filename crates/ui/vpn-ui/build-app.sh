@@ -41,6 +41,11 @@ cat > "$app/Contents/Info.plist" <<'PLIST'
   <key>CFBundlePackageType</key><string>APPL</string>
   <key>LSMinimumSystemVersion</key><string>11.0</string>
   <key>NSHighResolutionCapable</key><true/>
+  <!-- Declarative belt-and-suspenders for App::accessory(true) (app.rs):
+       LaunchServices reads this before the process runs any code, so there
+       is no Dock-icon flash between launch and the app's own
+       setActivationPolicy: call taking effect. -->
+  <key>LSUIElement</key><true/>
 </dict>
 </plist>
 PLIST
