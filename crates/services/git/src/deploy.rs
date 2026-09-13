@@ -103,6 +103,68 @@ pub async fn carry_out(
     }
 }
 
+/// A deployment in progress, marked on disk beside the working copy.
+///
+/// Two deployments of one service at once — a webhook landing twice, a manual
+/// `deploy` fired during a webhook-triggered one, two daemon instances — race
+/// each other inside the same checkout: both `git fetch`/`reset` (`index.lock`
+/// exists), both `npm ci` into one `node_modules` (`EPERM`, `ENOTEMPTY`), and
+/// whichever fails last reports the service "left stopped" over the other's
+/// "deployed, starting". The mark is a file created with create-new semantics,
+/// so only one of them gets it; the other logs and steps aside. It is removed
+/// on every exit path (`Drop`), and one older than a whole deployment could
+/// possibly take is treated as left behind by a crash.
+struct DeployLock(PathBuf);
+
+impl Drop for DeployLock {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
+/// Where a working copy's deployment mark lives: a sibling of the checkout, so
+/// it exists before the first clone and is never inside the tree `git reset`
+/// rewrites.
+fn lock_path(path: &Path) -> PathBuf {
+    let stem = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "checkout".to_owned());
+    path.with_file_name(format!(".{stem}.deploy.lock"))
+}
+
+/// Longer than any single deployment can run: one transfer plus one build.
+const LOCK_STALE_AFTER: Duration = Duration::from_secs(TRANSFER_TIMEOUT.as_secs() + BUILD_TIMEOUT.as_secs());
+
+/// Takes the deployment mark, or says another deployment holds it.
+fn acquire_deploy_lock(path: &Path) -> Result<Option<DeployLock>, ()> {
+    let lock = lock_path(path);
+    if let Some(parent) = lock.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    for attempt in 0..2 {
+        match std::fs::OpenOptions::new().write(true).create_new(true).open(&lock) {
+            Ok(_) => return Ok(Some(DeployLock(lock))),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                let stale = std::fs::metadata(&lock)
+                    .and_then(|m| m.modified())
+                    .ok()
+                    .and_then(|t| t.elapsed().ok())
+                    .is_none_or(|age| age > LOCK_STALE_AFTER);
+                if stale && attempt == 0 {
+                    let _ = std::fs::remove_file(&lock);
+                    continue;
+                }
+                return Err(());
+            }
+            // A filesystem that cannot hold the mark must not stop deployments;
+            // the race it guards against is rarer than a read-only parent.
+            Err(_) => return Ok(None),
+        }
+    }
+    Err(())
+}
+
 /// The sequence itself: stop, update the working copy, build, start.
 async fn update(
     supervisor: &Supervisor,
@@ -114,6 +176,23 @@ async fn update(
     let name = &spec.name;
     let base = supervisor.base_dir().to_path_buf();
     let path = working_copy(&base, watch);
+
+    let _deploy_lock = match acquire_deploy_lock(&path) {
+        Ok(lock) => lock,
+        Err(()) => {
+            note(
+                supervisor,
+                name,
+                format!(
+                    "another deployment of this service is already in progress (toward {}); \
+                     leaving it to finish instead of racing it",
+                    plan::short(commit)
+                ),
+            )
+            .await;
+            return Outcome::Reported;
+        }
+    };
 
     let was_running = supervisor
         .status(name)
