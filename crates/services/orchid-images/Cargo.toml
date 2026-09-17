@@ -1,0 +1,23 @@
+[package]
+name = "selfhost-orchid-images"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+tokio = { workspace = true }
+hyper = "1"
+bytes = "1"
+serde_json = "1"
+parking_lot = "0.12"
+tracing = "0.1"
+libc = "0.2"
+
+[[bin]]
+name = "orchid-server"
+path = "src/main.rs"
+
+[lib]
+path = "src/lib.rs"

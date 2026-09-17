@@ -27,7 +27,7 @@ path = "src/bin/securevpn-updater.rs"
 [dependencies]
 rui = { workspace = true }
 selfhost-dns = { workspace = true }
-nix = { version = "0.29", features = ["process"] }
+nix = { version = "0.29", features = ["process", "hostname"] }
 
 [lints.rust]
 unsafe_code = "warn"

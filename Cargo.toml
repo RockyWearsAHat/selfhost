@@ -37,6 +37,7 @@ members = [
     "crates/services/reports",
     "crates/services/app-deploy",
     "crates/services/vpn",
+    "crates/services/orchid-images",
 
     # ui — the two apps. The toolkit they are written in, `rui`, is not here:
     # it is its own project, consumed as a pinned git dependency below.
@@ -124,6 +125,7 @@ selfhost-storage = { path = "crates/services/storage" }
 selfhost-supervisor = { path = "crates/foundation/supervisor" }
 selfhost-vpn = { path = "crates/services/vpn" }
 selfhost-ws = { path = "crates/net/ws" }
+selfhost-orchid-images = { path = "crates/services/orchid-images" }
 # rui is NOT part of this project. It is a zero-dependency interface library
 # with its own repository, nothing in it knows selfhost exists, and it was
 # vendored here by path until 2026-08-17 — which meant two copies that had to be

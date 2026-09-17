@@ -123,11 +123,20 @@ pub fn ground(canvas: &mut Canvas, _theme: &Theme, kind: Hue) {
         Hue::Failed => (RED, 0.12),
         Hue::Off => (SLATE, 0.10),
     };
+    // Capped rather than a bare `bounds.w * 0.64`: a per-pixel radial fill
+    // costs area, i.e. the *square* of this radius, and the window this is
+    // drawn in ranges from a ~380px panel to a full display in fullscreen —
+    // six-plus times the width, three-dozen-plus times the fill cost, paid
+    // every animating frame for a bloom that reads the same either way past
+    // panel size. Capped at the panel's own comfortable width so windowed
+    // looks untouched (fills are well under the cap there) and fullscreen
+    // stops scaling the reactor-glow's cost with the display.
     let glow_center = Point::new(bounds.center().x, bounds.y + bounds.h * 0.26);
-    let bloom = circle(glow_center, bounds.w * 0.64);
+    let bloom_r = (bounds.w * 0.64).min(320.0);
+    let bloom = circle(glow_center, bloom_r);
     canvas.sculpt(
         &bloom,
-        &radial(glow_center, 0.0, bounds.w * 0.64, light.fade(strength), light.with_alpha(0)),
+        &radial(glow_center, 0.0, bloom_r, light.fade(strength), light.with_alpha(0)),
         Sculpt::Fill,
     );
 
@@ -148,12 +157,17 @@ pub fn ground(canvas: &mut Canvas, _theme: &Theme, kind: Hue) {
         canvas.line(vanish, Point::new(x, floor), 1.0, grid.fade(0.6));
     }
 
-    // Scanlines: a fine dark comb over the whole ground, the CRT tell.
+    // Scanlines: a fine dark comb over the whole ground, the CRT tell. The
+    // pitch grows with the window past a normal panel's height instead of
+    // holding at 3px, so a fullscreened window still draws roughly this many
+    // full-width lines rather than several times as many — each one a
+    // separate draw call over the whole width.
     let scan = VOID_DEEP.with_alpha(0x22);
+    let pitch = (bounds.h / 100.0).max(3.0);
     let mut y = bounds.y;
     while y < bounds.max_y() {
         canvas.line(Point::new(bounds.x, y), Point::new(bounds.max_x(), y), 1.0, scan);
-        y += 3.0;
+        y += pitch;
     }
 }
 

@@ -201,7 +201,11 @@ impl Tunnel {
     /// already listening there, so spawning here would only ever collide with
     /// it — `EADDRINUSE`, immediately, on every retry, forever. There is
     /// nothing to supervise in that case; the port already answering is
-    /// itself the evidence the tunnel is up.
+    /// itself the evidence the tunnel is up. It still gets a poller for the
+    /// byte counters ([`poll_adopted_stats`]) — this instance never spawned
+    /// the client, so it has no stdout pipe to read `LIVE_STATS` lines from,
+    /// which otherwise left SENT/RECEIVED reading `0 B` for the tunnel's
+    /// whole life.
     pub fn connect(&mut self) {
         if self.wanted.swap(true, Ordering::SeqCst) {
             return;
@@ -210,6 +214,14 @@ impl Tunnel {
             set(&self.shared, |link| {
                 *link = Link { phase: Phase::Up, since: Some(Instant::now()), ..Link::default() };
             });
+            let shared = Arc::clone(&self.shared);
+            let wanted = Arc::clone(&self.wanted);
+            self.supervisor = Some(
+                std::thread::Builder::new()
+                    .name("selfhost-vpn-stats-poll".into())
+                    .spawn(move || poll_adopted_stats(&shared, &wanted))
+                    .expect("the operating system refused to start a thread"),
+            );
             return;
         }
         set(&self.shared, |link| {
@@ -398,6 +410,37 @@ fn sleep_while_wanted(duration: Duration, wanted: &Arc<AtomicBool>) {
     }
 }
 
+/// Keeps an adopted tunnel's byte counters live by polling the stats file
+/// the client writes beside its `LIVE_STATS` stdout line (`client.py`'s
+/// `_report_live_stats`), rather than reading stdout — this instance did not
+/// spawn the client, so it has no pipe to that stdout at all.
+///
+/// A missing or unreadable file changes nothing: the counters simply stay at
+/// their last known value (initially `0 B`) rather than the poller treating
+/// a transient read failure as the tunnel going idle.
+fn poll_adopted_stats(shared: &Arc<Mutex<Link>>, wanted: &Arc<AtomicBool>) {
+    let path = live_stats_path();
+    while wanted.load(Ordering::SeqCst) {
+        if let Ok(text) = std::fs::read_to_string(&path) {
+            if let Some((tx, rx)) = parse_live_stats(text.trim()) {
+                set(shared, |link| {
+                    link.tx = tx;
+                    link.rx = rx;
+                });
+            }
+        }
+        sleep_while_wanted(Duration::from_secs(1), wanted);
+    }
+}
+
+/// Where the client writes its running byte totals, for [`poll_adopted_stats`]
+/// to read — see `client.py`'s `_report_live_stats`, which writes here
+/// (atomically, via rename) every time it prints a `LIVE_STATS` line.
+fn live_stats_path() -> String {
+    let home = std::env::var("HOME").unwrap_or_default();
+    format!("{home}/.securevpn/live-stats")
+}
+
 /// Where the real client, its interpreter, and its keys live.
 ///
 /// Named apart from [`spawn_client`] so a test can substitute a stub in
@@ -407,25 +450,26 @@ fn real_python() -> String {
     format!("{home}/.securevpn/venv/bin/python")
 }
 
-/// Detects whether a tunnel is already running by checking if the local port is listening.
+/// Detects whether a tunnel is already running by checking if the local port is bound.
 ///
-/// Returns `true` if a connection to `127.0.0.1:{endpoint.local_port}` succeeds,
-/// indicating a tunnel is already active. This avoids spawning a second client that
-/// would fail with EADDRINUSE.
+/// Tries to *bind* `127.0.0.1:{endpoint.local_port}` rather than connect to it: a
+/// bind that succeeds proves nothing is listening (and is immediately dropped,
+/// releasing the port again), while a bind that fails with the port already in
+/// use proves something is. A `connect()` probe, tried first, has a real cost
+/// this one does not: the local port is the client's own SSH-proxy accept
+/// socket, so connecting to it — even just to immediately drop the stream —
+/// is a real accepted connection from the already-running client's point of
+/// view, and `client.py`'s `handle_local_connection` opens a full authenticated
+/// VPN session (`_open_session()`) for *any* accepted connection before it
+/// ever reads a byte from it. Every app launch was silently opening (and
+/// immediately abandoning) one real VPN session against the box just to
+/// answer "is anything listening here" — inflating the byte-count totals and
+/// putting one needless round trip to the server on the critical path of
+/// opening the window at all. Binding never reaches the client's accept loop.
 fn detect_existing_tunnel(endpoint: &Endpoint) -> bool {
-    use std::net::TcpStream;
-    use std::time::Duration;
+    use std::net::TcpListener;
 
-    match TcpStream::connect_timeout(
-        &format!("127.0.0.1:{}", endpoint.local_port).parse().unwrap(),
-        Duration::from_millis(100),
-    ) {
-        Ok(stream) => {
-            let _ = stream;
-            true
-        }
-        Err(_) => false,
-    }
+    TcpListener::bind(("127.0.0.1", endpoint.local_port)).is_err()
 }
 
 /// Launches the Secure-VPN client for `endpoint` via `python`, wired for

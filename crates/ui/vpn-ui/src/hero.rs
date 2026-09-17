@@ -9,7 +9,7 @@
 //! breathe. Failed, the beam ruptures. Every mark is a sculpted signed-distance
 //! shape lit with additive glow — not a box with flags.
 
-use crate::style::{self, CYAN_BRIGHT};
+use crate::style::{self, CYAN_BRIGHT, space};
 use crate::tunnel::{Link, Phase};
 use rui::style::Length;
 use rui::{
@@ -39,8 +39,12 @@ pub fn tunnel_hero<S: 'static>(link: &Link) -> El<S> {
             .w(Length::Fill(1.0))
             .role(Role::Image)
             .label(motion.spoken()),
-        row((label("THIS MAC"), spacer().grow(), label("THE BOX")))
-            .pad_x(22.0)
+        // The same inset the state-word row below uses (`space::XS`), so the
+        // near/far captions sit in exactly the same left/right columns as
+        // "Connected" and the endpoint under them, instead of a hand-picked
+        // number that happened to look centred under the reactors.
+        row((label(&local_device_name()), spacer().grow(), label("THE BOX")))
+            .pad_x(space::XS)
             .h(CAPTION_HEIGHT)
             .min_h(CAPTION_HEIGHT)
             .align(rui::Align::Center),
@@ -51,6 +55,23 @@ pub fn tunnel_hero<S: 'static>(link: &Link) -> El<S> {
 /// A node caption in the muted mono the machine text is set in.
 fn label<S: 'static>(text: &str) -> El<S> {
     micro(text).color(Tone::Muted).tracking(1.6)
+}
+
+/// This machine's real name, read once from the OS — "THIS MAC" was a
+/// guess the window made about hardware it never checked. `nix::unistd`
+/// covers this app's one target (macOS); a lookup failure falls back to
+/// a name that is honest about being unconfirmed rather than presumptuous.
+fn local_device_name() -> String {
+    static NAME: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    NAME.get_or_init(|| {
+        nix::unistd::gethostname()
+            .ok()
+            .and_then(|h| h.into_string().ok())
+            .map(|h| h.trim_end_matches(".local").to_uppercase())
+            .filter(|h| !h.is_empty())
+            .unwrap_or_else(|| "THIS DEVICE".to_string())
+    })
+    .clone()
 }
 
 /// The link reduced to what the drawing switches on. `Copy`, so the paint
@@ -265,23 +286,86 @@ fn conduit(painter: &mut Painter<'_>, a: Point, b: Point, color: rui::Color, cha
     // extra animated element is added.
     let span = b.x - a.x;
     let packets: [(f32, f32); 4] = [(0.00, 1.15), (0.27, 0.75), (0.52, 1.5), (0.78, 0.9)];
-    for (offset, scale) in packets {
+    // Each packet's size gets a small random jitter, redrawn fresh every lap so
+    // no two trips down the conduit look alike — genuinely random, not a fixed
+    // handful of sizes on repeat. Seeded from the packet's index and which lap
+    // it is on (not the frame), so the jitter is picked once per trip and holds
+    // steady for the whole trip rather than swimming frame to frame.
+    //
+    // `flow` is `Painter::phase`'s own 0..1 loop counter (see rui's
+    // `Memory::phase`, which `.fract()`s every update) — it never actually
+    // accumulates a lap count, it just re-enters [0, 1) forever. Flooring
+    // `flow + offset` therefore only ever reads 0 or 1, alternating in a fixed
+    // pattern rather than incrementing — that was the "not randomized at all"
+    // bug. Worse, because `flow` itself resets 1 -> 0 independently of any one
+    // packet's own `offset`, that reset lands mid-flight for every packet
+    // whose offset is nonzero (its `t` is partway across the beam, not at 0/1,
+    // when the shared `flow` wraps) and flips this seed right then — the size
+    // (and its glow radius) visibly jumping at the same point on the line
+    // every cycle, which was the second bug. A real per-packet lap counter,
+    // incremented only when that packet's own position wraps, fixes both.
+    let lap = |index: usize, t: f32| -> u32 {
+        thread_local! {
+            static LAPS: std::cell::Cell<[(f32, u32); 4]> = const { std::cell::Cell::new([(0.0, 0); 4]) };
+        }
+        LAPS.with(|cell| {
+            let mut laps = cell.get();
+            let (last_t, count) = laps[index];
+            if t < last_t {
+                laps[index].1 = count.wrapping_add(1);
+            }
+            laps[index].0 = t;
+            cell.set(laps);
+            laps[index].1
+        })
+    };
+    let jitter = |index: u32, lap: u32| -> f32 {
+        let seed =
+            (index as i64).wrapping_mul(747_796_405).wrapping_add((lap as i64).wrapping_mul(2_891_336_453)) as u32;
+        let mut x = seed ^ (seed >> 16);
+        x = x.wrapping_mul(0x45d9f3b);
+        x ^= x >> 16;
+        x = x.wrapping_mul(0x45d9f3b);
+        x ^= x >> 16;
+        (x as f32 / u32::MAX as f32) * 0.5 + 0.75 // 0.75..1.25
+    };
+    // A packet's own brightness eases in as it leaves the near reactor's core
+    // and eases back out as it nears the far one, so the wrap from t=1 back to
+    // t=0 falls where both ends are already faded to nothing — the packet is
+    // born inside one core and is consumed by the other, never popping into or
+    // out of existence over open conduit. The window is kept tight against the
+    // very ends of the run: only opacity moves in it, never the packet's own
+    // size or its glow's radius, so nothing visibly swells or shrinks while a
+    // packet is actually travelling — only right at its birth and death.
+    const EDGE: f32 = 0.05;
+    let envelope = |t: f32| -> f32 {
+        let in_ramp = (t / EDGE).min(1.0);
+        let out_ramp = ((1.0 - t) / EDGE).min(1.0);
+        in_ramp.min(out_ramp)
+    };
+
+    for (index, (offset, base_scale)) in packets.into_iter().enumerate() {
         let t = (flow + offset).fract();
+        let scale = base_scale * jitter(index as u32, lap(index, t));
         let x = a.x + span * t;
         let p = Point::new(x, a.y);
+        let e = envelope(t);
+        if e <= 0.0 {
+            continue;
+        }
         let rad = 2.6 * scale;
 
         let long = Point::new((x - 22.0 * scale).max(a.x), a.y);
-        painter.sculpt(&capsule(long, p, rad * 0.7), &linear(long, p, color.with_alpha(0), color.fade(0.35)), Sculpt::Fill);
+        painter.sculpt(&capsule(long, p, rad * 0.7), &linear(long, p, color.with_alpha(0), color.fade(0.35 * e)), Sculpt::Fill);
         let short = Point::new((x - 9.0 * scale).max(a.x), a.y);
         painter.sculpt(
             &capsule(short, p, rad * 0.5),
-            &linear(short, p, color.with_alpha(0), CYAN_BRIGHT.fade(0.6)),
+            &linear(short, p, color.with_alpha(0), CYAN_BRIGHT.fade(0.6 * e)),
             Sculpt::Fill,
         );
 
-        painter.sculpt(&circle(p, rad), &solid(CYAN_BRIGHT), Sculpt::Fill);
-        painter.sculpt(&circle(p, rad), &solid(color), Sculpt::Glow { radius: 7.0 * scale, intensity: 0.95 });
+        painter.sculpt(&circle(p, rad), &solid(CYAN_BRIGHT.fade(e)), Sculpt::Fill);
+        painter.sculpt(&circle(p, rad), &solid(color), Sculpt::Glow { radius: 7.0 * scale, intensity: 0.95 * e });
     }
 }
 
