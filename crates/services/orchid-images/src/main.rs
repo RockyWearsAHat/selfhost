@@ -5,8 +5,8 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpListener;
 use selfhost_orchid_images::FrameStore;
 
-async fn handle_connection(mut stream: tokio::net::TcpStream, store: Arc<FrameStore>) {
-    let (reader, mut writer) = stream.split();
+async fn handle_connection(stream: tokio::net::TcpStream, store: Arc<FrameStore>) {
+    let (reader, mut writer) = tokio::io::split(stream);
     let mut reader = BufReader::new(reader);
     let mut line = String::new();
 
@@ -21,15 +21,23 @@ async fn handle_connection(mut stream: tokio::net::TcpStream, store: Arc<FrameSt
 
     let path = parts[1];
 
+    // Read remaining headers until blank line
+    let mut _header = String::new();
+    while reader.read_line(&mut _header).await.is_ok() && _header.trim() != "" {
+        _header.clear();
+    }
+
     let response = match path {
         "/latest-image" => {
             if let Some(frame) = store.get() {
                 let body = &frame.data;
-                format!(
+                let mut resp = format!(
                     "HTTP/1.1 200 OK\r\nContent-Type: image/jpeg\r\nContent-Length: {}\r\nX-Frame-ID: {}\r\n\r\n",
                     body.len(),
                     frame.id()
-                ) + &String::from_utf8_lossy(body)
+                );
+                resp.push_str(&String::from_utf8_lossy(body));
+                resp
             } else {
                 "HTTP/1.1 204 No Content\r\n\r\n".to_string()
             }
@@ -68,6 +76,7 @@ async fn handle_connection(mut stream: tokio::net::TcpStream, store: Arc<FrameSt
     };
 
     let _ = writer.write_all(response.as_bytes()).await;
+    let _ = writer.flush().await;
 }
 
 #[tokio::main]
