@@ -1,11 +1,10 @@
-use bytes::Bytes;
 use std::sync::Arc;
 use parking_lot::RwLock;
 use std::time::SystemTime;
 
 #[derive(Clone)]
 pub struct Frame {
-    pub data: Bytes,
+    pub data: Vec<u8>,
     pub timestamp: f64,
     pub size: usize,
 }
@@ -35,7 +34,7 @@ impl FrameStore {
 
         let size = data.len();
         let frame = Frame {
-            data: Bytes::from(data),
+            data,
             timestamp,
             size,
         };
