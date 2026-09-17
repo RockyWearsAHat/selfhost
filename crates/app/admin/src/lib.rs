@@ -47,6 +47,7 @@ pub mod audit_api;
 pub mod dav_api;
 pub mod device_password;
 pub mod desk_api;
+pub mod images_api;
 pub mod invite;
 pub mod mesh_api;
 pub mod passwd;
@@ -94,6 +95,7 @@ pub use passwd::ConsolePassword;
 pub use session::{Authenticated, FailureGate, Sessions};
 pub use dav_api::Webdav;
 pub use desk_api::{AgentReport, Fleet, Handover, NodeReport, Standings};
+pub use images_api::ImageStore;
 pub use mesh_api::Peerage;
 pub use storage_api::Volumes;
 pub use store::Store;
@@ -286,6 +288,8 @@ pub struct Api {
     /// [`Api::with_maintenance`], and `None` makes `GET /api/maintenance/status`
     /// answer with a default state (not in maintenance, no last reboot recorded).
     maintenance: Option<Arc<selfhost_maintenance::MaintenanceScheduler>>,
+    /// The visual-entropy image store for VPN authentication.
+    image_store: images_api::ImageStore,
 }
 
 /// Cookie-session authentication, present once [`Api::with_console_auth`] has
@@ -889,6 +893,7 @@ impl Api {
             agents: None,
             sites: None,
             maintenance: None,
+            image_store: images_api::ImageStore::new(),
         }
     }
 
@@ -1245,6 +1250,17 @@ impl Api {
         // a token, and so a tunnel can be health-checked.
         if path == "/api/health" {
             return json(Status(200), Json::object([("ok", Json::Bool(true))]));
+        }
+
+        // Image-sync endpoints for visual-entropy VPN authentication.
+        // These are ahead of the auth wall so Windows PC can push images and
+        // VPN clients can fetch them without authentication.
+        if path == "/api/images/push" && request.method == Method::Post {
+            return images_api::push_image(&self.image_store, body);
+        }
+
+        if path == "/api/images/latest" && request.method == Method::Get {
+            return images_api::get_latest_image(&self.image_store);
         }
 
         // Matched ahead of the authorisation wall, like /api/health: logging in
