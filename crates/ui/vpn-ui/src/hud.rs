@@ -11,8 +11,8 @@
 use crate::style::{CYAN, CYAN_BRIGHT, EDGE, GLASS, MUTED, SLATE, space};
 use rui::style::Radius;
 use rui::{
-    Align, Anchor, Children, El, Face, Ink, Point, Role, Size, Tone, capsule, circle, code, col, draw, figure,
-    heading, ring, row, solid, spacer,
+    Align, Anchor, Children, El, Point, Role, Size, Tone, capsule, circle, code, col, draw, figure, heading, ring,
+    row, solid, spacer,
 };
 use rui::{Painter, Sculpt};
 
@@ -176,36 +176,14 @@ pub fn seam<S: 'static>() -> El<S> {
 /// The size the state word is set at.
 pub const WORD_SIZE: f32 = 21.0;
 
-/// The state word, set large in the state's own hue and lit like a reactor
-/// core: the word itself is an ordinary text element (so it is read, probed
-/// and measured like any other), and a layer over it paints the same word
-/// again in faded copies fanned a unit or two around the glyphs — the bloom —
-/// before the crisp word goes back on top. Off asks for no light at all.
+/// The state word, set large in the state's own hue. Plain, crisp text — no
+/// glow layer behind it. A word this size in a solid, saturated colour
+/// already reads as lit against the panel's dark glass; a glow added on top
+/// only softened the letterforms. `lit` is kept so callers can still ask for
+/// the dim ink Off uses instead of the hue.
 pub fn state_word<S: 'static>(word: &'static str, color: rui::Color, lit: bool) -> El<S> {
-    const TRACKING: f32 = 0.6;
-    let text = figure(word).text_size(WORD_SIZE).bold().tracking(TRACKING).color(Tone::Exact(color));
-    if !lit {
-        return row(text);
-    }
-    let bloom = draw(Size::new(0.0, 0.0), move |painter, rect| {
-        let mut ink = Ink { size: WORD_SIZE, tone: Tone::Exact(color), face: Face::Ui, tracking: TRACKING, bold: true };
-        // Three dense fans of copies: a tight one for the hot edge, two wider
-        // ones for the halo. Each copy is very faint — a fan that can be seen
-        // as copies is a smear, not a light — and twelve directions per ring
-        // keep the halo round rather than star-shaped.
-        for (reach, alpha) in [(0.9_f32, 0.12_f32), (1.9, 0.06), (3.2, 0.028)] {
-            ink.tone = Tone::Exact(color.fade(alpha));
-            for i in 0..12 {
-                let ang = (i as f32 / 12.0) * std::f32::consts::TAU;
-                let shifted = rui::Rect::new(rect.x + reach * ang.cos(), rect.y + reach * ang.sin(), rect.w, rect.h);
-                painter.text(shifted, ink, Align::Start, word);
-            }
-        }
-        ink.tone = Tone::Exact(color);
-        painter.text(rect, ink, Align::Start, word);
-    })
-    .layer(Anchor::Over);
-    row(text).add(bloom)
+    let _ = lit;
+    row(figure(word).text_size(WORD_SIZE).bold().tracking(0.6).color(Tone::Exact(color)))
 }
 
 /// Sculpts a two-state switch into `rect`: a pill track and a glowing knob.

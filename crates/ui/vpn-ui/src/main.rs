@@ -37,6 +37,15 @@ const ROTATE_CHECK: Duration = Duration::from_secs(3600);
 /// How old the identity key may get before automatic rotation replaces it.
 const ROTATE_AFTER: Duration = Duration::from_secs(7 * 24 * 3600);
 
+/// How often the KEYS panel's on-disk reading is refreshed, independent of
+/// whether this app itself is the one rotating. A rotation triggered any
+/// other way — `rotate-keys.sh` run by hand, a script, another instance —
+/// used to leave the window showing a stale "N ago" until this app happened
+/// to perform (or be restarted into re-reading) its own rotation, because
+/// `Activity.last_rotation` was set once at launch and otherwise only ever
+/// updated by this app's own `actions::rotate()` callback.
+const DISPLAY_REFRESH: Duration = Duration::from_secs(2);
+
 fn main() -> std::process::ExitCode {
     match run(std::env::args().skip(1).collect()) {
         Ok(()) => std::process::ExitCode::SUCCESS,
@@ -133,22 +142,58 @@ fn spawn_auto_rotation(
 ) -> std::thread::JoinHandle<()> {
     std::thread::spawn(move || {
         let mut last = last_rotation_instant();
+        refresh_activity_from_disk(&activity);
+        let mut since_refresh = Duration::ZERO;
         while running.load(Ordering::Relaxed) {
+            // Checked first, before the hour-long wait below: `last` is
+            // already backdated to the key's real age, so a key that is
+            // already overdue when this thread starts (the common case —
+            // this only runs while the app is open, not continuously) must
+            // rotate now rather than sit overdue for up to another hour
+            // before the loop first looks.
+            if auto.load(Ordering::Relaxed) && last.elapsed() >= ROTATE_AFTER {
+                actions::rotate(Arc::clone(&activity));
+                last = Instant::now();
+            }
             // Sleep in short steps so closing the window does not wait an hour.
             let mut waited = Duration::ZERO;
             while waited < ROTATE_CHECK && running.load(Ordering::Relaxed) {
                 std::thread::sleep(Duration::from_millis(500));
                 waited += Duration::from_millis(500);
-            }
-            if !running.load(Ordering::Relaxed) {
-                break;
-            }
-            if auto.load(Ordering::Relaxed) && last.elapsed() >= ROTATE_AFTER {
-                actions::rotate(Arc::clone(&activity));
-                last = Instant::now();
+                since_refresh += Duration::from_millis(500);
+                if since_refresh >= DISPLAY_REFRESH {
+                    since_refresh = Duration::ZERO;
+                    if refresh_activity_from_disk(&activity) {
+                        // Someone else already rotated since this thread's
+                        // own `last` baseline was set — re-derive it from
+                        // the record that just changed, so this thread does
+                        // not also fire its own redundant rotation on top.
+                        last = last_rotation_instant();
+                    }
+                }
             }
         }
     })
+}
+
+/// Re-reads the identities and rotation record from disk and, if either
+/// changed, writes them into `activity` for the window to redraw. Returns
+/// whether anything changed — the caller uses that to know its own idea of
+/// the key's age just went stale.
+fn refresh_activity_from_disk(activity: &Arc<std::sync::Mutex<app::Activity>>) -> bool {
+    let (client, server) = keys::identities();
+    let last_rotation = keys::last_rotation();
+    let mut guard = match activity.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    let changed = guard.client != client || guard.server != server || guard.last_rotation != last_rotation;
+    if changed {
+        guard.client = client;
+        guard.server = server;
+        guard.last_rotation = last_rotation;
+    }
+    changed
 }
 
 /// Draws the window in each of its states to PNGs, with no window open.
