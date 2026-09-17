@@ -1,29 +1,37 @@
-use hyper::service::{make_service_fn, service_fn};
-use hyper::{Body, Request, Response, Server, StatusCode};
 use serde_json::json;
-use std::convert::Infallible;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::net::TcpListener;
 use selfhost_orchid_images::FrameStore;
 
-async fn handle_request(
-    req: Request<Body>,
-    store: Arc<FrameStore>,
-) -> Result<Response<Body>, Infallible> {
-    match req.uri().path() {
+async fn handle_connection(mut stream: tokio::net::TcpStream, store: Arc<FrameStore>) {
+    let (reader, mut writer) = stream.split();
+    let mut reader = BufReader::new(reader);
+    let mut line = String::new();
+
+    if reader.read_line(&mut line).await.is_err() {
+        return;
+    }
+
+    let parts: Vec<&str> = line.split_whitespace().collect();
+    if parts.len() < 2 {
+        return;
+    }
+
+    let path = parts[1];
+
+    let response = match path {
         "/latest-image" => {
             if let Some(frame) = store.get() {
-                Ok(Response::builder()
-                    .header("Content-Type", "image/jpeg")
-                    .header("X-Frame-ID", frame.id())
-                    .header("X-Timestamp", frame.timestamp.to_string())
-                    .body(Body::from(frame.data))
-                    .unwrap())
+                let body = &frame.data;
+                format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: image/jpeg\r\nContent-Length: {}\r\nX-Frame-ID: {}\r\n\r\n",
+                    body.len(),
+                    frame.id()
+                ) + &String::from_utf8_lossy(body)
             } else {
-                Ok(Response::builder()
-                    .status(StatusCode::NO_CONTENT)
-                    .body(Body::empty())
-                    .unwrap())
+                "HTTP/1.1 204 No Content\r\n\r\n".to_string()
             }
         }
         "/status" => {
@@ -41,23 +49,25 @@ async fn handle_request(
                 })
             };
 
-            Ok(Response::builder()
-                .header("Content-Type", "application/json")
-                .body(Body::from(status.to_string()))
-                .unwrap())
+            let body = status.to_string();
+            format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                body.len(),
+                body
+            )
         }
         "/health" => {
-            let health = json!({"status": "ok"});
-            Ok(Response::builder()
-                .header("Content-Type", "application/json")
-                .body(Body::from(health.to_string()))
-                .unwrap())
+            let body = json!({"status": "ok"}).to_string();
+            format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                body.len(),
+                body
+            )
         }
-        _ => Ok(Response::builder()
-            .status(StatusCode::NOT_FOUND)
-            .body(Body::from("404 Not Found"))
-            .unwrap()),
-    }
+        _ => "HTTP/1.1 404 Not Found\r\nContent-Length: 13\r\n\r\n404 Not Found".to_string(),
+    };
+
+    let _ = writer.write_all(response.as_bytes()).await;
 }
 
 #[tokio::main]
@@ -75,18 +85,13 @@ async fn main() {
     println!("  GET /status - JSON status");
     println!("  GET /health - health check");
 
-    let make_svc = make_service_fn(move |_conn| {
+    let listener = TcpListener::bind(addr)
+        .await
+        .expect("Failed to bind");
+
+    loop {
+        let (stream, _) = listener.accept().await.expect("Failed to accept");
         let store = Arc::clone(&store);
-        async move {
-            Ok::<_, Infallible>(service_fn(move |req| {
-                handle_request(req, Arc::clone(&store))
-            }))
-        }
-    });
-
-    let server = Server::bind(&addr).serve(make_svc);
-
-    if let Err(e) = server.await {
-        eprintln!("server error: {}", e);
+        tokio::spawn(handle_connection(stream, store));
     }
 }
