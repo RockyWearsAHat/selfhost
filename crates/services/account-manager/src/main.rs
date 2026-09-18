@@ -37,8 +37,18 @@ struct PermReq {
 async fn main() -> std::io::Result<()> {
     env_logger::init_from_env(env_logger::Env::new().default_filter_or("info"));
 
-    let db_url = std::env::var("DATABASE_URL")
-        .unwrap_or_else(|_| "sqlite:///Users/alexwaldmann/.selfhost/data/accounts.db".to_string());
+    let db_url = if let Ok(url) = std::env::var("DATABASE_URL") {
+        url
+    } else {
+        // Use Windows or Unix path depending on OS
+        if cfg!(windows) {
+            format!("sqlite://{}\\.selfhost\\data\\accounts.db",
+                std::env::var("USERPROFILE").unwrap_or_else(|_| "C:\\Users\\Alex".to_string()))
+        } else {
+            format!("sqlite://{}/.selfhost/data/accounts.db",
+                std::env::var("HOME").unwrap_or_else(|_| "/root".to_string()))
+        }
+    };
 
     let pool = SqlitePool::connect(&db_url).await
         .expect("Failed to connect database");
