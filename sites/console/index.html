@@ -666,6 +666,44 @@
     </div>
     <ul id="pk-list"></ul>
   </section>
+
+  <!-- PEOPLE: everybody this deployment has granted capabilities to, and the
+       one-time invitations that let them prove a passkey under their own
+       name. Owner-only on the daemon, exactly like AUDIT — a caller who has
+       been granted a machine sees no plate at all rather than an empty one.
+       A grant set is always saved whole, never incrementally: see
+       people_api's own contract for why a partial write would be worse than
+       no write. -->
+  <section id="people" class="plate" hidden>
+    <div class="section-rule">
+      <h2>PEOPLE</h2><span class="rule"></span>
+      <button id="pp-reload" class="btn ghost small" type="button">RELOAD</button>
+    </div>
+    <p id="pp-note" class="caption" hidden></p>
+    <p id="pp-vocab" class="caption mono micro"></p>
+    <ul id="pp-list"></ul>
+    <div id="pp-add-row" class="inline-form">
+      <input id="pp-add-name" type="text" maxlength="32" placeholder="name (e.g. dad)"
+             autocomplete="off" spellcheck="false">
+      <input id="pp-add-grants" type="text" maxlength="200"
+             placeholder="grants, e.g. vpn.access:ai-studio"
+             autocomplete="off" spellcheck="false">
+      <button id="pp-add-save" class="btn ghost small" type="button">SAVE GRANTS</button>
+    </div>
+
+    <div class="section-rule">
+      <h2>INVITATIONS</h2><span class="rule"></span>
+      <span id="pp-inv-count" class="mono micro"></span>
+    </div>
+    <p id="pp-inv-note" class="caption" hidden></p>
+    <ul id="pp-inv-list"></ul>
+
+    <div id="pp-minted" class="heldrow" hidden>
+      <span class="caption">Invitation for <b id="pp-minted-name"></b> — copy this link now, it will not be shown again:</span>
+      <input id="pp-minted-url" type="text" readonly class="mono micro">
+      <button id="pp-minted-dismiss" class="btn ghost small" type="button">DONE</button>
+    </div>
+  </section>
 </section>
 
 <script src="/app.js"></script>
