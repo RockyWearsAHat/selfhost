@@ -291,6 +291,15 @@ pub struct Api {
     maintenance: Option<Arc<selfhost_maintenance::MaintenanceScheduler>>,
     /// The visual-entropy image store for VPN authentication.
     image_store: images_api::ImageStore,
+    /// The relays and data directory `set_grants` provisions a roster entry
+    /// against as a side effect of a `vpn.access:<location>` grant or revoke.
+    ///
+    /// `None` until [`Api::with_vpn`] has been called, and `None` means a
+    /// `vpn.access:<location>` grant still takes effect exactly as before this
+    /// wiring existed — it is recorded in the registry, and nothing is
+    /// provisioned, which is the honest report for a deployment nobody has
+    /// pointed at its own `[[vpn]]` relays yet.
+    vpn: Option<people_api::VpnWiring>,
 }
 
 /// Cookie-session authentication, present once [`Api::with_console_auth`] has
@@ -900,6 +909,7 @@ impl Api {
             sites: None,
             maintenance: None,
             image_store: images_api::ImageStore::new(),
+            vpn: None,
         }
     }
 
@@ -938,6 +948,21 @@ impl Api {
     /// arbitrary `static_root` the way the local CLI can.
     pub fn with_site_admin(mut self, config_path: PathBuf, data_dir: PathBuf) -> Self {
         self.sites = Some(site_api::Wiring::new(config_path, data_dir));
+        self
+    }
+
+    /// Wires `PUT /api/people/<name>` to enrol or revoke a live roster entry as
+    /// a side effect of a `vpn.access:<location>` grant or revoke, mirroring
+    /// what `selfhost people grant/allow/deny` already does from the same
+    /// [`people_api::vpn_side_effects`].
+    ///
+    /// `relays` is `config.vpn`; `data_dir` is the same directory
+    /// [`Api::with_console_auth`] was given, since a relay's key directory is
+    /// resolved relative to it. Without this call the capability is still
+    /// recorded exactly as before — only the provisioning side effect is
+    /// skipped.
+    pub fn with_vpn(mut self, relays: Vec<selfhost_config::vpn::Relay>, data_dir: PathBuf) -> Self {
+        self.vpn = Some(people_api::VpnWiring::new(relays, data_dir));
         self
     }
 
@@ -1454,12 +1479,24 @@ impl Api {
             Ok(grants) => grants,
             Err(refusal) => return problem(Status(400), &refusal.message()),
         };
+        // What they held before this call, for the same reason `written` below
+        // is taken from the request rather than a re-read: `vpn_side_effects`
+        // diffs a before/after pair, and the registry's post-write state has
+        // already become "after" by the time it could be read back.
+        let before = people.find(&person).map(|entry| entry.grants).unwrap_or_default();
         // The words as they will be recorded, taken before the set is moved
         // into the registry: the audit line has to say *what they now hold*,
         // and reading it back out of the store afterwards would record what the
         // store thinks rather than what was asked for.
         let written = people_api::spell_grants(&grants);
-        match people.set_grants(&person, grants) {
+        // A warning about what was *asked for*, not a second read of the store
+        // that could disagree with it.
+        let unreachable = people_api::unreachable_without_vpn(&grants);
+        let (peer, public_key) = match people_api::vpn_fields_from_body(body) {
+            Ok(fields) => fields,
+            Err(refusal) => return problem(Status(400), &refusal),
+        };
+        match people.set_grants(&person, grants.clone()) {
             Ok(()) => match people.find(&person) {
                 Some(entry) => {
                     self.record_authority(
@@ -1468,7 +1505,26 @@ impl Api {
                         person.as_str(),
                         format!("now:{written}"),
                     );
-                    json(Status(200), people_api::person_json(&entry))
+                    // Provisioned only once the capability itself is durably
+                    // recorded — the same order `selfhost people grant` writes
+                    // in, and for the same reason: a roster entry granting
+                    // network reachability must never outlive, or outrun, the
+                    // capability grant that is supposed to be its authority.
+                    let notes = self.vpn.as_ref().map_or_else(Vec::new, |vpn| {
+                        vpn.side_effects(
+                            person.as_str(),
+                            &before,
+                            &grants,
+                            peer.as_deref(),
+                            public_key.as_deref(),
+                        )
+                    });
+                    // A warning, not a refusal: the grant is honoured exactly as
+                    // asked, and the console surfaces this beside it rather than
+                    // silently coupling `vpn.access:console` in — coupling it
+                    // would break the independence `Capability::VpnAccess`'s own
+                    // documentation calls a deliberate design decision.
+                    json(Status(200), people_api::person_json(&entry, unreachable, &notes))
                 }
                 // The registry accepted the write and then could not find the
                 // entry it had just made. Nothing sane produces this; saying so

@@ -1157,7 +1157,12 @@ async fn serve_everything(
         // same file `selfhost site` edits directly; a site created remotely
         // is indistinguishable, once written, from one typed at this box's
         // own keyboard.
-        .with_site_admin(config_path.clone(), data_dir.clone());
+        .with_site_admin(config_path.clone(), data_dir.clone())
+        // `PUT /api/people/<name>` provisions a roster entry as a side effect of
+        // a `vpn.access:<location>` grant, the same side effect `selfhost
+        // people grant/allow/deny` already performs — see
+        // `people_api::vpn_side_effects`.
+        .with_vpn(config.vpn.clone(), data_dir.clone());
     // Only when the section is live: a route that answers 202 and pokes a
     // watcher that is not running would report a deployment nobody is doing.
     if config.self_update.as_ref().is_some_and(|update| update.enabled) {

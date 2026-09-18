@@ -45,6 +45,12 @@ selfhost-maintenance = { workspace = true }
 # supplies the socket, the runtime and the capability decision.
 selfhost-storage = { workspace = true }
 selfhost-supervisor = { workspace = true }
+# Enrolling and revoking a roster entry as a side effect of a
+# `vpn.access:<location>` grant or revoke — see `people_api::vpn_side_effects`.
+# Depended on for the same reason `selfhost-desk` is: this crate hands the
+# subsystem a grant decision and a resolved key directory, and does no
+# cryptography itself.
+selfhost-vpn = { workspace = true }
 # The RFC 6455 handshake and frame codec. It runs in exactly one process — this
 # one, behind loopback — which is the whole reason the proxy that owns 80/443
 # does not link it: under `panic = "abort"` a parser fed by a stranger is a

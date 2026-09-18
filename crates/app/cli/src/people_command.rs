@@ -44,6 +44,16 @@ Usage
   selfhost people grant <name> <cap>[,<cap>] Replace what they hold with exactly this set
   selfhost people allow <name> <cap>[,<cap>] Add to what they already hold
   selfhost people deny  <name> <cap>[,<cap>] Take these away, leaving the rest
+
+  grant/allow/deny take two more, no-network options, for a `vpn.access:<location>`
+  in the capability list:
+    --peer <name>    the roster entry's own name ([a-z0-9-], distinct from <name>)
+    --pubkey <key>   their public key, base64 — generated on THEIR device, never here
+  Granting `vpn.access:<location>` with both present also writes them into that
+  relay's roster, live, with no restart. Denying it with --peer present also
+  removes that roster entry. Neither flag is required — the capability and the
+  roster entry are independent, the same way the console's own grant is — but a
+  grant with neither is a promise with nobody who can use it yet.
   selfhost people forget <name>              Remove the entry entirely
   selfhost people capabilities               Every capability word, and its target
 
@@ -91,13 +101,35 @@ pub fn run(arguments: &[String], data_dir: &Path, config: &Config) -> Result<(),
             Ok(())
         }
         Some("show") => show(&people, name_argument(arguments)?, data_dir),
-        Some("grant") => set(&people, data_dir, name_argument(arguments)?, wanted(arguments)?),
-        Some("allow") => {
-            amend(&people, data_dir, name_argument(arguments)?, wanted(arguments)?, Amend::Add)
-        }
-        Some("deny") => {
-            amend(&people, data_dir, name_argument(arguments)?, wanted(arguments)?, Amend::Take)
-        }
+        Some("grant") => set(
+            &people,
+            data_dir,
+            config,
+            name_argument(arguments)?,
+            wanted(arguments)?,
+            peer_argument(arguments)?,
+            pubkey_argument(arguments)?,
+        ),
+        Some("allow") => amend(
+            &people,
+            data_dir,
+            config,
+            name_argument(arguments)?,
+            wanted(arguments)?,
+            Amend::Add,
+            peer_argument(arguments)?,
+            pubkey_argument(arguments)?,
+        ),
+        Some("deny") => amend(
+            &people,
+            data_dir,
+            config,
+            name_argument(arguments)?,
+            wanted(arguments)?,
+            Amend::Take,
+            peer_argument(arguments)?,
+            pubkey_argument(arguments)?,
+        ),
         Some("forget") => forget(&people, data_dir, name_argument(arguments)?),
         Some("invite") => invite(&people, data_dir, config, arguments),
         Some("invited") => invited(data_dir),
@@ -325,6 +357,45 @@ fn email_argument(arguments: &[String]) -> Result<Option<String>, String> {
         return Err(format!(
             "--email needs an address after it, and \"{text}\" is another option"
         ));
+    }
+    Ok(Some(text.clone()))
+}
+
+/// The `--peer <name>` pair, if given.
+///
+/// Deliberately not [`PersonName`]: a roster entry is a device, one of possibly
+/// several a person holds, and it is checked against
+/// [`selfhost_config::vpn::peer_name_problem`] — the same rule a `[[vpn.peers]]`
+/// block is — rather than the person-name rule, which allows characters (spaces,
+/// most Unicode) a roster filename cannot.
+fn peer_argument(arguments: &[String]) -> Result<Option<String>, String> {
+    let Some(index) = arguments.iter().position(|word| word == "--peer") else {
+        return Ok(None);
+    };
+    let text = arguments
+        .get(index + 1)
+        .ok_or_else(|| "--peer needs a roster name after it".to_owned())?;
+    if let Some(problem) = selfhost_config::vpn::peer_name_problem(text) {
+        return Err(format!("\"{text}\" is not a usable roster name: {problem}"));
+    }
+    Ok(Some(text.clone()))
+}
+
+/// The `--pubkey <base64>` pair, if given.
+///
+/// Checked against [`selfhost_config::vpn::public_key_problem`] before it is
+/// ever handed to [`selfhost_vpn::enrol`] — the same shape check a `[[vpn.peers]]`
+/// block's `public_key` gets, so a typo is refused here rather than written and
+/// discovered at the next handshake.
+fn pubkey_argument(arguments: &[String]) -> Result<Option<String>, String> {
+    let Some(index) = arguments.iter().position(|word| word == "--pubkey") else {
+        return Ok(None);
+    };
+    let text = arguments
+        .get(index + 1)
+        .ok_or_else(|| "--pubkey needs a base64 public key after it".to_owned())?;
+    if let Some(problem) = selfhost_config::vpn::public_key_problem(text) {
+        return Err(format!("that --pubkey is not usable: {problem}"));
     }
     Ok(Some(text.clone()))
 }
@@ -611,21 +682,27 @@ fn print_person(person: &Person) {
 fn set(
     people: &People,
     data_dir: &Path,
+    config: &Config,
     name: PersonName,
     capabilities: Vec<Capability>,
+    peer: Option<String>,
+    pubkey: Option<String>,
 ) -> Result<(), String> {
     let before = people.find(&name).map(|person| person.grants).unwrap_or_else(Grants::none);
     let after = Grants::new(capabilities).map_err(|_| "too many capabilities for one person".to_owned())?;
-    write(people, data_dir, &name, &before, after)
+    write(people, data_dir, config, &name, &before, after, peer, pubkey)
 }
 
 /// Adds to or takes from what a person already holds.
 fn amend(
     people: &People,
     data_dir: &Path,
+    config: &Config,
     name: PersonName,
     capabilities: Vec<Capability>,
     how: Amend,
+    peer: Option<String>,
+    pubkey: Option<String>,
 ) -> Result<(), String> {
     let before = people.find(&name).map(|person| person.grants).unwrap_or_else(Grants::none);
     let mut after = before.clone();
@@ -641,21 +718,24 @@ fn amend(
             }
         }
     }
-    write(people, data_dir, &name, &before, after)
+    write(people, data_dir, config, &name, &before, after, peer, pubkey)
 }
 
 /// Persists a change and reports it as a before and an after.
 fn write(
     people: &People,
     data_dir: &Path,
+    config: &Config,
     name: &PersonName,
     before: &Grants,
     after: Grants,
+    peer: Option<String>,
+    pubkey: Option<String>,
 ) -> Result<(), String> {
     let unchanged = before == &after;
     let written = spell(&after);
     people
-        .set_grants(name, after)
+        .set_grants(name, after.clone())
         .map_err(|error| format!("could not write the registry: {error}"))?;
     if unchanged {
         // No record: the trail says what changed, and nothing did. A line here
@@ -670,6 +750,13 @@ fn write(
             None => println!("  now: (the registry accepted the change and lost it)"),
         }
     }
+    for line in vpn_side_effects(config, data_dir, name, before, &after, peer.as_deref(), pubkey.as_deref())
+    {
+        println!("  {line}");
+    }
+    if let Some(warning) = selfhost_admin::people_api::unreachable_without_vpn(&after) {
+        println!("  ! {name} {warning}");
+    }
     println!();
     println!(
         "  In effect now: a running daemon re-reads this file, so this needs no restart. \
@@ -677,6 +764,43 @@ fn write(
          be used."
     );
     Ok(())
+}
+
+/// Enrols or revokes a roster entry for every `vpn.access:<location>` the grant
+/// diff added or removed, and returns a line per location describing what
+/// happened — this command's only side effect outside the people registry.
+///
+/// A thin wrapper over [`selfhost_admin::people_api::vpn_side_effects`] — the
+/// actual roster enrol/revoke logic is shared with `PUT /api/people/<name>`
+/// rather than duplicated, so a fix reaches both doors at once.
+///
+/// # Why this exists here and not only in the admin daemon
+///
+/// The admin console's whole HTTP surface is reachable only through the VPN
+/// tunnel (see [`selfhost_admin::people_api::unreachable_without_vpn`]), so it
+/// cannot be the only door that can issue a working VPN peer — an operator
+/// locked out of the tunnel has no console to ask. This is the same reason this
+/// module writes the registry directly instead of calling the daemon's API: it
+/// is the tool reached for when the thing a permission tool would otherwise
+/// need is the thing that is not working.
+fn vpn_side_effects(
+    config: &Config,
+    data_dir: &Path,
+    name: &PersonName,
+    before: &Grants,
+    after: &Grants,
+    peer: Option<&str>,
+    pubkey: Option<&str>,
+) -> Vec<String> {
+    selfhost_admin::people_api::vpn_side_effects(
+        &config.vpn,
+        data_dir,
+        name.as_str(),
+        before,
+        after,
+        peer,
+        pubkey,
+    )
 }
 
 /// A grant set on one line, or the word for an empty one.
@@ -902,5 +1026,169 @@ allowed_cidrs = ["10.66.0.0/24"]
                 .unwrap_or_else(|| panic!("{word} is missing from `people capabilities`"));
             assert!(line.contains("not grantable"), "{word} is offered without a caveat: {line}");
         }
+    }
+
+    /// A config declaring one `[[vpn]]` relay named "console", disabled — the
+    /// side effects under test only resolve a key directory, they never start
+    /// anything, so an enabled relay's roster-non-empty requirement would just
+    /// be fixture noise.
+    fn config_with_vpn_relay() -> Config {
+        Config::parse(
+            r#"
+version = 1
+[server]
+http_bind = "127.0.0.1:8080"
+https_bind = "127.0.0.1:8443"
+acme_email = "a@b.com"
+acme = "self-signed"
+data_dir = "./data"
+[[nodes]]
+name = "home"
+role = "owner"
+[[vpn]]
+name = "console"
+listen = "127.0.0.1:8444"
+forward = "127.0.0.1:443"
+"#,
+        )
+        .expect("the fixture must be a config this deployment would accept")
+    }
+
+    fn scratch_dir(label: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir()
+            .join(format!("selfhost-people-vpn-{label}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("a scratch directory");
+        dir
+    }
+
+    #[test]
+    fn granting_vpn_access_with_peer_and_pubkey_enrols_a_roster_entry() {
+        let data_dir = scratch_dir("enrol");
+        let config = config_with_vpn_relay();
+        let location = selfhost_identity::VpnLocationId::parse("console").unwrap();
+        let after = Grants::new(vec![Capability::VpnAccess(location)]).unwrap();
+        let key = "gjD2KgdBYIQo0WmUvud9pnNFdNmtBcMbh5QLnTLBKW4=";
+        let name = PersonName::parse("dad").unwrap();
+        let lines = vpn_side_effects(
+            &config,
+            &data_dir,
+            &name,
+            &Grants::none(),
+            &after,
+            Some("dad-phone"),
+            Some(key),
+        );
+        assert!(
+            lines.iter().any(|line| line.contains("enrolled roster entry \"dad-phone\"")),
+            "{lines:?}"
+        );
+        let roster = std::fs::read_to_string(data_dir.join("vpn/console/roster")).unwrap();
+        assert!(roster.contains("dad-phone"), "{roster}");
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    #[test]
+    fn granting_vpn_access_without_peer_or_pubkey_writes_nothing_but_says_so() {
+        let data_dir = scratch_dir("no-peer");
+        let config = config_with_vpn_relay();
+        let location = selfhost_identity::VpnLocationId::parse("console").unwrap();
+        let after = Grants::new(vec![Capability::VpnAccess(location)]).unwrap();
+        let name = PersonName::parse("dad").unwrap();
+        let lines =
+            vpn_side_effects(&config, &data_dir, &name, &Grants::none(), &after, None, None);
+        assert!(lines.iter().any(|line| line.contains("no roster entry was written")), "{lines:?}");
+        assert!(
+            !data_dir.join("vpn/console").exists(),
+            "nothing should be written to disk without a peer and a key"
+        );
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    #[test]
+    fn denying_vpn_access_with_peer_removes_the_roster_entry() {
+        let data_dir = scratch_dir("revoke");
+        let config = config_with_vpn_relay();
+        let location = selfhost_identity::VpnLocationId::parse("console").unwrap();
+        let before = Grants::new(vec![Capability::VpnAccess(location)]).unwrap();
+        let key_dir = data_dir.join("vpn/console");
+        selfhost_vpn::enrol(
+            &key_dir,
+            "dad-phone",
+            "gjD2KgdBYIQo0WmUvud9pnNFdNmtBcMbh5QLnTLBKW4=",
+        )
+        .expect("the fixture enrols cleanly");
+        let name = PersonName::parse("dad").unwrap();
+        let lines = vpn_side_effects(
+            &config,
+            &data_dir,
+            &name,
+            &before,
+            &Grants::none(),
+            Some("dad-phone"),
+            None,
+        );
+        assert!(
+            lines.iter().any(|line| line.contains("removed roster entry \"dad-phone\"")),
+            "{lines:?}"
+        );
+        let roster = std::fs::read_to_string(key_dir.join("roster")).unwrap();
+        assert!(!roster.contains("dad-phone"), "{roster}");
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    #[test]
+    fn denying_vpn_access_without_peer_leaves_the_roster_entry_and_says_so() {
+        let data_dir = scratch_dir("revoke-no-peer");
+        let config = config_with_vpn_relay();
+        let location = selfhost_identity::VpnLocationId::parse("console").unwrap();
+        let before = Grants::new(vec![Capability::VpnAccess(location)]).unwrap();
+        let key_dir = data_dir.join("vpn/console");
+        selfhost_vpn::enrol(
+            &key_dir,
+            "dad-phone",
+            "gjD2KgdBYIQo0WmUvud9pnNFdNmtBcMbh5QLnTLBKW4=",
+        )
+        .expect("the fixture enrols cleanly");
+        let name = PersonName::parse("dad").unwrap();
+        let lines =
+            vpn_side_effects(&config, &data_dir, &name, &before, &Grants::none(), None, None);
+        assert!(lines.iter().any(|line| line.contains("no roster entry was removed")), "{lines:?}");
+        let roster = std::fs::read_to_string(key_dir.join("roster")).unwrap();
+        assert!(roster.contains("dad-phone"), "unrelated to a real removal, the fixture entry must survive: {roster}");
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    #[test]
+    fn an_unchanged_vpn_access_grant_touches_no_roster() {
+        // The diff, not the presence of `vpn.access` in the set, decides whether
+        // anything is written — granting a capability the person already held
+        // (e.g. `allow` repeated, or a `grant` that also restates an existing
+        // `vpn.access`) must not re-enrol or duplicate a roster line.
+        let data_dir = scratch_dir("unchanged");
+        let config = config_with_vpn_relay();
+        let location = selfhost_identity::VpnLocationId::parse("console").unwrap();
+        let grants = Grants::new(vec![Capability::VpnAccess(location), Capability::ConsoleRead])
+            .unwrap();
+        let name = PersonName::parse("dad").unwrap();
+        let lines =
+            vpn_side_effects(&config, &data_dir, &name, &grants, &grants, Some("dad-phone"), None);
+        assert!(lines.is_empty(), "{lines:?}");
+        assert!(!data_dir.join("vpn/console").exists());
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    #[test]
+    fn peer_and_pubkey_flags_are_validated_before_anything_is_written() {
+        let bad_peer = ["people".to_owned(), "grant".to_owned(), "dad".to_owned(), "vpn.access:console".to_owned(), "--peer".to_owned(), "Not A Peer Name".to_owned()];
+        let refusal = peer_argument(&bad_peer).unwrap_err();
+        assert!(refusal.contains("not a usable roster name"), "{refusal}");
+
+        let bad_key = ["people".to_owned(), "grant".to_owned(), "dad".to_owned(), "vpn.access:console".to_owned(), "--pubkey".to_owned(), "not-base64!!".to_owned()];
+        let refusal = pubkey_argument(&bad_key).unwrap_err();
+        assert!(refusal.contains("not usable"), "{refusal}");
+
+        assert_eq!(peer_argument(&["people".to_owned()]).unwrap(), None);
+        assert_eq!(pubkey_argument(&["people".to_owned()]).unwrap(), None);
     }
 }
