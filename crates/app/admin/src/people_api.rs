@@ -35,8 +35,9 @@
 //! half-applied. A body that fails to parse changes nothing — the grants are
 //! built and validated in full before the registry is touched.
 
-use selfhost_identity::{Capability, Caller, Grants, People, Person};
+use selfhost_identity::{Capability, Caller, Grants, People, Person, VpnLocationId};
 use selfhost_json::Json;
+use std::path::{Path, PathBuf};
 
 /// Why a submitted grant set was refused.
 ///
@@ -114,13 +115,236 @@ pub fn grants_from_body(body: &[u8]) -> Result<Grants, BadGrants> {
     Grants::new(capabilities).map_err(|_| BadGrants::TooMany)
 }
 
+/// Whether `grants` holds a console capability with no route to it, because
+/// the console's own HTTP surface is reachable only through the VPN tunnel and
+/// this set does not hold `vpn.access:console`.
+///
+/// # Why this warns rather than granting or refusing
+///
+/// [`Capability::VpnAccess`] is independent of every other capability by
+/// design — its own doc comment gives the reason: being able to reach a
+/// location says nothing about being able to administer it, the same
+/// separation that keeps `SiteAdmin`, `DnsAdmin` and `MailAdmin` from implying
+/// one another. Auto-granting `vpn.access:console` alongside a console
+/// capability would break that in the dangerous direction — a person given
+/// `vpn.access:console` for some unrelated reason would silently gain a route
+/// to console capabilities nobody meant to open to them, which is a reverse
+/// privilege escalation this deployment's own independence guarantee exists to
+/// rule out. So this never writes anything. It is the sibling of
+/// [`BadGrants::NotYetHonoured`] for a route that exists in general but is
+/// unreachable *for this person*: a promise the operator can act on, not a
+/// silent gap the audit trail has to discover later.
+pub fn unreachable_without_vpn(grants: &Grants) -> Option<String> {
+    let console = VpnLocationId::parse("console").expect("\"console\" is a valid location id");
+    let holds_console_capability =
+        grants.iter().any(|capability| !matches!(capability, Capability::VpnAccess(_)));
+    let holds_console_vpn_access = grants
+        .iter()
+        .any(|capability| matches!(capability, Capability::VpnAccess(location) if *location == console));
+    (holds_console_capability && !holds_console_vpn_access).then(|| {
+        "holds a console capability, but not vpn.access:console — the admin console's whole \
+         HTTP surface is reachable only through the VPN tunnel, so none of it is usable until \
+         they also hold vpn.access:console"
+            .to_owned()
+    })
+}
+
+/// The optional `"peer"` and `"public_key"` fields a `PUT /api/people/<name>`
+/// body may carry alongside `"grants"`, needed to actually provision a roster
+/// entry for a newly granted `vpn.access:<location>` — the same two values
+/// `selfhost people grant --peer --pubkey` supplies on the CLI side of
+/// [`vpn_side_effects`].
+///
+/// Absent fields are `None`, not a refusal: a grant with no peer/key yet is
+/// legal (see [`vpn_side_effects`]'s own doc comment), so this only refuses
+/// when a field is *present* and fails the same shape check
+/// [`selfhost_config::vpn::peer_name_problem`] / `public_key_problem` apply to
+/// a `[[vpn.peers]]` config entry or the CLI's own flags — a typo caught here
+/// rather than written and discovered at the next handshake.
+pub fn vpn_fields_from_body(body: &[u8]) -> Result<(Option<String>, Option<String>), String> {
+    let text = std::str::from_utf8(body).map_err(|_| "the body is not JSON".to_owned())?;
+    let document = selfhost_json::parse(text).map_err(|_| "the body is not JSON".to_owned())?;
+    let field = |name: &str| -> Result<Option<String>, String> {
+        match document.get(name) {
+            None | Some(Json::Null) => Ok(None),
+            Some(value) => {
+                let text = value.as_str().ok_or_else(|| format!("\"{name}\" must be a string"))?;
+                Ok(Some(text.to_owned()))
+            }
+        }
+    };
+    let peer = field("peer")?;
+    if let Some(peer) = &peer {
+        if let Some(problem) = selfhost_config::vpn::peer_name_problem(peer) {
+            return Err(format!("\"{peer}\" is not a usable roster name: {problem}"));
+        }
+    }
+    let public_key = field("public_key")?;
+    if let Some(public_key) = &public_key {
+        if let Some(problem) = selfhost_config::vpn::public_key_problem(public_key) {
+            return Err(format!("that public_key is not usable: {problem}"));
+        }
+    }
+    Ok((peer, public_key))
+}
+
+/// Enrols or revokes a roster entry for every `vpn.access:<location>` a grant
+/// diff added or removed, and returns one line per location describing what
+/// happened.
+///
+/// The shared side effect behind both doors that can change a person's grants
+/// — `PUT /api/people/<name>` and `selfhost people grant/allow/deny` — so a
+/// peer provisioned through one is provisioned exactly the same way through
+/// the other, and a fix here reaches both without being written twice.
+///
+/// # Why a missing `peer`/`public_key` is not a refusal
+///
+/// A `vpn.access:<location>` grant with no roster entry yet is the same kind
+/// of "granted before usable" state this deployment already lives with for a
+/// missing passkey — worth saying, not worth blocking, since provisioning
+/// later (a second call, from either door) is a legitimate order to do things
+/// in.
+///
+/// # Why a missing `peer` on revoke leaves the roster entry alone
+///
+/// Neither door records which roster name a person's grant was provisioned
+/// under — a person may hold several devices, or none — so there is nothing
+/// to look up. Revoking without `peer` still revokes the capability; it just
+/// cannot also guess which file to remove.
+pub fn vpn_side_effects(
+    relays: &[selfhost_config::vpn::Relay],
+    data_dir: &Path,
+    subject: &str,
+    before: &Grants,
+    after: &Grants,
+    peer: Option<&str>,
+    public_key: Option<&str>,
+) -> Vec<String> {
+    let held = |grants: &Grants, location: &VpnLocationId| {
+        grants
+            .iter()
+            .any(|capability| matches!(capability, Capability::VpnAccess(here) if here == location))
+    };
+    let mut locations: Vec<VpnLocationId> = Vec::new();
+    for capability in before.iter().chain(after.iter()) {
+        if let Capability::VpnAccess(location) = capability {
+            if !locations.contains(location) {
+                locations.push(location.clone());
+            }
+        }
+    }
+
+    let mut lines = Vec::new();
+    for location in locations {
+        let now_held = held(after, &location);
+        let previously_held = held(before, &location);
+        if now_held == previously_held {
+            continue;
+        }
+        let Some(relay) = relays.iter().find(|relay| relay.name == location.as_str()) else {
+            lines.push(format!(
+                "vpn.access:{location} names no `[[vpn]]` relay in this config, so no roster \
+                 entry was touched"
+            ));
+            continue;
+        };
+        let key_dir = selfhost_vpn::keys::key_dir(relay, data_dir);
+        if now_held {
+            match (peer, public_key) {
+                (Some(peer), Some(public_key)) => {
+                    match selfhost_vpn::enrol(&key_dir, peer, public_key) {
+                        Ok(()) => lines.push(format!(
+                            "vpn.access:{location}: enrolled roster entry \"{peer}\", live, no \
+                             restart"
+                        )),
+                        Err(error) => lines.push(format!(
+                            "vpn.access:{location}: granted, but the roster entry was NOT \
+                             written: {error}"
+                        )),
+                    }
+                }
+                _ => lines.push(format!(
+                    "vpn.access:{location}: granted, but no roster entry was written — a peer \
+                     name and public key are needed (this call or a later one) before {subject} \
+                     can actually connect"
+                )),
+            }
+        } else if let Some(peer) = peer {
+            match selfhost_vpn::revoke(&key_dir, peer) {
+                Ok(()) => lines.push(format!(
+                    "vpn.access:{location}: removed roster entry \"{peer}\", live, no restart"
+                )),
+                Err(error) => lines.push(format!(
+                    "vpn.access:{location}: revoked, but roster entry \"{peer}\" was NOT \
+                     removed: {error}"
+                )),
+            }
+        } else {
+            lines.push(format!(
+                "vpn.access:{location}: revoked, but no peer name was given, so no roster entry \
+                 was removed"
+            ));
+        }
+    }
+    lines
+}
+
+/// What `PUT /api/people/<name>` needs to run [`vpn_side_effects`]: the relays
+/// this deployment declares, and the data directory their key directories are
+/// resolved relative to.
+///
+/// Held on [`crate::Api`] rather than re-read from configuration per request,
+/// on the same grounds as [`crate::site_api::Wiring`] — a daemon's `[[vpn]]`
+/// blocks and data directory are fixed for the life of the process, and a test
+/// builds this from parts it controls rather than a file on disk.
+#[derive(Clone)]
+pub struct VpnWiring {
+    relays: Vec<selfhost_config::vpn::Relay>,
+    data_dir: PathBuf,
+}
+
+impl VpnWiring {
+    /// `relays` is `config.vpn` as loaded at start-up; `data_dir` is the same
+    /// data directory [`crate::Api::with_console_auth`] was given.
+    pub fn new(relays: Vec<selfhost_config::vpn::Relay>, data_dir: PathBuf) -> Self {
+        Self { relays, data_dir }
+    }
+
+    /// Runs [`vpn_side_effects`] against the relays and data directory this
+    /// was built with.
+    pub fn side_effects(
+        &self,
+        subject: &str,
+        before: &Grants,
+        after: &Grants,
+        peer: Option<&str>,
+        public_key: Option<&str>,
+    ) -> Vec<String> {
+        vpn_side_effects(&self.relays, &self.data_dir, subject, before, after, peer, public_key)
+    }
+}
+
 /// One person as the console reads them.
-pub fn person_json(person: &Person) -> Json {
-    Json::object([
-        ("name", Json::string(person.name.as_str())),
-        ("added_unix", Json::Number(person.added_unix as f64)),
-        ("grants", grants_json(&person.grants)),
-    ])
+///
+/// `warning` carries [`unreachable_without_vpn`]'s answer for the grant set
+/// just written, when the caller has one to attach — `None` leaves the object
+/// exactly as it was before this field existed, so a reader that does not know
+/// about warnings yet sees nothing new. `notes` carries [`vpn_side_effects`]'s
+/// report lines the same way — an empty slice leaves the object exactly as it
+/// was before this field existed.
+pub fn person_json(person: &Person, warning: Option<String>, notes: &[String]) -> Json {
+    let mut fields = vec![
+        ("name".to_owned(), Json::string(person.name.as_str())),
+        ("added_unix".to_owned(), Json::Number(person.added_unix as f64)),
+        ("grants".to_owned(), grants_json(&person.grants)),
+    ];
+    if let Some(reason) = warning {
+        fields.push(("warning".to_owned(), Json::string(reason)));
+    }
+    if !notes.is_empty() {
+        fields.push(("notes".to_owned(), Json::array(notes.iter().map(Json::string))));
+    }
+    Json::object(fields)
 }
 
 /// A grant set as the wire words the console submits back.
@@ -157,7 +381,7 @@ pub fn wire_word(capability: &Capability) -> String {
 pub fn roster_json(people: &People) -> Json {
     let entries = people.list();
     Json::object([
-        ("people", Json::array(entries.iter().map(person_json))),
+        ("people", Json::array(entries.iter().map(|person| person_json(person, None, &[])))),
         ("count", Json::Number(entries.len() as f64)),
     ])
 }
@@ -329,6 +553,45 @@ mod tests {
     }
 
     #[test]
+    fn a_console_capability_with_no_vpn_access_warns() {
+        let grants = Grants::new([Capability::ConsoleRead]).unwrap();
+        let warning = unreachable_without_vpn(&grants).expect("must warn");
+        assert!(warning.contains("vpn.access:console"));
+    }
+
+    #[test]
+    fn a_console_capability_with_console_vpn_access_is_silent() {
+        let grants = Grants::new([
+            Capability::ConsoleRead,
+            Capability::VpnAccess(VpnLocationId::parse("console").unwrap()),
+        ])
+        .unwrap();
+        assert_eq!(unreachable_without_vpn(&grants), None);
+    }
+
+    #[test]
+    fn vpn_access_to_a_different_location_still_warns() {
+        // `ssh`'s relay does not front the console's HTTP surface, so holding
+        // only that grant leaves a console capability exactly as unreachable.
+        let grants = Grants::new([
+            Capability::ConsoleRead,
+            Capability::VpnAccess(VpnLocationId::parse("ssh").unwrap()),
+        ])
+        .unwrap();
+        assert!(unreachable_without_vpn(&grants).is_some());
+    }
+
+    #[test]
+    fn vpn_access_alone_never_warns() {
+        // Nothing here is a console capability, so there is nothing to be
+        // unreachable.
+        let grants =
+            Grants::new([Capability::VpnAccess(VpnLocationId::parse("console").unwrap())])
+                .unwrap();
+        assert_eq!(unreachable_without_vpn(&grants), None);
+    }
+
+    #[test]
     fn a_grant_set_round_trips_through_its_wire_words() {
         // What the console does: fetch, toggle, submit. A spelling that did not
         // round-trip would silently drop a person's capability on every save.
@@ -340,5 +603,64 @@ mod tests {
         .unwrap();
         let body = format!(r#"{{"grants":{}}}"#, grants_json(&original).to_text());
         assert_eq!(grants_from_body(body.as_bytes()).unwrap(), original);
+    }
+
+    fn console_relay() -> selfhost_config::vpn::Relay {
+        selfhost_config::vpn::Relay::new("console", "127.0.0.1:9999", "127.0.0.1:443")
+    }
+
+    fn scratch_dir(label: &str) -> PathBuf {
+        let dir = std::env::temp_dir()
+            .join(format!("selfhost-admin-people-vpn-{label}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("a scratch directory");
+        dir
+    }
+
+    #[test]
+    fn granting_vpn_access_through_the_api_enrols_a_roster_entry_once_the_grant_is_saved() {
+        let data_dir = scratch_dir("wiring-enrol");
+        let wiring = VpnWiring::new(vec![console_relay()], data_dir.clone());
+        let location = VpnLocationId::parse("console").unwrap();
+        let after = Grants::new([Capability::VpnAccess(location)]).unwrap();
+        let key = "gjD2KgdBYIQo0WmUvud9pnNFdNmtBcMbh5QLnTLBKW4=";
+        let lines =
+            wiring.side_effects("dad", &Grants::none(), &after, Some("dad-phone"), Some(key));
+        assert!(lines.iter().any(|line| line.contains("enrolled roster entry \"dad-phone\"")));
+    }
+
+    #[test]
+    fn revoking_vpn_access_through_the_api_removes_the_roster_entry() {
+        let data_dir = scratch_dir("wiring-revoke");
+        let wiring = VpnWiring::new(vec![console_relay()], data_dir.clone());
+        let location = VpnLocationId::parse("console").unwrap();
+        let before = Grants::new([Capability::VpnAccess(location)]).unwrap();
+        let key = "gjD2KgdBYIQo0WmUvud9pnNFdNmtBcMbh5QLnTLBKW4=";
+        wiring.side_effects("dad", &Grants::none(), &before, Some("dad-phone"), Some(key));
+        let lines =
+            wiring.side_effects("dad", &before, &Grants::none(), Some("dad-phone"), None);
+        assert!(lines.iter().any(|line| line.contains("removed roster entry \"dad-phone\"")));
+    }
+
+    #[test]
+    fn a_put_body_with_no_peer_or_public_key_provisions_nothing_but_is_not_refused() {
+        assert_eq!(vpn_fields_from_body(br#"{"grants":[]}"#).unwrap(), (None, None));
+    }
+
+    #[test]
+    fn a_put_body_may_carry_peer_and_public_key_beside_the_grant_set() {
+        let body = br#"{"grants":[],"peer":"dad-phone","public_key":"gjD2KgdBYIQo0WmUvud9pnNFdNmtBcMbh5QLnTLBKW4="}"#;
+        let (peer, public_key) = vpn_fields_from_body(body).unwrap();
+        assert_eq!(peer.as_deref(), Some("dad-phone"));
+        assert_eq!(public_key.as_deref(), Some("gjD2KgdBYIQo0WmUvud9pnNFdNmtBcMbh5QLnTLBKW4="));
+    }
+
+    #[test]
+    fn a_malformed_peer_or_public_key_is_refused_before_anything_is_written() {
+        // The same shape check a `[[vpn.peers]]` config entry and the CLI's own
+        // `--peer`/`--pubkey` flags are held to — a typo caught here rather than
+        // written and discovered at the next handshake.
+        assert!(vpn_fields_from_body(br#"{"grants":[],"peer":"Not Valid!"}"#).is_err());
+        assert!(vpn_fields_from_body(br#"{"grants":[],"public_key":"not-base64-32-bytes"}"#).is_err());
     }
 }

@@ -1100,7 +1100,11 @@ fn relay_name_problem(name: &str) -> Option<String> {
 /// The same character set as a relay name and for the same reason: this name is a
 /// filename under the key directory *and* the value `--identity` carries on the
 /// wire (`scripts/securevpn/join-mac.sh`), so it must be safe in both.
-fn peer_name_problem(name: &str) -> Option<String> {
+///
+/// `pub` so a peer name typed outside this crate — `selfhost people grant`'s
+/// `--peer`, the console's grant form — is checked against the exact same rule
+/// a `[[vpn.peers]]` block is, rather than a hand-copied approximation of it.
+pub fn peer_name_problem(name: &str) -> Option<String> {
     if name.is_empty() {
         return Some(
             "must not be empty; this is the entry the relay looks a peer up under, and it is \
@@ -1168,7 +1172,11 @@ fn person_problem(person: &str) -> Option<String> {
 /// decide, and this crate deliberately does not link one — the workspace
 /// dependency policy is that cryptography is not hand-written here, and that
 /// includes half-checking a key.
-fn public_key_problem(key: &str) -> Option<String> {
+///
+/// `pub` for the same reason [`peer_name_problem`] is: a key a person pastes
+/// into `selfhost people grant` or the console's grant form gets the same shape
+/// check a `[[vpn.peers]]` block does, rather than a second, hand-copied one.
+pub fn public_key_problem(key: &str) -> Option<String> {
     if key.is_empty() {
         return Some(
             "must be the peer's public key in base64. It is not a secret — it is what pins \

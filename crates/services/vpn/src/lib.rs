@@ -61,6 +61,7 @@
 //! | [`runner`] | **pure** | the argument vector, and the refusal for a backend with no runner |
 //! | [`state`] | **pure** | declared, down, up, failed — named states rather than errors |
 //! | [`keys`] | impure | reads the key directory; never writes it, never generates a key |
+//! | [`enrol`] | impure | writes a peer's `.pub` file and the roster file; never generates a key |
 //! | this module | impure | the supervisor, and the four verbs a caller drives |
 //!
 //! The split is `desk`'s: one impure edge, everything that decides anything on the
@@ -88,6 +89,7 @@
 #![warn(missing_docs)]
 
 pub mod attribution;
+pub mod enrol;
 pub mod image_auth;
 pub mod keys;
 pub mod roster;
@@ -96,6 +98,7 @@ pub mod state;
 pub mod updater;
 
 pub use attribution::{Attributed, Attribution, Unanswered, who_arrived_at};
+pub use enrol::{EnrolError, enrol, revoke};
 pub use image_auth::{ImageAuthConfig, validate_image_auth_key};
 pub use keys::KeyReport;
 pub use roster::{Enrolled, Rejected, Roster};

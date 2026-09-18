@@ -2031,6 +2031,7 @@ dependencies = [
  "selfhost-orchid-images",
  "selfhost-storage",
  "selfhost-supervisor",
+ "selfhost-vpn",
  "selfhost-ws",
  "tokio",
 ]
