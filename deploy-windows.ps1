@@ -1,20 +1,17 @@
-# Windows PowerShell deployment script for account system
+# Account system Windows deployment
 
 $ErrorActionPreference = "Stop"
-
-Write-Host "=========================================="
-Write-Host "   ACCOUNT SYSTEM - WINDOWS DEPLOYMENT"
-Write-Host "=========================================="
-Write-Host ""
+Write-Host "=============================="
+Write-Host "  ACCOUNT SYSTEM DEPLOYMENT"
+Write-Host "=============================="
 
 $REPO = "C:\Users\Alex\Self-Host"
 cd $REPO
 
 # Database
-Write-Host "[1/5] Setting up database..." -ForegroundColor Cyan
+Write-Host "[1/3] Setting up database..." -ForegroundColor Cyan
 $DATA_DIR = "$env:USERPROFILE\.selfhost\data"
 if (!(Test-Path $DATA_DIR)) { New-Item -ItemType Directory -Path $DATA_DIR | Out-Null }
-
 $DB_PATH = "$DATA_DIR\accounts.db"
 if (Test-Path $DB_PATH) { Remove-Item $DB_PATH }
 
@@ -31,39 +28,29 @@ INSERT INTO vpn_locations VALUES ('us-east-1', 'US East', 'US'), ('eu-west-1', '
 "@
 
 $SCHEMA | sqlite3.exe $DB_PATH
-Write-Host "✓ Database ready at $DB_PATH" -ForegroundColor Green
-Write-Host ""
+Write-Host "OK: Database ready" -ForegroundColor Green
 
 # Build backend
-Write-Host "[2/5] Building backend..." -ForegroundColor Cyan
+Write-Host "[2/3] Building backend..." -ForegroundColor Cyan
 cd "$REPO\crates\services\account-manager"
-cargo build --release 2>&1 | Select-String "Finished|error" | Select-Object -Last 1
-Write-Host "✓ Backend built" -ForegroundColor Green
-Write-Host ""
+cargo build --release 2>&1 | Select-String "Finished"
+Write-Host "OK: Backend built" -ForegroundColor Green
 
 # Frontend
-Write-Host "[3/5] Installing frontend dependencies..." -ForegroundColor Cyan
+Write-Host "[3/3] Installing frontend..." -ForegroundColor Cyan
 cd "$REPO\crates\ui\account-console"
-npm install --silent 2>&1 | Select-String "added|up to date" | Select-Object -Last 1
-Write-Host "✓ Frontend ready" -ForegroundColor Green
-Write-Host ""
+npm install --silent 2>&1 | Out-Null
+Write-Host "OK: Frontend ready" -ForegroundColor Green
 
-Write-Host "[4/5] Summary" -ForegroundColor Cyan
-Write-Host "Backend: $REPO\crates\services\account-manager" -ForegroundColor Yellow
-Write-Host "Frontend: $REPO\crates\ui\account-console" -ForegroundColor Yellow
-Write-Host "Database: $DB_PATH" -ForegroundColor Yellow
 Write-Host ""
-
-Write-Host "[5/5] Ready to Start Services" -ForegroundColor Cyan
+Write-Host "READY!" -ForegroundColor Green
 Write-Host ""
-Write-Host "Terminal 1 (Backend):" -ForegroundColor Green
+Write-Host "Terminal 1 (Backend):" -ForegroundColor Yellow
 Write-Host "  cd C:\Users\Alex\Self-Host\crates\services\account-manager"
-Write-Host "  cargo run --release --bin account-manager"
+Write-Host "  cargo run --release"
 Write-Host ""
-Write-Host "Terminal 2 (Frontend):" -ForegroundColor Green
+Write-Host "Terminal 2 (Frontend):" -ForegroundColor Yellow
 Write-Host "  cd C:\Users\Alex\Self-Host\crates\ui\account-console"
 Write-Host "  npm run dev"
 Write-Host ""
-Write-Host "Browser:" -ForegroundColor Green
-Write-Host "  http://localhost:3000"
-Write-Host ""
+Write-Host "Then open: http://localhost:3000" -ForegroundColor Yellow
