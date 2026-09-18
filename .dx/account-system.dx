@@ -1,0 +1,259 @@
+---
+name: account-system
+title: Account System & VPN Authorization
+status: in-progress
+updated: 2026-09-18
+global_rules: |
+  ALWAYS USE DX FOR THIS PROJECT
+  - Every session reads .dx/account-system.dx first
+  - Every decision gets documented in dx before implementing
+  - dx is the single source of truth, not the code
+  - Future sessions read dx, not git history
+---
+
+# GLOBAL RULE: ALWAYS USE DX - READ THIS FIRST
+
+# Account System & VPN Authorization
+
+## Project Goal
+Build a complete user account + permission system that allows Alex to:
+1. Send one-time invite links to people (via email)
+2. They register their own passkey using the invite
+3. Alex grants granular permissions (VPN locations + subdomains/sites)
+4. Users login with their passkey and access only what they're allowed to reach
+5. All access is logged and auditable
+
+Current user: Dad (already invited via existing invite system)
+
+## Architecture Overview
+
+### Three Systems (Must Work Together)
+
+**🖥️ WINDOWS PRODUCTION BOX (192.168.1.8 - ALEX-DESKTOP)**
+
+**1. Account Manager Server** ← BACKEND (Rust + SQLite)
+- Email/password login → 24h VPN token
+- Subdomain/site permission tracking
+- Admin UI at localhost:3000 for granting access
+- Located: `crates/services/account-manager/`
+- Database: SQLite at `C:\Users\Alex\.selfhost\data\accounts.db`
+- **RUNS ON: Windows production box only**
+- **STARTED:** `.\target\release\account-manager.exe`
+
+**2. Secure-VPN Server** ← VPN ENDPOINT (Python)
+- Receives VPN connections on port 8443
+- Validates users with account-manager
+- Forwards authenticated traffic to SSH
+- Located: separate repo `RockyWearsAHat/Secure-VPN`
+- Server file: `server.py` (Python)
+- **RUNS ON: Windows production box only**
+
+**💻 MAC DEVELOPMENT MACHINE (Your computer)**
+
+**3. Secure-VPN Client** ← VPN CLIENT (Python/Rust)
+- User application to CONNECT to VPN server
+- Sends certificate + identity to server
+- Server validates identity with account-manager
+- Opens tunnel to Windows box
+- Located: `RockyWearsAHat/Secure-VPN` (same repo, client code)
+- **RUNS ON: Mac only**
+- **INSTALLED TO: /Applications/SecureVPN.app** (or run as CLI)
+
+## Current State - DONE ✅
+
+### Backend (account-manager)
+- [x] SQLite schema with users, vpn_sessions, subdomains, site_permissions tables
+- [x] VPN login endpoint: POST /api/vpn/login (email+password → 24h token)
+- [x] VPN token validation: POST /api/vpn/validate-token
+- [x] VPN token revocation: POST /api/vpn/revoke-token
+- [x] Subdomain list: GET /api/subdomains
+- [x] Grant subdomain access: POST /api/users/{id}/subdomains
+- [x] List user's subdomain access: GET /api/users/{id}/subdomains
+- [x] Revoke subdomain access: DELETE /api/users/{id}/subdomains/{sid}
+- [x] Check subdomain access: POST /api/vpn/check-subdomain-access
+- [x] 8 sample subdomains seeded (admin, ai, reports, git, mail, vault, vpn, api)
+
+### Frontend (React account-console)
+- [x] Fixed subdomain API response parsing
+- [x] Fixed grant subdomain request format (POST with array)
+- [x] Subdomains visible in admin dashboard
+- [x] Can grant multiple subdomains to a user
+- [x] Component layout: SubdomainList, GrantSubdomainAccess, UserSubdomainAccess, SubdomainRevoke
+
+### Testing Status
+- [x] Backend compiles and runs on Windows
+- [x] API endpoints respond with correct data
+- [x] Frontend fetches and displays subdomains
+- [x] Grant subdomain access works end-to-end
+
+## INTEGRATION - VPN AUTH COMPLETE ✅
+
+### VPN Server Integration - DONE!
+After CLIENT_AUTH verification, server now validates user with account-manager:
+1. VPN server calls `/api/vpn/validate-user` with peer_name (user identity)
+2. Account-manager confirms user exists and is active
+3. Access granted/denied based on account-manager response
+4. All validation errors fail-secure (deny access)
+
+Files changed (Secure-VPN repo):
+- `account_manager.py`: NEW - API client module
+- `server.py`: Added validation after CLIENT_AUTH
+
+How it works:
+1. User connects with certificate (cert CN = "dad")
+2. Handshake completes, CLIENT_AUTH verified
+3. Server calls `validate_vpn_user("dad")` via account-manager API
+4. If user found and active → tunnel allowed
+5. If user not in account-manager → connection denied
+
+### User Login Flow (Currently Broken)
+Users cannot actually log in to VPN yet because:
+- Account-manager exists but VPN server doesn't call it
+- No credential exchange between user's VPN client and account-manager
+- Subdomain permissions exist but aren't enforced
+
+Expected flow:
+1. User opens VPN app
+2. VPN app shows login UI (email + password from account-manager OR invite code)
+3. User enters credentials / redeems invite
+4. VPN app gets token from `/api/vpn/login`
+5. VPN app connects to server with token
+6. Server validates token + checks subdomain access
+7. Connection allowed/denied based on permissions
+
+## The Invite Flow (Reference)
+
+```
+1. Alex runs: selfhost people invite dad
+   → Generates: one-time high-entropy code, bound to name "dad"
+   → Code emailed to dad@example.com (via invite_email.rs)
+
+2. Dad clicks link in email:
+   → Redirects to admin console invite redemption page
+   → He enters passkey (Touch ID / Face ID / Windows Hello)
+   → Passkey is registered under name "dad"
+   → He's now logged in
+
+3. Alex sees dad in people registry
+   → Alex grants capabilities in console.people:
+      - VPN access
+      - Specific subdomains (admin, ai, etc.)
+
+4. Dad logs into account-manager UI (or VPN app)
+   → Uses email + password (or passkey?)
+   → Gets VPN token
+   → Connects to VPN with token
+   → Access enforced by server.py
+```
+
+## Database Schema (account-manager)
+
+**subdomains table:**
+- 8 pre-seeded rows (admin, ai, reports, git, mail, vault, vpn, api)
+- Each has name, url, description, is_public flag
+
+**site_permissions table:**
+- Tracks which users can access which subdomains
+- Supports expiration dates
+- UNIQUE constraint on (user_id, subdomain_id, action)
+
+**vpn_sessions table:**
+- 24h tokens for VPN access
+- Can be revoked early
+- Tracks creation/expiration timestamps
+
+**user_access_profiles table:**
+- Per-user access level: 'full_access' or 'restricted'
+- Allows fine-grained control later
+
+## Open Work Items
+
+### P0 - BLOCKING
+- [x] Wire Secure-VPN server.py to validate users with account-manager
+- [ ] TEST: Deploy Secure-VPN integration to Windows box
+- [ ] TEST: User login with certificate → VPN access
+- [ ] Implement subdomain access enforcement in server.py (HTTP Host header checking)
+
+### P1 - Important
+- [ ] Create VPN user setup guide (how users get certificate if using invite flow)
+- [ ] Add password reset flow in account-manager
+- [ ] Add audit logging for all permission grants/revokes
+- [ ] Add ability to manually create users (not just via invite)
+- [ ] Subdomain enforcement at HTTP layer (check Host header against permissions)
+
+### P2 - Nice to Have
+- [ ] WebAuthn passkey support in account-manager (like admin console)
+- [ ] Permission expiration enforcement
+- [ ] User profile page showing their own permissions
+- [ ] Audit trail UI showing access history
+- [ ] Rate limiting on VPN login attempts
+
+## Files Changed This Session
+
+```
+crates/services/account-manager/
+  ├── Cargo.toml (added chrono, hex, rand)
+  ├── schema.sql (added vpn_sessions, subdomains, site_permissions tables)
+  └── src/main.rs (complete rewrite with 15 endpoints)
+
+crates/ui/account-console/
+  ├── src/pages/AdminDashboard.tsx (fixed API parsing)
+  ├── src/components/
+  │   ├── SubdomainList.tsx (NEW)
+  │   ├── GrantSubdomainAccess.tsx (NEW - fixed request format)
+  │   ├── UserSubdomainAccess.tsx (NEW)
+  │   └── SubdomainRevoke.tsx (NEW)
+  └── src/styles/common.css (updated)
+
+Root:
+  ├── migration-vpn-auth.sql (created new tables)
+  ├── insert-subdomains.sql (seeded 8 subdomains)
+  └── Commits: 52549f8, 3cb37da, 5304556, e548a89, e8063c2
+```
+
+## Testing Commands
+
+```bash
+# Test login
+curl -X POST http://localhost:9000/api/auth/login \
+  -H "Content-Type: application/json" \
+  -d '{"email":"alexwaldmann2004@gmail.com","password":"admin"}'
+
+# Get subdomains
+curl -H "Authorization: Bearer <token>" \
+  http://localhost:9000/api/subdomains
+
+# Check subdomain access
+curl -X POST http://localhost:9000/api/vpn/check-subdomain-access \
+  -H "Content-Type: application/json" \
+  -d '{"user_id":"user123","subdomain":"admin"}'
+```
+
+## Deployment Status
+
+- **Mac (dev):** ✅ Code written, account-manager compiled
+- **Windows (prod):** ✅ Backend running, frontend working, DB populated with 8 subdomains
+- **Secure-VPN (prod):** ⏳ Integration code written, NOT YET TESTED on Windows
+
+## Next Steps (Priority Order)
+
+1. **TEST (Critical)**: Deploy and test end-to-end
+   - Push Secure-VPN changes to Windows production box
+   - Start both account-manager and Secure-VPN with integration
+   - User (Dad) connects to VPN with certificate
+   - Verify: Connection allowed AND validated in account-manager
+
+2. **Feature: Subdomain enforcement**
+   - Add HTTP proxy to Secure-VPN to check Host header
+   - Validate destination hostname against user's permissions
+   - Return 403 if user not allowed to access that subdomain
+
+3. **Documentation**
+   - How does Dad get his certificate? (via existing invite system?)
+   - How does he actually log into and USE the VPN client?
+   - Deployment guide for production
+
+4. **Polish**
+   - Audit logging for all access attempts
+   - Permission expiration enforcement
+   - User dashboard showing own permissions
