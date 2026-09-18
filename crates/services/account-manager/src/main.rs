@@ -1,4 +1,5 @@
-use actix_web::{web, App, HttpServer, HttpResponse, middleware, HttpRequest};
+use actix_web::{web, App, HttpServer, HttpResponse, middleware, HttpRequest, http};
+use actix_cors::Cors;
 use serde_json::json;
 use serde::{Deserialize, Serialize};
 use sqlx::sqlite::SqlitePool;
@@ -83,8 +84,14 @@ async fn main() -> std::io::Result<()> {
     let data = web::Data::new(pool);
 
     HttpServer::new(move || {
+        let cors = Cors::default()
+            .allow_any_origin()
+            .allow_any_method()
+            .allow_any_header();
+
         App::new()
             .app_data(data.clone())
+            .wrap(cors)
             .wrap(middleware::Logger::default())
             .route("/health", web::get().to(health))
             .route("/api/whoami", web::get().to(whoami))
