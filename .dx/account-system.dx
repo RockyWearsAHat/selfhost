@@ -3,7 +3,15 @@ name: account-system
 title: Account System & VPN Authorization
 status: in-progress
 updated: 2026-09-18
+global_rules: |
+  ALWAYS USE DX FOR THIS PROJECT
+  - Every session reads .dx/account-system.dx first
+  - Every decision gets documented in dx before implementing
+  - dx is the single source of truth, not the code
+  - Future sessions read dx, not git history
 ---
+
+# GLOBAL RULE: ALWAYS USE DX - READ THIS FIRST
 
 # Account System & VPN Authorization
 
@@ -21,24 +29,35 @@ Current user: Dad (already invited via existing invite system)
 
 ### Three Systems (Must Work Together)
 
-**1. Admin Console (selfhost main app)**
-- Owner-only authentication (password + Touch ID/Face ID)
-- Invite minting: `selfhost people invite <name>` → one-time code
-- People registry: stores who exists and their capabilities
-- Located: `crates/app/admin/`
+**🖥️ WINDOWS PRODUCTION BOX (192.168.1.8 - ALEX-DESKTOP)**
 
-**2. Account Manager (NEW - built this session)**
+**1. Account Manager Server** ← BACKEND (Rust + SQLite)
 - Email/password login → 24h VPN token
 - Subdomain/site permission tracking
 - Admin UI at localhost:3000 for granting access
 - Located: `crates/services/account-manager/`
-- Database: SQLite at `~/.selfhost/data/accounts.db`
+- Database: SQLite at `C:\Users\Alex\.selfhost\data\accounts.db`
+- **RUNS ON: Windows production box only**
+- **STARTED:** `.\target\release\account-manager.exe`
 
-**3. Secure-VPN Server (NEEDS INTEGRATION)**
-- Client VPN authentication
-- Permission validation (NOT YET WIRED)
+**2. Secure-VPN Server** ← VPN ENDPOINT (Python)
+- Receives VPN connections on port 8443
+- Validates users with account-manager
+- Forwards authenticated traffic to SSH
 - Located: separate repo `RockyWearsAHat/Secure-VPN`
 - Server file: `server.py` (Python)
+- **RUNS ON: Windows production box only**
+
+**💻 MAC DEVELOPMENT MACHINE (Your computer)**
+
+**3. Secure-VPN Client** ← VPN CLIENT (Python/Rust)
+- User application to CONNECT to VPN server
+- Sends certificate + identity to server
+- Server validates identity with account-manager
+- Opens tunnel to Windows box
+- Located: `RockyWearsAHat/Secure-VPN` (same repo, client code)
+- **RUNS ON: Mac only**
+- **INSTALLED TO: /Applications/SecureVPN.app** (or run as CLI)
 
 ## Current State - DONE ✅
 
