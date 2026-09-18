@@ -58,16 +58,10 @@ CREATE TABLE IF NOT EXISTS vpn_locations (
     created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 
--- Location permissions
-CREATE TABLE IF NOT EXISTS location_permissions (
-    id TEXT PRIMARY KEY,
-    user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-    location_id TEXT NOT NULL REFERENCES vpn_locations(id) ON DELETE CASCADE,
-    granted_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    granted_by TEXT REFERENCES users(id),
-    expires_at TIMESTAMP,
-    UNIQUE(user_id, location_id)
-);
+-- VPN location access is decided by the admin capability API
+-- (crates/app/admin's Capability::VpnAccess, checked via /api/vpn/check-access),
+-- not by a table in this database — there is no grant path in this service
+-- that could ever populate one. See account-manager's check_access handler.
 
 -- Action approvals (specific action permissions)
 CREATE TABLE IF NOT EXISTS action_approvals (
@@ -275,8 +269,6 @@ CREATE INDEX IF NOT EXISTS idx_users_username ON users(username);
 CREATE INDEX IF NOT EXISTS idx_users_status ON users(status);
 CREATE INDEX IF NOT EXISTS idx_sessions_user_id ON sessions(user_id);
 CREATE INDEX IF NOT EXISTS idx_sessions_token_hash ON sessions(token_hash);
-CREATE INDEX IF NOT EXISTS idx_location_permissions_user_id ON location_permissions(user_id);
-CREATE INDEX IF NOT EXISTS idx_location_permissions_location_id ON location_permissions(location_id);
 CREATE INDEX IF NOT EXISTS idx_vpn_sessions_user_id ON vpn_sessions(user_id);
 CREATE INDEX IF NOT EXISTS idx_vpn_sessions_token ON vpn_sessions(token);
 CREATE INDEX IF NOT EXISTS idx_vpn_sessions_expires_at ON vpn_sessions(expires_at);

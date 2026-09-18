@@ -6,6 +6,9 @@ use sqlx::sqlite::SqlitePool;
 use uuid::Uuid;
 use chrono::{Duration, Utc};
 use rand::Rng;
+use std::path::PathBuf;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpStream;
 
 #[derive(Serialize, Deserialize, Clone)]
 struct User {
@@ -327,27 +330,146 @@ async fn revoke_perm(pool: web::Data<SqlitePool>, path: web::Path<(String, Strin
     }
 }
 
+/// Where the admin capability API listens. Account-manager runs as an
+/// independent process with its own working directory, so it cannot share
+/// `Config` with the admin daemon — this is configured on its own.
+fn admin_bind() -> String {
+    std::env::var("SELFHOST_ADMIN_BIND").unwrap_or_else(|_| "127.0.0.1:9191".to_string())
+}
+
+/// Path to the admin daemon's bearer token file. Per docs/SECURITY.md, no
+/// service ever receives a secret itself — only a path to read one from. The
+/// fallback is a best-effort guess; a wrong guess just fails the read below
+/// and the check denies, so it is safe to get wrong.
+fn admin_token_file() -> PathBuf {
+    if let Ok(path) = std::env::var("SELFHOST_ADMIN_TOKEN_FILE") {
+        return PathBuf::from(path);
+    }
+    if cfg!(windows) {
+        PathBuf::from(std::env::var("USERPROFILE").unwrap_or_else(|_| "C:\\Users\\Alex".to_string()))
+            .join("Self-Host")
+            .join("data")
+            .join("admin.token")
+    } else {
+        PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| "/root".to_string()))
+            .join("Self-Host")
+            .join("data")
+            .join("admin.token")
+    }
+}
+
+/// Asks the admin capability API whether `person` holds `vpn.access` for
+/// `location`. Fails closed: any error along the way returns `Err`, and the
+/// caller treats that as "not allowed" — never a default-allow.
+///
+/// A one-shot raw-socket client rather than a general HTTP client, mirroring
+/// `doctor.rs`'s `ask_daemon` — the established shape for this codebase's
+/// loopback admin calls, kept to the one request/response it needs so it
+/// doesn't grow into an HTTP client nobody maintains.
+async fn admin_check_access(person: &str, location: &str) -> Result<(bool, String), String> {
+    const DEADLINE: std::time::Duration = std::time::Duration::from_secs(3);
+    const MAX_BODY: usize = 64 * 1024;
+
+    let token_path = admin_token_file();
+    let token = std::fs::read_to_string(&token_path).map_err(|error| {
+        format!("admin token at {} could not be read ({error})", token_path.display())
+    })?;
+    let token = token.trim();
+    if token.is_empty() {
+        return Err("admin token file is empty".to_string());
+    }
+
+    let bind = admin_bind();
+    let address: std::net::SocketAddr = bind
+        .parse()
+        .map_err(|error| format!("SELFHOST_ADMIN_BIND {bind} is not an address: {error}"))?;
+
+    let body = json!({"user_id": person, "location_id": location}).to_string();
+
+    let exchange = async {
+        let mut stream = TcpStream::connect(address)
+            .await
+            .map_err(|error| format!("nothing is answering on {address}: {error}"))?;
+        let request = format!(
+            "POST /api/vpn/check-access HTTP/1.1\r\nHost: {address}\r\nAuthorization: Bearer {token}\r\n\
+             Content-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        stream
+            .write_all(request.as_bytes())
+            .await
+            .map_err(|error| format!("the admin daemon closed the connection: {error}"))?;
+        let mut raw = Vec::new();
+        let mut buffer = [0u8; 4096];
+        loop {
+            let read = stream
+                .read(&mut buffer)
+                .await
+                .map_err(|error| format!("the admin daemon's answer stopped: {error}"))?;
+            if read == 0 {
+                break;
+            }
+            raw.extend_from_slice(buffer.get(..read).unwrap_or_default());
+            if raw.len() > MAX_BODY {
+                return Err("the admin daemon's answer is larger than this will read".to_string());
+            }
+        }
+        Ok(raw)
+    };
+
+    let raw = tokio::time::timeout(DEADLINE, exchange)
+        .await
+        .map_err(|_| format!("{address} did not answer within {}s", DEADLINE.as_secs()))??;
+
+    let text = String::from_utf8_lossy(&raw);
+    let (head, resp_body) = text
+        .split_once("\r\n\r\n")
+        .ok_or_else(|| "the admin daemon's answer had no complete head".to_string())?;
+    let status = head.split_whitespace().nth(1).unwrap_or_default();
+    if status != "200" {
+        return Err(format!("the admin daemon answered {status}"));
+    }
+
+    let parsed: serde_json::Value = serde_json::from_str(resp_body.trim())
+        .map_err(|error| format!("the admin daemon's answer is not JSON: {error}"))?;
+    let allowed = parsed.get("allowed").and_then(|v| v.as_bool()).unwrap_or(false);
+    let reason = parsed
+        .get("reason")
+        .and_then(|v| v.as_str())
+        .unwrap_or(if allowed { "Access granted" } else { "No permission for this location" })
+        .to_string();
+    Ok((allowed, reason))
+}
+
 async fn check_access(pool: web::Data<SqlitePool>, body: web::Json<serde_json::Value>) -> HttpResponse {
     let user_id = body.get("user_id").and_then(|v| v.as_str()).unwrap_or("");
     let location_id = body.get("location_id").and_then(|v| v.as_str()).unwrap_or("");
 
-    match sqlx::query(
-        "SELECT 1 FROM location_permissions WHERE user_id = ? AND location_id = ? AND (expires_at IS NULL OR expires_at > CURRENT_TIMESTAMP)"
-    )
-    .bind(user_id)
-    .bind(location_id)
-    .fetch_optional(pool.as_ref())
-    .await {
-        Ok(Some(_)) => HttpResponse::Ok().json(json!({
-            "allowed": true,
-            "reason": "Access granted",
+    // The People registry keys identities by name (e.g. "alex"), not by this
+    // service's own row id, so translate before asking the admin API.
+    let username: Option<(String,)> = sqlx::query_as("SELECT username FROM users WHERE id = ?")
+        .bind(user_id)
+        .fetch_optional(pool.as_ref())
+        .await
+        .unwrap_or(None);
+    let Some((username,)) = username else {
+        return HttpResponse::Ok().json(json!({"allowed": false, "reason": "unknown user"}));
+    };
+
+    match admin_check_access(&username, location_id).await {
+        Ok((allowed, reason)) => HttpResponse::Ok().json(json!({
+            "allowed": allowed,
+            "reason": reason,
             "session_timeout": 86400
         })),
-        Ok(None) => HttpResponse::Ok().json(json!({
-            "allowed": false,
-            "reason": "No permission for this location"
-        })),
-        Err(_) => HttpResponse::InternalServerError().json(json!({"allowed": false}))
+        Err(error) => {
+            log::error!("admin capability check failed: {error}");
+            HttpResponse::Ok().json(json!({
+                "allowed": false,
+                "reason": "could not reach the access-control service"
+            }))
+        }
     }
 }
 

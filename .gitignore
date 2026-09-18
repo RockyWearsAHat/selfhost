@@ -1,6 +1,14 @@
-# Rust build output
+# Rust build output. Anchored at /target/ only used to be enough when every
+# crate built into the one workspace target/ at the repo root; account-manager
+# was built standalone from inside its own directory at least once, which
+# cargo happily does by creating a second target/ right there — hence **/.
 /target/
+**/target/
 **/*.rs.bk
+
+# JS/TS dependency trees — never source, always npm install-able from a
+# committed package.json/package-lock.json.
+**/node_modules/
 
 # Persistent state: databases, mail spools, TLS keys and certificates, backups.
 # Deleting this loses the deployment — it is what the backups are for.
