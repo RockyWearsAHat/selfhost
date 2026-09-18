@@ -14,7 +14,7 @@
 # the real page and nothing is written to the system temp directory, so the whole harness
 # runs inside a dx block that has been granted `writes=target` and nothing else.
 set -u
-ROOT=/Users/alexwaldmann/Desktop/Self-Host
+ROOT=/Users/alexwaldmann/Self-Host
 ASSETS="$ROOT/crates/reports/assets"
 DIR="${SELFHOST_FRAME_DIR:-$ROOT/target/ui-frames}"
 HERE="$(cd "$(dirname "$0")" && pwd)"

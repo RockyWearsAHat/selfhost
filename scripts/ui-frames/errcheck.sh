@@ -5,7 +5,7 @@
 # one line per state to target/ui-frames/errcheck.txt, which the dx block in reports-ui-lab.dx
 # reads as its verdict. A screenshot proves the markup; only this proves the behaviour.
 set -u
-ROOT=/Users/alexwaldmann/Desktop/Self-Host
+ROOT=/Users/alexwaldmann/Self-Host
 CHROME="${CHROME:-/Applications/Google Chrome.app/Contents/MacOS/Google Chrome}"
 HERE="$(cd "$(dirname "$0")" && pwd)"
 DIR="${SELFHOST_FRAME_DIR:-$ROOT/target/ui-frames}"
