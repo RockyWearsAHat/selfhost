@@ -88,6 +88,7 @@
 #![warn(missing_docs)]
 
 pub mod attribution;
+pub mod image_auth;
 pub mod keys;
 pub mod roster;
 pub mod runner;
@@ -95,6 +96,7 @@ pub mod state;
 pub mod updater;
 
 pub use attribution::{Attributed, Attribution, Unanswered, who_arrived_at};
+pub use image_auth::{ImageAuthConfig, validate_image_auth_key};
 pub use keys::KeyReport;
 pub use roster::{Enrolled, Rejected, Roster};
 pub use runner::{Install, Launch, service_name};

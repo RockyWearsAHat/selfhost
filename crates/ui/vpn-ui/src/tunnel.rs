@@ -60,7 +60,7 @@ pub struct Endpoint {
 
 impl Default for Endpoint {
     fn default() -> Self {
-        Self { server_host: "rockywearsahat.com".into(), server_port: 8443, local_port: 8443 }
+        Self { server_host: "rockywearsahat.com".into(), server_port: 8500, local_port: 2222 }
     }
 }
 
@@ -646,11 +646,11 @@ mod tests {
     #[test]
     fn the_markers_drive_the_phase() {
         let mut link = Link::default();
-        interpret("Connecting to VPN server at 192.168.1.8:8443...", &mut link);
+        interpret("Connecting to VPN server at 192.168.1.8:8500...", &mut link);
         assert_eq!(link.phase, Phase::Dialling);
         interpret("✓ Handshake complete, server authenticated, secure tunnel ready", &mut link);
         assert_eq!(link.phase, Phase::Authenticated);
-        interpret("✓ Local SSH proxy listening on 127.0.0.1:8443", &mut link);
+        interpret("✓ Local SSH proxy listening on 127.0.0.1:8500", &mut link);
         assert_eq!(link.phase, Phase::Up);
         assert!(link.since.is_some());
     }
@@ -683,7 +683,7 @@ mod tests {
     #[test]
     fn coming_up_does_not_get_downgraded_by_a_later_dialling_line() {
         let mut link = Link::default();
-        interpret("✓ Local SSH proxy listening on 127.0.0.1:8443", &mut link);
+        interpret("✓ Local SSH proxy listening on 127.0.0.1:8500", &mut link);
         let when = link.since;
         interpret("Connecting to VPN server at ...", &mut link);
         assert_eq!(link.phase, Phase::Up);

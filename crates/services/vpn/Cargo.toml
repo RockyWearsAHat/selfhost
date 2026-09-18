@@ -18,6 +18,8 @@ selfhost-config = { workspace = true }
 selfhost-identity = { workspace = true }
 # The wire format the admin API and both consoles already speak.
 selfhost-json = { workspace = true }
+# Visual-entropy image-based authentication for VPN connections.
+selfhost-orchid-images = { workspace = true }
 # The relay is one more supervised child. Nothing here spawns a process itself.
 selfhost-supervisor = { workspace = true }
 tokio = { workspace = true }

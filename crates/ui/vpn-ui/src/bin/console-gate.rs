@@ -4,7 +4,7 @@
 //! It listens on `127.0.0.1:443` — the *specific* loopback address, beside any
 //! wildcard `*:443` the reverse proxy holds (BSD delivers a loopback connect to
 //! the most specific bound socket) — and splices each connection, byte for
-//! byte, to the Secure-VPN tunnel's local end at `127.0.0.1:8443`. TLS passes
+//! byte, to the Secure-VPN tunnel's local end at `127.0.0.1:8500`. TLS passes
 //! through untouched, so the certificate the browser verifies is the far end's
 //! real one. With the scoped resolver mapping `admin.rockywearsahat.com` to
 //! loopback, `https://admin.rockywearsahat.com/` lands here and comes out of
@@ -28,7 +28,7 @@ use std::time::Duration;
 const GATE: SocketAddr = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 443));
 
 /// The Secure-VPN client's local end, the far side of every splice.
-const TUNNEL: SocketAddr = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 8443));
+const TUNNEL: SocketAddr = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 8500));
 
 /// How long a connect to the tunnel may take before the client is dropped.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
