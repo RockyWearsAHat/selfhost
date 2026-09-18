@@ -264,7 +264,7 @@ fn build_relays(config: &Config, project_dir: &Path) -> Result<Relays, String> {
         return Err("no [[vpn]] relays are declared in selfhost.config.toml".to_owned());
     }
 
-    Ok(Relays::new(supervisor, &data_dir, install, vpn_relays))
+    Ok(Relays::new(supervisor, &data_dir, &config.server.admin_bind, install, vpn_relays))
 }
 
 /// Prints a table of relay summaries.

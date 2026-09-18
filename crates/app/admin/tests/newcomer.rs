@@ -81,6 +81,12 @@ const SURFACE: &[(&str, &str, Reach)] = &[
     ("GET", "/api/desktop", Reach::Granted),
     ("GET", "/api/desktop/nodes", Reach::Granted),
     ("GET", "/api/desktop/agent", Reach::Granted),
+    ("GET", "/api/maintenance/status", Reach::Granted),
+    // Capability::ConsoleRead again — the same credential a VPN relay's own
+    // account-manager check presents to ask "may this person use this
+    // location" (crates/services/vpn/src/runner.rs's `--account-manager`),
+    // not a door a browser session walks through for itself.
+    ("POST", "/api/vpn/check-access", Reach::Granted),
     ("GET", "/api/storage/shares", Reach::Granted),
     // Capability::FilesRead(vault) — held, on this share only.
     ("GET", "/api/storage/shares/vault/list", Reach::Granted),

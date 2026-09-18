@@ -133,7 +133,7 @@ pub mod policy;
 pub mod registry;
 
 pub use audit::{AuditId, AuditLog, AuditRecord, TRUNCATED, escape_field, unescape_field};
-pub use capability::{Capability, InvalidToken, NodeName, ShareId};
+pub use capability::{Capability, InvalidToken, NodeName, ShareId, VpnLocationId};
 pub use credential::{Credential, Opening, Session};
 pub use identity::{AgentName, Identity, InvalidAgentName, InvalidPersonName, OWNER_NAME, PersonName};
 pub use policy::{Caller, Decision, Grants, Granted, Policy, Refusal, TooManyGrants};

@@ -6,7 +6,7 @@
 
 use selfhost_http::{Response, Status};
 use selfhost_json::Json;
-use selfhost_identity::{People, PersonName};
+use selfhost_identity::{Capability, People, PersonName, VpnLocationId};
 
 /// Checks if a user has access to a specific VPN location.
 ///
@@ -28,7 +28,7 @@ pub fn check_access(people: Option<&People>, body: &[u8]) -> Response {
         None => return problem(Status(400), "missing or invalid user_id"),
     };
 
-    let _location_id = match json.get("location_id").and_then(|v| v.as_str()) {
+    let location_id = match json.get("location_id").and_then(|v| v.as_str()) {
         Some(lid) => lid,
         None => return problem(Status(400), "missing or invalid location_id"),
     };
@@ -50,19 +50,23 @@ pub fn check_access(people: Option<&People>, body: &[u8]) -> Response {
     };
 
     // Check if user exists
-    let Some(_person) = people.find(&name) else {
+    let Some(person) = people.find(&name) else {
         return json_response(Status(200), Json::object([
             ("allowed", Json::Bool(false)),
             ("reason", Json::String("user not found".to_string())),
         ]));
     };
 
-    // For now, grant access to all users for any location
-    // This is a placeholder implementation that will be replaced with
-    // actual permission checking once the People registry supports VPN grants.
-    //
-    // TODO: Check for "vpn.location.<location_id>" capability in person's grants
-    let has_access = true;
+    // A location that fails its own grammar can never have been granted —
+    // same reasoning as an invalid user_id above.
+    let Ok(location) = VpnLocationId::parse(location_id) else {
+        return json_response(Status(200), Json::object([
+            ("allowed", Json::Bool(false)),
+            ("reason", Json::String("invalid location_id".to_string())),
+        ]));
+    };
+
+    let has_access = person.grants.holds(&Capability::VpnAccess(location));
 
     if has_access {
         json_response(
@@ -98,6 +102,29 @@ fn json_response(status: Status, body: Json) -> Response {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use selfhost_http::Body;
+    use selfhost_identity::{Grants, People};
+    use std::path::PathBuf;
+
+    /// A scratch directory unique to one test.
+    ///
+    /// Named per test rather than per process: tests run concurrently, and a
+    /// shared directory means one test deletes the file another is asserting on.
+    fn scratch(name: &str) -> PathBuf {
+        let path = std::env::temp_dir()
+            .join(format!("selfhost-vpn-api-test-{}-{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&path);
+        std::fs::create_dir_all(&path).unwrap();
+        path
+    }
+
+    fn allowed(response: &Response) -> bool {
+        let Body::Bytes(bytes) = &response.body else {
+            panic!("expected a bytes body");
+        };
+        let json = selfhost_json::parse(std::str::from_utf8(bytes).unwrap()).unwrap();
+        json.get("allowed").and_then(|v| v.as_bool()).expect("an allowed field")
+    }
 
     #[test]
     fn test_check_access_missing_user_id() {
@@ -109,5 +136,51 @@ mod tests {
     fn test_check_access_no_registry() {
         let response = check_access(None, b"{\"user_id\":\"test\",\"location_id\":\"us-east-1\"}");
         assert_eq!(response.status.0, 200);
+        assert!(!allowed(&response), "no registry means nobody is allowed");
+    }
+
+    #[test]
+    fn an_unknown_user_is_denied() {
+        let people = People::load(&scratch("unknown-user"));
+        let response =
+            check_access(Some(&people), br#"{"user_id":"nobody","location_id":"console"}"#);
+        assert!(!allowed(&response));
+    }
+
+    #[test]
+    fn a_registered_user_with_no_vpn_grant_is_denied() {
+        let people = People::load(&scratch("no-grant"));
+        people
+            .set_grants(&PersonName::parse("alex").unwrap(), Grants::none())
+            .expect("register alex");
+        let response =
+            check_access(Some(&people), br#"{"user_id":"alex","location_id":"console"}"#);
+        assert!(!allowed(&response), "no vpn.access grant must not open the door");
+    }
+
+    #[test]
+    fn a_user_granted_a_different_location_is_still_denied() {
+        let people = People::load(&scratch("wrong-location"));
+        let grants = Grants::new([Capability::VpnAccess(
+            selfhost_identity::VpnLocationId::parse("ai-studio").unwrap(),
+        )])
+        .unwrap();
+        people.set_grants(&PersonName::parse("alex").unwrap(), grants).expect("register alex");
+        let response =
+            check_access(Some(&people), br#"{"user_id":"alex","location_id":"console"}"#);
+        assert!(!allowed(&response), "a grant for one location must not open another");
+    }
+
+    #[test]
+    fn a_user_granted_the_exact_location_is_allowed() {
+        let people = People::load(&scratch("exact-location"));
+        let grants = Grants::new([Capability::VpnAccess(
+            selfhost_identity::VpnLocationId::parse("console").unwrap(),
+        )])
+        .unwrap();
+        people.set_grants(&PersonName::parse("alex").unwrap(), grants).expect("register alex");
+        let response =
+            check_access(Some(&people), br#"{"user_id":"alex","location_id":"console"}"#);
+        assert!(allowed(&response));
     }
 }

@@ -729,7 +729,11 @@ fn the_machine_may(want: &Capability) -> bool {
         | Capability::NodeAdmin
         | Capability::SiteAdmin
         | Capability::DnsAdmin
-        | Capability::MailAdmin => false,
+        | Capability::MailAdmin
+        // A VPN location grant belongs to a *person* — it is what the
+        // account-manager checks the tunnel's peer against, not something the
+        // box's own automation token needs to assert about itself.
+        | Capability::VpnAccess(_) => false,
     }
 }
 
@@ -744,7 +748,7 @@ impl Default for Policy {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::capability::{NodeName, ShareId};
+    use crate::capability::{NodeName, ShareId, VpnLocationId};
     use crate::credential::Opening;
     use crate::identity::{AgentName, PersonName};
     use std::time::{Duration, Instant};
@@ -779,6 +783,10 @@ mod tests {
         NodeName::parse("home").expect("a valid node name")
     }
 
+    fn location() -> VpnLocationId {
+        VpnLocationId::parse("console").expect("a valid vpn location id")
+    }
+
     fn person() -> Identity {
         Identity::Person(PersonName::parse("Mom").expect("a valid name"))
     }
@@ -804,6 +812,7 @@ mod tests {
                 | Capability::SiteAdmin
                 | Capability::DnsAdmin
                 | Capability::MailAdmin
+                | Capability::VpnAccess(_)
         )
     }
 
@@ -818,7 +827,7 @@ mod tests {
             [Capability::SiteAdmin, Capability::DnsAdmin, Capability::MailAdmin];
         for held in &configuring {
             let grants = Grants::new([held.clone()]).expect("one grant");
-            for want in Capability::every_shape(&share(), &node()) {
+            for want in Capability::every_shape(&share(), &node(), &location()) {
                 assert_eq!(
                     grants.holds(&want),
                     *held == want,
@@ -889,7 +898,7 @@ mod tests {
         // Swept under both policies, because neither the arming switch nor the
         // passkey fact has anything to say about this credential.
         for policy in [Policy::locked_down(), Policy::new(true).with_passkey_enrolled(true)] {
-            for want in Capability::every_shape(&share(), &node()) {
+            for want in Capability::every_shape(&share(), &node(), &location()) {
                 let expected = if withheld_from_the_machine(&want) {
                     Decision::Refuse(Refusal::OutsideTheMachinesScope)
                 } else if want.drives_a_machine() && !policy.unattended_may_control() {
@@ -904,7 +913,7 @@ mod tests {
         }
         // A grant set cannot widen it: there is no registry entry for a token,
         // and a hand-edited one naming the machine must buy nothing.
-        let everything = Grants::new(Capability::every_shape(&share(), &node())).unwrap();
+        let everything = Grants::new(Capability::every_shape(&share(), &node(), &location())).unwrap();
         let forged = Caller::new(Identity::Machine, Credential::Bearer, everything);
         assert_eq!(
             Policy::new(true).decide(&forged, &Capability::SiteAdmin),
@@ -921,7 +930,7 @@ mod tests {
         let logged_in = Caller::new(Identity::Owner, session_of(Opening::Password), Grants::none());
         let fresh = Policy::locked_down();
         let enrolled = fresh.with_passkey_enrolled(true);
-        for want in Capability::every_shape(&share(), &node()) {
+        for want in Capability::every_shape(&share(), &node(), &location()) {
             // Everything, including the keyboard: a cookie is not unattended,
             // so how recently a person proved themselves is the freshness rule's
             // question and is answered at the ticket rather than here.
@@ -949,7 +958,7 @@ mod tests {
         let enrolled = Policy::locked_down().with_passkey_enrolled(true);
         let by_passkey =
             Caller::new(Identity::Owner, session_of(Opening::Passkey), Grants::none());
-        for want in Capability::every_shape(&share(), &node()) {
+        for want in Capability::every_shape(&share(), &node(), &location()) {
             assert_eq!(enrolled.decide(&by_passkey, &want), Decision::Allow, "{want}");
             assert_eq!(
                 enrolled.decide(&Caller::passkey(Identity::Owner, Grants::none()), &want),
@@ -972,7 +981,7 @@ mod tests {
         // Asymmetry two: the grant set is not consulted for the owner, so no
         // registry state can lock the operator out of their own console.
         let stripped = Caller::new(Identity::Owner, Credential::Passkey, Grants::none());
-        for want in Capability::every_shape(&share(), &node()) {
+        for want in Capability::every_shape(&share(), &node(), &location()) {
             assert_eq!(
                 Policy::locked_down().decide(&stripped, &want),
                 Decision::Allow,
@@ -997,7 +1006,7 @@ mod tests {
             // whether or not the keyboard is armed. This rule is about the other
             // seven, and the two credentials answer identically across them.
             let machine = unattended.identity().is_machine();
-            for want in Capability::every_shape(&share(), &node()) {
+            for want in Capability::every_shape(&share(), &node(), &location()) {
                 if machine && withheld_from_the_machine(&want) {
                     continue;
                 }
@@ -1044,9 +1053,9 @@ mod tests {
         {
             // Even fully granted, and even with the bearer armed: the pair is
             // incoherent and the refusal comes first.
-            let grants = Grants::new(Capability::every_shape(&share(), &node())).unwrap();
+            let grants = Grants::new(Capability::every_shape(&share(), &node(), &location())).unwrap();
             let caller = Caller::new(person(), credential, grants);
-            for want in Capability::every_shape(&share(), &node()) {
+            for want in Capability::every_shape(&share(), &node(), &location()) {
                 assert_eq!(
                     Policy::new(true).decide(&caller, &want),
                     Decision::Refuse(Refusal::CredentialIsNotThisIdentitys),
@@ -1082,7 +1091,7 @@ mod tests {
     #[test]
     fn a_person_with_no_grants_is_refused_everything() {
         let caller = Caller::passkey(person(), Grants::none());
-        for want in Capability::every_shape(&share(), &node()) {
+        for want in Capability::every_shape(&share(), &node(), &location()) {
             assert_eq!(
                 Policy::new(true).decide(&caller, &want),
                 Decision::Refuse(Refusal::NotGranted),
@@ -1093,7 +1102,7 @@ mod tests {
 
     #[test]
     fn a_person_holds_exactly_what_they_were_granted_and_what_it_implies() {
-        let shapes = Capability::every_shape(&share(), &node());
+        let shapes = Capability::every_shape(&share(), &node(), &location());
         for granted in &shapes {
             let caller =
                 Caller::passkey(person(), Grants::new([granted.clone()]).expect("one grant"));
@@ -1118,7 +1127,7 @@ mod tests {
         // agent scoped to `site.admin` alone can do site things and nothing
         // else — not console reads, not service control, not another site's
         // capability by accident, and never the owner's blanket allow.
-        let shapes = Capability::every_shape(&share(), &node());
+        let shapes = Capability::every_shape(&share(), &node(), &location());
         for granted in &shapes {
             let scoped = Caller::agent(
                 AgentName::parse("claude-mac").unwrap(),
@@ -1203,7 +1212,7 @@ mod tests {
         // The exhaustive sweep. It asserts the model against an independently
         // written expectation rather than against itself: if `decide` grows a
         // rule that this table does not describe, the sweep fails.
-        let shapes = Capability::every_shape(&share(), &node());
+        let shapes = Capability::every_shape(&share(), &node(), &location());
         let full = Grants::new(shapes.clone()).expect("every shape fits under the cap");
         let policies = [
             Policy::locked_down(),
