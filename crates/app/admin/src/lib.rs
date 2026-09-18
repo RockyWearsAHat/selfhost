@@ -59,6 +59,7 @@ pub mod store;
 pub mod stream;
 pub mod token;
 pub mod upgrade;
+pub mod vpn_api;
 pub mod webauthn;
 
 use selfhost_firewall::Manager;
@@ -517,6 +518,8 @@ enum Route<'a> {
     SiteFileDelete(&'a str),
     /// `GET /api/maintenance/status`
     MaintenanceStatus,
+    /// `POST /api/vpn/check-access`
+    VpnCheckAccess,
 }
 
 impl<'a> Route<'a> {
@@ -621,6 +624,7 @@ impl<'a> Route<'a> {
             (Method::Get, ["api", "sites", name]) => Some(Self::SiteShow(name)),
             (Method::Delete, ["api", "sites", name]) => Some(Self::SiteRemove(name)),
             (Method::Get, ["api", "maintenance", "status"]) => Some(Self::MaintenanceStatus),
+            (Method::Post, ["api", "vpn", "check-access"]) => Some(Self::VpnCheckAccess),
             _ => None,
         }
     }
@@ -659,7 +663,8 @@ impl<'a> Route<'a> {
             | Self::DesktopSettings
             | Self::DesktopNodes
             | Self::Shares
-            | Self::MaintenanceStatus => Demand::Held(Capability::ConsoleRead),
+            | Self::MaintenanceStatus
+            | Self::VpnCheckAccess => Demand::Held(Capability::ConsoleRead),
             // Per-node and per-share, so the target has to be a name the
             // vocabulary can hold. One that is not names nothing this
             // deployment serves, and refusing it as though it were somebody
@@ -1408,6 +1413,7 @@ impl Api {
             Route::SiteFilePut(name) => self.sites_file_put(name, query, body),
             Route::SiteFileDelete(name) => self.sites_file_delete(name, query),
             Route::MaintenanceStatus => self.maintenance_status(),
+            Route::VpnCheckAccess => vpn_api::check_access(self.people.as_ref(), body),
         }
     }
 

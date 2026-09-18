@@ -3621,3 +3621,55 @@ async fn site_files_round_trip_and_traversal_is_refused() {
     assert_eq!(status, 400, "a traversal attempt must be refused, not resolved");
     assert!(!dir.path().join("etc").exists(), "nothing was written outside the managed directory");
 }
+
+/// VPN access control: check-access endpoint returns allow/deny based on permissions.
+#[tokio::test]
+async fn vpn_check_access_endpoint_exists_and_authenticates() {
+    let (api, _dir) = api("vpn-check-access");
+
+    // Without authentication: 401
+    let (status, _) = call(&api, "POST", "/api/vpn/check-access", None, r#"{"user_id":"test","location_id":"us-east-1"}"#).await;
+    assert_eq!(status, 401, "unauthenticated request must be refused");
+
+    // With authentication: 200 (no user registered, so access denied)
+    let (status, body) = call(&api, "POST", "/api/vpn/check-access", Some(TOKEN), r#"{"user_id":"test","location_id":"us-east-1"}"#).await;
+    assert_eq!(status, 200, "check-access must return 200");
+    
+    // Check the response format
+    let allowed = body.get("allowed").and_then(|v| v.as_bool());
+    assert!(allowed.is_some(), "response must have 'allowed' boolean field");
+    assert!(!allowed.unwrap(), "access should be denied for unregistered user");
+}
+
+/// VPN access control: proper response format with reason on denial.
+#[tokio::test]
+async fn vpn_check_access_denies_unknown_user() {
+    let (api, _dir) = api("vpn-unknown-user");
+
+    let (status, body) = call(&api, "POST", "/api/vpn/check-access", Some(TOKEN), r#"{"user_id":"unknown_person","location_id":"us-west-2"}"#).await;
+    assert_eq!(status, 200, "check-access returns 200 for denial");
+    
+    let allowed = body.get("allowed").and_then(|v| v.as_bool());
+    assert_eq!(allowed, Some(false), "access should be denied");
+    
+    let reason = body.get("reason").and_then(|v| v.as_str());
+    assert!(reason.is_some(), "response should include denial reason");
+}
+
+/// VPN access control: bad requests are rejected with 400.
+#[tokio::test]
+async fn vpn_check_access_validates_request_format() {
+    let (api, _dir) = api("vpn-validation");
+
+    // Missing user_id
+    let (status, _) = call(&api, "POST", "/api/vpn/check-access", Some(TOKEN), r#"{"location_id":"us-east-1"}"#).await;
+    assert_eq!(status, 400, "missing user_id must return 400");
+
+    // Missing location_id
+    let (status, _) = call(&api, "POST", "/api/vpn/check-access", Some(TOKEN), r#"{"user_id":"test"}"#).await;
+    assert_eq!(status, 400, "missing location_id must return 400");
+
+    // Invalid JSON
+    let (status, _) = call(&api, "POST", "/api/vpn/check-access", Some(TOKEN), "not json").await;
+    assert_eq!(status, 400, "invalid JSON must return 400");
+}

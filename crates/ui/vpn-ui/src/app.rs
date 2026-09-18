@@ -80,7 +80,7 @@ fn build_mini_panel(actions: Arc<Mutex<Vec<MiniAction>>>) -> Result<MiniPanel, S
         .add_label(pad, MINI_HEIGHT - 52.0, inner, 20.0, "OFFLINE")
         .map_err(|e| format!("{e:?}"))?;
     let detail = window
-        .add_label(pad, MINI_HEIGHT - 72.0, inner, 16.0, "rockywearsahat.com:8443")
+        .add_label(pad, MINI_HEIGHT - 72.0, inner, 16.0, "rockywearsahat.com:8500")
         .map_err(|e| format!("{e:?}"))?;
     let _ = window.set_text_color(&detail, MUTED);
 
@@ -1195,7 +1195,7 @@ mod tests {
         for (name, link) in states() {
             let mut harness = window(link, SIZES[1]);
             harness.frame();
-            assert!(harness.shows("rockywearsahat.com:8443"), "{name} shows the endpoint");
+            assert!(harness.shows("rockywearsahat.com:8500"), "{name} shows the endpoint");
             assert!(harness.shows("THE BOX"), "{name} keeps the far caption");
             assert!(harness.shows("Auto-rotate weekly"), "{name} names the switch in plain words");
         }

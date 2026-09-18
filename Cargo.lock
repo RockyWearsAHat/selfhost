@@ -945,6 +945,7 @@ dependencies = [
  "selfhost-config",
  "selfhost-identity",
  "selfhost-json",
+ "selfhost-orchid-images",
  "selfhost-supervisor",
  "tokio",
 ]
