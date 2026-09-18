@@ -233,11 +233,23 @@ impl Launch {
 /// derived here, because resolving it is [`crate::keys`]'s job and two places
 /// deriving one path is how a relay ends up reading its keys from a directory
 /// nobody inspected.
+///
+/// `admin_bind` and `admin_token_path` point the server at the deployment's own
+/// admin API (`crates/app/admin/src/vpn_api.rs`'s `POST /api/vpn/check-access`)
+/// so a completed handshake still has to hold `vpn.access:<relay.name>` before
+/// the tunnel is handed to it — see `docs/SECURITY.md` on why a valid Ed25519
+/// key alone was never meant to be the whole story. `admin_token_path` is a
+/// *path*, never the token's bytes, on this command line: the same posture
+/// `--key-dir` already has, and the reason the service's own environment stays
+/// empty (see [`service`]) — the file's permissions are the credential's real
+/// protection, not process isolation.
 pub fn plan(
     relay: &Relay,
     roster: &Roster,
     install: &Install,
     key_dir: &Path,
+    admin_bind: &str,
+    admin_token_path: &Path,
 ) -> Result<Launch, VpnError> {
     let listen = relay.listen_addr().ok_or_else(|| VpnError::Unaddressable {
         relay: relay.name.clone(),
@@ -267,6 +279,12 @@ pub fn plan(
     args.push(key_dir.display().to_string());
     args.push("--identity".to_owned());
     args.push(SERVER_IDENTITY.to_owned());
+    args.push("--account-manager".to_owned());
+    args.push(format!("http://{admin_bind}"));
+    args.push("--account-manager-token-file".to_owned());
+    args.push(admin_token_path.display().to_string());
+    args.push("--location".to_owned());
+    args.push(relay.name.clone());
 
     // One `--peer` per *usable* entry, in roster order. A peer the roster
     // rejected is absent from this vector, which is what makes "dropped because
@@ -353,12 +371,21 @@ mod tests {
         PathBuf::from(r"C:\ProgramData\selfhost\securevpn\keys")
     }
 
+    fn admin_bind() -> String {
+        "127.0.0.1:9191".to_owned()
+    }
+
+    fn admin_token_path() -> PathBuf {
+        PathBuf::from(r"C:\ProgramData\selfhost\admin.token")
+    }
+
     #[test]
     fn the_invocation_is_the_one_the_production_box_already_runs() {
         // Read off scripts/securevpn/install-vpn-service.ps1, with `--peer`
-        // repeated as the multi-peer change made it. If this ever has to change,
-        // the script has to change in the same commit — that is what the test is
-        // for.
+        // repeated as the multi-peer change made it, and now the account-manager
+        // arguments `Relays::preflight` adds so a completed handshake still has to
+        // clear `vpn.access:<relay>`. If this ever has to change, the script has
+        // to change in the same commit — that is what the test is for.
         let mut relay = forwarding_relay();
         relay.listen = "0.0.0.0:8443".into();
         relay.public = true;
@@ -368,7 +395,8 @@ mod tests {
         ];
         let roster = Roster::build(&relay);
 
-        let launch = plan(&relay, &roster, &install(), &keys()).expect("a runnable relay");
+        let launch = plan(&relay, &roster, &install(), &keys(), &admin_bind(), &admin_token_path())
+            .expect("a runnable relay");
         assert_eq!(launch.program, PathBuf::from("python"));
         assert_eq!(
             launch.args,
@@ -389,6 +417,12 @@ mod tests {
                 r"C:\ProgramData\selfhost\securevpn\keys",
                 "--identity",
                 "server",
+                "--account-manager",
+                "http://127.0.0.1:9191",
+                "--account-manager-token-file",
+                r"C:\ProgramData\selfhost\admin.token",
+                "--location",
+                "console",
                 "--peer",
                 "client",
                 "--peer",
@@ -405,7 +439,7 @@ mod tests {
         relay.peers.push(Peer::new("dad-mac", "Dad!", "B".repeat(43)));
         let roster = Roster::build(&relay);
 
-        let launch = plan(&relay, &roster, &install(), &keys()).expect("still runnable");
+        let launch = plan(&relay, &roster, &install(), &keys(), &admin_bind(), &admin_token_path()).expect("still runnable");
         assert!(launch.args.contains(&"alex-mac".to_owned()));
         assert!(!launch.args.contains(&"dad-mac".to_owned()), "{:?}", launch.args);
     }
@@ -418,7 +452,7 @@ mod tests {
         // tunnel from starting.
         let relay = forwarding_relay();
         let roster = Roster::build(&relay);
-        let launch = plan(&relay, &roster, &install(), &keys()).expect("runnable");
+        let launch = plan(&relay, &roster, &install(), &keys(), &admin_bind(), &admin_token_path()).expect("runnable");
         assert!(
             !launch.args.iter().any(|arg| arg == "--peer-forward"),
             "{:?}",
@@ -434,7 +468,7 @@ mod tests {
         // refuse that one peer while coming up looking healthy.
         let relay = attributing_relay();
         let roster = Roster::build(&relay);
-        let launch = plan(&relay, &roster, &install(), &keys()).expect("runnable");
+        let launch = plan(&relay, &roster, &install(), &keys(), &admin_bind(), &admin_token_path()).expect("runnable");
 
         let at = launch.args.iter().position(|arg| arg == "--peer-forward").expect("emitted");
         assert_eq!(launch.args[at + 1], "alex-mac=127.0.0.1:9443");
@@ -454,7 +488,7 @@ mod tests {
             selfhost_config::vpn::Peer::new("dad-mac", "Dad", "B".repeat(43)).forwarded_to(9444),
         );
         let roster = Roster::build(&relay);
-        let launch = plan(&relay, &roster, &install(), &keys()).expect("still runnable");
+        let launch = plan(&relay, &roster, &install(), &keys(), &admin_bind(), &admin_token_path()).expect("still runnable");
         assert!(
             !launch.args.iter().any(|arg| arg.starts_with("alex-mac=")),
             "{:?}",
@@ -472,7 +506,7 @@ mod tests {
         relay.listen = "8443".into();
         let roster = Roster::build(&relay);
         assert!(matches!(
-            plan(&relay, &roster, &install(), &keys()),
+            plan(&relay, &roster, &install(), &keys(), &admin_bind(), &admin_token_path()),
             Err(VpnError::Unaddressable { field: "listen", .. })
         ));
     }
@@ -481,7 +515,7 @@ mod tests {
     fn the_service_is_named_once_and_the_same_everywhere() {
         let relay = forwarding_relay();
         let roster = Roster::build(&relay);
-        let launch = plan(&relay, &roster, &install(), &keys()).expect("runnable");
+        let launch = plan(&relay, &roster, &install(), &keys(), &admin_bind(), &admin_token_path()).expect("runnable");
         let spec = service(&relay, &launch);
         assert_eq!(spec.name, service_name(&relay.name));
         assert_eq!(spec.name, "vpn-console");
@@ -491,7 +525,7 @@ mod tests {
     fn the_service_starts_manually_restarts_always_and_carries_no_secret() {
         let relay = forwarding_relay();
         let roster = Roster::build(&relay);
-        let launch = plan(&relay, &roster, &install(), &keys()).expect("runnable");
+        let launch = plan(&relay, &roster, &install(), &keys(), &admin_bind(), &admin_token_path()).expect("runnable");
         let spec = service(&relay, &launch);
 
         assert_eq!(spec.start_mode, StartMode::Manual, "loading a config must not bind a port");
@@ -518,7 +552,7 @@ mod tests {
         // same rules every other service is held to.
         let relay = forwarding_relay();
         let roster = Roster::build(&relay);
-        let launch = plan(&relay, &roster, &install(), &keys()).expect("runnable");
+        let launch = plan(&relay, &roster, &install(), &keys(), &admin_bind(), &admin_token_path()).expect("runnable");
         let mut problems = Vec::new();
         service(&relay, &launch).check("vpn", &[], &mut problems);
         assert!(problems.is_empty(), "{problems:?}");
@@ -528,7 +562,7 @@ mod tests {
     fn a_command_line_is_for_reading_and_never_for_running() {
         let relay = forwarding_relay();
         let roster = Roster::build(&relay);
-        let launch = plan(&relay, &roster, &install(), &keys()).expect("runnable");
+        let launch = plan(&relay, &roster, &install(), &keys(), &admin_bind(), &admin_token_path()).expect("runnable");
         let line = launch.command_line();
         assert!(line.starts_with("python -X utf8 -u"), "{line}");
         assert!(line.contains("--identity server"), "{line}");

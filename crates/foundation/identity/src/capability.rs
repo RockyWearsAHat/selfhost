@@ -57,6 +57,13 @@ pub const MAX_SHARE_ID_CHARS: usize = 32;
 /// give machines long ones, but still bounded for the same reason.
 pub const MAX_NODE_NAME_CHARS: usize = 64;
 
+/// The longest VPN location id accepted, in characters.
+///
+/// A location is a `[[vpn]]` relay name or a gated site name, both of which
+/// are already bounded the same way a share id is — this shares that limit
+/// rather than inventing a different one.
+pub const MAX_VPN_LOCATION_ID_CHARS: usize = 32;
+
 /// Separators permitted inside a token, between alphanumerics.
 const TOKEN_SEPARATORS: [char; 3] = ['-', '_', '.'];
 
@@ -192,6 +199,30 @@ impl fmt::Display for NodeName {
     }
 }
 
+/// The id of a VPN-gated location: a `[[vpn]]` relay's `name`, or a site
+/// reachable only through one (`console`, `ai-studio`) — the same token
+/// `selfhost.config.toml` already uses to name both.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct VpnLocationId(String);
+
+impl VpnLocationId {
+    /// Validates `text` as a VPN location id.
+    pub fn parse(text: &str) -> Result<Self, InvalidToken> {
+        parse_token(text, MAX_VPN_LOCATION_ID_CHARS).map(Self)
+    }
+
+    /// The id as written.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for VpnLocationId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
 /// One power a caller may hold.
 ///
 /// The variants carrying a target are per-object: a person granted
@@ -277,6 +308,19 @@ pub enum Capability {
     /// mailbox that can receive a password reset is a way into every service that
     /// trusts the address. Granting it hands over that, and nothing else.
     MailAdmin,
+    /// Connect through one VPN-gated location: a `[[vpn]]` relay, or a site
+    /// reachable only through one (`ai-studio`, `console`).
+    ///
+    /// Checked by `crates/app/admin::vpn_api::check_access`, which the VPN
+    /// server (`Secure-VPN`'s `server.py`, via its `account_manager` client)
+    /// calls once per handshake and again per subdomain — the door a valid
+    /// tunnel identity alone does not open; the roster in `[[vpn.peers]]`
+    /// proves who is on the wire, this proves what they may reach through it.
+    /// Independent of every other capability, for the same reason
+    /// [`Capability::SiteAdmin`], [`Capability::DnsAdmin`] and
+    /// [`Capability::MailAdmin`] are independent of each other: being able to
+    /// reach a location says nothing about being able to administer it.
+    VpnAccess(VpnLocationId),
 }
 
 impl Capability {
@@ -302,6 +346,7 @@ impl Capability {
             Self::SiteAdmin => "site.admin",
             Self::DnsAdmin => "dns.admin",
             Self::MailAdmin => "mail.admin",
+            Self::VpnAccess(_) => "vpn.access",
         }
     }
 
@@ -349,7 +394,8 @@ impl Capability {
             | Self::DesktopControl(_)
             | Self::ClipboardRead(_)
             | Self::SiteAdmin
-            | Self::NodeAdmin => true,
+            | Self::NodeAdmin
+            | Self::VpnAccess(_) => true,
             // Grep for the name in `crates/app/admin/src/lib.rs`'s `Route::demand`
             // before flipping one of these: the test
             // `every_unhonoured_word_is_absent_from_every_routes_demand` is what
@@ -376,6 +422,7 @@ impl Capability {
             Self::DesktopView(node) | Self::DesktopControl(node) | Self::ClipboardRead(node) => {
                 Some(node.as_str())
             }
+            Self::VpnAccess(location) => Some(location.as_str()),
         }
     }
 
@@ -394,6 +441,7 @@ impl Capability {
         };
         let share = |target: Option<&str>| ShareId::parse(target?).ok();
         let node = |target: Option<&str>| NodeName::parse(target?).ok();
+        let location = |target: Option<&str>| VpnLocationId::parse(target?).ok();
         match (word, target) {
             ("console.read", None) => Some(Self::ConsoleRead),
             ("service.control", None) => Some(Self::ServiceControl),
@@ -408,6 +456,7 @@ impl Capability {
             ("desktop.view", target) => node(target).map(Self::DesktopView),
             ("desktop.control", target) => node(target).map(Self::DesktopControl),
             ("clipboard.read", target) => node(target).map(Self::ClipboardRead),
+            ("vpn.access", target) => location(target).map(Self::VpnAccess),
             _ => None,
         }
     }
@@ -426,7 +475,7 @@ impl Capability {
     /// same share and node it granted. The length assertion in this module's
     /// tests is the reminder to extend this list when a variant is added;
     /// [`Capability::name`] is what stops the build first.
-    pub fn every_shape(share: &ShareId, node: &NodeName) -> Vec<Capability> {
+    pub fn every_shape(share: &ShareId, node: &NodeName, location: &VpnLocationId) -> Vec<Capability> {
         vec![
             Self::ConsoleRead,
             Self::ServiceControl,
@@ -441,6 +490,7 @@ impl Capability {
             Self::SiteAdmin,
             Self::DnsAdmin,
             Self::MailAdmin,
+            Self::VpnAccess(location.clone()),
         ]
     }
 
@@ -478,6 +528,10 @@ mod tests {
 
     fn node() -> NodeName {
         NodeName::parse("alex-desktop").expect("a valid node name")
+    }
+
+    fn location() -> VpnLocationId {
+        VpnLocationId::parse("console").expect("a valid vpn location id")
     }
 
     #[test]
@@ -518,8 +572,8 @@ mod tests {
 
     #[test]
     fn every_capability_round_trips_through_its_wire_form() {
-        let shapes = Capability::every_shape(&share(), &node());
-        assert_eq!(shapes.len(), 13, "extend every_shape when a variant is added");
+        let shapes = Capability::every_shape(&share(), &node(), &location());
+        assert_eq!(shapes.len(), 14, "extend every_shape when a variant is added");
         for capability in &shapes {
             let text = capability.to_string();
             assert_eq!(
@@ -603,7 +657,7 @@ mod tests {
 
     #[test]
     fn driving_a_machine_is_exactly_control_and_clipboard() {
-        for capability in Capability::every_shape(&share(), &node()) {
+        for capability in Capability::every_shape(&share(), &node(), &location()) {
             let expected = matches!(
                 capability,
                 Capability::DesktopControl(_) | Capability::ClipboardRead(_)

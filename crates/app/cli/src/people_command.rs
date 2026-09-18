@@ -70,6 +70,7 @@ A capability is a word, and a target after a colon where it takes one:
   site.admin         create, change and remove websites
   dns.admin          create, change and remove DNS records
   mail.admin         create, change and remove mailboxes and aliases
+  vpn.access:<location> use one VPN relay location (e.g. console)
 
 The owner is never in this list. The owner's authority is their identity, not a
 grant, so it cannot be edited away here — which is what keeps a mistake in this

@@ -774,6 +774,7 @@ mod site_route_tests {
         for capability in Capability::every_shape(
             &selfhost_identity::ShareId::parse("vault").unwrap(),
             &selfhost_identity::NodeName::parse("home").unwrap(),
+            &selfhost_identity::VpnLocationId::parse("console").unwrap(),
         ) {
             if capability.is_honoured() {
                 continue;

@@ -266,6 +266,7 @@ pub struct Preflight {
 pub struct Relays {
     supervisor: Supervisor,
     data_dir: PathBuf,
+    admin_bind: String,
     install: Install,
     relays: Vec<Relay>,
     rosters: Vec<Roster>,
@@ -278,14 +279,27 @@ impl Relays {
     /// is pure and cheap, but doing it per request would mean two callers could
     /// see different rosters from the same config, and "who is at this address"
     /// is exactly the question that must not have two answers.
+    ///
+    /// `admin_bind` is `server.admin_bind` (`127.0.0.1:9191`) — where a started
+    /// relay points its `--account-manager` so a completed handshake still has
+    /// to clear `vpn.access:<relay>` before the tunnel opens. Not read from the
+    /// disk here: it is config the caller already has, the same as `data_dir`.
     pub fn new(
         supervisor: Supervisor,
         data_dir: impl Into<PathBuf>,
+        admin_bind: impl Into<String>,
         install: Install,
         relays: Vec<Relay>,
     ) -> Self {
         let rosters = relays.iter().map(Roster::build).collect();
-        Self { supervisor, data_dir: data_dir.into(), install, relays, rosters }
+        Self {
+            supervisor,
+            data_dir: data_dir.into(),
+            admin_bind: admin_bind.into(),
+            install,
+            relays,
+            rosters,
+        }
     }
 
     /// Every declared relay, in config order.
@@ -355,7 +369,9 @@ impl Relays {
         }
 
         let key_dir = self.key_dir(relay);
-        let launch = runner::plan(relay, roster, &self.install, &key_dir)?;
+        let admin_token_path = self.data_dir.join("admin.token");
+        let launch =
+            runner::plan(relay, roster, &self.install, &key_dir, &self.admin_bind, &admin_token_path)?;
 
         if !self.install.present().await {
             return Err(VpnError::ImplementationMissing {
@@ -623,7 +639,7 @@ pub(crate) mod tests {
     }
 
     fn relays(dir: &Path, install: Install, blocks: Vec<Relay>) -> Relays {
-        Relays::new(Supervisor::new(dir), dir, install, blocks)
+        Relays::new(Supervisor::new(dir), dir, "127.0.0.1:9191", install, blocks)
     }
 
     #[test]

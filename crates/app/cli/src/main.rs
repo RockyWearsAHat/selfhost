@@ -984,6 +984,7 @@ async fn serve_everything(
         let vpn_relays = selfhost_vpn::Relays::new(
             supervisor.clone(),
             &data_dir,
+            &config.server.admin_bind,
             selfhost_vpn::Install::vendored(),
             config.vpn.clone(),
         );
