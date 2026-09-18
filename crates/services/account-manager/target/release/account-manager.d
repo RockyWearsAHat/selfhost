@@ -1,1 +1,0 @@
-/Users/alexwaldmann/Desktop/Self-Host/crates/services/account-manager/target/release/account-manager: /Users/alexwaldmann/Desktop/Self-Host/crates/services/account-manager/src/lib.rs /Users/alexwaldmann/Desktop/Self-Host/crates/services/account-manager/src/main.rs
