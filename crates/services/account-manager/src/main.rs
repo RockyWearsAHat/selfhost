@@ -358,15 +358,17 @@ fn admin_token_file() -> PathBuf {
     }
 }
 
-/// Asks the admin capability API whether `person` holds `vpn.access` for
-/// `location`. Fails closed: any error along the way returns `Err`, and the
-/// caller treats that as "not allowed" — never a default-allow.
+/// One request/response against the admin daemon's loopback API, bearer-token
+/// authenticated from the token file `admin_token_file()` names.
 ///
 /// A one-shot raw-socket client rather than a general HTTP client, mirroring
 /// `doctor.rs`'s `ask_daemon` — the established shape for this codebase's
 /// loopback admin calls, kept to the one request/response it needs so it
-/// doesn't grow into an HTTP client nobody maintains.
-async fn admin_check_access(person: &str, location: &str) -> Result<(bool, String), String> {
+/// doesn't grow into an HTTP client nobody maintains. Shared by every admin
+/// call this service makes (`check-access` reads it, and grant-writing needs
+/// the exact same authenticated round trip, so this is the one place that
+/// speaks HTTP to the daemon).
+async fn admin_http(method: &str, path: &str, body: Option<&str>) -> Result<(u16, String), String> {
     const DEADLINE: std::time::Duration = std::time::Duration::from_secs(3);
     const MAX_BODY: usize = 64 * 1024;
 
@@ -384,14 +386,14 @@ async fn admin_check_access(person: &str, location: &str) -> Result<(bool, Strin
         .parse()
         .map_err(|error| format!("SELFHOST_ADMIN_BIND {bind} is not an address: {error}"))?;
 
-    let body = json!({"user_id": person, "location_id": location}).to_string();
+    let body = body.unwrap_or("");
 
     let exchange = async {
         let mut stream = TcpStream::connect(address)
             .await
             .map_err(|error| format!("nothing is answering on {address}: {error}"))?;
         let request = format!(
-            "POST /api/vpn/check-access HTTP/1.1\r\nHost: {address}\r\nAuthorization: Bearer {token}\r\n\
+            "{method} {path} HTTP/1.1\r\nHost: {address}\r\nAuthorization: Bearer {token}\r\n\
              Content-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
             body.len(),
             body
@@ -426,12 +428,25 @@ async fn admin_check_access(person: &str, location: &str) -> Result<(bool, Strin
     let (head, resp_body) = text
         .split_once("\r\n\r\n")
         .ok_or_else(|| "the admin daemon's answer had no complete head".to_string())?;
-    let status = head.split_whitespace().nth(1).unwrap_or_default();
-    if status != "200" {
+    let status: u16 = head
+        .split_whitespace()
+        .nth(1)
+        .and_then(|s| s.parse().ok())
+        .ok_or_else(|| "the admin daemon's answer had no status code".to_string())?;
+    Ok((status, resp_body.trim().to_string()))
+}
+
+/// Asks the admin capability API whether `person` holds `vpn.access` for
+/// `location`. Fails closed: any error along the way returns `Err`, and the
+/// caller treats that as "not allowed" — never a default-allow.
+async fn admin_check_access(person: &str, location: &str) -> Result<(bool, String), String> {
+    let body = json!({"user_id": person, "location_id": location}).to_string();
+    let (status, resp_body) = admin_http("POST", "/api/vpn/check-access", Some(&body)).await?;
+    if status != 200 {
         return Err(format!("the admin daemon answered {status}"));
     }
 
-    let parsed: serde_json::Value = serde_json::from_str(resp_body.trim())
+    let parsed: serde_json::Value = serde_json::from_str(&resp_body)
         .map_err(|error| format!("the admin daemon's answer is not JSON: {error}"))?;
     let allowed = parsed.get("allowed").and_then(|v| v.as_bool()).unwrap_or(false);
     let reason = parsed
@@ -440,6 +455,56 @@ async fn admin_check_access(person: &str, location: &str) -> Result<(bool, Strin
         .unwrap_or(if allowed { "Access granted" } else { "No permission for this location" })
         .to_string();
     Ok((allowed, reason))
+}
+
+/// Grants `person` the capability word `want` (e.g. `"vpn.access:console"`)
+/// in the admin daemon's real People registry — the one `check-access`
+/// actually reads.
+///
+/// `PUT /api/people/<name>` always replaces the whole grant set (see
+/// `people_api.rs`'s own contract), so this reads the person's current
+/// grants first and unions `want` in rather than clobbering whatever they
+/// already hold. A person the registry has never seen reads back as an empty
+/// set, which this treats the same as any other starting point.
+///
+/// This is what makes "grant subdomain access" in this service's own UI a
+/// real grant rather than a local record with nothing backing it: every
+/// subdomain here sits behind the single `console` VPN relay
+/// (`selfhost.config.toml`'s only `[[vpn]]` entry), so reaching any of them
+/// needs this exact capability regardless of which subdomain was clicked.
+async fn admin_add_grant(person: &str, want: &str) -> Result<(), String> {
+    let (status, resp_body) = admin_http("GET", "/api/people", None).await?;
+    if status != 200 {
+        return Err(format!("could not read the People registry: admin daemon answered {status}"));
+    }
+    let parsed: serde_json::Value = serde_json::from_str(&resp_body)
+        .map_err(|error| format!("the People registry answer is not JSON: {error}"))?;
+
+    let mut grants: Vec<String> = parsed
+        .get("people")
+        .and_then(|v| v.as_array())
+        .into_iter()
+        .flatten()
+        .find(|entry| entry.get("name").and_then(|n| n.as_str()) == Some(person))
+        .and_then(|entry| entry.get("grants"))
+        .and_then(|v| v.as_array())
+        .into_iter()
+        .flatten()
+        .filter_map(|w| w.as_str().map(str::to_string))
+        .collect();
+
+    if grants.iter().any(|held| held == want) {
+        return Ok(()); // already holds it — PUTting again would be a no-op write
+    }
+    grants.push(want.to_string());
+
+    let body = json!({"grants": grants}).to_string();
+    let path = format!("/api/people/{person}");
+    let (status, resp_body) = admin_http("PUT", &path, Some(&body)).await?;
+    if status != 200 {
+        return Err(format!("could not save {person}'s grants: admin daemon answered {status} ({resp_body})"));
+    }
+    Ok(())
 }
 
 async fn check_access(pool: web::Data<SqlitePool>, body: web::Json<serde_json::Value>) -> HttpResponse {
@@ -685,10 +750,41 @@ async fn grant_subdomain(pool: web::Data<SqlitePool>, path: web::Path<String>, b
         .map(|_| granted_count += 1);
     }
 
+    // The site_permissions rows above are this service's own local record of
+    // the grant, but they carry no authority anywhere else: every subdomain
+    // here sits behind the single "console" VPN relay, and the real door is
+    // the admin daemon's People registry (see admin_add_grant). Without this
+    // call, "granting" a subdomain here never actually let anyone in.
+    let vpn_grant: Option<String> = if granted_count > 0 {
+        let username: Option<(String,)> = sqlx::query_as("SELECT username FROM users WHERE id = ?")
+            .bind(&user_id)
+            .fetch_optional(pool.as_ref())
+            .await
+            .unwrap_or(None);
+        match username {
+            Some((username,)) => match admin_add_grant(&username, "vpn.access:console").await {
+                Ok(()) => None,
+                Err(error) => {
+                    log::error!("could not grant vpn.access:console to {username}: {error}");
+                    Some(format!(
+                        "subdomain access was recorded, but granting VPN access failed: {error}"
+                    ))
+                }
+            },
+            None => {
+                log::error!("grant_subdomain: no user found for id {user_id}, could not sync VPN access");
+                Some("subdomain access was recorded, but the VPN grant could not be synced: unknown user".to_string())
+            }
+        }
+    } else {
+        None
+    };
+
     HttpResponse::Created().json(json!({
         "success": true,
         "message": format!("Granted access to {} subdomain(s)", granted_count),
-        "granted_count": granted_count
+        "granted_count": granted_count,
+        "vpn_grant_warning": vpn_grant
     }))
 }
 
