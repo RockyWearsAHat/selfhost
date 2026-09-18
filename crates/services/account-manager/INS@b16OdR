@@ -1,0 +1,46 @@
+# crates/services/account-manager/Cargo.toml
+[package]
+name = "account-manager"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+# Web framework
+actix-web = "4"
+actix-rt = "2"
+tokio = { version = "1", features = ["full"] }
+
+# Database
+sqlx = { version = "0.7", features = ["runtime-tokio-rustls", "sqlite", "chrono", "uuid"] }
+
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# Cryptography
+sha2 = "0.10"
+base64 = "0.21"
+uuid = { version = "1.0", features = ["v4", "serde"] }
+chrono = { version = "0.4", features = ["serde"] }
+
+# Logging
+log = "0.4"
+env_logger = "0.11"
+
+# Error handling
+anyhow = "1.0"
+thiserror = "1.0"
+
+# WebAuthn (optional, for passkey support)
+# webauthn-rs = "0.4"
+
+[dev-dependencies]
+tokio-test = "0.4"
+
+[[bin]]
+name = "account-manager"
+path = "src/main.rs"
+
+[lib]
+name = "account_manager"
+path = "src/lib.rs"
