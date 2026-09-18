@@ -55,28 +55,29 @@ export default function GrantSubdomainAccess({
     try {
       setSubmitting(true)
 
+      const payload = {
+        subdomain_ids: selectedSubdomains,
+        access_level: accessLevel,
+        ...(expiresAt && { expires_in: Math.floor((new Date(expiresAt).getTime() - Date.now()) / 1000) })
+      }
+
+      const response = await fetch(
+        `http://localhost:9000/api/users/${selectedUser}/subdomains`,
+        {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            ...(authToken && { 'Authorization': `Bearer ${authToken}` })
+          },
+          body: JSON.stringify(payload)
+        }
+      )
+
+      if (!response.ok) {
+        throw new Error(`Failed to grant access to subdomains`)
+      }
+
       for (const subdomainId of selectedSubdomains) {
-        const payload = {
-          access_level: accessLevel,
-          ...(expiresAt && { expires_at: expiresAt })
-        }
-
-        const response = await fetch(
-          `http://localhost:9000/api/users/${selectedUser}/subdomains/${subdomainId}`,
-          {
-            method: 'POST',
-            headers: {
-              'Content-Type': 'application/json',
-              ...(authToken && { 'Authorization': `Bearer ${authToken}` })
-            },
-            body: JSON.stringify(payload)
-          }
-        )
-
-        if (!response.ok) {
-          throw new Error(`Failed to grant access to subdomain`)
-        }
-
         onGrant?.(selectedUser, subdomainId, accessLevel, expiresAt)
       }
 
