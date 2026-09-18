@@ -7,7 +7,7 @@
 	<key>ProgramArguments</key>
 	<array>
 		<string>/bin/zsh</string>
-		<string>/Users/alexwaldmann/Desktop/Self-Host/scripts/macos/security-watchdog.zsh</string>
+		<string>/Users/alexwaldmann/Self-Host/scripts/macos/security-watchdog.zsh</string>
 	</array>
 	<key>StartInterval</key>
 	<integer>900</integer>
