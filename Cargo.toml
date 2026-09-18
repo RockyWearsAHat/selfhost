@@ -38,6 +38,7 @@ members = [
     "crates/services/app-deploy",
     "crates/services/vpn",
     "crates/services/orchid-images",
+    "crates/services/account-manager",
 
     # ui — the two apps. The toolkit they are written in, `rui`, is not here:
     # it is its own project, consumed as a pinned git dependency below.
