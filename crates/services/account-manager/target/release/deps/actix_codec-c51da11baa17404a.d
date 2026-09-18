@@ -1,0 +1,10 @@
+/Users/alexwaldmann/Desktop/Self-Host/crates/services/account-manager/target/release/deps/actix_codec-c51da11baa17404a.d: /Users/alexwaldmann/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/actix-codec-0.5.4/src/lib.rs /Users/alexwaldmann/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/actix-codec-0.5.4/src/bcodec.rs /Users/alexwaldmann/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/actix-codec-0.5.4/src/framed.rs /Users/alexwaldmann/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/actix-codec-0.5.4/src/lines.rs
+
+/Users/alexwaldmann/Desktop/Self-Host/crates/services/account-manager/target/release/deps/libactix_codec-c51da11baa17404a.rlib: /Users/alexwaldmann/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/actix-codec-0.5.4/src/lib.rs /Users/alexwaldmann/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/actix-codec-0.5.4/src/bcodec.rs /Users/alexwaldmann/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/actix-codec-0.5.4/src/framed.rs /Users/alexwaldmann/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/actix-codec-0.5.4/src/lines.rs
+
+/Users/alexwaldmann/Desktop/Self-Host/crates/services/account-manager/target/release/deps/libactix_codec-c51da11baa17404a.rmeta: /Users/alexwaldmann/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/actix-codec-0.5.4/src/lib.rs /Users/alexwaldmann/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/actix-codec-0.5.4/src/bcodec.rs /Users/alexwaldmann/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/actix-codec-0.5.4/src/framed.rs /Users/alexwaldmann/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/actix-codec-0.5.4/src/lines.rs
+
+/Users/alexwaldmann/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/actix-codec-0.5.4/src/lib.rs:
+/Users/alexwaldmann/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/actix-codec-0.5.4/src/bcodec.rs:
+/Users/alexwaldmann/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/actix-codec-0.5.4/src/framed.rs:
+/Users/alexwaldmann/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/actix-codec-0.5.4/src/lines.rs:
