@@ -12,11 +12,13 @@ export default function AdminDashboard({ auth, onLogout }: any) {
       headers: { 'Authorization': `Bearer ${auth.token}` }
     })
     .then(r => r.json())
-    .then(setUsers)
+    .then(data => Array.isArray(data) ? setUsers(data) : alert('Error: ' + (data.error || 'Failed to load users')))
+    .catch(err => alert('Error: ' + err.message))
 
     fetch('http://localhost:9000/api/vpn/locations')
       .then(r => r.json())
-      .then(setLocations)
+      .then(data => Array.isArray(data) ? setLocations(data) : console.error(data))
+      .catch(err => console.error(err))
   }, [])
 
   const approveUser = async (userId: string) => {

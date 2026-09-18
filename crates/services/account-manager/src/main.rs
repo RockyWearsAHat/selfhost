@@ -171,7 +171,8 @@ async fn login(pool: web::Data<SqlitePool>, body: web::Json<LoginReq>) -> HttpRe
 }
 
 async fn list_users(pool: web::Data<SqlitePool>, req: HttpRequest) -> HttpResponse {
-    if !is_admin(&req) {
+    let token = get_token(&req);
+    if !check_is_admin(&pool, &token).await {
         return HttpResponse::Forbidden().json(json!({"error": "Admin only"}));
     }
 
@@ -206,7 +207,8 @@ async fn get_user(pool: web::Data<SqlitePool>, path: web::Path<String>) -> HttpR
 }
 
 async fn approve(pool: web::Data<SqlitePool>, path: web::Path<String>, req: HttpRequest) -> HttpResponse {
-    if !is_admin(&req) {
+    let token = get_token(&req);
+    if !check_is_admin(&pool, &token).await {
         return HttpResponse::Forbidden().json(json!({"error": "Admin only"}));
     }
 
@@ -221,7 +223,8 @@ async fn approve(pool: web::Data<SqlitePool>, path: web::Path<String>, req: Http
 }
 
 async fn grant_perm(pool: web::Data<SqlitePool>, path: web::Path<String>, body: web::Json<PermReq>, req: HttpRequest) -> HttpResponse {
-    if !is_admin(&req) {
+    let token = get_token(&req);
+    if !check_is_admin(&pool, &token).await {
         return HttpResponse::Forbidden().json(json!({"error": "Admin only"}));
     }
 
@@ -260,7 +263,8 @@ async fn list_perms(pool: web::Data<SqlitePool>, path: web::Path<String>) -> Htt
 }
 
 async fn revoke_perm(pool: web::Data<SqlitePool>, path: web::Path<(String, String)>, req: HttpRequest) -> HttpResponse {
-    if !is_admin(&req) {
+    let token = get_token(&req);
+    if !check_is_admin(&pool, &token).await {
         return HttpResponse::Forbidden().json(json!({"error": "Admin only"}));
     }
 
@@ -315,14 +319,29 @@ async fn locations(pool: web::Data<SqlitePool>) -> HttpResponse {
     }
 }
 
-fn is_admin(req: &HttpRequest) -> bool {
+fn get_token(req: &HttpRequest) -> String {
     if let Some(auth) = req.headers().get("Authorization") {
         if let Ok(auth_str) = auth.to_str() {
             if auth_str.starts_with("Bearer ") {
-                let token = &auth_str[7..];
-                return token == "admin" || token == "alex-admin";
+                return auth_str[7..].to_string();
             }
         }
     }
-    false
+    String::new()
+}
+
+async fn check_is_admin(pool: &SqlitePool, token: &str) -> bool {
+    if token.is_empty() {
+        return false;
+    }
+
+    match sqlx::query_as::<_, (i64,)>(
+        "SELECT is_admin FROM users WHERE id = ?"
+    )
+    .bind(token)
+    .fetch_one(pool)
+    .await {
+        Ok((is_admin,)) => is_admin == 1,
+        Err(_) => false
+    }
 }
