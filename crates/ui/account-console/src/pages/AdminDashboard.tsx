@@ -31,7 +31,7 @@ export default function AdminDashboard({ auth, onLogout }: any) {
       headers: { 'Authorization': `Bearer ${auth.token}` }
     })
       .then(r => r.json())
-      .then(data => Array.isArray(data) ? setSubdomains(data) : console.error(data))
+      .then(data => data.subdomains ? setSubdomains(data.subdomains) : console.error(data))
       .catch(err => console.error(err))
   }, [])
 
