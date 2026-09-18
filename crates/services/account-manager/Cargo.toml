@@ -14,3 +14,6 @@ tokio = { version = "1.35", features = ["full"] }
 uuid = { version = "1.6", features = ["v4", "serde"] }
 log = "0.4"
 env_logger = "0.11"
+chrono = { version = "0.4", features = ["serde"] }
+hex = "0.4"
+rand = "0.8"
