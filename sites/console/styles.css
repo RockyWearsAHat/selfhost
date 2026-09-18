@@ -473,6 +473,15 @@ textarea { resize: vertical; }
 #pk-register-row { display: flex; gap: 6px; align-items: center; margin-bottom: 8px; }
 #pk-register-row input { flex: 1; max-width: 260px; }
 
+/* ── the people panel ─────────────────────────────────────────────── */
+
+#pp-list { list-style: none; display: flex; flex-direction: column; gap: 6px; margin-bottom: 8px; }
+.pp-name { font-size: 12.5px; flex: 0 0 auto; min-width: 70px; }
+#pp-add-row { margin-bottom: 10px; }
+#pp-inv-list { list-style: none; display: flex; flex-direction: column; }
+#pp-inv-list li { display: flex; gap: 10px; align-items: center; padding: 7px 0; border-top: 1px solid var(--border); }
+#pp-minted-url { flex: 1 1 260px; min-width: 0; }
+
 /* ── the files plate ──────────────────────────────────────────────── */
 
 /* A caption one step quieter than the muted one: for the sentence that

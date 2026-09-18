@@ -2731,6 +2731,14 @@ function boot() {
     // granted a machine is not being told off for asking; there is simply no
     // capability that honestly says "may read the record of everybody else".
     audit: undefined,           // undefined → unasked · null → not this caller's to read · object → the tail
+    // The capability registry, same owner-only shape as `audit` above: a
+    // caller who has been granted a machine and nothing else is refused
+    // this route in the ordinary course of things, so `null` means *this
+    // caller may not manage people* as often as it means there are none.
+    people: undefined,          // undefined → unasked · null → not this caller's · object → {people, count}
+    vocabulary: null,           // every capability word this deployment knows, fetched once
+    invites: undefined,         // undefined → unasked · null → not this caller's · object → {invites, count}
+    invited: null,               // the invitation just minted, shown once until dismissed
   };
 
   const $ = (id) => document.getElementById(id);
@@ -3018,6 +3026,10 @@ function boot() {
     state.notice = null;
     state.formOpen = false;
     state.passkeys = null;
+    state.people = undefined;
+    state.vocabulary = null;
+    state.invites = undefined;
+    state.invited = null;
     state.user = null;
     resetLogs("");
     firewallDrawn = "";
@@ -3054,6 +3066,12 @@ function boot() {
     // a one-second loop would make reading the record of what was done the most
     // expensive thing the console does.
     refreshAudit();
+    // Off the poll for the same reason: the registry and the invitation
+    // store change only through this plate's own buttons, which refresh
+    // themselves after every mutation.
+    refreshPeople();
+    refreshVocabulary();
+    refreshInvites();
   }
 
   async function submitLogin(event) {
@@ -3337,6 +3355,228 @@ function boot() {
       row.append(person, label, added, rule, remove);
       rows.append(row);
     }
+  }
+
+  /* ── people & invitations ────────────────────────────────────────── */
+
+  /** Reads the capability roster. A non-200 — not the owner, or no
+   *  registry configured on this deployment — hides the whole plate
+   *  rather than sending the caller to the login page: this route is
+   *  owner-only, exactly like `/api/audit`, so a person who has been
+   *  granted a machine is refused it in the ordinary course of things and
+   *  is not being told off for asking. */
+  async function refreshPeople() {
+    let reply;
+    try { reply = await api("/api/people"); }
+    catch { return; }
+    state.people = reply.status === 200 && reply.body && Array.isArray(reply.body.people)
+      ? reply.body : null;
+    renderPeople();
+  }
+
+  /** The capability vocabulary. Fetched once and cached — it is compiled
+   *  into the daemon and cannot change while it runs — so a second call
+   *  after the first has already landed is a caller re-checking rather
+   *  than a reason to ask again. */
+  async function refreshVocabulary() {
+    if (state.vocabulary) { renderPeople(); return; }
+    let reply;
+    try { reply = await api("/api/people/capabilities"); }
+    catch { return; }
+    state.vocabulary = reply.status === 200 && Array.isArray(reply.body) ? reply.body : null;
+    renderPeople();
+  }
+
+  /** Who has an invitation pending, and until when. Same owner-only
+   *  handling as `refreshPeople`. */
+  async function refreshInvites() {
+    let reply;
+    try { reply = await api("/api/people/invites"); }
+    catch { return; }
+    state.invites = reply.status === 200 && reply.body && Array.isArray(reply.body.invites)
+      ? reply.body : null;
+    renderPeople();
+  }
+
+  /** Replaces one person's whole grant set, creating them if this is the
+   *  first one they have ever been given. The field is free text —
+   *  comma- or whitespace-separated capability words — because the
+   *  vocabulary caption above the list is the only reference anyone
+   *  needs, and a set the daemon refuses comes back with the exact reason
+   *  (`people_api::BadGrants::message`) rather than a silent no-op. */
+  async function saveGrants(name, text) {
+    const grants = text.split(/[,\s]+/).map((word) => word.trim()).filter(Boolean);
+    let reply;
+    try {
+      reply = await api(`/api/people/${encodeURIComponent(name)}`, { method: "PUT", body: { grants } });
+    } catch { notify("problem", "cannot reach the server"); return false; }
+    if (reply.status === 401) { toLogin(); return false; }
+    if (reply.status >= 400) {
+      notify("problem", (reply.body && reply.body.error) || `could not save ${name}'s grants (${reply.status})`);
+      return false;
+    }
+    notify("done", `${name} now holds: ${grants.length ? grants.join(", ") : "nothing"}`);
+    refreshPeople();
+    return true;
+  }
+
+  /** Removes a person from the registry entirely — every grant they held,
+   *  gone at once. Leaves any passkey they registered untouched; that is
+   *  PASSKEYS' door to close, not this one's. */
+  async function forgetPerson(name) {
+    await command(`Forgot ${name}`, "DELETE", `/api/people/${encodeURIComponent(name)}`);
+    refreshPeople();
+  }
+
+  /** Mints a one-time invitation and holds the code on screen until it is
+   *  dismissed. The daemon does not keep it in a form it can show again —
+   *  see `mint_invite`'s own contract — so losing it before it is sent
+   *  means minting a fresh one, not looking the old one up. */
+  async function mintInvite(name) {
+    let reply;
+    try { reply = await api(`/api/people/${encodeURIComponent(name)}/invite`, { method: "POST" }); }
+    catch { notify("problem", "cannot reach the server"); return; }
+    if (reply.status === 401) { toLogin(); return; }
+    if (reply.status >= 400) {
+      notify("problem", (reply.body && reply.body.error) || `could not invite ${name} (${reply.status})`);
+      return;
+    }
+    state.invited = reply.body;
+    if (reply.body && reply.body.holdsNothing) {
+      notify("problem", `${name} holds no grants yet — they will log in to an empty console`);
+    } else {
+      notify("done", `Invitation minted for ${name}`);
+    }
+    renderPeople();
+    refreshInvites();
+  }
+
+  /** Withdraws a pending invitation before anybody has redeemed it. */
+  async function revokeInvite(name) {
+    await command(`Withdrew ${name}'s invitation`, "DELETE", `/api/people/invites/${encodeURIComponent(name)}`);
+    refreshInvites();
+  }
+
+  /** The PEOPLE plate: hidden entirely for a caller `/api/people` refuses.
+   *  Drawn only from state the three refresh functions above set — nothing
+   *  here fetches — so a redraw after a local edit never races a request
+   *  in flight. */
+  function renderPeople() {
+    const panel = $("people");
+    const visible = state.people !== undefined && state.people !== null;
+    panel.hidden = !visible;
+    if (!visible) return;
+
+    const vocabulary = Array.isArray(state.vocabulary) ? state.vocabulary : [];
+    $("pp-vocab").textContent = vocabulary.length
+      ? "available: " + vocabulary
+          .filter((entry) => entry && entry.grantable)
+          .map((entry) => (entry.target ? `${entry.word}:<${entry.target}>` : entry.word))
+          .join(", ")
+      : "";
+
+    const people = Array.isArray(state.people.people)
+      ? state.people.people.filter((person) => person && typeof person.name === "string")
+      : [];
+    const note = $("pp-note");
+    note.hidden = people.length > 0;
+    note.textContent = "Nobody has been granted anything yet. Name somebody below and save their grants.";
+
+    const rows = $("pp-list");
+    rows.textContent = "";
+    for (const person of people) rows.append(personRow(person));
+
+    renderInvites();
+    renderMinted();
+  }
+
+  /** One person: their name, an editable field holding their whole grant
+   *  set, and the three acts this plate offers over them. */
+  function personRow(person) {
+    const row = document.createElement("li");
+    row.className = "inline-form";
+
+    const name = document.createElement("span");
+    name.className = "pp-name mono";
+    name.textContent = person.name;
+
+    const grants = document.createElement("input");
+    grants.type = "text";
+    grants.className = "mono micro";
+    grants.value = Array.isArray(person.grants) ? person.grants.join(", ") : "";
+    grants.setAttribute("aria-label", `${person.name}'s grants`);
+    grants.autocomplete = "off";
+    grants.spellcheck = false;
+
+    const save = document.createElement("button");
+    save.type = "button";
+    save.className = "btn ghost small";
+    save.textContent = "SAVE";
+    save.addEventListener("click", () => saveGrants(person.name, grants.value));
+
+    const invite = document.createElement("button");
+    invite.type = "button";
+    invite.className = "btn ghost small";
+    invite.textContent = "INVITE";
+    invite.addEventListener("click", () => mintInvite(person.name));
+
+    const forget = document.createElement("button");
+    forget.type = "button";
+    forget.className = "btn danger small";
+    forget.textContent = "FORGET";
+    forget.addEventListener("click", () => forgetPerson(person.name));
+
+    row.append(name, grants, save, invite, forget);
+    return row;
+  }
+
+  /** The INVITATIONS list beneath the roster. */
+  function renderInvites() {
+    const note = $("pp-inv-note");
+    const list = $("pp-inv-list");
+    const count = $("pp-inv-count");
+    if (!state.invites || !Array.isArray(state.invites.invites)) {
+      list.textContent = "";
+      count.textContent = "";
+      note.hidden = state.invites !== null;
+      note.textContent = "—";
+      return;
+    }
+    const invites = state.invites.invites.filter((entry) => entry && typeof entry.name === "string");
+    count.textContent = String(invites.length);
+    note.hidden = invites.length > 0;
+    note.textContent = "No invitations pending.";
+    list.textContent = "";
+    for (const entry of invites) list.append(inviteRow(entry));
+  }
+
+  function inviteRow(entry) {
+    const row = document.createElement("li");
+    const name = document.createElement("span");
+    name.className = "pp-name mono";
+    name.textContent = entry.name;
+    const until = document.createElement("span");
+    until.className = "mono micro";
+    until.textContent = `expires ${passkeyDay(entry.expiresUnix)}`;
+    const rule = document.createElement("span");
+    rule.className = "rule";
+    const revoke = document.createElement("button");
+    revoke.type = "button";
+    revoke.className = "btn danger small";
+    revoke.textContent = "REVOKE";
+    revoke.addEventListener("click", () => revokeInvite(entry.name));
+    row.append(name, until, rule, revoke);
+    return row;
+  }
+
+  /** The just-minted invitation, held on screen until DONE is pressed —
+   *  the one and only time this code is ever shown. */
+  function renderMinted() {
+    const box = $("pp-minted");
+    if (!state.invited) { box.hidden = true; return; }
+    box.hidden = false;
+    $("pp-minted-name").textContent = state.invited.name || "";
+    $("pp-minted-url").value = state.invited.url || state.invited.code || "";
   }
 
   /* ── the push stream ──────────────────────────────────────────────── */
@@ -8333,6 +8573,25 @@ function boot() {
     auditLimit = Math.min(AUDIT_CEILING, auditLimit + AUDIT_STEP);
     refreshAudit();
   });
+
+  /* The people plate. */
+
+  $("pp-reload").addEventListener("click", () => { refreshPeople(); refreshInvites(); });
+  $("pp-add-save").addEventListener("click", () => {
+    const name = ($("pp-add-name").value || "").trim().toLowerCase().slice(0, 32);
+    if (!name) return;
+    saveGrants(name, $("pp-add-grants").value).then((saved) => {
+      if (!saved) return;
+      $("pp-add-name").value = "";
+      $("pp-add-grants").value = "";
+    });
+  });
+  $("pp-minted-dismiss").addEventListener("click", () => { state.invited = null; renderMinted(); });
+  // Selecting the whole field on focus is the copy affordance: this app
+  // asks for no clipboard-write permission anywhere else, so the field is
+  // built to be selected and copied by hand rather than adding a new one
+  // here alone.
+  $("pp-minted-url").addEventListener("focus", (event) => event.target.select());
 
   // The log toolbar: the stderr switch and the filter sieve.
   $("log-stderr").addEventListener("click", () => {
