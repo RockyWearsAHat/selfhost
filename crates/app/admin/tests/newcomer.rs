@@ -82,6 +82,11 @@ const SURFACE: &[(&str, &str, Reach)] = &[
     ("GET", "/api/desktop/nodes", Reach::Granted),
     ("GET", "/api/desktop/agent", Reach::Granted),
     ("GET", "/api/maintenance/status", Reach::Granted),
+    // Deploy records and System health are console-shown state, the same as
+    // the routes above — not the owner-only record `/api/audit` is.
+    ("GET", "/api/deploys", Reach::Granted),
+    ("GET", "/api/deploys/anything", Reach::Granted),
+    ("GET", "/api/system", Reach::Granted),
     // Capability::ConsoleRead again — the same credential a VPN relay's own
     // account-manager check presents to ask "may this person use this
     // location" (crates/services/vpn/src/runner.rs's `--account-manager`),

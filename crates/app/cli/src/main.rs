@@ -1157,6 +1157,11 @@ async fn serve_everything(
     .map(selfhost_admin::site_pass::SitePasses::new)
     .map_err(|error| format!("cannot load the Pass signing key: {error}"))?;
 
+    // The Deploy record. Built once and shared by `Arc` with the self-update
+    // watcher in the `select!` below, rather than each holding its own handle
+    // onto the same file — see `Api::with_deploys`'s documentation.
+    let deploys = Arc::new(selfhost_admin::deploys::Deploys::in_dir(&data_dir));
+
     let mut api = Api::new(supervisor.clone(), store, token, firewall.clone())
         .with_github_credentials(github_credentials.clone())
         .with_console_auth(&data_dir)
@@ -1175,7 +1180,12 @@ async fn serve_everything(
         // people grant/allow/deny` already performs — see
         // `people_api::vpn_side_effects`.
         .with_vpn(config.vpn.clone(), data_dir.clone())
-        .with_site_passes(site_passes.clone());
+        .with_site_passes(site_passes.clone())
+        // Shared with the self-update watcher below, via the same `Arc` — see
+        // `Api::with_deploys`'s documentation for why this is not built from
+        // a `data_dir` the way `with_agents` is.
+        .with_deploys(Arc::clone(&deploys))
+        .with_mail_configured(config.mail.is_some());
     // Only when the section is live: a route that answers 202 and pokes a
     // watcher that is not running would report a deployment nobody is doing.
     if config.self_update.as_ref().is_some_and(|update| update.enabled) {
@@ -1485,6 +1495,7 @@ async fn serve_everything(
             config.self_update.clone(),
             project_dir.clone(),
             self_update_nudge.clone(),
+            Some(Arc::clone(&deploys)),
         ) => {
             updated_to = Some(commit);
             Ok(())
