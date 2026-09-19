@@ -24,8 +24,7 @@
 function boot() {
   const state = {
     view: "loading",   // "login" | "vpn-connect" | "signed-in"
-    siteReturn: null,  // the gated Site URL a proxy redirect carried here as ?return=
-    vpnConnect: null,  // {state, challenge, port} from a desktop app's redirect
+    vpnConnect: null,  // {location, state, challenge, port} from a desktop app's redirect
   };
 
   const $ = (id) => document.getElementById(id);
@@ -51,7 +50,7 @@ function boot() {
 
   /* ── vpn device sign-in ───────────────────────────────────────────── */
 
-  /** Parses a `#vpn-connect?state=...&challenge=...&port=...`
+  /** Parses a `#vpn-connect?location=...&state=...&challenge=...&port=...`
    *  link from the SelfHost VPN desktop app, or null if the fragment does
    *  not match.
    *
@@ -63,14 +62,15 @@ function boot() {
     const match = /^#vpn-connect\?(.+)$/.exec(location.hash || "");
     if (!match) return null;
     const params = new URLSearchParams(match[1]);
+    const forLocation = params.get("location");
     const forState = params.get("state");
     const challenge = params.get("challenge");
     const port = Number(params.get("port"));
-    if (!forState || !challenge
+    if (!forLocation || !forState || !challenge
       || !Number.isInteger(port) || port <= 0 || port > 65535) {
       return null;
     }
-    return { state: forState, challenge, port };
+    return { location: forLocation, state: forState, challenge, port };
   }
 
   /** Finishes a desktop app's sign-in against *this* browser session.
@@ -87,7 +87,7 @@ function boot() {
     try {
       reply = await api("/api/vpn/authorize", {
         method: "POST",
-        body: { codeChallenge: connect.challenge },
+        body: { location: connect.location, codeChallenge: connect.challenge },
       });
     } catch { vpnConnectFailed("cannot reach the server"); return; }
 
@@ -111,48 +111,6 @@ function boot() {
     location.href = callback;
   }
 
-  /* ── site sign-in ─────────────────────────────────────────────────── */
-
-  /** The URL a gated Site's proxy turned the reader away from, carried here
-   *  as `?return=`, or null. Only its shape is checked here; whether it names
-   *  a Site of this deployment, and whether this Person holds a Grant on it,
-   *  is `/api/pass/authorize`'s to decide. */
-  function siteReturnParam() {
-    const wanted = new URLSearchParams(location.search).get("return");
-    return wanted && wanted.startsWith("https://") ? wanted : null;
-  }
-
-  /** Signs this session's Person in to the Site they came from. The server
-   *  answers with that Site's own `/.selfhost/pass` link, or a refusal. */
-  async function completeSiteSignIn() {
-    const wanted = state.siteReturn;
-    showView("vpn-connect");
-    $("vpn-connect-status").textContent = "Signing you in to the site.";
-
-    let reply;
-    try {
-      reply = await api("/api/pass/authorize", { method: "POST", body: { return: wanted } });
-    } catch { siteSignInFailed("cannot reach the server"); return; }
-
-    if (reply.status === 401) {
-      showLogin("sign in to open that site", { keep: true });
-      return;
-    }
-    if (reply.status !== 200 || !reply.body || typeof reply.body.redirect !== "string") {
-      siteSignInFailed((reply.body && reply.body.error) || "could not sign in to that site");
-      return;
-    }
-    state.siteReturn = null;
-    location.href = reply.body.redirect;
-  }
-
-  function siteSignInFailed(text) {
-    $("vpn-connect-status").textContent = "You could not be signed in to that site.";
-    const line = $("vpn-connect-note");
-    line.textContent = text;
-    line.hidden = false;
-  }
-
   /** Says why the device could not be approved. */
   function vpnConnectFailed(text) {
     $("vpn-connect-status").textContent = "This device could not be signed in.";
@@ -174,7 +132,6 @@ function boot() {
       state.vpnConnect = connect;
       history.replaceState(null, "", location.pathname + location.search);
     }
-    state.siteReturn = siteReturnParam();
     try {
       const reply = await api("/api/session");
       if (reply.status === 200) afterSignIn();
@@ -189,7 +146,6 @@ function boot() {
    *  app, or say there is nothing else to do here. */
   function afterSignIn() {
     if (state.vpnConnect) { completeVpnConnect(); return; }
-    if (state.siteReturn) { completeSiteSignIn(); return; }
     showView("signed-in");
   }
 

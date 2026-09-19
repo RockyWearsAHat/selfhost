@@ -82,11 +82,6 @@ const SURFACE: &[(&str, &str, Reach)] = &[
     ("GET", "/api/desktop/nodes", Reach::Granted),
     ("GET", "/api/desktop/agent", Reach::Granted),
     ("GET", "/api/maintenance/status", Reach::Granted),
-    // Deploy records and System health are console-shown state, the same as
-    // the routes above — not the owner-only record `/api/audit` is.
-    ("GET", "/api/deploys", Reach::Granted),
-    ("GET", "/api/deploys/anything", Reach::Granted),
-    ("GET", "/api/system", Reach::Granted),
     // Capability::ConsoleRead again — the same credential a VPN relay's own
     // account-manager check presents to ask "may this person use this
     // location" (crates/services/vpn/src/runner.rs's `--account-manager`),
@@ -135,9 +130,6 @@ const SURFACE: &[(&str, &str, Reach)] = &[
     // (see `Api::vpn_authorize`), so a newcomer with no VPN grant still
     // reaches the route and is answered 403 or 404, never the wall's 401.
     ("POST", "/api/vpn/authorize", Reach::Granted),
-    // The same shape: signed in is enough to ask, and the Grant on the Site
-    // named in the body is checked inside `Api::pass_authorize`.
-    ("POST", "/api/pass/authorize", Reach::Granted),
     // Capability::SiteAdmin — the newcomer holds console.read and files.read on
     // one share, never site.admin, so every one of these is withheld exactly
     // like the service-control routes above. The wall is checked before
@@ -151,15 +143,10 @@ const SURFACE: &[(&str, &str, Reach)] = &[
     ("DELETE", "/api/sites/anything", Reach::Withheld),
     ("POST", "/api/sites/anything/domains", Reach::Withheld),
     ("DELETE", "/api/sites/anything/domains/anything", Reach::Withheld),
-    ("PUT", "/api/sites/anything/exposure", Reach::Withheld),
-    ("PUT", "/api/sites/anything/owner", Reach::Withheld),
     ("GET", "/api/sites/anything/files/list", Reach::Withheld),
     ("POST", "/api/sites/anything/files/mkdir", Reach::Withheld),
     ("PUT", "/api/sites/anything/files/entry", Reach::Withheld),
     ("DELETE", "/api/sites/anything/files/entry", Reach::Withheld),
-    // Demand::OwnerOnly again — the VPN roster is a list of who can reach
-    // what, the same grounds `/api/people` is withheld on above.
-    ("GET", "/api/vpn/peers", Reach::Withheld),
 ];
 
 /// The doors that stand *ahead* of the wall by design, and must therefore be

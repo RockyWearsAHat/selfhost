@@ -46,15 +46,6 @@ pub fn roster_file(key_dir: &Path) -> PathBuf {
     key_dir.join(ROSTER_FILE)
 }
 
-/// The names currently enrolled through this relay's roster file — the
-/// dynamic peers `[[vpn.peers]]` does not know about, because they never went
-/// through a config edit (see the module documentation). A missing roster
-/// file reads as no dynamic peers, matching [`revoke`] and [`enrol`]'s own
-/// treatment of one.
-pub fn roster(key_dir: &Path) -> io::Result<Vec<String>> {
-    read_roster(&roster_file(key_dir))
-}
-
 /// Why a peer could not be enrolled or revoked.
 #[derive(Debug)]
 pub enum EnrolError {

@@ -22,6 +22,7 @@
 //! recover from.
 
 use std::io::{BufRead, BufReader};
+use std::os::unix::process::CommandExt;
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -519,91 +520,41 @@ fn spawn_client(python: &str, endpoint: &Endpoint) -> std::io::Result<Child> {
 
 /// Spawns the Secure-VPN client in a new process session so it survives the parent's exit.
 ///
-/// A Peer may be enrolled from any device this app runs on, so both halves of
-/// [`detach`] are real, not a Unix-only path with a Windows gap: on Unix it
-/// calls `setsid()` in a `pre_exec()` closure to make the child the leader of
-/// its own process group; on Windows it starts the child in its own process
-/// group with no inherited console, the nearest equivalent `Command` exposes.
-/// Either way the child detaches from the parent's session, so it survives
-/// the parent exiting.
+/// On Unix/macOS, this calls `setsid()` in a `pre_exec()` closure to make the child
+/// the leader of its own process group. This detaches it from the parent's session,
+/// ensuring the child survives when the parent exits.
+#[allow(unsafe_code)]
 fn spawn_client_detached(python: &str, endpoint: &Endpoint) -> std::io::Result<Child> {
+    use nix::unistd::setsid;
+    use std::io;
+
     let home = std::env::var("HOME").unwrap_or_default();
     let client = format!("{home}/.securevpn/app/client.py");
     let keydir = format!("{home}/.securevpn/keys");
 
-    let mut command = Command::new(python);
-    command
-        .arg("-u")
-        .arg(client)
-        .arg(&endpoint.server_host)
-        .arg("--port")
-        .arg(endpoint.server_port.to_string())
-        .arg("--local-host")
-        .arg("127.0.0.1")
-        .arg("--local-port")
-        .arg(endpoint.local_port.to_string())
-        .arg("--identity")
-        .arg(&endpoint.identity)
-        .arg("--peer")
-        .arg("server")
-        .env("SECUREVPN_KEY_DIR", keydir)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    detach::detach(&mut command);
-    command.spawn()
-}
-
-/// The one piece of this module that is not the same shape on every OS:
-/// putting the just-built [`Command`] into a session of its own before it is
-/// spawned.
-#[cfg(unix)]
-mod detach {
-    // The whole module, not just `detach()`: the `extern` block below
-    // declaring `setsid` is itself unsafe code, by the same rule that made
-    // `crates/foundation/presence`'s FFI blocks need this.
-    #![allow(unsafe_code)]
-
-    use std::io;
-    use std::os::unix::process::CommandExt;
-    use std::process::Command;
-
-    // `setsid(2)` lives in libc/libSystem, which every Rust binary on Unix
-    // already links — no `#[link]` needed, the same as
-    // `crates/foundation/presence`'s `pthread_main_np`.
-    unsafe extern "C" {
-        fn setsid() -> i32;
-    }
-
-    /// Makes `command`, once spawned, the leader of a new process group —
-    /// detached from this process's own session.
-    pub(super) fn detach(command: &mut Command) {
-        // SAFETY: `pre_exec`'s closure runs in the forked child, after
-        // `fork()` and before `exec()`, with no other threads to race and
-        // nothing else of this process's state still reachable.
-        unsafe {
-            command.pre_exec(|| {
-                if setsid() == -1 { Err(io::Error::last_os_error()) } else { Ok(()) }
-            });
-        }
-    }
-}
-
-#[cfg(windows)]
-mod detach {
-    use std::os::windows::process::CommandExt;
-    use std::process::Command;
-
-    /// The child gets its own process group and no inherited console —
-    /// `CREATE_NEW_PROCESS_GROUP | DETACHED_PROCESS`, Win32's own constants,
-    /// spelled out here rather than pulled in through a `windows`/`windows-sys`
-    /// dependency this workspace does not otherwise take.
-    const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
-    const DETACHED_PROCESS: u32 = 0x0000_0008;
-
-    /// Makes `command`, once spawned, its own process group — detached from
-    /// this process's own console and job.
-    pub(super) fn detach(command: &mut Command) {
-        command.creation_flags(CREATE_NEW_PROCESS_GROUP | DETACHED_PROCESS);
+    // SAFETY: pre_exec is safe to call here; the closure only executes in the
+    // child process after fork() but before exec(), so no other threads interfere.
+    unsafe {
+        Ok(Command::new(python)
+            .arg("-u")
+            .arg(client)
+            .arg(&endpoint.server_host)
+            .arg("--port")
+            .arg(endpoint.server_port.to_string())
+            .arg("--local-host")
+            .arg("127.0.0.1")
+            .arg("--local-port")
+            .arg(endpoint.local_port.to_string())
+            .arg("--identity")
+            .arg(&endpoint.identity)
+            .arg("--peer")
+            .arg("server")
+            .env("SECUREVPN_KEY_DIR", keydir)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            // Detach from parent's process group
+            .pre_exec(|| setsid().map(|_| ()).map_err(|e| io::Error::from_raw_os_error(e as i32)))
+            .spawn()?)
     }
 }
 

@@ -330,18 +330,6 @@ textarea { resize: vertical; }
 #fw-table td.mono { font-family: var(--mono); }
 .verdict { display: inline-flex; gap: 6px; align-items: center; }
 
-/* ── the system panel ─────────────────────────────────────────────── */
-
-#system { display: flex; flex-direction: column; gap: 6px; }
-#system-rows { list-style: none; display: flex; flex-direction: column; gap: 4px; }
-#system-rows li {
-  display: flex; gap: 8px; align-items: center;
-  padding: 3px 0;
-}
-#system-rows li + li { border-top: 1px solid rgba(36, 39, 43, 0.55); }
-#system-rows .sys-name { font-family: var(--mono); font-size: 12.5px; min-width: 110px; }
-#system-rows .sys-reason { color: var(--muted); font-size: 12px; }
-
 /* ── panes ────────────────────────────────────────────────────────── */
 
 #panes { display: flex; gap: 8px; align-items: stretch; flex: 1; }
