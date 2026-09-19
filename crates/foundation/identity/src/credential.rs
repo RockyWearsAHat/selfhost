@@ -70,6 +70,18 @@ pub enum Opening {
     /// A passkey assertion — a biometric or a security key, on hardware present
     /// at the moment the session was opened.
     Passkey,
+    /// One person's own login password, typed into the login form and verified
+    /// against their entry in `<data_dir>/console.loginpw`.
+    ///
+    /// The variant [`Credential::is_a_password_login`] deliberately does not
+    /// match: that predicate is the demotion in [`crate::Policy::decide`], and
+    /// the demotion exists because [`Opening::Password`] names nobody once a
+    /// passkey has proven somebody can be named. A session opened this way
+    /// already names its holder — the same fact a passkey login has always
+    /// stood on — so it falls through to the ordinary "everyone else is
+    /// exactly what they were granted" rule instead of being narrowed to
+    /// [`crate::Capability::ConsoleRead`]. See `crates/app/admin/src/person_password.rs`.
+    PersonPassword,
 }
 
 impl Opening {
@@ -78,6 +90,7 @@ impl Opening {
         match self {
             Self::Password => "password",
             Self::Passkey => "passkey",
+            Self::PersonPassword => "person-password",
         }
     }
 
@@ -90,11 +103,12 @@ impl Opening {
         match self {
             Self::Password => Credential::Password,
             Self::Passkey => Credential::Passkey,
+            Self::PersonPassword => Credential::PersonPassword,
         }
     }
 
-    /// Both openings, in a fixed order, for exhaustive tables.
-    pub const EVERY: [Opening; 2] = [Self::Password, Self::Passkey];
+    /// Every opening, in a fixed order, for exhaustive tables.
+    pub const EVERY: [Opening; 3] = [Self::Password, Self::Passkey, Self::PersonPassword];
 }
 
 impl fmt::Display for Opening {
@@ -198,6 +212,29 @@ pub enum Credential {
     /// and conflating those is how a mounted drive would end up holding a
     /// keyboard. Only a passkey proves presence.
     DevicePassword,
+    /// One person's own login password, verified against the entry they hold
+    /// in `<data_dir>/console.loginpw`, and presented on *this* request.
+    ///
+    /// The credential that closes the same gap [`Credential::DevicePassword`]
+    /// closed for WebDAV, but for the console's own login form:
+    /// [`Credential::Password`] cannot be made to name a person, and the
+    /// public sign-in site's whole reason to exist — signing in without
+    /// depending on the admin console's own gated route — falls apart the
+    /// moment the only thing it can present is the deployment's one shared
+    /// secret. This is a *second* real credential, kept apart from
+    /// [`Credential::DevicePassword`] because the two answer different
+    /// questions: a device password is typed once and then replayed by an
+    /// operating system's keychain for the life of a mount, while this one is
+    /// typed at a login form, by a person, right then — which is also why its
+    /// [`Credential::is_unattended`] answer differs from
+    /// [`Credential::DevicePassword`]'s.
+    ///
+    /// It is a *person's*, so it names one: [`Credential::belongs_to`] admits
+    /// it only for [`Identity::Person`](crate::Identity::Person), same as
+    /// [`Credential::DevicePassword`] — the registry cannot spell the owner in
+    /// any casing, so there is no such thing as the owner's login password;
+    /// the owner already has [`Credential::Password`].
+    PersonPassword,
     /// A WebAuthn assertion from a registered passkey, presented on *this*
     /// request.
     ///
@@ -243,11 +280,13 @@ impl Credential {
             Self::Bearer => "bearer",
             Self::Password => "password",
             Self::DevicePassword => "device-password",
+            Self::PersonPassword => "person-password",
             Self::Passkey => "passkey",
             Self::Agent => "agent",
             Self::Session(session) => match session.opened_by {
                 Opening::Password => "session.password",
                 Opening::Passkey => "session.passkey",
+                Opening::PersonPassword => "session.person-password",
             },
         }
     }
@@ -263,12 +302,13 @@ impl Credential {
     pub fn is_deployment_wide(&self) -> bool {
         match self {
             Self::Bearer | Self::Password => true,
-            // A person's own storage password. There is one per person and it is
-            // looked up under their name, so it answers *which person* — which
-            // is the whole of what this predicate asks. An agent token is the
-            // same shape of answer for a different kind of "somebody": it names
-            // one trusted machine, never the deployment.
-            Self::DevicePassword | Self::Passkey | Self::Agent => false,
+            // A person's own storage or login password. There is one per
+            // person and it is looked up under their name, so it answers
+            // *which person* — which is the whole of what this predicate
+            // asks. An agent token is the same shape of answer for a
+            // different kind of "somebody": it names one trusted machine,
+            // never the deployment.
+            Self::DevicePassword | Self::PersonPassword | Self::Passkey | Self::Agent => false,
             Self::Session(session) => session.opened_by == Opening::Password,
         }
     }
@@ -298,6 +338,10 @@ impl Credential {
             // here would be a second way to become the owner with a stored
             // secret — which is the door this credential was added to close.
             Self::DevicePassword => identity.is_person(),
+            // Same narrowing, for the same reason: there is no such thing as
+            // the owner's login password, and admitting one here would be a
+            // second way to become the owner with a stored secret.
+            Self::PersonPassword => identity.is_person(),
             // Neither the machine (a WebAuthn ceremony needs hardware and a
             // person, and `Identity::Machine` is a token in a file) nor an
             // agent (the whole reason `Identity::Agent` exists is that a
@@ -319,6 +363,11 @@ impl Credential {
             Self::Session(session) => match session.opened_by {
                 Opening::Password => identity.is_owner(),
                 Opening::Passkey => !identity.is_machine() && !identity.is_agent(),
+                // A person's own login password names one person, cryptographic
+                // signature or not — the same reachable set as the passkey's
+                // session, minus the owner, who cannot hold this credential at
+                // all (see `Self::PersonPassword` above).
+                Opening::PersonPassword => identity.is_person(),
             },
         }
     }
@@ -334,6 +383,12 @@ impl Credential {
     /// enrolled a passkey, which is a feature being deleted rather than a
     /// credential being narrowed. That door is left open knowingly; closing it
     /// means per-person WebDAV credentials, which is its own piece of work.
+    ///
+    /// A session opened by [`Opening::PersonPassword`] does **not** match,
+    /// deliberately: that login already names the person who typed it, the
+    /// same fact a passkey login stands on, so narrowing it to
+    /// [`crate::Capability::ConsoleRead`] would demote a named account for no
+    /// reason the demotion exists to guard against. See [`Opening::PersonPassword`].
     pub fn is_a_password_login(&self) -> bool {
         matches!(self, Self::Session(session) if session.opened_by == Opening::Password)
     }
@@ -372,6 +427,12 @@ impl Credential {
     ///   say how stale the login is. Answering it here with no clock would mean
     ///   refusing every browser a keyboard for ever, which is not a stricter
     ///   rule, it is a broken feature.
+    /// - [`Credential::PersonPassword`] — false. Unlike
+    ///   [`Credential::DevicePassword`], nothing ever stores this one in an
+    ///   operating system's keychain and replays it: its only appearance is a
+    ///   login form, typed by the person it names, at the moment it is
+    ///   checked. That is the same live-presence property [`Credential::Passkey`]
+    ///   has, arrived at without hardware.
     pub fn is_unattended(&self) -> bool {
         matches!(self, Self::Bearer | Self::Password | Self::DevicePassword | Self::Agent)
     }
@@ -390,10 +451,12 @@ impl Credential {
             Self::Bearer,
             Self::Password,
             Self::DevicePassword,
+            Self::PersonPassword,
             Self::Passkey,
             Self::Agent,
             Self::Session(Session::new(Opening::Password, opened_at)),
             Self::Session(Session::new(Opening::Passkey, opened_at)),
+            Self::Session(Session::new(Opening::PersonPassword, opened_at)),
         ]
     }
 }
@@ -428,7 +491,7 @@ mod tests {
         words.sort_unstable();
         words.dedup();
         assert_eq!(words.len(), shapes.len(), "one word each, all distinct");
-        assert_eq!(shapes.len(), 7, "extend every_shape when a variant is added");
+        assert_eq!(shapes.len(), 9, "extend every_shape when a variant is added");
     }
 
     #[test]
@@ -443,6 +506,10 @@ mod tests {
             "there is one per person and it is looked up under their name"
         );
         assert!(
+            !Credential::PersonPassword.is_deployment_wide(),
+            "one per person, looked up under their name, same as the device password"
+        );
+        assert!(
             Credential::Session(Session::new(Opening::Password, now)).is_deployment_wide(),
             "there is one console password, so the session it minted names nobody"
         );
@@ -450,10 +517,14 @@ mod tests {
             !Credential::Session(Session::new(Opening::Passkey, now)).is_deployment_wide(),
             "a passkey signed for one person, and its session inherits that"
         );
+        assert!(
+            !Credential::Session(Session::new(Opening::PersonPassword, now)).is_deployment_wide(),
+            "a person's own login password names them, and its session inherits that"
+        );
     }
 
     #[test]
-    fn unattended_is_exactly_the_two_credentials_software_replays() {
+    fn unattended_is_exactly_the_credentials_software_replays() {
         let now = moment();
         assert!(Credential::Bearer.is_unattended(), "a token in a file");
         assert!(Credential::Password.is_unattended(), "a password in a keychain, on every WebDAV request");
@@ -462,6 +533,10 @@ mod tests {
             "naming a person is not proving one is there — the keychain replays this too"
         );
         assert!(!Credential::Passkey.is_unattended(), "signed on hardware, this instant");
+        assert!(
+            !Credential::PersonPassword.is_unattended(),
+            "typed at a login form, by the person it names, right then — nothing replays it"
+        );
         assert!(Credential::Agent.is_unattended(), "a secret in a file, replayed by an unattended process");
         for opening in Opening::EVERY {
             assert!(
@@ -481,7 +556,7 @@ mod tests {
         // two have to agree rather than restate each other. The load-bearing row
         // is the first: the token is the machine's and nobody else's, which is
         // what stops it from being the operator in the audit trail.
-        let expected: [(Credential, [bool; 4]); 7] = [
+        let expected: [(Credential, [bool; 4]); 9] = [
             //                                    owner, machine, person, agent
             (Credential::Bearer, [false, true, false, false]),
             (Credential::Password, [true, false, false, false]),
@@ -490,10 +565,14 @@ mod tests {
             // and admitting one would be a second way to become the owner with a
             // stored secret.
             (Credential::DevicePassword, [false, false, true, false]),
+            // Same narrowing, same reason, for the login password instead of
+            // the WebDAV one.
+            (Credential::PersonPassword, [false, false, true, false]),
             (Credential::Passkey, [true, false, true, false]),
             (Credential::Agent, [false, false, false, true]),
             (Credential::Session(Session::new(Opening::Password, now)), [true, false, false, false]),
             (Credential::Session(Session::new(Opening::Passkey, now)), [true, false, true, false]),
+            (Credential::Session(Session::new(Opening::PersonPassword, now)), [false, false, true, false]),
         ];
         for (credential, [owner, machine, named, agent_owns]) in expected {
             assert_eq!(credential.belongs_to(&Identity::Owner), owner, "{credential} / owner");
@@ -517,7 +596,13 @@ mod tests {
         assert!(!Credential::Bearer.is_a_password_login());
         assert!(!Credential::Passkey.is_a_password_login());
         assert!(!Credential::Agent.is_a_password_login());
+        assert!(!Credential::PersonPassword.is_a_password_login());
         assert!(!Credential::Session(Session::new(Opening::Passkey, now)).is_a_password_login());
+        assert!(
+            !Credential::Session(Session::new(Opening::PersonPassword, now)).is_a_password_login(),
+            "this login already names its holder; the demotion exists to guard against a \
+             credential that cannot, and this one is not that"
+        );
     }
 
     #[test]

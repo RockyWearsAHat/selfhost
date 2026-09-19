@@ -57,7 +57,7 @@
 
 use crate::capability::Capability;
 use crate::credential::Credential;
-use crate::identity::{Identity, PersonName};
+use crate::identity::{Identity, PersonEmail, PersonName};
 use crate::policy::{Caller, Grants, TooManyGrants};
 use selfhost_json::Json;
 use std::io;
@@ -141,6 +141,17 @@ pub struct Person {
     /// When the entry was first created, as seconds since the Unix epoch —
     /// wall-clock rather than `Instant` because it survives restarts on disk.
     pub added_unix: u64,
+    /// The email a real login password ([`crate::credential::Credential::PersonPassword`])
+    /// is looked up by, if the owner has set one.
+    ///
+    /// `None` on every entry a passkey-only deployment has ever written, and
+    /// on any entry the owner has chosen not to give a login password —
+    /// nothing about this field is required, because a passkey remains a
+    /// complete way to be this person. Unique across the registry when
+    /// present: [`People::set_email`] is the only way to set it and refuses a
+    /// second person the same address, which is what lets
+    /// [`People::find_by_email`] answer at most one entry.
+    pub email: Option<PersonEmail>,
 }
 
 /// The durable registry: `<data_dir>/console.people`, owner-only, JSON.
@@ -227,6 +238,43 @@ impl People {
         self.lock().entries.iter().find(|entry| &entry.name == name).cloned()
     }
 
+    /// The entry whose login email is `email`, if one has it set.
+    ///
+    /// This is the lookup a person-password login runs before it ever touches
+    /// a password store: an email that matches nobody is refused exactly like
+    /// a wrong password, through the same [`crate::policy`]-adjacent uniform
+    /// failure the console's other login doors already share, rather than
+    /// telling a caller which half of the pair was wrong.
+    pub fn find_by_email(&self, email: &PersonEmail) -> Option<Person> {
+        self.lock().entries.iter().find(|entry| entry.email.as_ref() == Some(email)).cloned()
+    }
+
+    /// Sets, replaces, or clears one person's login email, persisting.
+    ///
+    /// Refuses two ways, both fail-closed rather than silently doing something
+    /// else: naming a person who is not registered (email is a profile field
+    /// on an existing entry, not a second way to create one — [`Self::set_grants`]
+    /// is), and naming an email already set on somebody else, which is what
+    /// keeps [`Self::find_by_email`] able to answer at most one entry.
+    pub fn set_email(&self, name: &PersonName, email: Option<PersonEmail>) -> io::Result<()> {
+        let mut state = self.lock();
+        if let Some(wanted) = &email {
+            if state.entries.iter().any(|entry| &entry.name != name && entry.email.as_ref() == Some(wanted))
+            {
+                return Err(io::Error::other(format!(
+                    "{wanted} is already the login email for another person"
+                )));
+            }
+        }
+        match state.entries.iter_mut().find(|entry| &entry.name == name) {
+            Some(entry) => entry.email = email,
+            None => return Err(io::Error::other(format!("{name} is not a registered person"))),
+        }
+        self.persist(&state.entries)?;
+        self.mark_written(&mut state);
+        Ok(())
+    }
+
     /// What `identity` holds.
     ///
     /// The owner is answered with [`Grants::none`], and that is not a mistake:
@@ -295,7 +343,12 @@ impl People {
                         "at most {MAX_PEOPLE} people may be registered"
                     )));
                 }
-                state.entries.push(Person { name: name.clone(), grants, added_unix: now_unix() });
+                state.entries.push(Person {
+                    name: name.clone(),
+                    grants,
+                    added_unix: now_unix(),
+                    email: None,
+                });
             }
         }
         self.persist(&state.entries)?;
@@ -430,24 +483,32 @@ fn now_unix() -> u64 {
 }
 
 /// The stored file's JSON shape:
-/// `{"people": [{name, grants: ["files.read:vault", …], addedUnix}]}`.
+/// `{"people": [{name, grants: ["files.read:vault", …], addedUnix, email?}]}`.
 ///
 /// Grants are written in their wire form ([`Capability`]'s `Display`), which is
 /// the same spelling the console sends and the audit log records — one
 /// vocabulary for one idea, so a capability cannot be renamed in one place and
-/// silently mean something else in another.
+/// silently mean something else in another. `email` is omitted entirely when
+/// unset rather than written as `null`, which is what makes every entry a
+/// pre-login-password deployment ever wrote parse unchanged: an absent key and
+/// an explicit `null` are read identically by [`parse_people`], but only the
+/// first is what this crate itself has ever produced.
 fn people_to_json(entries: &[Person]) -> Json {
     Json::object([(
         "people",
         Json::array(entries.iter().map(|entry| {
-            Json::object([
+            let mut fields = vec![
                 ("name", Json::string(entry.name.as_str())),
                 (
                     "grants",
                     Json::array(entry.grants.iter().map(|c| Json::string(c.to_string()))),
                 ),
                 ("addedUnix", Json::Number(entry.added_unix as f64)),
-            ])
+            ];
+            if let Some(email) = &entry.email {
+                fields.push(("email", Json::string(email.as_str())));
+            }
+            Json::object(fields)
         })),
     )])
 }
@@ -457,10 +518,11 @@ fn people_to_json(entries: &[Person]) -> Json {
 /// "Anything at all" is the whole point, and every one of these is a refusal of
 /// the entire document rather than of one entry: a name that is not a valid
 /// [`PersonName`], a grant string this build does not understand, a grant list
-/// over the cap, a duplicate name, more than [`MAX_PEOPLE`] entries, a missing
-/// field. A permission file that is partly understood is a permission file
-/// whose meaning depends on which build is reading it, and the direction to
-/// fail in is obvious.
+/// over the cap, a duplicate name, an email that is not a valid [`PersonEmail`],
+/// a duplicate email, more than [`MAX_PEOPLE`] entries, a missing field. A
+/// permission file that is partly understood is a permission file whose
+/// meaning depends on which build is reading it, and the direction to fail in
+/// is obvious.
 ///
 /// An unknown grant word deserves a note: it is what a *downgrade* looks like,
 /// where a file written by a newer build names a capability this one has never
@@ -487,7 +549,17 @@ fn parse_people(text: &str) -> Option<Vec<Person>> {
             Ok(grants) => grants,
             Err(TooManyGrants) => return None,
         };
-        entries.push(Person { name, grants, added_unix: item.get("addedUnix")?.as_u64()? });
+        let email = match item.get("email") {
+            None | Some(Json::Null) => None,
+            Some(value) => {
+                let email = PersonEmail::parse(value.as_str()?).ok()?;
+                if entries.iter().any(|entry| entry.email.as_ref() == Some(&email)) {
+                    return None;
+                }
+                Some(email)
+            }
+        };
+        entries.push(Person { name, grants, added_unix: item.get("addedUnix")?.as_u64()?, email });
     }
     Some(entries)
 }
@@ -679,6 +751,9 @@ mod tests {
             r#"{"people":[{"name":"Mom","grants":["files.read"],"addedUnix":1}]}"#, // no target
             r#"{"people":[{"name":"Mom","grants":[],"addedUnix":1},
                           {"name":"Mom","grants":[],"addedUnix":2}]}"#,    // duplicate
+            r#"{"people":[{"name":"Mom","grants":[],"addedUnix":1,"email":"not-an-email"}]}"#, // bad email
+            r#"{"people":[{"name":"Mom","grants":[],"addedUnix":1,"email":"a@example.com"},
+                          {"name":"Dad","grants":[],"addedUnix":2,"email":"a@example.com"}]}"#, // duplicate email
         ];
         for text in bad {
             std::fs::write(&path, text).expect("writes the fixture");
@@ -700,12 +775,44 @@ mod tests {
                 ])
                 .unwrap(),
                 added_unix: 1_754_000_000,
+                email: Some(PersonEmail::parse("mary-anne@example.com").unwrap()),
             },
-            Person { name: person("Mom"), grants: Grants::none(), added_unix: 1 },
+            Person { name: person("Mom"), grants: Grants::none(), added_unix: 1, email: None },
         ];
         let text = people_to_json(&entries).to_text();
         assert_eq!(parse_people(&text).as_deref(), Some(entries.as_slice()));
         assert!(text.contains("desktop.control:alex-desktop"), "grants keep their wire spelling");
+        assert!(text.contains("mary-anne@example.com"), "an email that was set is written back out");
+        assert!(!text.contains("\"email\":null"), "an unset email is omitted, not written as null");
+    }
+
+    #[test]
+    fn a_persons_email_is_set_looked_up_and_kept_unique() {
+        let dir = scratch("email");
+        let people = People::load(&dir);
+        people.set_grants(&person("Mom"), Grants::none()).unwrap();
+        people.set_grants(&person("Dad"), Grants::none()).unwrap();
+
+        let mom_email = PersonEmail::parse("mom@example.com").unwrap();
+        people.set_email(&person("Mom"), Some(mom_email.clone())).expect("sets the email");
+        assert_eq!(people.find_by_email(&mom_email).map(|p| p.name), Some(person("Mom")));
+
+        // Nobody else can take the same address.
+        let collision = people.set_email(&person("Dad"), Some(mom_email.clone()));
+        assert!(collision.is_err(), "an email already in use is refused for a second person");
+        assert!(people.find_by_email(&mom_email).map(|p| p.name) == Some(person("Mom")));
+
+        // Setting an unregistered person's email is refused rather than
+        // creating them: this is a profile field, not a second way in.
+        assert!(people.set_email(&person("Nobody"), Some(mom_email)).is_err());
+
+        // Clearing it frees the address for somebody else.
+        people.set_email(&person("Mom"), None).expect("clears the email");
+        let dad_email = PersonEmail::parse("dad@example.com").unwrap();
+        people.set_email(&person("Dad"), Some(dad_email.clone())).expect("now free to take");
+        assert_eq!(people.find_by_email(&dad_email).map(|p| p.name), Some(person("Dad")));
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[cfg(unix)]

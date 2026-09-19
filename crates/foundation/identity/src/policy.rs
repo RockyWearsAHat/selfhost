@@ -1036,7 +1036,7 @@ mod tests {
         // question and it is answered at the ticket, with a clock.
         let at_the_keyboard = Caller::passkey(Identity::Owner, Grants::none());
         assert_eq!(locked.decide(&at_the_keyboard, &Capability::DesktopControl(node())), Decision::Allow);
-        for opening in Opening::EVERY {
+        for opening in [Opening::Password, Opening::Passkey] {
             let cookie = Caller::new(Identity::Owner, session_of(opening), Grants::none());
             assert_eq!(
                 locked.decide(&cookie, &Capability::ClipboardRead(node())),
@@ -1044,6 +1044,20 @@ mod tests {
                 "a session opened by {opening} is decided on recency, not here"
             );
         }
+        // A person-password session names its own holder rather than the
+        // owner — `Credential::belongs_to` refuses it for anyone else — so it
+        // is proven through a grant instead of the owner's blanket authority.
+        // But once granted, it too is decided on recency, not here.
+        let person_cookie = Caller::new(
+            person(),
+            session_of(Opening::PersonPassword),
+            Grants::new([Capability::ClipboardRead(node())]).expect("one grant"),
+        );
+        assert_eq!(
+            locked.decide(&person_cookie, &Capability::ClipboardRead(node())),
+            Decision::Allow,
+            "a session opened by person-password is decided on recency, not here"
+        );
     }
 
     #[test]

@@ -383,10 +383,12 @@ pub fn ceilings_from(config: &Desktop) -> Ceilings {
 pub fn fresh_enough(caller: &Caller, window: Duration, now: Instant) -> bool {
     match caller.credential() {
         Credential::Session(session) => match session.opened_by {
-            Opening::Password | Opening::Passkey => session.age(now) <= window,
+            Opening::Password | Opening::Passkey | Opening::PersonPassword => {
+                session.age(now) <= window
+            }
         },
         // Presented on this very request: nothing is fresher than that.
-        Credential::Password | Credential::Passkey => true,
+        Credential::Password | Credential::Passkey | Credential::PersonPassword => true,
         // Also presented on this request, and also with no login moment — but a
         // device password is a WebDAV mount's credential and is never carried on
         // a desktop route at all. It is answered `true` for consistency with the

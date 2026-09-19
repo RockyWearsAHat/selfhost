@@ -35,7 +35,7 @@
 //! half-applied. A body that fails to parse changes nothing — the grants are
 //! built and validated in full before the registry is touched.
 
-use selfhost_identity::{Capability, Caller, Grants, People, Person, VpnLocationId};
+use selfhost_identity::{Capability, Caller, Grants, People, Person, PersonEmail, PersonName, VpnLocationId};
 use selfhost_json::Json;
 use std::path::{Path, PathBuf};
 
@@ -186,6 +186,51 @@ pub fn vpn_fields_from_body(body: &[u8]) -> Result<(Option<String>, Option<Strin
         }
     }
     Ok((peer, public_key))
+}
+
+/// The optional `"email"` and `"password"` fields a `PUT /api/people/<name>`
+/// body may carry alongside `"grants"`, letting the owner give this person a
+/// real sign-in — an address and a password checked at the login form —
+/// in the same call that grants them something to do once they are in.
+///
+/// Absent or `null` fields are `None`, not a refusal, on the same grounds as
+/// [`vpn_fields_from_body`]'s pair: a grant with no email or password set yet
+/// is legal, it just leaves this person unable to use this particular door
+/// until one is set, through this call or a later one. This route only ever
+/// *sets* — clearing either field is not yet a shape this body can express,
+/// which is a deliberate, narrower first cut rather than an oversight; see
+/// this module's own commentary on `NotYetHonoured` for why a promise this
+/// deployment cannot yet keep is worse than a gap that is simply absent.
+///
+/// A field that is *present* and malformed is refused before anything is
+/// written: an email [`PersonEmail::parse`] refuses, or a password shorter
+/// than [`crate::person_password::MIN_PASSWORD_LENGTH`].
+pub fn identity_fields_from_body(body: &[u8]) -> Result<(Option<PersonEmail>, Option<String>), String> {
+    let text = std::str::from_utf8(body).map_err(|_| "the body is not JSON".to_owned())?;
+    let document = selfhost_json::parse(text).map_err(|_| "the body is not JSON".to_owned())?;
+    let email = match document.get("email") {
+        None | Some(Json::Null) => None,
+        Some(value) => {
+            let text = value.as_str().ok_or_else(|| "\"email\" must be a string".to_owned())?;
+            let email = PersonEmail::parse(text)
+                .map_err(|error| format!("\"email\" is not usable: {error}"))?;
+            Some(email)
+        }
+    };
+    let password = match document.get("password") {
+        None | Some(Json::Null) => None,
+        Some(value) => {
+            let text = value.as_str().ok_or_else(|| "\"password\" must be a string".to_owned())?;
+            if text.chars().count() < crate::person_password::MIN_PASSWORD_LENGTH {
+                return Err(format!(
+                    "a login password must be at least {} characters",
+                    crate::person_password::MIN_PASSWORD_LENGTH
+                ));
+            }
+            Some(text.to_owned())
+        }
+    };
+    Ok((email, password))
 }
 
 /// Enrols or revokes a roster entry for every `vpn.access:<location>` a grant
@@ -343,12 +388,20 @@ impl VpnWiring {
 /// exactly as it was before this field existed, so a reader that does not know
 /// about warnings yet sees nothing new. `notes` carries [`vpn_side_effects`]'s
 /// report lines the same way — an empty slice leaves the object exactly as it
-/// was before this field existed.
-pub fn person_json(person: &Person, warning: Option<String>, notes: &[String]) -> Json {
+/// was before this field existed. `has_password` answers whether the
+/// email-and-password door has anything to check for this person, since the
+/// registry itself does not hold that credential — see
+/// [`crate::person_password::PersonPasswords`].
+pub fn person_json(person: &Person, warning: Option<String>, notes: &[String], has_password: bool) -> Json {
     let mut fields = vec![
         ("name".to_owned(), Json::string(person.name.as_str())),
         ("added_unix".to_owned(), Json::Number(person.added_unix as f64)),
         ("grants".to_owned(), grants_json(&person.grants)),
+        (
+            "email".to_owned(),
+            person.email.as_ref().map_or(Json::Null, |email| Json::string(email.as_str())),
+        ),
+        ("has_password".to_owned(), Json::Bool(has_password)),
     ];
     if let Some(reason) = warning {
         fields.push(("warning".to_owned(), Json::string(reason)));
@@ -390,10 +443,22 @@ pub fn wire_word(capability: &Capability) -> String {
 }
 
 /// The whole roster, for the owner.
-pub fn roster_json(people: &People) -> Json {
+///
+/// `password_holders` names everybody the email-and-password door already has
+/// a credential for — see [`person_json`]'s `has_password`. Passed in rather
+/// than looked up here because [`crate::person_password::PersonPasswords`] is
+/// a store this module does not otherwise know about; the caller already read
+/// it once to build this list.
+pub fn roster_json(people: &People, password_holders: &[PersonName]) -> Json {
     let entries = people.list();
     Json::object([
-        ("people", Json::array(entries.iter().map(|person| person_json(person, None, &[])))),
+        (
+            "people",
+            Json::array(entries.iter().map(|person| {
+                let has_password = password_holders.contains(&person.name);
+                person_json(person, None, &[], has_password)
+            })),
+        ),
         ("count", Json::Number(entries.len() as f64)),
     ])
 }
@@ -674,5 +739,56 @@ mod tests {
         // written and discovered at the next handshake.
         assert!(vpn_fields_from_body(br#"{"grants":[],"peer":"Not Valid!"}"#).is_err());
         assert!(vpn_fields_from_body(br#"{"grants":[],"public_key":"not-base64-32-bytes"}"#).is_err());
+    }
+
+    #[test]
+    fn a_put_body_with_no_email_or_password_sets_neither() {
+        // Absent, same as `vpn_fields_from_body`'s pair: a grant change with no
+        // identity fields is legal and leaves this person's login door alone.
+        assert_eq!(identity_fields_from_body(br#"{"grants":[]}"#).unwrap(), (None, None));
+        assert_eq!(
+            identity_fields_from_body(br#"{"grants":[],"email":null,"password":null}"#).unwrap(),
+            (None, None)
+        );
+    }
+
+    #[test]
+    fn a_put_body_may_carry_email_and_password_beside_the_grant_set() {
+        let body = br#"{"grants":[],"email":"Mom@Example.com","password":"correct horse battery"}"#;
+        let (email, password) = identity_fields_from_body(body).unwrap();
+        // Lower-cased on the way in, the same normalisation `PersonEmail::parse`
+        // gives every other caller, so two spellings of one address can never
+        // both be "the" email on file.
+        assert_eq!(email.unwrap().as_str(), "mom@example.com");
+        assert_eq!(password.as_deref(), Some("correct horse battery"));
+    }
+
+    #[test]
+    fn a_malformed_email_is_refused_before_anything_is_written() {
+        let refusal = identity_fields_from_body(br#"{"grants":[],"email":"not-an-email"}"#).unwrap_err();
+        assert!(refusal.contains("email"), "{refusal}");
+    }
+
+    #[test]
+    fn a_password_shorter_than_the_minimum_is_refused() {
+        let refusal = identity_fields_from_body(br#"{"grants":[],"password":"short"}"#).unwrap_err();
+        assert!(
+            refusal.contains(&crate::person_password::MIN_PASSWORD_LENGTH.to_string()),
+            "{refusal}"
+        );
+    }
+
+    #[test]
+    fn a_password_at_exactly_the_minimum_length_is_accepted() {
+        let password = "x".repeat(crate::person_password::MIN_PASSWORD_LENGTH);
+        let body = format!(r#"{{"grants":[],"password":"{password}"}}"#);
+        let (_, parsed_password) = identity_fields_from_body(body.as_bytes()).unwrap();
+        assert_eq!(parsed_password.as_deref(), Some(password.as_str()));
+    }
+
+    #[test]
+    fn a_non_string_email_or_password_is_refused_rather_than_silently_dropped() {
+        assert!(identity_fields_from_body(br#"{"grants":[],"email":7}"#).is_err());
+        assert!(identity_fields_from_body(br#"{"grants":[],"password":7}"#).is_err());
     }
 }
