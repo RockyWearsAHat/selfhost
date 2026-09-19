@@ -503,6 +503,12 @@ pub struct Site {
     /// deployment's owner and explicit Grants decide.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub owner: Option<SiteOwner>,
+    /// Which VPN relay gates this private site. Absent for public/people sites.
+    /// When present, POST /api/vpn/authorize only authorises this relay for
+    /// callers who hold a grant on this site. Default: the single relay if
+    /// exactly one exists; required if zero or multiple relays are configured.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub relay: Option<String>,
 }
 
 /// Who may reach a site.
@@ -635,6 +641,13 @@ impl Site {
     /// to enroll a Peer.
     pub fn is_network_gated(&self) -> bool {
         self.exposure == Some(Exposure::Private) || !self.allowed_cidrs.is_empty()
+    }
+
+    /// The VPN relay that gates this site, if one is explicitly configured.
+    /// For sites without an explicit relay setting, callers must determine
+    /// defaulting (single relay, if exactly one exists) at the API layer.
+    pub fn relay_name(&self) -> Option<&str> {
+        self.relay.as_deref()
     }
 
     /// Whether `path` is on this site's [`public_api_paths`](Self::public_api_paths)
@@ -819,6 +832,7 @@ mod tests {
             public_api_paths: vec![],
             exposure: None,
             owner: None,
+            relay: None,
         };
         assert!(!site.routes_to_app("/api/health"));
     }
@@ -839,6 +853,7 @@ mod tests {
             public_api_paths: vec![],
             exposure: None,
             owner: None,
+            relay: None,
         };
         assert!(site.routes_to_app("/anything"));
     }
@@ -898,6 +913,7 @@ mod tests {
                 public_api_paths: vec![],
                 exposure: None,
                 owner: None,
+                relay: None,
             }],
             dns: None,
             mail: None,
@@ -1005,6 +1021,7 @@ static_root = "./public"
             public_api_paths: vec![],
             exposure: None,
             owner: None,
+            relay: None,
         };
         let vpn_client: IpAddr = "10.66.0.2".parse().unwrap();
         let stranger: IpAddr = "203.0.113.9".parse().unwrap();
@@ -1039,6 +1056,7 @@ static_root = "./public"
             public_api_paths: vec!["/api/session".into(), "/api/vpn/authorize".into()],
             exposure: None,
             owner: None,
+            relay: None,
         };
         assert!(site.permits_public_api_path("/api/session"));
         assert!(site.permits_public_api_path("/api/vpn/authorize"));

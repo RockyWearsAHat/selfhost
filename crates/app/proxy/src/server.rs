@@ -2668,6 +2668,7 @@ mod tests {
             public_api_paths: vec![],
             exposure: None,
             owner: None,
+            relay: None,
         }
     }
 
