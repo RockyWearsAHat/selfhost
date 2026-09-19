@@ -2037,6 +2037,47 @@ impl Api {
             .any(|site| site.is_network_gated() && !site.console && self.may_reach_site(caller, site))
     }
 
+    /// Which relays a caller may authorize access to, based on their grants.
+    /// Includes relays they can access via explicit `vpn.access:<relay>` grants,
+    /// and relays that gate sites they have access to (via `site.access:<site>`).
+    fn relays_accessible_to(&self, caller: &Caller) -> Vec<String> {
+        let Some(vpn) = &self.vpn else {
+            return Vec::new();
+        };
+        let mut accessible_relays: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+        // Add relays the caller has explicit vpn.access for
+        for relay_name in vpn.relay_names() {
+            let cap = Capability::VpnAccess(
+                selfhost_identity::VpnLocationId::parse(relay_name)
+                    .expect("relay name from config is valid"),
+            );
+            if self.policy().decide(caller, &cap).is_allowed() {
+                accessible_relays.insert(relay_name.to_owned());
+            }
+        }
+
+        // Add relays that gate sites this caller has access to
+        for site in self.configured_sites() {
+            if !site.is_network_gated() || site.console {
+                continue;
+            }
+            if !self.may_reach_site(caller, &site) {
+                continue;
+            }
+            if let Some(relay_name) = site.relay_name() {
+                accessible_relays.insert(relay_name.to_owned());
+            } else if vpn.relay_names().len() == 1 {
+                // Default to the single relay if not explicitly named
+                accessible_relays.insert(vpn.relay_names()[0].to_owned());
+            }
+        }
+
+        let mut result: Vec<_> = accessible_relays.into_iter().collect();
+        result.sort();
+        result
+    }
+
     /// Answers `POST /api/vpn/authorize`: the console-session half of a VPN
     /// sign-in.
     ///
@@ -2063,15 +2104,38 @@ impl Api {
         let Ok(document) = selfhost_json::parse(text) else {
             return problem(Status(400), "invalid JSON body");
         };
-        // Absent means "this deployment's relay": the first `[[vpn]]` entry.
-        let Some(location_text) = document
-            .get("location")
-            .and_then(Json::as_str)
-            .or_else(|| vpn.relay_names().first().copied())
-        else {
-            return problem(Status(404), "no VPN location is configured on this deployment");
+        // Determine the location: explicit in the request, or default to the single
+        // relay the caller can reach (if exactly one).
+        let location_text = match document.get("location").and_then(Json::as_str) {
+            Some(requested) => requested.to_owned(),
+            None => {
+                // No explicit location: determine the default by checking which
+                // relays the caller can access via their grants
+                let accessible = self.relays_accessible_to(caller);
+                match accessible.len() {
+                    0 => {
+                        return problem(
+                            Status(403),
+                            "you have no VPN access — ask the owner to grant you vpn.access or \
+                             access to a private site",
+                        );
+                    }
+                    1 => accessible[0].clone(),
+                    _ => {
+                        return problem(
+                            Status(400),
+                            &format!(
+                                "you have access to multiple relays ({}) — specify which one you \
+                                 want to enroll with: {}",
+                                accessible.len(),
+                                accessible.join(", ")
+                            ),
+                        );
+                    }
+                }
+            }
         };
-        let Ok(location) = VpnLocationId::parse(location_text) else {
+        let Ok(location) = VpnLocationId::parse(&location_text) else {
             return problem(Status(400), "not a usable VPN location id");
         };
         let Some(code_challenge) = document.get("codeChallenge").and_then(Json::as_str) else {
@@ -2083,19 +2147,34 @@ impl Api {
                 "no such VPN location is configured on this deployment",
             );
         }
-        // Two ways in: the relay's own word, or — on a single-relay deployment
-        // only, see `holds_the_one_network_gated_site` — a Grant on a Site
-        // that can only be reached from inside that one network. The second
-        // is what lets a Site's people enrol a Peer without the owner also
-        // handing each of them a relay by name.
-        if !self.policy().decide(caller, &Capability::VpnAccess(location.clone())).is_allowed()
-            && !self.holds_the_one_network_gated_site(caller)
-        {
+        // Check if the caller can access this specific relay. Two ways in:
+        // 1. An explicit vpn.access grant for this relay, OR
+        // 2. A grant on any site that maps to this relay (via site.access).
+        let can_access_relay = self.policy()
+            .decide(caller, &Capability::VpnAccess(location.clone()))
+            .is_allowed()
+            || self.configured_sites().iter().any(|site| {
+                if !site.is_network_gated() || site.console {
+                    return false;
+                }
+                // Check if this site gates the requested relay
+                let site_gates_relay = if let Some(relay_name) = site.relay_name() {
+                    relay_name == location.as_str()
+                } else if vpn.relay_names().len() == 1 {
+                    // Site defaults to single relay
+                    site.relay.is_none() && location.as_str() == vpn.relay_names()[0]
+                } else {
+                    false
+                };
+                site_gates_relay && self.may_reach_site(caller, &site)
+            });
+
+        if !can_access_relay {
             return problem(
                 Status(403),
                 &format!(
-                    "you hold neither vpn.access:{location} nor access to a private site; ask \
-                     the owner for one before signing this device in"
+                    "you don't have access to the {location} relay — ask the owner to grant you \
+                     vpn.access:{location} or access to a private site that uses this relay"
                 ),
             );
         }
