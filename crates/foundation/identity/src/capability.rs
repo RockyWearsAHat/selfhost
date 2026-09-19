@@ -223,6 +223,32 @@ impl fmt::Display for VpnLocationId {
     }
 }
 
+/// The name of a Site: the `name` its config entry carries.
+///
+/// The same grammar and the same cap as a share id, because a Site's name is
+/// written into the same registry and the same audit lines, and — new with the
+/// per-Site grants — into the audience of a [`crate::Pass`].
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct SiteName(String);
+
+impl SiteName {
+    /// Validates `text` as a Site name.
+    pub fn parse(text: &str) -> Result<Self, InvalidToken> {
+        parse_token(text, MAX_SHARE_ID_CHARS).map(Self)
+    }
+
+    /// The name as written.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for SiteName {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
 /// One power a caller may hold.
 ///
 /// The variants carrying a target are per-object: a person granted
@@ -290,6 +316,22 @@ pub enum Capability {
     /// widen a site's `allowed_cidrs`. It is therefore never implied by anything,
     /// and the console it is administered from is itself a site.
     SiteAdmin,
+    /// Reach one Site whose Exposure is `people` or `private`.
+    ///
+    /// What the proxy asks for, per request, of the Person a Pass names. It
+    /// opens that one Site's content and nothing in the console: holding it
+    /// says nothing about reading, let alone administering, this deployment.
+    SiteAccess(SiteName),
+    /// Decide who may reach one Site: the delegation an owner hands out.
+    ///
+    /// Written `site.admin:<site>`, beside the untargeted `site.admin` rather
+    /// than instead of it, and deliberately much smaller: the holder may give
+    /// and take away `site.access:<site>` for that same Site through the people
+    /// API, and nothing broader. It does not edit the Site's definition — that
+    /// stays [`Capability::SiteAdmin`] — and it is not implied by it. Implies
+    /// [`Capability::SiteAccess`] on the same Site: whoever decides who gets in
+    /// is not locked out themselves.
+    SiteAdminOf(SiteName),
     /// Create, change and remove **DNS records** in the zones this deployment
     /// serves.
     ///
@@ -343,7 +385,8 @@ impl Capability {
             Self::DesktopControl(_) => "desktop.control",
             Self::ClipboardRead(_) => "clipboard.read",
             Self::NodeAdmin => "node.admin",
-            Self::SiteAdmin => "site.admin",
+            Self::SiteAdmin | Self::SiteAdminOf(_) => "site.admin",
+            Self::SiteAccess(_) => "site.access",
             Self::DnsAdmin => "dns.admin",
             Self::MailAdmin => "mail.admin",
             Self::VpnAccess(_) => "vpn.access",
@@ -394,6 +437,8 @@ impl Capability {
             | Self::DesktopControl(_)
             | Self::ClipboardRead(_)
             | Self::SiteAdmin
+            | Self::SiteAccess(_)
+            | Self::SiteAdminOf(_)
             | Self::NodeAdmin
             | Self::VpnAccess(_) => true,
             // Grep for the name in `crates/app/admin/src/lib.rs`'s `Route::demand`
@@ -422,6 +467,7 @@ impl Capability {
             Self::DesktopView(node) | Self::DesktopControl(node) | Self::ClipboardRead(node) => {
                 Some(node.as_str())
             }
+            Self::SiteAccess(site) | Self::SiteAdminOf(site) => Some(site.as_str()),
             Self::VpnAccess(location) => Some(location.as_str()),
         }
     }
@@ -442,6 +488,7 @@ impl Capability {
         let share = |target: Option<&str>| ShareId::parse(target?).ok();
         let node = |target: Option<&str>| NodeName::parse(target?).ok();
         let location = |target: Option<&str>| VpnLocationId::parse(target?).ok();
+        let site = |target: Option<&str>| SiteName::parse(target?).ok();
         match (word, target) {
             ("console.read", None) => Some(Self::ConsoleRead),
             ("service.control", None) => Some(Self::ServiceControl),
@@ -456,6 +503,8 @@ impl Capability {
             ("desktop.view", target) => node(target).map(Self::DesktopView),
             ("desktop.control", target) => node(target).map(Self::DesktopControl),
             ("clipboard.read", target) => node(target).map(Self::ClipboardRead),
+            ("site.admin", target) => site(target).map(Self::SiteAdminOf),
+            ("site.access", target) => site(target).map(Self::SiteAccess),
             ("vpn.access", target) => location(target).map(Self::VpnAccess),
             _ => None,
         }
@@ -475,7 +524,12 @@ impl Capability {
     /// same share and node it granted. The length assertion in this module's
     /// tests is the reminder to extend this list when a variant is added;
     /// [`Capability::name`] is what stops the build first.
-    pub fn every_shape(share: &ShareId, node: &NodeName, location: &VpnLocationId) -> Vec<Capability> {
+    pub fn every_shape(
+        share: &ShareId,
+        node: &NodeName,
+        location: &VpnLocationId,
+        site: &SiteName,
+    ) -> Vec<Capability> {
         vec![
             Self::ConsoleRead,
             Self::ServiceControl,
@@ -488,6 +542,8 @@ impl Capability {
             Self::ClipboardRead(node.clone()),
             Self::NodeAdmin,
             Self::SiteAdmin,
+            Self::SiteAccess(site.clone()),
+            Self::SiteAdminOf(site.clone()),
             Self::DnsAdmin,
             Self::MailAdmin,
             Self::VpnAccess(location.clone()),
@@ -534,6 +590,10 @@ mod tests {
         VpnLocationId::parse("console").expect("a valid vpn location id")
     }
 
+    fn site() -> SiteName {
+        SiteName::parse("blog").expect("a valid site name")
+    }
+
     #[test]
     fn ordinary_tokens_parse_and_odd_ones_do_not() {
         for good in ["vault", "a", "a1", "photos-2024", "alex_desktop", "a.b", "self", "home"] {
@@ -572,8 +632,8 @@ mod tests {
 
     #[test]
     fn every_capability_round_trips_through_its_wire_form() {
-        let shapes = Capability::every_shape(&share(), &node(), &location());
-        assert_eq!(shapes.len(), 14, "extend every_shape when a variant is added");
+        let shapes = Capability::every_shape(&share(), &node(), &location(), &site());
+        assert_eq!(shapes.len(), 16, "extend every_shape when a variant is added");
         for capability in &shapes {
             let text = capability.to_string();
             assert_eq!(
@@ -588,6 +648,8 @@ mod tests {
         assert_eq!(Capability::DesktopControl(node()).to_string(), "desktop.control:alex-desktop");
         assert_eq!(Capability::NodeAdmin.to_string(), "node.admin");
         assert_eq!(Capability::SiteAdmin.to_string(), "site.admin");
+        assert_eq!(Capability::SiteAdminOf(site()).to_string(), "site.admin:blog");
+        assert_eq!(Capability::SiteAccess(site()).to_string(), "site.access:blog");
         assert_eq!(Capability::DnsAdmin.to_string(), "dns.admin");
         assert_eq!(Capability::MailAdmin.to_string(), "mail.admin");
     }
@@ -626,10 +688,13 @@ mod tests {
 
     #[test]
     fn a_configuration_capability_takes_no_target() {
-        // `site.admin:example` would read as "may administer only this site" and
-        // grant something this grammar cannot enforce, so it is refused outright
-        // rather than silently reduced to the whole-deployment grant.
-        for text in ["site.admin:example", "dns.admin:rockywearsahat.com", "mail.admin:alex"] {
+        // `dns.admin:example.com` would read as "may administer only this zone"
+        // and grant something this grammar cannot enforce, so it is refused
+        // outright rather than silently reduced to the whole-deployment grant.
+        // `site.admin:<site>` is no longer in this list: it is its own, much
+        // smaller power ([`Capability::SiteAdminOf`]), not a narrowed spelling
+        // of [`Capability::SiteAdmin`].
+        for text in ["dns.admin:rockywearsahat.com", "mail.admin:alex"] {
             assert_eq!(Capability::parse(text), None, "{text} must not parse");
         }
     }
@@ -644,6 +709,8 @@ mod tests {
             "files.read:",          // present but empty
             "files.read:Vault",     // a target that fails its own grammar
             "files.read:a:b",       // the second colon lands inside the target
+            "site.access",          // a Site grant always names its Site
+            "site.access:Blog",
             "desktop.control",
             "node.admin:self",
             "FILES.READ:vault",
@@ -657,7 +724,7 @@ mod tests {
 
     #[test]
     fn driving_a_machine_is_exactly_control_and_clipboard() {
-        for capability in Capability::every_shape(&share(), &node(), &location()) {
+        for capability in Capability::every_shape(&share(), &node(), &location(), &site()) {
             let expected = matches!(
                 capability,
                 Capability::DesktopControl(_) | Capability::ClipboardRead(_)

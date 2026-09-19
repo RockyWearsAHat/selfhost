@@ -323,6 +323,24 @@ pub fn certificate_days_remaining(store: &CertificateStore, host: &str) -> Optio
     Some(CERTIFICATE_LIFETIME_DAYS as i64 - age_days as i64)
 }
 
+/// The [`selfhost_admin::CertificateExpiry`] `main.rs` hands the admin API,
+/// so `GET /api/system` can report certificate expiry without `selfhost-admin`
+/// depending on this crate or on `selfhost-proxy` — see that trait's
+/// documentation. A thin wrapper around the same [`CertificateStore`] the
+/// proxy and mail already share; every read here is the same
+/// [`certificate_days_remaining`] a `selfhost doctor` run would compute.
+pub struct CertificateExpiryReport(pub CertificateStore);
+
+impl selfhost_admin::CertificateExpiry for CertificateExpiryReport {
+    fn hosts(&self) -> Vec<String> {
+        self.0.hosts()
+    }
+
+    fn days_remaining(&self, host: &str) -> Option<i64> {
+        certificate_days_remaining(&self.0, host)
+    }
+}
+
 /// The issue-time marker path that sits beside a host's certificate, e.g.
 /// `<data_dir>/tls/example.com.issued` next to `example.com.crt.pem`.
 ///
@@ -374,6 +392,8 @@ mod tests {
             allowed_cidrs: vec![],
             console: false,
             public_api_paths: vec![],
+            exposure: None,
+            owner: None,
         }
     }
 

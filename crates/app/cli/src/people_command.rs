@@ -754,7 +754,8 @@ fn write(
     {
         println!("  {line}");
     }
-    if let Some(warning) = selfhost_admin::people_api::unreachable_without_vpn(&after) {
+    let relays: Vec<&str> = config.vpn.iter().map(|relay| relay.name.as_str()).collect();
+    if let Some(warning) = selfhost_admin::people_api::unreachable_without_vpn(&after, &relays) {
         println!("  ! {name} {warning}");
     }
     println!();

@@ -141,6 +141,12 @@ fn load(wiring: &Wiring) -> Result<Config, Response> {
         .map_err(|error| problem(Status(500), &format!("cannot read the site configuration: {error}")))
 }
 
+/// Every Site the configuration declares now, read fresh so an Exposure or
+/// owner edited a moment ago is the one a sign-in is judged against.
+pub fn configured_sites(wiring: &Wiring) -> Result<Vec<selfhost_config::Site>, Response> {
+    load(wiring).map(|config| config.sites)
+}
+
 /// Reads the config's source text, for the [`selfhost_config::edit`] functions
 /// that transform it without losing comments or untouched sections.
 fn read_source(wiring: &Wiring) -> Result<String, Response> {
@@ -183,6 +189,8 @@ fn site_json(site: &Site) -> Json {
             })),
         ),
         ("canonicalRedirect", Json::Bool(site.canonical_redirect)),
+        ("exposure", exposure_json(site.exposure)),
+        ("owner", site.owner.as_deref().map_or(Json::Null, Json::string)),
     ])
 }
 
@@ -337,6 +345,8 @@ pub fn add(wiring: &Wiring, body: &[u8]) -> Response {
         allowed_cidrs: Vec::new(),
         console: false,
         public_api_paths: vec![],
+        exposure: None,
+        owner: None,
     };
 
     let source = match read_source(wiring) {
@@ -429,6 +439,97 @@ pub fn remove_domain(wiring: &Wiring, name: &str, hostname: &str) -> Response {
         },
         Ok(None) => problem(Status(404), &format!("no site named \"{name}\"")),
         Err(error) => problem(Status(400), &format!("that hostname cannot be removed:\n{error}")),
+    }
+}
+
+/// A submitted `PUT /api/sites/<name>/exposure` body: `{"exposure": "public"}`,
+/// `{"exposure": "people"}`, `{"exposure": "private"}`, or `{"exposure": null}`
+/// (or the field simply absent) to clear it back to the unset default.
+fn parse_exposure(body: &[u8]) -> Result<Option<selfhost_config::Exposure>, String> {
+    let text = std::str::from_utf8(body).map_err(|_| "the body is not UTF-8".to_owned())?;
+    let document = selfhost_json::parse(text).map_err(|_| "the body is not JSON".to_owned())?;
+    match document.get("exposure") {
+        None | Some(Json::Null) => Ok(None),
+        Some(Json::String(word)) => match word.as_str() {
+            "public" => Ok(Some(selfhost_config::Exposure::Public)),
+            "people" => Ok(Some(selfhost_config::Exposure::People)),
+            "private" => Ok(Some(selfhost_config::Exposure::Private)),
+            other => Err(format!(
+                "\"exposure\" must be \"public\", \"people\" or \"private\", not \"{other}\""
+            )),
+        },
+        Some(_) => Err("\"exposure\" must be a string or null".to_owned()),
+    }
+}
+
+/// Answers `PUT /api/sites/<name>/exposure`.
+pub fn set_exposure(wiring: &Wiring, name: &str, body: &[u8]) -> Response {
+    if let Some(refusal) = refuse_if_console(wiring, name) {
+        return refusal;
+    }
+    let exposure = match parse_exposure(body) {
+        Ok(exposure) => exposure,
+        Err(message) => return problem(Status(400), &message),
+    };
+    let source = match read_source(wiring) {
+        Ok(source) => source,
+        Err(refusal) => return refusal,
+    };
+    match selfhost_config::edit::set_exposure(&source, name, exposure) {
+        Ok(Some(updated)) => match write_atomically(&wiring.config_path, &updated) {
+            Ok(()) => json(Status(200), Json::object([("exposure", exposure_json(exposure))])),
+            Err(refusal) => refusal,
+        },
+        Ok(None) => problem(Status(404), &format!("no site named \"{name}\"")),
+        Err(error) => problem(Status(400), &format!("that exposure cannot be set:\n{error}")),
+    }
+}
+
+/// A submitted `PUT /api/sites/<name>/owner` body: `{"owner": "alex"}`, or
+/// `{"owner": null}` (or the field simply absent) to clear it.
+fn parse_owner(body: &[u8]) -> Result<Option<String>, String> {
+    let text = std::str::from_utf8(body).map_err(|_| "the body is not UTF-8".to_owned())?;
+    let document = selfhost_json::parse(text).map_err(|_| "the body is not JSON".to_owned())?;
+    match document.get("owner") {
+        None | Some(Json::Null) => Ok(None),
+        Some(Json::String(owner)) => Ok(Some(owner.clone())),
+        Some(_) => Err("\"owner\" must be a string or null".to_owned()),
+    }
+}
+
+/// Answers `PUT /api/sites/<name>/owner`.
+pub fn set_owner(wiring: &Wiring, name: &str, body: &[u8]) -> Response {
+    if let Some(refusal) = refuse_if_console(wiring, name) {
+        return refusal;
+    }
+    let owner = match parse_owner(body) {
+        Ok(owner) => owner,
+        Err(message) => return problem(Status(400), &message),
+    };
+    let source = match read_source(wiring) {
+        Ok(source) => source,
+        Err(refusal) => return refusal,
+    };
+    match selfhost_config::edit::set_owner(&source, name, owner.as_deref()) {
+        Ok(Some(updated)) => match write_atomically(&wiring.config_path, &updated) {
+            Ok(()) => json(
+                Status(200),
+                Json::object([("owner", owner.as_deref().map_or(Json::Null, Json::string))]),
+            ),
+            Err(refusal) => refusal,
+        },
+        Ok(None) => problem(Status(404), &format!("no site named \"{name}\"")),
+        Err(error) => problem(Status(400), &format!("that owner cannot be set:\n{error}")),
+    }
+}
+
+/// The `exposure` field [`site_json`] and [`set_exposure`]'s response both use.
+fn exposure_json(exposure: Option<selfhost_config::Exposure>) -> Json {
+    match exposure {
+        None => Json::Null,
+        Some(selfhost_config::Exposure::Public) => Json::string("public"),
+        Some(selfhost_config::Exposure::People) => Json::string("people"),
+        Some(selfhost_config::Exposure::Private) => Json::string("private"),
     }
 }
 

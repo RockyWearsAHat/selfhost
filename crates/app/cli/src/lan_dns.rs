@@ -308,6 +308,8 @@ mod tests {
             allowed_cidrs: vec![],
             console: false,
             public_api_paths: vec![],
+            exposure: None,
+            owner: None,
         }
     }
 
