@@ -533,10 +533,6 @@ impl Config {
                 }
             }
 
-            if let Some(refusal) = exposure_refusal(site) {
-                problems.push(Problem { field: format!("sites[{i}].exposure"), message: refusal });
-            }
-
             if site.console {
                 if let Some(previous) = console_site {
                     problems.push(Problem {
@@ -628,29 +624,6 @@ impl Config {
                 }
             }
         }
-
-        // A `people`- or `private`-gated site is reached through a signed Pass, and a
-        // Pass is only ever minted by `/api/pass/authorize` — so a deployment that
-        // gates a site but never relays that one path has built a lock with no key:
-        // the proxy will 302 a visitor to sign in, and every sign-in attempt will 404.
-        use crate::Exposure;
-        if self
-            .sites
-            .iter()
-            .any(|site| matches!(site.exposure, Some(Exposure::People) | Some(Exposure::Private)))
-            && !self
-                .sites
-                .iter()
-                .any(|site| site.public_api_paths.iter().any(|p| p == "/api/pass/authorize"))
-        {
-            problems.push(Problem {
-                field: "sites".into(),
-                message: "a site is exposure = \"people\" or \"private\", but no site's \
-                          public_api_paths lists /api/pass/authorize; nobody could ever sign in \
-                          to reach it"
-                    .into(),
-            });
-        }
     }
 
     /// No two processes may claim the same port on the same machine.
@@ -703,39 +676,6 @@ const CONSOLE_GATE_RANGES: [&str; 7] = [
 /// hosts, and an operator who types it has almost certainly meant "the machines
 /// I own" while writing "every address any router might hand out".
 const CONSOLE_GATE_NARROWEST_IPV4: u8 = 24;
-
-/// Why a site's `exposure` contradicts the rest of its definition, if it does.
-///
-/// Each refusal is a config that reads one way and would behave another: a
-/// `public` site that still lists networks, a `private` one that lists none.
-/// The console and the sign-in gateway take no `exposure` at all — the console
-/// keeps its own login behind its own gate, and a sign-in page that demanded a
-/// Pass could never be reached by anyone who needs one.
-fn exposure_refusal(site: &crate::Site) -> Option<String> {
-    use crate::Exposure;
-    let exposure = site.exposure?;
-    if site.console {
-        return Some(
-            "the console site takes no exposure; it keeps its own login behind allowed_cidrs".into(),
-        );
-    }
-    if !site.public_api_paths.is_empty() && exposure != Exposure::Public {
-        return Some("a site with public_api_paths is how people sign in, so it must stay public".into());
-    }
-    match (exposure, site.allowed_cidrs.is_empty()) {
-        (Exposure::Public | Exposure::People, false) => Some(
-            "allowed_cidrs restricts the network, which is what exposure = \"private\" means; \
-             use that, or drop allowed_cidrs"
-                .into(),
-        ),
-        (Exposure::Private, true) => Some(
-            "exposure = \"private\" needs allowed_cidrs: the networks (the VPN's) a request must \
-             arrive from"
-                .into(),
-        ),
-        _ => None,
-    }
-}
 
 /// Why a console site may not name this CIDR, or `None` when it may.
 ///
@@ -860,8 +800,6 @@ mod tests {
             allowed_cidrs: vec![],
             console: false,
             public_api_paths: vec![],
-            exposure: None,
-            owner: None,
         }
     }
 
@@ -1145,37 +1083,6 @@ mod tests {
         let mut ok = config(vec![owner_node()], vec![site("a", "a.com")]);
         ok.server.firewall = Firewall { manage: true, scope: Scope::Lan };
         assert!(ok.validate().is_ok());
-    }
-
-    #[test]
-    fn an_exposure_must_agree_with_the_rest_of_the_site() {
-        use crate::Exposure::{People, Private, Public};
-        let cidrs = || vec!["10.66.0.0/24".to_owned()];
-        // (exposure, allowed_cidrs, console, public_api_paths, valid)
-        let table = [
-            (None, vec![], false, false, true),
-            (None, cidrs(), false, false, true),
-            (Some(Public), vec![], false, false, true),
-            (Some(Public), cidrs(), false, false, false),
-            (Some(People), vec![], false, false, true),
-            (Some(People), cidrs(), false, false, false),
-            (Some(Private), cidrs(), false, false, true),
-            (Some(Private), vec![], false, false, false),
-            (Some(Private), cidrs(), true, false, false),
-            (Some(People), vec![], false, true, false),
-            (Some(Public), vec![], false, true, true),
-        ];
-        for (exposure, allowed_cidrs, console, gateway, valid) in table {
-            let mut subject = site("a", "a.com");
-            subject.exposure = exposure;
-            subject.allowed_cidrs = allowed_cidrs;
-            subject.console = console;
-            if gateway {
-                subject.public_api_paths = vec!["/api/session".into()];
-            }
-            let refused = exposure_refusal(&subject).is_some();
-            assert_eq!(!refused, valid, "{subject:?}");
-        }
     }
 
     #[test]

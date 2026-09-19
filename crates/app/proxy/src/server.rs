@@ -15,7 +15,6 @@
 use crate::dav::{self, BodyPolicy};
 use crate::files::{self, Resolution};
 use crate::health;
-use crate::pass_gate::{self, PassGate};
 use crate::upgrade;
 use crate::upstream::Pool;
 use selfhost_config::{Config, Site, autodiscover, pacc};
@@ -229,11 +228,6 @@ pub struct Server {
     /// counters. So it is set once, from outside, by whichever caller also
     /// hands the same handle to `mail_task::run`.
     mail: RwLock<Option<Arc<MailHandles>>>,
-    /// The identity gate for `people` and `private` Sites; see
-    /// [`crate::pass_gate`]. Attached after build for the reason `mail` is:
-    /// the Pass key it holds is the one value the admin API also holds.
-    /// While it is `None` a Site that asks for a Pass is served to nobody.
-    passes: RwLock<Option<Arc<PassGate>>>,
 }
 
 /// The store and credential check EWS/ActiveSync need, bundled so
@@ -297,7 +291,6 @@ impl Server {
                     .expect("Store::load never touches disk and cannot fail")
             }),
             mail: RwLock::new(None),
-            passes: RwLock::new(None),
         }
     }
 
@@ -345,27 +338,6 @@ impl Server {
     ) {
         *self.mail.write().unwrap_or_else(|poisoned| poisoned.into_inner()) =
             Some(Arc::new(MailHandles { maildir, authenticator, hostname, local_domains }));
-    }
-
-    /// Attaches the identity gate. `gate` must be built over a clone of the
-    /// [`selfhost_admin::site_pass::SitePasses`] given to the admin API, or
-    /// the codes that API mints redeem nowhere.
-    pub fn attach_passes(&self, gate: PassGate) {
-        *self.passes.write().unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(Arc::new(gate));
-    }
-
-    fn pass_gate(&self) -> Option<Arc<PassGate>> {
-        self.passes.read().unwrap_or_else(|poisoned| poisoned.into_inner()).clone()
-    }
-
-    /// The authority of the sign-in site: the one Site that exposes
-    /// `public_api_paths`, where a Person's session lives.
-    fn sign_in_authority(&self) -> Option<String> {
-        let sites = self.sites.read().unwrap_or_else(|poisoned| poisoned.into_inner());
-        sites
-            .iter()
-            .find(|runtime| !runtime.site.public_api_paths.is_empty())
-            .map(|runtime| self.https_authority(runtime.site.canonical()))
     }
 
     /// The shared mail handles, if [`Server::attach_mail`] has run.
@@ -841,48 +813,6 @@ where
         return Ok(Outcome::Reusable);
     }
 
-    // The proxy's own namespace on every Site. Answered here or refused here;
-    // never static content, never an upstream's to see.
-    if request.path().starts_with(pass_gate::RESERVED_PREFIX) || request.path() == "/.selfhost" {
-        let response = redeem_pass(server, &runtime.site, request, &host);
-        write_response(stream, response, keep_alive).await?;
-        return Ok(Outcome::Reusable);
-    }
-
-    // The identity gate. A `private` Site has already passed the network
-    // check above; both kinds now need a Pass whose Person holds a Grant.
-    let person = if runtime.site.requires_pass() {
-        let verdict = server
-            .pass_gate()
-            .map(|gate| gate.judge(&runtime.site, request.headers.get_str("cookie")));
-        match verdict {
-            Some(pass_gate::Verdict::Open(person)) => Some(person),
-            Some(pass_gate::Verdict::NoGrant) => {
-                eprintln!("[proxy] {peer}: denied — signed in, but no grant on {host}");
-                write_response(stream, Response::error_page(Status::FORBIDDEN), keep_alive).await?;
-                return Ok(Outcome::Reusable);
-            }
-            Some(pass_gate::Verdict::SignIn) => {
-                let wanted = format!("https://{}{}", server.https_authority(&host), request.target);
-                let response = server
-                    .sign_in_authority()
-                    .and_then(|authority| {
-                        Response::redirect(Status::FOUND, &pass_gate::sign_in_url(&authority, &wanted)).ok()
-                    })
-                    .unwrap_or_else(|| Response::error_page(Status::FORBIDDEN));
-                write_response(stream, response, keep_alive).await?;
-                return Ok(Outcome::Reusable);
-            }
-            // No gate attached: nobody can be shown to hold a Grant.
-            None => {
-                write_response(stream, Response::error_page(Status::FORBIDDEN), keep_alive).await?;
-                return Ok(Outcome::Reusable);
-            }
-        }
-    } else {
-        None
-    };
-
     // The built-in console: `/api/*` goes to the loopback admin API, and
     // everything else falls through to the SPA in `static_root`. Validation
     // guarantees a console site has no instances, so `routes_to_app` below
@@ -929,40 +859,10 @@ where
     }
 
     if runtime.site.routes_to_app(request.path()) {
-        return forward(&runtime, request, peer, person.as_ref(), leftover, stream).await;
+        return forward(&runtime, request, peer, leftover, stream).await;
     }
 
     serve_static(&runtime, request, stream, keep_alive).await
-}
-
-/// Answers a request under [`pass_gate::RESERVED_PREFIX`].
-///
-/// The one thing there is [`pass_gate::REDEEM_PATH`]: a one-time code from
-/// the sign-in site becomes the Pass cookie, and the visitor goes on to the
-/// path they first asked for — a path, validated when the code was minted,
-/// resolved against this same host, so there is nowhere else to be sent.
-/// Every other path, and every code that does not redeem, is the 404 an
-/// unknown `Host` gets.
-fn redeem_pass(server: &Server, site: &selfhost_config::Site, request: &Request, host: &str) -> Response {
-    let not_found = || Response::error_page(Status::NOT_FOUND);
-    if request.path() != pass_gate::REDEEM_PATH || request.method != Method::Get || !site.requires_pass() {
-        return not_found();
-    }
-    let Some(redeemed) = pass_gate::code_in(&request.target)
-        .and_then(|code| server.pass_gate().and_then(|gate| gate.redeem(site, code)))
-    else {
-        return not_found();
-    };
-    let target = format!("https://{}{}", server.https_authority(host), redeemed.return_path);
-    let Ok(mut response) = Response::redirect(Status::FOUND, &target) else {
-        return not_found();
-    };
-    if response.headers.set("Set-Cookie", pass_gate::set_cookie(&redeemed.pass)).is_err() {
-        return not_found();
-    }
-    let _ = response.headers.set("Cache-Control", "no-store");
-    eprintln!("[proxy] signed {} in to {}", redeemed.person, site.name);
-    response
 }
 
 /// Serves a mail domain's automatic-configuration document (PACC).
@@ -1673,17 +1573,10 @@ async fn relay_deploy(server: &Server, name: &str) -> io::Result<Status> {
     // `/api/services/`. `name` reaches a raw request line either way, which is
     // why `valid_service_name` has already refused anything outside its
     // allow-list.
-    // `?via=webhook` marks this call, and only this call, as the webhook
-    // relay's own — `Api::deploy_now` reads it to record the Deploy it starts
-    // as `Trigger::Webhook` rather than `Trigger::Api`. The self-update branch
-    // carries no marker: `Api::self_update_now` records no Deploy at all (the
-    // watcher it nudges does, tagged `Trigger::SelfUpdate` unconditionally —
-    // see `crates/app/cli/src/self_update.rs`), so there is nothing here for
-    // a marker to change.
     let target = if name == selfhost_config::git::SELF_UPDATE_WEBHOOK_NAME {
         "/api/self-update/deploy".to_owned()
     } else {
-        format!("/api/services/{name}/deploy?via=webhook")
+        format!("/api/services/{name}/deploy")
     };
 
     let mut upstream = TcpStream::connect(admin_bind).await?;
@@ -2469,7 +2362,6 @@ async fn forward<S>(
     runtime: &SiteRuntime,
     request: &Request,
     peer: SocketAddr,
-    person: Option<&selfhost_identity::Identity>,
     leftover: &mut Vec<u8>,
     stream: &mut S,
 ) -> io::Result<Outcome>
@@ -2517,9 +2409,6 @@ where
         // handshake, which the instance needs to see spelled out below.
         if (is_hop_by_hop(name) && !(is_upgrade && (name.eq_ignore_ascii_case("connection") || name.eq_ignore_ascii_case("upgrade"))))
             || name.eq_ignore_ascii_case("content-length")
-            // Only this proxy may say who is asking. Dropped on every Site,
-            // gated or not, so no upstream ever reads a client's own claim.
-            || name.eq_ignore_ascii_case(pass_gate::PERSON_HEADER)
         {
             continue;
         }
@@ -2531,9 +2420,6 @@ where
 
     head.extend_from_slice(format!("X-Forwarded-For: {}\r\n", peer.ip()).as_bytes());
     head.extend_from_slice(b"X-Forwarded-Proto: https\r\n");
-    if let Some(person) = person {
-        head.extend_from_slice(format!("{}: {person}\r\n", pass_gate::PERSON_HEADER).as_bytes());
-    }
     if !is_upgrade {
         head.extend_from_slice(b"Connection: close\r\n");
     }
@@ -2666,8 +2552,6 @@ mod tests {
             allowed_cidrs: vec![],
             console: false,
             public_api_paths: vec![],
-            exposure: None,
-            owner: None,
         }
     }
 
@@ -2872,7 +2756,6 @@ mod tests {
             &runtime,
             &request,
             "127.0.0.1:1".parse().unwrap(),
-            None,
             &mut Vec::new(),
             &mut upstream_side,
         )
@@ -3298,10 +3181,7 @@ mod tests {
         assert!(response.starts_with("HTTP/1.1 202"), "{response}");
 
         let relayed = accepted.await.expect("the fake admin task did not panic");
-        // `?via=webhook` marks this as the relay's own call, so `Api::deploy_now`
-        // records the resulting Deploy as `Trigger::Webhook` rather than
-        // `Trigger::Api` — see `relay_deploy`'s documentation.
-        assert!(relayed.starts_with("POST /api/services/levelup/deploy?via=webhook HTTP/1.1"), "{relayed}");
+        assert!(relayed.starts_with("POST /api/services/levelup/deploy HTTP/1.1"), "{relayed}");
         assert!(relayed.contains("Authorization: Bearer "), "{relayed}");
     }
 
@@ -3517,13 +3397,7 @@ mod tests {
         assert!(response.starts_with("HTTP/1.1 202"), "{response}");
 
         let relayed = accepted.await.expect("the fake admin task did not panic");
-        // `?via=webhook` marks this as the relay's own call, so `Api::deploy_now`
-        // records the resulting Deploy as `Trigger::Webhook` rather than
-        // `Trigger::Api` — see `relay_deploy`'s documentation.
-        assert!(
-            relayed.starts_with("POST /api/services/levelup/deploy?via=webhook HTTP/1.1"),
-            "{relayed}"
-        );
+        assert!(relayed.starts_with("POST /api/services/levelup/deploy HTTP/1.1"), "{relayed}");
     }
 
     /// A `Server` like [`server_with_github_app`], with `[self_update]` also
@@ -3752,295 +3626,6 @@ mod tests {
         let mut response = Vec::new();
         client.read_to_end(&mut response).await.expect("read the response back");
         response
-    }
-
-    // ─── The identity gate ────────────────────────────────────────────────────
-
-    /// A deployment with a sign-in site, a public Site, and one `people` Site
-    /// (`blog`) whose upstream is `upstream_port`; the gate is attached over a
-    /// fresh key and the People registry in `dir`.
-    fn gated_deployment(
-        dir: &std::path::Path,
-        upstream_port: u16,
-    ) -> (Server, selfhost_admin::site_pass::SitePasses) {
-        let mut auth = site("auth", &["auth.example.com"]);
-        auth.public_api_paths = vec!["/api/pass/authorize".into()];
-        let mut blog = site("blog", &["blog.example.com"]);
-        blog.exposure = Some(selfhost_config::Exposure::People);
-        blog.static_root = None;
-        blog.instances = vec![Instance { node: "home".into(), port: upstream_port }];
-        let mut ledger = gated_site("ledger", &["ledger.example.com"]);
-        ledger.exposure = Some(selfhost_config::Exposure::Private);
-        let config = config_with(vec![auth, site("hello", &["hello.example.com"]), blog, ledger]);
-        let server = Server::build(&config, dir);
-        let passes = selfhost_admin::site_pass::SitePasses::new(
-            selfhost_identity::PassKey::ephemeral().expect("a key"),
-        );
-        server.attach_passes(PassGate::new(passes.clone(), selfhost_identity::People::load(dir)));
-        (server, passes)
-    }
-
-    fn grant_blog_to(dir: &std::path::Path, person: &str) {
-        let blog = selfhost_identity::SiteName::parse("blog").unwrap();
-        selfhost_identity::People::load(dir)
-            .set_grants(
-                &selfhost_identity::PersonName::parse(person).unwrap(),
-                selfhost_identity::Grants::new([selfhost_identity::Capability::SiteAccess(blog)]).unwrap(),
-            )
-            .expect("grants are written");
-    }
-
-    /// Signs `person` in to `site` the way the two halves really do it: a code
-    /// minted by the admin side, redeemed through `dispatch`. Returns the
-    /// cookie pair and the redeeming response.
-    async fn sign_in(
-        server: &Server,
-        passes: &selfhost_admin::site_pass::SitePasses,
-        person: &str,
-        site: &str,
-        path: &str,
-    ) -> (String, String) {
-        let code = passes
-            .mint_code(
-                &selfhost_identity::Identity::parse(person).unwrap(),
-                &selfhost_identity::SiteName::parse(site).unwrap(),
-                path,
-            )
-            .expect("a code");
-        let head = format!("GET /.selfhost/pass?code={code} HTTP/1.1\r\nHost: {site}.example.com\r\n\r\n");
-        let response = String::from_utf8(dispatch_bytes(server, &head, "203.0.113.9:5000", true, b"").await).unwrap();
-        let cookie = response
-            .lines()
-            .find_map(|line| line.strip_prefix("Set-Cookie: "))
-            .map(|value| value.split(';').next().unwrap().to_owned())
-            .unwrap_or_default();
-        (cookie, response)
-    }
-
-    #[tokio::test]
-    async fn a_public_site_is_untouched_by_the_identity_gate() {
-        let dir = ScratchDataDir::new("pass-public");
-        write_spa(&dir.0);
-        let (server, _passes) = gated_deployment(&dir.0, 1);
-        let response = dispatch_bytes(
-            &server,
-            "GET / HTTP/1.1\r\nHost: hello.example.com\r\n\r\n",
-            "203.0.113.9:5000",
-            true,
-            b"",
-        )
-        .await;
-        let text = String::from_utf8_lossy(&response);
-        assert!(text.starts_with("HTTP/1.1 200"), "{text}");
-        assert!(text.contains("console spa"), "{text}");
-        assert!(!text.contains("Set-Cookie"), "{text}");
-    }
-
-    #[tokio::test]
-    async fn no_pass_and_a_bad_pass_are_both_sent_to_sign_in() {
-        let dir = ScratchDataDir::new("pass-missing");
-        let (server, _passes) = gated_deployment(&dir.0, 1);
-        // A Pass signed by some other key, for the right Site and a real name.
-        let forged = selfhost_identity::PassKey::ephemeral()
-            .unwrap()
-            .issue(
-                &selfhost_identity::Identity::parse("bob").unwrap(),
-                &selfhost_identity::SiteName::parse("blog").unwrap(),
-                std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs(),
-                600,
-            )
-            .unwrap();
-        grant_blog_to(&dir.0, "bob");
-        for cookie in [String::new(), "Cookie: __Host-selfhost-pass=garbage\r\n".to_owned(), format!("Cookie: __Host-selfhost-pass={forged}\r\n")] {
-            let head = format!("GET /drafts?x=1 HTTP/1.1\r\nHost: blog.example.com\r\n{cookie}\r\n");
-            let response = dispatch_bytes(&server, &head, "203.0.113.9:5000", true, b"").await;
-            let text = String::from_utf8_lossy(&response);
-            assert!(text.starts_with("HTTP/1.1 302"), "{text}");
-            assert!(
-                text.contains(
-                    "Location: https://auth.example.com/?return=https%3A%2F%2Fblog.example.com%2Fdrafts%3Fx%3D1\r\n"
-                ),
-                "{text}"
-            );
-        }
-    }
-
-    #[tokio::test]
-    async fn a_pass_without_a_grant_is_a_plain_403_and_revocation_is_immediate() {
-        let dir = ScratchDataDir::new("pass-no-grant");
-        let (upstream, _task) = fake_daemon(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok").await;
-        let (server, passes) = gated_deployment(&dir.0, upstream.port());
-        grant_blog_to(&dir.0, "bob");
-        let (cookie, _) = sign_in(&server, &passes, "bob", "blog", "/").await;
-        assert!(cookie.starts_with("__Host-selfhost-pass=v1."), "{cookie}");
-
-        // The Grant goes; the Pass is still cryptographically perfect.
-        selfhost_identity::People::load(&dir.0)
-            .set_grants(&selfhost_identity::PersonName::parse("bob").unwrap(), selfhost_identity::Grants::none())
-            .unwrap();
-        let head = format!("GET / HTTP/1.1\r\nHost: blog.example.com\r\nCookie: {cookie}\r\n\r\n");
-        let response = dispatch_bytes(&server, &head, "203.0.113.9:5000", true, b"").await;
-        let text = String::from_utf8_lossy(&response);
-        assert!(text.starts_with("HTTP/1.1 403"), "{text}");
-        assert!(!text.contains("Location:"), "{text}");
-    }
-
-    #[tokio::test]
-    async fn a_pass_with_a_grant_reaches_the_upstream_under_the_proxys_word_for_who() {
-        let dir = ScratchDataDir::new("pass-granted");
-        let (upstream, task) = fake_daemon(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok").await;
-        let (server, passes) = gated_deployment(&dir.0, upstream.port());
-        grant_blog_to(&dir.0, "bob");
-        let (cookie, redeemed) = sign_in(&server, &passes, "bob", "blog", "/drafts?x=1").await;
-        assert!(redeemed.starts_with("HTTP/1.1 302"), "{redeemed}");
-        assert!(redeemed.contains("Location: https://blog.example.com/drafts?x=1\r\n"), "{redeemed}");
-        for attribute in ["; Path=/", "; Secure", "; HttpOnly", "; SameSite=Lax"] {
-            assert!(redeemed.contains(attribute), "{redeemed}");
-        }
-
-        // The client claims to be the owner, twice, in two spellings.
-        let head = format!(
-            "GET /drafts HTTP/1.1\r\nHost: blog.example.com\r\nCookie: {cookie}\r\n\
-             X-Selfhost-Person: owner\r\nx-selfhost-person: owner\r\n\r\n"
-        );
-        let response = dispatch_bytes(&server, &head, "203.0.113.9:5000", true, b"").await;
-        assert!(response.starts_with(b"HTTP/1.1 200"), "{}", String::from_utf8_lossy(&response));
-        let relayed = task.await.expect("the upstream saw one request");
-        assert!(relayed.head.contains("X-Selfhost-Person: bob\r\n"), "{}", relayed.head);
-        assert_eq!(relayed.head.to_ascii_lowercase().matches("x-selfhost-person").count(), 1, "{}", relayed.head);
-    }
-
-    #[tokio::test]
-    async fn a_spoofed_person_header_is_stripped_on_a_public_site_too() {
-        let dir = ScratchDataDir::new("pass-spoof-public");
-        let (upstream, task) = fake_daemon(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok").await;
-        let mut api = site("api", &["api.example.com"]);
-        api.static_root = None;
-        api.instances = vec![Instance { node: "home".into(), port: upstream.port() }];
-        let server = Server::build(&config_with(vec![api]), &dir.0);
-        let head = "GET / HTTP/1.1\r\nHost: api.example.com\r\nX-Selfhost-Person: owner\r\n\r\n";
-        let response = dispatch_bytes(&server, head, "203.0.113.9:5000", true, b"").await;
-        assert!(response.starts_with(b"HTTP/1.1 200"), "{}", String::from_utf8_lossy(&response));
-        let relayed = task.await.expect("the upstream saw one request");
-        assert!(!relayed.head.to_ascii_lowercase().contains("x-selfhost-person"), "{}", relayed.head);
-    }
-
-    #[tokio::test]
-    async fn a_code_is_spent_once_and_only_at_the_site_it_was_minted_for() {
-        let dir = ScratchDataDir::new("pass-code-reuse");
-        let (server, passes) = gated_deployment(&dir.0, 1);
-        let code = passes
-            .mint_code(
-                &selfhost_identity::Identity::parse("bob").unwrap(),
-                &selfhost_identity::SiteName::parse("blog").unwrap(),
-                "/",
-            )
-            .unwrap();
-        let at = |host: &str| format!("GET /.selfhost/pass?code={code} HTTP/1.1\r\nHost: {host}\r\n\r\n");
-        let unknown = dispatch_bytes(
-            &server,
-            "GET / HTTP/1.1\r\nHost: not-hosted.example.com\r\n\r\n",
-            "10.66.0.2:5000",
-            true,
-            b"",
-        )
-        .await;
-
-        // Another gated Site, and a public one: not theirs to redeem.
-        for host in ["ledger.example.com", "hello.example.com"] {
-            let response = dispatch_bytes(&server, &at(host), "10.66.0.2:5000", true, b"").await;
-            assert_eq!(response, unknown, "{host}");
-        }
-        let first = dispatch_bytes(&server, &at("blog.example.com"), "10.66.0.2:5000", true, b"").await;
-        assert!(first.starts_with(b"HTTP/1.1 302"), "{}", String::from_utf8_lossy(&first));
-        let second = dispatch_bytes(&server, &at("blog.example.com"), "10.66.0.2:5000", true, b"").await;
-        assert_eq!(second, unknown, "a spent code is a 404 with no cookie");
-    }
-
-    #[tokio::test]
-    async fn the_return_is_a_path_on_the_same_site_or_no_code_exists() {
-        // The redirect after sign-in is built from this host and a stored
-        // path; a path that could be read as another origin never gets a code.
-        let dir = ScratchDataDir::new("pass-open-redirect");
-        let (_server, passes) = gated_deployment(&dir.0, 1);
-        for path in ["//evil.example/", "/\\evil.example/", "https://evil.example/", "/a\r\nLocation: https://evil.example/"] {
-            let minted = passes.mint_code(
-                &selfhost_identity::Identity::parse("bob").unwrap(),
-                &selfhost_identity::SiteName::parse("blog").unwrap(),
-                path,
-            );
-            assert!(minted.is_err(), "{path:?}");
-        }
-    }
-
-    #[tokio::test]
-    async fn the_reserved_prefix_is_never_forwarded_or_served() {
-        let dir = ScratchDataDir::new("pass-reserved");
-        write_spa(&dir.0);
-        std::fs::create_dir_all(dir.0.join("public/.selfhost")).unwrap();
-        std::fs::write(dir.0.join("public/.selfhost/secret"), b"static").unwrap();
-        let (server, _passes) = gated_deployment(&dir.0, 1);
-        for host in ["hello.example.com", "blog.example.com"] {
-            for path in ["/.selfhost/secret", "/.selfhost/", "/.selfhost", "/.selfhost/pass"] {
-                let head = format!("GET {path} HTTP/1.1\r\nHost: {host}\r\n\r\n");
-                let response = dispatch_bytes(&server, &head, "203.0.113.9:5000", true, b"").await;
-                assert!(response.starts_with(b"HTTP/1.1 404"), "{host}{path}");
-            }
-        }
-    }
-
-    #[tokio::test]
-    async fn a_private_site_runs_the_network_check_before_the_pass() {
-        let dir = ScratchDataDir::new("pass-private");
-        write_spa(&dir.0);
-        let (server, passes) = gated_deployment(&dir.0, 1);
-        selfhost_identity::People::load(&dir.0)
-            .set_grants(
-                &selfhost_identity::PersonName::parse("bob").unwrap(),
-                selfhost_identity::Grants::new([selfhost_identity::Capability::SiteAccess(
-                    selfhost_identity::SiteName::parse("ledger").unwrap(),
-                )])
-                .unwrap(),
-            )
-            .unwrap();
-        let (cookie, _) = sign_in(&server, &passes, "bob", "ledger", "/").await;
-        assert_eq!(cookie, "", "off the network, even the redeem path is the 404");
-        let code_cookie = {
-            let code = passes
-                .mint_code(
-                    &selfhost_identity::Identity::parse("bob").unwrap(),
-                    &selfhost_identity::SiteName::parse("ledger").unwrap(),
-                    "/",
-                )
-                .unwrap();
-            let head = format!("GET /.selfhost/pass?code={code} HTTP/1.1\r\nHost: ledger.example.com\r\n\r\n");
-            let response = String::from_utf8(dispatch_bytes(&server, &head, "10.66.0.2:5000", true, b"").await).unwrap();
-            response
-                .lines()
-                .find_map(|line| line.strip_prefix("Set-Cookie: "))
-                .map(|value| value.split(';').next().unwrap().to_owned())
-                .expect("on the network, the code redeems")
-        };
-        let head = format!("GET / HTTP/1.1\r\nHost: ledger.example.com\r\nCookie: {code_cookie}\r\n\r\n");
-        let outside = dispatch_bytes(&server, &head, "203.0.113.9:5000", true, b"").await;
-        assert!(outside.starts_with(b"HTTP/1.1 404"), "a Pass does not replace the network check");
-        let inside = dispatch_bytes(&server, &head, "10.66.0.2:5000", true, b"").await;
-        assert!(inside.starts_with(b"HTTP/1.1 200"), "{}", String::from_utf8_lossy(&inside));
-        let bare = dispatch_bytes(&server, "GET / HTTP/1.1\r\nHost: ledger.example.com\r\n\r\n", "10.66.0.2:5000", true, b"").await;
-        assert!(bare.starts_with(b"HTTP/1.1 302"), "and the network does not replace the Pass");
-    }
-
-    #[tokio::test]
-    async fn a_legacy_cidr_site_keeps_exactly_its_cidr_gate_and_asks_for_no_pass() {
-        let dir = ScratchDataDir::new("pass-legacy");
-        write_spa(&dir.0);
-        let config = config_with(vec![gated_site("console", &["console.example.com"])]);
-        let server = Server::build(&config, &dir.0);
-        let head = "GET / HTTP/1.1\r\nHost: console.example.com\r\n\r\n";
-        let inside = dispatch_bytes(&server, head, "10.66.0.2:5000", true, b"").await;
-        assert!(inside.starts_with(b"HTTP/1.1 200"), "{}", String::from_utf8_lossy(&inside));
-        let outside = dispatch_bytes(&server, head, "203.0.113.9:5000", true, b"").await;
-        assert!(outside.starts_with(b"HTTP/1.1 404"));
     }
 
     #[test]

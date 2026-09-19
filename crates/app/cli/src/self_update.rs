@@ -56,20 +56,12 @@
 //! the tree back to the running commit and restores the binary, so the next
 //! poll retries the whole update instead of reporting up to date.
 
-use selfhost_admin::deploys::{DeployResult, Deploys, Trigger};
 use selfhost_config::SelfUpdate;
 use selfhost_git::Nudge;
 use selfhost_git::plan;
 use selfhost_git::run::{self, BUILD_TIMEOUT, LS_REMOTE_TIMEOUT, TRANSFER_TIMEOUT};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::time::Duration;
-
-/// This watcher's Deploy target name, for the same reason
-/// `selfhost_config::git::SELF_UPDATE_WEBHOOK_NAME` names it on the webhook
-/// side: the daemon's own repository is not in the service catalogue, so it
-/// needs a name of its own rather than borrowing a service's.
-const SELF_UPDATE_TARGET: &str = "self-update";
 
 /// The exit code of a restart-on-purpose.
 ///
@@ -102,22 +94,10 @@ enum Progress {
 /// than trusting anything the nudge carried — nothing about a check depends
 /// on *why* it started, so a forged nudge can never deploy anything other
 /// than what is really at the tip of the watched branch.
-///
-/// `deploys`, when wired, gets one [`Deploys::start`]/[`Deploys::finish`] pair
-/// per pass round this loop, tagged [`Trigger::SelfUpdate`] — the Deploy
-/// record for a self-update lives here rather than in the HTTP handler that
-/// nudges this watcher (`Api::self_update_now`), because that handler only
-/// ever asks for a check; the check, and therefore the only place an outcome
-/// exists to record, happens in this loop, at a time the handler has already
-/// returned `202` and moved on. On the branch that returns (an update was
-/// applied), [`Deploys::finish`] is called and its write awaited *before*
-/// returning — a process that exits on [`RESTART_EXIT`] a moment later must
-/// not race its own record of having done so.
 pub async fn watch_own_repository(
     update: Option<SelfUpdate>,
     project_dir: PathBuf,
     nudge: Nudge,
-    deploys: Option<Arc<Deploys>>,
 ) -> String {
     let Some(update) = update.filter(|u| u.enabled) else { return std::future::pending().await };
     sweep_aside();
@@ -131,25 +111,10 @@ pub async fn watch_own_repository(
         // next pass round this loop.
         nudge.poked().await;
         println!("self-update: a push was announced; checking now");
-        let deploy_id = deploys.as_ref().map(|store| store.start(SELF_UPDATE_TARGET, Trigger::SelfUpdate));
         match poll_once(&update, &project_dir).await {
-            Ok(Progress::UpToDate) => {
-                already_said.clear();
-                if let (Some(store), Some(id)) = (&deploys, &deploy_id) {
-                    store.finish(id, DeployResult::Succeeded, None, "nothing to do; already at the tip");
-                }
-            }
-            Ok(Progress::Updated { to }) => {
-                if let (Some(store), Some(id)) = (&deploys, &deploy_id) {
-                    let log = format!("deployed {to}");
-                    store.finish(id, DeployResult::Succeeded, Some(to.clone()), log);
-                }
-                return to;
-            }
+            Ok(Progress::UpToDate) => already_said.clear(),
+            Ok(Progress::Updated { to }) => return to,
             Err(reason) => {
-                if let (Some(store), Some(id)) = (&deploys, &deploy_id) {
-                    store.finish(id, DeployResult::Failed, None, reason.clone());
-                }
                 if reason != already_said {
                     eprintln!("self-update: {reason}");
                     already_said = reason;
@@ -375,7 +340,7 @@ mod tests {
 
     #[tokio::test]
     async fn an_absent_self_update_section_pends_rather_than_polling() {
-        let watch = watch_own_repository(None, PathBuf::from("."), Nudge::new(), None);
+        let watch = watch_own_repository(None, PathBuf::from("."), Nudge::new());
         let outcome = tokio::time::timeout(Duration::from_millis(50), watch).await;
         assert!(outcome.is_err(), "no config must mean no polling");
     }
@@ -390,7 +355,7 @@ mod tests {
         let nudge = Nudge::new();
         nudge.poke();
 
-        let watch = watch_own_repository(Some(update), PathBuf::from("."), nudge, None);
+        let watch = watch_own_repository(Some(update), PathBuf::from("."), nudge);
         let outcome = tokio::time::timeout(Duration::from_millis(100), watch).await;
         assert!(outcome.is_err(), "a disabled watch must not act on a push");
     }

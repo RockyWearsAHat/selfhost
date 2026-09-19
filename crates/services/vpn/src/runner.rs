@@ -279,7 +279,6 @@ pub fn plan(
     args.push(key_dir.display().to_string());
     args.push("--identity".to_owned());
     args.push(SERVER_IDENTITY.to_owned());
-    // --account-manager is the external relay's flag name for the admin API check endpoint.
     args.push("--account-manager".to_owned());
     args.push(format!("http://{admin_bind}"));
     args.push("--account-manager-token-file".to_owned());

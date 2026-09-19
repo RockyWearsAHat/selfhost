@@ -45,19 +45,16 @@
 pub mod agent_store;
 pub mod audit_api;
 pub mod dav_api;
-pub mod deploys;
 pub mod device_password;
 pub mod desk_api;
 pub mod images_api;
 pub mod invite;
 pub mod mesh_api;
 pub mod passwd;
-pub mod peer_binding;
 pub mod people_api;
 pub mod person_password;
 pub mod session;
 pub mod site_api;
-pub mod site_pass;
 pub mod storage_api;
 pub mod store;
 pub mod stream;
@@ -71,7 +68,7 @@ use selfhost_firewall::Manager;
 use selfhost_git::{CredentialSource, Nudge};
 use selfhost_http::{Body, Method, Request, Response, Status};
 use selfhost_identity::{
-    Caller, Capability, Grants, Identity, Opening, People, PersonName, Policy, VpnLocationId,
+    Caller, Capability, Grants, Opening, People, PersonName, Policy, VpnLocationId,
 };
 use selfhost_maintenance;
 
@@ -158,25 +155,6 @@ fn body_limit(request: &Request) -> usize {
 
 /// Default number of log lines returned when the caller does not say.
 const DEFAULT_LOG_LIMIT: usize = 500;
-
-/// Reads certificate expiry for `GET /api/system`, without this crate
-/// depending on `selfhost-proxy` (a peer in the same `app` layer, holding
-/// `CertificateStore`) or on `selfhost-cli` (which owns the ACME renewal
-/// task that stamps each certificate's issue date).
-///
-/// Mirrors [`desk_api::Fleet`]'s shape: a small trait this crate defines and
-/// consumes as `Arc<dyn CertificateExpiry>`, implemented in `main.rs` against
-/// the concrete `CertificateStore` and `acme_task` types it already holds.
-/// See [`Api::with_certificates`].
-pub trait CertificateExpiry: Send + Sync + 'static {
-    /// Every host this deployment holds a certificate for.
-    fn hosts(&self) -> Vec<String>;
-
-    /// Days remaining before `host`'s certificate needs renewal, or `None`
-    /// when there is no issue-date record for it (a self-signed fallback
-    /// that was never issued through ACME, or a host not yet certified).
-    fn days_remaining(&self, host: &str) -> Option<i64>;
-}
 
 /// The control API.
 #[derive(Clone)]
@@ -349,49 +327,6 @@ pub struct Api {
     /// for. What still gates the door is `vpn` and the policy check in the
     /// `/api/vpn/authorize` handler.
     vpn_authorizations: vpn_enroll::Authorizations,
-    /// The Pass key and sign-in codes shared with the proxy; `None` leaves
-    /// `POST /api/pass/authorize` a 404. See [`Api::with_site_passes`].
-    site_passes: Option<site_pass::SitePasses>,
-    /// The Deploy record: one entry per repo→build→publish attempt, however it
-    /// was asked for.
-    ///
-    /// `None` only before [`Api::with_deploys`] has been called — every real
-    /// daemon wires it unconditionally in `main.rs`, the same way
-    /// [`Api::with_agents`] always is, so `None` here is a test fixture's
-    /// state rather than a deployment's. With no store, `deploy_now` still
-    /// deploys exactly as before this existed; it just has nowhere to record
-    /// that it did, and `GET /api/deploys`/`GET /api/deploys/<id>` answer as
-    /// though this build did not serve them.
-    deploys: Option<Arc<deploys::Deploys>>,
-    /// Whether `[mail]` is configured, for `GET /api/system`'s report on it.
-    ///
-    /// Mail is never a supervised catalogue entry (it runs via
-    /// `mail_task::run` directly — see `crates/app/cli/src/main.rs`), so
-    /// there is no [`selfhost_supervisor::state::ServiceStatus`] for
-    /// [`Api::system_health`] to read; this one bit is what `main.rs` hands
-    /// across instead. `false` by default, matching a deployment with no
-    /// `[mail]` section.
-    mail_configured: bool,
-    /// Certificate expiry for `GET /api/system`, threaded in from `main.rs`
-    /// the same way `mail_configured` is. `None` in a test fixture that
-    /// never called [`Api::with_certificates`]; every real daemon wires it
-    /// unconditionally.
-    certificates: Option<Arc<dyn CertificateExpiry>>,
-    /// Serialises a Site's `owner` field against the one thing that trusts it:
-    /// a delegate's [`Api::delegate_site_access`] check.
-    ///
-    /// Without this, `PUT /api/sites/<name>/owner` and `PUT
-    /// /api/people/<name>` from a delegate race: the delegate's request reads
-    /// `owner` as itself, and — before it gets to write the grant it decided
-    /// that read allows — a concurrent owner change removes it, yet the
-    /// grant is still written on the strength of a permission that no longer
-    /// holds. Holding this for the whole of each of those two critical
-    /// sections (`site_api::set_owner`'s read-then-write, and
-    /// [`Api::delegate_site_access`]'s check-then-write) makes them run one at
-    /// a time rather than interleaved, the same shape [`store::Store`]'s own
-    /// `guard` serialises catalogue saves with. An `Arc` because every clone
-    /// of this `Api` must serialise against the same lock, not one each.
-    site_ownership_guard: Arc<tokio::sync::Mutex<()>>,
 }
 
 /// Cookie-session authentication, present once [`Api::with_console_auth`] has
@@ -550,16 +485,6 @@ enum Route<'a> {
     DesktopAgent,
     /// `GET /api/audit?limit=<n>`
     AuditTrail,
-    /// `GET /api/deploys` — every recorded Deploy, newest first. See
-    /// [`deploys`].
-    Deploys,
-    /// `GET /api/deploys/<id>`
-    DeployShow(&'a str),
-    /// `GET /api/system` — every System part (proxy, admin API, relay(s),
-    /// updater, mail if configured, certificate expiry), its state, and a
-    /// human reason when it is unhealthy. Never a Service: see
-    /// `docs/architecture.dx`'s System/Service split.
-    System,
     /// `GET /api/storage/shares`
     Shares,
     /// `GET /api/storage/shares/<id>/list?path=…`
@@ -619,10 +544,6 @@ enum Route<'a> {
     SiteAddDomain(&'a str),
     /// `DELETE /api/sites/<name>/domains/<hostname>`
     SiteRemoveDomain(&'a str, &'a str),
-    /// `PUT /api/sites/<name>/exposure` — see [`site_api::set_exposure`].
-    SiteSetExposure(&'a str),
-    /// `PUT /api/sites/<name>/owner` — see [`site_api::set_owner`].
-    SiteSetOwner(&'a str),
     /// `GET /api/sites/<name>/files/list?path=…`
     SiteFileList(&'a str),
     /// `POST /api/sites/<name>/files/mkdir`
@@ -638,12 +559,6 @@ enum Route<'a> {
     /// `POST /api/vpn/authorize` — the console-session half of the VPN sign-in
     /// exchange. See [`vpn_enroll`].
     VpnAuthorize,
-    /// `POST /api/pass/authorize`: a signed-in Person asks to be signed in to
-    /// a gated Site. See [`site_pass`].
-    PassAuthorize,
-    /// `GET /api/vpn/peers` — every peer this deployment's relays know about,
-    /// static and dynamic alike. See [`people_api::VpnWiring::peers_json`].
-    VpnPeers,
 }
 
 impl<'a> Route<'a> {
@@ -678,11 +593,6 @@ impl<'a> Route<'a> {
             // The trail of what the dangerous capabilities did. A `GET`, and
             // owner-only: see `Route::demand`.
             (Method::Get, ["api", "audit"]) => Some(Self::AuditTrail),
-            // Matched ahead of nothing in particular — `deploys` is not a
-            // prefix any other route under `/api/` uses.
-            (Method::Get, ["api", "deploys"]) => Some(Self::Deploys),
-            (Method::Get, ["api", "deploys", id]) => Some(Self::DeployShow(id)),
-            (Method::Get, ["api", "system"]) => Some(Self::System),
             (Method::Get, ["api", "storage", "shares"]) => Some(Self::Shares),
             (Method::Get, ["api", "storage", "shares", id, "list"]) => Some(Self::ShareList(id)),
             (Method::Get, ["api", "storage", "shares", id, "stat"]) => Some(Self::ShareStat(id)),
@@ -748,8 +658,6 @@ impl<'a> Route<'a> {
             (Method::Delete, ["api", "sites", name, "domains", hostname]) => {
                 Some(Self::SiteRemoveDomain(name, hostname))
             }
-            (Method::Put, ["api", "sites", name, "exposure"]) => Some(Self::SiteSetExposure(name)),
-            (Method::Put, ["api", "sites", name, "owner"]) => Some(Self::SiteSetOwner(name)),
             (Method::Get, ["api", "sites"]) => Some(Self::Sites),
             (Method::Post, ["api", "sites"]) => Some(Self::SiteAdd),
             (Method::Get, ["api", "sites", name]) => Some(Self::SiteShow(name)),
@@ -757,8 +665,6 @@ impl<'a> Route<'a> {
             (Method::Get, ["api", "maintenance", "status"]) => Some(Self::MaintenanceStatus),
             (Method::Post, ["api", "vpn", "check-access"]) => Some(Self::VpnCheckAccess),
             (Method::Post, ["api", "vpn", "authorize"]) => Some(Self::VpnAuthorize),
-            (Method::Get, ["api", "vpn", "peers"]) => Some(Self::VpnPeers),
-            (Method::Post, ["api", "pass", "authorize"]) => Some(Self::PassAuthorize),
             _ => None,
         }
     }
@@ -798,10 +704,7 @@ impl<'a> Route<'a> {
             | Self::DesktopNodes
             | Self::Shares
             | Self::MaintenanceStatus
-            | Self::VpnCheckAccess
-            | Self::Deploys
-            | Self::DeployShow(_)
-            | Self::System => Demand::Held(Capability::ConsoleRead),
+            | Self::VpnCheckAccess => Demand::Held(Capability::ConsoleRead),
             // Per-node and per-share, so the target has to be a name the
             // vocabulary can hold. One that is not names nothing this
             // deployment serves, and refusing it as though it were somebody
@@ -847,18 +750,8 @@ impl<'a> Route<'a> {
             // grant" because no grant should ever confer it. So these ask for
             // the identity that cannot be delegated. Reading the roster joins
             // them because it is a list of who can reach what — a target list,
-            // as `crates/identity`'s registry says in its own header. The VPN
-            // roster joins them on the same grounds: it too is a list of who
-            // can reach what, just for a door `[[vpn.peers]]` and the roster
-            // file guard rather than the console password.
-            Self::ListPeople | Self::ForgetPerson(_) | Self::VpnPeers => Demand::OwnerOnly,
-            // The one delegation the model has: whoever holds
-            // `site.admin:<site>` may hand out `site.access:<site>` for that
-            // Site and nothing else. Which Site depends on the body, so the
-            // demand here is only "signed in"; `Api::set_grants` holds the
-            // owner to exactly the old `OwnerOnly` bar and everybody else to
-            // `Api::delegate_site_access`.
-            Self::SetGrants(_) => Demand::Authenticated,
+            // as `crates/identity`'s registry says in its own header.
+            Self::ListPeople | Self::SetGrants(_) | Self::ForgetPerson(_) => Demand::OwnerOnly,
             // Minting an invitation is the most concentrated form of the same
             // act: it does not merely write down a power, it creates the means
             // by which somebody will prove they are the person who holds it. If
@@ -881,8 +774,6 @@ impl<'a> Route<'a> {
             | Self::SiteRemove(_)
             | Self::SiteAddDomain(_)
             | Self::SiteRemoveDomain(_, _)
-            | Self::SiteSetExposure(_)
-            | Self::SiteSetOwner(_)
             | Self::SiteFileList(_)
             | Self::SiteFileMkdir(_)
             | Self::SiteFilePut(_)
@@ -899,12 +790,7 @@ impl<'a> Route<'a> {
             // depends on which location was asked for and so cannot be this
             // match's fixed answer. A caller who holds nothing there is
             // refused inside the handler, not by never reaching it.
-            //
-            // `PassAuthorize` is the same shape: which Site is in the body, and
-            // the Grant is checked against it inside the handler.
-            Self::Vocabulary | Self::WhoAmI | Self::VpnAuthorize | Self::PassAuthorize => {
-                Demand::Authenticated
-            }
+            Self::Vocabulary | Self::WhoAmI | Self::VpnAuthorize => Demand::Authenticated,
         }
     }
 }
@@ -927,8 +813,6 @@ mod site_route_tests {
             Route::SiteRemove("blog"),
             Route::SiteAddDomain("blog"),
             Route::SiteRemoveDomain("blog", "home.example.com"),
-            Route::SiteSetExposure("blog"),
-            Route::SiteSetOwner("blog"),
             Route::SiteFileList("blog"),
             Route::SiteFileMkdir("blog"),
             Route::SiteFilePut("blog"),
@@ -940,7 +824,6 @@ mod site_route_tests {
             &selfhost_identity::ShareId::parse("vault").unwrap(),
             &selfhost_identity::NodeName::parse("home").unwrap(),
             &selfhost_identity::VpnLocationId::parse("console").unwrap(),
-            &selfhost_identity::SiteName::parse("blog").unwrap(),
         ) {
             if capability.is_honoured() {
                 continue;
@@ -956,7 +839,7 @@ mod site_route_tests {
         // And the positive half: SiteAdmin is honoured, and it really is what
         // every site route demands.
         assert!(Capability::SiteAdmin.is_honoured());
-        for route in &routes[..12] {
+        for route in &routes[..10] {
             assert_eq!(route.demand(), Demand::Held(Capability::SiteAdmin), "{route:?}");
         }
     }
@@ -1069,11 +952,6 @@ impl Api {
             image_store: images_api::ImageStore::new(),
             vpn: None,
             vpn_authorizations: vpn_enroll::Authorizations::new(),
-            site_passes: None,
-            deploys: None,
-            mail_configured: false,
-            certificates: None,
-            site_ownership_guard: Arc::new(tokio::sync::Mutex::new(())),
         }
     }
 
@@ -1086,37 +964,6 @@ impl Api {
     /// the honest report for a deployment nobody has enrolled an agent on.
     pub fn with_agents(mut self, data_dir: &Path) -> Self {
         self.agents = Some(agent_store::AgentStore::in_dir(data_dir));
-        self
-    }
-
-    /// Wires the Deploy record: one entry per repo→build→publish attempt,
-    /// read back through `GET /api/deploys` and `GET /api/deploys/<id>`.
-    ///
-    /// Takes an already-built, shared handle rather than a `data_dir` the way
-    /// [`Api::with_agents`] does, because the same store is also handed to
-    /// `self_update::watch_own_repository` — one value, so a self-update
-    /// Deploy this watcher records and a `GET /api/deploys/<id>` reading it
-    /// back agree by construction rather than by both reading the same file
-    /// at slightly different times. Always called in `main.rs`,
-    /// unconditionally; there is no config flag that turns a Deploy off, only
-    /// a builder chain a test fixture may choose to leave short.
-    pub fn with_deploys(mut self, deploys: Arc<deploys::Deploys>) -> Self {
-        self.deploys = Some(deploys);
-        self
-    }
-
-    /// Records whether `[mail]` is configured, so `GET /api/system` can
-    /// report on it without this crate needing a handle onto the mail
-    /// subsystem itself. See the `mail_configured` field's documentation.
-    pub fn with_mail_configured(mut self, configured: bool) -> Self {
-        self.mail_configured = configured;
-        self
-    }
-
-    /// Wires certificate expiry into `GET /api/system`. See
-    /// [`CertificateExpiry`] and the `certificates` field's documentation.
-    pub fn with_certificates(mut self, certificates: Arc<dyn CertificateExpiry>) -> Self {
-        self.certificates = Some(certificates);
         self
     }
 
@@ -1158,16 +1005,6 @@ impl Api {
     /// skipped.
     pub fn with_vpn(mut self, relays: Vec<selfhost_config::vpn::Relay>, data_dir: PathBuf) -> Self {
         self.vpn = Some(people_api::VpnWiring::new(relays, data_dir));
-        self
-    }
-
-    /// Opens `POST /api/pass/authorize`, the sign-in half of a `people` or
-    /// `private` Site.
-    ///
-    /// `passes` must be a clone of the value the proxy was given: the proxy
-    /// redeems, in-process, the codes this mints. See [`site_pass`].
-    pub fn with_site_passes(mut self, passes: site_pass::SitePasses) -> Self {
-        self.site_passes = Some(passes);
         self
     }
 
@@ -1634,7 +1471,7 @@ impl Api {
             Route::Install(name) => self.install(name, body).await,
             Route::Uninstall(name) => self.uninstall(name).await,
             Route::Logs(name) => self.logs(name, query).await,
-            Route::DeployNow(name) => self.deploy_now(name, query, body).await,
+            Route::DeployNow(name) => self.deploy_now(name, body).await,
             Route::SelfUpdateNow => self.self_update_now(),
             Route::Act(name, action) => self.act(name, action).await,
             Route::MintTicket => self.mint_ticket(request, &caller, body),
@@ -1642,9 +1479,6 @@ impl Api {
             Route::DesktopNodes => self.desktop_nodes(&caller),
             Route::DesktopAgent => self.desktop_agent(&caller, query),
             Route::AuditTrail => self.audit_trail(query),
-            Route::Deploys => self.list_deploys(),
-            Route::DeployShow(id) => self.show_deploy(id),
-            Route::System => self.system_health().await,
             Route::Shares => self.shares(&caller).await,
             Route::ShareList(id) => self.share_list(id, &caller, query).await,
             Route::ShareStat(id) => self.share_stat(id, &caller, query).await,
@@ -1663,7 +1497,7 @@ impl Api {
             Route::WhoAmI => json(Status(200), people_api::whoami_json(&caller)),
             Route::Vocabulary => json(Status(200), people_api::vocabulary_json()),
             Route::ListPeople => self.list_people(),
-            Route::SetGrants(name) => self.set_grants(&caller, name, body).await,
+            Route::SetGrants(name) => self.set_grants(&caller, name, body),
             Route::ForgetPerson(name) => self.forget_person(&caller, name),
             Route::MintInvite(name) => self.mint_invite(&caller, name, body),
             Route::ListInvites => self.list_invites(),
@@ -1674,8 +1508,6 @@ impl Api {
             Route::SiteRemove(name) => self.sites_remove(name),
             Route::SiteAddDomain(name) => self.sites_add_domain(name, body),
             Route::SiteRemoveDomain(name, hostname) => self.sites_remove_domain(name, hostname),
-            Route::SiteSetExposure(name) => self.sites_set_exposure(name, body),
-            Route::SiteSetOwner(name) => self.sites_set_owner(name, body).await,
             Route::SiteFileList(name) => self.sites_file_list(name, query),
             Route::SiteFileMkdir(name) => self.sites_file_mkdir(name, body),
             Route::SiteFilePut(name) => self.sites_file_put(name, query, body),
@@ -1683,8 +1515,6 @@ impl Api {
             Route::MaintenanceStatus => self.maintenance_status(),
             Route::VpnCheckAccess => vpn_api::check_access(self.people.as_ref(), body),
             Route::VpnAuthorize => self.vpn_authorize(&caller, body),
-            Route::VpnPeers => self.vpn_peers(),
-            Route::PassAuthorize => self.pass_authorize(&caller, body),
         }
     }
 
@@ -1723,18 +1553,10 @@ impl Api {
     /// Their name still has to be a name — [`PersonName`] refuses the owner's
     /// spelling in every casing, so no grant written here can touch the
     /// operator's own authority.
-    async fn set_grants(&self, caller: &Caller, name: &str, body: &[u8]) -> Response {
+    fn set_grants(&self, caller: &Caller, name: &str, body: &[u8]) -> Response {
         let Some(people) = &self.people else {
             return problem(Status(404), NO_REGISTRY);
         };
-        if !caller.identity().is_owner() {
-            return self.delegate_site_access(caller, people, name, body).await;
-        }
-        // The bar `Demand::OwnerOnly` sets, held here because the route's own
-        // demand had to loosen to let a delegate in.
-        if !self.names_who_is_acting(caller) {
-            return problem(Status(401), "authorisation required");
-        }
         let Ok(person) = PersonName::parse(name) else {
             return problem(
                 Status(400),
@@ -1780,10 +1602,7 @@ impl Api {
         let written = people_api::spell_grants(&grants);
         // A warning about what was *asked for*, not a second read of the store
         // that could disagree with it.
-        let unreachable = self
-            .vpn
-            .as_ref()
-            .and_then(|vpn| people_api::unreachable_without_vpn(&grants, &vpn.relay_names()));
+        let unreachable = people_api::unreachable_without_vpn(&grants);
         let (peer, public_key) = match people_api::vpn_fields_from_body(body) {
             Ok(fields) => fields,
             Err(refusal) => return problem(Status(400), &refusal),
@@ -1860,183 +1679,6 @@ impl Api {
         }
     }
 
-    /// The Sites the configuration declares now; empty when no site wiring was
-    /// given, which makes every Site-relative question answer "no".
-    fn configured_sites(&self) -> Vec<selfhost_config::Site> {
-        self.sites.as_ref().and_then(|wiring| site_api::configured_sites(wiring).ok()).unwrap_or_default()
-    }
-
-    /// Whether `caller` is the Person a Site's `owner` field names.
-    ///
-    /// `owner` names a Person in the Person registry, never an Agent, so this
-    /// only ever matches [`Identity::Person`] — an Agent enrolled under the
-    /// same word is a different Identity entirely (see
-    /// [`Identity::as_str`]'s documentation) and must fall through to an
-    /// explicit Grant like anyone else, never inherit a Person's ownership by
-    /// sharing their name.
-    fn is_site_owner(caller: &Caller, owner: Option<&str>) -> bool {
-        matches!(caller.identity(), Identity::Person(name) if Some(name.as_str()) == owner)
-    }
-
-    /// Whether `caller` may open `site`: the owner, the Site's own `owner`, or
-    /// a holder of `site.access:<site>` (which `site.admin:<site>` implies).
-    fn may_reach_site(&self, caller: &Caller, site: &selfhost_config::Site) -> bool {
-        if Self::is_site_owner(caller, site.owner.as_deref()) {
-            return true;
-        }
-        selfhost_identity::SiteName::parse(&site.name).is_ok_and(|name| {
-            self.policy().decide(caller, &Capability::SiteAccess(name)).is_allowed()
-        })
-    }
-
-    /// Whether `caller` may hand out `site.access` for the Site named `site`.
-    fn may_admin_site(&self, caller: &Caller, site: &selfhost_identity::SiteName) -> bool {
-        self.policy().decide(caller, &Capability::SiteAdminOf(site.clone())).is_allowed()
-            || self
-                .configured_sites()
-                .iter()
-                .any(|entry| entry.name == site.as_str() && Self::is_site_owner(caller, entry.owner.as_deref()))
-    }
-
-    /// `PUT /api/people/<name>` from somebody who is not the owner.
-    ///
-    /// The whole of what a delegate may do: add or remove `site.access:<site>`
-    /// on a Person who already exists, for a Site they administer. The body is
-    /// the same full grant set the owner sends, and it is judged by its
-    /// difference from what the Person holds now — any other word appearing or
-    /// disappearing refuses the whole change. A delegate never creates a
-    /// Person, and never touches an email, a password or a Peer.
-    ///
-    /// Somebody who administers nothing gets the same 401 every other refused
-    /// route gives, so this route tells them nothing about who exists.
-    ///
-    /// Holds [`Self::site_ownership_guard`] for the whole call: [`Self::may_admin_site`]
-    /// below reads a Site's `owner` from the live config, and without the guard a
-    /// concurrent `PUT /api/sites/<name>/owner` could remove that ownership between
-    /// the read and the grant this function still goes on to write — see the field's
-    /// own documentation for the shape of that race.
-    async fn delegate_site_access(&self, caller: &Caller, people: &People, name: &str, body: &[u8]) -> Response {
-        let _held = self.site_ownership_guard.lock().await;
-        let refused = || problem(Status(401), "authorisation required");
-        let Ok(person) = PersonName::parse(name) else {
-            return refused();
-        };
-        let Ok(after) = people_api::grants_from_body(body) else {
-            return refused();
-        };
-        let Some(entry) = people.find(&person) else {
-            return refused();
-        };
-        let untouched = matches!(people_api::identity_fields_from_body(body), Ok((None, None)))
-            && matches!(people_api::vpn_fields_from_body(body), Ok((None, None)));
-        if !untouched {
-            return refused();
-        }
-        let before = entry.grants;
-        let changed: Vec<&Capability> = before
-            .iter()
-            .filter(|held| !after.iter().any(|kept| kept == *held))
-            .chain(after.iter().filter(|added| !before.iter().any(|held| held == *added)))
-            .collect();
-        let all_delegable = changed.iter().all(|capability| {
-            matches!(capability, Capability::SiteAccess(site) if self.may_admin_site(caller, site))
-        });
-        if changed.is_empty() || !all_delegable {
-            return refused();
-        }
-        let written = people_api::spell_grants(&after);
-        if let Err(error) = people.set_grants(&person, after) {
-            return problem(Status(500), &format!("could not save the registry: {error}"));
-        }
-        self.record_authority(
-            caller,
-            selfhost_identity::audit::Authority::GrantsChanged,
-            person.as_str(),
-            format!("now:{written}"),
-        );
-        match people.find(&person) {
-            Some(entry) => {
-                let has_password = self.person_passwords.as_ref().is_some_and(|store| store.holds(&person));
-                json(Status(200), people_api::person_json(&entry, None, &[], has_password))
-            }
-            None => problem(Status(500), "the registry accepted the change and lost it"),
-        }
-    }
-
-    /// Answers `POST /api/pass/authorize`: signs the caller in to a gated Site.
-    ///
-    /// Body: `{"return": "https://<a domain of the Site>/<path>"}` — the URL
-    /// the proxy turned the visitor away from. The host must be a domain of a
-    /// configured `people` or `private` Site; anything else is refused, so
-    /// this can never be made to redirect off the deployment. Only the path
-    /// survives into the code. The reply is `{"redirect": ...}`, the Site's own
-    /// `/.selfhost/pass` with a one-time code; see [`site_pass`].
-    ///
-    /// A signed-in Person with no Grant on the Site gets a plain 403: they
-    /// know who they are, and the Site's existence is public DNS.
-    fn pass_authorize(&self, caller: &Caller, body: &[u8]) -> Response {
-        let Some(passes) = &self.site_passes else {
-            return problem(Status(404), "no such endpoint");
-        };
-        let Some(document) = std::str::from_utf8(body).ok().and_then(|text| selfhost_json::parse(text).ok())
-        else {
-            return problem(Status(400), "invalid JSON body");
-        };
-        let Some(wanted) = document.get("return").and_then(Json::as_str) else {
-            return problem(Status(400), "missing return");
-        };
-        let Some((host, path)) = site_pass::split_return_url(wanted) else {
-            return problem(Status(400), "return must be an https URL on one of this deployment's sites");
-        };
-        let sites = self.configured_sites();
-        let Some(site) = sites
-            .iter()
-            .find(|site| site.requires_pass() && site.domains.iter().any(|domain| domain.eq_ignore_ascii_case(host)))
-        else {
-            return problem(Status(400), "return must be an https URL on one of this deployment's sites");
-        };
-        let Ok(site_name) = selfhost_identity::SiteName::parse(&site.name) else {
-            return problem(Status(400), "that site's name cannot carry a Grant");
-        };
-        if !self.may_reach_site(caller, site) {
-            return problem(Status(403), "you are signed in, but hold no access to that site");
-        }
-        match passes.mint_code(caller.identity(), &site_name, path) {
-            Ok(code) => {
-                self.record_authority(
-                    caller,
-                    selfhost_identity::audit::Authority::SitePassAuthorised,
-                    caller.identity().as_str(),
-                    format!("site:{site_name}"),
-                );
-                let redirect = format!("https://{}/.selfhost/pass?code={code}", host.to_ascii_lowercase());
-                json(Status(200), Json::object([("redirect", Json::string(&redirect))]))
-            }
-            Err(refusal) => problem(Status(400), &refusal),
-        }
-    }
-
-    /// Whether `caller` holds a Grant on some network-gated Site (a `private`
-    /// Site, or one with `allowed_cidrs`) that stands in for `vpn.access:<location>`
-    /// on the one relay this deployment has.
-    ///
-    /// Only sound when there is exactly one relay: nothing in a Site's config
-    /// says *which* `[[vpn]]` relay it sits behind, so with a single relay
-    /// "reaches some network-gated Site" and "belongs on this network" are
-    /// the same fact, but with two or more relays (independent tenants on one
-    /// box) they are not — a Grant on tenant A's private Site must never
-    /// authorise enrolling a Peer onto tenant B's relay. Multi-relay
-    /// deployments have no such shortcut: a Peer there is only ever minted
-    /// from an explicit `vpn.access:<location>`.
-    fn holds_the_one_network_gated_site(&self, caller: &Caller) -> bool {
-        if self.vpn.as_ref().is_none_or(|vpn| vpn.relay_names().len() != 1) {
-            return false;
-        }
-        self.configured_sites()
-            .iter()
-            .any(|site| site.is_network_gated() && !site.console && self.may_reach_site(caller, site))
-    }
-
     /// Answers `POST /api/vpn/authorize`: the console-session half of a VPN
     /// sign-in.
     ///
@@ -2063,13 +1705,8 @@ impl Api {
         let Ok(document) = selfhost_json::parse(text) else {
             return problem(Status(400), "invalid JSON body");
         };
-        // Absent means "this deployment's relay": the first `[[vpn]]` entry.
-        let Some(location_text) = document
-            .get("location")
-            .and_then(Json::as_str)
-            .or_else(|| vpn.relay_names().first().copied())
-        else {
-            return problem(Status(404), "no VPN location is configured on this deployment");
+        let Some(location_text) = document.get("location").and_then(Json::as_str) else {
+            return problem(Status(400), "missing location");
         };
         let Ok(location) = VpnLocationId::parse(location_text) else {
             return problem(Status(400), "not a usable VPN location id");
@@ -2083,19 +1720,12 @@ impl Api {
                 "no such VPN location is configured on this deployment",
             );
         }
-        // Two ways in: the relay's own word, or — on a single-relay deployment
-        // only, see `holds_the_one_network_gated_site` — a Grant on a Site
-        // that can only be reached from inside that one network. The second
-        // is what lets a Site's people enrol a Peer without the owner also
-        // handing each of them a relay by name.
-        if !self.policy().decide(caller, &Capability::VpnAccess(location.clone())).is_allowed()
-            && !self.holds_the_one_network_gated_site(caller)
-        {
+        if !self.policy().decide(caller, &Capability::VpnAccess(location.clone())).is_allowed() {
             return problem(
                 Status(403),
                 &format!(
-                    "you hold neither vpn.access:{location} nor access to a private site; ask \
-                     the owner for one before signing this device in"
+                    "this account does not hold vpn.access:{location}; ask the owner to grant \
+                     it before signing this device in"
                 ),
             );
         }
@@ -2107,17 +1737,6 @@ impl Api {
         ) {
             Ok(code) => json(Status(200), Json::object([("code", Json::string(&code))])),
             Err(refusal) => problem(Status(429), &refusal),
-        }
-    }
-
-    /// Answers `GET /api/vpn/peers`: every peer this deployment's relays
-    /// know about, static `[[vpn.peers]]` entries and dynamic roster
-    /// enrolments alike. Owner-only, on the same grounds `ListPeople` is —
-    /// see [`Route::demand`]. See [`people_api::VpnWiring::peers_json`].
-    fn vpn_peers(&self) -> Response {
-        match &self.vpn {
-            Some(wiring) => json(Status(200), wiring.peers_json()),
-            None => problem(Status(404), "no `[[vpn]]` relay is configured on this deployment"),
         }
     }
 
@@ -2177,13 +1796,6 @@ impl Api {
             }
         };
         console.gate.reset();
-        // A Peer is one Person's device. Bound before the roster is touched, so
-        // a name somebody else already owns never gets a second key.
-        if let Some(vpn) = &self.vpn {
-            if let Err(refusal) = peer_binding::bind(vpn.data_dir(), &peer, &authorized.name) {
-                return problem(Status(409), &refusal);
-            }
-        }
         let Ok(location) = VpnLocationId::parse(&authorized.location) else {
             return problem(Status(500), "the authorized location is no longer usable");
         };
@@ -2260,28 +1872,6 @@ impl Api {
     fn sites_remove_domain(&self, name: &str, hostname: &str) -> Response {
         match &self.sites {
             Some(wiring) => site_api::remove_domain(wiring, name, hostname),
-            None => problem(Status(404), NO_SITES),
-        }
-    }
-
-    /// Answers `PUT /api/sites/<name>/exposure`.
-    fn sites_set_exposure(&self, name: &str, body: &[u8]) -> Response {
-        match &self.sites {
-            Some(wiring) => site_api::set_exposure(wiring, name, body),
-            None => problem(Status(404), NO_SITES),
-        }
-    }
-
-    /// Answers `PUT /api/sites/<name>/owner`.
-    ///
-    /// Holds [`Self::site_ownership_guard`] for the read-then-write
-    /// [`site_api::set_owner`] performs, the other half of the race
-    /// [`Self::delegate_site_access`] closes its own half of — see that
-    /// field's documentation.
-    async fn sites_set_owner(&self, name: &str, body: &[u8]) -> Response {
-        let _held = self.site_ownership_guard.lock().await;
-        match &self.sites {
-            Some(wiring) => site_api::set_owner(wiring, name, body),
             None => problem(Status(404), NO_SITES),
         }
     }
@@ -3700,109 +3290,12 @@ impl Api {
         Some(Standings::new(console.sessions.clone(), self.people.clone(), self.policy(), switches))
     }
 
-    /// Every hosted Service — never a System part. See [`is_system`] and
-    /// `docs/architecture.dx`'s System/Service split: a Person chose to host a
-    /// Service, where a System part (the relay, the updater, `reports`) is
-    /// this deployment supervising itself and belongs on [`Api::system_health`]
-    /// instead.
     async fn list_services(&self) -> Response {
         let statuses = self.supervisor.statuses().await;
         json(
             Status(200),
-            Json::object([(
-                "services",
-                Json::array(statuses.iter().filter(|s| !is_system(&s.name)).map(|s| s.to_json())),
-            )]),
+            Json::object([("services", Json::array(statuses.iter().map(|s| s.to_json())))]),
         )
-    }
-
-    /// Every recorded Deploy, newest first. `GET /api/deploys`.
-    ///
-    /// An empty list, not an error, when no `Deploys` store was wired — the
-    /// honest report for a build that predates this feature or a test
-    /// fixture that left it out, the same convention [`Api::audit_trail`]
-    /// follows for its own absent store.
-    fn list_deploys(&self) -> Response {
-        let records = match &self.deploys {
-            Some(store) => store.list(),
-            None => Vec::new(),
-        };
-        json(Status(200), Json::object([("deploys", Json::array(records.iter().map(deploys::Deploy::to_json)))]))
-    }
-
-    /// One Deploy by id. `GET /api/deploys/<id>`.
-    fn show_deploy(&self, id: &str) -> Response {
-        let Some(deploys) = &self.deploys else {
-            return problem(Status(404), "no such deploy");
-        };
-        match deploys.get(id) {
-            Some(deploy) => json(Status(200), deploy.to_json()),
-            None => problem(Status(404), "no such deploy"),
-        }
-    }
-
-    /// Every System part of this deployment — never a hosted Service — with
-    /// its state and, when unhealthy, why. `GET /api/system`.
-    ///
-    /// Covers the proxy, this admin API, every VPN relay and `vpn-updater`
-    /// (both System-classified, see [`is_system`]), mail when `[mail]` is
-    /// configured, and each certified host's certificate expiry — the set
-    /// `docs/architecture.dx`'s "now" step 3 names.
-    ///
-    /// Composed here rather than filtered out of [`Api::list_services`]'s
-    /// answer because a System part can be unhealthy in ways the supervisor's
-    /// own state does not capture — the reason each entry below carries its
-    /// own human-readable state rather than only the supervisor's.
-    async fn system_health(&self) -> Response {
-        let statuses = self.supervisor.statuses().await;
-        let mut parts = Vec::new();
-
-        // This admin API and the proxy are always present — reaching this
-        // handler at all proves both are serving requests: a `tokio::select!`
-        // arm ending for either one is fatal to the whole daemon process (see
-        // `crates/app/cli/src/main.rs`'s `serve_everything`), so an answering
-        // admin API is proof the proxy is still in that same `select!`.
-        parts.push(system_part_json("admin-api", "running", None));
-        parts.push(system_part_json("proxy", "running", None));
-
-        for status in statuses.iter().filter(|s| is_system(&s.name)) {
-            let unhealthy_reason = match status.state {
-                selfhost_supervisor::state::ServiceState::Running { .. } => None,
-                ref other => Some(other.label().to_owned()),
-            };
-            parts.push(system_part_json(&status.name, status.state.label(), unhealthy_reason.as_deref()));
-        }
-
-        // Mail is never a supervised catalogue entry — it runs via
-        // `mail_task::run` directly, so there is no `ServiceStatus` for it to
-        // read here. `mail_configured` is the one bit `main.rs` hands this
-        // struct for exactly this route; see [`Api::with_mail_configured`].
-        match self.mail_configured {
-            true => parts.push(system_part_json("mail", "configured", None)),
-            false => parts.push(system_part_json("mail", "not configured", None)),
-        }
-
-        // `None` here means no `with_certificates` wiring (a test fixture),
-        // not zero certified hosts — a real deployment with no hosts yet
-        // would still report an empty list rather than nothing at all.
-        if let Some(certificates) = &self.certificates {
-            for host in certificates.hosts() {
-                let name = format!("certificate:{host}");
-                match certificates.days_remaining(&host) {
-                    Some(days) if days < 0 => {
-                        parts.push(system_part_json(&name, "expired", Some(&format!("expired {} day(s) ago", -days))));
-                    }
-                    Some(days) => {
-                        parts.push(system_part_json(&name, "valid", Some(&format!("{days} day(s) remaining"))));
-                    }
-                    None => {
-                        parts.push(system_part_json(&name, "unknown", Some("no issue date on record (self-signed fallback)")));
-                    }
-                }
-            }
-        }
-
-        json(Status(200), Json::object([("system", Json::array(parts))]))
     }
 
     async fn describe(&self, name: &str) -> Response {
@@ -3929,20 +3422,8 @@ impl Api {
     /// that blocking the response on it would tie up the caller — the proxy's
     /// webhook handler, in turn tying up the pusher's HTTP client — for as
     /// long as the build takes. The outcome lands where every other
-    /// deployment's does: the service's own `[git]`-tagged output, *and* — when
-    /// [`Api::with_deploys`] wired a store — a Deploy record a caller can poll
-    /// by the id this route hands back. No silent failures: a build that
-    /// fails is a Deploy this store records as `failed`, not one that is
-    /// merely absent from the log nobody happened to be watching.
-    ///
-    /// `query`'s only use here is telling a webhook delivery from every other
-    /// caller: the proxy's relay marks its own request `?via=webhook` (see
-    /// `crates/app/proxy/src/server.rs`'s `relay_deploy`); anything else —
-    /// `selfhost repo deploy`, the console's deploy button, a manual call — is
-    /// recorded as [`deploys::Trigger::Api`]. See [`deploys::Trigger`]'s
-    /// documentation for why a third, CLI-specific value would be a
-    /// distinction the wire protocol does not actually make.
-    async fn deploy_now(&self, name: &str, query: &str, body: &[u8]) -> Response {
+    /// deployment's does: the service's own `[git]`-tagged output.
+    async fn deploy_now(&self, name: &str, body: &[u8]) -> Response {
         let Some(spec) = self.supervisor.spec(name).await else {
             return problem(Status(404), "no such service");
         };
@@ -3959,22 +3440,14 @@ impl Api {
             .and_then(|value| value.get("force").and_then(Json::as_bool))
             .unwrap_or(false);
 
-        let trigger = match query_value(query, "via") {
-            Some("webhook") => deploys::Trigger::Webhook,
-            _ => deploys::Trigger::Api,
-        };
-        let deploy_id = self.deploys.as_ref().map(|deploys| deploys.start(name, trigger));
-
         let supervisor = self.supervisor.clone();
         let credentials = self.github_credentials.clone();
-        let deploys = self.deploys.clone();
-        let record_id = deploy_id.clone();
         tokio::spawn(async move {
             let credential = match &credentials {
                 Some(source) => source.authenticated_url(&watch.repository).await,
                 None => None,
             };
-            let outcome = selfhost_git::check_once_with_credential(
+            let _ = selfhost_git::check_once_with_credential(
                 &supervisor,
                 &spec,
                 &watch,
@@ -3982,17 +3455,12 @@ impl Api {
                 force,
             )
             .await;
-            if let (Some(deploys), Some(id)) = (&deploys, &record_id) {
-                let (result, commit, log) = deploy_outcome_to_record(outcome);
-                deploys.finish(id, result, commit, log);
-            }
         });
 
-        let mut fields = vec![("accepted", Json::Bool(true)), ("service", Json::string(name))];
-        if let Some(id) = &deploy_id {
-            fields.push(("deploy", Json::string(id.as_str())));
-        }
-        json(Status(202), Json::object(fields))
+        json(
+            Status(202),
+            Json::object([("accepted", Json::Bool(true)), ("service", Json::string(name))]),
+        )
     }
 
     /// Asks the self-update watcher to check its branch immediately.
@@ -4141,63 +3609,6 @@ fn requested_abilities(body: &[u8]) -> Option<Vec<Ability>> {
 /// Parses a request body as JSON, or `None` for anything that is not.
 fn parse_json_body(body: &[u8]) -> Option<Json> {
     selfhost_json::parse(std::str::from_utf8(body).ok()?).ok()
-}
-
-/// Whether a supervised entry is a System part of Self-Host itself rather
-/// than a Service a Person chose to host.
-///
-/// `docs/architecture.dx`'s System/Service split names exactly these:
-/// `reports` (the public report intake this daemon runs for itself) and
-/// every VPN relay plus `vpn-updater` (`crates/services/vpn/src/runner.rs`'s
-/// `SERVICE_PREFIX = "vpn-"`, and `crates/services/vpn/src/updater.rs`'s
-/// `SERVICE_NAME = "vpn-updater"` — both start with `"vpn-"`). Anything else
-/// in the catalogue was installed by an operator naming a repository and a
-/// serve command, which is what a Service is.
-fn is_system(name: &str) -> bool {
-    name == "reports" || name.starts_with("vpn-")
-}
-
-/// One System part's entry in `GET /api/system`'s answer.
-fn system_part_json(name: &str, state: &str, unhealthy_reason: Option<&str>) -> Json {
-    Json::object([
-        ("name", Json::string(name)),
-        ("state", Json::string(state)),
-        (
-            "reason",
-            match unhealthy_reason {
-                Some(reason) => Json::string(reason),
-                None => Json::Null,
-            },
-        ),
-    ])
-}
-
-/// Turns what [`selfhost_git::check_once_with_credential`] returns into what a
-/// Deploy record stores: a result, an optional commit, and one human-readable
-/// line. "Nothing to do" and "reported only" both count as `succeeded` — a
-/// no-op is a recorded no-op, never an unrecorded one, which is the whole
-/// point of a Deploy record existing at all.
-fn deploy_outcome_to_record(
-    outcome: Result<selfhost_git::Outcome, String>,
-) -> (deploys::DeployResult, Option<String>, String) {
-    match outcome {
-        Ok(selfhost_git::Outcome::NothingToDo) => {
-            (deploys::DeployResult::Succeeded, None, "nothing to do; already at the tip".to_owned())
-        }
-        Ok(selfhost_git::Outcome::Deployed { commit }) => {
-            let log = format!("deployed {commit}");
-            (deploys::DeployResult::Succeeded, Some(commit), log)
-        }
-        Ok(selfhost_git::Outcome::Reported) => (
-            deploys::DeployResult::Succeeded,
-            None,
-            "branch moved; this watch only reports it".to_owned(),
-        ),
-        Ok(selfhost_git::Outcome::Failed { step, reason }) => {
-            (deploys::DeployResult::Failed, None, format!("{step} failed: {reason}"))
-        }
-        Err(reason) => (deploys::DeployResult::Failed, None, reason),
-    }
 }
 
 /// The most `selfhost_session` pairs read out of one `Cookie` header.
@@ -4829,160 +4240,5 @@ mod tests {
         // A peer that is not a legal node name names nothing this deployment
         // serves, and is refused rather than defaulted to this machine.
         assert_eq!(StreamRoute::for_target("/api/desktop/session?peer=Not%20A%20Node"), None);
-    }
-
-    /// Regression for the TOCTOU between a delegate's Grant write and a
-    /// concurrent `owner` change: [`Api::sites_set_owner`] and
-    /// [`Api::delegate_site_access`] must not be able to interleave their
-    /// read-then-write halves.
-    ///
-    /// White-box on purpose — an integration test driving both routes through
-    /// [`Api::handle`] cannot force the interleaving that used to be the bug,
-    /// since neither critical section suspends once it acquires the guard.
-    /// Locking [`Api::site_ownership_guard`] here, from outside either
-    /// method, stands in for "the other write already has it" and proves
-    /// [`Api::sites_set_owner`] really does wait its turn rather than racing
-    /// past a stale read.
-    #[tokio::test]
-    async fn site_ownership_writes_wait_for_the_guard_rather_than_racing() {
-        let dir = std::env::temp_dir()
-            .join(format!("selfhost-admin-lib-site-ownership-guard-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        let config_path = dir.join("selfhost.config.toml");
-        std::fs::write(
-            &config_path,
-            "version = 1\n\
-             [server]\n\
-             http_bind = \"127.0.0.1:8080\"\n\
-             https_bind = \"127.0.0.1:8443\"\n\
-             acme_email = \"a@b.com\"\n\
-             acme = \"self-signed\"\n\
-             data_dir = \"./data\"\n\
-             [[nodes]]\n\
-             name = \"home\"\n\
-             role = \"owner\"\n\
-             [[sites]]\n\
-             name = \"blog\"\n\
-             domains = [\"blog.example.com\"]\n\
-             static_root = \"./sites/blog\"\n\
-             exposure = \"people\"\n\
-             owner = \"carol\"\n\
-             [[sites]]\n\
-             name = \"auth\"\n\
-             domains = [\"auth.example.com\"]\n\
-             static_root = \"./sites/auth\"\n\
-             public_api_paths = [\"/api/pass/authorize\"]\n",
-        )
-        .unwrap();
-        let config =
-            selfhost_config::Config::parse(&std::fs::read_to_string(&config_path).unwrap())
-                .expect("a valid config");
-
-        let api = Api::new(
-            Supervisor::new(&dir),
-            Store::new(&dir),
-            Token::load_or_create(&dir).unwrap(),
-            Manager::for_config(&config),
-        )
-        .with_site_admin(config_path, dir.clone())
-        .with_people(People::load(&dir));
-
-        // Stand in for a write already in its critical section.
-        let held = api.site_ownership_guard.clone();
-        let _held = held.lock().await;
-
-        let mut attempt = Box::pin(api.sites_set_owner("blog", br#"{"owner":"dave"}"#));
-        let outcome =
-            tokio::time::timeout(std::time::Duration::from_millis(50), &mut attempt).await;
-        assert!(outcome.is_err(), "sites_set_owner ran while the guard was held elsewhere");
-
-        drop(_held);
-        let response = attempt.await;
-        assert_eq!(response.status.code(), 200, "and completes once the other write lets go");
-
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// A fixed [`CertificateExpiry`] standing in for a real [`CertificateStore`]
-    /// — `selfhost-admin` cannot depend on `selfhost-proxy` to build one, which
-    /// is the whole reason the trait exists (see [`CertificateExpiry`]'s
-    /// documentation).
-    struct FakeCertificates(Vec<(&'static str, Option<i64>)>);
-
-    impl CertificateExpiry for FakeCertificates {
-        fn hosts(&self) -> Vec<String> {
-            self.0.iter().map(|(host, _)| host.to_string()).collect()
-        }
-
-        fn days_remaining(&self, host: &str) -> Option<i64> {
-            self.0.iter().find(|(h, _)| *h == host).and_then(|(_, days)| *days)
-        }
-    }
-
-    /// Regression for Finding 7: `GET /api/system` used to omit certificate
-    /// expiry entirely, with no way for an operator to learn a certificate was
-    /// about to lapse short of `selfhost doctor` or reading the file's own
-    /// notBefore. [`Api::system_health`] must now report one entry per
-    /// certified host, and must tell a healthy host apart from an expired one
-    /// and from a host with no real ACME certificate on record at all.
-    #[tokio::test]
-    async fn system_health_reports_certificate_expiry_per_host() {
-        let dir = std::env::temp_dir()
-            .join(format!("selfhost-admin-lib-certificate-expiry-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-
-        let config = selfhost_config::Config::parse(
-            "version = 1\n\
-             [server]\n\
-             http_bind = \"127.0.0.1:8080\"\n\
-             https_bind = \"127.0.0.1:8443\"\n\
-             acme_email = \"a@b.com\"\n\
-             acme = \"self-signed\"\n\
-             data_dir = \"./data\"\n\
-             [[nodes]]\n\
-             name = \"home\"\n\
-             role = \"owner\"\n",
-        )
-        .expect("a valid config");
-
-        let api = Api::new(
-            Supervisor::new(&dir),
-            Store::new(&dir),
-            Token::load_or_create(&dir).unwrap(),
-            Manager::for_config(&config),
-        )
-        .with_certificates(Arc::new(FakeCertificates(vec![
-            ("fresh.example.com", Some(60)),
-            ("stale.example.com", Some(-3)),
-            ("unissued.example.com", None),
-        ])));
-
-        let response = api.system_health().await;
-        assert_eq!(response.status.code(), 200);
-        let Body::Bytes(bytes) = &response.body else {
-            panic!("system_health did not return a body");
-        };
-        let body = selfhost_json::parse(std::str::from_utf8(bytes).unwrap()).unwrap();
-        let parts = body.get("system").and_then(Json::as_array).expect("a system array");
-
-        let find = |name: &str| {
-            parts
-                .iter()
-                .find(|part| part.get("name").and_then(Json::as_str) == Some(name))
-                .unwrap_or_else(|| panic!("no part named {name} in {parts:?}"))
-        };
-
-        let fresh = find("certificate:fresh.example.com");
-        assert_eq!(fresh.get("state").and_then(Json::as_str), Some("valid"));
-
-        let stale = find("certificate:stale.example.com");
-        assert_eq!(stale.get("state").and_then(Json::as_str), Some("expired"));
-
-        let unissued = find("certificate:unissued.example.com");
-        assert_eq!(unissued.get("state").and_then(Json::as_str), Some("unknown"));
-
-        let _ = std::fs::remove_dir_all(&dir);
     }
 }

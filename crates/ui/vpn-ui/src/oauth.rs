@@ -3,8 +3,8 @@
 //!
 //! `auth.rockywearsahat.com` *is* the authorization server: there is no
 //! third-party identity provider, because the identity that matters is
-//! "a Person who can already sign in here and holds either the relay's own
-//! `vpn.access` or a Grant on a Site only a Peer can reach". It shares the admin console's
+//! "someone who can already log into our own account and holds
+//! `vpn.access:<location>` for this relay". It shares the admin console's
 //! login/passkey backend but is its own public, ungated site (see
 //! `crates/foundation/config`'s `Site::public_api_paths`) — precisely so this
 //! flow never depends on the console route already being installed. This
@@ -19,7 +19,7 @@
 //!    the challenge, the state, and the port of a loopback listener this
 //!    process just opened.
 //! 3. That page — already logged in, or logging the person in first — checks
-//!    their Grants (see `Api::vpn_authorize`), mints a one-time code
+//!    their `vpn.access:<location>` capability, mints a one-time code
 //!    server-side, and redirects the browser to
 //!    `http://127.0.0.1:<port>/callback?code=...&state=...`.
 //! 4. This process's loopback listener catches that redirect, checks `state`,
@@ -44,6 +44,11 @@ use std::time::{Duration, Instant};
 
 use crate::app::AUTH_URL;
 use crate::keys;
+
+/// The one relay this deployment actually has (`selfhost.config.toml`'s
+/// single `[[vpn]]` block is named "console"). There is no location-picker
+/// in the window, so this is the only value the client ever asks for.
+const LOCATION: &str = "console";
 
 /// How long the loopback listener waits for the browser to finish the
 /// console round trip before giving up. Generous: it covers a login plus a
@@ -108,12 +113,10 @@ pub fn sign_in() -> Result<SignInResult, String> {
 /// carrying everything `sites/auth/app.js`'s `vpnConnectParams()` expects.
 /// A fragment, not a query string, on the site's own side too — but this
 /// process only builds it, it never reads one back.
-///
-/// It names no relay: which one a deployment runs is the deployment's to
-/// know, and `POST /api/vpn/authorize` answers for its own.
 fn authorize_url(state: &str, challenge: &str, port: u16) -> String {
     format!(
-        "{AUTH_URL}#vpn-connect?state={}&challenge={}&port={port}",
+        "{AUTH_URL}#vpn-connect?location={}&state={}&challenge={}&port={port}",
+        percent_encode(LOCATION),
         percent_encode(state),
         percent_encode(challenge),
     )
@@ -478,7 +481,7 @@ mod tests {
     fn the_authorize_url_carries_every_field_vpn_connect_params_expects() {
         let url = authorize_url("st ate", "cha llenge", 54321);
         assert!(url.starts_with(&format!("{AUTH_URL}#vpn-connect?")));
-        assert!(!url.contains("location="), "the relay is the server's to name");
+        assert!(url.contains("location=console"));
         assert!(url.contains("state=st%20ate"));
         assert!(url.contains("challenge=cha%20llenge"));
         assert!(url.contains("port=54321"));

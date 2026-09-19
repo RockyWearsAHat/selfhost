@@ -131,7 +131,6 @@ fn run(connect: impl Connect, shared: Arc<Mutex<Snapshot>>, running: Arc<AtomicB
                         refresh_definition(ready, &shared);
                         refresh_logs(ready, &shared);
                         refresh_firewall(ready, &shared);
-                        refresh_system(ready, &shared);
                     }
                     Screen::Files => {
                         refresh_shares(ready, &shared);
@@ -360,19 +359,6 @@ fn refresh_firewall(client: &Client, shared: &Arc<Mutex<Snapshot>>) {
     if let Ok(value) = client.get("/api/firewall") {
         if let Some(state) = FirewallState::from_json(&value) {
             shared.lock().expect("the snapshot lock was poisoned").firewall = Some(state);
-        }
-    }
-}
-
-/// Fetches the daemon's own internal parts into the snapshot.
-///
-/// The same shape of fetch as [`refresh_firewall`], for the same reason: rare
-/// to change, silent on a 404 (a daemon built before `GET /api/system`
-/// existed), and the last good answer is left in place until a fetch succeeds.
-fn refresh_system(client: &Client, shared: &Arc<Mutex<Snapshot>>) {
-    if let Ok(value) = client.get("/api/system") {
-        if let Some(parts) = crate::state::SystemPart::list_from_json(&value) {
-            shared.lock().expect("the snapshot lock was poisoned").system = Some(parts);
         }
     }
 }
