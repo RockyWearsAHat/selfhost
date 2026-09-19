@@ -30,12 +30,14 @@ use std::path::Path;
 /// The words this command accepts after `agent`, and what each one is for.
 pub const USAGE: &str = "\
 Usage
-  selfhost agent add <name> --grant <cap>[,<cap>]...
-                                 Mint a scoped credential for a trusted machine
-                                 and print its token exactly once. Running this
-                                 again for the same name replaces its token and
-                                 grants, revoking whatever it held before.
-  selfhost agent list            Every agent, what it holds, and when it was minted
+  selfhost agent add <name> --person <name> --grant <cap>[,<cap>]...
+                                 Mint a scoped credential for a trusted machine,
+                                 associated with a Person account, and print its
+                                 token exactly once. Running this again for the
+                                 same name replaces its token and grants,
+                                 revoking whatever it held before.
+  selfhost agent list            Every agent, what it holds, its owner Person,
+                                 and when it was minted
   selfhost agent revoke <name>   Delete an agent's credential; every request it
                                  authenticates is refused from the daemon's very
                                  next check, with nothing to restart
@@ -61,13 +63,16 @@ pub fn run(arguments: &[String], data_dir: &Path) -> Result<(), String> {
     }
 }
 
-/// `selfhost agent add <name> --grant <cap>[,<cap>]...`
+/// `selfhost agent add <name> --person <name> --grant <cap>[,<cap>]...`
 fn add(arguments: &[String], store: &AgentStore) -> Result<(), String> {
     let name = arguments
         .get(2)
         .filter(|word| !word.starts_with("--"))
-        .ok_or_else(|| format!("agent add needs a name: `selfhost agent add <name> --grant <cap>...`\n\n{USAGE}"))?;
+        .ok_or_else(|| format!("agent add needs a name: `selfhost agent add <name> --person <name> --grant <cap>...`\n\n{USAGE}"))?;
     let name = AgentName::parse(name).map_err(|error| error.to_string())?;
+
+    let person = person_name(arguments)
+        .ok_or_else(|| format!("agent add needs a --person: `selfhost agent add <name> --person <name> --grant <cap>...`\n\n{USAGE}"))?;
 
     let words = grant_words(arguments);
     if words.is_empty() {
@@ -81,8 +86,8 @@ fn add(arguments: &[String], store: &AgentStore) -> Result<(), String> {
     }
     let grants = Grants::new(capabilities).map_err(|error| error.to_string())?;
 
-    let minted = store.mint(&name, grants).map_err(|error| format!("could not save the agent store: {error}"))?;
-    println!("✓ minted an agent named \"{name}\", granted: {}", words.join(", "));
+    let minted = store.mint(&name, grants, &person).map_err(|error| format!("could not save the agent store: {error}"))?;
+    println!("✓ minted an agent named \"{name}\" for Person \"{person}\", granted: {}", words.join(", "));
     println!();
     println!("  {}", minted.as_str());
     println!();
@@ -90,6 +95,16 @@ fn add(arguments: &[String], store: &AgentStore) -> Result<(), String> {
     println!("  export SELFHOST_AGENT_TOKEN={}", minted.as_str());
     println!("or write it to ~/.selfhost/agent-token, owner-readable only.");
     Ok(())
+}
+
+/// Extract the `--person` value from arguments.
+fn person_name(arguments: &[String]) -> Option<String> {
+    for (i, argument) in arguments.iter().enumerate() {
+        if argument == "--person" {
+            return arguments.get(i + 1).cloned();
+        }
+    }
+    None
 }
 
 /// Every `--grant` value, allowing the flag to repeat and each occurrence to
@@ -111,15 +126,16 @@ fn grant_words(arguments: &[String]) -> Vec<String> {
 fn list(store: &AgentStore) -> Result<(), String> {
     let agents = store.list();
     if agents.is_empty() {
-        println!("no agents enrolled — add one with `selfhost agent add <name> --grant <cap>`");
+        println!("no agents enrolled — add one with `selfhost agent add <name> --person <name> --grant <cap>`");
         return Ok(());
     }
-    let width = agents.iter().map(|(name, _, _)| name.as_str().len()).max().unwrap_or(4).max(4);
-    println!("  {:<width$}  GRANTS", "NAME");
-    for (name, grants, _created_unix) in &agents {
+    let name_width = agents.iter().map(|(name, _, _, _)| name.as_str().len()).max().unwrap_or(4).max(4);
+    let person_width = agents.iter().map(|(_, _, _, person)| person.len()).max().unwrap_or(6).max(6);
+    println!("  {:<name_width$}  {:<person_width$}  GRANTS", "NAME", "PERSON");
+    for (name, grants, _created_unix, person) in &agents {
         let words: Vec<String> = grants.iter().map(selfhost_admin::people_api::wire_word).collect();
         let rendered = if words.is_empty() { "(nothing)".to_owned() } else { words.join(", ") };
-        println!("  {:<width$}  {rendered}", name.as_str());
+        println!("  {:<name_width$}  {:<person_width$}  {rendered}", name.as_str(), person);
     }
     Ok(())
 }
@@ -156,20 +172,28 @@ mod tests {
     }
 
     #[test]
-    fn adding_an_agent_then_listing_it_shows_its_grants() {
+    fn adding_an_agent_then_listing_it_shows_its_grants_and_person() {
         let dir = scratch("add-list");
-        run(&args(&["agent", "add", "claude-mac", "--grant", "site.admin"]), &dir).expect("mints");
+        run(&args(&["agent", "add", "claude-mac", "--person", "Alex", "--grant", "site.admin"]), &dir).expect("mints");
         let store = AgentStore::in_dir(&dir);
         let listed = store.list();
         assert_eq!(listed.len(), 1);
         assert_eq!(listed[0].0.as_str(), "claude-mac");
+        assert_eq!(listed[0].3.as_str(), "Alex");
         assert!(listed[0].1.holds(&selfhost_identity::Capability::SiteAdmin));
+    }
+
+    #[test]
+    fn adding_with_no_person_is_refused() {
+        let dir = scratch("no-person");
+        let error = run(&args(&["agent", "add", "claude-mac", "--grant", "site.admin"]), &dir).unwrap_err();
+        assert!(error.contains("--person"), "{error}");
     }
 
     #[test]
     fn adding_with_no_grant_is_refused() {
         let dir = scratch("no-grant");
-        let error = run(&args(&["agent", "add", "claude-mac"]), &dir).unwrap_err();
+        let error = run(&args(&["agent", "add", "claude-mac", "--person", "Alex"]), &dir).unwrap_err();
         assert!(error.contains("--grant"), "{error}");
     }
 
@@ -183,25 +207,27 @@ mod tests {
     #[test]
     fn revoking_a_real_agent_removes_it() {
         let dir = scratch("revoke-real");
-        run(&args(&["agent", "add", "claude-mac", "--grant", "site.admin"]), &dir).expect("mints");
+        run(&args(&["agent", "add", "claude-mac", "--person", "Alex", "--grant", "site.admin"]), &dir).expect("mints");
         run(&args(&["agent", "revoke", "claude-mac"]), &dir).expect("revokes");
         assert!(AgentStore::in_dir(&dir).list().is_empty());
     }
 
     #[test]
-    fn a_repeat_mint_replaces_the_previous_token() {
+    fn a_repeat_mint_replaces_the_previous_token_and_can_change_person() {
         let dir = scratch("remint");
-        run(&args(&["agent", "add", "claude-mac", "--grant", "site.admin"]), &dir).expect("mints");
+        run(&args(&["agent", "add", "claude-mac", "--person", "Alex", "--grant", "site.admin"]), &dir).expect("mints");
         let store = AgentStore::in_dir(&dir);
         let first_grants = store.list()[0].1.clone();
         assert!(first_grants.holds(&selfhost_identity::Capability::SiteAdmin));
+        assert_eq!(store.list()[0].3, "Alex");
 
         // Re-minting under the same name is what the module documentation
         // promises: the old token stops working, the new grants take over.
-        run(&args(&["agent", "add", "claude-mac", "--grant", "console.read"]), &dir).expect("re-mints");
+        run(&args(&["agent", "add", "claude-mac", "--person", "Claude", "--grant", "console.read"]), &dir).expect("re-mints");
         let listed = store.list();
         assert_eq!(listed.len(), 1, "the same name, not a second entry");
         assert!(listed[0].1.holds(&selfhost_identity::Capability::ConsoleRead));
         assert!(!listed[0].1.holds(&selfhost_identity::Capability::SiteAdmin));
+        assert_eq!(listed[0].3, "Claude");
     }
 }
