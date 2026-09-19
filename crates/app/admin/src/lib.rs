@@ -67,6 +67,9 @@ pub mod vpn_api;
 pub mod vpn_enroll;
 pub mod webauthn;
 
+#[cfg(test)]
+mod parity_test;
+
 use selfhost_firewall::Manager;
 use selfhost_git::{CredentialSource, Nudge};
 use selfhost_http::{Body, Method, Request, Response, Status};
