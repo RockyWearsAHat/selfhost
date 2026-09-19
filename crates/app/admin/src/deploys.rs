@@ -19,8 +19,11 @@
 //! [`Deploys::finish`] is called with whatever really happened, however long
 //! that takes. `GET /api/deploys` and `GET /api/deploys/<id>` read this record
 //! rather than infer anything from a service's log tail — a deploy that is
-//! still `running` when asked about is still running; a deploy that is
-//! `failed` says exactly what step failed and why, in [`Deploy::log`].
+//! still `running` when asked about is still running, unless it has sat there
+//! past [`STALLED_DEPLOY_TIMEOUT_SECS`] with nothing to show for it, in which
+//! case the read itself is what corrects the record (see [`Deploys::get`]);
+//! a deploy that is `failed` says exactly what step failed and why, in
+//! [`Deploy::log`].
 //!
 //! # A different shape from [`crate::agent_store`], deliberately
 //!
@@ -57,6 +60,24 @@ pub const DEPLOY_STORE_FILENAME: &str = "console.deploys";
 /// audit log — [`crate::audit_api`] is the store for anything that needs to
 /// outlive a long tail of ordinary deploys.
 pub const MAX_DEPLOYS: usize = 200;
+
+/// How long a Deploy may sit at [`DeployResult::Running`] before this store
+/// stops trusting that and reports it as [`DeployResult::Failed`] instead.
+///
+/// Twenty minutes is generously above the slowest step this daemon ever
+/// blocks on (`cargo build --release`, still under ten on this box) so a
+/// deploy that is genuinely still working is never reaped out from under it.
+/// A deploy still `running` past this point almost certainly outlived
+/// whatever was going to call [`Deploys::finish`] for it: the spawned task
+/// panicked or was killed without unwinding through it, or — see
+/// [`Deploys::in_dir`] — the daemon itself restarted mid-deploy and took the
+/// in-memory task with it.
+pub const STALLED_DEPLOY_TIMEOUT_SECS: u64 = 20 * 60;
+
+/// The [`Deploy::log`] a stall is recorded with, whichever of the two ways
+/// above reaped it — see [`STALLED_DEPLOY_TIMEOUT_SECS`].
+const STALL_LOG: &str = "stalled: no result was ever recorded for this deploy; the task that was \
+    supposed to finish it crashed, was killed, or the daemon restarted before it could";
 
 /// Bytes of entropy in a deploy id. No secret is derived from it — it only
 /// has to be unguessable enough that one caller cannot enumerate another's
@@ -132,9 +153,11 @@ impl Trigger {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DeployResult {
     /// Started; no outcome yet. A caller polling `GET /api/deploys/<id>` sees
-    /// this until [`Deploys::finish`] is called — there is no timeout that
-    /// turns a stalled deploy into `failed` on its own, the same "report what
-    /// is really known" rule the rest of this API follows.
+    /// this until [`Deploys::finish`] is called, or until
+    /// [`STALLED_DEPLOY_TIMEOUT_SECS`] passes with no result — see
+    /// [`Deploys::get`]/[`Deploys::list`] — whichever comes first, so a task
+    /// that never gets to call `finish` does not leave this at `running`
+    /// forever.
     Running,
     /// Finished with nothing wrong — including "nothing to do; already at the
     /// tip", which is success, not failure: no silent failure means a
@@ -235,10 +258,22 @@ impl Deploys {
     /// Loads `<data_dir>/console.deploys` once. A missing or malformed file
     /// starts empty rather than failing — a deployment's first deploy must
     /// not be blocked on a record of deploys that came before it.
+    ///
+    /// Any entry loaded as still [`DeployResult::Running`] is immediately
+    /// reaped as [`DeployResult::Failed`]: the only process that could ever
+    /// call [`Deploys::finish`] for it is this daemon, and this daemon is
+    /// only reading this file from disk because it just (re)started — the
+    /// in-memory task that would have finished it is gone along with the
+    /// process that held it. See this module's documentation.
     pub fn in_dir(data_dir: &Path) -> Self {
         let path = data_dir.join(DEPLOY_STORE_FILENAME);
-        let entries = std::fs::read_to_string(&path).ok().and_then(|text| parse(&text)).unwrap_or_default();
-        Self { path, entries: Mutex::new(entries) }
+        let mut entries = std::fs::read_to_string(&path).ok().and_then(|text| parse(&text)).unwrap_or_default();
+        let reaped = reap_on_restart(&mut entries);
+        let store = Self { path, entries: Mutex::new(entries) };
+        if reaped {
+            store.persist(&store.entries.lock().unwrap_or_else(|p| p.into_inner()));
+        }
+        store
     }
 
     /// Records a Deploy as accepted and [`DeployResult::Running`], returning
@@ -286,15 +321,25 @@ impl Deploys {
         self.persist(&entries);
     }
 
-    /// One Deploy by id, for `GET /api/deploys/<id>`.
+    /// One Deploy by id, for `GET /api/deploys/<id>`. Reaps stalled entries
+    /// first — see [`STALLED_DEPLOY_TIMEOUT_SECS`] — so a caller polling this
+    /// id is what corrects a `running` record nothing else was going to.
     pub fn get(&self, id: &str) -> Option<Deploy> {
-        let entries = self.entries.lock().unwrap_or_else(|p| p.into_inner());
+        let mut entries = self.entries.lock().unwrap_or_else(|p| p.into_inner());
+        if reap_stalled(&mut entries) {
+            self.persist(&entries);
+        }
         entries.iter().find(|deploy| deploy.id.as_str() == id).cloned()
     }
 
-    /// Every held Deploy, newest first, for `GET /api/deploys`.
+    /// Every held Deploy, newest first, for `GET /api/deploys`. Reaps stalled
+    /// entries first — see [`Deploys::get`].
     pub fn list(&self) -> Vec<Deploy> {
-        self.entries.lock().unwrap_or_else(|p| p.into_inner()).clone()
+        let mut entries = self.entries.lock().unwrap_or_else(|p| p.into_inner());
+        if reap_stalled(&mut entries) {
+            self.persist(&entries);
+        }
+        entries.clone()
     }
 
     /// Writes the store owner-only through a temporary file and a rename, the
@@ -320,6 +365,42 @@ impl Deploys {
 /// Seconds since the Unix epoch, or zero on a clock set before it.
 fn now_unix() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|since| since.as_secs()).unwrap_or(0)
+}
+
+/// Marks every still-[`DeployResult::Running`] entry as [`DeployResult::Failed`]
+/// unconditionally, for [`Deploys::in_dir`]'s restart case — see there for why
+/// age does not matter for this one. Returns whether anything changed.
+fn reap_on_restart(entries: &mut [Deploy]) -> bool {
+    let now = now_unix();
+    let mut changed = false;
+    for deploy in entries.iter_mut() {
+        if deploy.result == DeployResult::Running {
+            deploy.result = DeployResult::Failed;
+            deploy.finished_unix = Some(now);
+            deploy.log = STALL_LOG.to_owned();
+            changed = true;
+        }
+    }
+    changed
+}
+
+/// Marks every [`DeployResult::Running`] entry older than
+/// [`STALLED_DEPLOY_TIMEOUT_SECS`] as [`DeployResult::Failed`], for
+/// [`Deploys::get`]/[`Deploys::list`]'s same-process case, where a still-live
+/// daemon just never heard back from the task it spawned. Returns whether
+/// anything changed.
+fn reap_stalled(entries: &mut [Deploy]) -> bool {
+    let now = now_unix();
+    let mut changed = false;
+    for deploy in entries.iter_mut() {
+        if deploy.result == DeployResult::Running && now.saturating_sub(deploy.started_unix) >= STALLED_DEPLOY_TIMEOUT_SECS {
+            deploy.result = DeployResult::Failed;
+            deploy.finished_unix = Some(now);
+            deploy.log = STALL_LOG.to_owned();
+            changed = true;
+        }
+    }
+    changed
 }
 
 /// The stored shape: `{"deploys":[{id, target, trigger, startedUnix,
@@ -482,5 +563,78 @@ mod tests {
         // store never started (e.g. one from before a restart) must not crash
         // the caller that raced a persist with a lost in-memory entry.
         store.finish(&DeployId("does-not-exist".into()), DeployResult::Failed, None, "irrelevant");
+    }
+
+    /// Regression for a `running` deploy left behind by a crashed daemon: a
+    /// fresh `Deploys::in_dir` over the same directory must not resurrect it
+    /// as still in progress forever — it should read back as `failed`.
+    #[test]
+    fn a_running_deploy_from_before_a_restart_is_marked_failed_on_reload() {
+        let dir = scratch("restart");
+        let writer = Deploys::in_dir(&dir);
+        let id = writer.start("mysite", Trigger::Webhook);
+        // Simulate the daemon exiting mid-deploy: `writer` is dropped without
+        // ever calling `finish`, exactly like a crash or a kill.
+        drop(writer);
+
+        let reader = Deploys::in_dir(&dir);
+        let deploy = reader.get(id.as_str()).expect("still on disk");
+        assert_eq!(deploy.result, DeployResult::Failed);
+        assert!(deploy.finished_unix.is_some());
+        assert!(!deploy.log.is_empty());
+
+        // The correction itself is durable, not just in this handle's memory.
+        let reader_again = Deploys::in_dir(&dir);
+        assert_eq!(reader_again.get(id.as_str()).unwrap().result, DeployResult::Failed);
+    }
+
+    /// A deploy that finished normally before a restart must reload exactly
+    /// as it finished — only still-`running` entries are reaped.
+    #[test]
+    fn a_finished_deploy_survives_a_restart_untouched() {
+        let dir = scratch("restart-finished");
+        let writer = Deploys::in_dir(&dir);
+        let id = writer.start("mysite", Trigger::Api);
+        writer.finish(&id, DeployResult::Succeeded, Some("cafef00d".into()), "deployed cafef00d");
+        drop(writer);
+
+        let reader = Deploys::in_dir(&dir);
+        let deploy = reader.get(id.as_str()).unwrap();
+        assert_eq!(deploy.result, DeployResult::Succeeded);
+        assert_eq!(deploy.log, "deployed cafef00d");
+    }
+
+    /// Regression for a deploy whose spawned task crashed without ever
+    /// calling `finish`, in a daemon that itself kept running: once the
+    /// deploy has sat `running` past the timeout, reading it is what
+    /// corrects the record — no restart required.
+    #[test]
+    fn a_stalled_running_deploy_is_reaped_on_read() {
+        let store = Deploys::in_dir(&scratch("stalled"));
+        let id = store.start("mysite", Trigger::Api);
+        // Back-date the start so it reads as long past the stall timeout,
+        // standing in for real time passing with no call to `finish`.
+        {
+            let mut entries = store.entries.lock().unwrap();
+            entries[0].started_unix = entries[0].started_unix.saturating_sub(STALLED_DEPLOY_TIMEOUT_SECS + 1);
+        }
+
+        let deploy = store.get(id.as_str()).expect("still recorded");
+        assert_eq!(deploy.result, DeployResult::Failed);
+        assert!(deploy.finished_unix.is_some());
+
+        // list() reaps the same way.
+        let listed = store.list();
+        assert_eq!(listed[0].result, DeployResult::Failed);
+    }
+
+    /// A deploy that is `running` but well within the timeout must not be
+    /// touched — only genuinely stalled entries are reaped.
+    #[test]
+    fn a_recent_running_deploy_is_left_alone() {
+        let store = Deploys::in_dir(&scratch("recent"));
+        let id = store.start("mysite", Trigger::Api);
+        let deploy = store.get(id.as_str()).unwrap();
+        assert_eq!(deploy.result, DeployResult::Running);
     }
 }

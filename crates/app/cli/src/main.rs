@@ -1344,6 +1344,10 @@ async fn serve_everything(
     }
 
     let certificates = CertificateStore::open(&data_dir).map_err(|e| e.to_string())?;
+    // Wired here rather than beside the rest of the builder chain above,
+    // because `certificates` does not exist until this line — see
+    // `Api::with_certificates` and `acme_task::CertificateExpiryReport`.
+    api = api.with_certificates(Arc::new(acme_task::CertificateExpiryReport(certificates.clone())));
 
     // The fallback identity: served on :443 the instant the listener binds, and
     // for any SNI that has no certificate of its own. A self-signed pair is

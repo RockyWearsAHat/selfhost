@@ -732,6 +732,18 @@ role = \"owner\"
         }
     }
 
+    /// A site that relays `/api/pass/authorize`, the one path a `people`- or
+    /// `private`-gated site's sign-in depends on — see `validate.rs`'s whole-config
+    /// check. Tests that set a gated `exposure` need one of these present, exactly
+    /// as a real deployment would need its own auth site configured, or validation
+    /// (which every one of these edit functions runs before returning) refuses the
+    /// result.
+    fn auth_site() -> Site {
+        let mut site = static_site("auth", "auth.example.com");
+        site.public_api_paths = vec!["/api/pass/authorize".into()];
+        site
+    }
+
     #[test]
     fn adding_a_site_appends_a_block_and_leaves_it_valid() {
         let text = add_site(EMPTY, &static_site("blog", "blog.example.com")).unwrap();
@@ -1243,6 +1255,7 @@ domains = [\"example.com\", \"lab.example.com\"]
     #[test]
     fn set_exposure_writes_a_fresh_line_when_the_site_has_none() {
         let text = add_site(EMPTY, &static_site("blog", "blog.example.com")).unwrap();
+        let text = add_site(&text, &auth_site()).unwrap();
         let updated = set_exposure(&text, "blog", Some(crate::Exposure::People)).unwrap().unwrap();
         let config = Config::parse(&updated).unwrap();
         assert_eq!(config.sites[0].exposure, Some(crate::Exposure::People));
@@ -1254,6 +1267,7 @@ domains = [\"example.com\", \"lab.example.com\"]
         let mut site = static_site("blog", "blog.example.com");
         site.exposure = Some(crate::Exposure::Public);
         let text = add_site(EMPTY, &site).unwrap();
+        let text = add_site(&text, &auth_site()).unwrap();
         let updated = set_exposure(&text, "blog", Some(crate::Exposure::People)).unwrap().unwrap();
         let config = Config::parse(&updated).unwrap();
         assert_eq!(config.sites[0].exposure, Some(crate::Exposure::People));
@@ -1294,19 +1308,22 @@ domains = [\"example.com\", \"lab.example.com\"]
 
     #[test]
     fn set_owner_preserves_sibling_sites_and_sub_tables() {
+        // The auth site has to exist before blog is gated, or `add_site` refuses the
+        // gated site outright — see `auth_site`'s documentation.
+        let with_auth = add_site(EMPTY, &auth_site()).unwrap();
         let mut first = static_site("blog", "blog.example.com");
         first.exposure = Some(crate::Exposure::People);
-        let with_first = add_site(EMPTY, &first).unwrap();
+        let with_first = add_site(&with_auth, &first).unwrap();
         let with_second = add_site(&with_first, &static_site("shop", "shop.example.com")).unwrap();
 
         let updated = set_owner(&with_second, "shop", Some("erin")).unwrap().unwrap();
         let config = Config::parse(&updated).unwrap();
-        assert_eq!(config.sites.len(), 2);
+        assert_eq!(config.sites.len(), 3);
         // The untouched site keeps every field it had, including one set earlier
         // by this same family of function.
-        assert_eq!(config.sites[0].exposure, Some(crate::Exposure::People));
-        assert_eq!(config.sites[0].owner, None);
-        assert_eq!(config.sites[1].owner.as_deref(), Some("erin"));
+        assert_eq!(config.sites[1].exposure, Some(crate::Exposure::People));
+        assert_eq!(config.sites[1].owner, None);
+        assert_eq!(config.sites[2].owner.as_deref(), Some("erin"));
     }
 
     #[test]
