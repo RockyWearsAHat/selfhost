@@ -475,6 +475,13 @@ fn init(arguments: &[String]) -> Result<(), String> {
 
     // Defaults are chosen so a first run cannot publish anything or burn a
     // certificate rate limit: loopback binds, self-signed certificates.
+    // Format the public API paths as a TOML inline array.
+    let auth_paths = selfhost_config::PUBLIC_AUTH_PATHS
+        .iter()
+        .map(|p| format!(r#""{}""#, p))
+        .collect::<Vec<_>>()
+        .join(", ");
+
     let starter = format!(
         r#"# selfhost — one file describes the whole deployment.
 version = 1
@@ -496,6 +503,16 @@ data_dir = "./data"
 [[nodes]]
 name = "home"
 role = "owner"
+
+# The auth site handles sign-in for gated sites. Its public_api_paths are
+# auto-configured with the same paths every deployment needs: /api/session for
+# login, /api/vpn/authorize for VPN enrollment, and /api/pass/authorize for
+# signing into gated sites. Change the domain to match your hostname.
+[[sites]]
+name = "auth"
+domains = ["auth.localhost"]
+static_root = "./sites/auth"
+public_api_paths = [{auth_paths}]
 
 [[sites]]
 name = "hello"
@@ -521,6 +538,11 @@ spa = false
 
     std::fs::write(&path, starter).map_err(|e| e.to_string())?;
     println!("• {CONFIG_FILENAME}");
+
+    // Create the auth site directory (empty for now; it will be populated by the daemon).
+    let auth_dir = PathBuf::from("sites/auth");
+    std::fs::create_dir_all(&auth_dir).map_err(|e| e.to_string())?;
+    println!("• sites/auth/");
 
     let page_dir = PathBuf::from("sites/hello");
     std::fs::create_dir_all(&page_dir).map_err(|e| e.to_string())?;
