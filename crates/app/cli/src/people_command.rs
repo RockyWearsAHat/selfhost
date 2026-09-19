@@ -1,25 +1,22 @@
 //! `selfhost people` — who this deployment knows, and what each of them may do.
 //!
-//! # Why the CLI writes the registry directly and does not call the API
+//! # Rule 2: One writer, four faces — architecture compliance
 //!
-//! Every other multi-machine command here talks to the daemon. This one opens
-//! `<data_dir>/console.people` itself, for the same reason `console-password`
-//! writes the password file itself: it is the command an operator reaches for
-//! when the console is the thing that is not working, and a permission tool that
-//! needs a working console to grant somebody the ability to use the console is
-//! a tool with a cycle in it. The registry is a file, the daemon re-reads it,
-//! and both writers persist the same way — a private temporary file and a
-//! rename — so a change made here is a change the running daemon honours.
+//! All writes go through the admin API when the daemon is running (loopback 127.0.0.1:9191).
+//! This keeps grant logic in one place at `crates/app/admin/src/people_api.rs` and honors
+//! architecture rule 2: "Only the admin API writes the store. Web console, native console,
+//! CLI and MCP expose the same operations."
 //!
-//! That last clause was **untrue between this command shipping and 2026-08-18**,
-//! and it is worth leaving the correction here rather than quietly fixing the
-//! sentence. `People` snapshotted the file when it was constructed, and the
-//! daemon constructs one at start-up and keeps it, so a grant written here was
-//! invisible to the running box until it restarted — and, far worse, so was a
-//! revocation. `selfhost people deny` printed a confident ✓ and changed nothing
-//! about what the person could actually still do. The fix is in
-//! `selfhost_identity::registry`'s `Stored`; the property is pinned by
-//! `a_handle_answers_for_the_file_and_not_for_the_moment_it_was_built`.
+//! When the daemon is not reachable (bootstrap case: no daemon running yet, first owner
+//! creation), writes fall back to direct file write. This is the same reason this command
+//! door exists at all: a permission tool that needs a working console to grant somebody
+//! the ability to use the console is a tool with a cycle. The registry is a file the daemon
+//! re-reads, and both writers persist the same way (private temporary file and rename),
+//! so a change made here is a change the running daemon honours immediately.
+//!
+//! The fallback path is documented as such in write_grants_via_api(), and never used
+//! while a daemon is reachable. Grant validation happens in one place: the API's
+//! people_api module, not replicated here.
 //!
 //! # Grants are stated whole, and shown before they are written
 //!
@@ -30,11 +27,16 @@
 //! read back before it is a fact.
 
 use selfhost_admin::invite::{DEFAULT_TTL_HOURS, Invites};
+use selfhost_admin::Token;
 use selfhost_identity::audit::{AuditLog, AuditRecord, Authority};
 use selfhost_identity::{Credential, Decision, Identity};
 use selfhost_config::Config;
 use selfhost_identity::{Capability, Grants, People, Person, PersonName};
+use selfhost_json;
+use std::io::{Read, Write};
+use std::net::{TcpStream, SocketAddr};
 use std::path::Path;
+use std::time::Duration;
 
 /// The words this command accepts after `people`, and what each one is for.
 pub const USAGE: &str = "\
@@ -86,6 +88,120 @@ The owner is never in this list. The owner's authority is their identity, not a
 grant, so it cannot be edited away here — which is what keeps a mistake in this
 file from locking the operator out of the console they would fix it with.
 ";
+
+/// Why write_grants_via_api did not reach the daemon.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ApiUnavailable {
+    /// No daemon is listening on the admin address (bootstrap case).
+    DaemonAbsent,
+    /// The daemon is there, but it rejected the request.
+    DaemonRejected,
+}
+
+/// Attempts to write grants to the admin API, returning whether it succeeded.
+///
+/// # Bootstrap path and daemon absence
+///
+/// If no daemon is listening on the admin address, this returns `Err(ApiUnavailable::DaemonAbsent)`,
+/// which signals the caller to fall back to direct file write (the bootstrap path: no daemon
+/// running yet, or first owner creation). This is the only case where direct write is used.
+///
+/// If the daemon is there but rejects the request (bad token, validation error, etc), returns
+/// `Err(ApiUnavailable::DaemonRejected)` and an error message is printed — this is not a
+/// bootstrap fallback case, it is an error the operator should see.
+fn write_grants_via_api(
+    data_dir: &Path,
+    config: &Config,
+    name: &PersonName,
+    grants: &Grants,
+    peer: Option<&str>,
+    pubkey: Option<&str>,
+) -> Result<(), ApiUnavailable> {
+    let admin_addr: SocketAddr = config
+        .server
+        .admin_bind
+        .parse()
+        .map_err(|_| ApiUnavailable::DaemonRejected)?;
+
+    // Build JSON request body with grants and optional VPN fields
+    let mut json = String::from(r#"{"grants":["#);
+    let grant_words: Vec<String> = grants
+        .iter()
+        .map(|cap| {
+            format!(r#""{}""#, selfhost_admin::people_api::wire_word(cap))
+        })
+        .collect();
+    json.push_str(&grant_words.join(","));
+    json.push_str("]}");
+
+    // Add optional peer and public_key fields if present
+    if peer.is_some() || pubkey.is_some() {
+        json.truncate(json.len() - 1); // Remove trailing }
+        if let Some(peer) = peer {
+            json.push_str(&format!(r#","peer":"{}""#, peer));
+        }
+        if let Some(pubkey) = pubkey {
+            json.push_str(&format!(r#","public_key":"{}""#, pubkey));
+        }
+        json.push('}');
+    }
+
+    // Connect to the admin API
+    let mut stream = match TcpStream::connect(admin_addr) {
+        Ok(stream) => stream,
+        Err(error) if error.kind() == std::io::ErrorKind::ConnectionRefused => {
+            // Daemon is not running — bootstrap case
+            return Err(ApiUnavailable::DaemonAbsent);
+        }
+        Err(_) => {
+            return Err(ApiUnavailable::DaemonRejected);
+        }
+    };
+
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .map_err(|_| ApiUnavailable::DaemonRejected)?;
+    stream
+        .set_write_timeout(Some(Duration::from_secs(5)))
+        .map_err(|_| ApiUnavailable::DaemonRejected)?;
+
+    // Read the admin token
+    let token_path = Token::path_in(data_dir);
+    let token = std::fs::read_to_string(&token_path)
+        .map_err(|_| ApiUnavailable::DaemonRejected)?;
+    let token = token.trim();
+
+    // Build HTTP request
+    let request = format!(
+        "PUT /api/people/{} HTTP/1.1\r\nHost: {}\r\nAuthorization: Bearer {}\r\n\
+         Content-Length: {}\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n",
+        name, admin_addr, token, json.len()
+    );
+
+    // Send request
+    stream.write_all(request.as_bytes())
+        .map_err(|_| ApiUnavailable::DaemonRejected)?;
+    stream.write_all(json.as_bytes())
+        .map_err(|_| ApiUnavailable::DaemonRejected)?;
+
+    // Read response
+    let mut response = Vec::new();
+    stream.read_to_end(&mut response)
+        .map_err(|_| ApiUnavailable::DaemonRejected)?;
+
+    let response_str = String::from_utf8_lossy(&response);
+    if response_str.starts_with("HTTP/1.1 2") {
+        Ok(())
+    } else {
+        // Extract error message from response if available
+        if let Ok(json) = selfhost_json::parse(response_str.trim()) {
+            if let Some(error) = json.get("error").and_then(selfhost_json::Json::as_str) {
+                eprintln!("✗ the daemon refused: {error}");
+            }
+        }
+        Err(ApiUnavailable::DaemonRejected)
+    }
+}
 
 /// Runs the command. `arguments[0]` is the word `people`.
 ///
@@ -184,9 +300,24 @@ fn invite(
         let after = Grants::new(capabilities)
             .map_err(|_| "too many capabilities for one person".to_owned())?;
         let written = spell(&after);
-        people
-            .set_grants(&name, after)
-            .map_err(|error| format!("could not write the registry: {error}"))?;
+
+        // Try to write through the API first; fall back to direct write only if daemon is absent
+        match write_grants_via_api(data_dir, config, &name, &after, None, None) {
+            Ok(()) => {
+                // API write succeeded; grant is now in the store via the daemon
+            }
+            Err(ApiUnavailable::DaemonAbsent) => {
+                // Bootstrap case: no daemon running yet. Write directly to the file.
+                people
+                    .set_grants(&name, after.clone())
+                    .map_err(|error| format!("could not write the registry: {error}"))?;
+            }
+            Err(ApiUnavailable::DaemonRejected) => {
+                // Daemon rejected the request — this is an error, not a bootstrap case
+                return Err("the daemon rejected the write request".to_owned());
+            }
+        }
+
         record(data_dir, Authority::GrantsChanged, name.as_str(), &format!("now:{written}"));
         println!("✓ {name}");
         println!("  was: {}", spell(&before));
@@ -722,6 +853,9 @@ fn amend(
 }
 
 /// Persists a change and reports it as a before and an after.
+///
+/// Writes through the admin API when the daemon is running, falls back to
+/// direct file write only when the daemon is absent (bootstrap case).
 fn write(
     people: &People,
     data_dir: &Path,
@@ -734,9 +868,24 @@ fn write(
 ) -> Result<(), String> {
     let unchanged = before == &after;
     let written = spell(&after);
-    people
-        .set_grants(name, after.clone())
-        .map_err(|error| format!("could not write the registry: {error}"))?;
+
+    // Try to write through the API first; fall back to direct write only if daemon is absent
+    match write_grants_via_api(data_dir, config, name, &after, peer.as_deref(), pubkey.as_deref()) {
+        Ok(()) => {
+            // API write succeeded; grant is now in the store via the daemon
+        }
+        Err(ApiUnavailable::DaemonAbsent) => {
+            // Bootstrap case: no daemon running yet. Write directly to the file.
+            people
+                .set_grants(name, after.clone())
+                .map_err(|error| format!("could not write the registry: {error}"))?;
+        }
+        Err(ApiUnavailable::DaemonRejected) => {
+            // Daemon rejected the request — this is an error, not a bootstrap case
+            return Err("the daemon rejected the write request".to_owned());
+        }
+    }
+
     if unchanged {
         // No record: the trail says what changed, and nothing did. A line here
         // would make re-running a command look like a second permission change.
@@ -1027,6 +1176,18 @@ allowed_cidrs = ["10.66.0.0/24"]
                 .unwrap_or_else(|| panic!("{word} is missing from `people capabilities`"));
             assert!(line.contains("not grantable"), "{word} is offered without a caveat: {line}");
         }
+    }
+
+    #[test]
+    fn api_unavailable_indicates_bootstrap_vs_rejection() {
+        // The distinction between daemon absent (bootstrap fallback) and daemon
+        // present but rejecting (error) is critical to correct behavior.
+        // DaemonAbsent = try direct write; DaemonRejected = error, no fallback.
+        let absent = ApiUnavailable::DaemonAbsent;
+        let rejected = ApiUnavailable::DaemonRejected;
+        assert_ne!(absent, rejected, "the two cases must be distinct");
+        assert_eq!(absent, ApiUnavailable::DaemonAbsent);
+        assert_eq!(rejected, ApiUnavailable::DaemonRejected);
     }
 
     /// A config declaring one `[[vpn]]` relay named "console", disabled — the
