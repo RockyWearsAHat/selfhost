@@ -318,6 +318,106 @@ pub struct Node {
     pub mesh_ip: Option<String>,
 }
 
+/// A Person's name as a Site owner: validated and parsed at write time.
+///
+/// The owner of a Site must be a valid person name from the identity registry.
+/// This newtype enforces the same validation rules as [`selfhost_identity::PersonName`]:
+/// no empty strings, no over-length names, no reserved names ("owner", "machine"),
+/// and only alphanumeric characters plus a small set of interior separators.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SiteOwner(String);
+
+impl SiteOwner {
+    /// Maximum length of a site owner name, in characters.
+    ///
+    /// Matched to the identity crate's PersonName maximum so that a validated
+    /// SiteOwner can always parse as a PersonName.
+    pub const MAX_CHARS: usize = 32;
+
+    /// Validates `text` as a Site owner's name.
+    ///
+    /// Refuses, in this order: emptiness, over-length, the reserved owner name
+    /// in any casing, the reserved machine name in any casing, edges that are not
+    /// alphanumeric, forbidden characters, and adjacent separators.
+    ///
+    /// These rules match [`selfhost_identity::PersonName`]'s validation so that
+    /// a SiteOwner can always parse as a PersonName at runtime.
+    pub fn parse(text: &str) -> Result<Self, String> {
+        if text.is_empty() {
+            return Err("owner name cannot be empty".to_owned());
+        }
+
+        let chars = text.chars().count();
+        if chars > Self::MAX_CHARS {
+            return Err(format!("owner name is {chars} characters, but the limit is {}", Self::MAX_CHARS));
+        }
+
+        if text.eq_ignore_ascii_case("owner") {
+            return Err("\"owner\" is a reserved name and cannot be a site owner".to_owned());
+        }
+
+        if text.eq_ignore_ascii_case("machine") {
+            return Err("\"machine\" is a reserved name and cannot be a site owner".to_owned());
+        }
+
+        // Same separators as identity crate's PersonName
+        const SEPARATORS: &[char] = &[' ', '-', '_', '.', '\''];
+
+        let mut previous_separator = None;
+        let mut last_was_separator = false;
+        for (index, character) in text.chars().enumerate() {
+            let separator = SEPARATORS.contains(&character);
+            if !separator && !character.is_alphanumeric() {
+                return Err(format!("owner name contains forbidden character: '{character}'"));
+            }
+            if index == 0 && separator {
+                return Err("owner name must start with a letter or digit".to_owned());
+            }
+            // One pair of adjacent separators is allowed: a full stop followed by a space ("J. Alex")
+            if separator && previous_separator.is_some_and(|previous| (previous, character) != ('.', ' ')) {
+                return Err("owner name cannot have adjacent separators".to_owned());
+            }
+            previous_separator = separator.then_some(character);
+            last_was_separator = separator;
+        }
+        if last_was_separator {
+            return Err("owner name must end with a letter or digit".to_owned());
+        }
+
+        Ok(Self(text.to_owned()))
+    }
+
+    /// The name as written.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for SiteOwner {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl Serialize for SiteOwner {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        self.0.serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for SiteOwner {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let s = String::deserialize(deserializer)?;
+        Self::parse(&s).map_err(serde::de::Error::custom)
+    }
+}
+
 /// A website.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Site {
@@ -391,7 +491,7 @@ pub struct Site {
     /// does, as though they held `site.admin:<site>`. Absent means only the
     /// deployment's owner and explicit Grants decide.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub owner: Option<String>,
+    pub owner: Option<SiteOwner>,
 }
 
 /// Who may reach a site.
@@ -655,7 +755,7 @@ mod exposure_tests {
         site.allowed_cidrs = vec!["10.66.0.0/24".into()];
         assert!(site.requires_pass() && site.is_network_gated());
         assert!(!site.permits("8.8.8.8".parse().unwrap()), "private keeps the network check");
-        assert_eq!(parsed("owner = \"mom\"").unwrap().owner.as_deref(), Some("mom"));
+        assert_eq!(parsed("owner = \"mom\"").unwrap().owner.as_ref().map(|o| o.as_str()), Some("mom"));
     }
 }
 

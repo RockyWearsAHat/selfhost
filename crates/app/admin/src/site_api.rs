@@ -70,6 +70,24 @@ use std::path::{Path, PathBuf};
 
 use crate::{SITE_UPLOAD_MAX_BODY, json, problem};
 
+/// Parses a JSON field that can be a string, null, or absent, and applies
+/// validation to the string value if present.
+///
+/// This helper reduces duplication between different field parsers (exposure,
+/// owner, etc.) that all follow the same JSON extraction pattern.
+fn parse_optional_json_field<F, T>(body: &[u8], field_name: &str, validate: F) -> Result<Option<T>, String>
+where
+    F: Fn(&str) -> Result<T, String>,
+{
+    let text = std::str::from_utf8(body).map_err(|_| "the body is not UTF-8".to_owned())?;
+    let document = selfhost_json::parse(text).map_err(|_| "the body is not JSON".to_owned())?;
+    match document.get(field_name) {
+        None | Some(Json::Null) => Ok(None),
+        Some(Json::String(value)) => validate(value.as_str()).map(Some),
+        Some(_) => Err(format!("\"{field_name}\" must be a string or null")),
+    }
+}
+
 /// What this daemon needs to administer sites over the API: where the config
 /// lives, and where an API-created site's managed content lives.
 #[derive(Clone)]
@@ -190,7 +208,7 @@ fn site_json(site: &Site) -> Json {
         ),
         ("canonicalRedirect", Json::Bool(site.canonical_redirect)),
         ("exposure", exposure_json(site.exposure)),
-        ("owner", site.owner.as_deref().map_or(Json::Null, Json::string)),
+        ("owner", site.owner.as_ref().map_or(Json::Null, |o| Json::string(o.as_str()))),
     ])
 }
 
@@ -446,20 +464,14 @@ pub fn remove_domain(wiring: &Wiring, name: &str, hostname: &str) -> Response {
 /// `{"exposure": "people"}`, `{"exposure": "private"}`, or `{"exposure": null}`
 /// (or the field simply absent) to clear it back to the unset default.
 fn parse_exposure(body: &[u8]) -> Result<Option<selfhost_config::Exposure>, String> {
-    let text = std::str::from_utf8(body).map_err(|_| "the body is not UTF-8".to_owned())?;
-    let document = selfhost_json::parse(text).map_err(|_| "the body is not JSON".to_owned())?;
-    match document.get("exposure") {
-        None | Some(Json::Null) => Ok(None),
-        Some(Json::String(word)) => match word.as_str() {
-            "public" => Ok(Some(selfhost_config::Exposure::Public)),
-            "people" => Ok(Some(selfhost_config::Exposure::People)),
-            "private" => Ok(Some(selfhost_config::Exposure::Private)),
-            other => Err(format!(
-                "\"exposure\" must be \"public\", \"people\" or \"private\", not \"{other}\""
-            )),
-        },
-        Some(_) => Err("\"exposure\" must be a string or null".to_owned()),
-    }
+    parse_optional_json_field(body, "exposure", |word| match word {
+        "public" => Ok(selfhost_config::Exposure::Public),
+        "people" => Ok(selfhost_config::Exposure::People),
+        "private" => Ok(selfhost_config::Exposure::Private),
+        other => Err(format!(
+            "\"exposure\" must be \"public\", \"people\" or \"private\", not \"{other}\""
+        )),
+    })
 }
 
 /// Answers `PUT /api/sites/<name>/exposure`.
@@ -487,14 +499,8 @@ pub fn set_exposure(wiring: &Wiring, name: &str, body: &[u8]) -> Response {
 
 /// A submitted `PUT /api/sites/<name>/owner` body: `{"owner": "alex"}`, or
 /// `{"owner": null}` (or the field simply absent) to clear it.
-fn parse_owner(body: &[u8]) -> Result<Option<String>, String> {
-    let text = std::str::from_utf8(body).map_err(|_| "the body is not UTF-8".to_owned())?;
-    let document = selfhost_json::parse(text).map_err(|_| "the body is not JSON".to_owned())?;
-    match document.get("owner") {
-        None | Some(Json::Null) => Ok(None),
-        Some(Json::String(owner)) => Ok(Some(owner.clone())),
-        Some(_) => Err("\"owner\" must be a string or null".to_owned()),
-    }
+fn parse_owner(body: &[u8]) -> Result<Option<selfhost_config::SiteOwner>, String> {
+    parse_optional_json_field(body, "owner", selfhost_config::SiteOwner::parse)
 }
 
 /// Answers `PUT /api/sites/<name>/owner`.
@@ -510,11 +516,11 @@ pub fn set_owner(wiring: &Wiring, name: &str, body: &[u8]) -> Response {
         Ok(source) => source,
         Err(refusal) => return refusal,
     };
-    match selfhost_config::edit::set_owner(&source, name, owner.as_deref()) {
+    match selfhost_config::edit::set_owner(&source, name, owner.as_ref().map(|o| o.as_str())) {
         Ok(Some(updated)) => match write_atomically(&wiring.config_path, &updated) {
             Ok(()) => json(
                 Status(200),
-                Json::object([("owner", owner.as_deref().map_or(Json::Null, Json::string))]),
+                Json::object([("owner", owner.as_ref().map_or(Json::Null, |o| Json::string(o.as_str())))]),
             ),
             Err(refusal) => refusal,
         },

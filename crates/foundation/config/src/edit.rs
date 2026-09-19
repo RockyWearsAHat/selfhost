@@ -343,7 +343,7 @@ fn render_site_block(site: &Site) -> String {
         out.push_str(&format!("exposure = {}\n", quote(word)));
     }
     if let Some(owner) = &site.owner {
-        out.push_str(&format!("owner = {}\n", quote(owner)));
+        out.push_str(&format!("owner = {}\n", quote(owner.as_str())));
     }
 
     for instance in &site.instances {
@@ -1296,10 +1296,10 @@ domains = [\"example.com\", \"lab.example.com\"]
     fn set_owner_writes_reads_and_clears_the_same_way() {
         let text = add_site(EMPTY, &static_site("blog", "blog.example.com")).unwrap();
         let with_owner = set_owner(&text, "blog", Some("carol")).unwrap().unwrap();
-        assert_eq!(Config::parse(&with_owner).unwrap().sites[0].owner.as_deref(), Some("carol"));
+        assert_eq!(Config::parse(&with_owner).unwrap().sites[0].owner.as_ref().map(|o| o.as_str()), Some("carol"));
 
         let reassigned = set_owner(&with_owner, "blog", Some("dave")).unwrap().unwrap();
-        assert_eq!(Config::parse(&reassigned).unwrap().sites[0].owner.as_deref(), Some("dave"));
+        assert_eq!(Config::parse(&reassigned).unwrap().sites[0].owner.as_ref().map(|o| o.as_str()), Some("dave"));
         assert_eq!(reassigned.matches("owner =").count(), 1, "{reassigned}");
 
         let cleared = set_owner(&reassigned, "blog", None).unwrap().unwrap();
@@ -1323,7 +1323,7 @@ domains = [\"example.com\", \"lab.example.com\"]
         // by this same family of function.
         assert_eq!(config.sites[1].exposure, Some(crate::Exposure::People));
         assert_eq!(config.sites[1].owner, None);
-        assert_eq!(config.sites[2].owner.as_deref(), Some("erin"));
+        assert_eq!(config.sites[2].owner.as_ref().map(|o| o.as_str()), Some("erin"));
     }
 
     #[test]
@@ -1360,6 +1360,6 @@ allowed_cidrs = [\"127.0.0.1/32\"]
         let updated = set_owner(text, "console", Some("alex")).unwrap().unwrap();
         let config = Config::parse(&updated).unwrap();
         assert!(config.sites[0].console);
-        assert_eq!(config.sites[0].owner.as_deref(), Some("alex"));
+        assert_eq!(config.sites[0].owner.as_ref().map(|o| o.as_str()), Some("alex"));
     }
 }

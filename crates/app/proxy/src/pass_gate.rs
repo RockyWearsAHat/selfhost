@@ -81,7 +81,7 @@ impl PassGate {
     /// The owner, the Site's own `owner`, or a Person who holds
     /// `site.access:<site>` in the registry as it stands this instant.
     fn holds_a_grant(&self, person: &Identity, site: &Site, name: &SiteName) -> bool {
-        if person.is_owner() || site.owner.as_deref() == Some(person.as_str()) {
+        if person.is_owner() || site.owner.as_ref().is_some_and(|owner| owner.as_str() == person.as_str()) {
             return true;
         }
         PersonName::parse(person.as_str())
