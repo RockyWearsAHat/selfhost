@@ -71,7 +71,7 @@ use selfhost_firewall::Manager;
 use selfhost_git::{CredentialSource, Nudge};
 use selfhost_http::{Body, Method, Request, Response, Status};
 use selfhost_identity::{
-    Caller, Capability, Grants, Opening, People, PersonName, Policy, VpnLocationId,
+    Caller, Capability, Grants, Identity, Opening, People, PersonName, Policy, VpnLocationId,
 };
 use selfhost_maintenance;
 
@@ -158,6 +158,25 @@ fn body_limit(request: &Request) -> usize {
 
 /// Default number of log lines returned when the caller does not say.
 const DEFAULT_LOG_LIMIT: usize = 500;
+
+/// Reads certificate expiry for `GET /api/system`, without this crate
+/// depending on `selfhost-proxy` (a peer in the same `app` layer, holding
+/// `CertificateStore`) or on `selfhost-cli` (which owns the ACME renewal
+/// task that stamps each certificate's issue date).
+///
+/// Mirrors [`desk_api::Fleet`]'s shape: a small trait this crate defines and
+/// consumes as `Arc<dyn CertificateExpiry>`, implemented in `main.rs` against
+/// the concrete `CertificateStore` and `acme_task` types it already holds.
+/// See [`Api::with_certificates`].
+pub trait CertificateExpiry: Send + Sync + 'static {
+    /// Every host this deployment holds a certificate for.
+    fn hosts(&self) -> Vec<String>;
+
+    /// Days remaining before `host`'s certificate needs renewal, or `None`
+    /// when there is no issue-date record for it (a self-signed fallback
+    /// that was never issued through ACME, or a host not yet certified).
+    fn days_remaining(&self, host: &str) -> Option<i64>;
+}
 
 /// The control API.
 #[derive(Clone)]
@@ -353,6 +372,26 @@ pub struct Api {
     /// across instead. `false` by default, matching a deployment with no
     /// `[mail]` section.
     mail_configured: bool,
+    /// Certificate expiry for `GET /api/system`, threaded in from `main.rs`
+    /// the same way `mail_configured` is. `None` in a test fixture that
+    /// never called [`Api::with_certificates`]; every real daemon wires it
+    /// unconditionally.
+    certificates: Option<Arc<dyn CertificateExpiry>>,
+    /// Serialises a Site's `owner` field against the one thing that trusts it:
+    /// a delegate's [`Api::delegate_site_access`] check.
+    ///
+    /// Without this, `PUT /api/sites/<name>/owner` and `PUT
+    /// /api/people/<name>` from a delegate race: the delegate's request reads
+    /// `owner` as itself, and — before it gets to write the grant it decided
+    /// that read allows — a concurrent owner change removes it, yet the
+    /// grant is still written on the strength of a permission that no longer
+    /// holds. Holding this for the whole of each of those two critical
+    /// sections (`site_api::set_owner`'s read-then-write, and
+    /// [`Api::delegate_site_access`]'s check-then-write) makes them run one at
+    /// a time rather than interleaved, the same shape [`store::Store`]'s own
+    /// `guard` serialises catalogue saves with. An `Arc` because every clone
+    /// of this `Api` must serialise against the same lock, not one each.
+    site_ownership_guard: Arc<tokio::sync::Mutex<()>>,
 }
 
 /// Cookie-session authentication, present once [`Api::with_console_auth`] has
@@ -1033,6 +1072,8 @@ impl Api {
             site_passes: None,
             deploys: None,
             mail_configured: false,
+            certificates: None,
+            site_ownership_guard: Arc::new(tokio::sync::Mutex::new(())),
         }
     }
 
@@ -1069,6 +1110,13 @@ impl Api {
     /// subsystem itself. See the `mail_configured` field's documentation.
     pub fn with_mail_configured(mut self, configured: bool) -> Self {
         self.mail_configured = configured;
+        self
+    }
+
+    /// Wires certificate expiry into `GET /api/system`. See
+    /// [`CertificateExpiry`] and the `certificates` field's documentation.
+    pub fn with_certificates(mut self, certificates: Arc<dyn CertificateExpiry>) -> Self {
+        self.certificates = Some(certificates);
         self
     }
 
@@ -1615,7 +1663,7 @@ impl Api {
             Route::WhoAmI => json(Status(200), people_api::whoami_json(&caller)),
             Route::Vocabulary => json(Status(200), people_api::vocabulary_json()),
             Route::ListPeople => self.list_people(),
-            Route::SetGrants(name) => self.set_grants(&caller, name, body),
+            Route::SetGrants(name) => self.set_grants(&caller, name, body).await,
             Route::ForgetPerson(name) => self.forget_person(&caller, name),
             Route::MintInvite(name) => self.mint_invite(&caller, name, body),
             Route::ListInvites => self.list_invites(),
@@ -1627,7 +1675,7 @@ impl Api {
             Route::SiteAddDomain(name) => self.sites_add_domain(name, body),
             Route::SiteRemoveDomain(name, hostname) => self.sites_remove_domain(name, hostname),
             Route::SiteSetExposure(name) => self.sites_set_exposure(name, body),
-            Route::SiteSetOwner(name) => self.sites_set_owner(name, body),
+            Route::SiteSetOwner(name) => self.sites_set_owner(name, body).await,
             Route::SiteFileList(name) => self.sites_file_list(name, query),
             Route::SiteFileMkdir(name) => self.sites_file_mkdir(name, body),
             Route::SiteFilePut(name) => self.sites_file_put(name, query, body),
@@ -1675,12 +1723,12 @@ impl Api {
     /// Their name still has to be a name — [`PersonName`] refuses the owner's
     /// spelling in every casing, so no grant written here can touch the
     /// operator's own authority.
-    fn set_grants(&self, caller: &Caller, name: &str, body: &[u8]) -> Response {
+    async fn set_grants(&self, caller: &Caller, name: &str, body: &[u8]) -> Response {
         let Some(people) = &self.people else {
             return problem(Status(404), NO_REGISTRY);
         };
         if !caller.identity().is_owner() {
-            return self.delegate_site_access(caller, people, name, body);
+            return self.delegate_site_access(caller, people, name, body).await;
         }
         // The bar `Demand::OwnerOnly` sets, held here because the route's own
         // demand had to loosen to let a delegate in.
@@ -1818,10 +1866,22 @@ impl Api {
         self.sites.as_ref().and_then(|wiring| site_api::configured_sites(wiring).ok()).unwrap_or_default()
     }
 
+    /// Whether `caller` is the Person a Site's `owner` field names.
+    ///
+    /// `owner` names a Person in the Person registry, never an Agent, so this
+    /// only ever matches [`Identity::Person`] — an Agent enrolled under the
+    /// same word is a different Identity entirely (see
+    /// [`Identity::as_str`]'s documentation) and must fall through to an
+    /// explicit Grant like anyone else, never inherit a Person's ownership by
+    /// sharing their name.
+    fn is_site_owner(caller: &Caller, owner: Option<&str>) -> bool {
+        matches!(caller.identity(), Identity::Person(name) if Some(name.as_str()) == owner)
+    }
+
     /// Whether `caller` may open `site`: the owner, the Site's own `owner`, or
     /// a holder of `site.access:<site>` (which `site.admin:<site>` implies).
     fn may_reach_site(&self, caller: &Caller, site: &selfhost_config::Site) -> bool {
-        if site.owner.as_deref() == Some(caller.identity().as_str()) {
+        if Self::is_site_owner(caller, site.owner.as_deref()) {
             return true;
         }
         selfhost_identity::SiteName::parse(&site.name).is_ok_and(|name| {
@@ -1835,7 +1895,7 @@ impl Api {
             || self
                 .configured_sites()
                 .iter()
-                .any(|entry| entry.name == site.as_str() && entry.owner.as_deref() == Some(caller.identity().as_str()))
+                .any(|entry| entry.name == site.as_str() && Self::is_site_owner(caller, entry.owner.as_deref()))
     }
 
     /// `PUT /api/people/<name>` from somebody who is not the owner.
@@ -1849,7 +1909,14 @@ impl Api {
     ///
     /// Somebody who administers nothing gets the same 401 every other refused
     /// route gives, so this route tells them nothing about who exists.
-    fn delegate_site_access(&self, caller: &Caller, people: &People, name: &str, body: &[u8]) -> Response {
+    ///
+    /// Holds [`Self::site_ownership_guard`] for the whole call: [`Self::may_admin_site`]
+    /// below reads a Site's `owner` from the live config, and without the guard a
+    /// concurrent `PUT /api/sites/<name>/owner` could remove that ownership between
+    /// the read and the grant this function still goes on to write — see the field's
+    /// own documentation for the shape of that race.
+    async fn delegate_site_access(&self, caller: &Caller, people: &People, name: &str, body: &[u8]) -> Response {
+        let _held = self.site_ownership_guard.lock().await;
         let refused = || problem(Status(401), "authorisation required");
         let Ok(person) = PersonName::parse(name) else {
             return refused();
@@ -1949,9 +2016,22 @@ impl Api {
         }
     }
 
-    /// Whether `caller` holds a Grant on any Site that only a Peer can reach:
-    /// a `private` Site, or one with `allowed_cidrs`.
-    fn holds_a_network_gated_site(&self, caller: &Caller) -> bool {
+    /// Whether `caller` holds a Grant on some network-gated Site (a `private`
+    /// Site, or one with `allowed_cidrs`) that stands in for `vpn.access:<location>`
+    /// on the one relay this deployment has.
+    ///
+    /// Only sound when there is exactly one relay: nothing in a Site's config
+    /// says *which* `[[vpn]]` relay it sits behind, so with a single relay
+    /// "reaches some network-gated Site" and "belongs on this network" are
+    /// the same fact, but with two or more relays (independent tenants on one
+    /// box) they are not — a Grant on tenant A's private Site must never
+    /// authorise enrolling a Peer onto tenant B's relay. Multi-relay
+    /// deployments have no such shortcut: a Peer there is only ever minted
+    /// from an explicit `vpn.access:<location>`.
+    fn holds_the_one_network_gated_site(&self, caller: &Caller) -> bool {
+        if self.vpn.as_ref().is_none_or(|vpn| vpn.relay_names().len() != 1) {
+            return false;
+        }
         self.configured_sites()
             .iter()
             .any(|site| site.is_network_gated() && !site.console && self.may_reach_site(caller, site))
@@ -2003,12 +2083,13 @@ impl Api {
                 "no such VPN location is configured on this deployment",
             );
         }
-        // Two ways in: the relay's own word, or a Grant on a Site that can
-        // only be reached from inside the network. The second is what lets a
-        // Site's people enrol a Peer without the owner also handing each of
-        // them a relay by name.
+        // Two ways in: the relay's own word, or — on a single-relay deployment
+        // only, see `holds_the_one_network_gated_site` — a Grant on a Site
+        // that can only be reached from inside that one network. The second
+        // is what lets a Site's people enrol a Peer without the owner also
+        // handing each of them a relay by name.
         if !self.policy().decide(caller, &Capability::VpnAccess(location.clone())).is_allowed()
-            && !self.holds_a_network_gated_site(caller)
+            && !self.holds_the_one_network_gated_site(caller)
         {
             return problem(
                 Status(403),
@@ -2192,7 +2273,13 @@ impl Api {
     }
 
     /// Answers `PUT /api/sites/<name>/owner`.
-    fn sites_set_owner(&self, name: &str, body: &[u8]) -> Response {
+    ///
+    /// Holds [`Self::site_ownership_guard`] for the read-then-write
+    /// [`site_api::set_owner`] performs, the other half of the race
+    /// [`Self::delegate_site_access`] closes its own half of — see that
+    /// field's documentation.
+    async fn sites_set_owner(&self, name: &str, body: &[u8]) -> Response {
+        let _held = self.site_ownership_guard.lock().await;
         match &self.sites {
             Some(wiring) => site_api::set_owner(wiring, name, body),
             None => problem(Status(404), NO_SITES),
@@ -3658,10 +3745,9 @@ impl Api {
     /// its state and, when unhealthy, why. `GET /api/system`.
     ///
     /// Covers the proxy, this admin API, every VPN relay and `vpn-updater`
-    /// (both System-classified, see [`is_system`]), and mail when `[mail]` is
-    /// configured — the set `docs/architecture.dx`'s "now" step 3 names.
-    /// Certificate expiry is not yet part of this answer; see this method's
-    /// `dx_append` finding for why.
+    /// (both System-classified, see [`is_system`]), mail when `[mail]` is
+    /// configured, and each certified host's certificate expiry — the set
+    /// `docs/architecture.dx`'s "now" step 3 names.
     ///
     /// Composed here rather than filtered out of [`Api::list_services`]'s
     /// answer because a System part can be unhealthy in ways the supervisor's
@@ -3694,6 +3780,26 @@ impl Api {
         match self.mail_configured {
             true => parts.push(system_part_json("mail", "configured", None)),
             false => parts.push(system_part_json("mail", "not configured", None)),
+        }
+
+        // `None` here means no `with_certificates` wiring (a test fixture),
+        // not zero certified hosts — a real deployment with no hosts yet
+        // would still report an empty list rather than nothing at all.
+        if let Some(certificates) = &self.certificates {
+            for host in certificates.hosts() {
+                let name = format!("certificate:{host}");
+                match certificates.days_remaining(&host) {
+                    Some(days) if days < 0 => {
+                        parts.push(system_part_json(&name, "expired", Some(&format!("expired {} day(s) ago", -days))));
+                    }
+                    Some(days) => {
+                        parts.push(system_part_json(&name, "valid", Some(&format!("{days} day(s) remaining"))));
+                    }
+                    None => {
+                        parts.push(system_part_json(&name, "unknown", Some("no issue date on record (self-signed fallback)")));
+                    }
+                }
+            }
         }
 
         json(Status(200), Json::object([("system", Json::array(parts))]))
@@ -4723,5 +4829,160 @@ mod tests {
         // A peer that is not a legal node name names nothing this deployment
         // serves, and is refused rather than defaulted to this machine.
         assert_eq!(StreamRoute::for_target("/api/desktop/session?peer=Not%20A%20Node"), None);
+    }
+
+    /// Regression for the TOCTOU between a delegate's Grant write and a
+    /// concurrent `owner` change: [`Api::sites_set_owner`] and
+    /// [`Api::delegate_site_access`] must not be able to interleave their
+    /// read-then-write halves.
+    ///
+    /// White-box on purpose — an integration test driving both routes through
+    /// [`Api::handle`] cannot force the interleaving that used to be the bug,
+    /// since neither critical section suspends once it acquires the guard.
+    /// Locking [`Api::site_ownership_guard`] here, from outside either
+    /// method, stands in for "the other write already has it" and proves
+    /// [`Api::sites_set_owner`] really does wait its turn rather than racing
+    /// past a stale read.
+    #[tokio::test]
+    async fn site_ownership_writes_wait_for_the_guard_rather_than_racing() {
+        let dir = std::env::temp_dir()
+            .join(format!("selfhost-admin-lib-site-ownership-guard-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let config_path = dir.join("selfhost.config.toml");
+        std::fs::write(
+            &config_path,
+            "version = 1\n\
+             [server]\n\
+             http_bind = \"127.0.0.1:8080\"\n\
+             https_bind = \"127.0.0.1:8443\"\n\
+             acme_email = \"a@b.com\"\n\
+             acme = \"self-signed\"\n\
+             data_dir = \"./data\"\n\
+             [[nodes]]\n\
+             name = \"home\"\n\
+             role = \"owner\"\n\
+             [[sites]]\n\
+             name = \"blog\"\n\
+             domains = [\"blog.example.com\"]\n\
+             static_root = \"./sites/blog\"\n\
+             exposure = \"people\"\n\
+             owner = \"carol\"\n\
+             [[sites]]\n\
+             name = \"auth\"\n\
+             domains = [\"auth.example.com\"]\n\
+             static_root = \"./sites/auth\"\n\
+             public_api_paths = [\"/api/pass/authorize\"]\n",
+        )
+        .unwrap();
+        let config =
+            selfhost_config::Config::parse(&std::fs::read_to_string(&config_path).unwrap())
+                .expect("a valid config");
+
+        let api = Api::new(
+            Supervisor::new(&dir),
+            Store::new(&dir),
+            Token::load_or_create(&dir).unwrap(),
+            Manager::for_config(&config),
+        )
+        .with_site_admin(config_path, dir.clone())
+        .with_people(People::load(&dir));
+
+        // Stand in for a write already in its critical section.
+        let held = api.site_ownership_guard.clone();
+        let _held = held.lock().await;
+
+        let mut attempt = Box::pin(api.sites_set_owner("blog", br#"{"owner":"dave"}"#));
+        let outcome =
+            tokio::time::timeout(std::time::Duration::from_millis(50), &mut attempt).await;
+        assert!(outcome.is_err(), "sites_set_owner ran while the guard was held elsewhere");
+
+        drop(_held);
+        let response = attempt.await;
+        assert_eq!(response.status.code(), 200, "and completes once the other write lets go");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A fixed [`CertificateExpiry`] standing in for a real [`CertificateStore`]
+    /// — `selfhost-admin` cannot depend on `selfhost-proxy` to build one, which
+    /// is the whole reason the trait exists (see [`CertificateExpiry`]'s
+    /// documentation).
+    struct FakeCertificates(Vec<(&'static str, Option<i64>)>);
+
+    impl CertificateExpiry for FakeCertificates {
+        fn hosts(&self) -> Vec<String> {
+            self.0.iter().map(|(host, _)| host.to_string()).collect()
+        }
+
+        fn days_remaining(&self, host: &str) -> Option<i64> {
+            self.0.iter().find(|(h, _)| *h == host).and_then(|(_, days)| *days)
+        }
+    }
+
+    /// Regression for Finding 7: `GET /api/system` used to omit certificate
+    /// expiry entirely, with no way for an operator to learn a certificate was
+    /// about to lapse short of `selfhost doctor` or reading the file's own
+    /// notBefore. [`Api::system_health`] must now report one entry per
+    /// certified host, and must tell a healthy host apart from an expired one
+    /// and from a host with no real ACME certificate on record at all.
+    #[tokio::test]
+    async fn system_health_reports_certificate_expiry_per_host() {
+        let dir = std::env::temp_dir()
+            .join(format!("selfhost-admin-lib-certificate-expiry-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let config = selfhost_config::Config::parse(
+            "version = 1\n\
+             [server]\n\
+             http_bind = \"127.0.0.1:8080\"\n\
+             https_bind = \"127.0.0.1:8443\"\n\
+             acme_email = \"a@b.com\"\n\
+             acme = \"self-signed\"\n\
+             data_dir = \"./data\"\n\
+             [[nodes]]\n\
+             name = \"home\"\n\
+             role = \"owner\"\n",
+        )
+        .expect("a valid config");
+
+        let api = Api::new(
+            Supervisor::new(&dir),
+            Store::new(&dir),
+            Token::load_or_create(&dir).unwrap(),
+            Manager::for_config(&config),
+        )
+        .with_certificates(Arc::new(FakeCertificates(vec![
+            ("fresh.example.com", Some(60)),
+            ("stale.example.com", Some(-3)),
+            ("unissued.example.com", None),
+        ])));
+
+        let response = api.system_health().await;
+        assert_eq!(response.status.code(), 200);
+        let Body::Bytes(bytes) = &response.body else {
+            panic!("system_health did not return a body");
+        };
+        let body = selfhost_json::parse(std::str::from_utf8(bytes).unwrap()).unwrap();
+        let parts = body.get("system").and_then(Json::as_array).expect("a system array");
+
+        let find = |name: &str| {
+            parts
+                .iter()
+                .find(|part| part.get("name").and_then(Json::as_str) == Some(name))
+                .unwrap_or_else(|| panic!("no part named {name} in {parts:?}"))
+        };
+
+        let fresh = find("certificate:fresh.example.com");
+        assert_eq!(fresh.get("state").and_then(Json::as_str), Some("valid"));
+
+        let stale = find("certificate:stale.example.com");
+        assert_eq!(stale.get("state").and_then(Json::as_str), Some("expired"));
+
+        let unissued = find("certificate:unissued.example.com");
+        assert_eq!(unissued.get("state").and_then(Json::as_str), Some("unknown"));
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -628,6 +628,29 @@ impl Config {
                 }
             }
         }
+
+        // A `people`- or `private`-gated site is reached through a signed Pass, and a
+        // Pass is only ever minted by `/api/pass/authorize` — so a deployment that
+        // gates a site but never relays that one path has built a lock with no key:
+        // the proxy will 302 a visitor to sign in, and every sign-in attempt will 404.
+        use crate::Exposure;
+        if self
+            .sites
+            .iter()
+            .any(|site| matches!(site.exposure, Some(Exposure::People) | Some(Exposure::Private)))
+            && !self
+                .sites
+                .iter()
+                .any(|site| site.public_api_paths.iter().any(|p| p == "/api/pass/authorize"))
+        {
+            problems.push(Problem {
+                field: "sites".into(),
+                message: "a site is exposure = \"people\" or \"private\", but no site's \
+                          public_api_paths lists /api/pass/authorize; nobody could ever sign in \
+                          to reach it"
+                    .into(),
+            });
+        }
     }
 
     /// No two processes may claim the same port on the same machine.
