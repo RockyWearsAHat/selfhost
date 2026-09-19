@@ -119,6 +119,11 @@ struct Entry {
     /// When this agent was minted, for `selfhost agent list`. Not a security
     /// field.
     created_unix: u64,
+    /// The Person this agent works for. An agent's capabilities can never exceed
+    /// its Person's Grants, and revoking the Person revokes its Agents. The
+    /// agent operates through the authenticated API/MCP as this account, over
+    /// the VPN like its owner.
+    person: String,
 }
 
 /// Why a submitted grant word could not be stored.
@@ -200,8 +205,8 @@ impl AgentStore {
 
     /// Every agent this store holds, for `selfhost agent list`. Never the
     /// secret — only what the operator needs to audit who can do what.
-    pub fn list(&self) -> Vec<(AgentName, Grants, u64)> {
-        self.entries().into_iter().map(|entry| (entry.name, entry.grants, entry.created_unix)).collect()
+    pub fn list(&self) -> Vec<(AgentName, Grants, u64, String)> {
+        self.entries().into_iter().map(|entry| (entry.name, entry.grants, entry.created_unix, entry.person)).collect()
     }
 
     /// Mints a new agent, replacing any existing entry of the same name, and
@@ -215,7 +220,7 @@ impl AgentStore {
     /// write goes to a temporary sibling and is renamed over the file, so a
     /// crash mid-write leaves the previous credentials rather than half of the
     /// new ones.
-    pub fn mint(&self, name: &AgentName, grants: Grants) -> io::Result<MintedToken> {
+    pub fn mint(&self, name: &AgentName, grants: Grants, person: &str) -> io::Result<MintedToken> {
         let secret = crate::token::hex(&crate::token::random_bytes(SECRET_BYTES)?);
         let secret_hash = hash_secret(&secret);
 
@@ -225,6 +230,7 @@ impl AgentStore {
                 entry.secret_hash = secret_hash;
                 entry.grants = grants;
                 entry.created_unix = now_unix();
+                entry.person = person.to_owned();
             }
             None => {
                 if entries.len() >= MAX_AGENTS {
@@ -233,7 +239,13 @@ impl AgentStore {
                          `selfhost agent revoke <name>`"
                     )));
                 }
-                entries.push(Entry { name: name.clone(), secret_hash, grants, created_unix: now_unix() });
+                entries.push(Entry {
+                    name: name.clone(),
+                    secret_hash,
+                    grants,
+                    created_unix: now_unix(),
+                    person: person.to_owned(),
+                });
             }
         }
         self.persist(&entries)?;
@@ -321,7 +333,7 @@ fn now_unix() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|since| since.as_secs()).unwrap_or(0)
 }
 
-/// The stored shape: `{"agents":[{name, secretHash, grants, createdUnix}]}`.
+/// The stored shape: `{"agents":[{name, secretHash, grants, createdUnix, person}]}`.
 fn to_json(entries: &[Entry]) -> Json {
     Json::object([(
         "agents",
@@ -336,6 +348,7 @@ fn to_json(entries: &[Entry]) -> Json {
                     })),
                 ),
                 ("createdUnix", Json::Number(entry.created_unix as f64)),
+                ("person", Json::string(&entry.person)),
             ])
         })),
     )])
@@ -345,9 +358,9 @@ fn to_json(entries: &[Entry]) -> Json {
 ///
 /// A name that is not a valid [`AgentName`], a duplicate name, a missing
 /// field, more than [`MAX_AGENTS`] entries, a grant word this build does not
-/// know, a hash that is not 64 lowercase hex characters — every one of them
-/// refuses the whole document, for the reason this module's own documentation
-/// gives.
+/// know, a hash that is not 64 lowercase hex characters, or a missing person
+/// field — every one of them refuses the whole document, for the reason this
+/// module's own documentation gives.
 fn parse(text: &str) -> Option<Vec<Entry>> {
     let value = selfhost_json::parse(text).ok()?;
     let items = value.get("agents")?.as_array()?;
@@ -371,7 +384,8 @@ fn parse(text: &str) -> Option<Vec<Entry>> {
         }
         let grants = Grants::new(capabilities).ok()?;
         let created_unix = item.get("createdUnix")?.as_u64()?;
-        entries.push(Entry { name, secret_hash, grants, created_unix });
+        let person = item.get("person")?.as_str()?.to_owned();
+        entries.push(Entry { name, secret_hash, grants, created_unix, person });
     }
     Some(entries)
 }
@@ -406,7 +420,7 @@ mod tests {
         let dir = scratch("roundtrip");
         let store = AgentStore::in_dir(&dir);
         let grants = Grants::new([Capability::SiteAdmin]).unwrap();
-        let minted = store.mint(&agent("claude-mac"), grants.clone()).expect("mints");
+        let minted = store.mint(&agent("claude-mac"), grants.clone(), "Alex").expect("mints");
 
         let (name, secret) = split(minted.as_str());
         assert_eq!(store.verify(&agent(&name), &secret), Some(grants));
@@ -418,7 +432,7 @@ mod tests {
     fn a_revoked_agent_stops_verifying_immediately() {
         let dir = scratch("revoke");
         let store = AgentStore::in_dir(&dir);
-        let minted = store.mint(&agent("claude-mac"), Grants::none()).expect("mints");
+        let minted = store.mint(&agent("claude-mac"), Grants::none(), "Alex").expect("mints");
         let (name, secret) = split(minted.as_str());
 
         assert!(store.verify(&agent(&name), &secret).is_some());
@@ -438,7 +452,7 @@ mod tests {
         let reader = AgentStore::in_dir(&dir);
         assert_eq!(reader.list().len(), 0);
 
-        let minted = writer.mint(&agent("claude-mac"), Grants::none()).expect("mints");
+        let minted = writer.mint(&agent("claude-mac"), Grants::none(), "Alex").expect("mints");
         let (name, secret) = split(minted.as_str());
         assert!(reader.verify(&agent(&name), &secret).is_some(), "the second handle sees it too");
     }
@@ -457,12 +471,13 @@ mod tests {
         let dir = scratch("list");
         let store = AgentStore::in_dir(&dir);
         let grants = Grants::new([Capability::SiteAdmin]).unwrap();
-        let minted = store.mint(&agent("claude-mac"), grants).expect("mints");
+        let minted = store.mint(&agent("claude-mac"), grants, "Alex").expect("mints");
         let (name, secret) = split(minted.as_str());
 
         let listed = store.list();
         assert_eq!(listed.len(), 1);
         assert_eq!(listed[0].0.as_str(), name);
+        assert_eq!(listed[0].3, "Alex");
         // The token itself, and therefore the secret, appears nowhere the
         // listing could leak it — only in the one `MintedToken` handed back at
         // mint time.
@@ -474,9 +489,29 @@ mod tests {
         let dir = scratch("cap");
         let store = AgentStore::in_dir(&dir);
         for i in 0..MAX_AGENTS {
-            store.mint(&agent(&format!("agent-{i}")), Grants::none()).expect("under the cap");
+            store.mint(&agent(&format!("agent-{i}")), Grants::none(), "Alex").expect("under the cap");
         }
-        assert!(store.mint(&agent("one-too-many"), Grants::none()).is_err());
+        assert!(store.mint(&agent("one-too-many"), Grants::none(), "Alex").is_err());
+    }
+
+    #[test]
+    fn an_agent_is_associated_with_a_person() {
+        let dir = scratch("person");
+        let store = AgentStore::in_dir(&dir);
+        let grants = Grants::new([Capability::SiteAdmin]).unwrap();
+        store.mint(&agent("claude-mac"), grants.clone(), "Alex").expect("mints");
+
+        let listed = store.list();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].0.as_str(), "claude-mac");
+        assert_eq!(listed[0].3, "Alex");
+
+        // Test with a different person
+        store.mint(&agent("claude-desktop"), grants, "Claude").expect("mints");
+        let listed = store.list();
+        assert_eq!(listed.len(), 2);
+        assert!(listed.iter().any(|(name, _, _, person)| name.as_str() == "claude-mac" && person == "Alex"));
+        assert!(listed.iter().any(|(name, _, _, person)| name.as_str() == "claude-desktop" && person == "Claude"));
     }
 
     /// Splits a minted token's `agent:<name>:<secret>` shape for a test that

@@ -3776,7 +3776,7 @@ fn mint_agent(
     let store = selfhost_admin::agent_store::AgentStore::in_dir(dir);
     let agent_name = selfhost_identity::AgentName::parse(name).expect("a valid agent name");
     let grants = selfhost_identity::Grants::new(capabilities).expect("under the grant cap");
-    store.mint(&agent_name, grants).expect("mints").as_str().to_owned()
+    store.mint(&agent_name, grants, "owner").expect("mints").as_str().to_owned()
 }
 
 /// The console site is not administrable through this API, by anybody.
