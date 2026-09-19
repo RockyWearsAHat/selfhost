@@ -736,6 +736,105 @@ async fn a_login_body_that_is_not_json_is_a_400_not_a_counted_failure() {
     assert_eq!(response.status.code(), 400, "a non-string password is malformed, not a guess");
 }
 
+// ─── The person-password door ──────────────────────────────────────────────
+//
+// A second shape of `POST /api/session` body — `{"email", "password"}` next
+// to the owner's bare `{"password"}` — that mints a session naming its own
+// holder rather than `OWNER`, so it is decided on recency like a passkey
+// login instead of being demoted the moment this deployment has one. See
+// `Opening::PersonPassword` and `Policy::decide`.
+
+#[tokio::test]
+async fn an_email_and_password_login_mints_a_session_for_that_person_with_their_own_grants() {
+    let sessions = Sessions::new();
+    let (api, dir) = console_api("person-login", sessions);
+    let people = People::load(dir.path());
+    let mut grants = Grants::none();
+    grants.grant(Capability::ConsoleRead).expect("room for one grant");
+    let name = PersonName::parse("Mom").expect("a legal name");
+    people.set_grants(&name, grants).expect("grants are written");
+    people
+        .set_email(&name, Some(selfhost_identity::PersonEmail::parse("mom@example.com").unwrap()))
+        .expect("email is written");
+    let person_passwords = selfhost_admin::PersonPasswords::in_dir(dir.path());
+    person_passwords.set(&name, "correct horse battery").expect("password is written");
+    let api = api.with_people(people).with_person_passwords(person_passwords);
+
+    let response = call_with(
+        &api,
+        "POST",
+        "/api/session",
+        &[("X-Selfhost-Console", "1")],
+        r#"{"email":"mom@example.com","password":"correct horse battery"}"#,
+    )
+    .await;
+    assert_eq!(response.status.code(), 200);
+    let cookie = response.headers.get_str("set-cookie").expect("a session cookie").to_owned();
+    let cookie = cookie.split(';').next().expect("at least the cookie pair").to_owned();
+
+    let answered = call_with(&api, "GET", "/api/whoami", &[("Cookie", &cookie)], "").await;
+    assert_eq!(answered.status.code(), 200);
+    let body = body_json(&answered);
+    assert_eq!(body.get("name").and_then(Json::as_str), Some("Mom"));
+    assert_eq!(body.get("owner").and_then(Json::as_bool), Some(false));
+    assert_eq!(body.get("grants").and_then(Json::as_array).map(<[Json]>::len), Some(1));
+
+    // The email is case-insensitive, on both sides of `@`.
+    let cookie2 = call_with(
+        &api,
+        "POST",
+        "/api/session",
+        &[("X-Selfhost-Console", "1")],
+        r#"{"email":"MOM@EXAMPLE.COM","password":"correct horse battery"}"#,
+    )
+    .await;
+    assert_eq!(cookie2.status.code(), 200);
+}
+
+#[tokio::test]
+async fn a_wrong_email_login_is_the_same_401_as_a_wrong_password_and_a_wrong_owner_password() {
+    let sessions = Sessions::new();
+    let (api, dir) = console_api("person-login-refused", sessions);
+    let people = People::load(dir.path());
+    let name = PersonName::parse("Mom").expect("a legal name");
+    people.set_grants(&name, Grants::none()).expect("grants are written");
+    people
+        .set_email(&name, Some(selfhost_identity::PersonEmail::parse("mom@example.com").unwrap()))
+        .expect("email is written");
+    let person_passwords = selfhost_admin::PersonPasswords::in_dir(dir.path());
+    person_passwords.set(&name, "correct horse battery").expect("password is written");
+    let api = api.with_people(people).with_person_passwords(person_passwords);
+
+    // Wrong password, unknown email, and a malformed email are the identical
+    // refusal — none of them may tell a guesser anything about the registry.
+    for body in [
+        r#"{"email":"mom@example.com","password":"wrong password"}"#,
+        r#"{"email":"nobody@example.com","password":"correct horse battery"}"#,
+        r#"{"email":"not-an-email","password":"correct horse battery"}"#,
+    ] {
+        let response =
+            call_with(&api, "POST", "/api/session", &[("X-Selfhost-Console", "1")], body).await;
+        assert_eq!(response.status.code(), 401, "body was {body}");
+    }
+}
+
+#[tokio::test]
+async fn an_email_login_is_refused_when_no_person_registry_is_wired() {
+    // A deployment that has never named a person at all: the email door
+    // answers the same 401 the owner door would for a wrong password, rather
+    // than a different failure that would reveal the registry is absent.
+    let (api, _dir) = console_api("person-login-unwired", Sessions::new());
+    let response = call_with(
+        &api,
+        "POST",
+        "/api/session",
+        &[("X-Selfhost-Console", "1")],
+        r#"{"email":"mom@example.com","password":"correct horse battery"}"#,
+    )
+    .await;
+    assert_eq!(response.status.code(), 401);
+}
+
 #[tokio::test]
 async fn an_invented_cookie_does_not_authorise_anything() {
     let (api, _dir) = console_api("forged-cookie", Sessions::new());
@@ -3351,6 +3450,144 @@ async fn a_permission_change_that_does_not_parse_changes_nothing() {
     let grants = listed[0].get("grants").and_then(Json::as_array).expect("a grants array");
     assert_eq!(grants.len(), 1, "the previous set is untouched");
     assert_eq!(grants[0].as_str(), Some("console.read"));
+}
+
+#[tokio::test]
+async fn setting_an_email_and_password_through_the_api_lets_that_person_log_in() {
+    // The owner-facing half of the login door: granting somebody an email and
+    // password through the same call that grants them capabilities, and
+    // proving the credential that call wrote is the one the login route
+    // actually accepts.
+    let sessions = Sessions::new();
+    let (api, dir) = console_api("people-identity", sessions);
+    let people = People::load(dir.path());
+    let person_passwords = selfhost_admin::PersonPasswords::in_dir(dir.path());
+    let api = api.with_people(people).with_person_passwords(person_passwords);
+
+    let (status, body) = as_owner(
+        &api,
+        "PUT",
+        "/api/people/mom",
+        r#"{"grants":["console.read"],"email":"mom@example.com","password":"correct horse battery"}"#,
+    )
+    .await;
+    assert_eq!(status, 200, "{body:?}");
+    // The single-person response surfaces the identity fields immediately,
+    // not just the roster listing.
+    assert_eq!(body.get("email").and_then(Json::as_str), Some("mom@example.com"));
+    assert_eq!(body.get("has_password").and_then(Json::as_bool), Some(true));
+
+    // The roster agrees, for whoever renders the people panel from a list.
+    let (status, roster) = as_owner(&api, "GET", "/api/people", "").await;
+    assert_eq!(status, 200);
+    let listed = roster.get("people").and_then(Json::as_array).expect("a people array");
+    assert_eq!(listed[0].get("email").and_then(Json::as_str), Some("mom@example.com"));
+    assert_eq!(listed[0].get("has_password").and_then(Json::as_bool), Some(true));
+
+    // And the credential this call wrote is the one the login door checks.
+    let logged_in = call_with(
+        &api,
+        "POST",
+        "/api/session",
+        &[("X-Selfhost-Console", "1")],
+        r#"{"email":"mom@example.com","password":"correct horse battery"}"#,
+    )
+    .await;
+    assert_eq!(logged_in.status.code(), 200);
+}
+
+#[tokio::test]
+async fn the_api_refuses_an_email_already_registered_to_somebody_else() {
+    let (api, dir) = console_api("people-identity-dup", Sessions::new());
+    let people = People::load(dir.path());
+    let person_passwords = selfhost_admin::PersonPasswords::in_dir(dir.path());
+    let api = api.with_people(people).with_person_passwords(person_passwords);
+
+    let (status, _) = as_owner(
+        &api,
+        "PUT",
+        "/api/people/mom",
+        r#"{"grants":[],"email":"shared@example.com"}"#,
+    )
+    .await;
+    assert_eq!(status, 200);
+
+    // Somebody else claiming the same address is refused, and refused before
+    // anything about them is written — not just the email.
+    let (status, body) = as_owner(
+        &api,
+        "PUT",
+        "/api/people/dad",
+        r#"{"grants":["console.read"],"email":"shared@example.com"}"#,
+    )
+    .await;
+    assert_eq!(status, 400);
+    assert!(
+        body.get("error").and_then(Json::as_str).unwrap_or_default().contains("already registered"),
+        "{body:?}"
+    );
+
+    let (_, roster) = as_owner(&api, "GET", "/api/people", "").await;
+    let listed = roster.get("people").and_then(Json::as_array).expect("a people array");
+    assert_eq!(listed.len(), 1, "dad was never written at all, grants included");
+}
+
+#[tokio::test]
+async fn the_api_refuses_a_too_short_password_and_leaves_existing_grants_untouched() {
+    let (api, dir) = console_api("people-identity-short", Sessions::new());
+    let people = People::load(dir.path());
+    let person_passwords = selfhost_admin::PersonPasswords::in_dir(dir.path());
+    let api = api.with_people(people).with_person_passwords(person_passwords);
+
+    as_owner(&api, "PUT", "/api/people/mom", r#"{"grants":["console.read"]}"#).await;
+
+    let (status, body) = as_owner(
+        &api,
+        "PUT",
+        "/api/people/mom",
+        r#"{"grants":["node.admin"],"password":"short"}"#,
+    )
+    .await;
+    assert_eq!(status, 400);
+    assert!(
+        body.get("error").and_then(Json::as_str).unwrap_or_default().contains("8 characters"),
+        "{body:?}"
+    );
+
+    // Whole change or none of it: the grant change bundled with the bad
+    // password never landed either.
+    let (_, roster) = as_owner(&api, "GET", "/api/people", "").await;
+    let listed = roster.get("people").and_then(Json::as_array).expect("a people array");
+    let grants = listed[0].get("grants").and_then(Json::as_array).expect("a grants array");
+    assert_eq!(grants.len(), 1);
+    assert_eq!(grants[0].as_str(), Some("console.read"));
+    assert_eq!(listed[0].get("has_password").and_then(Json::as_bool), Some(false));
+}
+
+#[tokio::test]
+async fn setting_a_password_with_no_login_store_wired_is_refused_before_any_write() {
+    // No `.with_person_passwords(...)` at all: the deployment has not turned
+    // this door on, and a request naming a password should not be able to
+    // tell that apart from any other refusal by leaving grants behind.
+    let (api, dir) = console_api("people-identity-unwired", Sessions::new());
+    let api = api.with_people(People::load(dir.path()));
+
+    let (status, body) = as_owner(
+        &api,
+        "PUT",
+        "/api/people/mom",
+        r#"{"grants":["console.read"],"password":"correct horse battery"}"#,
+    )
+    .await;
+    assert_eq!(status, 400);
+    assert!(
+        body.get("error").and_then(Json::as_str).unwrap_or_default().contains("no login-password store"),
+        "{body:?}"
+    );
+
+    let (_, roster) = as_owner(&api, "GET", "/api/people", "").await;
+    let listed = roster.get("people").and_then(Json::as_array).expect("a people array");
+    assert_eq!(listed.len(), 0, "mom was never written at all");
 }
 
 #[tokio::test]

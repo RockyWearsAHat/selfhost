@@ -274,6 +274,121 @@ impl fmt::Display for PersonName {
     }
 }
 
+/// The longest login email accepted, in characters.
+///
+/// RFC 5321's own envelope-address limit, not a mail grammar this crate has any
+/// business enforcing more of: nothing here sends mail, so the only questions
+/// worth asking of the string are the ones that matter to a login identifier —
+/// is it short enough to store and log, and does it look enough like an email
+/// that a person did not just type their name into the wrong field.
+pub const MAX_EMAIL_CHARS: usize = 254;
+
+/// Why a string is not a usable login email.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum InvalidPersonEmail {
+    /// The email was empty.
+    Empty,
+    /// The email was longer than [`MAX_EMAIL_CHARS`] characters.
+    TooLong {
+        /// How many characters were offered.
+        chars: usize,
+    },
+    /// The email contained whitespace or a control character.
+    Whitespace,
+    /// The email did not contain exactly one `@`.
+    NotOneAt,
+    /// The part before or after the `@` was empty.
+    EmptyLocalOrDomain,
+    /// The domain half had no `.`, so it cannot be a deliverable one.
+    DomainHasNoDot,
+}
+
+impl fmt::Display for InvalidPersonEmail {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Empty => write!(f, "a login email may not be empty"),
+            Self::TooLong { chars } => write!(
+                f,
+                "a login email may be at most {MAX_EMAIL_CHARS} characters ({chars} given)"
+            ),
+            Self::Whitespace => write!(f, "a login email may not contain whitespace"),
+            Self::NotOneAt => write!(f, "a login email must contain exactly one '@'"),
+            Self::EmptyLocalOrDomain => {
+                write!(f, "a login email needs something on both sides of the '@'")
+            }
+            Self::DomainHasNoDot => {
+                write!(f, "a login email's domain must contain a '.'")
+            }
+        }
+    }
+}
+
+impl std::error::Error for InvalidPersonEmail {}
+
+/// A validated login email: the identifier a real person's own account is
+/// looked up by, distinct from the [`PersonName`] a passkey and the audit
+/// trail already key on.
+///
+/// The only way to build one is [`PersonEmail::parse`], which also lower-cases
+/// it. Email is compared case-insensitively everywhere a mail system is
+/// expected to treat it that way, and storing it already-folded is what lets
+/// [`crate::registry::People::find_by_email`] compare stored values directly
+/// instead of every caller remembering to fold its argument first.
+///
+/// This type deliberately checks shape, not deliverability — no DNS lookup, no
+/// confirmation that anything answers at that address. That is the seam a real
+/// verification flow will use later (see this crate's module documentation on
+/// planned expansion): today an owner types an address in and it is trusted,
+/// exactly as a name is; nothing here promises the address is reachable.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct PersonEmail(String);
+
+impl PersonEmail {
+    /// Validates `text` as a login email, and lower-cases it.
+    ///
+    /// Refuses, in this order: emptiness, over-length, whitespace or control
+    /// characters, anything but exactly one `@`, an empty local or domain
+    /// half, and a domain with no `.`. This is a shape check, not a mail
+    /// grammar — it accepts addresses a full RFC 5321 parser would refuse and
+    /// refuses some it would accept, on purpose: the job here is catching a
+    /// typo or the wrong field, not validating deliverability.
+    pub fn parse(text: &str) -> Result<Self, InvalidPersonEmail> {
+        if text.is_empty() {
+            return Err(InvalidPersonEmail::Empty);
+        }
+        let chars = text.chars().count();
+        if chars > MAX_EMAIL_CHARS {
+            return Err(InvalidPersonEmail::TooLong { chars });
+        }
+        if text.chars().any(|character| character.is_whitespace() || character.is_control()) {
+            return Err(InvalidPersonEmail::Whitespace);
+        }
+        let mut halves = text.split('@');
+        let local = halves.next().unwrap_or_default();
+        let (Some(domain), None) = (halves.next(), halves.next()) else {
+            return Err(InvalidPersonEmail::NotOneAt);
+        };
+        if local.is_empty() || domain.is_empty() {
+            return Err(InvalidPersonEmail::EmptyLocalOrDomain);
+        }
+        if !domain.contains('.') {
+            return Err(InvalidPersonEmail::DomainHasNoDot);
+        }
+        Ok(Self(text.to_lowercase()))
+    }
+
+    /// The email as stored: lower-cased, exactly as [`PersonEmail::parse`] left it.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for PersonEmail {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
 /// Why a string is not a usable agent's name.
 ///
 /// A near-copy of [`InvalidPersonName`] rather than a shared type, because the
@@ -733,5 +848,33 @@ mod tests {
         assert!(!Identity::Machine.is_agent());
         assert_eq!(agent.kind(), "agent");
         assert_eq!(agent.as_str(), "claude-mac");
+    }
+
+    #[test]
+    fn an_ordinary_email_is_accepted_and_folded_to_lowercase() {
+        let email = PersonEmail::parse("Mom@Example.COM").expect("a valid email");
+        assert_eq!(email.as_str(), "mom@example.com");
+        assert_eq!(email.to_string(), "mom@example.com");
+    }
+
+    #[test]
+    fn an_email_is_refused_for_every_shape_that_is_not_one() {
+        assert_eq!(PersonEmail::parse(""), Err(InvalidPersonEmail::Empty));
+        assert_eq!(PersonEmail::parse("nobody"), Err(InvalidPersonEmail::NotOneAt));
+        assert_eq!(PersonEmail::parse("a@b@c.com"), Err(InvalidPersonEmail::NotOneAt));
+        assert_eq!(PersonEmail::parse("@example.com"), Err(InvalidPersonEmail::EmptyLocalOrDomain));
+        assert_eq!(PersonEmail::parse("mom@"), Err(InvalidPersonEmail::EmptyLocalOrDomain));
+        assert_eq!(PersonEmail::parse("mom@localhost"), Err(InvalidPersonEmail::DomainHasNoDot));
+        assert_eq!(PersonEmail::parse("mo m@example.com"), Err(InvalidPersonEmail::Whitespace));
+        let over = format!("{}@example.com", "a".repeat(MAX_EMAIL_CHARS));
+        assert!(matches!(PersonEmail::parse(&over), Err(InvalidPersonEmail::TooLong { .. })));
+    }
+
+    #[test]
+    fn two_spellings_that_differ_only_in_case_are_the_same_email() {
+        // The whole point of folding at parse time: a lookup does not have to
+        // remember to fold its argument, because nothing unfolded is ever
+        // stored.
+        assert_eq!(PersonEmail::parse("Mom@Example.com"), PersonEmail::parse("mom@example.com"));
     }
 }

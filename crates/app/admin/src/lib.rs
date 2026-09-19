@@ -52,6 +52,7 @@ pub mod invite;
 pub mod mesh_api;
 pub mod passwd;
 pub mod people_api;
+pub mod person_password;
 pub mod session;
 pub mod site_api;
 pub mod storage_api;
@@ -96,6 +97,7 @@ use tokio::net::{TcpListener, TcpStream};
 pub use agent_store::AgentStore;
 pub use device_password::DevicePasswords;
 pub use passwd::ConsolePassword;
+pub use person_password::PersonPasswords;
 pub use session::{Authenticated, FailureGate, Sessions};
 pub use dav_api::Webdav;
 pub use desk_api::{AgentReport, Fleet, Handover, NodeReport, Standings};
@@ -209,6 +211,17 @@ pub struct Api {
     /// different process; see [`device_password`] for why that distinction is the
     /// whole design.
     device_passwords: Option<device_password::DevicePasswords>,
+    /// The per-person login passwords, checked against an email looked up in
+    /// `people` to answer `POST /api/session` for somebody who is not the
+    /// owner.
+    ///
+    /// `None` until a data directory has been named, and `None` closes the
+    /// door completely — a body naming an email is refused exactly like a
+    /// wrong password rather than treated as the owner door. It is a handle
+    /// onto a file rather than a loaded table for the same reason
+    /// `device_passwords` is: `selfhost people` can write it from a different
+    /// process.
+    person_passwords: Option<person_password::PersonPasswords>,
     /// The outstanding invitations: one-time codes that let somebody who is not
     /// the owner register a passkey under a name the owner chose.
     ///
@@ -926,6 +939,7 @@ impl Api {
             policy: Policy::locked_down(),
             people: None,
             device_passwords: None,
+            person_passwords: None,
             invites: None,
             storage: None,
             desktop: None,
@@ -1095,6 +1109,7 @@ impl Api {
         self.with_console_auth_parts(ConsolePassword::load(dir), Sessions::new())
             .with_people(people_registry(dir))
             .with_device_passwords(device_password::DevicePasswords::in_dir(dir))
+            .with_person_passwords(person_password::PersonPasswords::in_dir(dir))
             .with_invites(invite::Invites::load(dir))
             .with_audit(selfhost_identity::AuditLog::in_dir(dir))
     }
@@ -1108,6 +1123,18 @@ impl Api {
     /// registry entry whose grants decide what it opens.
     pub fn with_device_passwords(mut self, store: device_password::DevicePasswords) -> Self {
         self.device_passwords = Some(store);
+        self
+    }
+
+    /// Records the per-person login passwords `POST /api/session` checks a
+    /// looked-up email against.
+    ///
+    /// Separate from [`Api::with_console_auth`] on the same grounds as
+    /// [`Api::with_device_passwords`] — a test hands in a scratch store —
+    /// and, like it, meaningless without the registry entry whose email
+    /// resolves to the name this store is keyed on.
+    pub fn with_person_passwords(mut self, store: person_password::PersonPasswords) -> Self {
+        self.person_passwords = Some(store);
         self
     }
 
@@ -1500,9 +1527,23 @@ impl Api {
     /// person can act on.
     fn list_people(&self) -> Response {
         match &self.people {
-            Some(people) => json(Status(200), people_api::roster_json(people)),
+            Some(people) => {
+                let holders = self.password_holders();
+                json(Status(200), people_api::roster_json(people, &holders))
+            }
             None => problem(Status(404), NO_REGISTRY),
         }
+    }
+
+    /// Everybody the email-and-password door already has a credential for.
+    ///
+    /// Empty, not an error, when the login-password store was never wired: a
+    /// deployment with no store has nobody in it.
+    fn password_holders(&self) -> Vec<PersonName> {
+        self.person_passwords
+            .as_ref()
+            .map(|store| store.holders().into_iter().map(|(name, _)| name).collect())
+            .unwrap_or_default()
     }
 
     /// Replaces everything one person holds.
@@ -1527,6 +1568,28 @@ impl Api {
             Ok(grants) => grants,
             Err(refusal) => return problem(Status(400), &refusal.message()),
         };
+        let (email, password) = match people_api::identity_fields_from_body(body) {
+            Ok(fields) => fields,
+            Err(refusal) => return problem(Status(400), &refusal),
+        };
+        // Checked before anything is written, on the same "whole change or
+        // none of it" grounds `grants_from_body` is built on: a duplicate
+        // email or an unconfigured password store discovered *after* the
+        // grants were already saved would leave this call half-applied.
+        if let Some(email) = &email {
+            if people.find_by_email(email).is_some_and(|existing| existing.name != person) {
+                return problem(
+                    Status(400),
+                    "that email is already registered to somebody else in this deployment",
+                );
+            }
+        }
+        if password.is_some() && self.person_passwords.is_none() {
+            return problem(
+                Status(400),
+                "no login-password store is configured on this deployment",
+            );
+        }
         // What they held before this call, for the same reason `written` below
         // is taken from the request rather than a re-read: `vpn_side_effects`
         // diffs a before/after pair, and the registry's post-write state has
@@ -1545,40 +1608,73 @@ impl Api {
             Err(refusal) => return problem(Status(400), &refusal),
         };
         match people.set_grants(&person, grants.clone()) {
-            Ok(()) => match people.find(&person) {
-                Some(entry) => {
-                    self.record_authority(
-                        caller,
-                        selfhost_identity::audit::Authority::GrantsChanged,
-                        person.as_str(),
-                        format!("now:{written}"),
-                    );
-                    // Provisioned only once the capability itself is durably
-                    // recorded — the same order `selfhost people grant` writes
-                    // in, and for the same reason: a roster entry granting
-                    // network reachability must never outlive, or outrun, the
-                    // capability grant that is supposed to be its authority.
-                    let notes = self.vpn.as_ref().map_or_else(Vec::new, |vpn| {
-                        vpn.side_effects(
-                            person.as_str(),
-                            &before,
-                            &grants,
-                            peer.as_deref(),
-                            public_key.as_deref(),
-                        )
-                    });
-                    // A warning, not a refusal: the grant is honoured exactly as
-                    // asked, and the console surfaces this beside it rather than
-                    // silently coupling `vpn.access:console` in — coupling it
-                    // would break the independence `Capability::VpnAccess`'s own
-                    // documentation calls a deliberate design decision.
-                    json(Status(200), people_api::person_json(&entry, unreachable, &notes))
+            Ok(()) => {
+                // Applied after the grants, and reported as a 500 rather than
+                // rolled back on failure — this store's own write is the same
+                // temp-file-and-rename atomic swap `set_grants` uses, so the
+                // only realistic way here is a mid-flight I/O error, and the
+                // grants themselves already stand. See `Api::record_authority`
+                // for why a failure to write is not treated as a failure to act.
+                if let Some(email) = &email {
+                    if let Err(error) = people.set_email(&person, Some(email.clone())) {
+                        return problem(
+                            Status(500),
+                            &format!("grants were saved, but the email could not be: {error}"),
+                        );
+                    }
                 }
-                // The registry accepted the write and then could not find the
-                // entry it had just made. Nothing sane produces this; saying so
-                // is better than a 200 over a roster that disagrees with itself.
-                None => problem(Status(500), "the registry accepted the change and lost it"),
-            },
+                if let Some(password) = &password {
+                    // `person_passwords.is_none()` was already refused above,
+                    // before the grants were written.
+                    if let Some(store) = &self.person_passwords {
+                        if let Err(error) = store.set(&person, password) {
+                            return problem(
+                                Status(500),
+                                &format!("grants were saved, but the password could not be: {error}"),
+                            );
+                        }
+                    }
+                }
+                match people.find(&person) {
+                    Some(entry) => {
+                        self.record_authority(
+                            caller,
+                            selfhost_identity::audit::Authority::GrantsChanged,
+                            person.as_str(),
+                            format!("now:{written}"),
+                        );
+                        // Provisioned only once the capability itself is durably
+                        // recorded — the same order `selfhost people grant` writes
+                        // in, and for the same reason: a roster entry granting
+                        // network reachability must never outlive, or outrun, the
+                        // capability grant that is supposed to be its authority.
+                        let notes = self.vpn.as_ref().map_or_else(Vec::new, |vpn| {
+                            vpn.side_effects(
+                                person.as_str(),
+                                &before,
+                                &grants,
+                                peer.as_deref(),
+                                public_key.as_deref(),
+                            )
+                        });
+                        let has_password =
+                            self.person_passwords.as_ref().is_some_and(|store| store.holds(&person));
+                        // A warning, not a refusal: the grant is honoured exactly as
+                        // asked, and the console surfaces this beside it rather than
+                        // silently coupling `vpn.access:console` in — coupling it
+                        // would break the independence `Capability::VpnAccess`'s own
+                        // documentation calls a deliberate design decision.
+                        json(
+                            Status(200),
+                            people_api::person_json(&entry, unreachable, &notes, has_password),
+                        )
+                    }
+                    // The registry accepted the write and then could not find the
+                    // entry it had just made. Nothing sane produces this; saying so
+                    // is better than a 200 over a roster that disagrees with itself.
+                    None => problem(Status(500), "the registry accepted the change and lost it"),
+                }
+            }
             Err(error) => problem(Status(500), &format!("could not save the registry: {error}")),
         }
     }
@@ -2263,7 +2359,16 @@ impl Api {
         let Some(password) = login_password(body) else {
             return problem(Status(400), "body must be JSON with a \"password\" string");
         };
-        if !console.password.verify(&password) {
+        match login_email(body) {
+            Some(email) => self.login_person(console, &email, &password).await,
+            None => self.login_owner(console, &password).await,
+        }
+    }
+
+    /// The owner half of [`Api::login`]: a bare `{"password": ...}` body,
+    /// unchanged from before this door had a second shape.
+    async fn login_owner(&self, console: &ConsoleAuth, password: &str) -> Response {
+        if !console.password.verify(password) {
             return self.refuse_login(console).await;
         }
         console.gate.reset();
@@ -2276,6 +2381,40 @@ impl Api {
         match console.sessions.create(OWNER, Opening::Password) {
             Ok(id) => with_session_cookie(
                 json(Status(200), session_granted(OWNER)),
+                &id,
+                session::SESSION_LIFETIME_SECS,
+            ),
+            Err(error) => problem(Status(500), &format!("could not create a session: {error}")),
+        }
+    }
+
+    /// The person half of [`Api::login`]: an `{"email": ..., "password": ...}`
+    /// body, resolved through the registry rather than the deployment's own
+    /// root credential.
+    ///
+    /// "No such email", "that person has no password set" and "wrong
+    /// password" are the identical refusal — the same uninformative 401 the
+    /// owner door answers, through the same [`Api::refuse_login`] gate, so
+    /// this door cannot be told apart from the other by timing, rate limit or
+    /// body. Unlike the owner login, the session this mints names its own
+    /// holder ([`Opening::PersonPassword`]) rather than [`OWNER`], which is
+    /// exactly what lets [`Policy::decide`]'s console-password demotion pass
+    /// it by — see `Credential::is_a_password_login`.
+    async fn login_person(&self, console: &ConsoleAuth, email: &str, password: &str) -> Response {
+        let resolved = (|| {
+            let people = self.people.as_ref()?;
+            let person_passwords = self.person_passwords.as_ref()?;
+            let email = selfhost_identity::PersonEmail::parse(email).ok()?;
+            let person = people.find_by_email(&email)?;
+            person_passwords.verify(&person.name, password).then_some(person.name)
+        })();
+        let Some(name) = resolved else {
+            return self.refuse_login(console).await;
+        };
+        console.gate.reset();
+        match console.sessions.create(name.as_str(), Opening::PersonPassword) {
+            Ok(id) => with_session_cookie(
+                json(Status(200), session_granted(name.as_str())),
                 &id,
                 session::SESSION_LIFETIME_SECS,
             ),
@@ -3402,6 +3541,16 @@ impl Api {
 /// caller answers 400 rather than treating a malformed body as a failed guess.
 fn login_password(body: &[u8]) -> Option<String> {
     parse_json_body(body)?.get("password").and_then(Json::as_str).map(str::to_owned)
+}
+
+/// Reads the `email` string out of a login request body, when there is one.
+///
+/// Its presence, not its validity, is what chooses [`Api::login_person`] over
+/// [`Api::login_owner`] in [`Api::login`] — an unparseable or unknown address
+/// still takes the person door, and still meets the same uninformative 401,
+/// rather than silently falling back to a door the caller did not ask for.
+fn login_email(body: &[u8]) -> Option<String> {
+    parse_json_body(body)?.get("email").and_then(Json::as_str).map(str::to_owned)
 }
 
 /// Reads the abilities a ticket is being minted for, and the machine they name.
