@@ -59,18 +59,28 @@ mod tests {
             time_window_secs: 30,
         };
 
-        // `validate_image_auth_key` always buckets `SystemTime::now()`, never
-        // `config.image_timestamp` or a timestamp of the caller's choosing, so
-        // the expected key has to be derived from the real clock too.
+        // `validate_image_auth_key` always buckets a fresh `SystemTime::now()`
+        // read of its own, so calling it here would race a *second* clock
+        // read against the one below — under heavy parallel test load a
+        // scheduling gap of more than one time bucket between the two reads
+        // makes this fail nondeterministically. Instead exercise the
+        // underlying pure, timestamp-taking functions directly against a
+        // single shared timestamp, which is deterministic.
         let test_time =
             SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
         let expected_key = compute_expected_key(&config, test_time);
 
-        // Validate that key (would normally be from client)
-        assert!(validate_image_auth_key(&config, &expected_key));
+        assert!(selfhost_orchid_images::validate_auth_key(
+            &config.image_data,
+            &expected_key,
+            test_time,
+        ));
 
-        // Wrong key should fail
         let wrong_key = vec![0x00; 32];
-        assert!(!validate_image_auth_key(&config, &wrong_key));
+        assert!(!selfhost_orchid_images::validate_auth_key(
+            &config.image_data,
+            &wrong_key,
+            test_time,
+        ));
     }
 }
