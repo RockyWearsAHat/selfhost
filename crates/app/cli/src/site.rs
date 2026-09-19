@@ -87,6 +87,11 @@ Add options
                           mixed) site.
   --app-path <prefix>     A path prefix routed to the application rather than to
                           static files; repeatable. Needs at least one instance.
+  --public-api-path <p>   A /api/* path relayed to the loopback admin API, the
+                          same one the console relays; repeatable. Unlike the
+                          console, this site is not gated by allowed_cidrs, so
+                          only the named paths are reachable — everything else
+                          under /api/* 404s. Cannot be combined with --instance.
   --no-canonical-redirect Do not redirect the other domains to the first one.
 
 Adding a subdomain is `add-domain` on the site that should answer it, not a new
@@ -234,6 +239,15 @@ fn add(arguments: &[String], config_path: &Path) -> Result<(), String> {
     let instances = instances_from(arguments)?;
     let app_paths = values_of(arguments, "--app-path");
     let canonical_redirect = !flag(arguments, "--no-canonical-redirect");
+    let public_api_paths = values_of(arguments, "--public-api-path");
+    if !public_api_paths.is_empty() && !instances.is_empty() {
+        return Err(
+            "--public-api-path relays to the loopback admin API and declares no application \
+             instances of its own, so it cannot be combined with --instance\n\n"
+                .to_owned()
+                + USAGE,
+        );
+    }
 
     let site = Site {
         name: name.clone(),
@@ -246,7 +260,7 @@ fn add(arguments: &[String], config_path: &Path) -> Result<(), String> {
         canonical_redirect,
         allowed_cidrs: vec![],
         console: false,
-        public_api_paths: vec![],
+        public_api_paths,
     };
 
     let source = read_source(config_path)?;
@@ -609,5 +623,71 @@ mod tests {
     fn repeatable_options_collect_every_value() {
         let a = args(&["site", "add", "s", "--app-path", "/api", "--app-path", "/ws"]);
         assert_eq!(values_of(&a, "--app-path"), vec!["/api", "/ws"]);
+    }
+
+    const EMPTY_CONFIG: &str = "\
+version = 1
+
+[server]
+acme_email = \"a@b.com\"
+acme = \"self-signed\"
+
+[[nodes]]
+name = \"home\"
+role = \"owner\"
+";
+
+    fn temp_config(tag: &str, text: &str) -> PathBuf {
+        let path = std::env::temp_dir()
+            .join(format!("selfhost-site-cli-{tag}-{}.toml", std::process::id()));
+        std::fs::write(&path, text).expect("write the scratch config");
+        path
+    }
+
+    #[test]
+    fn public_api_path_lands_in_the_written_site() {
+        let path = temp_config("public-api", EMPTY_CONFIG);
+        let a = args(&[
+            "site",
+            "add",
+            "auth",
+            "--domain",
+            "auth.example.com",
+            "--static",
+            "./sites/auth",
+            "--spa",
+            "--public-api-path",
+            "/api/session",
+            "--public-api-path",
+            "/api/vpn/authorize",
+        ]);
+        add(&a, &path).expect("a public-api-path site is accepted");
+
+        let config = load(&path).expect("the written config still parses");
+        let site = config.sites.iter().find(|s| s.name == "auth").expect("the site was added");
+        assert_eq!(site.public_api_paths, vec!["/api/session", "/api/vpn/authorize"]);
+        assert!(site.allowed_cidrs.is_empty(), "a public gateway must not be network-gated");
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn public_api_path_refuses_to_combine_with_an_instance() {
+        let path = temp_config("public-api-conflict", EMPTY_CONFIG);
+        let a = args(&[
+            "site",
+            "add",
+            "auth",
+            "--domain",
+            "auth.example.com",
+            "--instance",
+            "home:5050",
+            "--public-api-path",
+            "/api/session",
+        ]);
+        let error = add(&a, &path).expect_err("an instance and a public-api-path must conflict");
+        assert!(error.contains("--public-api-path"), "{error}");
+
+        let _ = std::fs::remove_file(&path);
     }
 }

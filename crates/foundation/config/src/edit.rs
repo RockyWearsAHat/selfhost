@@ -330,6 +330,9 @@ fn render_site_block(site: &Site) -> String {
     if !site.canonical_redirect {
         out.push_str("canonical_redirect = false\n");
     }
+    if !site.public_api_paths.is_empty() {
+        out.push_str(&format!("public_api_paths = {}\n", quote_array(&site.public_api_paths)));
+    }
 
     for instance in &site.instances {
         out.push_str("\n[[sites.instances]]\n");
@@ -635,6 +638,18 @@ role = \"owner\"
         assert_eq!(config.sites[0].instances.len(), 1);
         assert_eq!(config.sites[0].instances[0].node, "home");
         assert_eq!(config.sites[0].instances[0].port, 5050);
+    }
+
+    #[test]
+    fn a_public_api_gateway_site_writes_its_allowlist() {
+        let mut site = static_site("auth", "auth.example.com");
+        site.public_api_paths = vec!["/api/session".into(), "/api/vpn/authorize".into()];
+        let text = add_site(EMPTY, &site).unwrap();
+        let config = Config::parse(&text).unwrap();
+        assert_eq!(
+            config.sites[0].public_api_paths,
+            vec!["/api/session".to_owned(), "/api/vpn/authorize".to_owned()]
+        );
     }
 
     #[test]
