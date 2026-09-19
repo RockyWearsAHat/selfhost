@@ -40,7 +40,7 @@ const CONFIG: &str = "version = 1\n\
     name = \"auth\"\n\
     domains = [\"auth.example.com\"]\n\
     static_root = \"./sites/auth\"\n\
-    public_api_paths = [\"/api/pass/authorize\"]\n\
+    public_api_paths = [\"/api/session\", \"/api/vpn/authorize\", \"/api/pass/authorize\"]\n\
     [[vpn]]\n\
     name = \"home\"\n\
     backend = \"secure-vpn\"\n\
@@ -78,7 +78,7 @@ const CONFIG_MULTI_TENANT: &str = "version = 1\n\
     name = \"auth\"\n\
     domains = [\"auth.example.com\"]\n\
     static_root = \"./sites/auth\"\n\
-    public_api_paths = [\"/api/pass/authorize\"]\n\
+    public_api_paths = [\"/api/session\", \"/api/vpn/authorize\", \"/api/pass/authorize\"]\n\
     [[vpn]]\n\
     name = \"office\"\n\
     backend = \"secure-vpn\"\n\

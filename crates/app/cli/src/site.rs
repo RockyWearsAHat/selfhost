@@ -664,12 +664,14 @@ role = \"owner\"
             "/api/session",
             "--public-api-path",
             "/api/vpn/authorize",
+            "--public-api-path",
+            "/api/pass/authorize",
         ]);
         add(&a, &path).expect("a public-api-path site is accepted");
 
         let config = load(&path).expect("the written config still parses");
         let site = config.sites.iter().find(|s| s.name == "auth").expect("the site was added");
-        assert_eq!(site.public_api_paths, vec!["/api/session", "/api/vpn/authorize"]);
+        assert_eq!(site.public_api_paths, selfhost_config::PUBLIC_AUTH_PATHS.iter().map(|s| s.to_string()).collect::<Vec<_>>());
         assert!(site.allowed_cidrs.is_empty(), "a public gateway must not be network-gated");
 
         let _ = std::fs::remove_file(&path);
