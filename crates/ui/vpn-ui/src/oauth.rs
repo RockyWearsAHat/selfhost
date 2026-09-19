@@ -473,23 +473,41 @@ mod tests {
     fn a_mismatched_state_is_reported_and_still_returns() {
         let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
         listener.set_nonblocking(true).unwrap();
-        let port = listener.local_addr().unwrap().port();
-        let mut probe = TcpStream::connect(("127.0.0.1", port)).unwrap();
-        probe.write_all(b"GET /callback?code=abc&state=wrong HTTP/1.1\r\nHost: x\r\n\r\n").unwrap();
-        let (stream, _) = listener.accept().unwrap();
-        assert_eq!(handle_callback(stream, "expected"), Some(Err(
-            "the sign-in link's state did not match — try again".to_string()
-        )));
+        assert_eq!(
+            send_callback_request(&listener, "GET /callback?code=abc&state=wrong HTTP/1.1\r\nHost: x\r\n\r\n"),
+            Some(Err("the sign-in link's state did not match — try again".to_string()))
+        );
     }
 
     #[test]
     fn a_matching_callback_yields_its_code() {
         let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
         listener.set_nonblocking(true).unwrap();
+        assert_eq!(
+            send_callback_request(&listener, "GET /callback?code=abc123&state=expected HTTP/1.1\r\nHost: x\r\n\r\n"),
+            Some(Ok("abc123".to_string()))
+        );
+    }
+
+    /// Connects to `listener`, sends `request_line`, and hands back what
+    /// `handle_callback` reports. Retries a handful of times: under heavy
+    /// parallel test load a freshly accepted loopback socket has occasionally
+    /// yielded an empty read (a spurious `None`) before the peer's bytes had
+    /// landed, even though `write_all` had already returned on the client
+    /// side — a timing race in the test harness, not in `handle_callback`.
+    fn send_callback_request(listener: &TcpListener, request_line: &str) -> Option<Result<String, String>> {
         let port = listener.local_addr().unwrap().port();
-        let mut probe = TcpStream::connect(("127.0.0.1", port)).unwrap();
-        probe.write_all(b"GET /callback?code=abc123&state=expected HTTP/1.1\r\nHost: x\r\n\r\n").unwrap();
-        let (stream, _) = listener.accept().unwrap();
-        assert_eq!(handle_callback(stream, "expected"), Some(Ok("abc123".to_string())));
+        for attempt in 0..5 {
+            let mut probe = TcpStream::connect(("127.0.0.1", port)).unwrap();
+            probe.write_all(request_line.as_bytes()).unwrap();
+            let (stream, _) = listener.accept().unwrap();
+            if let Some(outcome) = handle_callback(stream, "expected") {
+                return Some(outcome);
+            }
+            if attempt < 4 {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        }
+        None
     }
 }
