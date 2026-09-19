@@ -1663,7 +1663,7 @@ impl Api {
             Route::Register => self.webauthn_register(&caller, body),
             Route::ListPasskeys => self.webauthn_list(),
             Route::RemovePasskey(id) => self.webauthn_remove(&caller, id),
-            Route::WhoAmI => json(Status(200), people_api::whoami_json(&caller)),
+            Route::WhoAmI => json(Status(200), people_api::whoami_json(&caller, self.agents.as_ref())),
             Route::Vocabulary => json(Status(200), people_api::vocabulary_json()),
             Route::ListPeople => self.list_people(),
             Route::SetGrants(name) => self.set_grants(&caller, name, body).await,
