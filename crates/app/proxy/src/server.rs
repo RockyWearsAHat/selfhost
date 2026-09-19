@@ -1673,10 +1673,17 @@ async fn relay_deploy(server: &Server, name: &str) -> io::Result<Status> {
     // `/api/services/`. `name` reaches a raw request line either way, which is
     // why `valid_service_name` has already refused anything outside its
     // allow-list.
+    // `?via=webhook` marks this call, and only this call, as the webhook
+    // relay's own — `Api::deploy_now` reads it to record the Deploy it starts
+    // as `Trigger::Webhook` rather than `Trigger::Api`. The self-update branch
+    // carries no marker: `Api::self_update_now` records no Deploy at all (the
+    // watcher it nudges does, tagged `Trigger::SelfUpdate` unconditionally —
+    // see `crates/app/cli/src/self_update.rs`), so there is nothing here for
+    // a marker to change.
     let target = if name == selfhost_config::git::SELF_UPDATE_WEBHOOK_NAME {
         "/api/self-update/deploy".to_owned()
     } else {
-        format!("/api/services/{name}/deploy")
+        format!("/api/services/{name}/deploy?via=webhook")
     };
 
     let mut upstream = TcpStream::connect(admin_bind).await?;
@@ -3291,7 +3298,10 @@ mod tests {
         assert!(response.starts_with("HTTP/1.1 202"), "{response}");
 
         let relayed = accepted.await.expect("the fake admin task did not panic");
-        assert!(relayed.starts_with("POST /api/services/levelup/deploy HTTP/1.1"), "{relayed}");
+        // `?via=webhook` marks this as the relay's own call, so `Api::deploy_now`
+        // records the resulting Deploy as `Trigger::Webhook` rather than
+        // `Trigger::Api` — see `relay_deploy`'s documentation.
+        assert!(relayed.starts_with("POST /api/services/levelup/deploy?via=webhook HTTP/1.1"), "{relayed}");
         assert!(relayed.contains("Authorization: Bearer "), "{relayed}");
     }
 
@@ -3507,7 +3517,13 @@ mod tests {
         assert!(response.starts_with("HTTP/1.1 202"), "{response}");
 
         let relayed = accepted.await.expect("the fake admin task did not panic");
-        assert!(relayed.starts_with("POST /api/services/levelup/deploy HTTP/1.1"), "{relayed}");
+        // `?via=webhook` marks this as the relay's own call, so `Api::deploy_now`
+        // records the resulting Deploy as `Trigger::Webhook` rather than
+        // `Trigger::Api` — see `relay_deploy`'s documentation.
+        assert!(
+            relayed.starts_with("POST /api/services/levelup/deploy?via=webhook HTTP/1.1"),
+            "{relayed}"
+        );
     }
 
     /// A `Server` like [`server_with_github_app`], with `[self_update]` also

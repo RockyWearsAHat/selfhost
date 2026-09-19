@@ -45,6 +45,7 @@
 pub mod agent_store;
 pub mod audit_api;
 pub mod dav_api;
+pub mod deploys;
 pub mod device_password;
 pub mod desk_api;
 pub mod images_api;
@@ -332,6 +333,26 @@ pub struct Api {
     /// The Pass key and sign-in codes shared with the proxy; `None` leaves
     /// `POST /api/pass/authorize` a 404. See [`Api::with_site_passes`].
     site_passes: Option<site_pass::SitePasses>,
+    /// The Deploy record: one entry per repo→build→publish attempt, however it
+    /// was asked for.
+    ///
+    /// `None` only before [`Api::with_deploys`] has been called — every real
+    /// daemon wires it unconditionally in `main.rs`, the same way
+    /// [`Api::with_agents`] always is, so `None` here is a test fixture's
+    /// state rather than a deployment's. With no store, `deploy_now` still
+    /// deploys exactly as before this existed; it just has nowhere to record
+    /// that it did, and `GET /api/deploys`/`GET /api/deploys/<id>` answer as
+    /// though this build did not serve them.
+    deploys: Option<Arc<deploys::Deploys>>,
+    /// Whether `[mail]` is configured, for `GET /api/system`'s report on it.
+    ///
+    /// Mail is never a supervised catalogue entry (it runs via
+    /// `mail_task::run` directly — see `crates/app/cli/src/main.rs`), so
+    /// there is no [`selfhost_supervisor::state::ServiceStatus`] for
+    /// [`Api::system_health`] to read; this one bit is what `main.rs` hands
+    /// across instead. `false` by default, matching a deployment with no
+    /// `[mail]` section.
+    mail_configured: bool,
 }
 
 /// Cookie-session authentication, present once [`Api::with_console_auth`] has
@@ -490,6 +511,16 @@ enum Route<'a> {
     DesktopAgent,
     /// `GET /api/audit?limit=<n>`
     AuditTrail,
+    /// `GET /api/deploys` — every recorded Deploy, newest first. See
+    /// [`deploys`].
+    Deploys,
+    /// `GET /api/deploys/<id>`
+    DeployShow(&'a str),
+    /// `GET /api/system` — every System part (proxy, admin API, relay(s),
+    /// updater, mail if configured, certificate expiry), its state, and a
+    /// human reason when it is unhealthy. Never a Service: see
+    /// `docs/architecture.dx`'s System/Service split.
+    System,
     /// `GET /api/storage/shares`
     Shares,
     /// `GET /api/storage/shares/<id>/list?path=…`
@@ -601,6 +632,11 @@ impl<'a> Route<'a> {
             // The trail of what the dangerous capabilities did. A `GET`, and
             // owner-only: see `Route::demand`.
             (Method::Get, ["api", "audit"]) => Some(Self::AuditTrail),
+            // Matched ahead of nothing in particular — `deploys` is not a
+            // prefix any other route under `/api/` uses.
+            (Method::Get, ["api", "deploys"]) => Some(Self::Deploys),
+            (Method::Get, ["api", "deploys", id]) => Some(Self::DeployShow(id)),
+            (Method::Get, ["api", "system"]) => Some(Self::System),
             (Method::Get, ["api", "storage", "shares"]) => Some(Self::Shares),
             (Method::Get, ["api", "storage", "shares", id, "list"]) => Some(Self::ShareList(id)),
             (Method::Get, ["api", "storage", "shares", id, "stat"]) => Some(Self::ShareStat(id)),
@@ -713,7 +749,10 @@ impl<'a> Route<'a> {
             | Self::DesktopNodes
             | Self::Shares
             | Self::MaintenanceStatus
-            | Self::VpnCheckAccess => Demand::Held(Capability::ConsoleRead),
+            | Self::VpnCheckAccess
+            | Self::Deploys
+            | Self::DeployShow(_)
+            | Self::System => Demand::Held(Capability::ConsoleRead),
             // Per-node and per-share, so the target has to be a name the
             // vocabulary can hold. One that is not names nothing this
             // deployment serves, and refusing it as though it were somebody
@@ -975,6 +1014,8 @@ impl Api {
             vpn: None,
             vpn_authorizations: vpn_enroll::Authorizations::new(),
             site_passes: None,
+            deploys: None,
+            mail_configured: false,
         }
     }
 
@@ -987,6 +1028,30 @@ impl Api {
     /// the honest report for a deployment nobody has enrolled an agent on.
     pub fn with_agents(mut self, data_dir: &Path) -> Self {
         self.agents = Some(agent_store::AgentStore::in_dir(data_dir));
+        self
+    }
+
+    /// Wires the Deploy record: one entry per repo→build→publish attempt,
+    /// read back through `GET /api/deploys` and `GET /api/deploys/<id>`.
+    ///
+    /// Takes an already-built, shared handle rather than a `data_dir` the way
+    /// [`Api::with_agents`] does, because the same store is also handed to
+    /// `self_update::watch_own_repository` — one value, so a self-update
+    /// Deploy this watcher records and a `GET /api/deploys/<id>` reading it
+    /// back agree by construction rather than by both reading the same file
+    /// at slightly different times. Always called in `main.rs`,
+    /// unconditionally; there is no config flag that turns a Deploy off, only
+    /// a builder chain a test fixture may choose to leave short.
+    pub fn with_deploys(mut self, deploys: Arc<deploys::Deploys>) -> Self {
+        self.deploys = Some(deploys);
+        self
+    }
+
+    /// Records whether `[mail]` is configured, so `GET /api/system` can
+    /// report on it without this crate needing a handle onto the mail
+    /// subsystem itself. See the `mail_configured` field's documentation.
+    pub fn with_mail_configured(mut self, configured: bool) -> Self {
+        self.mail_configured = configured;
         self
     }
 
@@ -1504,7 +1569,7 @@ impl Api {
             Route::Install(name) => self.install(name, body).await,
             Route::Uninstall(name) => self.uninstall(name).await,
             Route::Logs(name) => self.logs(name, query).await,
-            Route::DeployNow(name) => self.deploy_now(name, body).await,
+            Route::DeployNow(name) => self.deploy_now(name, query, body).await,
             Route::SelfUpdateNow => self.self_update_now(),
             Route::Act(name, action) => self.act(name, action).await,
             Route::MintTicket => self.mint_ticket(request, &caller, body),
@@ -1512,6 +1577,9 @@ impl Api {
             Route::DesktopNodes => self.desktop_nodes(&caller),
             Route::DesktopAgent => self.desktop_agent(&caller, query),
             Route::AuditTrail => self.audit_trail(query),
+            Route::Deploys => self.list_deploys(),
+            Route::DeployShow(id) => self.show_deploy(id),
+            Route::System => self.system_health().await,
             Route::Shares => self.shares(&caller).await,
             Route::ShareList(id) => self.share_list(id, &caller, query).await,
             Route::ShareStat(id) => self.share_stat(id, &caller, query).await,
@@ -3498,12 +3566,90 @@ impl Api {
         Some(Standings::new(console.sessions.clone(), self.people.clone(), self.policy(), switches))
     }
 
+    /// Every hosted Service — never a System part. See [`is_system`] and
+    /// `docs/architecture.dx`'s System/Service split: a Person chose to host a
+    /// Service, where a System part (the relay, the updater, `reports`) is
+    /// this deployment supervising itself and belongs on [`Api::system_health`]
+    /// instead.
     async fn list_services(&self) -> Response {
         let statuses = self.supervisor.statuses().await;
         json(
             Status(200),
-            Json::object([("services", Json::array(statuses.iter().map(|s| s.to_json())))]),
+            Json::object([(
+                "services",
+                Json::array(statuses.iter().filter(|s| !is_system(&s.name)).map(|s| s.to_json())),
+            )]),
         )
+    }
+
+    /// Every recorded Deploy, newest first. `GET /api/deploys`.
+    ///
+    /// An empty list, not an error, when no `Deploys` store was wired — the
+    /// honest report for a build that predates this feature or a test
+    /// fixture that left it out, the same convention [`Api::audit_trail`]
+    /// follows for its own absent store.
+    fn list_deploys(&self) -> Response {
+        let records = match &self.deploys {
+            Some(store) => store.list(),
+            None => Vec::new(),
+        };
+        json(Status(200), Json::object([("deploys", Json::array(records.iter().map(deploys::Deploy::to_json)))]))
+    }
+
+    /// One Deploy by id. `GET /api/deploys/<id>`.
+    fn show_deploy(&self, id: &str) -> Response {
+        let Some(deploys) = &self.deploys else {
+            return problem(Status(404), "no such deploy");
+        };
+        match deploys.get(id) {
+            Some(deploy) => json(Status(200), deploy.to_json()),
+            None => problem(Status(404), "no such deploy"),
+        }
+    }
+
+    /// Every System part of this deployment — never a hosted Service — with
+    /// its state and, when unhealthy, why. `GET /api/system`.
+    ///
+    /// Covers the proxy, this admin API, every VPN relay and `vpn-updater`
+    /// (both System-classified, see [`is_system`]), and mail when `[mail]` is
+    /// configured — the set `docs/architecture.dx`'s "now" step 3 names.
+    /// Certificate expiry is not yet part of this answer; see this method's
+    /// `dx_append` finding for why.
+    ///
+    /// Composed here rather than filtered out of [`Api::list_services`]'s
+    /// answer because a System part can be unhealthy in ways the supervisor's
+    /// own state does not capture — the reason each entry below carries its
+    /// own human-readable state rather than only the supervisor's.
+    async fn system_health(&self) -> Response {
+        let statuses = self.supervisor.statuses().await;
+        let mut parts = Vec::new();
+
+        // This admin API and the proxy are always present — reaching this
+        // handler at all proves both are serving requests: a `tokio::select!`
+        // arm ending for either one is fatal to the whole daemon process (see
+        // `crates/app/cli/src/main.rs`'s `serve_everything`), so an answering
+        // admin API is proof the proxy is still in that same `select!`.
+        parts.push(system_part_json("admin-api", "running", None));
+        parts.push(system_part_json("proxy", "running", None));
+
+        for status in statuses.iter().filter(|s| is_system(&s.name)) {
+            let unhealthy_reason = match status.state {
+                selfhost_supervisor::state::ServiceState::Running { .. } => None,
+                ref other => Some(other.label().to_owned()),
+            };
+            parts.push(system_part_json(&status.name, status.state.label(), unhealthy_reason.as_deref()));
+        }
+
+        // Mail is never a supervised catalogue entry — it runs via
+        // `mail_task::run` directly, so there is no `ServiceStatus` for it to
+        // read here. `mail_configured` is the one bit `main.rs` hands this
+        // struct for exactly this route; see [`Api::with_mail_configured`].
+        match self.mail_configured {
+            true => parts.push(system_part_json("mail", "configured", None)),
+            false => parts.push(system_part_json("mail", "not configured", None)),
+        }
+
+        json(Status(200), Json::object([("system", Json::array(parts))]))
     }
 
     async fn describe(&self, name: &str) -> Response {
@@ -3630,8 +3776,20 @@ impl Api {
     /// that blocking the response on it would tie up the caller — the proxy's
     /// webhook handler, in turn tying up the pusher's HTTP client — for as
     /// long as the build takes. The outcome lands where every other
-    /// deployment's does: the service's own `[git]`-tagged output.
-    async fn deploy_now(&self, name: &str, body: &[u8]) -> Response {
+    /// deployment's does: the service's own `[git]`-tagged output, *and* — when
+    /// [`Api::with_deploys`] wired a store — a Deploy record a caller can poll
+    /// by the id this route hands back. No silent failures: a build that
+    /// fails is a Deploy this store records as `failed`, not one that is
+    /// merely absent from the log nobody happened to be watching.
+    ///
+    /// `query`'s only use here is telling a webhook delivery from every other
+    /// caller: the proxy's relay marks its own request `?via=webhook` (see
+    /// `crates/app/proxy/src/server.rs`'s `relay_deploy`); anything else —
+    /// `selfhost repo deploy`, the console's deploy button, a manual call — is
+    /// recorded as [`deploys::Trigger::Api`]. See [`deploys::Trigger`]'s
+    /// documentation for why a third, CLI-specific value would be a
+    /// distinction the wire protocol does not actually make.
+    async fn deploy_now(&self, name: &str, query: &str, body: &[u8]) -> Response {
         let Some(spec) = self.supervisor.spec(name).await else {
             return problem(Status(404), "no such service");
         };
@@ -3648,14 +3806,22 @@ impl Api {
             .and_then(|value| value.get("force").and_then(Json::as_bool))
             .unwrap_or(false);
 
+        let trigger = match query_value(query, "via") {
+            Some("webhook") => deploys::Trigger::Webhook,
+            _ => deploys::Trigger::Api,
+        };
+        let deploy_id = self.deploys.as_ref().map(|deploys| deploys.start(name, trigger));
+
         let supervisor = self.supervisor.clone();
         let credentials = self.github_credentials.clone();
+        let deploys = self.deploys.clone();
+        let record_id = deploy_id.clone();
         tokio::spawn(async move {
             let credential = match &credentials {
                 Some(source) => source.authenticated_url(&watch.repository).await,
                 None => None,
             };
-            let _ = selfhost_git::check_once_with_credential(
+            let outcome = selfhost_git::check_once_with_credential(
                 &supervisor,
                 &spec,
                 &watch,
@@ -3663,12 +3829,17 @@ impl Api {
                 force,
             )
             .await;
+            if let (Some(deploys), Some(id)) = (&deploys, &record_id) {
+                let (result, commit, log) = deploy_outcome_to_record(outcome);
+                deploys.finish(id, result, commit, log);
+            }
         });
 
-        json(
-            Status(202),
-            Json::object([("accepted", Json::Bool(true)), ("service", Json::string(name))]),
-        )
+        let mut fields = vec![("accepted", Json::Bool(true)), ("service", Json::string(name))];
+        if let Some(id) = &deploy_id {
+            fields.push(("deploy", Json::string(id.as_str())));
+        }
+        json(Status(202), Json::object(fields))
     }
 
     /// Asks the self-update watcher to check its branch immediately.
@@ -3817,6 +3988,63 @@ fn requested_abilities(body: &[u8]) -> Option<Vec<Ability>> {
 /// Parses a request body as JSON, or `None` for anything that is not.
 fn parse_json_body(body: &[u8]) -> Option<Json> {
     selfhost_json::parse(std::str::from_utf8(body).ok()?).ok()
+}
+
+/// Whether a supervised entry is a System part of Self-Host itself rather
+/// than a Service a Person chose to host.
+///
+/// `docs/architecture.dx`'s System/Service split names exactly these:
+/// `reports` (the public report intake this daemon runs for itself) and
+/// every VPN relay plus `vpn-updater` (`crates/services/vpn/src/runner.rs`'s
+/// `SERVICE_PREFIX = "vpn-"`, and `crates/services/vpn/src/updater.rs`'s
+/// `SERVICE_NAME = "vpn-updater"` — both start with `"vpn-"`). Anything else
+/// in the catalogue was installed by an operator naming a repository and a
+/// serve command, which is what a Service is.
+fn is_system(name: &str) -> bool {
+    name == "reports" || name.starts_with("vpn-")
+}
+
+/// One System part's entry in `GET /api/system`'s answer.
+fn system_part_json(name: &str, state: &str, unhealthy_reason: Option<&str>) -> Json {
+    Json::object([
+        ("name", Json::string(name)),
+        ("state", Json::string(state)),
+        (
+            "reason",
+            match unhealthy_reason {
+                Some(reason) => Json::string(reason),
+                None => Json::Null,
+            },
+        ),
+    ])
+}
+
+/// Turns what [`selfhost_git::check_once_with_credential`] returns into what a
+/// Deploy record stores: a result, an optional commit, and one human-readable
+/// line. "Nothing to do" and "reported only" both count as `succeeded` — a
+/// no-op is a recorded no-op, never an unrecorded one, which is the whole
+/// point of a Deploy record existing at all.
+fn deploy_outcome_to_record(
+    outcome: Result<selfhost_git::Outcome, String>,
+) -> (deploys::DeployResult, Option<String>, String) {
+    match outcome {
+        Ok(selfhost_git::Outcome::NothingToDo) => {
+            (deploys::DeployResult::Succeeded, None, "nothing to do; already at the tip".to_owned())
+        }
+        Ok(selfhost_git::Outcome::Deployed { commit }) => {
+            let log = format!("deployed {commit}");
+            (deploys::DeployResult::Succeeded, Some(commit), log)
+        }
+        Ok(selfhost_git::Outcome::Reported) => (
+            deploys::DeployResult::Succeeded,
+            None,
+            "branch moved; this watch only reports it".to_owned(),
+        ),
+        Ok(selfhost_git::Outcome::Failed { step, reason }) => {
+            (deploys::DeployResult::Failed, None, format!("{step} failed: {reason}"))
+        }
+        Err(reason) => (deploys::DeployResult::Failed, None, reason),
+    }
 }
 
 /// The most `selfhost_session` pairs read out of one `Cookie` header.
