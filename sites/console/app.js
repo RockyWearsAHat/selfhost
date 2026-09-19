@@ -3081,7 +3081,7 @@ function boot() {
     line.textContent = note;
     line.hidden = note === "";
     if (!options.keep) $("login-password").value = "";
-    $("login-password").focus();
+    ($("login-email").value ? $("login-password") : $("login-email")).focus();
   }
 
   /** Back to the password field, with everything the session showed dropped. */
@@ -3167,7 +3167,10 @@ function boot() {
     $("login-submit").disabled = true;
     $("login-sweep").hidden = false;
     try {
-      const reply = await api("/api/session", { method: "POST", body: { password: $("login-password").value } });
+      const email = $("login-email").value.trim();
+      const body = { password: $("login-password").value };
+      if (email) body.email = email;
+      const reply = await api("/api/session", { method: "POST", body });
       if (reply.status >= 200 && reply.status < 300) { rememberUser(reply); enterConsole(); return; }
       note.hidden = false;
       if (reply.status === 401) note.textContent = "not accepted";
@@ -3489,12 +3492,20 @@ function boot() {
    *  comma- or whitespace-separated capability words — because the
    *  vocabulary caption above the list is the only reference anyone
    *  needs, and a set the daemon refuses comes back with the exact reason
-   *  (`people_api::BadGrants::message`) rather than a silent no-op. */
-  async function saveGrants(name, text) {
+   *  (`people_api::BadGrants::message`) rather than a silent no-op.
+   *
+   *  `email`/`password` are sent only when the field held something —
+   *  leaving either blank leaves that person's existing value untouched,
+   *  it is never read back as "clear this", since the API has no way to
+   *  tell "leave alone" from "erase" for a field it wasn't sent at all. */
+  async function saveGrants(name, text, email, password) {
     const grants = text.split(/[,\s]+/).map((word) => word.trim()).filter(Boolean);
+    const body = { grants };
+    if (email) body.email = email;
+    if (password) body.password = password;
     let reply;
     try {
-      reply = await api(`/api/people/${encodeURIComponent(name)}`, { method: "PUT", body: { grants } });
+      reply = await api(`/api/people/${encodeURIComponent(name)}`, { method: "PUT", body });
     } catch { notify("problem", "cannot reach the server"); return false; }
     if (reply.status === 401) { toLogin(); return false; }
     if (reply.status >= 400) {
@@ -3576,11 +3587,13 @@ function boot() {
     renderMinted();
   }
 
-  /** One person: their name, an editable field holding their whole grant
-   *  set, and the three acts this plate offers over them. */
+  /** One person: their name, editable fields for their grant set, login
+   *  email and login password, and the three acts this plate offers over
+   *  them. Email and password ride the same SAVE as the grants — one
+   *  "whole set or none of it" write, matching `set_grants` on the server. */
   function personRow(person) {
     const row = document.createElement("li");
-    row.className = "inline-form";
+    row.className = "inline-form pp-row";
 
     const name = document.createElement("span");
     name.className = "pp-name mono";
@@ -3594,11 +3607,30 @@ function boot() {
     grants.autocomplete = "off";
     grants.spellcheck = false;
 
+    const email = document.createElement("input");
+    email.type = "email";
+    email.className = "mono micro";
+    email.value = typeof person.email === "string" ? person.email : "";
+    email.placeholder = "email (login)";
+    email.setAttribute("aria-label", `${person.name}'s login email`);
+    email.autocomplete = "off";
+    email.spellcheck = false;
+
+    const password = document.createElement("input");
+    password.type = "password";
+    password.className = "mono micro";
+    password.placeholder = person.has_password ? "•••••••• (set)" : "no password set";
+    password.setAttribute("aria-label", `set a new login password for ${person.name}`);
+    password.autocomplete = "new-password";
+
     const save = document.createElement("button");
     save.type = "button";
     save.className = "btn ghost small";
     save.textContent = "SAVE";
-    save.addEventListener("click", () => saveGrants(person.name, grants.value));
+    save.addEventListener("click", () => {
+      saveGrants(person.name, grants.value, email.value.trim(), password.value)
+        .then((ok) => { if (ok) password.value = ""; });
+    });
 
     const invite = document.createElement("button");
     invite.type = "button";
@@ -3612,7 +3644,7 @@ function boot() {
     forget.textContent = "FORGET";
     forget.addEventListener("click", () => forgetPerson(person.name));
 
-    row.append(name, grants, save, invite, forget);
+    row.append(name, grants, email, password, save, invite, forget);
     return row;
   }
 
