@@ -59,8 +59,11 @@ mod tests {
             time_window_secs: 30,
         };
 
-        // Compute a key for a known timestamp
-        let test_time = 1000u64;
+        // `validate_image_auth_key` always buckets `SystemTime::now()`, never
+        // `config.image_timestamp` or a timestamp of the caller's choosing, so
+        // the expected key has to be derived from the real clock too.
+        let test_time =
+            SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
         let expected_key = compute_expected_key(&config, test_time);
 
         // Validate that key (would normally be from client)
