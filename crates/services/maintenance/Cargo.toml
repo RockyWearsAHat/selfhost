@@ -17,9 +17,6 @@ serde = { workspace = true, features = ["derive"] }
 selfhost-config = { workspace = true }
 selfhost-json = { workspace = true }
 
-[target.'cfg(windows)'.dependencies]
-windows = { version = "0.52", features = ["Win32_System_Shutdown"] }
-
 [lints.rust]
 unsafe_code = "forbid"
 missing_docs = "warn"

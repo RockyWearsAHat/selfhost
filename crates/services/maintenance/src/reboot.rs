@@ -45,21 +45,19 @@ pub fn reboot() -> Result<(), RebootError> {
 
 #[cfg(windows)]
 fn windows_reboot() -> Result<(), RebootError> {
-    use windows::Win32::System::Shutdown::ExitWindowsEx;
-    use windows::Win32::System::Shutdown::EWX_REBOOT;
+    use std::process::Command;
 
-    unsafe {
-        // Call the Windows API to request an immediate reboot.
-        // EWX_REBOOT = 2 (reboot)
-        if ExitWindowsEx(EWX_REBOOT, 0).as_bool() {
-            // Does not return on success; if we get here, something went wrong
-            Err(RebootError::Failed(
-                "ExitWindowsEx returned true but process still running".to_string(),
-            ))
-        } else {
-            Err(RebootError::Failed(
-                format!("ExitWindowsEx failed with error code"),
-            ))
-        }
-    }
+    // Shell out to the built-in shutdown utility rather than calling the
+    // Win32 API directly: this crate forbids unsafe code workspace-wide,
+    // and ExitWindowsEx has no safe wrapper.
+    let status = Command::new("shutdown")
+        .args(["/r", "/t", "0"])
+        .status()
+        .map_err(|e| RebootError::Failed(e.to_string()))?;
+
+    // The OS terminates the process on a successful reboot request; if we
+    // get here, the request itself failed.
+    Err(RebootError::Failed(format!(
+        "shutdown command exited with status {status}"
+    )))
 }
