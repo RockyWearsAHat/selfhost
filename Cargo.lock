@@ -886,6 +886,7 @@ dependencies = [
  "selfhost-config",
  "selfhost-github-app",
  "selfhost-http",
+ "selfhost-identity",
  "selfhost-mail",
  "selfhost-ws",
  "tokio",

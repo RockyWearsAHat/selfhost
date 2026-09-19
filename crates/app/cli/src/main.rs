@@ -1145,6 +1145,18 @@ async fn serve_everything(
             ))
         });
 
+    // The Pass key, generated once and owner-only. One value, cloned into the
+    // admin API (which mints sign-in codes) and the proxy (which redeems them
+    // and verifies the cookie), so the two halves are in-process by
+    // construction. A key that cannot be read is a start-up failure: the
+    // alternative is `people` Sites that sign nobody in, silently.
+    let site_passes = selfhost_identity::PassKey::load_or_create(
+        &data_dir,
+        selfhost_identity::registry::write_owner_only,
+    )
+    .map(selfhost_admin::site_pass::SitePasses::new)
+    .map_err(|error| format!("cannot load the Pass signing key: {error}"))?;
+
     let mut api = Api::new(supervisor.clone(), store, token, firewall.clone())
         .with_github_credentials(github_credentials.clone())
         .with_console_auth(&data_dir)
@@ -1162,7 +1174,8 @@ async fn serve_everything(
         // a `vpn.access:<location>` grant, the same side effect `selfhost
         // people grant/allow/deny` already performs — see
         // `people_api::vpn_side_effects`.
-        .with_vpn(config.vpn.clone(), data_dir.clone());
+        .with_vpn(config.vpn.clone(), data_dir.clone())
+        .with_site_passes(site_passes.clone());
     // Only when the section is live: a route that answers 202 and pokes a
     // watcher that is not running would report a deployment nobody is doing.
     if config.self_update.as_ref().is_some_and(|update| update.enabled) {
@@ -1283,6 +1296,10 @@ async fn serve_everything(
     // loaded. Binding :443 first would open a window where the internet can
     // reach a proxy whose backends have not been started.
     let server = Arc::new(Server::build(&config, &project_dir));
+    server.attach_passes(selfhost_proxy::pass_gate::PassGate::new(
+        site_passes,
+        selfhost_identity::People::load(&data_dir),
+    ));
     server.spawn_health_tasks();
 
     // One place the live config is published from, so everything that has to

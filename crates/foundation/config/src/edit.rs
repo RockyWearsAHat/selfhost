@@ -334,6 +334,18 @@ fn render_site_block(site: &Site) -> String {
         out.push_str(&format!("public_api_paths = {}\n", quote_array(&site.public_api_paths)));
     }
 
+    if let Some(exposure) = site.exposure {
+        let word = match exposure {
+            crate::Exposure::Public => "public",
+            crate::Exposure::People => "people",
+            crate::Exposure::Private => "private",
+        };
+        out.push_str(&format!("exposure = {}\n", quote(word)));
+    }
+    if let Some(owner) = &site.owner {
+        out.push_str(&format!("owner = {}\n", quote(owner)));
+    }
+
     for instance in &site.instances {
         out.push_str("\n[[sites.instances]]\n");
         out.push_str(&format!("node = {}\n", quote(&instance.node)));
@@ -597,6 +609,8 @@ role = \"owner\"
             allowed_cidrs: vec![],
             console: false,
             public_api_paths: vec![],
+            exposure: None,
+            owner: None,
         }
     }
 

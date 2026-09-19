@@ -129,15 +129,17 @@ pub mod audit;
 pub mod capability;
 pub mod credential;
 pub mod identity;
+pub mod pass;
 pub mod policy;
 pub mod registry;
 
 pub use audit::{AuditId, AuditLog, AuditRecord, TRUNCATED, escape_field, unescape_field};
-pub use capability::{Capability, InvalidToken, NodeName, ShareId, VpnLocationId};
+pub use capability::{Capability, InvalidToken, NodeName, ShareId, SiteName, VpnLocationId};
 pub use credential::{Credential, Opening, Session};
 pub use identity::{
     AgentName, Identity, InvalidAgentName, InvalidPersonEmail, InvalidPersonName, OWNER_NAME,
     PersonEmail, PersonName,
 };
+pub use pass::{MAX_PASS_LIFETIME_SECS, Pass, PassKey, PassRefused};
 pub use policy::{Caller, Decision, Grants, Granted, Policy, Refusal, TooManyGrants};
 pub use registry::{People, Person, PrivateWrite, write_owner_only};

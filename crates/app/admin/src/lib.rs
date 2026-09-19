@@ -51,10 +51,12 @@ pub mod images_api;
 pub mod invite;
 pub mod mesh_api;
 pub mod passwd;
+pub mod peer_binding;
 pub mod people_api;
 pub mod person_password;
 pub mod session;
 pub mod site_api;
+pub mod site_pass;
 pub mod storage_api;
 pub mod store;
 pub mod stream;
@@ -327,6 +329,9 @@ pub struct Api {
     /// for. What still gates the door is `vpn` and the policy check in the
     /// `/api/vpn/authorize` handler.
     vpn_authorizations: vpn_enroll::Authorizations,
+    /// The Pass key and sign-in codes shared with the proxy; `None` leaves
+    /// `POST /api/pass/authorize` a 404. See [`Api::with_site_passes`].
+    site_passes: Option<site_pass::SitePasses>,
 }
 
 /// Cookie-session authentication, present once [`Api::with_console_auth`] has
@@ -559,6 +564,9 @@ enum Route<'a> {
     /// `POST /api/vpn/authorize` — the console-session half of the VPN sign-in
     /// exchange. See [`vpn_enroll`].
     VpnAuthorize,
+    /// `POST /api/pass/authorize`: a signed-in Person asks to be signed in to
+    /// a gated Site. See [`site_pass`].
+    PassAuthorize,
 }
 
 impl<'a> Route<'a> {
@@ -665,6 +673,7 @@ impl<'a> Route<'a> {
             (Method::Get, ["api", "maintenance", "status"]) => Some(Self::MaintenanceStatus),
             (Method::Post, ["api", "vpn", "check-access"]) => Some(Self::VpnCheckAccess),
             (Method::Post, ["api", "vpn", "authorize"]) => Some(Self::VpnAuthorize),
+            (Method::Post, ["api", "pass", "authorize"]) => Some(Self::PassAuthorize),
             _ => None,
         }
     }
@@ -751,7 +760,14 @@ impl<'a> Route<'a> {
             // the identity that cannot be delegated. Reading the roster joins
             // them because it is a list of who can reach what — a target list,
             // as `crates/identity`'s registry says in its own header.
-            Self::ListPeople | Self::SetGrants(_) | Self::ForgetPerson(_) => Demand::OwnerOnly,
+            Self::ListPeople | Self::ForgetPerson(_) => Demand::OwnerOnly,
+            // The one delegation the model has: whoever holds
+            // `site.admin:<site>` may hand out `site.access:<site>` for that
+            // Site and nothing else. Which Site depends on the body, so the
+            // demand here is only "signed in"; `Api::set_grants` holds the
+            // owner to exactly the old `OwnerOnly` bar and everybody else to
+            // `Api::delegate_site_access`.
+            Self::SetGrants(_) => Demand::Authenticated,
             // Minting an invitation is the most concentrated form of the same
             // act: it does not merely write down a power, it creates the means
             // by which somebody will prove they are the person who holds it. If
@@ -790,7 +806,12 @@ impl<'a> Route<'a> {
             // depends on which location was asked for and so cannot be this
             // match's fixed answer. A caller who holds nothing there is
             // refused inside the handler, not by never reaching it.
-            Self::Vocabulary | Self::WhoAmI | Self::VpnAuthorize => Demand::Authenticated,
+            //
+            // `PassAuthorize` is the same shape: which Site is in the body, and
+            // the Grant is checked against it inside the handler.
+            Self::Vocabulary | Self::WhoAmI | Self::VpnAuthorize | Self::PassAuthorize => {
+                Demand::Authenticated
+            }
         }
     }
 }
@@ -824,6 +845,7 @@ mod site_route_tests {
             &selfhost_identity::ShareId::parse("vault").unwrap(),
             &selfhost_identity::NodeName::parse("home").unwrap(),
             &selfhost_identity::VpnLocationId::parse("console").unwrap(),
+            &selfhost_identity::SiteName::parse("blog").unwrap(),
         ) {
             if capability.is_honoured() {
                 continue;
@@ -952,6 +974,7 @@ impl Api {
             image_store: images_api::ImageStore::new(),
             vpn: None,
             vpn_authorizations: vpn_enroll::Authorizations::new(),
+            site_passes: None,
         }
     }
 
@@ -1005,6 +1028,16 @@ impl Api {
     /// skipped.
     pub fn with_vpn(mut self, relays: Vec<selfhost_config::vpn::Relay>, data_dir: PathBuf) -> Self {
         self.vpn = Some(people_api::VpnWiring::new(relays, data_dir));
+        self
+    }
+
+    /// Opens `POST /api/pass/authorize`, the sign-in half of a `people` or
+    /// `private` Site.
+    ///
+    /// `passes` must be a clone of the value the proxy was given: the proxy
+    /// redeems, in-process, the codes this mints. See [`site_pass`].
+    pub fn with_site_passes(mut self, passes: site_pass::SitePasses) -> Self {
+        self.site_passes = Some(passes);
         self
     }
 
@@ -1515,6 +1548,7 @@ impl Api {
             Route::MaintenanceStatus => self.maintenance_status(),
             Route::VpnCheckAccess => vpn_api::check_access(self.people.as_ref(), body),
             Route::VpnAuthorize => self.vpn_authorize(&caller, body),
+            Route::PassAuthorize => self.pass_authorize(&caller, body),
         }
     }
 
@@ -1557,6 +1591,14 @@ impl Api {
         let Some(people) = &self.people else {
             return problem(Status(404), NO_REGISTRY);
         };
+        if !caller.identity().is_owner() {
+            return self.delegate_site_access(caller, people, name, body);
+        }
+        // The bar `Demand::OwnerOnly` sets, held here because the route's own
+        // demand had to loosen to let a delegate in.
+        if !self.names_who_is_acting(caller) {
+            return problem(Status(401), "authorisation required");
+        }
         let Ok(person) = PersonName::parse(name) else {
             return problem(
                 Status(400),
@@ -1602,7 +1644,10 @@ impl Api {
         let written = people_api::spell_grants(&grants);
         // A warning about what was *asked for*, not a second read of the store
         // that could disagree with it.
-        let unreachable = people_api::unreachable_without_vpn(&grants);
+        let unreachable = self
+            .vpn
+            .as_ref()
+            .and_then(|vpn| people_api::unreachable_without_vpn(&grants, &vpn.relay_names()));
         let (peer, public_key) = match people_api::vpn_fields_from_body(body) {
             Ok(fields) => fields,
             Err(refusal) => return problem(Status(400), &refusal),
@@ -1679,6 +1724,151 @@ impl Api {
         }
     }
 
+    /// The Sites the configuration declares now; empty when no site wiring was
+    /// given, which makes every Site-relative question answer "no".
+    fn configured_sites(&self) -> Vec<selfhost_config::Site> {
+        self.sites.as_ref().and_then(|wiring| site_api::configured_sites(wiring).ok()).unwrap_or_default()
+    }
+
+    /// Whether `caller` may open `site`: the owner, the Site's own `owner`, or
+    /// a holder of `site.access:<site>` (which `site.admin:<site>` implies).
+    fn may_reach_site(&self, caller: &Caller, site: &selfhost_config::Site) -> bool {
+        if site.owner.as_deref() == Some(caller.identity().as_str()) {
+            return true;
+        }
+        selfhost_identity::SiteName::parse(&site.name).is_ok_and(|name| {
+            self.policy().decide(caller, &Capability::SiteAccess(name)).is_allowed()
+        })
+    }
+
+    /// Whether `caller` may hand out `site.access` for the Site named `site`.
+    fn may_admin_site(&self, caller: &Caller, site: &selfhost_identity::SiteName) -> bool {
+        self.policy().decide(caller, &Capability::SiteAdminOf(site.clone())).is_allowed()
+            || self
+                .configured_sites()
+                .iter()
+                .any(|entry| entry.name == site.as_str() && entry.owner.as_deref() == Some(caller.identity().as_str()))
+    }
+
+    /// `PUT /api/people/<name>` from somebody who is not the owner.
+    ///
+    /// The whole of what a delegate may do: add or remove `site.access:<site>`
+    /// on a Person who already exists, for a Site they administer. The body is
+    /// the same full grant set the owner sends, and it is judged by its
+    /// difference from what the Person holds now — any other word appearing or
+    /// disappearing refuses the whole change. A delegate never creates a
+    /// Person, and never touches an email, a password or a Peer.
+    ///
+    /// Somebody who administers nothing gets the same 401 every other refused
+    /// route gives, so this route tells them nothing about who exists.
+    fn delegate_site_access(&self, caller: &Caller, people: &People, name: &str, body: &[u8]) -> Response {
+        let refused = || problem(Status(401), "authorisation required");
+        let Ok(person) = PersonName::parse(name) else {
+            return refused();
+        };
+        let Ok(after) = people_api::grants_from_body(body) else {
+            return refused();
+        };
+        let Some(entry) = people.find(&person) else {
+            return refused();
+        };
+        let untouched = matches!(people_api::identity_fields_from_body(body), Ok((None, None)))
+            && matches!(people_api::vpn_fields_from_body(body), Ok((None, None)));
+        if !untouched {
+            return refused();
+        }
+        let before = entry.grants;
+        let changed: Vec<&Capability> = before
+            .iter()
+            .filter(|held| !after.iter().any(|kept| kept == *held))
+            .chain(after.iter().filter(|added| !before.iter().any(|held| held == *added)))
+            .collect();
+        let all_delegable = changed.iter().all(|capability| {
+            matches!(capability, Capability::SiteAccess(site) if self.may_admin_site(caller, site))
+        });
+        if changed.is_empty() || !all_delegable {
+            return refused();
+        }
+        let written = people_api::spell_grants(&after);
+        if let Err(error) = people.set_grants(&person, after) {
+            return problem(Status(500), &format!("could not save the registry: {error}"));
+        }
+        self.record_authority(
+            caller,
+            selfhost_identity::audit::Authority::GrantsChanged,
+            person.as_str(),
+            format!("now:{written}"),
+        );
+        match people.find(&person) {
+            Some(entry) => {
+                let has_password = self.person_passwords.as_ref().is_some_and(|store| store.holds(&person));
+                json(Status(200), people_api::person_json(&entry, None, &[], has_password))
+            }
+            None => problem(Status(500), "the registry accepted the change and lost it"),
+        }
+    }
+
+    /// Answers `POST /api/pass/authorize`: signs the caller in to a gated Site.
+    ///
+    /// Body: `{"return": "https://<a domain of the Site>/<path>"}` — the URL
+    /// the proxy turned the visitor away from. The host must be a domain of a
+    /// configured `people` or `private` Site; anything else is refused, so
+    /// this can never be made to redirect off the deployment. Only the path
+    /// survives into the code. The reply is `{"redirect": ...}`, the Site's own
+    /// `/.selfhost/pass` with a one-time code; see [`site_pass`].
+    ///
+    /// A signed-in Person with no Grant on the Site gets a plain 403: they
+    /// know who they are, and the Site's existence is public DNS.
+    fn pass_authorize(&self, caller: &Caller, body: &[u8]) -> Response {
+        let Some(passes) = &self.site_passes else {
+            return problem(Status(404), "no such endpoint");
+        };
+        let Some(document) = std::str::from_utf8(body).ok().and_then(|text| selfhost_json::parse(text).ok())
+        else {
+            return problem(Status(400), "invalid JSON body");
+        };
+        let Some(wanted) = document.get("return").and_then(Json::as_str) else {
+            return problem(Status(400), "missing return");
+        };
+        let Some((host, path)) = site_pass::split_return_url(wanted) else {
+            return problem(Status(400), "return must be an https URL on one of this deployment's sites");
+        };
+        let sites = self.configured_sites();
+        let Some(site) = sites
+            .iter()
+            .find(|site| site.requires_pass() && site.domains.iter().any(|domain| domain.eq_ignore_ascii_case(host)))
+        else {
+            return problem(Status(400), "return must be an https URL on one of this deployment's sites");
+        };
+        let Ok(site_name) = selfhost_identity::SiteName::parse(&site.name) else {
+            return problem(Status(400), "that site's name cannot carry a Grant");
+        };
+        if !self.may_reach_site(caller, site) {
+            return problem(Status(403), "you are signed in, but hold no access to that site");
+        }
+        match passes.mint_code(caller.identity(), &site_name, path) {
+            Ok(code) => {
+                self.record_authority(
+                    caller,
+                    selfhost_identity::audit::Authority::SitePassAuthorised,
+                    caller.identity().as_str(),
+                    format!("site:{site_name}"),
+                );
+                let redirect = format!("https://{}/.selfhost/pass?code={code}", host.to_ascii_lowercase());
+                json(Status(200), Json::object([("redirect", Json::string(&redirect))]))
+            }
+            Err(refusal) => problem(Status(400), &refusal),
+        }
+    }
+
+    /// Whether `caller` holds a Grant on any Site that only a Peer can reach:
+    /// a `private` Site, or one with `allowed_cidrs`.
+    fn holds_a_network_gated_site(&self, caller: &Caller) -> bool {
+        self.configured_sites()
+            .iter()
+            .any(|site| site.is_network_gated() && !site.console && self.may_reach_site(caller, site))
+    }
+
     /// Answers `POST /api/vpn/authorize`: the console-session half of a VPN
     /// sign-in.
     ///
@@ -1705,8 +1895,13 @@ impl Api {
         let Ok(document) = selfhost_json::parse(text) else {
             return problem(Status(400), "invalid JSON body");
         };
-        let Some(location_text) = document.get("location").and_then(Json::as_str) else {
-            return problem(Status(400), "missing location");
+        // Absent means "this deployment's relay": the first `[[vpn]]` entry.
+        let Some(location_text) = document
+            .get("location")
+            .and_then(Json::as_str)
+            .or_else(|| vpn.relay_names().first().copied())
+        else {
+            return problem(Status(404), "no VPN location is configured on this deployment");
         };
         let Ok(location) = VpnLocationId::parse(location_text) else {
             return problem(Status(400), "not a usable VPN location id");
@@ -1720,12 +1915,18 @@ impl Api {
                 "no such VPN location is configured on this deployment",
             );
         }
-        if !self.policy().decide(caller, &Capability::VpnAccess(location.clone())).is_allowed() {
+        // Two ways in: the relay's own word, or a Grant on a Site that can
+        // only be reached from inside the network. The second is what lets a
+        // Site's people enrol a Peer without the owner also handing each of
+        // them a relay by name.
+        if !self.policy().decide(caller, &Capability::VpnAccess(location.clone())).is_allowed()
+            && !self.holds_a_network_gated_site(caller)
+        {
             return problem(
                 Status(403),
                 &format!(
-                    "this account does not hold vpn.access:{location}; ask the owner to grant \
-                     it before signing this device in"
+                    "you hold neither vpn.access:{location} nor access to a private site; ask \
+                     the owner for one before signing this device in"
                 ),
             );
         }
@@ -1796,6 +1997,13 @@ impl Api {
             }
         };
         console.gate.reset();
+        // A Peer is one Person's device. Bound before the roster is touched, so
+        // a name somebody else already owns never gets a second key.
+        if let Some(vpn) = &self.vpn {
+            if let Err(refusal) = peer_binding::bind(vpn.data_dir(), &peer, &authorized.name) {
+                return problem(Status(409), &refusal);
+            }
+        }
         let Ok(location) = VpnLocationId::parse(&authorized.location) else {
             return problem(Status(500), "the authorized location is no longer usable");
         };

@@ -130,6 +130,9 @@ const SURFACE: &[(&str, &str, Reach)] = &[
     // (see `Api::vpn_authorize`), so a newcomer with no VPN grant still
     // reaches the route and is answered 403 or 404, never the wall's 401.
     ("POST", "/api/vpn/authorize", Reach::Granted),
+    // The same shape: signed in is enough to ask, and the Grant on the Site
+    // named in the body is checked inside `Api::pass_authorize`.
+    ("POST", "/api/pass/authorize", Reach::Granted),
     // Capability::SiteAdmin — the newcomer holds console.read and files.read on
     // one share, never site.admin, so every one of these is withheld exactly
     // like the service-control routes above. The wall is checked before
