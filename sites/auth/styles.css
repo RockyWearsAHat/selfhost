@@ -1,0 +1,150 @@
+/* The public sign-in site's house style: the console's THEATRE palette,
+   verbatim (sites/console/styles.css), trimmed to only what the login and
+   VPN-connect screens use — this site has no console view. */
+
+:root {
+  color-scheme: dark;
+  --bg:        #060708;
+  --bg-deep:   #020203;
+  --surface:   #0d0e10;
+  --surface-d: #090a0c;
+  --raised:    #15171a;
+  --sunken:    #020304;
+  --border:    #24272b;
+  --text:      #e9ecee;
+  --muted:     #70787e;
+  --accent:    #f2f5f6;
+  --on-accent: #0a0b0d;
+  --warn:      #e0a458;
+  --bad:       #f2555a;
+  --idle:      #4a5157;
+  --ui:   -apple-system, "Segoe UI", "Helvetica Neue", Arial, sans-serif;
+  --mono: ui-monospace, "SF Mono", "Cascadia Mono", "Menlo", "Consolas", monospace;
+}
+
+* { margin: 0; padding: 0; box-sizing: border-box; }
+
+[hidden] { display: none !important; }
+
+html, body { min-height: 100vh; }
+
+body {
+  background: linear-gradient(var(--bg), var(--bg-deep) 60vh);
+  color: var(--text);
+  font: 14px/1.5 var(--ui);
+  padding: 16px;
+  padding-left: max(16px, env(safe-area-inset-left));
+  padding-right: max(16px, env(safe-area-inset-right));
+  padding-bottom: max(16px, env(safe-area-inset-bottom));
+}
+
+/* The ground's one decoration: a measurement ruler along the top edge. */
+body::before {
+  content: "";
+  display: block;
+  height: 7px;
+  margin: -16px -16px 9px;
+  background-image:
+    repeating-linear-gradient(90deg, transparent 0 49px, rgba(233, 236, 238, 0.22) 49px 50px),
+    repeating-linear-gradient(90deg, transparent 0 9px, rgba(233, 236, 238, 0.10) 9px 10px);
+  background-size: 100% 7px, 100% 3px;
+  background-repeat: no-repeat;
+}
+
+button, input, select, textarea { font: inherit; color: inherit; }
+
+:focus-visible { outline: 1px solid var(--accent); outline-offset: 1px; }
+
+::selection { background: var(--accent); color: var(--on-accent); }
+
+.wordmark {
+  font-size: 14px; font-weight: 600; letter-spacing: 0.24em; color: var(--text);
+}
+.designation {
+  font-size: 11px; letter-spacing: 0.18em; color: var(--muted); align-self: center;
+}
+.caption { font-size: 12px; color: var(--muted); }
+.bad-ink  { color: var(--bad); }
+.warn-ink { color: var(--warn); }
+
+.fieldlabel {
+  font-size: 10px; letter-spacing: 0.12em; color: var(--muted);
+  text-transform: uppercase;
+}
+
+/* A connection being made: the one mark allowed to loop. */
+.sweep {
+  width: 14px; height: 14px; flex: none; align-self: center;
+  border-radius: 50%;
+  border: 2px solid rgba(242, 245, 246, 0.16);
+  border-top-color: var(--warn);
+  animation: sweep 2.4s linear infinite;
+}
+@keyframes sweep { to { transform: rotate(360deg); } }
+
+@media (prefers-reduced-motion: reduce) {
+  .sweep { animation: none; }
+}
+
+/* A framed surface one value above the ground: gradient fill, grey hairline,
+   a sheen along the top edge, and corner brackets that say it is bolted
+   down. */
+.plate {
+  background: linear-gradient(var(--surface), var(--surface-d));
+  border: 1px solid var(--border);
+  box-shadow: inset 0 1px 0 rgba(242, 245, 246, 0.14);
+  padding: 12px;
+  position: relative;
+}
+.plate::before, .plate::after {
+  content: ""; position: absolute; width: 7px; height: 7px; pointer-events: none;
+}
+.plate::before {
+  top: -1px; left: -1px;
+  border-top: 1px solid rgba(242, 245, 246, 0.38);
+  border-left: 1px solid rgba(242, 245, 246, 0.38);
+}
+.plate::after {
+  bottom: -1px; right: -1px;
+  border-bottom: 1px solid rgba(242, 245, 246, 0.38);
+  border-right: 1px solid rgba(242, 245, 246, 0.38);
+}
+
+.btn {
+  font-size: 11px; letter-spacing: 0.06em; text-transform: uppercase;
+  background: var(--raised);
+  border: 1px solid var(--border);
+  padding: 6px 12px;
+  cursor: pointer;
+  transition: border-color 120ms ease, background-color 120ms ease;
+}
+.btn:hover:not(:disabled) { border-color: var(--muted); }
+.btn:active:not(:disabled) { background: var(--sunken); }
+.btn:disabled { color: var(--idle); cursor: default; }
+.btn.primary { background: var(--accent); color: var(--on-accent); border-color: var(--accent); font-weight: 600; }
+.btn.primary:hover:not(:disabled) { border-color: var(--accent); box-shadow: 0 0 0 1px rgba(242, 245, 246, 0.35); }
+.btn.primary:disabled { background: var(--raised); color: var(--idle); border-color: var(--border); font-weight: 400; box-shadow: none; }
+.btn.wide { width: 100%; letter-spacing: 0.1em; }
+
+input, select, textarea {
+  background: var(--sunken);
+  border: 1px solid var(--border);
+  padding: 6px 8px;
+  font-size: 13px;
+  width: 100%;
+  transition: border-color 120ms ease;
+}
+input:focus, select:focus, textarea:focus { border-color: var(--muted); outline: none; }
+input:focus-visible, select:focus-visible, textarea:focus-visible { outline: none; border-color: var(--accent); }
+::placeholder { color: var(--idle); }
+
+/* ── login / vpn-connect ──────────────────────────────────────────── */
+
+#view-login, #view-vpn-connect, #view-signed-in {
+  display: flex; justify-content: center; align-items: flex-start; padding-top: 18vh;
+}
+.login-plate { width: min(340px, 100%); display: flex; flex-direction: column; gap: 14px; padding: 18px 16px 14px; }
+.login-mast { display: flex; gap: 10px; align-items: baseline; }
+#login-form { display: flex; flex-direction: column; gap: 10px; }
+.login-submit-row { display: flex; gap: 10px; align-items: center; }
+.login-submit-row .btn { flex: 1 1 auto; }

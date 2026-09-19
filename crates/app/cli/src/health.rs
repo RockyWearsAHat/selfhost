@@ -1087,6 +1087,7 @@ mod tests {
             canonical_redirect: true,
             allowed_cidrs: Vec::new(),
             console: false,
+            public_api_paths: vec![],
         }
     }
 

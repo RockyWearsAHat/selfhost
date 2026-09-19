@@ -36,10 +36,11 @@ secrets/
 selfhost.config.toml
 
 # Site content served by the proxy — the user's websites, not this project's
-# source. Two exceptions, and both are exceptions for the same reason: they are
-# hand-written SPAs belonging to this project, with no build step, so nothing
-# committed could regenerate them. sites/console is the web admin console;
-# sites/home is the smart-home dashboard.
+# source. Three exceptions, and all three are exceptions for the same reason:
+# they are hand-written SPAs belonging to this project, with no build step, so
+# nothing committed could regenerate them. sites/console is the web admin
+# console; sites/home is the smart-home dashboard; sites/auth is the public
+# sign-in site (auth.rockywearsahat.com).
 #
 # The rule this stanza has to keep getting right is in docs/principles.dx:
 # before ignoring a path, ask whether a fresh clone still works without it. A
@@ -51,6 +52,7 @@ selfhost.config.toml
 sites/*
 !sites/console/
 !sites/home/
+!sites/auth/
 
 # OS noise
 .DS_Store

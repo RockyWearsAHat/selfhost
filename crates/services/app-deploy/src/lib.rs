@@ -203,6 +203,7 @@ impl AppSpec {
             canonical_redirect: self.canonical_redirect,
             allowed_cidrs: Vec::new(),
             console: false,
+            public_api_paths: vec![],
         }
     }
 

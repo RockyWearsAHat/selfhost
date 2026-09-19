@@ -80,7 +80,7 @@ fn build_mini_panel(actions: Arc<Mutex<Vec<MiniAction>>>) -> Result<MiniPanel, S
         .add_label(pad, MINI_HEIGHT - 52.0, inner, 20.0, "OFFLINE")
         .map_err(|e| format!("{e:?}"))?;
     let detail = window
-        .add_label(pad, MINI_HEIGHT - 72.0, inner, 16.0, "rockywearsahat.com:8500")
+        .add_label(pad, MINI_HEIGHT - 72.0, inner, 16.0, "rockywearsahat.com:8443")
         .map_err(|e| format!("{e:?}"))?;
     let _ = window.set_text_color(&detail, MUTED);
 
@@ -204,6 +204,13 @@ pub const CONSOLE_URL: &str = "https://admin.rockywearsahat.com/";
 
 /// The console host: answered by the split-DNS responder, mapped to loopback.
 pub const CONSOLE_HOST: &str = "admin.rockywearsahat.com";
+
+/// The sign-in URL: a public, always-reachable site that hosts nothing but
+/// the login/passkey ceremony and the VPN-connect handoff — deliberately
+/// *not* one of [`GATED_HOSTS`], because the whole point is to break the
+/// circular dependency where reaching a sign-in page needed the gate that
+/// signing in was supposed to unlock.
+pub const AUTH_URL: &str = "https://auth.rockywearsahat.com/";
 
 /// The SARA gateway URL, reached portless through the same loopback 443 gate.
 pub const SARA_URL: &str = "https://sara.rockywearsahat.com/";
@@ -1252,7 +1259,7 @@ mod tests {
         for (name, link) in states() {
             let mut harness = window(link, SIZES[1]);
             harness.frame();
-            assert!(harness.shows("rockywearsahat.com:8500"), "{name} shows the endpoint");
+            assert!(harness.shows("rockywearsahat.com:8443"), "{name} shows the endpoint");
             assert!(harness.shows("THE BOX"), "{name} keeps the far caption");
             assert!(harness.shows("Auto-rotate weekly"), "{name} names the switch in plain words");
         }

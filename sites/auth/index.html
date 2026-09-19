@@ -1,0 +1,82 @@
+<!doctype html>
+<!-- The public sign-in site: the login/passkey ceremony and the VPN-connect
+     handoff, and nothing else. It exists so signing in never depends on the
+     admin console's own gated route — see crates/ui/vpn-ui/src/oauth.rs and
+     crates/foundation/config's Site::public_api_paths. Static skeleton;
+     app.js fills every reading. No build step, no framework, no external
+     request of any kind — the CSP below refuses them outright. -->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta http-equiv="Content-Security-Policy"
+      content="default-src 'none'; connect-src 'self'; style-src 'self'; script-src 'self'; img-src 'self'">
+<title>SELFHOST — Sign In</title>
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+
+<!-- LOGIN: one password field. Quiet refusals; the server says nothing more. -->
+<section id="view-login" hidden>
+  <div class="plate login-plate">
+    <header class="login-mast">
+      <span class="wordmark">SELFHOST</span>
+      <span class="designation">SIGN IN</span>
+    </header>
+    <form id="login-form">
+      <label class="fieldlabel" for="login-password">PASSWORD</label>
+      <input id="login-password" type="password" autocomplete="current-password" required>
+      <div class="login-submit-row">
+        <button type="submit" class="btn primary" id="login-submit">ENTER</button>
+        <span id="login-sweep" class="sweep" hidden></span>
+      </div>
+    </form>
+    <!-- Password only: this page's WebAuthn relying-party id would have to
+         match its own hostname, and the console's passkeys are bound to
+         admin.rockywearsahat.com. Touch ID / passkey login stays inside the
+         admin console; a session started here with the password carries into
+         a VPN-connect handoff exactly the same as one started with a
+         passkey there. -->
+    <p id="login-caps" class="caption warn-ink" hidden>Caps Lock is on.</p>
+    <p id="login-note" class="caption bad-ink" hidden></p>
+  </div>
+</section>
+
+<!-- VPN SIGN-IN
+     Reached only by a redirect from the SelfHost VPN desktop app, of the form
+     /#vpn-connect?location=...&state=...&challenge=...&port=.... The desktop
+     app has no login of its own; it borrows this session's, which is why
+     this screen shows nothing to type — by the time it appears the browser
+     is either already logged in (the ordinary session cookie carries this
+     through) or is sent to the login form first, same as any other page. -->
+<section id="view-vpn-connect" hidden>
+  <div class="plate login-plate">
+    <header class="login-mast">
+      <span class="wordmark">SELFHOST</span>
+      <span class="designation">SIGN IN DEVICE</span>
+    </header>
+    <p id="vpn-connect-status" class="caption">Approving this device…</p>
+    <p id="vpn-connect-note" class="caption bad-ink" hidden></p>
+  </div>
+</section>
+
+<!-- SIGNED IN
+     What a plain visit to this site (no #vpn-connect fragment) lands on once
+     the password or passkey has been accepted. This site has nothing else to
+     show — the admin console and every other gated tool live behind their
+     own routes, reached from the desktop app or the console itself, never
+     from here. -->
+<section id="view-signed-in" hidden>
+  <div class="plate login-plate">
+    <header class="login-mast">
+      <span class="wordmark">SELFHOST</span>
+      <span class="designation">SIGNED IN</span>
+    </header>
+    <p class="caption">You are signed in. You can close this tab.</p>
+  </div>
+</section>
+
+<script src="/app.js"></script>
+</body>
+</html>

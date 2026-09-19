@@ -69,8 +69,8 @@ impl Default for Endpoint {
     fn default() -> Self {
         Self {
             server_host: "rockywearsahat.com".into(),
-            server_port: 8500,
-            local_port: 2222,
+            server_port: 8443,
+            local_port: 8500,
             identity: "client".into(),
         }
     }

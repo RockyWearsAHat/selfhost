@@ -74,18 +74,24 @@ pub fn rotate(activity: Arc<Mutex<Activity>>) {
     });
 }
 
-/// Signs this install in through the console's own OAuth-with-PKCE flow (see
-/// [`crate::oauth`]): opens the browser to the console's sign-in screen and
-/// waits for it to hand a redeemed identity back over a loopback callback.
+/// Signs this install in through the public sign-in site's OAuth-with-PKCE
+/// flow (see [`crate::oauth`]): opens the browser to `auth.rockywearsahat.com`
+/// and waits for it to hand a redeemed identity back over a loopback callback.
 ///
 /// No admin command to copy and no name typed by hand — the account that
 /// approves the browser prompt, and whether it holds `vpn.access:<location>`
 /// for this relay, is the whole decision; this call just carries the result.
+///
+/// Unlike [`open_console`]/[`open_sara`]/[`open_ai_studio`], this does *not*
+/// call `ensure_console_route()` first: the sign-in site is a public, ungated
+/// host reachable over the open internet, precisely so a first-time sign-in
+/// never depends on the privileged gate that only signing in can justify
+/// installing.
 pub fn sign_in(activity: Arc<Mutex<Activity>>) {
     if !set_busy(&activity, "Waiting for the browser sign-in…") {
         return;
     }
-    std::thread::spawn(move || match ensure_console_route().and_then(|()| crate::oauth::sign_in()) {
+    std::thread::spawn(move || match crate::oauth::sign_in() {
         Ok(result) => {
             let client = keys::identities(Some(&result.peer)).0;
             finish(&activity, Ok(format!("Signed in as {}.", result.account)), move |a| {
