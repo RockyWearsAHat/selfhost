@@ -700,6 +700,25 @@
     <ul id="pk-list"></ul>
   </section>
 
+  <!-- SITES: the configured web domains and their access configuration.
+       Owner-only on the daemon; shows exposure (public/people/private), owner,
+       and grants for each site. -->
+  <section id="sites" class="plate" hidden>
+    <div class="section-rule">
+      <h2>SITES</h2><span class="rule"></span>
+      <span id="sites-count" class="mono micro"></span>
+      <button id="sites-reload" class="btn ghost small" type="button">RELOAD</button>
+    </div>
+    <p id="sites-note" class="caption" hidden></p>
+    <table id="sites-table" hidden>
+      <thead><tr>
+        <th>NAME</th><th>DOMAINS</th><th>EXPOSURE</th><th>OWNER</th>
+      </tr></thead>
+      <tbody id="sites-rows"></tbody>
+    </table>
+    <div id="sites-empty" class="caption centered" hidden></div>
+  </section>
+
   <!-- PEOPLE: everybody this deployment has granted capabilities to, and the
        one-time invitations that let them prove a passkey under their own
        name. Owner-only on the daemon, exactly like AUDIT — a caller who has
