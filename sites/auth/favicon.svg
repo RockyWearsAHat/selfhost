@@ -1,0 +1,9 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16">
+  <!-- The sign-in site's mark: an open door in the same machined plate the
+       console's lamp-slot mark uses — this is the door into that product,
+       not a separate one. -->
+  <rect width="16" height="16" fill="#060708"/>
+  <rect x="0.5" y="0.5" width="15" height="15" fill="none" stroke="#24272b"/>
+  <path d="M6 3 h4 v10 h-4" fill="none" stroke="#f2f5f6"/>
+  <rect x="9.5" y="7.5" width="1" height="1" fill="#f2f5f6"/>
+</svg>

@@ -246,6 +246,7 @@ fn add(arguments: &[String], config_path: &Path) -> Result<(), String> {
         canonical_redirect,
         allowed_cidrs: vec![],
         console: false,
+        public_api_paths: vec![],
     };
 
     let source = read_source(config_path)?;
@@ -593,6 +594,7 @@ mod tests {
             canonical_redirect: true,
             allowed_cidrs: vec![],
             console: false,
+            public_api_paths: vec![],
         };
         assert_eq!(kind_of(&site), "static");
 

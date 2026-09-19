@@ -336,6 +336,7 @@ pub fn add(wiring: &Wiring, body: &[u8]) -> Response {
         canonical_redirect: true,
         allowed_cidrs: Vec::new(),
         console: false,
+        public_api_paths: vec![],
     };
 
     let source = match read_source(wiring) {

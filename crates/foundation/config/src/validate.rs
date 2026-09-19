@@ -590,6 +590,38 @@ impl Config {
                             .into(),
                     });
                 }
+
+                if !site.public_api_paths.is_empty() {
+                    problems.push(Problem {
+                        field: format!("sites[{i}].public_api_paths"),
+                        message: "a console site already relays every /api path; \
+                                  public_api_paths is for a different, non-console site"
+                            .into(),
+                    });
+                }
+            }
+
+            if !site.public_api_paths.is_empty() {
+                if !site.instances.is_empty() {
+                    problems.push(Problem {
+                        field: format!("sites[{i}].instances"),
+                        message: "a site with public_api_paths declares no instances; \
+                                  the paths it names are relayed to server.admin_bind, \
+                                  not to an application pool"
+                            .into(),
+                    });
+                }
+
+                for (j, prefix) in site.public_api_paths.iter().enumerate() {
+                    if !prefix.starts_with("/api") {
+                        problems.push(Problem {
+                            field: format!("sites[{i}].public_api_paths[{j}]"),
+                            message: format!(
+                                "\"{prefix}\" must start with /api; nothing outside it is relayed"
+                            ),
+                        });
+                    }
+                }
             }
         }
     }
@@ -767,6 +799,7 @@ mod tests {
             canonical_redirect: true,
             allowed_cidrs: vec![],
             console: false,
+            public_api_paths: vec![],
         }
     }
 
@@ -1118,6 +1151,39 @@ mod tests {
         console.console = true;
         console.allowed_cidrs = vec!["10.66.0.0/24".into()];
         assert!(config(vec![owner_node()], vec![console]).validate().is_ok());
+    }
+
+    #[test]
+    fn a_console_site_may_not_also_declare_public_api_paths() {
+        // A console site already relays every /api path; a second, narrower
+        // allowlist on the same site would be dead configuration at best and
+        // a confusing second door at worst.
+        let mut console = site("console", "admin.example.com");
+        console.console = true;
+        console.allowed_cidrs = vec!["10.66.0.0/24".into()];
+        console.public_api_paths = vec!["/api/session".into()];
+        let problems = problems_of(&config(vec![owner_node()], vec![console]));
+        assert!(problems.iter().any(|p| p.field == "sites[0].public_api_paths"), "{problems:?}");
+    }
+
+    #[test]
+    fn a_public_api_gateway_forbids_instances_and_requires_api_prefixed_paths() {
+        let mut auth = site("auth", "auth.example.com");
+        auth.instances = vec![Instance { node: "home".into(), port: 5050 }];
+        auth.public_api_paths = vec!["/api/session".into(), "/webauthn/login".into()];
+        let problems = problems_of(&config(vec![owner_node()], vec![auth]));
+        assert!(problems.iter().any(|p| p.field == "sites[0].instances"), "{problems:?}");
+        assert!(
+            problems.iter().any(|p| p.field == "sites[0].public_api_paths[1]"),
+            "{problems:?}"
+        );
+    }
+
+    #[test]
+    fn a_well_formed_public_api_gateway_site_is_valid() {
+        let mut auth = site("auth", "auth.example.com");
+        auth.public_api_paths = vec!["/api/session".into(), "/api/vpn/authorize".into()];
+        assert!(config(vec![owner_node()], vec![auth]).validate().is_ok());
     }
 
     #[test]

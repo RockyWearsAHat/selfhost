@@ -358,6 +358,27 @@ pub struct Site {
     /// must be gated by `allowed_cidrs` — a console is never left open.
     #[serde(default)]
     pub console: bool,
+    /// A narrow, explicitly enumerated slice of the same loopback admin API
+    /// `console` relays wholesale, relayed here too even though this site is
+    /// not the console.
+    ///
+    /// Exists for a site that must be reachable before its caller has a
+    /// session, a passkey, or VPN access at all — a self-service login and
+    /// VPN-enrollment page — without that site becoming a second front door
+    /// into the console's full API. A request under `/api/*` matches this
+    /// site the same way `app_paths` matches (`path_matches`); anything under
+    /// `/api/*` that names no entry here 404s before the loopback connection
+    /// ever opens, rather than only being refused once the admin API sees it.
+    /// Everything *not* under `/api/*` is served from `static_root` exactly
+    /// as any other static site.
+    ///
+    /// Empty — the default — relays nothing, so an ordinary site's `/api/*`
+    /// requests are unaffected. Mutually exclusive with `console` (see
+    /// `validate`): the console is the one deliberately wide, uniquely
+    /// gated door into this API; this is a deliberately narrow, ungated one,
+    /// and a site cannot be both at once.
+    #[serde(default)]
+    pub public_api_paths: Vec<String>,
 }
 
 fn default_true() -> bool {
@@ -464,6 +485,17 @@ impl Site {
                 .allowed_cidrs
                 .iter()
                 .any(|entry| Cidr::parse(entry).is_ok_and(|cidr| cidr.contains(ip)))
+    }
+
+    /// Whether `path` is on this site's [`public_api_paths`](Self::public_api_paths)
+    /// allowlist.
+    ///
+    /// Empty imposes no restriction, matching every other site's default of
+    /// having no such relay at all; the proxy only calls this once it has
+    /// already decided the request is a candidate for the public-gateway
+    /// relay in the first place.
+    pub fn permits_public_api_path(&self, path: &str) -> bool {
+        self.public_api_paths.iter().any(|prefix| path_matches(prefix, path))
     }
 }
 
@@ -593,6 +625,7 @@ mod tests {
             canonical_redirect: true,
             allowed_cidrs: vec![],
             console: false,
+            public_api_paths: vec![],
         };
         assert!(!site.routes_to_app("/api/health"));
     }
@@ -610,6 +643,7 @@ mod tests {
             canonical_redirect: true,
             allowed_cidrs: vec![],
             console: false,
+            public_api_paths: vec![],
         };
         assert!(site.routes_to_app("/anything"));
     }
@@ -666,6 +700,7 @@ mod tests {
                 canonical_redirect: true,
                 allowed_cidrs: vec![],
                 console: false,
+                public_api_paths: vec![],
             }],
             dns: None,
             mail: None,
@@ -766,6 +801,7 @@ static_root = "./public"
             canonical_redirect: true,
             allowed_cidrs: vec![],
             console: true,
+            public_api_paths: vec![],
         };
         let vpn_client: IpAddr = "10.66.0.2".parse().unwrap();
         let stranger: IpAddr = "203.0.113.9".parse().unwrap();
@@ -782,6 +818,30 @@ static_root = "./public"
         // A malformed entry permits nothing — the gate fails closed.
         site.allowed_cidrs = vec!["garbage".into()];
         assert!(!site.permits(vpn_client));
+    }
+
+    #[test]
+    fn permits_public_api_path_matches_named_prefixes_only() {
+        let site = Site {
+            name: "auth".into(),
+            domains: vec!["auth.example.com".into()],
+            static_root: Some("./auth".into()),
+            spa: false,
+            app_paths: vec![],
+            instances: vec![],
+            health: Health::default(),
+            canonical_redirect: true,
+            allowed_cidrs: vec![],
+            console: false,
+            public_api_paths: vec!["/api/session".into(), "/api/vpn/authorize".into()],
+        };
+        assert!(site.permits_public_api_path("/api/session"));
+        assert!(site.permits_public_api_path("/api/vpn/authorize"));
+        // Every other path under /api — including a sibling this site never
+        // named — is refused, the same as an unknown Host would be.
+        assert!(!site.permits_public_api_path("/api/vpn/enroll"));
+        assert!(!site.permits_public_api_path("/api/services"));
+        assert!(!site.permits_public_api_path("/api/sessionwards"));
     }
 
     #[test]

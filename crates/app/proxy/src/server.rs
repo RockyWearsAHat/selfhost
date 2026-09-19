@@ -830,6 +830,25 @@ where
         return relay_console_api(server, request, peer, leftover, stream).await;
     }
 
+    // A public gateway: the same loopback admin API `console` relays, but
+    // narrowed to exactly the paths `public_api_paths` names — everything
+    // else under `/api/*` gets the same 404 an unknown Host would, before
+    // the loopback connection to the admin API ever opens. Validation
+    // guarantees this site has no instances and is never also `console`, so
+    // it cannot fall through to `routes_to_app` below, and it is not the
+    // wide, uniquely-gated door that branch above is.
+    if !runtime.site.public_api_paths.is_empty() && (is_console_bulk(request.path()) || is_console_api(request.path())) {
+        if !runtime.site.permits_public_api_path(request.path()) {
+            write_response(stream, Response::error_page(Status::NOT_FOUND), keep_alive).await?;
+            return Ok(Outcome::Reusable);
+        }
+        return if is_console_bulk(request.path()) {
+            relay_console_bulk(server, request, peer, leftover, stream).await
+        } else {
+            relay_console_api(server, request, peer, leftover, stream).await
+        };
+    }
+
     // The WebDAV mount, which is the same relay to the same loopback API under
     // the same gate — the source-address check above has already run, and this
     // branch is unreachable without it. What differs is the traffic, not the
@@ -2532,6 +2551,7 @@ mod tests {
             canonical_redirect: true,
             allowed_cidrs: vec![],
             console: false,
+            public_api_paths: vec![],
         }
     }
 
@@ -4114,6 +4134,15 @@ mod tests {
         site
     }
 
+    /// A public, ungated gateway site — `auth.rockywearsahat.com`'s shape:
+    /// reachable from anywhere, but only the named `/api/*` paths reach the
+    /// loopback admin API; everything else under `/api/*` 404s.
+    fn public_gateway_site(allowed: &[&str]) -> Site {
+        let mut site = site("auth", &["auth.example.com"]);
+        site.public_api_paths = allowed.iter().map(|p| (*p).to_owned()).collect();
+        site
+    }
+
     #[tokio::test]
     async fn a_console_api_request_is_relayed_and_the_admin_response_returns_verbatim() {
         let dir = ScratchDataDir::new("console-relay");
@@ -4213,6 +4242,80 @@ mod tests {
         let response = dispatch_bytes(&server, &head, "10.66.0.2:5000", true, b"").await;
         let text = String::from_utf8_lossy(&response);
         assert!(text.starts_with("HTTP/1.1 413"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn a_public_api_gateway_relays_its_allowlisted_path_and_404s_everything_else() {
+        let dir = ScratchDataDir::new("public-gateway");
+        write_spa(&dir.0);
+
+        const ADMIN_REPLY: &[u8] = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok";
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind a fake admin port");
+        let admin_bind = listener.local_addr().expect("a bound address");
+        let accepted = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("one connection");
+            let mut buffer = Vec::new();
+            let mut chunk = [0u8; 512];
+            loop {
+                let read = stream.read(&mut chunk).await.expect("read the relayed request");
+                if read == 0 {
+                    break;
+                }
+                buffer.extend_from_slice(&chunk[..read]);
+                if buffer.ends_with(b"\r\n\r\n") {
+                    break;
+                }
+            }
+            stream.write_all(ADMIN_REPLY).await.expect("answer the relay");
+            stream.flush().await.expect("flush the answer");
+            String::from_utf8_lossy(&buffer).into_owned()
+        });
+
+        let mut config = config_with(vec![public_gateway_site(&["/api/session"])]);
+        config.server.admin_bind = admin_bind.to_string();
+        let server = Server::build(&config, &dir.0);
+
+        // Reached from a peer nowhere near the VPN network — the whole point
+        // of a public gateway is that no network gate applies here.
+        let allowed = dispatch_bytes(
+            &server,
+            "GET /api/session HTTP/1.1\r\nHost: auth.example.com\r\n\r\n",
+            "203.0.113.9:5000",
+            true,
+            b"",
+        )
+        .await;
+        assert_eq!(allowed, ADMIN_REPLY, "{}", String::from_utf8_lossy(&allowed));
+        let relayed = accepted.await.expect("the fake admin task did not panic");
+        assert!(relayed.starts_with("GET /api/session HTTP/1.1"), "{relayed}");
+
+        // A path outside this site's own allowlist, same host, same open
+        // network — must 404 before ever touching the admin API.
+        let mut config = config_with(vec![public_gateway_site(&["/api/session"])]);
+        config.server.admin_bind = "127.0.0.1:1".into();
+        let server = Server::build(&config, &dir.0);
+
+        let denied = dispatch_bytes(
+            &server,
+            "POST /api/webauthn/login HTTP/1.1\r\nHost: auth.example.com\r\n\r\n",
+            "203.0.113.9:5000",
+            true,
+            b"",
+        )
+        .await;
+        let unknown = dispatch_bytes(
+            &server,
+            "POST /api/webauthn/login HTTP/1.1\r\nHost: not-hosted.example.com\r\n\r\n",
+            "203.0.113.9:5000",
+            true,
+            b"",
+        )
+        .await;
+        assert!(denied.starts_with(b"HTTP/1.1 404"), "{}", String::from_utf8_lossy(&denied));
+        assert_eq!(
+            denied, unknown,
+            "a path outside the allowlist must not be distinguishable from an unknown host"
+        );
     }
 
     // The upgrade relay, and the four ways it is known to be got wrong. Each of

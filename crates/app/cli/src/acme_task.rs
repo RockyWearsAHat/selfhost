@@ -373,6 +373,7 @@ mod tests {
             canonical_redirect: true,
             allowed_cidrs: vec![],
             console: false,
+            public_api_paths: vec![],
         }
     }
 

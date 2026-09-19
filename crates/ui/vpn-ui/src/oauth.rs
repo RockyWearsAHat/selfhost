@@ -1,20 +1,25 @@
-//! Signing in through the console's own login — no admin command to copy.
+//! Signing in through the public sign-in site's own login — no admin command
+//! to copy, and no privileged gate to install first.
 //!
-//! The console *is* the authorization server: there is no third-party
-//! identity provider, because the identity that matters is "someone who can
-//! already log into our own admin console and holds `vpn.access:<location>`
-//! for this relay". This module's whole job is carrying that proof across the
-//! gap between a browser tab and this desktop process, with PKCE (RFC 7636)
-//! binding the two ends together so a code intercepted in transit is useless
-//! without the verifier this process never lets leave it:
+//! `auth.rockywearsahat.com` *is* the authorization server: there is no
+//! third-party identity provider, because the identity that matters is
+//! "someone who can already log into our own account and holds
+//! `vpn.access:<location>` for this relay". It shares the admin console's
+//! login/passkey backend but is its own public, ungated site (see
+//! `crates/foundation/config`'s `Site::public_api_paths`) — precisely so this
+//! flow never depends on the console route already being installed. This
+//! module's whole job is carrying that proof across the gap between a browser
+//! tab and this desktop process, with PKCE (RFC 7636) binding the two ends
+//! together so a code intercepted in transit is useless without the verifier
+//! this process never lets leave it:
 //!
 //! 1. Generate a PKCE `code_verifier`/`code_challenge` pair and a `state`.
-//! 2. Open the console in the system browser at a `#vpn-connect?...` link
-//!    (matched by `sites/console/app.js`'s `vpnConnectParams()`), carrying the
-//!    challenge, the state, and the port of a loopback listener this process
-//!    just opened.
-//! 3. The console page — already logged in, or logging the person in first —
-//!    checks their `vpn.access:<location>` capability, mints a one-time code
+//! 2. Open the sign-in site in the system browser at a `#vpn-connect?...`
+//!    link (matched by `sites/auth/app.js`'s `vpnConnectParams()`), carrying
+//!    the challenge, the state, and the port of a loopback listener this
+//!    process just opened.
+//! 3. That page — already logged in, or logging the person in first — checks
+//!    their `vpn.access:<location>` capability, mints a one-time code
 //!    server-side, and redirects the browser to
 //!    `http://127.0.0.1:<port>/callback?code=...&state=...`.
 //! 4. This process's loopback listener catches that redirect, checks `state`,
@@ -37,7 +42,7 @@ use std::net::{TcpListener, TcpStream};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use crate::app::CONSOLE_URL;
+use crate::app::AUTH_URL;
 use crate::keys;
 
 /// The one relay this deployment actually has (`selfhost.config.toml`'s
@@ -104,13 +109,13 @@ pub fn sign_in() -> Result<SignInResult, String> {
     Ok(SignInResult { peer, account: reply.account })
 }
 
-/// The console URL the browser should open: a `#vpn-connect` fragment
-/// carrying everything `sites/console/app.js`'s `vpnConnectParams()` expects.
-/// A fragment, not a query string, on the console's own side too — but this
+/// The sign-in URL the browser should open: a `#vpn-connect` fragment
+/// carrying everything `sites/auth/app.js`'s `vpnConnectParams()` expects.
+/// A fragment, not a query string, on the site's own side too — but this
 /// process only builds it, it never reads one back.
 fn authorize_url(state: &str, challenge: &str, port: u16) -> String {
     format!(
-        "{CONSOLE_URL}#vpn-connect?location={}&state={}&challenge={}&port={port}",
+        "{AUTH_URL}#vpn-connect?location={}&state={}&challenge={}&port={port}",
         percent_encode(LOCATION),
         percent_encode(state),
         percent_encode(challenge),
@@ -215,7 +220,7 @@ fn enroll(code: &str, verifier: &str, peer: &str, public_key: &str) -> Result<En
     ])
     .to_text();
 
-    let host = console_host()?;
+    let host = auth_host()?;
     let response = https_post(&host, "/api/vpn/enroll", &body)?;
 
     let json = selfhost_json::parse(&response).map_err(|_| "the server sent back malformed JSON".to_string())?;
@@ -232,11 +237,11 @@ struct EnrollReply {
     account: String,
 }
 
-/// `CONSOLE_URL`'s host, for the TLS handshake's SNI and the `Host` header.
-fn console_host() -> Result<String, String> {
-    let without_scheme = CONSOLE_URL.strip_prefix("https://").ok_or("CONSOLE_URL is not https")?;
+/// `AUTH_URL`'s host, for the TLS handshake's SNI and the `Host` header.
+fn auth_host() -> Result<String, String> {
+    let without_scheme = AUTH_URL.strip_prefix("https://").ok_or("AUTH_URL is not https")?;
     let host = without_scheme.split('/').next().unwrap_or(without_scheme);
-    if host.is_empty() { Err("CONSOLE_URL has no host".into()) } else { Ok(host.to_string()) }
+    if host.is_empty() { Err("AUTH_URL has no host".into()) } else { Ok(host.to_string()) }
 }
 
 /// Posts a JSON body to `host` over TLS on 443, and returns the response body
@@ -446,7 +451,7 @@ mod tests {
     #[test]
     fn the_authorize_url_carries_every_field_vpn_connect_params_expects() {
         let url = authorize_url("st ate", "cha llenge", 54321);
-        assert!(url.starts_with(&format!("{CONSOLE_URL}#vpn-connect?")));
+        assert!(url.starts_with(&format!("{AUTH_URL}#vpn-connect?")));
         assert!(url.contains("location=console"));
         assert!(url.contains("state=st%20ate"));
         assert!(url.contains("challenge=cha%20llenge"));
