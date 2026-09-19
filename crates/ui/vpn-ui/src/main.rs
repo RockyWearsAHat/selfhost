@@ -22,6 +22,7 @@ mod hud;
 mod keys;
 #[cfg(target_os = "macos")]
 mod macos_native;
+mod oauth;
 mod style;
 mod tunnel;
 
@@ -181,7 +182,8 @@ fn spawn_auto_rotation(
 /// whether anything changed — the caller uses that to know its own idea of
 /// the key's age just went stale.
 fn refresh_activity_from_disk(activity: &Arc<std::sync::Mutex<app::Activity>>) -> bool {
-    let (client, server) = keys::identities();
+    let account = keys::account();
+    let (client, server) = keys::identities(account.as_deref());
     let last_rotation = keys::last_rotation();
     let mut guard = match activity.lock() {
         Ok(guard) => guard,

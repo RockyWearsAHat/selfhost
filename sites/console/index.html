@@ -65,6 +65,24 @@
   </div>
 </section>
 
+<!-- VPN SIGN-IN
+     Reached only by a redirect from the SelfHost VPN desktop app, of the form
+     /#vpn-connect?location=...&state=...&challenge=...&port=.... The desktop
+     app has no login of its own; it borrows this session's, which is why
+     this screen shows nothing to type — by the time it appears the browser
+     is either already logged in (the ordinary session cookie carries this
+     through) or is sent to the login form first, same as any other page. -->
+<section id="view-vpn-connect" hidden>
+  <div class="plate login-plate">
+    <header class="login-mast">
+      <span class="wordmark">SELFHOST</span>
+      <span class="designation">SIGN IN DEVICE</span>
+    </header>
+    <p id="vpn-connect-status" class="caption">Approving this device…</p>
+    <p id="vpn-connect-note" class="caption bad-ink" hidden></p>
+  </div>
+</section>
+
 <!-- CONSOLE -->
 <section id="view-console" hidden>
 

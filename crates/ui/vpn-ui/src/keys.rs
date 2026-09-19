@@ -18,8 +18,13 @@ pub struct Identity {
 }
 
 /// The client and server fingerprints, each present only if its file is.
-pub fn identities() -> (Option<Identity>, Option<Identity>) {
-    (read_identity("client"), read_identity("server"))
+///
+/// `account` is the signed-in identity name (see [`account`]); its own key
+/// file is read for the "client" side once someone has signed in, so the
+/// fingerprint shown actually matches what the tunnel dials with instead of
+/// always reading the generic, unbound `client.pub`.
+pub fn identities(account: Option<&str>) -> (Option<Identity>, Option<Identity>) {
+    (read_identity(account.unwrap_or("client")), read_identity("server"))
 }
 
 /// Reads one `<name>.pub` from the key directory and fingerprints it.
@@ -137,21 +142,168 @@ pub(crate) fn rotation_stale(then: i64, now: i64) -> bool {
     now - then >= 7 * 86_400
 }
 
+/// Where the peer identity is recorded — unchanged path from when this held a
+/// hand-typed account name, so `tunnel.rs`'s dialing code and the rotation
+/// script (`--identity`) need no changes at all for what the file now means.
+fn account_path() -> Option<String> {
+    let home = std::env::var("HOME").ok()?;
+    Some(format!("{home}/.securevpn/account"))
+}
+
+/// Where the signed-in account's human-facing label is recorded — separate
+/// from [`account_path`], which holds the `peer`/key-file identity: the two
+/// no longer need to be the same string once a peer name is derived from the
+/// hostname rather than typed by a person.
+fn account_label_path() -> Option<String> {
+    let home = std::env::var("HOME").ok()?;
+    Some(format!("{home}/.securevpn/account-label"))
+}
+
+/// The peer this install last signed in as, if any — the identity
+/// `tunnel::Endpoint` should dial as, the key-file stem, and the roster entry
+/// name — instead of the generic, unbound `"client"`.
+pub fn account() -> Option<String> {
+    let text = std::fs::read_to_string(account_path()?).ok()?;
+    let name = text.trim();
+    (!name.is_empty()).then(|| name.to_string())
+}
+
+/// The human-facing account name the console approved this device under, for
+/// the masthead's "@name" — distinct from [`account`], which is the roster
+/// `peer`, not something meant for display.
+pub fn account_label() -> Option<String> {
+    let text = std::fs::read_to_string(account_label_path()?).ok()?;
+    let name = text.trim();
+    (!name.is_empty()).then(|| name.to_string())
+}
+
+/// A `[a-z0-9-]` peer name derived from this device's hostname, for a first
+/// sign-in that has no peer recorded yet — mirrors
+/// `selfhost_config::vpn::peer_name_problem`'s rule, since this name becomes
+/// both a key-file stem and the roster's `peer` value. Runs of anything else
+/// collapse to one hyphen; a hostname that sanitizes to nothing at all (or
+/// could not be read) falls back to a fixed name rather than an empty one.
+///
+/// Ends in a short random disambiguator: macOS's factory-default hostname is
+/// the same "MacBook-Pro" on every unconfigured Mac, and the roster keys
+/// entries on this name alone — two such devices signing in for the first
+/// time would otherwise silently overwrite each other's roster entry, one
+/// disconnecting the other with no error on either side. The suffix is
+/// generated once, at first sign-in, and then persisted in [`account_path`]
+/// like the rest of the name, so it never changes underneath an enrolled
+/// device.
+pub(crate) fn generate_peer_name() -> String {
+    let raw = nix::unistd::gethostname().ok().and_then(|h| h.into_string().ok()).unwrap_or_default();
+    let host = raw.strip_suffix(".local").unwrap_or(&raw);
+    let mut sanitized = String::new();
+    let mut last_was_hyphen = true; // swallow a leading separator
+    for ch in host.chars() {
+        let lower = ch.to_ascii_lowercase();
+        if lower.is_ascii_lowercase() || lower.is_ascii_digit() {
+            sanitized.push(lower);
+            last_was_hyphen = false;
+        } else if !last_was_hyphen {
+            sanitized.push('-');
+            last_was_hyphen = true;
+        }
+    }
+    let sanitized = sanitized.trim_end_matches('-');
+    let base = if sanitized.is_empty() { "mac" } else { sanitized };
+    // The suffix below adds 7 characters ("-" + 6 hex); truncated here so the
+    // combined name never trips `peer_name_problem`'s 32-character ceiling —
+    // a long hostname must not turn a sign-in into an opaque 400 from the
+    // server over a limit this function already knows about.
+    let base: String = base.chars().take(MAX_PEER_NAME_LEN - 7).collect();
+    let base = base.trim_end_matches('-');
+    format!("{base}-{}", random_suffix())
+}
+
+/// Mirrors `selfhost_config::vpn::MAX_PEER_NAME_LEN` — not imported directly
+/// to keep this crate's dependency graph free of `selfhost-config`, which
+/// pulls in far more than one constant.
+const MAX_PEER_NAME_LEN: usize = 32;
+
+/// A short, lowercase hex disambiguator for [`generate_peer_name`] — not a
+/// secret, just enough entropy (2^24 values) that two devices with the same
+/// sanitized hostname essentially never pick the same roster name.
+fn random_suffix() -> String {
+    use ring::rand::{SecureRandom, SystemRandom};
+    let mut bytes = [0u8; 3];
+    if SystemRandom::new().fill(&mut bytes).is_err() {
+        // Practically never happens on a real OS RNG; falls back to the
+        // process id rather than leaving the name with no disambiguator at
+        // all, which would put this back to square one.
+        return format!("{:06x}", std::process::id() & 0xff_ffff);
+    }
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+/// Records a completed sign-in: `peer` as the identity the tunnel dials and
+/// the roster tracks, `label` as the human-facing name for display.
+pub(crate) fn set_signed_in(peer: &str, label: &str) -> Result<(), String> {
+    let account_path = account_path().ok_or("no HOME")?;
+    let label_path = account_label_path().ok_or("no HOME")?;
+    if let Some(parent) = std::path::Path::new(&account_path).parent() {
+        std::fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+    }
+    std::fs::write(&account_path, format!("{peer}\n")).map_err(|error| error.to_string())?;
+    std::fs::write(&label_path, format!("{label}\n")).map_err(|error| error.to_string())?;
+    Ok(())
+}
+
+/// Shells out to Secure-VPN's own key manager to generate (or load) one
+/// named identity and print its public key — the one call here that
+/// touches private key material, and it never leaves that script's process.
+pub(crate) fn generate_named_key(name: &str) -> Result<String, String> {
+    let home = std::env::var("HOME").map_err(|_| "no HOME".to_string())?;
+    let script = format!("{home}/.securevpn/app/key_manager.py");
+    if !std::path::Path::new(&script).exists() {
+        return Err("Secure-VPN is not installed (key_manager.py not found)".into());
+    }
+    let output = Command::new(crate::tunnel::real_python())
+        .arg(script)
+        .arg("--generate")
+        .arg(name)
+        .output()
+        .map_err(|error| format!("could not generate a key: {error}"))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let last = stderr.lines().last().unwrap_or("key generation failed");
+        return Err(last.to_string());
+    }
+    // `generate_identity()` prints its own progress lines on a fresh key
+    // (an existing one is loaded silently) — the public key is always the
+    // last line printed, not the whole of stdout.
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let key = stdout.lines().last().unwrap_or("").trim().to_string();
+    if key.is_empty() {
+        return Err("key generation produced no public key".into());
+    }
+    Ok(key)
+}
+
 /// Runs the rotation script and reports whether it succeeded.
 ///
 /// Blocking — a rotation takes a few seconds and the caller runs it off the
 /// window thread. The script is lock-out-proof on its own (it rolls back over
 /// SSH), so the worst a failure here does is leave the current key in place.
+///
+/// Passes `--identity` explicitly as the signed-in account (see [`account`]),
+/// falling back to the script's own `client` default when signed out —
+/// otherwise a signed-in account's "Rotate now" would silently rotate the
+/// unrelated, unbound `client` key instead of the one actually in use.
 pub fn rotate() -> Result<(), String> {
     let home = std::env::var("HOME").map_err(|_| "no HOME".to_string())?;
     let script = format!("{home}/.securevpn/rotate-keys.sh");
     if !std::path::Path::new(&script).exists() {
         return Err("rotation script is not installed".into());
     }
-    let output = Command::new("/bin/bash")
-        .arg(script)
-        .output()
-        .map_err(|error| format!("could not run rotation: {error}"))?;
+    let mut command = Command::new("/bin/bash");
+    command.arg(&script);
+    if let Some(name) = account() {
+        command.arg("--identity").arg(name);
+    }
+    let output = command.output().map_err(|error| format!("could not run rotation: {error}"))?;
     if output.status.success() {
         Ok(())
     } else {

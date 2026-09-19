@@ -171,3 +171,4 @@ pub fn confirm_quit_native() -> bool {
         response == ALERT_SECOND_BUTTON
     }
 }
+

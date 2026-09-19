@@ -310,6 +310,18 @@ impl VpnWiring {
         Self { relays, data_dir }
     }
 
+    /// Whether `location` names a `[[vpn]]` relay this deployment actually
+    /// declares.
+    ///
+    /// Used ahead of minting a sign-in code: a code for a location with no
+    /// relay behind it would only ever produce the same "no roster entry was
+    /// touched" note [`vpn_side_effects`] already gives a grant for one, and
+    /// refusing it up front gives the desktop app a reason to show
+    /// immediately rather than a code that redeems into a no-op.
+    pub fn has_relay(&self, location: &str) -> bool {
+        self.relays.iter().any(|relay| relay.name == location)
+    }
+
     /// Runs [`vpn_side_effects`] against the relays and data directory this
     /// was built with.
     pub fn side_effects(

@@ -56,11 +56,23 @@ pub struct Endpoint {
     pub server_port: u16,
     /// The local port the client listens on for the browser.
     pub local_port: u16,
+    /// Which local identity the client presents at handshake — the roster
+    /// name (and key file) it dials as. `"client"` until someone signs in
+    /// (see [`crate::oauth::sign_in`]), then the peer name that sign-in
+    /// bound this install to, so the box's roster can tell one device's
+    /// connection from another's instead of every install on earth
+    /// presenting the same generic key.
+    pub identity: String,
 }
 
 impl Default for Endpoint {
     fn default() -> Self {
-        Self { server_host: "rockywearsahat.com".into(), server_port: 8500, local_port: 2222 }
+        Self {
+            server_host: "rockywearsahat.com".into(),
+            server_port: 8500,
+            local_port: 2222,
+            identity: "client".into(),
+        }
     }
 }
 
@@ -184,6 +196,13 @@ impl Tunnel {
     /// Whether this instance is managing the tunnel (spawned it) or adopted a pre-existing one.
     pub fn is_managed(&self) -> bool {
         self.managed
+    }
+
+    /// Changes which identity the next `connect()` dials as, for signing in
+    /// after the window is already open. A tunnel already up keeps running
+    /// under its old identity until the next connect.
+    pub fn set_identity(&mut self, name: String) {
+        self.endpoint.identity = name;
     }
 
     /// Marks the tunnel wanted and starts the thread that keeps it up.
@@ -445,7 +464,7 @@ fn live_stats_path() -> String {
 ///
 /// Named apart from [`spawn_client`] so a test can substitute a stub in
 /// `python`'s place without touching `HOME` or any real Secure-VPN install.
-fn real_python() -> String {
+pub(crate) fn real_python() -> String {
     let home = std::env::var("HOME").unwrap_or_default();
     format!("{home}/.securevpn/venv/bin/python")
 }
@@ -490,7 +509,7 @@ fn spawn_client(python: &str, endpoint: &Endpoint) -> std::io::Result<Child> {
         .arg("--local-port")
         .arg(endpoint.local_port.to_string())
         .arg("--identity")
-        .arg("client")
+        .arg(&endpoint.identity)
         .arg("--peer")
         .arg("server")
         .env("SECUREVPN_KEY_DIR", keydir)
@@ -527,7 +546,7 @@ fn spawn_client_detached(python: &str, endpoint: &Endpoint) -> std::io::Result<C
             .arg("--local-port")
             .arg(endpoint.local_port.to_string())
             .arg("--identity")
-            .arg("client")
+            .arg(&endpoint.identity)
             .arg("--peer")
             .arg("server")
             .env("SECUREVPN_KEY_DIR", keydir)

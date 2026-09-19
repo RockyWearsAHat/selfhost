@@ -2333,8 +2333,13 @@ name = "selfhost-vpn-ui"
 version = "0.1.0"
 dependencies = [
  "nix",
+ "ring",
  "rui-native",
+ "rustls 0.23.42",
  "selfhost-dns",
+ "selfhost-http",
+ "selfhost-json",
+ "webpki-roots 1.0.9",
 ]
 
 [[package]]

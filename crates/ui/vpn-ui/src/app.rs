@@ -236,6 +236,14 @@ pub struct Activity {
     pub server: Option<Identity>,
     /// When the client key was last rotated, as recorded on disk.
     pub last_rotation: Option<String>,
+    /// The signed-in account's human-facing name, if any (see
+    /// [`keys::account_label`]) — shown in the masthead as "@name".
+    pub account: Option<String>,
+    /// A peer identity a background sign-in just bound this install to,
+    /// waiting for the next frame to hand it to `self.tunnel.set_identity`
+    /// (see [`Panel::drain_pending_identity`]) — the tunnel is owned by the
+    /// UI thread, so a background thread cannot set it directly.
+    pub pending_identity: Option<String>,
 }
 
 /// Everything the window is and can do.
@@ -266,12 +274,17 @@ pub struct Panel {
 
 impl Panel {
     /// A panel that dials `endpoint`, with the keys already read once.
-    pub fn new(endpoint: Endpoint, running: Arc<AtomicBool>) -> Self {
-        let (client, server) = keys::identities();
+    pub fn new(mut endpoint: Endpoint, running: Arc<AtomicBool>) -> Self {
+        let peer = keys::account();
+        if let Some(name) = &peer {
+            endpoint.identity = name.clone();
+        }
+        let (client, server) = keys::identities(peer.as_deref());
         let activity = Arc::new(Mutex::new(Activity {
             client,
             server,
             last_rotation: keys::last_rotation(),
+            account: keys::account_label(),
             ..Activity::default()
         }));
         let mut tunnel = Tunnel::new(endpoint);
@@ -301,11 +314,13 @@ impl Panel {
     /// A panel with no client but a preset link, for rendering the window's
     /// looks headless. The keys are read from disk if present.
     pub fn demo(link: Link) -> Self {
-        let (client, server) = keys::identities();
+        let peer = keys::account();
+        let (client, server) = keys::identities(peer.as_deref());
         let activity = Arc::new(Mutex::new(Activity {
             client,
             server,
             last_rotation: keys::last_rotation(),
+            account: keys::account_label(),
             ..Activity::default()
         }));
         Self {
@@ -339,6 +354,30 @@ impl Panel {
         match self.activity.lock() {
             Ok(activity) => activity,
             Err(poisoned) => poisoned.into_inner(),
+        }
+    }
+
+    /// Starts the console's own OAuth-with-PKCE sign-in (see [`crate::oauth`])
+    /// off the UI thread: opens the browser, waits for its loopback callback,
+    /// and redeems the code. Runs through [`actions::sign_in`] the same way
+    /// every other slow action here does, since it makes a network round
+    /// trip and waits on the browser — the window must stay responsive
+    /// through both.
+    fn sign_in(&mut self) {
+        actions::sign_in(self.activity_handle());
+    }
+
+    /// Hands a peer identity a background sign-in just bound this install to
+    /// over to the tunnel, which only the UI thread may touch.
+    ///
+    /// Mirrors [`Self::drain_tray_events`]/[`Self::drain_mini_actions`]: work
+    /// queued off-thread is applied here, once a frame, rather than the
+    /// background thread reaching into `self.tunnel` directly.
+    fn drain_pending_identity(&mut self) {
+        let pending = { self.activity().pending_identity.clone() };
+        if let Some(peer) = pending {
+            self.tunnel.set_identity(peer);
+            self.activity().pending_identity = None;
         }
     }
 
@@ -583,6 +622,7 @@ impl Panel {
         let on_frame = move |panel: &mut Panel| {
             panel.drain_tray_events();
             panel.drain_mini_actions();
+            panel.drain_pending_identity();
             // Not panel.update_tray_menu() here: that rebuilds the tray's real
             // NSMenu (Connect/Disconnect/Quit as text items), which is exactly
             // the old dropdown the mini panel now replaces. Calling it every
@@ -711,7 +751,7 @@ pub fn view(ui: &Panel) -> El<Panel> {
     let activity = ui.activity();
     let auto = ui.auto_rotate.load(Ordering::Relaxed);
     col((
-        masthead(&link),
+        masthead(&link, activity.account.as_deref()),
         instrument(&link),
         primary(&link),
         routes(&link),
@@ -738,19 +778,36 @@ pub fn view(ui: &Panel) -> El<Panel> {
     })
 }
 
-/// The bar across the top: the mark, the wordmark, and the state at a glance.
-fn masthead(link: &Link) -> El<Panel> {
+/// The bar across the top: the mark, the wordmark, who is signed in, and the
+/// state at a glance.
+fn masthead(link: &Link, account: Option<&str>) -> El<Panel> {
     row((
         hud::mark(),
         title("SELFHOST").bold().tracking(1.0),
         caption("VPN").color(Tone::Exact(style::CYAN)).tracking(2.0),
         spacer().grow(),
+        sign_in_control(account),
         dot(status_of(link), 4.0),
         micro(state_word(link)).color(word_tone(link)).tracking(1.5),
     ))
     .gap(space::S)
     .h(22.0)
     .align(rui::Align::Center)
+}
+
+/// The one account control: "Sign in" when no identity is bound yet, or
+/// "@name" once one is — clicking either opens the console in the browser
+/// for the same OAuth-with-PKCE flow, so switching accounts later needs no
+/// separate control to find.
+fn sign_in_control(account: Option<&str>) -> El<Panel> {
+    let label = match account {
+        Some(name) => format!("@{name}"),
+        None => "Sign in".into(),
+    };
+    button(label)
+        .h(20.0)
+        .label("Sign in through the admin console")
+        .on_click(|panel: &mut Panel| panel.sign_in())
 }
 
 /// The instrument: the hero in a glass panel lit by the tunnel's hue, and
