@@ -17,7 +17,8 @@
 </head>
 <body>
 
-<!-- LOGIN: one password field. Quiet refusals; the server says nothing more. -->
+<!-- LOGIN: the owner's bare password, or a person's email + password. Quiet
+     refusals either way; the server says nothing more. -->
 <section id="view-login" hidden>
   <div class="plate login-plate">
     <header class="login-mast">
@@ -25,6 +26,8 @@
       <span class="designation">SIGN IN</span>
     </header>
     <form id="login-form">
+      <label class="fieldlabel" for="login-email">EMAIL <span class="caption">(leave blank if you are the owner)</span></label>
+      <input id="login-email" type="email" autocomplete="username" autocapitalize="off" spellcheck="false">
       <label class="fieldlabel" for="login-password">PASSWORD</label>
       <input id="login-password" type="password" autocomplete="current-password" required>
       <div class="login-submit-row">

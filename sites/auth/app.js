@@ -162,7 +162,7 @@ function boot() {
     line.textContent = note;
     line.hidden = note === "";
     if (!options.keep) $("login-password").value = "";
-    $("login-password").focus();
+    ($("login-email").value ? $("login-password") : $("login-email")).focus();
   }
 
   async function submitLogin(event) {
@@ -172,7 +172,10 @@ function boot() {
     $("login-submit").disabled = true;
     $("login-sweep").hidden = false;
     try {
-      const reply = await api("/api/session", { method: "POST", body: { password: $("login-password").value } });
+      const email = $("login-email").value.trim();
+      const body = { password: $("login-password").value };
+      if (email) body.email = email;
+      const reply = await api("/api/session", { method: "POST", body });
       if (reply.status >= 200 && reply.status < 300) { afterSignIn(); return; }
       note.hidden = false;
       if (reply.status === 401) note.textContent = "not accepted";
