@@ -29,7 +29,6 @@ rui = { workspace = true }
 selfhost-dns = { workspace = true }
 selfhost-http = { workspace = true }
 selfhost-json = { workspace = true }
-nix = { version = "0.29", features = ["process", "hostname"] }
 ring = { workspace = true }
 rustls = { workspace = true }
 webpki-roots = { workspace = true }

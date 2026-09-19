@@ -58,6 +58,7 @@
 mod desktop;
 mod detail;
 mod exposure;
+mod system;
 pub(crate) mod files;
 mod install;
 mod lock;
@@ -1163,6 +1164,10 @@ fn services(console: &Console, snapshot: &Snapshot) -> El<Console> {
         // and only when the firewall is managed — it returns `None` otherwise, so
         // on the common unmanaged deployment it costs the log below it nothing.
         exposure::view(snapshot.firewall.as_ref()),
+        // The SYSTEM panel: the daemon's own internal parts, drawn the same
+        // way and in the same slot — a full-width strip that costs nothing
+        // before it has anything to say. See `system::view`.
+        system::view(snapshot.system.as_deref()),
         row((rail(snapshot), pane(console, snapshot))).gap(8.0).grow(),
     ))
     .gap(8.0)

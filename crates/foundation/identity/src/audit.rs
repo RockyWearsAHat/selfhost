@@ -179,6 +179,8 @@ pub enum Authority {
     /// the desktop process presenting the code has no session to be `caller`
     /// checked through.
     VpnDeviceEnrolled,
+    /// A Person was signed in to a gated Site: a Pass was authorised for them.
+    SitePassAuthorised,
 }
 
 impl Authority {
@@ -197,6 +199,7 @@ impl Authority {
             Self::PasskeyRegistered => "authority.enrol",
             Self::PasskeyRemoved => "authority.unenrol",
             Self::VpnDeviceEnrolled => "authority.vpn-enrol",
+            Self::SitePassAuthorised => "authority.site-pass",
         }
     }
 }
@@ -576,6 +579,7 @@ mod tests {
             Authority::PasskeyRegistered,
             Authority::PasskeyRemoved,
             Authority::VpnDeviceEnrolled,
+            Authority::SitePassAuthorised,
         ] {
             assert!(
                 Capability::parse(authority.name()).is_none(),

@@ -58,15 +58,14 @@ fn label<S: 'static>(text: &str) -> El<S> {
 }
 
 /// This machine's real name, read once from the OS — "THIS MAC" was a
-/// guess the window made about hardware it never checked. `nix::unistd`
-/// covers this app's one target (macOS); a lookup failure falls back to
-/// a name that is honest about being unconfirmed rather than presumptuous.
+/// guess the window made about hardware it never checked. A Peer may be any
+/// device a Person enrols, not only a Mac, so [`crate::hostname::hostname`]
+/// is the cross-platform lookup; a failed one falls back to a name that is
+/// honest about being unconfirmed rather than presumptuous.
 fn local_device_name() -> String {
     static NAME: std::sync::OnceLock<String> = std::sync::OnceLock::new();
     NAME.get_or_init(|| {
-        nix::unistd::gethostname()
-            .ok()
-            .and_then(|h| h.into_string().ok())
+        crate::hostname::hostname()
             .map(|h| h.trim_end_matches(".local").to_uppercase())
             .filter(|h| !h.is_empty())
             .unwrap_or_else(|| "THIS DEVICE".to_string())

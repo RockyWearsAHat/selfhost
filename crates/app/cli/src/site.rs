@@ -261,6 +261,8 @@ fn add(arguments: &[String], config_path: &Path) -> Result<(), String> {
         allowed_cidrs: vec![],
         console: false,
         public_api_paths,
+        exposure: None,
+        owner: None,
     };
 
     let source = read_source(config_path)?;
@@ -609,6 +611,8 @@ mod tests {
             allowed_cidrs: vec![],
             console: false,
             public_api_paths: vec![],
+            exposure: None,
+            owner: None,
         };
         assert_eq!(kind_of(&site), "static");
 
