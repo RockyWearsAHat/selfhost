@@ -379,6 +379,33 @@ pub struct Site {
     /// and a site cannot be both at once.
     #[serde(default)]
     pub public_api_paths: Vec<String>,
+    /// Who may reach this site. See [`Exposure`].
+    ///
+    /// Absent — the default, so existing configs keep parsing and keep meaning
+    /// what they meant — is `public` for a site with no `allowed_cidrs`, and
+    /// for a site that lists them it is the source-address gate alone, exactly
+    /// as before this field existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exposure: Option<Exposure>,
+    /// The Person who owns this site: they reach it, and they decide who else
+    /// does, as though they held `site.admin:<site>`. Absent means only the
+    /// deployment's owner and explicit Grants decide.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner: Option<String>,
+}
+
+/// Who may reach a site.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Exposure {
+    /// Open to the internet. The normal case.
+    Public,
+    /// Anyone may try; every request must carry a Pass naming a Person who
+    /// holds `site.access:<site>`.
+    People,
+    /// `people`, and the request must also arrive from `allowed_cidrs` — in
+    /// practice, through the VPN.
+    Private,
 }
 
 fn default_true() -> bool {
@@ -487,6 +514,18 @@ impl Site {
                 .any(|entry| Cidr::parse(entry).is_ok_and(|cidr| cidr.contains(ip)))
     }
 
+    /// Whether every request to this site must carry a Pass.
+    pub fn requires_pass(&self) -> bool {
+        matches!(self.exposure, Some(Exposure::People | Exposure::Private))
+    }
+
+    /// Whether this site is reached through the VPN: `private`, or gated by
+    /// `allowed_cidrs` without saying so. A Grant on such a site is a reason
+    /// to enroll a Peer.
+    pub fn is_network_gated(&self) -> bool {
+        self.exposure == Some(Exposure::Private) || !self.allowed_cidrs.is_empty()
+    }
+
     /// Whether `path` is on this site's [`public_api_paths`](Self::public_api_paths)
     /// allowlist.
     ///
@@ -580,6 +619,47 @@ impl fmt::Display for Config {
 }
 
 #[cfg(test)]
+mod exposure_tests {
+    use super::*;
+
+    fn parsed(extra: &str) -> Result<Site, String> {
+        let text = format!("name = \"a\"\ndomains = [\"a.com\"]\n{extra}");
+        toml::from_str::<Site>(&text).map_err(|error| error.to_string())
+    }
+
+    #[test]
+    fn exposure_parses_its_three_words_and_nothing_else() {
+        let table = [
+            ("", Ok(None)),
+            ("exposure = \"public\"", Ok(Some(Exposure::Public))),
+            ("exposure = \"people\"", Ok(Some(Exposure::People))),
+            ("exposure = \"private\"", Ok(Some(Exposure::Private))),
+            ("exposure = \"Public\"", Err(())),
+            ("exposure = \"vpn\"", Err(())),
+            ("exposure = \"\"", Err(())),
+            ("exposure = true", Err(())),
+        ];
+        for (extra, expected) in table {
+            let got = parsed(extra).map(|site| site.exposure).map_err(|_| ());
+            assert_eq!(got, expected, "{extra:?}");
+        }
+    }
+
+    #[test]
+    fn what_an_exposure_asks_of_a_request() {
+        let mut site = parsed("").unwrap();
+        assert!(!site.requires_pass() && !site.is_network_gated(), "neither field: public");
+        site.exposure = Some(Exposure::People);
+        assert!(site.requires_pass() && !site.is_network_gated());
+        site.exposure = Some(Exposure::Private);
+        site.allowed_cidrs = vec!["10.66.0.0/24".into()];
+        assert!(site.requires_pass() && site.is_network_gated());
+        assert!(!site.permits("8.8.8.8".parse().unwrap()), "private keeps the network check");
+        assert_eq!(parsed("owner = \"mom\"").unwrap().owner.as_deref(), Some("mom"));
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -626,6 +706,8 @@ mod tests {
             allowed_cidrs: vec![],
             console: false,
             public_api_paths: vec![],
+            exposure: None,
+            owner: None,
         };
         assert!(!site.routes_to_app("/api/health"));
     }
@@ -644,6 +726,8 @@ mod tests {
             allowed_cidrs: vec![],
             console: false,
             public_api_paths: vec![],
+            exposure: None,
+            owner: None,
         };
         assert!(site.routes_to_app("/anything"));
     }
@@ -701,6 +785,8 @@ mod tests {
                 allowed_cidrs: vec![],
                 console: false,
                 public_api_paths: vec![],
+                exposure: None,
+                owner: None,
             }],
             dns: None,
             mail: None,
@@ -786,6 +872,10 @@ static_root = "./public"
         // Old configs never mention the new fields; they must default open.
         assert!(!config.sites[1].console);
         assert!(config.sites[1].allowed_cidrs.is_empty());
+        // Neither site says `exposure`, and both mean what they always meant.
+        assert_eq!(config.sites[0].exposure, None);
+        assert!(!config.sites[0].requires_pass() && config.sites[0].is_network_gated());
+        assert!(!config.sites[1].requires_pass() && !config.sites[1].is_network_gated());
     }
 
     #[test]
@@ -802,6 +892,8 @@ static_root = "./public"
             allowed_cidrs: vec![],
             console: true,
             public_api_paths: vec![],
+            exposure: None,
+            owner: None,
         };
         let vpn_client: IpAddr = "10.66.0.2".parse().unwrap();
         let stranger: IpAddr = "203.0.113.9".parse().unwrap();
@@ -834,6 +926,8 @@ static_root = "./public"
             allowed_cidrs: vec![],
             console: false,
             public_api_paths: vec!["/api/session".into(), "/api/vpn/authorize".into()],
+            exposure: None,
+            owner: None,
         };
         assert!(site.permits_public_api_path("/api/session"));
         assert!(site.permits_public_api_path("/api/vpn/authorize"));

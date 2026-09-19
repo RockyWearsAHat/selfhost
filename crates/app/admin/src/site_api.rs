@@ -141,6 +141,12 @@ fn load(wiring: &Wiring) -> Result<Config, Response> {
         .map_err(|error| problem(Status(500), &format!("cannot read the site configuration: {error}")))
 }
 
+/// Every Site the configuration declares now, read fresh so an Exposure or
+/// owner edited a moment ago is the one a sign-in is judged against.
+pub fn configured_sites(wiring: &Wiring) -> Result<Vec<selfhost_config::Site>, Response> {
+    load(wiring).map(|config| config.sites)
+}
+
 /// Reads the config's source text, for the [`selfhost_config::edit`] functions
 /// that transform it without losing comments or untouched sections.
 fn read_source(wiring: &Wiring) -> Result<String, Response> {
@@ -337,6 +343,8 @@ pub fn add(wiring: &Wiring, body: &[u8]) -> Response {
         allowed_cidrs: Vec::new(),
         console: false,
         public_api_paths: vec![],
+        exposure: None,
+        owner: None,
     };
 
     let source = match read_source(wiring) {

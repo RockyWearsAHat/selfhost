@@ -2739,7 +2739,7 @@ function boot() {
     vocabulary: null,           // every capability word this deployment knows, fetched once
     invites: undefined,         // undefined → unasked · null → not this caller's · object → {invites, count}
     invited: null,               // the invitation just minted, shown once until dismissed
-    vpnConnect: null,           // {location, state, challenge, port} from a desktop app's redirect, while approving it
+    vpnConnect: null,           // {state, challenge, port} from a desktop app's redirect, while approving it
   };
 
   const $ = (id) => document.getElementById(id);
@@ -2809,7 +2809,7 @@ function boot() {
 
   /* ── vpn device sign-in ───────────────────────────────────────────── */
 
-  /** Parses a `#vpn-connect?location=...&state=...&challenge=...&port=...`
+  /** Parses a `#vpn-connect?state=...&challenge=...&port=...`
    *  link from the SelfHost VPN desktop app, or null if the fragment does
    *  not match.
    *
@@ -2821,15 +2821,14 @@ function boot() {
     const match = /^#vpn-connect\?(.+)$/.exec(location.hash || "");
     if (!match) return null;
     const params = new URLSearchParams(match[1]);
-    const forLocation = params.get("location");
     const forState = params.get("state");
     const challenge = params.get("challenge");
     const port = Number(params.get("port"));
-    if (!forLocation || !forState || !challenge
+    if (!forState || !challenge
       || !Number.isInteger(port) || port <= 0 || port > 65535) {
       return null;
     }
-    return { location: forLocation, state: forState, challenge, port };
+    return { state: forState, challenge, port };
   }
 
   /** Finishes a desktop app's sign-in against *this* browser session.
@@ -2850,7 +2849,7 @@ function boot() {
     try {
       reply = await api("/api/vpn/authorize", {
         method: "POST",
-        body: { location: connect.location, codeChallenge: connect.challenge },
+        body: { codeChallenge: connect.challenge },
       });
     } catch { vpnConnectFailed("cannot reach the server"); return; }
 

@@ -10,6 +10,7 @@ description = "TLS termination, static serving with byte ranges, reverse proxy, 
 [dependencies]
 selfhost-http = { workspace = true }
 selfhost-config = { workspace = true }
+selfhost-identity = { workspace = true }
 # EWS/ActiveSync/Autodiscover need the same Maildir store and credential
 # check IMAP/submission already use — see `Server::attach_mail` for why this
 # is the one process's single shared handle rather than a second store.
