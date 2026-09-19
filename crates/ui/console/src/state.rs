@@ -351,11 +351,13 @@ pub enum Screen {
     Desktop,
     /// The identity registry and the audit tail.
     People,
+    /// The site roster with exposure and access configuration.
+    Sites,
 }
 
 impl Screen {
     /// The screens, in the order the tabs draw them.
-    pub const ALL: [Screen; 4] = [Self::Services, Self::Files, Self::Desktop, Self::People];
+    pub const ALL: [Screen; 5] = [Self::Services, Self::Files, Self::Desktop, Self::People, Self::Sites];
 
     /// The word on the tab.
     pub fn label(self) -> &'static str {
@@ -364,6 +366,7 @@ impl Screen {
             Self::Files => "FILES",
             Self::Desktop => "DESKTOP",
             Self::People => "PEOPLE",
+            Self::Sites => "SITES",
         }
     }
 
@@ -489,6 +492,9 @@ impl Viewer {
             // The roster and the audit trail are both owner-only routes, so for
             // anybody else this screen is two refusals and nothing else.
             Screen::People => false,
+            // Sites management is owner-only; site.admin does not open this screen
+            // because the page lists all sites and permissions are global.
+            Screen::Sites => false,
         }
     }
 }
@@ -612,7 +618,16 @@ impl Desk {
     }
 }
 
-/// Who holds authority on this box, and what it has been used for.
+/// The Sites plate: every web domain and its configuration.
+#[derive(Debug, Clone, Default)]
+pub struct Sites {
+    /// Every site configured on this deployment, or `None` until first fetched.
+    pub sites: Option<Vec<crate::view::sites::Site>>,
+    /// Why the site roster could not be read — on a deployment where this
+    /// console's credential is not the owner.
+    pub trouble: Option<String>,
+}
+
 #[derive(Debug, Default)]
 pub struct People {
     /// Everyone who holds a credential, or `None` until first fetched.
@@ -739,6 +754,8 @@ pub struct Snapshot {
     pub files: Files,
     /// What the DESKTOP plate knows about the deployment and the fleet.
     pub desk: Desk,
+    /// The configured sites and their access settings.
+    pub sites: Sites,
     /// Who holds authority here, and what it has been used for.
     pub people: People,
     /// Commands the interface has asked for and the poller has not run yet.

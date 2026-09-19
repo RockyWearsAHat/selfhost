@@ -2740,6 +2740,7 @@ function boot() {
     vocabulary: null,           // every capability word this deployment knows, fetched once
     invites: undefined,         // undefined → unasked · null → not this caller's · object → {invites, count}
     invited: null,               // the invitation just minted, shown once until dismissed
+    sites: null,                // the configured sites and their settings, or null if not fetched
     vpnConnect: null,           // {state, challenge, port} from a desktop app's redirect, while approving it
   };
 
@@ -3162,6 +3163,8 @@ function boot() {
     refreshPeople();
     refreshVocabulary();
     refreshInvites();
+    // Sites are fetched once on load, like the audit trail.
+    refreshSites();
   }
 
   async function submitLogin(event) {
@@ -8310,6 +8313,49 @@ function boot() {
     return row;
   }
 
+  /** Fetches the list of configured sites and their settings. */
+  async function refreshSites() {
+    let reply;
+    try { reply = await api("/api/sites"); }
+    catch { return; }
+    state.sites = reply.status === 200 && reply.body && Array.isArray(reply.body.sites)
+      ? reply.body.sites : null;
+    renderSites();
+  }
+
+  /** Renders the sites table. */
+  function renderSites() {
+    const panel = $("sites");
+    if (!state.sites) {
+      panel.hidden = true;
+      return;
+    }
+    panel.hidden = false;
+    $("sites-count").textContent = state.sites.length.toString();
+
+    const rows = $("sites-rows");
+    rows.textContent = "";
+    for (const site of state.sites) {
+      const row = document.createElement("tr");
+      const name = document.createElement("td");
+      name.textContent = site.name || "";
+      const domains = document.createElement("td");
+      domains.textContent = (site.domains || []).join(", ") || "—";
+      const exposure = document.createElement("td");
+      exposure.textContent = site.exposure || "—";
+      const owner = document.createElement("td");
+      owner.textContent = site.owner || "—";
+      row.append(name, domains, exposure, owner);
+      rows.append(row);
+    }
+
+    $("sites-table").hidden = state.sites.length === 0;
+    $("sites-empty").hidden = state.sites.length > 0;
+    if (state.sites.length === 0) {
+      $("sites-empty").textContent = "No sites configured.";
+    }
+  }
+
   /* ── wiring ───────────────────────────────────────────────────────── */
 
   $("login-form").addEventListener("submit", submitLogin);
@@ -8750,6 +8796,10 @@ function boot() {
     auditLimit = Math.min(AUDIT_CEILING, auditLimit + AUDIT_STEP);
     refreshAudit();
   });
+
+  /* The sites plate. */
+
+  $("sites-reload").addEventListener("click", refreshSites);
 
   /* The people plate. */
 

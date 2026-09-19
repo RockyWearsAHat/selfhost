@@ -64,6 +64,7 @@ mod install;
 mod lock;
 mod machines;
 mod people;
+pub mod sites;
 mod style;
 
 use crate::channel::{Live, Session};
@@ -1105,7 +1106,7 @@ pub fn view(console: &Console) -> El<Console> {
         snapshot.notice.clone().map(notice),
         match screen {
             Screen::Services => services(console, &snapshot),
-            // The three new screens are drawn from the console rather than from
+            // The new screens are drawn from the console rather than from
             // this borrow of the snapshot, so each takes its own: a plate that
             // needs the session as well as the snapshot cannot be handed a
             // guard this function is still holding.
@@ -1120,6 +1121,10 @@ pub fn view(console: &Console) -> El<Console> {
             Screen::People => {
                 drop(snapshot);
                 people::view(console)
+            }
+            Screen::Sites => {
+                drop(snapshot);
+                sites::view(console)
             }
         },
     ))
