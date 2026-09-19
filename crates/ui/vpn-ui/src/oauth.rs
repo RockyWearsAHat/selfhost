@@ -152,10 +152,39 @@ fn await_callback(listener: &TcpListener, expected_state: &str) -> Result<String
 /// Handles one connection to the loopback listener. `None` means "not the
 /// callback — keep listening"; `Some` is the flow's final result.
 fn handle_callback(mut stream: TcpStream, expected_state: &str) -> Option<Result<String, String>> {
-    let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
+    // A single `read` is not guaranteed to return the whole request — TCP is
+    // a byte stream, not a message protocol, and a request can legitimately
+    // arrive across more than one segment. A socket accepted from a
+    // nonblocking listener can itself read as nonblocking (observed on
+    // macOS), so a `WouldBlock` here means "no more bytes yet", not
+    // "connection is empty" — it must be polled like `await_callback` polls
+    // `accept`, never treated as an immediate "not the callback".
+    let _ = stream.set_nonblocking(true);
+    let deadline = Instant::now() + Duration::from_secs(5);
     let mut buffer = [0u8; 8192];
-    let read = stream.read(&mut buffer).ok()?;
-    let request = String::from_utf8_lossy(&buffer[..read]);
+    let mut filled = 0;
+    while filled < buffer.len() {
+        match stream.read(&mut buffer[filled..]) {
+            Ok(0) => break,
+            Ok(read) => {
+                filled += read;
+                if buffer[..filled].windows(2).any(|pair| pair == b"\r\n") {
+                    break;
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                if Instant::now() >= deadline {
+                    return None;
+                }
+                std::thread::sleep(POLL_INTERVAL);
+            }
+            Err(_) => return None,
+        }
+    }
+    if filled == 0 {
+        return None;
+    }
+    let request = String::from_utf8_lossy(&buffer[..filled]);
     let target = request.lines().next()?.split_whitespace().nth(1)?;
     let (path, query) = target.split_once('?').unwrap_or((target, ""));
     if path != "/callback" {
@@ -465,7 +494,7 @@ mod tests {
         let port = listener.local_addr().unwrap().port();
         let mut probe = TcpStream::connect(("127.0.0.1", port)).unwrap();
         probe.write_all(b"GET /favicon.ico HTTP/1.1\r\nHost: x\r\n\r\n").unwrap();
-        let (stream, _) = listener.accept().unwrap();
+        let stream = accept_blocking(&listener);
         assert!(handle_callback(stream, "expected").is_none());
     }
 
@@ -489,25 +518,44 @@ mod tests {
         );
     }
 
-    /// Connects to `listener`, sends `request_line`, and hands back what
-    /// `handle_callback` reports. Retries a handful of times: under heavy
-    /// parallel test load a freshly accepted loopback socket has occasionally
-    /// yielded an empty read (a spurious `None`) before the peer's bytes had
-    /// landed, even though `write_all` had already returned on the client
-    /// side — a timing race in the test harness, not in `handle_callback`.
+    /// Connects to `listener`, sends `request_line` in one shot, and hands
+    /// back what `handle_callback` reports.
     fn send_callback_request(listener: &TcpListener, request_line: &str) -> Option<Result<String, String>> {
         let port = listener.local_addr().unwrap().port();
-        for attempt in 0..5 {
-            let mut probe = TcpStream::connect(("127.0.0.1", port)).unwrap();
-            probe.write_all(request_line.as_bytes()).unwrap();
-            let (stream, _) = listener.accept().unwrap();
-            if let Some(outcome) = handle_callback(stream, "expected") {
-                return Some(outcome);
-            }
-            if attempt < 4 {
-                std::thread::sleep(Duration::from_millis(20));
+        let mut probe = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        probe.write_all(request_line.as_bytes()).unwrap();
+        handle_callback(accept_blocking(listener), "expected")
+    }
+
+    /// `accept` on this nonblocking listener can return `WouldBlock` even
+    /// after the peer's `connect`/`write_all` have already returned — the
+    /// completed handshake is not always visible in the accept queue
+    /// instantly. Poll it exactly as `await_callback` does in production.
+    fn accept_blocking(listener: &TcpListener) -> TcpStream {
+        loop {
+            match listener.accept() {
+                Ok((stream, _addr)) => return stream,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(POLL_INTERVAL);
+                }
+                Err(error) => panic!("{error}"),
             }
         }
-        None
+    }
+
+    #[test]
+    fn a_request_split_across_multiple_reads_is_still_parsed() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let writer = std::thread::spawn(move || {
+            let mut probe = TcpStream::connect(("127.0.0.1", port)).unwrap();
+            probe.write_all(b"GET /callback?code=abc123&state=e").unwrap();
+            std::thread::sleep(Duration::from_millis(50));
+            probe.write_all(b"xpected HTTP/1.1\r\nHost: x\r\n\r\n").unwrap();
+        });
+        let stream = accept_blocking(&listener);
+        assert_eq!(handle_callback(stream, "expected"), Some(Ok("abc123".to_string())));
+        writer.join().unwrap();
     }
 }
