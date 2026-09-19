@@ -22,6 +22,7 @@ use crate::nas::{self, Listing, Share};
 use crate::registry::{Person, Trail};
 use crate::remote::{Agent, Node, Settings};
 use crate::state::{Command, FileAction, Link, LogLine, Screen, Snapshot, Viewer};
+use crate::view::sites::Site;
 use selfhost_firewall::FirewallState;
 use selfhost_json::Json;
 use selfhost_supervisor::state::{ServiceStatus, spec_from_json, spec_to_json};
@@ -139,6 +140,7 @@ fn run(connect: impl Connect, shared: Arc<Mutex<Snapshot>>, running: Arc<AtomicB
                     }
                     Screen::Desktop => refresh_desktop(ready, &shared),
                     Screen::People => refresh_people(ready, &shared),
+                    Screen::Sites => refresh_sites(ready, &shared),
                 }
             }
         }
@@ -671,6 +673,30 @@ fn refresh_people(client: &Client, shared: &Arc<Mutex<Snapshot>>) {
     if trail.is_some() {
         snapshot.people.trail = trail;
     }
+}
+
+/// Fetches the roster of configured sites and their access settings.
+fn refresh_sites(client: &Client, shared: &Arc<Mutex<Snapshot>>) {
+    let (sites, trouble) = match client.get("/api/sites") {
+        Ok(value) => {
+            let sites = value
+                .get("sites")
+                .and_then(Json::as_array)
+                .unwrap_or(&[])
+                .iter()
+                .filter_map(Site::from_json)
+                .collect();
+            (Some(sites), None)
+        }
+        Err(ClientError::Refused { status, message }) => {
+            (None, Some(nas::refusal_text(status.code(), Some(&Json::string(message)))))
+        }
+        Err(_) => return,
+    };
+
+    let mut snapshot = shared.lock().expect("the snapshot lock was poisoned");
+    snapshot.sites.sites = sites;
+    snapshot.sites.trouble = trouble;
 }
 
 /// Reads one log line from the wire.
