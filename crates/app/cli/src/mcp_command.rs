@@ -120,10 +120,18 @@ type Tool = (&'static str, &'static str, &'static [Param]);
 ///
 /// `params` is turned into the JSON Schema `tools/list` answers with by
 /// [`tool_schema`]. Together these cover the far side's whole operational
-/// surface an agent can be granted: sites and their content (`site.admin`),
+/// surface an agent can be granted: sites and their content (`site.admin`,
+/// including who may reach one — `site_set_exposure`/`site_set_owner`),
 /// services and deploys (`service.control`, with reads under `console.read`),
-/// the deployment's own self-update, and `whoami` so an agent can see exactly
-/// which of these its token will open.
+/// the deployment's own self-update, `whoami` so an agent can see exactly
+/// which of these its token will open, and — owner-only, the same as the
+/// routes behind them — the registry (`people_*`), the deploy record and
+/// System health (`deploys_*`, `system_health`), the VPN roster
+/// (`vpn_peers_list`) and the firewall (`firewall_show`). This is "STEP 4 —
+/// control parity" from `docs/architecture.dx`'s "now" list: every mutating
+/// admin route reachable from a keyboard on the box is reachable here too,
+/// gated by the calling token's grants exactly as the HTTP route is — see
+/// `docs/labs/mcp-lab.dx` for the parity table and what still is not.
 const TOOLS: &[Tool] = &[
     ("sites_list", "List every site this deployment's proxy answers for.", &[]),
     (
@@ -204,6 +212,28 @@ const TOOLS: &[Tool] = &[
         "sites_delete_file",
         "Delete one file or empty directory from a site's static content.",
         &[("name", "The site's name.", true, Kind::Text), ("path", "Path within the site's content directory.", true, Kind::Text)],
+    ),
+    (
+        "site_set_exposure",
+        "Set who may reach a site: \"public\" (open to the internet, the normal case), \"people\" \
+         (a signed-in Person holding site.access:<site>, from anywhere), \"private\" (the same, and \
+         the request must also arrive from the site's allowed_cidrs — in practice, the VPN), or \
+         omit exposure entirely to clear it back to the unset default. The console site cannot take \
+         an exposure at all; it keeps its own login.",
+        &[
+            ("name", "The site's name.", true, Kind::Text),
+            ("exposure", "\"public\", \"people\" or \"private\"; omit to clear.", false, Kind::Text),
+        ],
+    ),
+    (
+        "site_set_owner",
+        "Set which Person a site is delegated to: that Person may then grant or revoke \
+         site.access:<site> on other people without holding site.admin outright. Omit owner to \
+         clear the delegation.",
+        &[
+            ("name", "The site's name.", true, Kind::Text),
+            ("owner", "The delegate's Person name; omit to clear.", false, Kind::Text),
+        ],
     ),
     ("services_list", "List every service this deployment supervises, with its state.", &[]),
     (
@@ -294,6 +324,63 @@ const TOOLS: &[Tool] = &[
          that call refused\".",
         &[],
     ),
+    ("people_list", "List every registered Person, their grants, and whether they hold a login password.", &[]),
+    (
+        "people_show",
+        "Show one registered Person: their grants, added time, email and whether they hold a login \
+         password.",
+        &[("name", "The person's name.", true, Kind::Text)],
+    ),
+    (
+        "people_grant",
+        "Give a Person one more capability, alongside whatever they already hold — this reads their \
+         current grants first, so it never clears the rest. Granting vpn.access:<location> may also \
+         provision a VPN roster entry if peer and pubkey are both given, the same as \
+         `selfhost people grant --peer --pubkey`.",
+        &[
+            ("name", "The person's name. Creates them if this is their first grant.", true, Kind::Text),
+            ("capability", "The capability word, e.g. \"console.read\" or \"site.access:blog\".", true, Kind::Text),
+            ("peer", "A VPN roster entry's own name, for a vpn.access:<location> grant.", false, Kind::Text),
+            ("pubkey", "That peer's public key in base64, generated on their own device.", false, Kind::Text),
+        ],
+    ),
+    (
+        "people_revoke",
+        "Take one capability away from a Person, leaving everything else they hold in place.",
+        &[
+            ("name", "The person's name.", true, Kind::Text),
+            ("capability", "The capability word to remove.", true, Kind::Text),
+        ],
+    ),
+    (
+        "people_invite",
+        "Mint a one-time invitation code for a Person who does not yet hold a credential, so they can \
+         register their own passkey without ever seeing this deployment's console password.",
+        &[
+            ("name", "The person's name.", true, Kind::Text),
+            ("hours", "How long the code stays redeemable. Server default applies if omitted.", false, Kind::Count),
+        ],
+    ),
+    ("deploys_list", "List every recorded Deploy (service and self-update alike), newest first.", &[]),
+    (
+        "deploys_show",
+        "Show one recorded Deploy: what triggered it, its result, and its log.",
+        &[("id", "The deploy's id, as deploys_list shows it.", true, Kind::Text)],
+    ),
+    (
+        "system_health",
+        "Show every System part of this deployment — the proxy, this admin API, VPN relays, mail — \
+         with its state and, when unhealthy, why. Never lists hosted Services; see services_list for \
+         those.",
+        &[],
+    ),
+    (
+        "vpn_peers_list",
+        "List every peer this deployment's VPN relays know about, static and dynamically enrolled \
+         alike, with which Person (if any) each is bound to.",
+        &[],
+    ),
+    ("firewall_show", "Show the firewall's desired and live state: every rule this deployment manages.", &[]),
     (
         "report",
         "File a bug, suggestion, or observation about this deployment's own code (selfhost itself) \
@@ -990,8 +1077,134 @@ async fn call_tool(client: &RemoteClient, name: &str, arguments: &Json) -> Resul
                 .await?;
             Ok(answer.to_text())
         }
+        "site_set_exposure" => {
+            let site = required(arguments, "name")?;
+            let exposure = optional(arguments, "exposure");
+            let body = Json::object([(
+                "exposure",
+                if exposure.is_empty() { Json::Null } else { Json::string(&exposure) },
+            )])
+            .to_text();
+            let answer = client
+                .request("PUT", &format!("/api/sites/{}/exposure", encode(&site)), Some(body.as_bytes()))
+                .await?;
+            Ok(answer.to_text())
+        }
+        "site_set_owner" => {
+            let site = required(arguments, "name")?;
+            let owner = optional(arguments, "owner");
+            let body =
+                Json::object([("owner", if owner.is_empty() { Json::Null } else { Json::string(&owner) })])
+                    .to_text();
+            let answer = client
+                .request("PUT", &format!("/api/sites/{}/owner", encode(&site)), Some(body.as_bytes()))
+                .await?;
+            Ok(answer.to_text())
+        }
+        "people_list" => {
+            let answer = client.get("/api/people").await?;
+            Ok(answer.to_text())
+        }
+        "people_show" => {
+            let name = required(arguments, "name")?;
+            let roster = client.get("/api/people").await?;
+            let found = roster
+                .get("people")
+                .and_then(Json::as_array)
+                .and_then(|people| people.iter().find(|person| person.get("name").and_then(Json::as_str) == Some(name.as_str())));
+            match found {
+                Some(person) => Ok(person.to_text()),
+                None => Err(format!("no person named \"{name}\" is registered")),
+            }
+        }
+        "people_grant" => {
+            let name = required(arguments, "name")?;
+            let capability = required(arguments, "capability")?;
+            let peer = optional(arguments, "peer");
+            let pubkey = optional(arguments, "pubkey");
+            let mut grants = current_grants(client, &name).await?;
+            if !grants.iter().any(|held| held == &capability) {
+                grants.push(capability);
+            }
+            let mut fields = vec![("grants", Json::array(grants.iter().map(Json::string)))];
+            if !peer.is_empty() {
+                fields.push(("peer", Json::string(&peer)));
+            }
+            if !pubkey.is_empty() {
+                fields.push(("public_key", Json::string(&pubkey)));
+            }
+            let body = Json::object(fields).to_text();
+            let answer =
+                client.request("PUT", &format!("/api/people/{}", encode(&name)), Some(body.as_bytes())).await?;
+            Ok(answer.to_text())
+        }
+        "people_revoke" => {
+            let name = required(arguments, "name")?;
+            let capability = required(arguments, "capability")?;
+            let grants: Vec<String> =
+                current_grants(client, &name).await?.into_iter().filter(|held| held != &capability).collect();
+            let body = Json::object([("grants", Json::array(grants.iter().map(Json::string)))]).to_text();
+            let answer =
+                client.request("PUT", &format!("/api/people/{}", encode(&name)), Some(body.as_bytes())).await?;
+            Ok(answer.to_text())
+        }
+        "people_invite" => {
+            let name = required(arguments, "name")?;
+            let mut fields = Vec::new();
+            if let Some(hours) = count(arguments, "hours")? {
+                fields.push(("hours", Json::Number(hours as f64)));
+            }
+            let body = Json::object(fields).to_text();
+            let answer = client
+                .request("POST", &format!("/api/people/{}/invite", encode(&name)), Some(body.as_bytes()))
+                .await?;
+            Ok(answer.to_text())
+        }
+        "deploys_list" => {
+            let answer = client.get("/api/deploys").await?;
+            Ok(answer.to_text())
+        }
+        "deploys_show" => {
+            let id = required(arguments, "id")?;
+            let answer = client.get(&format!("/api/deploys/{}", encode(&id))).await?;
+            Ok(answer.to_text())
+        }
+        "system_health" => {
+            let answer = client.get("/api/system").await?;
+            Ok(answer.to_text())
+        }
+        "vpn_peers_list" => {
+            let answer = client.get("/api/vpn/peers").await?;
+            Ok(answer.to_text())
+        }
+        "firewall_show" => {
+            let answer = client.get("/api/firewall").await?;
+            Ok(answer.to_text())
+        }
         other => Err(format!("unknown tool \"{other}\"")),
     }
+}
+
+/// The capability words a Person currently holds, read from the roster —
+/// `PUT /api/people/<name>` replaces the whole grant set in one call, so
+/// `people_grant` and `people_revoke` both read this first and write back the
+/// union or the difference, never a bare single word, on the same grounds
+/// [`crate::people_command`]'s own `set` does for the CLI's direct-file path.
+/// A Person not yet registered simply holds nothing yet — this is not an
+/// error, since granting them their first capability is exactly how they come
+/// to exist.
+async fn current_grants(client: &RemoteClient, name: &str) -> Result<Vec<String>, String> {
+    let roster = client.get("/api/people").await?;
+    let Some(people) = roster.get("people").and_then(Json::as_array) else {
+        return Ok(Vec::new());
+    };
+    let Some(person) = people.iter().find(|person| person.get("name").and_then(Json::as_str) == Some(name)) else {
+        return Ok(Vec::new());
+    };
+    let Some(grants) = person.get("grants").and_then(Json::as_array) else {
+        return Ok(Vec::new());
+    };
+    Ok(grants.iter().filter_map(Json::as_str).map(str::to_owned).collect())
 }
 
 /// The bytes one `sites_upload_file` call should send: inline `content`

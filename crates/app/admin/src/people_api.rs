@@ -396,6 +396,52 @@ impl VpnWiring {
     ) -> Vec<String> {
         vpn_side_effects(&self.relays, &self.data_dir, subject, before, after, peer, public_key)
     }
+
+    /// Every peer this deployment's relays know about, for `GET /api/vpn/peers`.
+    ///
+    /// A static entry comes straight from `[[vpn.peers]]` — reviewed and
+    /// committed like any other access decision, `person` required by the
+    /// schema itself. A dynamic entry was enrolled through a relay's roster
+    /// file with no config edit and no restart (see [`selfhost_vpn::enrol`]'s
+    /// module documentation for why that file exists at all); its `person`
+    /// comes from [`crate::peer_binding::owner_of`], the one record of who a
+    /// roster name belongs to, and is `null` for a name nothing has bound yet.
+    /// A roster name that also appears in `[[vpn.peers]]` is reported only
+    /// once, as the static entry — the config already speaks for it.
+    pub fn peers_json(&self) -> Json {
+        let mut peers = Vec::new();
+        for relay in &self.relays {
+            for peer in &relay.peers {
+                peers.push(Json::object([
+                    ("relay".to_owned(), Json::string(relay.name.as_str())),
+                    ("name".to_owned(), Json::string(peer.name.as_str())),
+                    ("person".to_owned(), Json::string(peer.person.as_str())),
+                    ("static".to_owned(), Json::Bool(true)),
+                    (
+                        "forwardPort".to_owned(),
+                        peer.forward_port.map_or(Json::Null, |port| Json::Number(port as f64)),
+                    ),
+                ]));
+            }
+
+            let key_dir = selfhost_vpn::keys::key_dir(relay, &self.data_dir);
+            let dynamic_names = selfhost_vpn::enrol::roster(&key_dir).unwrap_or_default();
+            for name in &dynamic_names {
+                if relay.peers.iter().any(|peer| &peer.name == name) {
+                    continue;
+                }
+                let person = crate::peer_binding::owner_of(&self.data_dir, name);
+                peers.push(Json::object([
+                    ("relay".to_owned(), Json::string(relay.name.as_str())),
+                    ("name".to_owned(), Json::string(name.as_str())),
+                    ("person".to_owned(), person.map_or(Json::Null, Json::string)),
+                    ("static".to_owned(), Json::Bool(false)),
+                    ("forwardPort".to_owned(), Json::Null),
+                ]));
+            }
+        }
+        Json::array(peers)
+    }
 }
 
 /// One person as the console reads them.

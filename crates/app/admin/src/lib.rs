@@ -580,6 +580,10 @@ enum Route<'a> {
     SiteAddDomain(&'a str),
     /// `DELETE /api/sites/<name>/domains/<hostname>`
     SiteRemoveDomain(&'a str, &'a str),
+    /// `PUT /api/sites/<name>/exposure` — see [`site_api::set_exposure`].
+    SiteSetExposure(&'a str),
+    /// `PUT /api/sites/<name>/owner` — see [`site_api::set_owner`].
+    SiteSetOwner(&'a str),
     /// `GET /api/sites/<name>/files/list?path=…`
     SiteFileList(&'a str),
     /// `POST /api/sites/<name>/files/mkdir`
@@ -598,6 +602,9 @@ enum Route<'a> {
     /// `POST /api/pass/authorize`: a signed-in Person asks to be signed in to
     /// a gated Site. See [`site_pass`].
     PassAuthorize,
+    /// `GET /api/vpn/peers` — every peer this deployment's relays know about,
+    /// static and dynamic alike. See [`people_api::VpnWiring::peers_json`].
+    VpnPeers,
 }
 
 impl<'a> Route<'a> {
@@ -702,6 +709,8 @@ impl<'a> Route<'a> {
             (Method::Delete, ["api", "sites", name, "domains", hostname]) => {
                 Some(Self::SiteRemoveDomain(name, hostname))
             }
+            (Method::Put, ["api", "sites", name, "exposure"]) => Some(Self::SiteSetExposure(name)),
+            (Method::Put, ["api", "sites", name, "owner"]) => Some(Self::SiteSetOwner(name)),
             (Method::Get, ["api", "sites"]) => Some(Self::Sites),
             (Method::Post, ["api", "sites"]) => Some(Self::SiteAdd),
             (Method::Get, ["api", "sites", name]) => Some(Self::SiteShow(name)),
@@ -709,6 +718,7 @@ impl<'a> Route<'a> {
             (Method::Get, ["api", "maintenance", "status"]) => Some(Self::MaintenanceStatus),
             (Method::Post, ["api", "vpn", "check-access"]) => Some(Self::VpnCheckAccess),
             (Method::Post, ["api", "vpn", "authorize"]) => Some(Self::VpnAuthorize),
+            (Method::Get, ["api", "vpn", "peers"]) => Some(Self::VpnPeers),
             (Method::Post, ["api", "pass", "authorize"]) => Some(Self::PassAuthorize),
             _ => None,
         }
@@ -798,8 +808,11 @@ impl<'a> Route<'a> {
             // grant" because no grant should ever confer it. So these ask for
             // the identity that cannot be delegated. Reading the roster joins
             // them because it is a list of who can reach what — a target list,
-            // as `crates/identity`'s registry says in its own header.
-            Self::ListPeople | Self::ForgetPerson(_) => Demand::OwnerOnly,
+            // as `crates/identity`'s registry says in its own header. The VPN
+            // roster joins them on the same grounds: it too is a list of who
+            // can reach what, just for a door `[[vpn.peers]]` and the roster
+            // file guard rather than the console password.
+            Self::ListPeople | Self::ForgetPerson(_) | Self::VpnPeers => Demand::OwnerOnly,
             // The one delegation the model has: whoever holds
             // `site.admin:<site>` may hand out `site.access:<site>` for that
             // Site and nothing else. Which Site depends on the body, so the
@@ -829,6 +842,8 @@ impl<'a> Route<'a> {
             | Self::SiteRemove(_)
             | Self::SiteAddDomain(_)
             | Self::SiteRemoveDomain(_, _)
+            | Self::SiteSetExposure(_)
+            | Self::SiteSetOwner(_)
             | Self::SiteFileList(_)
             | Self::SiteFileMkdir(_)
             | Self::SiteFilePut(_)
@@ -873,6 +888,8 @@ mod site_route_tests {
             Route::SiteRemove("blog"),
             Route::SiteAddDomain("blog"),
             Route::SiteRemoveDomain("blog", "home.example.com"),
+            Route::SiteSetExposure("blog"),
+            Route::SiteSetOwner("blog"),
             Route::SiteFileList("blog"),
             Route::SiteFileMkdir("blog"),
             Route::SiteFilePut("blog"),
@@ -900,7 +917,7 @@ mod site_route_tests {
         // And the positive half: SiteAdmin is honoured, and it really is what
         // every site route demands.
         assert!(Capability::SiteAdmin.is_honoured());
-        for route in &routes[..10] {
+        for route in &routes[..12] {
             assert_eq!(route.demand(), Demand::Held(Capability::SiteAdmin), "{route:?}");
         }
     }
@@ -1609,6 +1626,8 @@ impl Api {
             Route::SiteRemove(name) => self.sites_remove(name),
             Route::SiteAddDomain(name) => self.sites_add_domain(name, body),
             Route::SiteRemoveDomain(name, hostname) => self.sites_remove_domain(name, hostname),
+            Route::SiteSetExposure(name) => self.sites_set_exposure(name, body),
+            Route::SiteSetOwner(name) => self.sites_set_owner(name, body),
             Route::SiteFileList(name) => self.sites_file_list(name, query),
             Route::SiteFileMkdir(name) => self.sites_file_mkdir(name, body),
             Route::SiteFilePut(name) => self.sites_file_put(name, query, body),
@@ -1616,6 +1635,7 @@ impl Api {
             Route::MaintenanceStatus => self.maintenance_status(),
             Route::VpnCheckAccess => vpn_api::check_access(self.people.as_ref(), body),
             Route::VpnAuthorize => self.vpn_authorize(&caller, body),
+            Route::VpnPeers => self.vpn_peers(),
             Route::PassAuthorize => self.pass_authorize(&caller, body),
         }
     }
@@ -2009,6 +2029,17 @@ impl Api {
         }
     }
 
+    /// Answers `GET /api/vpn/peers`: every peer this deployment's relays
+    /// know about, static `[[vpn.peers]]` entries and dynamic roster
+    /// enrolments alike. Owner-only, on the same grounds `ListPeople` is —
+    /// see [`Route::demand`]. See [`people_api::VpnWiring::peers_json`].
+    fn vpn_peers(&self) -> Response {
+        match &self.vpn {
+            Some(wiring) => json(Status(200), wiring.peers_json()),
+            None => problem(Status(404), "no `[[vpn]]` relay is configured on this deployment"),
+        }
+    }
+
     /// Answers `POST /api/vpn/enroll`: the desktop app's half of a VPN
     /// sign-in, reached ahead of the authorisation wall — see the inline
     /// routing in [`Api::handle`] and [`vpn_enroll`]'s module documentation
@@ -2148,6 +2179,22 @@ impl Api {
     fn sites_remove_domain(&self, name: &str, hostname: &str) -> Response {
         match &self.sites {
             Some(wiring) => site_api::remove_domain(wiring, name, hostname),
+            None => problem(Status(404), NO_SITES),
+        }
+    }
+
+    /// Answers `PUT /api/sites/<name>/exposure`.
+    fn sites_set_exposure(&self, name: &str, body: &[u8]) -> Response {
+        match &self.sites {
+            Some(wiring) => site_api::set_exposure(wiring, name, body),
+            None => problem(Status(404), NO_SITES),
+        }
+    }
+
+    /// Answers `PUT /api/sites/<name>/owner`.
+    fn sites_set_owner(&self, name: &str, body: &[u8]) -> Response {
+        match &self.sites {
+            Some(wiring) => site_api::set_owner(wiring, name, body),
             None => problem(Status(404), NO_SITES),
         }
     }

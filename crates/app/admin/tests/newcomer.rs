@@ -151,10 +151,15 @@ const SURFACE: &[(&str, &str, Reach)] = &[
     ("DELETE", "/api/sites/anything", Reach::Withheld),
     ("POST", "/api/sites/anything/domains", Reach::Withheld),
     ("DELETE", "/api/sites/anything/domains/anything", Reach::Withheld),
+    ("PUT", "/api/sites/anything/exposure", Reach::Withheld),
+    ("PUT", "/api/sites/anything/owner", Reach::Withheld),
     ("GET", "/api/sites/anything/files/list", Reach::Withheld),
     ("POST", "/api/sites/anything/files/mkdir", Reach::Withheld),
     ("PUT", "/api/sites/anything/files/entry", Reach::Withheld),
     ("DELETE", "/api/sites/anything/files/entry", Reach::Withheld),
+    // Demand::OwnerOnly again — the VPN roster is a list of who can reach
+    // what, the same grounds `/api/people` is withheld on above.
+    ("GET", "/api/vpn/peers", Reach::Withheld),
 ];
 
 /// The doors that stand *ahead* of the wall by design, and must therefore be
