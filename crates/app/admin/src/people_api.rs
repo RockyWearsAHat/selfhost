@@ -533,8 +533,8 @@ pub fn roster_json(people: &People, password_holders: &[PersonName]) -> Json {
 /// never consults a grant set for the owner, so an owner's authority is their
 /// identity and not a list that could be edited away. A client must read the
 /// flag, not the list, to decide whether to draw everything.
-pub fn whoami_json(caller: &Caller) -> Json {
-    Json::object([
+pub fn whoami_json(caller: &Caller, agents: Option<&crate::agent_store::AgentStore>) -> Json {
+    let mut fields = vec![
         ("name", Json::string(caller.identity().to_string())),
         ("owner", Json::Bool(caller.identity().is_owner())),
         // Its own flag rather than folded into `owner`, and this is the whole
@@ -548,7 +548,22 @@ pub fn whoami_json(caller: &Caller) -> Json {
         ("machine", Json::Bool(caller.identity().is_machine())),
         ("credential", Json::string(caller.credential().as_str())),
         ("grants", grants_json(caller.grants())),
-    ])
+    ];
+
+    // If this is an agent, include the person it belongs to by looking up the
+    // agent in the store and extracting its person association.
+    if let selfhost_identity::Identity::Agent(name) = caller.identity() {
+        if let Some(agent_store) = agents {
+            for (agent_name, _, _, person) in agent_store.list() {
+                if agent_name == *name {
+                    fields.push(("person", Json::string(&person)));
+                    break;
+                }
+            }
+        }
+    }
+
+    Json::object(fields)
 }
 
 /// Every capability word this deployment understands, and whether it takes a
