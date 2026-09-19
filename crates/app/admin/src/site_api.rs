@@ -365,6 +365,7 @@ pub fn add(wiring: &Wiring, body: &[u8]) -> Response {
         public_api_paths: vec![],
         exposure: None,
         owner: None,
+        relay: None,
     };
 
     let source = match read_source(wiring) {
