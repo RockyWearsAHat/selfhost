@@ -171,6 +171,14 @@ pub enum Authority {
     PasskeyRegistered,
     /// A passkey was removed.
     PasskeyRemoved,
+    /// A VPN roster entry was enrolled for a device, as the automatic
+    /// conclusion of a browser sign-in that already held `vpn.access` at the
+    /// location — never a new grant, only a device provisioned against one
+    /// that already existed. Written by the route that stands *ahead* of the
+    /// authorisation wall, on the same grounds as [`Self::InvitationRedeemed`]:
+    /// the desktop process presenting the code has no session to be `caller`
+    /// checked through.
+    VpnDeviceEnrolled,
 }
 
 impl Authority {
@@ -188,6 +196,7 @@ impl Authority {
             Self::InvitationRedeemed => "authority.redeem",
             Self::PasskeyRegistered => "authority.enrol",
             Self::PasskeyRemoved => "authority.unenrol",
+            Self::VpnDeviceEnrolled => "authority.vpn-enrol",
         }
     }
 }
@@ -566,6 +575,7 @@ mod tests {
             Authority::InvitationRedeemed,
             Authority::PasskeyRegistered,
             Authority::PasskeyRemoved,
+            Authority::VpnDeviceEnrolled,
         ] {
             assert!(
                 Capability::parse(authority.name()).is_none(),

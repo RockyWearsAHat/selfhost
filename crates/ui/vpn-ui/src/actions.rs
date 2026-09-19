@@ -63,13 +63,38 @@ pub fn rotate(activity: Arc<Mutex<Activity>>) {
     }
     std::thread::spawn(move || {
         let outcome = keys::rotate();
-        let (client, server) = keys::identities();
+        let account = keys::account();
+        let (client, server) = keys::identities(account.as_deref());
         let last = keys::last_rotation();
         finish(&activity, outcome.map(|()| "Key rotated and verified.".to_string()), move |a| {
             a.client = client;
             a.server = server;
             a.last_rotation = last;
         });
+    });
+}
+
+/// Signs this install in through the console's own OAuth-with-PKCE flow (see
+/// [`crate::oauth`]): opens the browser to the console's sign-in screen and
+/// waits for it to hand a redeemed identity back over a loopback callback.
+///
+/// No admin command to copy and no name typed by hand — the account that
+/// approves the browser prompt, and whether it holds `vpn.access:<location>`
+/// for this relay, is the whole decision; this call just carries the result.
+pub fn sign_in(activity: Arc<Mutex<Activity>>) {
+    if !set_busy(&activity, "Waiting for the browser sign-in…") {
+        return;
+    }
+    std::thread::spawn(move || match ensure_console_route().and_then(|()| crate::oauth::sign_in()) {
+        Ok(result) => {
+            let client = keys::identities(Some(&result.peer)).0;
+            finish(&activity, Ok(format!("Signed in as {}.", result.account)), move |a| {
+                a.client = client;
+                a.account = Some(result.account);
+                a.pending_identity = Some(result.peer);
+            });
+        }
+        Err(error) => finish(&activity, Err(format!("Sign-in failed: {error}")), |_| {}),
     });
 }
 
@@ -466,7 +491,7 @@ fn sh_quote(path: &Path) -> String {
 }
 
 /// Opens `url` in the default browser.
-fn open_url(url: &str) -> Result<(), String> {
+pub(crate) fn open_url(url: &str) -> Result<(), String> {
     let status = Command::new("open")
         .arg(url)
         .status()

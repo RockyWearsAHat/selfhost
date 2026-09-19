@@ -2697,7 +2697,7 @@ function boot() {
 
   /** Everything the page knows. The DOM is a function of this and nothing else. */
   const state = {
-    view: "loading",            // "login" | "console" | "invite"
+    view: "loading",            // "login" | "console" | "invite" | "vpn-connect"
     invite: null,               // the code from an /#invite= link, while redeeming
     inviteName: null,           // who the daemon says that code was minted for
     link: "connecting",         // "connecting" | "connected" | "lost"
@@ -2739,6 +2739,7 @@ function boot() {
     vocabulary: null,           // every capability word this deployment knows, fetched once
     invites: undefined,         // undefined → unasked · null → not this caller's · object → {invites, count}
     invited: null,               // the invitation just minted, shown once until dismissed
+    vpnConnect: null,           // {location, state, challenge, port} from a desktop app's redirect, while approving it
   };
 
   const $ = (id) => document.getElementById(id);
@@ -2806,6 +2807,81 @@ function boot() {
     return match ? match[1] : "";
   }
 
+  /* ── vpn device sign-in ───────────────────────────────────────────── */
+
+  /** Parses a `#vpn-connect?location=...&state=...&challenge=...&port=...`
+   *  link from the SelfHost VPN desktop app, or null if the fragment does
+   *  not match.
+   *
+   *  A fragment for the same reason as the invite code: none of this is sent
+   *  to the server or left in a log. `state` and `challenge` are the desktop
+   *  app's own PKCE bookkeeping — this page only carries them to
+   *  `/api/vpn/authorize` and back to the app's loopback callback. */
+  function vpnConnectParams() {
+    const match = /^#vpn-connect\?(.+)$/.exec(location.hash || "");
+    if (!match) return null;
+    const params = new URLSearchParams(match[1]);
+    const forLocation = params.get("location");
+    const forState = params.get("state");
+    const challenge = params.get("challenge");
+    const port = Number(params.get("port"));
+    if (!forLocation || !forState || !challenge
+      || !Number.isInteger(port) || port <= 0 || port > 65535) {
+      return null;
+    }
+    return { location: forLocation, state: forState, challenge, port };
+  }
+
+  /** Finishes a desktop app's sign-in against *this* browser session.
+   *
+   *  By the time this runs the reader is already authenticated — that is how
+   *  execution got here, from `checkSession` after a valid session or from a
+   *  fresh login — so approving the device is just minting a code against
+   *  this session and handing it back to the app that asked for one. */
+  async function completeVpnConnect() {
+    const connect = state.vpnConnect;
+    state.view = "vpn-connect";
+    $("view-login").hidden = true;
+    $("view-invite").hidden = true;
+    $("view-console").hidden = true;
+    $("view-vpn-connect").hidden = false;
+
+    let reply;
+    try {
+      reply = await api("/api/vpn/authorize", {
+        method: "POST",
+        body: { location: connect.location, codeChallenge: connect.challenge },
+      });
+    } catch { vpnConnectFailed("cannot reach the server"); return; }
+
+    if (reply.status === 401) {
+      // The session lapsed between the redirect landing and this call. Send
+      // the reader to the ordinary door without dropping the app's request —
+      // `state.vpnConnect` survives, so logging back in resumes the handoff
+      // instead of stranding it on a dead screen.
+      showLogin("sign in to approve this device", { keep: true });
+      return;
+    }
+    if (reply.status !== 200 || !reply.body || typeof reply.body.code !== "string") {
+      vpnConnectFailed((reply.body && reply.body.error) || "could not approve this device");
+      return;
+    }
+
+    const callback = `http://127.0.0.1:${connect.port}/callback`
+      + `?code=${encodeURIComponent(reply.body.code)}`
+      + `&state=${encodeURIComponent(connect.state)}`;
+    state.vpnConnect = null;
+    location.href = callback;
+  }
+
+  /** Says why the device could not be approved. */
+  function vpnConnectFailed(text) {
+    $("vpn-connect-status").textContent = "This device could not be signed in.";
+    const line = $("vpn-connect-note");
+    line.textContent = text;
+    line.hidden = false;
+  }
+
   /** Opens the set-up screen for a code and names the person it was minted for.
    *
    *  The name is asked of the daemon rather than typed here, which is the whole
@@ -2817,6 +2893,7 @@ function boot() {
     state.invite = code;
     $("view-login").hidden = true;
     $("view-console").hidden = true;
+    $("view-vpn-connect").hidden = true;
     $("view-invite").hidden = false;
     // Read once, then gone: from here it lives in `state.invite` only.
     history.replaceState(null, "", location.pathname + location.search);
@@ -2959,6 +3036,11 @@ function boot() {
   async function checkSession() {
     const invitation = inviteCode();
     if (invitation) { showInvite(invitation); return; }
+    const connect = vpnConnectParams();
+    if (connect) {
+      state.vpnConnect = connect;
+      history.replaceState(null, "", location.pathname + location.search);
+    }
     try {
       const reply = await api("/api/session");
       if (reply.status === 200) { rememberUser(reply); enterConsole(); }
@@ -2993,6 +3075,7 @@ function boot() {
     clearTimeout(pollTimer);
     $("view-console").hidden = true;
     $("view-invite").hidden = true;
+    $("view-vpn-connect").hidden = true;
     $("view-login").hidden = false;
     const line = $("login-note");
     line.textContent = note;
@@ -3030,6 +3113,7 @@ function boot() {
     state.vocabulary = null;
     state.invites = undefined;
     state.invited = null;
+    state.vpnConnect = null;
     state.user = null;
     resetLogs("");
     firewallDrawn = "";
@@ -3039,10 +3123,12 @@ function boot() {
   }
 
   function enterConsole() {
+    if (state.vpnConnect) { completeVpnConnect(); return; }
     state.view = "console";
     state.link = "connecting";
     $("view-login").hidden = true;
     $("view-invite").hidden = true;
+    $("view-vpn-connect").hidden = true;
     $("view-console").hidden = false;
     showUser();
     render();

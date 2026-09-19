@@ -60,12 +60,15 @@ pub mod stream;
 pub mod token;
 pub mod upgrade;
 pub mod vpn_api;
+pub mod vpn_enroll;
 pub mod webauthn;
 
 use selfhost_firewall::Manager;
 use selfhost_git::{CredentialSource, Nudge};
 use selfhost_http::{Body, Method, Request, Response, Status};
-use selfhost_identity::{Caller, Capability, Grants, Opening, People, PersonName, Policy};
+use selfhost_identity::{
+    Caller, Capability, Grants, Opening, People, PersonName, Policy, VpnLocationId,
+};
 use selfhost_maintenance;
 
 /// What a deployment with no permission registry answers on every people route.
@@ -300,6 +303,17 @@ pub struct Api {
     /// provisioned, which is the honest report for a deployment nobody has
     /// pointed at its own `[[vpn]]` relays yet.
     vpn: Option<people_api::VpnWiring>,
+    /// Outstanding VPN sign-in authorizations: one-time, PKCE-bound codes
+    /// minted by `POST /api/vpn/authorize` for a console session that already
+    /// holds `vpn.access:<location>`, redeemed by `POST /api/vpn/enroll` from
+    /// the desktop app that opened that browser tab.
+    ///
+    /// Always constructed, unlike `vpn` above — this store grants nothing by
+    /// itself (see [`vpn_enroll`]'s module documentation) and needs no data
+    /// directory, so there is no "not wired yet" state for it to be absent
+    /// for. What still gates the door is `vpn` and the policy check in the
+    /// `/api/vpn/authorize` handler.
+    vpn_authorizations: vpn_enroll::Authorizations,
 }
 
 /// Cookie-session authentication, present once [`Api::with_console_auth`] has
@@ -529,6 +543,9 @@ enum Route<'a> {
     MaintenanceStatus,
     /// `POST /api/vpn/check-access`
     VpnCheckAccess,
+    /// `POST /api/vpn/authorize` — the console-session half of the VPN sign-in
+    /// exchange. See [`vpn_enroll`].
+    VpnAuthorize,
 }
 
 impl<'a> Route<'a> {
@@ -634,6 +651,7 @@ impl<'a> Route<'a> {
             (Method::Delete, ["api", "sites", name]) => Some(Self::SiteRemove(name)),
             (Method::Get, ["api", "maintenance", "status"]) => Some(Self::MaintenanceStatus),
             (Method::Post, ["api", "vpn", "check-access"]) => Some(Self::VpnCheckAccess),
+            (Method::Post, ["api", "vpn", "authorize"]) => Some(Self::VpnAuthorize),
             _ => None,
         }
     }
@@ -750,7 +768,16 @@ impl<'a> Route<'a> {
             // The vocabulary is a constant of the build, not a fact about this
             // deployment: it names the words that exist, never who holds one.
             // A client needs it to render a grant editor at all.
-            Self::Vocabulary | Self::WhoAmI => Demand::Authenticated,
+            //
+            // `VpnAuthorize` joins them for the same reason `WhoAmI` is not
+            // narrower than "signed in": every caller is allowed to *ask*
+            // whether they may sign a device in at some location, and the
+            // answer to that question is where the real capability check
+            // happens — against `Capability::VpnAccess(location)`, which
+            // depends on which location was asked for and so cannot be this
+            // match's fixed answer. A caller who holds nothing there is
+            // refused inside the handler, not by never reaching it.
+            Self::Vocabulary | Self::WhoAmI | Self::VpnAuthorize => Demand::Authenticated,
         }
     }
 }
@@ -910,6 +937,7 @@ impl Api {
             maintenance: None,
             image_store: images_api::ImageStore::new(),
             vpn: None,
+            vpn_authorizations: vpn_enroll::Authorizations::new(),
         }
     }
 
@@ -1353,6 +1381,25 @@ impl Api {
             };
         }
 
+        // The VPN sign-in door's second half sits ahead of the wall for a
+        // different reason than the invite and passkey-login doors above:
+        // those exist so a *browser with no credential yet* can get one; this
+        // exists so a process with no HTTP session at all — the desktop app,
+        // which authenticates over a loopback callback rather than a cookie
+        // — can redeem a code the browser half already vetted. No CSRF header
+        // is demanded, unlike every other POST out here: the CSRF check
+        // matters only when an ambient credential (a cookie) would otherwise
+        // ride along with a forged cross-site request, and this request
+        // carries no ambient credential — the code and PKCE verifier it
+        // presents *are* the credential, held only by the desktop process
+        // that generated them. See [`vpn_enroll`].
+        if path == "/api/vpn/enroll" {
+            if request.method != Method::Post {
+                return problem(Status(404), "no such endpoint");
+            }
+            return self.vpn_enroll(body);
+        }
+
         // WebDAV sits ahead of the wall because it has a door of its own, and it
         // has to: a Finder or a Windows mount speaks HTTP authentication or
         // nothing — no login form, no cookie, no bearer header it could be
@@ -1440,6 +1487,7 @@ impl Api {
             Route::SiteFileDelete(name) => self.sites_file_delete(name, query),
             Route::MaintenanceStatus => self.maintenance_status(),
             Route::VpnCheckAccess => vpn_api::check_access(self.people.as_ref(), body),
+            Route::VpnAuthorize => self.vpn_authorize(&caller, body),
         }
     }
 
@@ -1533,6 +1581,155 @@ impl Api {
             },
             Err(error) => problem(Status(500), &format!("could not save the registry: {error}")),
         }
+    }
+
+    /// Answers `POST /api/vpn/authorize`: the console-session half of a VPN
+    /// sign-in.
+    ///
+    /// `caller` is whoever the session cookie already names — the browser has
+    /// to be logged in to reach this at all, since [`Route::VpnAuthorize`]
+    /// demands [`Demand::Authenticated`]. What this adds on top is the one
+    /// check that demand cannot express: whether *this* identity may reach
+    /// the *specific* location the body asked for. A code is minted only when
+    /// [`Policy::decide`] already says yes — see [`vpn_enroll`]'s module
+    /// documentation for why that makes this route incapable of granting
+    /// anything new.
+    ///
+    /// Body: `{"location": "<vpn location id>", "codeChallenge": "<PKCE S256
+    /// challenge>"}`. The challenge is opaque to this handler — it is sealed
+    /// into the code and compared again at redemption, in
+    /// [`vpn_enroll::Authorizations::redeem`].
+    fn vpn_authorize(&self, caller: &Caller, body: &[u8]) -> Response {
+        let Some(vpn) = &self.vpn else {
+            return problem(Status(404), "no such endpoint");
+        };
+        let Ok(text) = std::str::from_utf8(body) else {
+            return problem(Status(400), "invalid UTF-8 in body");
+        };
+        let Ok(document) = selfhost_json::parse(text) else {
+            return problem(Status(400), "invalid JSON body");
+        };
+        let Some(location_text) = document.get("location").and_then(Json::as_str) else {
+            return problem(Status(400), "missing location");
+        };
+        let Ok(location) = VpnLocationId::parse(location_text) else {
+            return problem(Status(400), "not a usable VPN location id");
+        };
+        let Some(code_challenge) = document.get("codeChallenge").and_then(Json::as_str) else {
+            return problem(Status(400), "missing codeChallenge");
+        };
+        if !vpn.has_relay(location.as_str()) {
+            return problem(
+                Status(404),
+                "no such VPN location is configured on this deployment",
+            );
+        }
+        if !self.policy().decide(caller, &Capability::VpnAccess(location.clone())).is_allowed() {
+            return problem(
+                Status(403),
+                &format!(
+                    "this account does not hold vpn.access:{location}; ask the owner to grant \
+                     it before signing this device in"
+                ),
+            );
+        }
+        match self.vpn_authorizations.mint(
+            caller.identity().as_str(),
+            caller.credential(),
+            location.as_str(),
+            code_challenge,
+        ) {
+            Ok(code) => json(Status(200), Json::object([("code", Json::string(&code))])),
+            Err(refusal) => problem(Status(429), &refusal),
+        }
+    }
+
+    /// Answers `POST /api/vpn/enroll`: the desktop app's half of a VPN
+    /// sign-in, reached ahead of the authorisation wall — see the inline
+    /// routing in [`Api::handle`] and [`vpn_enroll`]'s module documentation
+    /// for why a process with no session can still reach this safely.
+    ///
+    /// Body: `{"code", "verifier", "peer", "public_key"}`. `peer` and
+    /// `public_key` are required here, unlike [`people_api::vpn_fields_from_body`]'s
+    /// use in `set_grants` — an admin may grant `vpn.access` before a device
+    /// exists to provision, but a desktop app presenting a sign-in code
+    /// always already generated the key it wants enrolled, and a response
+    /// that confirmed the account without writing a roster entry would just
+    /// be a more confusing way to say the same fields are missing.
+    ///
+    /// The code/verifier surface is what feeds [`FailureGate`]: guessing a
+    /// code is guessing a credential, the same as a password or a passkey
+    /// challenge. A body with a missing or malformed `peer`/`public_key`
+    /// is a caller bug, not a guess, so it is refused plainly and does not
+    /// touch the gate or spend the code.
+    fn vpn_enroll(&self, body: &[u8]) -> Response {
+        let Some(console) = &self.console else {
+            return problem(Status(404), "no such endpoint");
+        };
+        if console.gate.locked() {
+            return problem(Status(429), "too many failed attempts; try again shortly");
+        }
+        let Ok(text) = std::str::from_utf8(body) else {
+            console.gate.record_failure();
+            return problem(Status(401), "authorisation required");
+        };
+        let Ok(document) = selfhost_json::parse(text) else {
+            console.gate.record_failure();
+            return problem(Status(401), "authorisation required");
+        };
+        let Some(code) = document.get("code").and_then(Json::as_str) else {
+            console.gate.record_failure();
+            return problem(Status(401), "authorisation required");
+        };
+        let Some(verifier) = document.get("verifier").and_then(Json::as_str) else {
+            console.gate.record_failure();
+            return problem(Status(401), "authorisation required");
+        };
+        let (peer, public_key) = match people_api::vpn_fields_from_body(body) {
+            Ok((Some(peer), Some(public_key))) => (peer, public_key),
+            Ok(_) => {
+                return problem(Status(400), "peer and public_key are required to enrol a device");
+            }
+            Err(refusal) => return problem(Status(400), &refusal),
+        };
+        let authorized = match self.vpn_authorizations.redeem(code, verifier) {
+            Ok(authorized) => authorized,
+            Err(_) => {
+                console.gate.record_failure();
+                return problem(Status(401), "authorisation required");
+            }
+        };
+        console.gate.reset();
+        let Ok(location) = VpnLocationId::parse(&authorized.location) else {
+            return problem(Status(500), "the authorized location is no longer usable");
+        };
+        let after = Grants::new([Capability::VpnAccess(location.clone())]).expect("one grant");
+        let notes = self.vpn.as_ref().map_or_else(Vec::new, |vpn| {
+            vpn.side_effects(
+                &authorized.name,
+                &Grants::none(),
+                &after,
+                Some(&peer),
+                Some(&public_key),
+            )
+        });
+        let Ok(identity) = selfhost_identity::Identity::parse(&authorized.name) else {
+            return problem(Status(500), "the authorized identity is no longer usable");
+        };
+        self.record_authority(
+            &Caller::new(identity, authorized.credential, Grants::none()),
+            selfhost_identity::audit::Authority::VpnDeviceEnrolled,
+            &authorized.name,
+            format!("location:{location} peer:{peer}"),
+        );
+        json(
+            Status(200),
+            Json::object([
+                ("name", Json::string(&authorized.name)),
+                ("location", Json::string(location.as_str())),
+                ("notes", Json::array(notes.iter().map(Json::string))),
+            ]),
+        )
     }
 
     /// Answers `GET /api/sites`.
