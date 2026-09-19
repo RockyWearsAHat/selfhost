@@ -1178,6 +1178,18 @@ allowed_cidrs = ["10.66.0.0/24"]
         }
     }
 
+    #[test]
+    fn api_unavailable_indicates_bootstrap_vs_rejection() {
+        // The distinction between daemon absent (bootstrap fallback) and daemon
+        // present but rejecting (error) is critical to correct behavior.
+        // DaemonAbsent = try direct write; DaemonRejected = error, no fallback.
+        let absent = ApiUnavailable::DaemonAbsent;
+        let rejected = ApiUnavailable::DaemonRejected;
+        assert_ne!(absent, rejected, "the two cases must be distinct");
+        assert_eq!(absent, ApiUnavailable::DaemonAbsent);
+        assert_eq!(rejected, ApiUnavailable::DaemonRejected);
+    }
+
     /// A config declaring one `[[vpn]]` relay named "console", disabled — the
     /// side effects under test only resolve a key directory, they never start
     /// anything, so an enabled relay's roster-non-empty requirement would just
