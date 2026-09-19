@@ -3764,7 +3764,7 @@ mod tests {
         upstream_port: u16,
     ) -> (Server, selfhost_admin::site_pass::SitePasses) {
         let mut auth = site("auth", &["auth.example.com"]);
-        auth.public_api_paths = vec!["/api/pass/authorize".into()];
+        auth.public_api_paths = selfhost_config::PUBLIC_AUTH_PATHS.iter().map(|s| (*s).to_string()).collect();
         let mut blog = site("blog", &["blog.example.com"]);
         blog.exposure = Some(selfhost_config::Exposure::People);
         blog.static_root = None;

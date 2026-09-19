@@ -57,6 +57,17 @@ pub use validate::{ConfigError, Problem};
 // `vpn::Relay` — which is also how the section is spelled in the config file.
 pub use vpn::{Backend, Peer};
 
+/// The public API paths that are auto-configured for the auth site.
+///
+/// Every deployment has an auth site that relays these paths to the admin API,
+/// so a first-time visitor can sign in and enroll in the VPN without needing
+/// a session or VPN access yet. This list must include `/api/pass/authorize`,
+/// which every gated (people/private) site's sign-in depends on.
+///
+/// Kept as one list so a change is reflected everywhere at once: tests, the
+/// init command, and any site that needs these paths.
+pub const PUBLIC_AUTH_PATHS: &[&str] = &["/api/session", "/api/vpn/authorize", "/api/pass/authorize"];
+
 /// A complete deployment.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {

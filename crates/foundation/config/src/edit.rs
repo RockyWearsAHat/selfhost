@@ -732,15 +732,15 @@ role = \"owner\"
         }
     }
 
-    /// A site that relays `/api/pass/authorize`, the one path a `people`- or
-    /// `private`-gated site's sign-in depends on — see `validate.rs`'s whole-config
-    /// check. Tests that set a gated `exposure` need one of these present, exactly
-    /// as a real deployment would need its own auth site configured, or validation
-    /// (which every one of these edit functions runs before returning) refuses the
-    /// result.
+    /// A site that relays the public auth paths, including `/api/pass/authorize`,
+    /// which every `people`- or `private`-gated site's sign-in depends on — see
+    /// `validate.rs`'s whole-config check. Tests that set a gated `exposure` need
+    /// one of these present, exactly as a real deployment would need its own auth
+    /// site configured, or validation (which every one of these edit functions runs
+    /// before returning) refuses the result.
     fn auth_site() -> Site {
         let mut site = static_site("auth", "auth.example.com");
-        site.public_api_paths = vec!["/api/pass/authorize".into()];
+        site.public_api_paths = crate::PUBLIC_AUTH_PATHS.iter().map(|s| (*s).to_string()).collect();
         site
     }
 
