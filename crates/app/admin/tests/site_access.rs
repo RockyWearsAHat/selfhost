@@ -282,7 +282,7 @@ async fn an_agent_with_the_same_name_as_a_site_owner_gets_none_of_their_authorit
     let dir = box_.dir.clone();
     let agents = selfhost_admin::agent_store::AgentStore::in_dir(&dir);
     let agent_name = selfhost_identity::AgentName::parse("carol").expect("a valid agent name");
-    let minted = agents.mint(&agent_name, Grants::none(), "bob").expect("mints");
+    let minted = agents.mint(&agent_name, Grants::none(), &selfhost_identity::PersonName::parse("bob").expect("a name")).expect("mints");
 
     let body = r#"{"grants":["site.access:blog"]}"#;
     let text = format!(

@@ -550,16 +550,13 @@ pub fn whoami_json(caller: &Caller, agents: Option<&crate::agent_store::AgentSto
         ("grants", grants_json(caller.grants())),
     ];
 
-    // If this is an agent, include the person it belongs to by looking up the
-    // agent in the store and extracting its person association.
+    // An Agent also names the Person it acts for.
     if let selfhost_identity::Identity::Agent(name) = caller.identity() {
-        if let Some(agent_store) = agents {
-            for (agent_name, _, _, person) in agent_store.list() {
-                if agent_name == *name {
-                    fields.push(("person", Json::string(&person)));
-                    break;
-                }
-            }
+        let person = agents
+            .and_then(|store| store.list().into_iter().find(|agent| &agent.name == name))
+            .and_then(|agent| agent.person);
+        if let Some(person) = person {
+            fields.push(("person", Json::string(person.as_str())));
         }
     }
 

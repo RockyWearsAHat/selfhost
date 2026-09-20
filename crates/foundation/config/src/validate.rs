@@ -629,27 +629,74 @@ impl Config {
             }
         }
 
-        // A `people`- or `private`-gated site is reached through a signed Pass, and a
-        // Pass is only ever minted by `/api/pass/authorize` — so a deployment that
-        // gates a site but never relays that one path has built a lock with no key:
-        // the proxy will 302 a visitor to sign in, and every sign-in attempt will 404.
+        // A `people`- or `private`-gated Site is reached through a signed Pass, and
+        // getting one takes every path in `PUBLIC_AUTH_PATHS`: sign in
+        // (`/api/session`), be passed to the Site (`/api/pass/authorize`), enrol a
+        // Peer for a `private` one (`/api/vpn/authorize`). A deployment that gates a
+        // Site but relays only some of them has built a lock with part of a key: the
+        // proxy 302s a visitor to sign in and the missing step 404s. One Site — the
+        // auth site — must relay them all.
         use crate::Exposure;
-        if self
+        let gated = self
             .sites
             .iter()
-            .any(|site| matches!(site.exposure, Some(Exposure::People) | Some(Exposure::Private)))
-            && !self
+            .any(|site| matches!(site.exposure, Some(Exposure::People) | Some(Exposure::Private)));
+        if gated {
+            let missing_from = |site: &crate::Site| -> Vec<&str> {
+                crate::PUBLIC_AUTH_PATHS
+                    .iter()
+                    .copied()
+                    .filter(|path| !site.permits_public_api_path(path))
+                    .collect()
+            };
+            // The Site that relays the most of them is the auth site the message names.
+            let closest = self
                 .sites
                 .iter()
-                .any(|site| site.public_api_paths.iter().any(|p| p == "/api/pass/authorize"))
-        {
-            problems.push(Problem {
-                field: "sites".into(),
-                message: "a site is exposure = \"people\" or \"private\", but no site's \
-                          public_api_paths lists /api/pass/authorize; nobody could ever sign in \
-                          to reach it"
-                    .into(),
-            });
+                .enumerate()
+                .filter(|(_, site)| !site.public_api_paths.is_empty())
+                .map(|(i, site)| (i, missing_from(site)))
+                .min_by_key(|(_, missing)| missing.len());
+            match closest {
+                Some((_, missing)) if missing.is_empty() => {}
+                Some((i, missing)) => problems.push(Problem {
+                    field: format!("sites[{i}].public_api_paths"),
+                    message: format!(
+                        "a site is exposure = \"people\" or \"private\", but this auth site does \
+                         not relay {}; sign-in would 404 at that step. It must list all of: {}",
+                        missing.join(", "),
+                        crate::PUBLIC_AUTH_PATHS.join(", ")
+                    ),
+                }),
+                None => problems.push(Problem {
+                    field: "sites".into(),
+                    message: format!(
+                        "a site is exposure = \"people\" or \"private\", but no site's \
+                         public_api_paths relays the sign-in paths ({}); nobody could ever \
+                         sign in to reach it",
+                        crate::PUBLIC_AUTH_PATHS.join(", ")
+                    ),
+                }),
+            }
+        }
+
+        // A Site's `relay` names one of this deployment's `[[vpn]]` relays. A name
+        // that matches none is a Site no Peer can ever reach, and a phantom entry in
+        // every "which relays may you use" answer.
+        for (i, site) in self.sites.iter().enumerate() {
+            if let Some(relay) = site.relay_name() {
+                if !self.vpn.iter().any(|configured| configured.name == relay) {
+                    let known: Vec<&str> = self.vpn.iter().map(|configured| configured.name.as_str()).collect();
+                    problems.push(Problem {
+                        field: format!("sites[{i}].relay"),
+                        message: if known.is_empty() {
+                            format!("relay \"{relay}\" is named, but this deployment declares no [[vpn]] relay")
+                        } else {
+                            format!("no [[vpn]] relay is named \"{relay}\"; the relays are: {}", known.join(", "))
+                        },
+                    });
+                }
+            }
         }
     }
 
@@ -1278,6 +1325,39 @@ mod tests {
         let mut auth = site("auth", "auth.example.com");
         auth.public_api_paths = vec!["/api/session".into(), "/api/vpn/authorize".into()];
         assert!(config(vec![owner_node()], vec![auth]).validate().is_ok());
+    }
+
+    /// A `people`-gated Site beside an auth site relaying `paths`.
+    fn gated_with_auth_paths(paths: &[&str]) -> Vec<Problem> {
+        let mut auth = site("auth", "auth.example.com");
+        auth.public_api_paths = paths.iter().map(|path| (*path).to_owned()).collect();
+        let mut gated = site("family", "family.example.com");
+        gated.exposure = Some(crate::Exposure::People);
+        problems_of(&config(vec![owner_node()], vec![auth, gated]))
+    }
+
+    #[test]
+    fn a_gated_site_needs_every_sign_in_path_relayed_not_just_the_pass() {
+        // Regression: only /api/pass/authorize was demanded, so an old config
+        // listing just that one validated and then 404ed /api/session.
+        let problems = gated_with_auth_paths(&["/api/pass/authorize"]);
+        let problem = problems
+            .iter()
+            .find(|p| p.field == "sites[0].public_api_paths")
+            .unwrap_or_else(|| panic!("{problems:?}"));
+        assert!(problem.message.contains("/api/session"), "{problem:?}");
+        assert!(problem.message.contains("/api/vpn/authorize"), "{problem:?}");
+
+        assert!(gated_with_auth_paths(crate::PUBLIC_AUTH_PATHS).is_empty());
+        assert!(gated_with_auth_paths(&[]).iter().any(|p| p.field == "sites"));
+    }
+
+    #[test]
+    fn a_site_relay_must_name_a_configured_vpn_relay() {
+        let mut private = site("lab", "lab.example.com");
+        private.relay = Some("office".into());
+        let problems = problems_of(&config(vec![owner_node()], vec![private]));
+        assert!(problems.iter().any(|p| p.field == "sites[0].relay"), "{problems:?}");
     }
 
     #[test]

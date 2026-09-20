@@ -24,7 +24,8 @@
 //! and immediately revokes every session that still holds it.
 
 use selfhost_admin::agent_store::{self, AgentStore};
-use selfhost_identity::{AgentName, Grants};
+use crate::arguments::value_of;
+use selfhost_identity::{AgentName, Grants, People, PersonName};
 use std::path::Path;
 
 /// The words this command accepts after `agent`, and what each one is for.
@@ -32,8 +33,9 @@ pub const USAGE: &str = "\
 Usage
   selfhost agent add <name> --person <name> --grant <cap>[,<cap>]...
                                  Mint a scoped credential for a trusted machine,
-                                 associated with a Person account, and print its
-                                 token exactly once. Running this again for the
+                                 acting for one registered Person and never
+                                 holding more than they do, and print its token
+                                 exactly once. Running this again for the
                                  same name replaces its token and grants,
                                  revoking whatever it held before.
   selfhost agent list            Every agent, what it holds, its owner Person,
@@ -55,7 +57,7 @@ or anywhere this shell's history keeps it.
 pub fn run(arguments: &[String], data_dir: &Path) -> Result<(), String> {
     let store = AgentStore::in_dir(data_dir);
     match arguments.get(1).map(String::as_str) {
-        Some("add") => add(arguments, &store),
+        Some("add") => add(arguments, &store, &selfhost_admin::people_registry(data_dir)),
         Some("list") => list(&store),
         Some("revoke") => revoke(arguments, &store),
         Some(other) => Err(format!("unknown agent subcommand \"{other}\"\n\n{USAGE}")),
@@ -64,15 +66,16 @@ pub fn run(arguments: &[String], data_dir: &Path) -> Result<(), String> {
 }
 
 /// `selfhost agent add <name> --person <name> --grant <cap>[,<cap>]...`
-fn add(arguments: &[String], store: &AgentStore) -> Result<(), String> {
+fn add(arguments: &[String], store: &AgentStore, people: &People) -> Result<(), String> {
     let name = arguments
         .get(2)
         .filter(|word| !word.starts_with("--"))
         .ok_or_else(|| format!("agent add needs a name: `selfhost agent add <name> --person <name> --grant <cap>...`\n\n{USAGE}"))?;
     let name = AgentName::parse(name).map_err(|error| error.to_string())?;
 
-    let person = person_name(arguments)
+    let person = value_of(arguments, "--person")
         .ok_or_else(|| format!("agent add needs a --person: `selfhost agent add <name> --person <name> --grant <cap>...`\n\n{USAGE}"))?;
+    let person = PersonName::parse(&person).map_err(|error| error.to_string())?;
 
     let words = grant_words(arguments);
     if words.is_empty() {
@@ -86,6 +89,8 @@ fn add(arguments: &[String], store: &AgentStore) -> Result<(), String> {
     }
     let grants = Grants::new(capabilities).map_err(|error| error.to_string())?;
 
+    agent_store::check_mint(people, &person, &grants).map_err(|error| error.to_string())?;
+
     let minted = store.mint(&name, grants, &person).map_err(|error| format!("could not save the agent store: {error}"))?;
     println!("✓ minted an agent named \"{name}\" for Person \"{person}\", granted: {}", words.join(", "));
     println!();
@@ -95,16 +100,6 @@ fn add(arguments: &[String], store: &AgentStore) -> Result<(), String> {
     println!("  export SELFHOST_AGENT_TOKEN={}", minted.as_str());
     println!("or write it to ~/.selfhost/agent-token, owner-readable only.");
     Ok(())
-}
-
-/// Extract the `--person` value from arguments.
-fn person_name(arguments: &[String]) -> Option<String> {
-    for (i, argument) in arguments.iter().enumerate() {
-        if argument == "--person" {
-            return arguments.get(i + 1).cloned();
-        }
-    }
-    None
 }
 
 /// Every `--grant` value, allowing the flag to repeat and each occurrence to
@@ -129,13 +124,17 @@ fn list(store: &AgentStore) -> Result<(), String> {
         println!("no agents enrolled — add one with `selfhost agent add <name> --person <name> --grant <cap>`");
         return Ok(());
     }
-    let name_width = agents.iter().map(|(name, _, _, _)| name.as_str().len()).max().unwrap_or(4).max(4);
-    let person_width = agents.iter().map(|(_, _, _, person)| person.len()).max().unwrap_or(6).max(6);
-    println!("  {:<name_width$}  {:<person_width$}  GRANTS", "NAME", "PERSON");
-    for (name, grants, _created_unix, person) in &agents {
-        let words: Vec<String> = grants.iter().map(selfhost_admin::people_api::wire_word).collect();
+    let person_of = |agent: &agent_store::Agent| match &agent.person {
+        Some(person) => person.to_string(),
+        None => "(none — re-mint with --person; holds nothing)".to_owned(),
+    };
+    let name_width = agents.iter().map(|agent| agent.name.as_str().len()).max().unwrap_or(4).max(4);
+    let person_width = agents.iter().map(|agent| person_of(agent).len()).max().unwrap_or(6).max(6);
+    println!("  {:<name_width$}  {:<person_width$}  GRANTS (capped by the Person's own)", "NAME", "PERSON");
+    for agent in &agents {
+        let words: Vec<String> = agent.grants.iter().map(selfhost_admin::people_api::wire_word).collect();
         let rendered = if words.is_empty() { "(nothing)".to_owned() } else { words.join(", ") };
-        println!("  {:<name_width$}  {:<person_width$}  {rendered}", name.as_str(), person);
+        println!("  {:<name_width$}  {:<person_width$}  {rendered}", agent.name.as_str(), person_of(agent));
     }
     Ok(())
 }
@@ -167,20 +166,65 @@ mod tests {
         path
     }
 
+    /// A scratch data dir in which `names` are registered People holding
+    /// `site.admin` and `console.read`.
+    fn scratch_with_people(name: &str, names: &[&str]) -> std::path::PathBuf {
+        let dir = scratch(name);
+        let people = selfhost_admin::people_registry(&dir);
+        for person in names {
+            people
+                .set_grants(
+                    &PersonName::parse(person).unwrap(),
+                    Grants::new([
+                        selfhost_identity::Capability::SiteAdmin,
+                        selfhost_identity::Capability::ConsoleRead,
+                    ])
+                    .unwrap(),
+                )
+                .unwrap();
+        }
+        dir
+    }
+
+    #[test]
+    fn an_agent_for_an_unknown_person_is_refused() {
+        let dir = scratch("unknown-person");
+        let error = run(&args(&["agent", "add", "ci-bot", "--person", "nonexistent-person", "--grant", "site.admin"]), &dir)
+            .unwrap_err();
+        assert!(error.contains("not a registered Person"), "{error}");
+        assert!(AgentStore::in_dir(&dir).list().is_empty());
+    }
+
+    #[test]
+    fn an_agent_may_not_hold_more_than_its_person() {
+        let dir = scratch_with_people("beyond", &["intern"]);
+        let error = run(&args(&["agent", "add", "bot", "--person", "intern", "--grant", "site.admin,dns.admin"]), &dir)
+            .unwrap_err();
+        assert!(error.contains("dns.admin") && !error.contains("site.admin,"), "{error}");
+        assert!(AgentStore::in_dir(&dir).list().is_empty());
+    }
+
+    #[test]
+    fn a_person_name_is_validated_like_every_other() {
+        let dir = scratch("bad-person");
+        let error = run(&args(&["agent", "add", "bot", "--person", "owner", "--grant", "site.admin"]), &dir).unwrap_err();
+        assert!(error.contains("may not name a person"), "{error}");
+    }
+
     fn args(list: &[&str]) -> Vec<String> {
         list.iter().map(|s| (*s).to_owned()).collect()
     }
 
     #[test]
     fn adding_an_agent_then_listing_it_shows_its_grants_and_person() {
-        let dir = scratch("add-list");
+        let dir = scratch_with_people("add-list", &["Alex"]);
         run(&args(&["agent", "add", "claude-mac", "--person", "Alex", "--grant", "site.admin"]), &dir).expect("mints");
         let store = AgentStore::in_dir(&dir);
         let listed = store.list();
         assert_eq!(listed.len(), 1);
-        assert_eq!(listed[0].0.as_str(), "claude-mac");
-        assert_eq!(listed[0].3.as_str(), "Alex");
-        assert!(listed[0].1.holds(&selfhost_identity::Capability::SiteAdmin));
+        assert_eq!(listed[0].name.as_str(), "claude-mac");
+        assert_eq!(listed[0].person.as_ref().map(PersonName::as_str), Some("Alex"));
+        assert!(listed[0].grants.holds(&selfhost_identity::Capability::SiteAdmin));
     }
 
     #[test]
@@ -192,7 +236,7 @@ mod tests {
 
     #[test]
     fn adding_with_no_grant_is_refused() {
-        let dir = scratch("no-grant");
+        let dir = scratch_with_people("no-grant", &["Alex"]);
         let error = run(&args(&["agent", "add", "claude-mac", "--person", "Alex"]), &dir).unwrap_err();
         assert!(error.contains("--grant"), "{error}");
     }
@@ -206,7 +250,7 @@ mod tests {
 
     #[test]
     fn revoking_a_real_agent_removes_it() {
-        let dir = scratch("revoke-real");
+        let dir = scratch_with_people("revoke-real", &["Alex"]);
         run(&args(&["agent", "add", "claude-mac", "--person", "Alex", "--grant", "site.admin"]), &dir).expect("mints");
         run(&args(&["agent", "revoke", "claude-mac"]), &dir).expect("revokes");
         assert!(AgentStore::in_dir(&dir).list().is_empty());
@@ -214,20 +258,20 @@ mod tests {
 
     #[test]
     fn a_repeat_mint_replaces_the_previous_token_and_can_change_person() {
-        let dir = scratch("remint");
+        let dir = scratch_with_people("remint", &["Alex", "Claude"]);
         run(&args(&["agent", "add", "claude-mac", "--person", "Alex", "--grant", "site.admin"]), &dir).expect("mints");
         let store = AgentStore::in_dir(&dir);
-        let first_grants = store.list()[0].1.clone();
+        let first_grants = store.list()[0].grants.clone();
         assert!(first_grants.holds(&selfhost_identity::Capability::SiteAdmin));
-        assert_eq!(store.list()[0].3, "Alex");
+        assert_eq!(store.list()[0].person.as_ref().map(PersonName::as_str), Some("Alex"));
 
         // Re-minting under the same name is what the module documentation
         // promises: the old token stops working, the new grants take over.
         run(&args(&["agent", "add", "claude-mac", "--person", "Claude", "--grant", "console.read"]), &dir).expect("re-mints");
         let listed = store.list();
         assert_eq!(listed.len(), 1, "the same name, not a second entry");
-        assert!(listed[0].1.holds(&selfhost_identity::Capability::ConsoleRead));
-        assert!(!listed[0].1.holds(&selfhost_identity::Capability::SiteAdmin));
-        assert_eq!(listed[0].3, "Claude");
+        assert!(listed[0].grants.holds(&selfhost_identity::Capability::ConsoleRead));
+        assert!(!listed[0].grants.holds(&selfhost_identity::Capability::SiteAdmin));
+        assert_eq!(listed[0].person.as_ref().map(PersonName::as_str), Some("Claude"));
     }
 }

@@ -649,6 +649,38 @@ enum Route<'a> {
     VpnPeers,
 }
 
+/// The `[[vpn]]` relay a network-gated Site is reached through, out of the
+/// deployment's configured `relays`: the one its `relay` names, or the only
+/// relay there is. The single statement of the Site-to-relay rule.
+///
+/// A `relay` naming nothing configured maps to no relay at all — config
+/// validation refuses such a Site, and a stale one must not surface here as a
+/// phantom choice.
+fn relay_of_site<'a>(site: &selfhost_config::Site, relays: &[&'a str]) -> Option<&'a str> {
+    match site.relay_name() {
+        Some(named) => relays.iter().copied().find(|relay| *relay == named),
+        None => match relays {
+            [only] => Some(only),
+            _ => None,
+        },
+    }
+}
+
+/// A Person's name as it arrived in a path segment, percent-decoded once.
+///
+/// A [`PersonName`] may contain a space ("Jane Doe", "J. Alex"), which a
+/// request line cannot carry raw, so every face encodes the segment
+/// ([`selfhost_http::percent::encode_segment`]) and this is the one place it is
+/// decoded — before any people handler sees it.
+fn person_segment(segment: &str) -> Option<String> {
+    selfhost_http::percent::decode_segment(segment)
+}
+
+/// The refusal for a people path segment that does not decode.
+fn bad_person_segment() -> Response {
+    problem(Status(400), "not a usable person name")
+}
+
 impl<'a> Route<'a> {
     /// The route named by a method and a split path, or `None` for anything
     /// this API does not serve.
@@ -1666,11 +1698,23 @@ impl Api {
             Route::WhoAmI => json(Status(200), people_api::whoami_json(&caller, self.agents.as_ref())),
             Route::Vocabulary => json(Status(200), people_api::vocabulary_json()),
             Route::ListPeople => self.list_people(),
-            Route::SetGrants(name) => self.set_grants(&caller, name, body).await,
-            Route::ForgetPerson(name) => self.forget_person(&caller, name),
-            Route::MintInvite(name) => self.mint_invite(&caller, name, body),
+            Route::SetGrants(name) => match person_segment(name) {
+                Some(name) => self.set_grants(&caller, &name, body).await,
+                None => bad_person_segment(),
+            },
+            Route::ForgetPerson(name) => match person_segment(name) {
+                Some(name) => self.forget_person(&caller, &name),
+                None => bad_person_segment(),
+            },
+            Route::MintInvite(name) => match person_segment(name) {
+                Some(name) => self.mint_invite(&caller, &name, body),
+                None => bad_person_segment(),
+            },
             Route::ListInvites => self.list_invites(),
-            Route::RevokeInvite(name) => self.revoke_invite(&caller, name),
+            Route::RevokeInvite(name) => match person_segment(name) {
+                Some(name) => self.revoke_invite(&caller, &name),
+                None => bad_person_segment(),
+            },
             Route::Sites => self.sites_list(),
             Route::SiteShow(name) => self.sites_show(name),
             Route::SiteAdd => self.sites_add(body),
@@ -2040,18 +2084,13 @@ impl Api {
         }
 
         // Add relays that gate sites this caller has access to
+        let relays = vpn.relay_names();
         for site in self.configured_sites() {
-            if !site.is_network_gated() || site.console {
+            if !site.is_network_gated() || site.console || !self.may_reach_site(caller, &site) {
                 continue;
             }
-            if !self.may_reach_site(caller, &site) {
-                continue;
-            }
-            if let Some(relay_name) = site.relay_name() {
-                accessible_relays.insert(relay_name.to_owned());
-            } else if vpn.relay_names().len() == 1 {
-                // Default to the single relay if not explicitly named
-                accessible_relays.insert(vpn.relay_names()[0].to_owned());
+            if let Some(relay) = relay_of_site(&site, &relays) {
+                accessible_relays.insert(relay.to_owned());
             }
         }
 
@@ -2129,27 +2168,11 @@ impl Api {
                 "no such VPN location is configured on this deployment",
             );
         }
-        // Check if the caller can access this specific relay. Two ways in:
-        // 1. An explicit vpn.access grant for this relay, OR
-        // 2. A grant on any site that maps to this relay (via site.access).
-        let can_access_relay = self.policy()
-            .decide(caller, &Capability::VpnAccess(location.clone()))
-            .is_allowed()
-            || self.configured_sites().iter().any(|site| {
-                if !site.is_network_gated() || site.console {
-                    return false;
-                }
-                // Check if this site gates the requested relay
-                let site_gates_relay = if let Some(relay_name) = site.relay_name() {
-                    relay_name == location.as_str()
-                } else if vpn.relay_names().len() == 1 {
-                    // Site defaults to single relay
-                    site.relay.is_none() && location.as_str() == vpn.relay_names()[0]
-                } else {
-                    false
-                };
-                site_gates_relay && self.may_reach_site(caller, &site)
-            });
+        // One rule, one place: the relays a caller may name are exactly the
+        // ones `relays_accessible_to` lists — what the picker shows is what
+        // this authorises, by construction.
+        let can_access_relay =
+            self.relays_accessible_to(caller).iter().any(|relay| relay == location.as_str());
 
         if !can_access_relay {
             return problem(
@@ -2387,6 +2410,16 @@ impl Api {
         let Ok(person) = PersonName::parse(name) else {
             return problem(Status(400), "not a usable person name");
         };
+        // Agents first: if this write fails the Person is still there to retry
+        // against, whereas the other order could leave a live Agent credential
+        // whose Person is gone. (Such an Agent would hold nothing anyway — see
+        // `Agent::effective_grants` — but a forgotten Person's credentials
+        // should not linger in the store to be re-animated by a namesake.)
+        if let Some(agents) = &self.agents {
+            if let Err(error) = agents.revoke_for_person(&person) {
+                return problem(Status(500), &format!("could not revoke this Person's Agents: {error}"));
+            }
+        }
         match people.remove(&person) {
             Ok(true) => {
                 self.record_authority(
@@ -2677,7 +2710,10 @@ impl Api {
         let rest = presented.strip_prefix("agent:")?;
         let (name, secret) = rest.split_once(':')?;
         let name = selfhost_identity::AgentName::parse(name).ok()?;
-        let grants = agents.verify(&name, secret)?;
+        // An Agent is confined to its Person: what it may do is what it was
+        // minted with, narrowed to what that Person holds right now. With no
+        // People registry there is no Person to act for, so no Agent either.
+        let grants = agents.verify(&name, secret)?.effective_grants(self.people.as_ref()?);
         Some((name, grants))
     }
 
@@ -2738,9 +2774,9 @@ impl Api {
             return Some(Caller::bearer());
         }
         if let Some((name, grants)) = self.agent_authorised(request) {
-            // An agent's caller holds exactly what `console.agents` granted it
-            // — never the machine's fixed list, never the owner's blanket
-            // allow. See `agent_store` and `Policy::decide`'s step 6.
+            // An Agent's caller holds what `console.agents` granted it, capped
+            // by its Person's current Grants — never the machine's fixed list,
+            // never the owner's blanket allow. See `agent_store::Agent::effective_grants`.
             return Some(Caller::agent(name, grants));
         }
         let console = self.console.as_ref()?;
@@ -4833,6 +4869,30 @@ async fn write_response(stream: &mut TcpStream, response: &Response) -> std::io:
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_sites_relay_is_the_configured_one_it_names_or_the_only_one() {
+        // Regression: the accessible-relays listing and the authorise check
+        // each spelled this rule themselves, and neither filtered a stale
+        // `relay` against the configured relays, so a phantom relay surfaced.
+        // Built by mutation: config validation refuses a stale `relay`, and
+        // this rule must hold for one that got past it anyway.
+        let site = |relay: Option<&str>| {
+            let text = "version = 1\n[server]\nhttp_bind = \"127.0.0.1:8080\"\nhttps_bind = \"127.0.0.1:8443\"\n\
+                 acme_email = \"a@b.com\"\nacme = \"self-signed\"\ndata_dir = \"./data\"\n\
+                 [[nodes]]\nname = \"home\"\nrole = \"owner\"\n\
+                 [[sites]]\nname = \"lab\"\ndomains = [\"lab.example.com\"]\nstatic_root = \"./s\"\n";
+            let mut site = selfhost_config::Config::parse(text).expect("parses").sites.remove(0);
+            site.relay = relay.map(str::to_owned);
+            site
+        };
+        assert_eq!(super::relay_of_site(&site(Some("office")), &["office", "clientb"]), Some("office"));
+        assert_eq!(super::relay_of_site(&site(Some("gone")), &["office", "clientb"]), None, "no phantom relay");
+        assert_eq!(super::relay_of_site(&site(Some("gone")), &["office"]), None, "nor a silent re-map");
+        assert_eq!(super::relay_of_site(&site(None), &["office"]), Some("office"));
+        assert_eq!(super::relay_of_site(&site(None), &["office", "clientb"]), None);
+        assert_eq!(super::relay_of_site(&site(None), &[]), None);
+    }
+
     use super::*;
 
     /// The whole upgrade routing table, which is the thing that was wrong.
@@ -4933,7 +4993,7 @@ mod tests {
              name = \"auth\"\n\
              domains = [\"auth.example.com\"]\n\
              static_root = \"./sites/auth\"\n\
-             public_api_paths = [\"/api/pass/authorize\"]\n",
+             public_api_paths = [\"/api/session\", \"/api/pass/authorize\", \"/api/vpn/authorize\"]\n",
         )
         .unwrap();
         let config =

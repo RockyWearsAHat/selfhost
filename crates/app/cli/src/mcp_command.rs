@@ -51,6 +51,8 @@
 //! panic — this process is meant to run for the life of an agent's session,
 //! and one bad request must not end it.
 
+use crate::arguments::value_of;
+use selfhost_http::percent::encode_segment as encode;
 use crate::remote_client::{Remote, RemoteClient};
 use selfhost_json::Json;
 use std::io::{BufRead, Write};
@@ -472,11 +474,6 @@ pub fn run(arguments: &[String]) -> Result<(), String> {
 
     eprintln!("selfhost mcp: ready, talking to {host}");
     runtime.block_on(serve(&client))
-}
-
-/// The value immediately following the first occurrence of `name`.
-fn value_of(arguments: &[String], name: &str) -> Option<String> {
-    arguments.iter().position(|argument| argument == name).and_then(|at| arguments.get(at + 1)).cloned()
 }
 
 /// The stdin-read, dispatch, stdout-write loop. Runs until stdin closes.
@@ -1346,26 +1343,6 @@ fn collect(
         }
     }
     Ok(())
-}
-
-/// Percent-encodes one path segment or query value for a request line.
-///
-/// Deliberately conservative — everything outside `[A-Za-z0-9._~-]` is
-/// escaped, well past what any of these fields actually need — because the
-/// cost of over-escaping is a slightly longer request line and the cost of
-/// under-escaping is a byte that changes which route this reaches. The far
-/// side's own resolver (`selfhost_storage::path::resolve`) fully
-/// percent-decodes and re-validates every one of these regardless, so this
-/// encoder's only job is getting the bytes there intact.
-fn encode(text: &str) -> String {
-    let mut out = String::with_capacity(text.len());
-    for byte in text.bytes() {
-        match byte {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'.' | b'_' | b'~' | b'-' => out.push(byte as char),
-            _ => out.push_str(&format!("%{byte:02X}")),
-        }
-    }
-    out
 }
 
 /// Decodes a base64 string, for binary `sites_upload_file` content.
