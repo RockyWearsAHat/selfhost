@@ -861,6 +861,33 @@ async fn watch_dns(bind: SocketAddr, upstream: SocketAddr) -> Result<(), String>
 fn daemon_command(arguments: &[String]) -> Result<(), String> {
     let (config, project_dir) = load()?;
     let config_path = project_dir.join(CONFIG_FILENAME);
+
+    // Everything from here down runs unattended, possibly for months, with
+    // nobody's terminal reading its stderr — see `install_startup_crash_log`.
+    // The config parsed, so its data_dir is known even if a later step
+    // (an unparsable --bind, a port already in use, a panic deep in
+    // `serve_everything`) is what actually stops the daemon: whatever it is,
+    // it belongs in the same log an operator already knows to look in.
+    let data_dir = teardown::data_dir(&config, &project_dir);
+    install_startup_crash_log(data_dir.clone());
+
+    let result = run_daemon(arguments, config, project_dir, config_path);
+    if let Err(message) = &result {
+        append_startup_log(&data_dir, message);
+    }
+    result
+}
+
+/// The part of [`daemon_command`] that can still fail after the
+/// startup-crash log is already installed, kept separate so every one of
+/// those failures — not just the ones inside `serve_everything` — is
+/// guaranteed to pass back through its caller's `append_startup_log`.
+fn run_daemon(
+    arguments: &[String],
+    config: Config,
+    project_dir: PathBuf,
+    config_path: PathBuf,
+) -> Result<(), String> {
     let bind = value_of(arguments, "--bind").unwrap_or_else(|| config.server.admin_bind.clone());
     let address: SocketAddr = bind.parse().map_err(|e| format!("--bind {bind}: {e}"))?;
 
@@ -870,6 +897,61 @@ fn daemon_command(arguments: &[String]) -> Result<(), String> {
         .map_err(|e| format!("could not start the async runtime: {e}"))?;
 
     runtime.block_on(serve_everything(config, project_dir, config_path, address))
+}
+
+/// The file a fatal daemon exit is recorded to, in the data directory, in
+/// addition to stderr.
+///
+/// Stderr is not a reliable diagnostic on every platform this runs on: a
+/// Windows Scheduled Task run without the keep-alive wrapper's own
+/// `>> ...\data\selfhost-daemon.log 2>&1` redirection has no console at all, a
+/// systemd journal can be rotated away, and an operator testing a fresh build
+/// over RDP or SSH loses their scrollback the moment the session drops. This
+/// file lives beside the data the daemon already owns, so "why did it stop"
+/// survives all three.
+const STARTUP_LOG_FILENAME: &str = "daemon-startup.log";
+
+/// Installs a panic hook that keeps the default terminal report and also
+/// appends it to [`STARTUP_LOG_FILENAME`] under `data_dir`.
+///
+/// This workspace builds with `panic = "abort"` (see the root `Cargo.toml`),
+/// so a panic never unwinds back to a `catch_unwind` further up this call
+/// stack — the process is simply gone the instant the hook returns. That
+/// makes the hook the only point in the whole program that ever sees a
+/// panic's message, which is why it is installed here rather than relying on
+/// an `Err` this function's caller ([`finish`]) already prints: `finish`
+/// never runs for a panic. Installed only for `daemon`, not in `main` before
+/// dispatch, because every other command is short-lived and interactive with
+/// a terminal already attached — the daemon is the one command meant to run
+/// with nobody watching.
+fn install_startup_crash_log(data_dir: PathBuf) {
+    let previous = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        previous(info);
+        append_startup_log(&data_dir, &info.to_string());
+    }));
+}
+
+/// Appends one timestamped line to the daemon's startup-failure log, creating
+/// the data directory first if this is the very first thing ever written to
+/// it (a startup failure can happen before anything else has).
+///
+/// A failure to write here is swallowed rather than propagated or panicked
+/// on: the process is already on its way out over one problem, and a full
+/// disk must not turn that into a second, unrelated panic inside the panic
+/// handler itself.
+fn append_startup_log(data_dir: &Path, message: &str) {
+    use std::io::Write as _;
+    let _ = std::fs::create_dir_all(data_dir);
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|since| since.as_secs())
+        .unwrap_or(0);
+    if let Ok(mut file) =
+        std::fs::OpenOptions::new().create(true).append(true).open(data_dir.join(STARTUP_LOG_FILENAME))
+    {
+        let _ = writeln!(file, "[{stamp}] {message}");
+    }
 }
 
 /// Brings up every subsystem this deployment is configured for, and serves
@@ -2737,6 +2819,59 @@ role = \"owner\"
         std::fs::create_dir_all(&dir).expect("create the temp project dir");
         let config_path = dir.join(CONFIG_FILENAME);
         (dir, config_path)
+    }
+
+    /// A startup failure is appended to the log rather than only printed,
+    /// so it survives a Scheduled Task with no console and a dropped RDP
+    /// session alike (see [`append_startup_log`]'s doc comment).
+    ///
+    /// The data directory here is seeded the way a real upgrade finds one:
+    /// already populated by an old build (a pre-existing `console.passwd`
+    /// this call must not disturb), never created for the first time by this
+    /// call alone. That is the scenario the daemon actually fails in — an
+    /// old data directory, a new binary — not a pristine one.
+    #[test]
+    fn a_startup_failure_is_appended_to_the_data_dir_log() {
+        let (dir, _config_path) = temp_project("startup-log");
+        std::fs::write(dir.join("console.passwd"), "pbkdf2-sha256$old$stuff$here")
+            .expect("seed a pre-existing, old-format file");
+
+        append_startup_log(&dir, "could not bind 127.0.0.1:8443: address in use");
+        append_startup_log(&dir, "could not bind 127.0.0.1:8443: address in use (retry)");
+
+        let logged = std::fs::read_to_string(dir.join(STARTUP_LOG_FILENAME))
+            .expect("the log file exists after a failure");
+        assert!(logged.contains("address in use"), "the failure reason is recorded: {logged}");
+        assert_eq!(
+            logged.lines().count(),
+            2,
+            "a second failure appends a new line rather than truncating the first — the reason a \
+             restart happened is in the run before it: {logged}"
+        );
+        assert!(
+            std::fs::read_to_string(dir.join("console.passwd")).unwrap().contains("old$stuff"),
+            "an old file already in the data directory is left exactly as it was"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The same mechanism also creates the data directory when a failure
+    /// happens before anything else ever has — the config parsed, so
+    /// `daemon_command` knows where `data_dir` is, but nothing has written
+    /// into it yet (a `--bind` argument that fails to parse, for instance,
+    /// is returned before any file is touched).
+    #[test]
+    fn a_startup_failure_creates_the_data_dir_if_nothing_has_yet() {
+        let (project, _config_path) = temp_project("startup-log-fresh");
+        let data_dir = project.join("data");
+        assert!(!data_dir.exists(), "nothing has created it yet");
+
+        append_startup_log(&data_dir, "the async runtime could not start");
+
+        let logged = std::fs::read_to_string(data_dir.join(STARTUP_LOG_FILENAME))
+            .expect("the log file exists, in a data directory this call created");
+        assert!(logged.contains("the async runtime could not start"));
+        let _ = std::fs::remove_dir_all(&project);
     }
 
     #[test]
