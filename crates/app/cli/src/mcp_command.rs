@@ -130,7 +130,7 @@ type Tool = (&'static str, &'static str, &'static [Param]);
 /// routes behind them — the registry (`people_*`), the deploy record and
 /// System health (`deploys_*`, `system_health`), the VPN roster
 /// (`vpn_peers_list`) and the firewall (`firewall_show`). This is "STEP 4 —
-/// control parity" from `docs/architecture.dx`'s "now" list: every mutating
+/// control parity" from `index.dx`'s goal 4: every mutating
 /// admin route reachable from a keyboard on the box is reachable here too,
 /// gated by the calling token's grants exactly as the HTTP route is — see
 /// `docs/labs/mcp-lab.dx` for the parity table and what still is not.

@@ -238,7 +238,7 @@
 //! count. A refusal names the field that was wrong, never the value — so this endpoint cannot
 //! be used to serve a payload of somebody else's choosing to somebody else's browser. That
 //! holds for the account doors too, which are the ones an actual page renders errors from:
-//! [`crate::accounts::AccountError::BadEmail`] carries the *reason* an address did not parse
+//! [`crate::accounts::FilerError::BadEmail`] carries the *reason* an address did not parse
 //! and never the address, for exactly this reason.
 
 use std::net::SocketAddr;
@@ -252,7 +252,7 @@ use selfhost_mail::OutboundQueue;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
-use crate::accounts::{self, ReportFiler, ReportFilers, AccountError};
+use crate::accounts::{self, ReportFiler, ReportFilers, FilerError};
 use crate::clock;
 use crate::limit::{Decision, Limiter, Meter, Rate};
 use crate::notify::{self, Mailbox};
@@ -1269,9 +1269,9 @@ impl Service {
                         ("reproMax", Json::Number(report::MAX_REPRO as f64)),
                         (
                             "passkeysPerAccount",
-                            Json::Number(webauthn::MAX_PASSKEYS_PER_ACCOUNT as f64),
+                            Json::Number(webauthn::MAX_PASSKEYS_PER_FILER as f64),
                         ),
-                        ("maxAccounts", Json::Number(accounts::MAX_ACCOUNTS as f64)),
+                        ("maxAccounts", Json::Number(accounts::MAX_FILERS as f64)),
                         ("maxProjects", Json::Number(store::MAX_PROJECTS as f64)),
                     ]),
                 ),
@@ -1537,7 +1537,7 @@ impl Service {
         runtime
             .accounts
             .create_with_password(email, password)
-            .map_err(|error| account_error_response(&error))
+            .map_err(|error| filer_error_response(&error))
     }
 
     /// `POST <route>/login` — email and password. Every way of failing answers the same
@@ -1782,7 +1782,7 @@ impl Service {
                 runtime.sessions.end_all_for(&account.id);
                 self.session_response(runtime, &account.id)
             }
-            Err(error) => account_error_response(&error),
+            Err(error) => filer_error_response(&error),
         }
     }
 
@@ -1865,7 +1865,7 @@ impl Service {
     ///
     /// The alternative — minting a throwaway pending account and binding the challenge to *that*
     /// — was rejected because it is a new resource-exhaustion path aimed straight at
-    /// [`crate::accounts::MAX_ACCOUNTS`]: the "one account per email" rule is what today bounds
+    /// [`crate::accounts::MAX_FILERS`]: the "one account per email" rule is what today bounds
     /// how many rows an anonymous caller can create, and a decoy account for an address that
     /// already has one is precisely a row that rule was refusing. A decoy *challenge* allocates
     /// only an entry in the in-memory pool `crate::webauthn` already caps and expires.
@@ -1897,8 +1897,8 @@ impl Service {
                     // documentation. Everything else — an address that is not an address, a box
                     // at its account cap, a filesystem that refused — is about the *request* or
                     // this box, never about who else is registered, and is answered plainly.
-                    Err(AccountError::EmailTaken) => None,
-                    Err(error) => return account_error_response(&error),
+                    Err(FilerError::EmailTaken) => None,
+                    Err(error) => return filer_error_response(&error),
                 }
             }
         };
@@ -2219,7 +2219,7 @@ impl Service {
                 provider_name,
                 &identity.subject,
             )
-            .map_err(|error| account_error_response(&error))
+            .map_err(|error| filer_error_response(&error))
     }
 
     /// Mints a session for `account_id` and returns the whole `Set-Cookie` field value it is
@@ -3044,19 +3044,19 @@ fn query_param(query: &str, name: &str) -> Option<String> {
     })
 }
 
-/// Maps an [`AccountError`] to the response its caller gives back.
-fn account_error_response(error: &AccountError) -> Response {
+/// Maps a [`FilerError`] to the response its caller gives back.
+fn filer_error_response(error: &FilerError) -> Response {
     match error {
-        AccountError::Full => refuse(Status::SERVICE_UNAVAILABLE, &error.to_string()),
-        AccountError::NotFound => refuse(Status::NOT_FOUND, &error.to_string()),
-        AccountError::Io(_) => {
+        FilerError::Full => refuse(Status::SERVICE_UNAVAILABLE, &error.to_string()),
+        FilerError::NotFound => refuse(Status::NOT_FOUND, &error.to_string()),
+        FilerError::Io(_) => {
             eprintln!("[{}] reports: {error}", selfhost_mail::stamp());
             refuse(
                 Status::INTERNAL_SERVER_ERROR,
                 "the account could not be updated",
             )
         }
-        AccountError::EmailTaken | AccountError::WeakPassword | AccountError::BadEmail(_) => {
+        FilerError::EmailTaken | FilerError::WeakPassword | FilerError::BadEmail(_) => {
             refuse(Status::BAD_REQUEST, &error.to_string())
         }
     }
@@ -3624,8 +3624,8 @@ mod tests {
             ("titleMax", report::MAX_TITLE),
             ("detailMax", report::MAX_DETAIL),
             ("reproMax", report::MAX_REPRO),
-            ("passkeysPerAccount", webauthn::MAX_PASSKEYS_PER_ACCOUNT),
-            ("maxAccounts", accounts::MAX_ACCOUNTS),
+            ("passkeysPerAccount", webauthn::MAX_PASSKEYS_PER_FILER),
+            ("maxAccounts", accounts::MAX_FILERS),
             ("maxProjects", store::MAX_PROJECTS),
         ] {
             assert_eq!(

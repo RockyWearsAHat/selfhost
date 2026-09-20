@@ -360,24 +360,13 @@ impl fmt::Display for SiteOwner {
     }
 }
 
-impl Serialize for SiteOwner {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: serde::Serializer,
-    {
-        self.as_str().serialize(serializer)
-    }
-}
-
-impl<'de> Deserialize<'de> for SiteOwner {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        let s = String::deserialize(deserializer)?;
-        Self::parse(&s).map_err(serde::de::Error::custom)
-    }
-}
+// Deliberately no `Serialize`/`Deserialize` for `SiteOwner` itself: `Site.owner`
+// is a raw `Option<String>` (see its field doc below) so that one unparseable
+// owner is a reported `Problem` on that one site, not a `ConfigError::Syntax`
+// that refuses the whole file before `validate()` ever runs — the same
+// "checked here for shape only" split `vpn.rs`'s `Peer::person` uses. Write-time
+// validation (`PUT /api/sites/<name>/owner`, `site_api::parse_owner`) still
+// goes through `SiteOwner::parse` directly, without needing a serde impl.
 
 /// A website.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -451,8 +440,16 @@ pub struct Site {
     /// The Person who owns this site: they reach it, and they decide who else
     /// does, as though they held `site.admin:<site>`. Absent means only the
     /// deployment's owner and explicit Grants decide.
+    ///
+    /// Stored raw rather than as a validated [`SiteOwner`] so that a value
+    /// [`SiteOwner::parse`] rejects (too long, an email address, a reserved
+    /// word) is a `Problem` naming this one site, checked in
+    /// [`validate::Config::check_sites`] — not a hard `toml::from_str` failure
+    /// that refuses to load every other site and every other subsystem in the
+    /// same file. See `SiteOwner`'s doc for why the shape check still lives
+    /// with `identity::PersonName` and not here.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub owner: Option<SiteOwner>,
+    pub owner: Option<String>,
     /// Which VPN relay gates this private site. Absent for public/people sites.
     /// When present, POST /api/vpn/authorize only authorises this relay for
     /// callers who hold a grant on this site. Default: the single relay if
@@ -761,6 +758,44 @@ mod tests {
             );
         }
         assert_eq!(SiteOwner::parse("Jane Doe").unwrap().person().as_str(), "Jane Doe");
+    }
+
+    #[test]
+    fn a_site_with_an_email_as_owner_fails_to_validate_not_to_parse() {
+        // Regression (root cause of the bug `SiteOwner`'s old custom
+        // `Deserialize` impl caused): an owner value `PersonName` rejects must
+        // surface as `ConfigError::Invalid`, collected with every other
+        // problem `validate()` finds — never `ConfigError::Syntax`, which
+        // `toml::from_str` raises before `validate()` runs at all and which
+        // would refuse to even look at the rest of the file. Two unrelated
+        // mistakes (a bad owner on one site, a duplicate name on two others)
+        // must both be reported from the one `Config::parse` call.
+        let text = "version = 1\n\
+             [server]\n\
+             acme_email = \"a@b.com\"\n\
+             acme = \"self-signed\"\n\n\
+             [[nodes]]\n\
+             name = \"home\"\n\
+             role = \"owner\"\n\n\
+             [[sites]]\n\
+             name = \"a\"\n\
+             domains = [\"a.example.com\"]\n\
+             static_root = \"./public\"\n\
+             owner = \"alex@example.com\"\n\n\
+             [[sites]]\n\
+             name = \"a\"\n\
+             domains = [\"b.example.com\"]\n\
+             static_root = \"./public\"\n";
+        match Config::parse(text) {
+            Err(ConfigError::Invalid(problems)) => {
+                assert!(problems.iter().any(|p| p.field == "sites[0].owner"), "{problems:?}");
+                assert!(
+                    problems.iter().any(|p| p.field == "sites[1].name"),
+                    "the unrelated duplicate-name problem must still be reported: {problems:?}"
+                );
+            }
+            other => panic!("expected ConfigError::Invalid with both problems collected, got {other:?}"),
+        }
     }
 
     #[test]

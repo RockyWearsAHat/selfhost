@@ -52,7 +52,7 @@ pub const ACCOUNTS_FILENAME: &str = "accounts.json";
 /// The most accounts this box will hold. Registration is a door open to the internet, so it is
 /// bounded like every other one: past this, registration is refused in a sentence rather than
 /// growing the file without end.
-pub const MAX_ACCOUNTS: usize = 10_000;
+pub const MAX_FILERS: usize = 10_000;
 
 /// The most OAuth identities one account may carry linked. Nobody has more than a handful of
 /// sign-in providers; this is a wall against a loop, not a real limit anyone should hit.
@@ -62,7 +62,7 @@ pub const MAX_OAUTH_LINKS: usize = 8;
 /// reports" list, not the database of record — [`crate::store::Store`] still holds every report
 /// in full; past this cap the oldest reference is dropped and the report itself is unaffected,
 /// still reachable through the owner's feed like any other.
-pub const MAX_FILED_PER_ACCOUNT: usize = 500;
+pub const MAX_FILED_PER_FILER: usize = 500;
 
 /// The shortest accepted password. PBKDF2 at 600,000 iterations already does the expensive
 /// work; this exists only to refuse the handful of passwords too short to be a password at all.
@@ -73,14 +73,14 @@ pub const MIN_PASSWORD: usize = 8;
 pub const MAX_PASSWORD: usize = 200;
 
 /// Bytes of entropy in an account id.
-const ACCOUNT_ID_BYTES: usize = 16;
+const FILER_ID_BYTES: usize = 16;
 
 /// Why an account operation could not be carried out.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum AccountError {
+pub enum FilerError {
     /// An account already exists for this email.
     EmailTaken,
-    /// The box already holds [`MAX_ACCOUNTS`].
+    /// The box already holds [`MAX_FILERS`].
     Full,
     /// The password is shorter than [`MIN_PASSWORD`] or longer than [`MAX_PASSWORD`].
     WeakPassword,
@@ -100,11 +100,11 @@ pub enum AccountError {
     Io(String),
 }
 
-impl std::fmt::Display for AccountError {
+impl std::fmt::Display for FilerError {
     fn fmt(&self, out: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::EmailTaken => out.write_str("an account already exists for this email"),
-            Self::Full => out.write_str(&format!("this box already holds {MAX_ACCOUNTS} accounts")),
+            Self::Full => out.write_str(&format!("this box already holds {MAX_FILERS} accounts")),
             Self::WeakPassword => out.write_str(&format!(
                 "a password must be {MIN_PASSWORD} to {MAX_PASSWORD} characters"
             )),
@@ -115,7 +115,7 @@ impl std::fmt::Display for AccountError {
     }
 }
 
-impl std::error::Error for AccountError {}
+impl std::error::Error for FilerError {}
 
 /// One OAuth identity linked to a report filer.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -153,7 +153,7 @@ pub struct ReportFiler {
     /// Every OAuth identity that may sign in as this filer.
     pub oauth_links: Vec<FilingOAuthLink>,
     /// The reports this filer filed while signed in, newest last, capped at
-    /// [`MAX_FILED_PER_ACCOUNT`]. The dashboard's "my reports" list reads this and then asks
+    /// [`MAX_FILED_PER_FILER`]. The dashboard's "my reports" list reads this and then asks
     /// [`crate::store::Store::get`] for each one's current content.
     pub filed: Vec<FiledReport>,
     /// When this filer was created, seconds since the Unix epoch.
@@ -270,23 +270,23 @@ impl ReportFilers {
     /// Creates a filer with `email` and `password`, hashed here.
     ///
     /// # Errors
-    /// [`AccountError::BadEmail`] when the address does not parse, [`AccountError::WeakPassword`]
-    /// outside [`MIN_PASSWORD`]..=[`MAX_PASSWORD`], [`AccountError::EmailTaken`] when a filer
-    /// already answers to this address, [`AccountError::Full`] at [`MAX_ACCOUNTS`].
+    /// [`FilerError::BadEmail`] when the address does not parse, [`FilerError::WeakPassword`]
+    /// outside [`MIN_PASSWORD`]..=[`MAX_PASSWORD`], [`FilerError::EmailTaken`] when a filer
+    /// already answers to this address, [`FilerError::Full`] at [`MAX_FILERS`].
     pub fn create_with_password(
         &self,
         email: &str,
         password: &str,
-    ) -> Result<ReportFiler, AccountError> {
+    ) -> Result<ReportFiler, FilerError> {
         let address = Address::parse(email.trim()).map_err(|error| {
-            AccountError::BadEmail(format!("`email` is not an address: {error}"))
+            FilerError::BadEmail(format!("`email` is not an address: {error}"))
         })?;
         let characters = password.chars().count();
         if !(MIN_PASSWORD..=MAX_PASSWORD).contains(&characters) {
-            return Err(AccountError::WeakPassword);
+            return Err(FilerError::WeakPassword);
         }
         let hashed =
-            hash_password(password).map_err(|error| AccountError::Io(error.to_string()))?;
+            hash_password(password).map_err(|error| FilerError::Io(error.to_string()))?;
         self.insert(ReportFiler {
             id: String::new(), // filled in by `insert`
             email: address.to_string(),
@@ -312,9 +312,9 @@ impl ReportFilers {
         email_verified: bool,
         provider: &str,
         subject: &str,
-    ) -> Result<ReportFiler, AccountError> {
+    ) -> Result<ReportFiler, FilerError> {
         let address = Address::parse(email.trim()).map_err(|error| {
-            AccountError::BadEmail(format!("`email` is not an address: {error}"))
+            FilerError::BadEmail(format!("`email` is not an address: {error}"))
         })?;
         self.insert(ReportFiler {
             id: String::new(),
@@ -337,9 +337,9 @@ impl ReportFilers {
     ///
     /// # Errors
     /// The same as [`Self::create_with_password`], minus the password checks.
-    pub fn create_pending(&self, email: &str) -> Result<ReportFiler, AccountError> {
+    pub fn create_pending(&self, email: &str) -> Result<ReportFiler, FilerError> {
         let address = Address::parse(email.trim()).map_err(|error| {
-            AccountError::BadEmail(format!("`email` is not an address: {error}"))
+            FilerError::BadEmail(format!("`email` is not an address: {error}"))
         })?;
         self.insert(ReportFiler {
             id: String::new(),
@@ -358,9 +358,9 @@ impl ReportFilers {
     /// than duplicated.
     ///
     /// # Errors
-    /// [`AccountError::NotFound`] when `id` names no filer, or an [`AccountError::Io`] naming
+    /// [`FilerError::NotFound`] when `id` names no filer, or an [`FilerError::Io`] naming
     /// what could not be persisted.
-    pub fn link_oauth(&self, id: &str, provider: &str, subject: &str) -> Result<(), AccountError> {
+    pub fn link_oauth(&self, id: &str, provider: &str, subject: &str) -> Result<(), FilerError> {
         self.update(id, |filer| {
             if filer
                 .oauth_links
@@ -370,7 +370,7 @@ impl ReportFilers {
                 return Ok(());
             }
             if filer.oauth_links.len() >= MAX_OAUTH_LINKS {
-                return Err(AccountError::Io(format!(
+                return Err(FilerError::Io(format!(
                     "a filer may link at most {MAX_OAUTH_LINKS} sign-in providers"
                 )));
             }
@@ -385,8 +385,8 @@ impl ReportFilers {
     /// Marks the filer's email verified.
     ///
     /// # Errors
-    /// [`AccountError::NotFound`] or an [`AccountError::Io`].
-    pub fn mark_verified(&self, id: &str) -> Result<(), AccountError> {
+    /// [`FilerError::NotFound`] or an [`FilerError::Io`].
+    pub fn mark_verified(&self, id: &str) -> Result<(), FilerError> {
         self.update(id, |filer| {
             filer.email_verified = true;
             Ok(())
@@ -396,14 +396,14 @@ impl ReportFilers {
     /// Replaces the filer's password.
     ///
     /// # Errors
-    /// [`AccountError::WeakPassword`], [`AccountError::NotFound`], or an [`AccountError::Io`].
-    pub fn set_password(&self, id: &str, password: &str) -> Result<(), AccountError> {
+    /// [`FilerError::WeakPassword`], [`FilerError::NotFound`], or an [`FilerError::Io`].
+    pub fn set_password(&self, id: &str, password: &str) -> Result<(), FilerError> {
         let characters = password.chars().count();
         if !(MIN_PASSWORD..=MAX_PASSWORD).contains(&characters) {
-            return Err(AccountError::WeakPassword);
+            return Err(FilerError::WeakPassword);
         }
         let hashed =
-            hash_password(password).map_err(|error| AccountError::Io(error.to_string()))?;
+            hash_password(password).map_err(|error| FilerError::Io(error.to_string()))?;
         self.update(id, |filer| {
             filer.password = Some(hashed);
             Ok(())
@@ -412,24 +412,24 @@ impl ReportFilers {
 
     /// Records that this filer filed `project`/`id` — called once, when the report is fresh;
     /// see `crate::store::Entry::account_id` for why a repeat sighting never calls this again.
-    /// Past [`MAX_FILED_PER_ACCOUNT`] the oldest reference is dropped; the report itself is
+    /// Past [`MAX_FILED_PER_FILER`] the oldest reference is dropped; the report itself is
     /// unaffected and stays reachable through the owner's feed.
     ///
     /// # Errors
-    /// [`AccountError::NotFound`] or an [`AccountError::Io`].
+    /// [`FilerError::NotFound`] or an [`FilerError::Io`].
     pub fn record_filed(
         &self,
         account_id: &str,
         project: &str,
         id: &str,
-    ) -> Result<(), AccountError> {
+    ) -> Result<(), FilerError> {
         self.update(account_id, |filer| {
             filer.filed.push(FiledReport {
                 project: project.to_string(),
                 id: id.to_string(),
             });
-            if filer.filed.len() > MAX_FILED_PER_ACCOUNT {
-                let excess = filer.filed.len() - MAX_FILED_PER_ACCOUNT;
+            if filer.filed.len() > MAX_FILED_PER_FILER {
+                let excess = filer.filed.len() - MAX_FILED_PER_FILER;
                 filer.filed.drain(..excess);
             }
             Ok(())
@@ -440,13 +440,13 @@ impl ReportFilers {
     /// withdrawn, so a closed report does not linger in a dashboard's list.
     ///
     /// # Errors
-    /// [`AccountError::NotFound`] or an [`AccountError::Io`].
+    /// [`FilerError::NotFound`] or an [`FilerError::Io`].
     pub fn remove_filed(
         &self,
         account_id: &str,
         project: &str,
         id: &str,
-    ) -> Result<(), AccountError> {
+    ) -> Result<(), FilerError> {
         self.update(account_id, |filer| {
             filer
                 .filed
@@ -465,24 +465,24 @@ impl ReportFilers {
         }
     }
 
-    /// Inserts `filer`, assigning it a fresh id, enforcing [`MAX_ACCOUNTS`] and the one
+    /// Inserts `filer`, assigning it a fresh id, enforcing [`MAX_FILERS`] and the one
     /// filer per email rule, and persisting.
-    fn insert(&self, mut filer: ReportFiler) -> Result<ReportFiler, AccountError> {
+    fn insert(&self, mut filer: ReportFiler) -> Result<ReportFiler, FilerError> {
         let mut entries = self.lock();
         let address = Address::parse(&filer.email).expect("just parsed by the caller");
         if entries
             .iter()
             .any(|entry| Address::parse(&entry.email).is_ok_and(|stored| stored.matches(&address)))
         {
-            return Err(AccountError::EmailTaken);
+            return Err(FilerError::EmailTaken);
         }
-        if entries.len() >= MAX_ACCOUNTS {
-            return Err(AccountError::Full);
+        if entries.len() >= MAX_FILERS {
+            return Err(FilerError::Full);
         }
-        filer.id = fresh_id().map_err(|error| AccountError::Io(error.to_string()))?;
+        filer.id = fresh_id().map_err(|error| FilerError::Io(error.to_string()))?;
         entries.push(filer.clone());
         self.persist(&entries)
-            .map_err(|error| AccountError::Io(error.to_string()))?;
+            .map_err(|error| FilerError::Io(error.to_string()))?;
         Ok(filer)
     }
 
@@ -490,16 +490,16 @@ impl ReportFilers {
     fn update(
         &self,
         id: &str,
-        change: impl FnOnce(&mut ReportFiler) -> Result<(), AccountError>,
-    ) -> Result<(), AccountError> {
+        change: impl FnOnce(&mut ReportFiler) -> Result<(), FilerError>,
+    ) -> Result<(), FilerError> {
         let mut entries = self.lock();
         let filer = entries
             .iter_mut()
             .find(|entry| entry.id == id)
-            .ok_or(AccountError::NotFound)?;
+            .ok_or(FilerError::NotFound)?;
         change(filer)?;
         self.persist(&entries)
-            .map_err(|error| AccountError::Io(error.to_string()))
+            .map_err(|error| FilerError::Io(error.to_string()))
     }
 
     /// Writes the store owner-only via a temporary file and rename, like every sibling
@@ -533,7 +533,7 @@ impl std::fmt::Debug for ReportFilers {
 /// A fresh account id: `acct-` and 32 hex digits from the operating system's entropy.
 fn fresh_id() -> io::Result<String> {
     let rng = SystemRandom::new();
-    let mut bytes = [0u8; ACCOUNT_ID_BYTES];
+    let mut bytes = [0u8; FILER_ID_BYTES];
     rng.fill(&mut bytes)
         .map_err(|_| io::Error::other("the system random source was unavailable"))?;
     Ok(format!("acct-{}", hex(&bytes)))
@@ -638,7 +638,7 @@ fn filers_to_json(entries: &[ReportFiler]) -> Json {
 fn parse_filers(text: &str) -> Option<Vec<ReportFiler>> {
     let value = selfhost_json::parse(text).ok()?;
     let items = value.get("accounts")?.as_array()?;
-    if items.len() > MAX_ACCOUNTS {
+    if items.len() > MAX_FILERS {
         return None;
     }
     let mut entries: Vec<ReportFiler> = Vec::new();
@@ -775,7 +775,7 @@ mod tests {
         let error = filers
             .create_with_password("Alice@Example.com", "differentpw")
             .expect_err("refused");
-        assert_eq!(error, AccountError::EmailTaken);
+        assert_eq!(error, FilerError::EmailTaken);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -787,13 +787,13 @@ mod tests {
             filers
                 .create_with_password("a@example.com", "short")
                 .unwrap_err(),
-            AccountError::WeakPassword
+            FilerError::WeakPassword
         );
         assert_eq!(
             filers
                 .create_with_password("a@example.com", &"x".repeat(MAX_PASSWORD + 1))
                 .unwrap_err(),
-            AccountError::WeakPassword
+            FilerError::WeakPassword
         );
         assert!(
             filers
@@ -810,7 +810,7 @@ mod tests {
         let error = filers
             .create_with_password("not an address", "hunter2fish")
             .expect_err("refused");
-        assert!(matches!(error, AccountError::BadEmail(_)), "{error}");
+        assert!(matches!(error, FilerError::BadEmail(_)), "{error}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -962,16 +962,16 @@ mod tests {
         let filer = filers
             .create_pending("alex@example.com")
             .expect("registers");
-        for nth in 0..(MAX_FILED_PER_ACCOUNT + 10) {
+        for nth in 0..(MAX_FILED_PER_FILER + 10) {
             filers
                 .record_filed(&filer.id, "dx", &format!("report-{nth:08x}"))
                 .expect("recorded");
         }
         let reloaded = filers.find_by_id(&filer.id).expect("found");
-        assert_eq!(reloaded.filed.len(), MAX_FILED_PER_ACCOUNT);
+        assert_eq!(reloaded.filed.len(), MAX_FILED_PER_FILER);
         assert_eq!(
             reloaded.filed.last().unwrap().id,
-            format!("report-{:08x}", MAX_FILED_PER_ACCOUNT + 9),
+            format!("report-{:08x}", MAX_FILED_PER_FILER + 9),
             "the most recent reference is kept"
         );
         let _ = std::fs::remove_dir_all(&dir);
@@ -1023,13 +1023,13 @@ mod tests {
         let filers = ReportFilers::load(&dir);
         assert_eq!(
             filers.mark_verified("acct-deadbeef").unwrap_err(),
-            AccountError::NotFound
+            FilerError::NotFound
         );
         assert_eq!(
             filers
                 .set_password("acct-deadbeef", "longenoughpassword")
                 .unwrap_err(),
-            AccountError::NotFound
+            FilerError::NotFound
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1037,13 +1037,13 @@ mod tests {
     #[test]
     fn registration_past_the_cap_is_refused_while_existing_filers_keep_working() {
         let dir = scratch("cap");
-        // Seeded directly at `MAX_ACCOUNTS - 1` in one write, rather than by looping
+        // Seeded directly at `MAX_FILERS - 1` in one write, rather than by looping
         // `create_*` that many times: `insert` rewrites the whole file on every call, so a
         // tight loop to the cap pays for that rewrite ten thousand times over just to reach
         // the boundary this test actually cares about. One seed write plus the two calls
         // at the boundary prove the same bound `insert` enforces.
         let filers = ReportFilers::load(&dir);
-        let seeded = (0..MAX_ACCOUNTS - 1).map(|nth| ReportFiler {
+        let seeded = (0..MAX_FILERS - 1).map(|nth| ReportFiler {
             id: format!("acct-{nth:028x}"),
             email: format!("user{nth}@example.com"),
             email_verified: false,
@@ -1061,7 +1061,7 @@ mod tests {
         let error = filers
             .create_pending("one-too-many@example.com")
             .expect_err("refused");
-        assert_eq!(error, AccountError::Full);
+        assert_eq!(error, FilerError::Full);
         assert!(
             filers
                 .find_by_email(&Address::parse("user0@example.com").unwrap())
