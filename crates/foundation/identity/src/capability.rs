@@ -363,6 +363,32 @@ pub enum Capability {
     /// [`Capability::MailAdmin`] are independent of each other: being able to
     /// reach a location says nothing about being able to administer it.
     VpnAccess(VpnLocationId),
+    /// Holds every other capability that exists in this deployment, at every
+    /// target, forever — the one grant that makes an ordinary
+    /// [`Identity::Person`](crate::Identity::Person) an owner.
+    ///
+    /// Where `Identity::Owner`'s blanket allow in [`crate::Policy::decide`] is
+    /// an identity's authority and never consults a grant set, this is the same
+    /// authority expressed *as* a grant, so it can be held by a named Person
+    /// with an email, checked into the same registry as everyone else's
+    /// grants, and — because several owners are allowed — held by more than
+    /// one Person at once. [`crate::Grants::satisfies`] is where the "holds
+    /// everything" is actually implemented: a caller who holds this capability
+    /// satisfies any `want`, through the same `Grants::holds` every ordinary
+    /// capability is decided by.
+    ///
+    /// Deliberately absent from [`Capability::drives_a_machine`] and
+    /// [`Capability::edits_the_deployment`] (both default to `false` for it,
+    /// same as every other identity-shaped capability) and withheld from the
+    /// bearer token by `crate::policy::the_machine_may` — the box's own
+    /// automation token must never become an owner by holding this.
+    ///
+    /// An [`crate::Identity::Agent`]'s own ceiling is never widened by its
+    /// Person holding this: [`crate::Grants::within`] only ever filters an
+    /// agent's own explicit grants down to what the ceiling holds, so an agent
+    /// must be granted `Capability::Owner` itself — never inherited — to reach
+    /// the same authority its Person has.
+    Owner,
 }
 
 impl Capability {
@@ -390,6 +416,7 @@ impl Capability {
             Self::DnsAdmin => "dns.admin",
             Self::MailAdmin => "mail.admin",
             Self::VpnAccess(_) => "vpn.access",
+            Self::Owner => "owner",
         }
     }
 
@@ -440,7 +467,8 @@ impl Capability {
             | Self::SiteAccess(_)
             | Self::SiteAdminOf(_)
             | Self::NodeAdmin
-            | Self::VpnAccess(_) => true,
+            | Self::VpnAccess(_)
+            | Self::Owner => true,
             // Grep for the name in `crates/app/admin/src/lib.rs`'s `Route::demand`
             // before flipping one of these: the test
             // `every_unhonoured_word_is_absent_from_every_routes_demand` is what
@@ -462,7 +490,8 @@ impl Capability {
             | Self::NodeAdmin
             | Self::SiteAdmin
             | Self::DnsAdmin
-            | Self::MailAdmin => None,
+            | Self::MailAdmin
+            | Self::Owner => None,
             Self::FilesRead(share) | Self::FilesWrite(share) => Some(share.as_str()),
             Self::DesktopView(node) | Self::DesktopControl(node) | Self::ClipboardRead(node) => {
                 Some(node.as_str())
@@ -506,6 +535,7 @@ impl Capability {
             ("site.admin", target) => site(target).map(Self::SiteAdminOf),
             ("site.access", target) => site(target).map(Self::SiteAccess),
             ("vpn.access", target) => location(target).map(Self::VpnAccess),
+            ("owner", None) => Some(Self::Owner),
             _ => None,
         }
     }
@@ -547,6 +577,7 @@ impl Capability {
             Self::DnsAdmin,
             Self::MailAdmin,
             Self::VpnAccess(location.clone()),
+            Self::Owner,
         ]
     }
 
@@ -633,7 +664,7 @@ mod tests {
     #[test]
     fn every_capability_round_trips_through_its_wire_form() {
         let shapes = Capability::every_shape(&share(), &node(), &location(), &site());
-        assert_eq!(shapes.len(), 16, "extend every_shape when a variant is added");
+        assert_eq!(shapes.len(), 17, "extend every_shape when a variant is added");
         for capability in &shapes {
             let text = capability.to_string();
             assert_eq!(
@@ -652,6 +683,19 @@ mod tests {
         assert_eq!(Capability::SiteAccess(site()).to_string(), "site.access:blog");
         assert_eq!(Capability::DnsAdmin.to_string(), "dns.admin");
         assert_eq!(Capability::MailAdmin.to_string(), "mail.admin");
+        assert_eq!(Capability::Owner.to_string(), "owner");
+    }
+
+    #[test]
+    fn owner_is_honoured_but_neither_a_keyboard_nor_a_target() {
+        // `Capability::Owner` is a grant a Person holds, not an act on a
+        // machine or a rewrite of `selfhost.config.toml` — those predicates
+        // stay `false` for it, same as every other identity-shaped capability.
+        assert!(Capability::Owner.is_honoured());
+        assert!(!Capability::Owner.drives_a_machine());
+        assert!(!Capability::Owner.edits_the_deployment());
+        assert_eq!(Capability::Owner.target(), None);
+        assert_eq!(Capability::parse("owner:anything"), None, "owner takes no target");
     }
 
     #[test]
