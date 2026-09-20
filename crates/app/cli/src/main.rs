@@ -252,6 +252,7 @@ Commands
                              omitted. [mail] must already be configured.
   mail remove <address>      Remove a mailbox
   people <list|show|grant|allow|deny|forget|capabilities>
+  people forget-device <name> <device>
                              Who else may use this deployment, and exactly what
                              each of them may do. `allow <name> <cap>[,<cap>]`
                              creates an entry and adds to it; `grant` states the
@@ -275,8 +276,6 @@ Commands
                              `preflight <name>` reports the command that would run
                              without running it (plan-before-acting).
                              `up <name>` and `down <name>` start and stop a relay.
-                             `who <address>` identifies who arrived at a loopback
-                             socket, and answers clearly when nobody can be named.
   agent <add|list|revoke>    Scoped, revocable credentials for trusted machines —
                              an AI agent, a script. `add <name> --grant <cap>`
                              mints one and prints its token once; it holds

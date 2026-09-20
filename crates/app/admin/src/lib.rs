@@ -52,7 +52,6 @@ pub mod images_api;
 pub mod invite;
 pub mod mesh_api;
 pub mod passwd;
-pub mod peer_binding;
 pub mod people_api;
 pub mod person_password;
 pub mod session;
@@ -889,8 +888,8 @@ impl<'a> Route<'a> {
             // them because it is a list of who can reach what — a target list,
             // as `crates/identity`'s registry says in its own header. The VPN
             // roster joins them on the same grounds: it too is a list of who
-            // can reach what, just for a door `[[vpn.peers]]` and the roster
-            // file guard rather than the console password.
+            // can reach what, just for a door the roster file guards rather
+            // than the console password.
             Self::ListPeople | Self::ForgetPerson(_) | Self::VpnPeers => Demand::OwnerOnly,
             // The one delegation the model has: whoever holds
             // `site.admin:<site>` may hand out `site.access:<site>` for that
@@ -2209,8 +2208,7 @@ impl Api {
     }
 
     /// Answers `GET /api/vpn/peers`: every peer this deployment's relays
-    /// know about, static `[[vpn.peers]]` entries and dynamic roster
-    /// enrolments alike. Owner-only, on the same grounds `ListPeople` is —
+    /// know about, each with the Person who enrolled it. Owner-only, on the same grounds `ListPeople` is —
     /// see [`Route::demand`]. See [`people_api::VpnWiring::peers_json`].
     fn vpn_peers(&self) -> Response {
         match &self.vpn {
@@ -2224,13 +2222,11 @@ impl Api {
     /// routing in [`Api::handle`] and [`vpn_enroll`]'s module documentation
     /// for why a process with no session can still reach this safely.
     ///
-    /// Body: `{"code", "verifier", "peer", "public_key"}`. `peer` and
-    /// `public_key` are required here, unlike [`people_api::vpn_fields_from_body`]'s
-    /// use in `set_grants` — an admin may grant `vpn.access` before a device
-    /// exists to provision, but a desktop app presenting a sign-in code
-    /// always already generated the key it wants enrolled, and a response
-    /// that confirmed the account without writing a roster entry would just
-    /// be a more confusing way to say the same fields are missing.
+    /// Body: `{"code", "verifier", "peer", "public_key"}`. `peer` is the
+    /// device's own label, not a roster name: the Peer is named here,
+    /// `<person>-<device>` ([`selfhost_vpn::peer_binding::peer_name`]), and the
+    /// reply's `peer` is the name the device must dial as. `server_public_key`
+    /// is the relay's `server.pub` line for the device to pin, or `null`.
     ///
     /// The code/verifier surface is what feeds [`FailureGate`]: guessing a
     /// code is guessing a credential, the same as a password or a passkey
@@ -2260,13 +2256,13 @@ impl Api {
             console.gate.record_failure();
             return problem(Status(401), "authorisation required");
         };
-        let (peer, public_key) = match people_api::vpn_fields_from_body(body) {
-            Ok((Some(peer), Some(public_key))) => (peer, public_key),
-            Ok(_) => {
-                return problem(Status(400), "peer and public_key are required to enrol a device");
-            }
-            Err(refusal) => return problem(Status(400), &refusal),
+        let device = document.get("peer").and_then(Json::as_str).unwrap_or_default();
+        let Some(public_key) = document.get("public_key").and_then(Json::as_str) else {
+            return problem(Status(400), "public_key is required to enrol a device");
         };
+        if let Some(why) = selfhost_config::vpn::public_key_problem(public_key) {
+            return problem(Status(400), &format!("that public_key is not usable: {why}"));
+        }
         let authorized = match self.vpn_authorizations.redeem(code, verifier) {
             Ok(authorized) => authorized,
             Err(_) => {
@@ -2275,10 +2271,14 @@ impl Api {
             }
         };
         console.gate.reset();
+        let peer = selfhost_vpn::peer_binding::peer_name(&authorized.name, device);
+        if let Some(why) = selfhost_config::vpn::peer_name_problem(&peer) {
+            return problem(Status(400), &format!("\"{peer}\" is not a usable device name: {why}"));
+        }
         // A Peer is one Person's device. Bound before the roster is touched, so
         // a name somebody else already owns never gets a second key.
         if let Some(vpn) = &self.vpn {
-            if let Err(refusal) = peer_binding::bind(vpn.data_dir(), &peer, &authorized.name) {
+            if let Err(refusal) = selfhost_vpn::peer_binding::bind(vpn.data_dir(), &peer, &authorized.name) {
                 return problem(Status(409), &refusal);
             }
         }
@@ -2292,9 +2292,14 @@ impl Api {
                 &Grants::none(),
                 &after,
                 Some(&peer),
-                Some(&public_key),
+                Some(public_key),
             )
         });
+        let server_public_key = self
+            .vpn
+            .as_ref()
+            .and_then(|vpn| vpn.server_public_key(location.as_str()))
+            .map_or(Json::Null, Json::string);
         let Ok(identity) = selfhost_identity::Identity::parse(&authorized.name) else {
             return problem(Status(500), "the authorized identity is no longer usable");
         };
@@ -2309,6 +2314,8 @@ impl Api {
             Json::object([
                 ("name", Json::string(&authorized.name)),
                 ("location", Json::string(location.as_str())),
+                ("peer", Json::string(&peer)),
+                ("server_public_key", server_public_key),
                 ("notes", Json::array(notes.iter().map(Json::string))),
             ]),
         )

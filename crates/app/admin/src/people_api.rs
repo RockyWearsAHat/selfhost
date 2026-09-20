@@ -164,7 +164,7 @@ pub fn unreachable_without_vpn(grants: &Grants, relays: &[&str]) -> Option<Strin
 /// legal (see [`vpn_side_effects`]'s own doc comment), so this only refuses
 /// when a field is *present* and fails the same shape check
 /// [`selfhost_config::vpn::peer_name_problem`] / `public_key_problem` apply to
-/// a `[[vpn.peers]]` config entry or the CLI's own flags — a typo caught here
+/// the CLI's own flags — a typo caught here
 /// rather than written and discovered at the next handshake.
 pub fn vpn_fields_from_body(body: &[u8]) -> Result<(Option<String>, Option<String>), String> {
     let text = std::str::from_utf8(body).map_err(|_| "the body is not JSON".to_owned())?;
@@ -302,7 +302,13 @@ pub fn vpn_side_effects(
         if now_held {
             match (peer, public_key) {
                 (Some(peer), Some(public_key)) => {
-                    match selfhost_vpn::enrol(&key_dir, peer, public_key) {
+                    // Bound first: an unbound roster name is admitted nowhere.
+                    let enrolled = selfhost_vpn::peer_binding::bind(data_dir, peer, subject)
+                        .and_then(|()| {
+                            selfhost_vpn::enrol(&key_dir, peer, public_key)
+                                .map_err(|error| error.to_string())
+                        });
+                    match enrolled {
                         Ok(()) => lines.push(format!(
                             "vpn.access:{location}: enrolled roster entry \"{peer}\", live, no \
                              restart"
@@ -320,7 +326,7 @@ pub fn vpn_side_effects(
                 )),
             }
         } else if let Some(peer) = peer {
-            match selfhost_vpn::revoke(&key_dir, peer) {
+            match selfhost_vpn::peer_binding::forget(std::slice::from_ref(relay), data_dir, subject, peer) {
                 Ok(()) => lines.push(format!(
                     "vpn.access:{location}: removed roster entry \"{peer}\", live, no restart"
                 )),
@@ -378,19 +384,27 @@ impl VpnWiring {
         &self.data_dir
     }
 
-    /// The Person a Peer on `location` belongs to.
-    ///
-    /// A relay names whoever connected by their Peer — the device — and access
-    /// is a Person's. The relay's own roster is asked first, then the binding
-    /// enrolment recorded in `<data_dir>/vpn.peers`.
-    pub fn person_of_peer(&self, location: &str, peer: &str) -> Option<String> {
-        self.relays
-            .iter()
-            .filter(|relay| relay.name == location)
-            .flat_map(|relay| &relay.peers)
-            .find(|entry| entry.name == peer)
-            .map(|entry| entry.person.clone())
-            .or_else(|| crate::peer_binding::owner_of(&self.data_dir, peer))
+    /// The Person a Peer belongs to: whoever enrolled it, and nobody otherwise.
+    pub fn person_of_peer(&self, peer: &str) -> Option<String> {
+        selfhost_vpn::peer_binding::owner_of(&self.data_dir, peer)
+    }
+
+    /// The relay's own public key line (`server.pub`), for a device to pin.
+    pub fn server_public_key(&self, location: &str) -> Option<String> {
+        let relay = self.relays.iter().find(|relay| relay.name == location)?;
+        let key_dir = selfhost_vpn::keys::key_dir(relay, &self.data_dir);
+        let text = std::fs::read_to_string(key_dir.join("server.pub")).ok()?;
+        Some(text.trim().to_owned()).filter(|line| !line.is_empty())
+    }
+
+    /// Every Peer bound to `person`.
+    pub fn devices_of(&self, person: &str) -> Vec<String> {
+        selfhost_vpn::peer_binding::peers_of(&self.data_dir, person)
+    }
+
+    /// Forgets `person`'s device `peer` — see [`selfhost_vpn::peer_binding::forget`].
+    pub fn forget_device(&self, person: &str, peer: &str) -> Result<(), String> {
+        selfhost_vpn::peer_binding::forget(&self.relays, &self.data_dir, person, peer)
     }
 
     /// The name of every `[[vpn]]` relay this deployment declares, in
@@ -414,44 +428,27 @@ impl VpnWiring {
 
     /// Every peer this deployment's relays know about, for `GET /api/vpn/peers`.
     ///
-    /// A static entry comes straight from `[[vpn.peers]]` — reviewed and
-    /// committed like any other access decision, `person` required by the
-    /// schema itself. A dynamic entry was enrolled through a relay's roster
-    /// file with no config edit and no restart (see [`selfhost_vpn::enrol`]'s
-    /// module documentation for why that file exists at all); its `person`
-    /// comes from [`crate::peer_binding::owner_of`], the one record of who a
-    /// roster name belongs to, and is `null` for a name nothing has bound yet.
-    /// A roster name that also appears in `[[vpn.peers]]` is reported only
-    /// once, as the static entry — the config already speaks for it.
+    /// Read from each relay's roster ([`selfhost_vpn::Roster`]). `person` is
+    /// who enrolled it; a listed name nobody enrolled has `person: null` and
+    /// the `reason` it is not admitted.
     pub fn peers_json(&self) -> Json {
         let mut peers = Vec::new();
         for relay in &self.relays {
-            for peer in &relay.peers {
+            let key_dir = selfhost_vpn::keys::key_dir(relay, &self.data_dir);
+            let roster = selfhost_vpn::Roster::read(relay, &key_dir, &self.data_dir);
+            for entry in roster.enrolled() {
                 peers.push(Json::object([
                     ("relay".to_owned(), Json::string(relay.name.as_str())),
-                    ("name".to_owned(), Json::string(peer.name.as_str())),
-                    ("person".to_owned(), Json::string(peer.person.as_str())),
-                    ("static".to_owned(), Json::Bool(true)),
-                    (
-                        "forwardPort".to_owned(),
-                        peer.forward_port.map_or(Json::Null, |port| Json::Number(port as f64)),
-                    ),
+                    ("name".to_owned(), Json::string(entry.peer.as_str())),
+                    ("person".to_owned(), Json::string(entry.person.as_str())),
                 ]));
             }
-
-            let key_dir = selfhost_vpn::keys::key_dir(relay, &self.data_dir);
-            let dynamic_names = selfhost_vpn::enrol::roster(&key_dir).unwrap_or_default();
-            for name in &dynamic_names {
-                if relay.peers.iter().any(|peer| &peer.name == name) {
-                    continue;
-                }
-                let person = crate::peer_binding::owner_of(&self.data_dir, name);
+            for entry in roster.rejected() {
                 peers.push(Json::object([
                     ("relay".to_owned(), Json::string(relay.name.as_str())),
-                    ("name".to_owned(), Json::string(name.as_str())),
-                    ("person".to_owned(), person.map_or(Json::Null, Json::string)),
-                    ("static".to_owned(), Json::Bool(false)),
-                    ("forwardPort".to_owned(), Json::Null),
+                    ("name".to_owned(), Json::string(entry.peer.as_str())),
+                    ("person".to_owned(), Json::Null),
+                    ("reason".to_owned(), Json::string(entry.reason.as_str())),
                 ]));
             }
         }
@@ -824,8 +821,8 @@ mod tests {
 
     #[test]
     fn a_malformed_peer_or_public_key_is_refused_before_anything_is_written() {
-        // The same shape check a `[[vpn.peers]]` config entry and the CLI's own
-        // `--peer`/`--pubkey` flags are held to — a typo caught here rather than
+        // The same shape check the CLI's own `--peer`/`--pubkey` flags are
+        // held to — a typo caught here rather than
         // written and discovered at the next handshake.
         assert!(vpn_fields_from_body(br#"{"grants":[],"peer":"Not Valid!"}"#).is_err());
         assert!(vpn_fields_from_body(br#"{"grants":[],"public_key":"not-base64-32-bytes"}"#).is_err());

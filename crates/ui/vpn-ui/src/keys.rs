@@ -251,6 +251,38 @@ pub(crate) fn set_signed_in(peer: &str, label: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Renames the key pair generated under `label` to the Peer name the server
+/// chose, so `--identity <peer>` finds it. The `.pub` file's third field is
+/// the name, so it is rewritten rather than moved.
+pub(crate) fn adopt_peer_name(label: &str, peer: &str) -> Result<(), String> {
+    if label == peer {
+        return Ok(());
+    }
+    // The server's word becomes a file name here; hold it to its own grammar.
+    if peer.is_empty() || !peer.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-') {
+        return Err(format!("the server named this device \"{peer}\", which is not a usable name"));
+    }
+    let home = std::env::var("HOME").map_err(|_| "no HOME".to_string())?;
+    let dir = format!("{home}/.securevpn/keys");
+    let public = std::fs::read_to_string(format!("{dir}/{label}.pub")).map_err(|error| error.to_string())?;
+    let mut fields = public.split_whitespace();
+    let (Some(tag), Some(key)) = (fields.next(), fields.next()) else {
+        return Err(format!("{dir}/{label}.pub is not a public key file"));
+    };
+    std::fs::rename(format!("{dir}/{label}.key"), format!("{dir}/{peer}.key"))
+        .map_err(|error| error.to_string())?;
+    std::fs::write(format!("{dir}/{peer}.pub"), format!("{tag} {key} {peer}\n"))
+        .map_err(|error| error.to_string())?;
+    std::fs::remove_file(format!("{dir}/{label}.pub")).map_err(|error| error.to_string())
+}
+
+/// Pins the relay's public key as `keys/server.pub`, as the server sent it.
+pub(crate) fn write_server_key(line: &str) -> Result<(), String> {
+    let home = std::env::var("HOME").map_err(|_| "no HOME".to_string())?;
+    std::fs::write(format!("{home}/.securevpn/keys/server.pub"), format!("{}\n", line.trim()))
+        .map_err(|error| error.to_string())
+}
+
 /// Shells out to Secure-VPN's own key manager to generate (or load) one
 /// named identity and print its public key — the one call here that
 /// touches private key material, and it never leaves that script's process.

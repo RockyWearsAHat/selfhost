@@ -89,16 +89,12 @@ A difference means somebody edited the installed copy in place. Reconcile it her
 first — this side is the reviewed one — and then reinstall. To check either
 against the source of truth, clone the repository above and diff.
 
-## `--peer-forward`, and which `server.py` a box is running
+## `--roster`, and which `server.py` a box is running
 
-`crates/services/vpn/src/runner.rs` launches a relay with
-`--peer-forward <peer>=<socket>` for every roster entry that declares a
-`forward_port`. That flag is implemented in `server.py` **upstream**; it is not in
-any copy that predates it, and Python's `argparse` exits non-zero on an argument
-it does not recognise. So the question a deployment has to answer is not "does
-the implementation exist" but "**is the copy installed on this box new enough**".
-`Relays::preflight` puts that requirement in the relay's own service log before the
-first start rather than after it.
+`crates/services/vpn/src/runner.rs` launches a relay with `--roster <key_dir>/roster`
+and no `--peer`: a device is admitted only because a signed-in account enrolled it.
+`--roster` is implemented in `server.py` **upstream**; a copy that predates it exits
+non-zero on the unknown argument, so the installed copy must be new enough.
 
 ## `join-mac.sh` clones this repository, and no longer destroys anything
 

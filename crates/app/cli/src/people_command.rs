@@ -248,6 +248,7 @@ pub fn run(arguments: &[String], data_dir: &Path, config: &Config) -> Result<(),
             pubkey_argument(arguments)?,
         ),
         Some("forget") => forget(&people, data_dir, name_argument(arguments)?),
+        Some("forget-device") => forget_device(data_dir, config, name_argument(arguments)?, arguments.get(3)),
         Some("invite") => invite(&people, data_dir, config, arguments),
         Some("invited") => invited(data_dir),
         Some("uninvite") => uninvite(data_dir, name_argument(arguments)?),
@@ -482,8 +483,7 @@ fn email_argument(arguments: &[String]) -> Result<Option<String>, String> {
 ///
 /// Deliberately not [`PersonName`]: a roster entry is a device, one of possibly
 /// several a person holds, and it is checked against
-/// [`selfhost_config::vpn::peer_name_problem`] — the same rule a `[[vpn.peers]]`
-/// block is — rather than the person-name rule, which allows characters (spaces,
+/// [`selfhost_config::vpn::peer_name_problem`] rather than the person-name rule, which allows characters (spaces,
 /// most Unicode) a roster filename cannot.
 fn peer_argument(arguments: &[String]) -> Result<Option<String>, String> {
     let Some(index) = arguments.iter().position(|word| word == "--peer") else {
@@ -501,8 +501,7 @@ fn peer_argument(arguments: &[String]) -> Result<Option<String>, String> {
 /// The `--pubkey <base64>` pair, if given.
 ///
 /// Checked against [`selfhost_config::vpn::public_key_problem`] before it is
-/// ever handed to [`selfhost_vpn::enrol`] — the same shape check a `[[vpn.peers]]`
-/// block's `public_key` gets, so a typo is refused here rather than written and
+/// ever handed to [`selfhost_vpn::enrol`], so a typo is refused here rather than written and
 /// discovered at the next handshake.
 fn pubkey_argument(arguments: &[String]) -> Result<Option<String>, String> {
     let Some(index) = arguments.iter().position(|word| word == "--pubkey") else {
@@ -727,7 +726,7 @@ fn list(people: &People, data_dir: &Path) -> Result<(), String> {
         if waiting.contains(&person.name) {
             continue;
         }
-        print_person(person);
+        print_person(person, data_dir);
         listed += 1;
     }
     if !waiting.is_empty() {
@@ -760,7 +759,7 @@ fn show(people: &People, name: PersonName, data_dir: &Path) -> Result<(), String
     let enrolled = enrolled_names(data_dir).contains(&name);
     match people.find(&name) {
         Some(person) => {
-            print_person(&person);
+            print_person(&person, data_dir);
             if person.grants.is_empty() && enrolled {
                 println!("  — but has registered a passkey, so they can log in to an empty console");
             }
@@ -782,16 +781,18 @@ fn show(people: &People, name: PersonName, data_dir: &Path) -> Result<(), String
     }
 }
 
-/// One entry: the name, then a line per capability.
-fn print_person(person: &Person) {
+/// One entry: the name, a line per capability, then a line per VPN device.
+fn print_person(person: &Person, data_dir: &Path) {
     println!();
     println!("{}", person.name);
     if person.grants.is_empty() {
         println!("  holds nothing");
-        return;
     }
     for capability in person.grants.iter() {
         println!("  {}", selfhost_admin::people_api::wire_word(capability));
+    }
+    for peer in selfhost_vpn::peer_binding::peers_of(data_dir, person.name.as_str()) {
+        println!("  device {peer}");
     }
 }
 
@@ -960,6 +961,20 @@ fn forget(people: &People, data_dir: &Path, name: PersonName) -> Result<(), Stri
         Ok(false) => Err(format!("{name} had no entry here; nothing changed")),
         Err(error) => Err(format!("could not write the registry: {error}")),
     }
+}
+
+/// Removes one of a person's VPN devices: key file, roster line and binding.
+fn forget_device(
+    data_dir: &Path,
+    config: &Config,
+    name: PersonName,
+    peer: Option<&String>,
+) -> Result<(), String> {
+    let peer = peer.ok_or("usage: selfhost people forget-device <name> <device>")?;
+    selfhost_vpn::peer_binding::forget(&config.vpn, data_dir, name.as_str(), peer)?;
+    record(data_dir, Authority::GrantsChanged, name.as_str(), &format!("device-forgotten:{peer}"));
+    println!("✓ {peer} is no longer one of {name}'s devices; the relay refuses it from now on");
+    Ok(())
 }
 
 /// The capability vocabulary, from the API's own list rather than a second copy.
@@ -1307,6 +1322,7 @@ forward = "127.0.0.1:443"
             "gjD2KgdBYIQo0WmUvud9pnNFdNmtBcMbh5QLnTLBKW4=",
         )
         .expect("the fixture enrols cleanly");
+        selfhost_vpn::peer_binding::bind(&data_dir, "dad-phone", "dad").expect("the fixture binds");
         let name = PersonName::parse("dad").unwrap();
         let lines = vpn_side_effects(
             &config,

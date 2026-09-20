@@ -95,13 +95,19 @@ pub fn sign_in() -> Result<SignInResult, String> {
 
     let code = await_callback(&listener, &state)?;
 
-    let peer = keys::account().unwrap_or_else(keys::generate_peer_name);
-    let public_key = keys::generate_named_key(&peer)?;
+    // The name sent is only this device's label: the server names the Peer
+    // `<person>-<device>`, and that reply is the identity the tunnel dials as.
+    let label = keys::account().unwrap_or_else(keys::generate_peer_name);
+    let public_key = keys::generate_named_key(&label)?;
 
-    let reply = enroll(&code, &verifier, &peer, &public_key)?;
-    keys::set_signed_in(&peer, &reply.account)?;
+    let reply = enroll(&code, &verifier, &label, &public_key)?;
+    keys::adopt_peer_name(&label, &reply.peer)?;
+    if let Some(server_key) = &reply.server_public_key {
+        keys::write_server_key(server_key)?;
+    }
+    keys::set_signed_in(&reply.peer, &reply.account)?;
 
-    Ok(SignInResult { peer, account: reply.account })
+    Ok(SignInResult { peer: reply.peer, account: reply.account })
 }
 
 /// The sign-in URL the browser should open: a `#vpn-connect` fragment
@@ -255,12 +261,22 @@ fn enroll(code: &str, verifier: &str, peer: &str, public_key: &str) -> Result<En
     }
     let account =
         json.get("name").and_then(|value| value.as_str()).ok_or("the server's reply had no account name")?;
-    Ok(EnrollReply { account: account.to_string() })
+    let peer = json.get("peer").and_then(|value| value.as_str()).ok_or("the server's reply had no device name")?;
+    let server_public_key = json.get("server_public_key").and_then(|value| value.as_str());
+    Ok(EnrollReply {
+        account: account.to_string(),
+        peer: peer.to_string(),
+        server_public_key: server_public_key.map(str::to_string),
+    })
 }
 
 /// The server's successful reply to `/api/vpn/enroll`.
 struct EnrollReply {
     account: String,
+    /// The Peer name the server gave this device.
+    peer: String,
+    /// The relay's `server.pub` line, when the server has one to give.
+    server_public_key: Option<String>,
 }
 
 /// `AUTH_URL`'s host, for the TLS handshake's SNI and the `Host` header.
