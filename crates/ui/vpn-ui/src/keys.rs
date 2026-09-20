@@ -251,6 +251,29 @@ pub(crate) fn set_signed_in(peer: &str, label: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Clears a completed sign-in: the inverse of [`set_signed_in`], for "My
+/// devices" removing the device this install itself is.
+///
+/// Only ever removes the two local label files [`account_path`] and
+/// [`account_label_path`] — it holds no private key material to begin with
+/// (see this module's own doc comment) and never talks to the network; the
+/// server-side half (the roster line, the `.pub` file, the binding, the
+/// audit record) is `crates/services/vpn/src/peer_binding.rs`'s
+/// `forget_device`, reached only through a signed-in console session, not
+/// from this desktop process (see `app::my_devices_screen`'s doc comment for
+/// why). A file that is already gone is not an error — signing out twice is
+/// still signed out.
+pub(crate) fn sign_out() -> Result<(), String> {
+    for path in [account_path(), account_label_path()].into_iter().flatten() {
+        match std::fs::remove_file(&path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.to_string()),
+        }
+    }
+    Ok(())
+}
+
 /// Shells out to Secure-VPN's own key manager to generate (or load) one
 /// named identity and print its public key — the one call here that
 /// touches private key material, and it never leaves that script's process.
