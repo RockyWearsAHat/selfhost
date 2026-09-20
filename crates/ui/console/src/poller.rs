@@ -22,6 +22,7 @@ use crate::nas::{self, Listing, Share};
 use crate::registry::{Person, Trail};
 use crate::remote::{Agent, Node, Settings};
 use crate::state::{Command, FileAction, Link, LogLine, Screen, Snapshot, Viewer};
+use crate::view::sites::Site;
 use selfhost_firewall::FirewallState;
 use selfhost_json::Json;
 use selfhost_supervisor::state::{ServiceStatus, spec_from_json, spec_to_json};
@@ -131,6 +132,7 @@ fn run(connect: impl Connect, shared: Arc<Mutex<Snapshot>>, running: Arc<AtomicB
                         refresh_definition(ready, &shared);
                         refresh_logs(ready, &shared);
                         refresh_firewall(ready, &shared);
+                        refresh_system(ready, &shared);
                     }
                     Screen::Files => {
                         refresh_shares(ready, &shared);
@@ -138,6 +140,7 @@ fn run(connect: impl Connect, shared: Arc<Mutex<Snapshot>>, running: Arc<AtomicB
                     }
                     Screen::Desktop => refresh_desktop(ready, &shared),
                     Screen::People => refresh_people(ready, &shared),
+                    Screen::Sites => refresh_sites(ready, &shared),
                 }
             }
         }
@@ -359,6 +362,19 @@ fn refresh_firewall(client: &Client, shared: &Arc<Mutex<Snapshot>>) {
     if let Ok(value) = client.get("/api/firewall") {
         if let Some(state) = FirewallState::from_json(&value) {
             shared.lock().expect("the snapshot lock was poisoned").firewall = Some(state);
+        }
+    }
+}
+
+/// Fetches the daemon's own internal parts into the snapshot.
+///
+/// The same shape of fetch as [`refresh_firewall`], for the same reason: rare
+/// to change, silent on a 404 (a daemon built before `GET /api/system`
+/// existed), and the last good answer is left in place until a fetch succeeds.
+fn refresh_system(client: &Client, shared: &Arc<Mutex<Snapshot>>) {
+    if let Ok(value) = client.get("/api/system") {
+        if let Some(parts) = crate::state::SystemPart::list_from_json(&value) {
+            shared.lock().expect("the snapshot lock was poisoned").system = Some(parts);
         }
     }
 }
@@ -657,6 +673,30 @@ fn refresh_people(client: &Client, shared: &Arc<Mutex<Snapshot>>) {
     if trail.is_some() {
         snapshot.people.trail = trail;
     }
+}
+
+/// Fetches the roster of configured sites and their access settings.
+fn refresh_sites(client: &Client, shared: &Arc<Mutex<Snapshot>>) {
+    let (sites, trouble) = match client.get("/api/sites") {
+        Ok(value) => {
+            let sites = value
+                .get("sites")
+                .and_then(Json::as_array)
+                .unwrap_or(&[])
+                .iter()
+                .filter_map(Site::from_json)
+                .collect();
+            (Some(sites), None)
+        }
+        Err(ClientError::Refused { status, message }) => {
+            (None, Some(nas::refusal_text(status.code(), Some(&Json::string(message)))))
+        }
+        Err(_) => return,
+    };
+
+    let mut snapshot = shared.lock().expect("the snapshot lock was poisoned");
+    snapshot.sites.sites = sites;
+    snapshot.sites.trouble = trouble;
 }
 
 /// Reads one log line from the wire.

@@ -162,9 +162,10 @@ crates/
                 and the two loopback relays (/api/* and /dav). Here rather than
                 in net/ because it depends on mail and admin.
     cli/        The `selfhost` binary, including `doctor` and `daemon`.
-docs/           principles.dx (how to work here), architecture.dx, surfaces.dx,
-                the security guidebook, measured constraints, roadmap.
-  labs/         One runnable document per subsystem, with recorded verdicts.
+docs/           principles.dx (how to work here), surfaces.dx, the security
+                guidebook, measured constraints, roadmap.
+  labs/         One runnable document per subsystem, with recorded verdicts;
+                redesign-history.dx is the round-by-round design record.
 index.dx        The map. Start here.
 scripts/        macos/ windows/ shared/ for loose scripts; securevpn/,
                 mail-discovery/ and ui-frames/ are whole tools that span both.

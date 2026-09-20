@@ -2705,6 +2705,7 @@ function boot() {
     selected: null,             // tracked by NAME, never by index
     spec: null,                 // fetched definition for the selected service
     firewall: null,             // last firewall state, or null → panel hidden
+    system: null,                // last GET /api/system answer, or null → panel hidden
     logs: { service: "", nextSeq: 0, missed: 0, count: 0 },
     notice: null,               // { kind: "done"|"problem", text }
     formOpen: false,
@@ -2739,7 +2740,8 @@ function boot() {
     vocabulary: null,           // every capability word this deployment knows, fetched once
     invites: undefined,         // undefined → unasked · null → not this caller's · object → {invites, count}
     invited: null,               // the invitation just minted, shown once until dismissed
-    vpnConnect: null,           // {location, state, challenge, port} from a desktop app's redirect, while approving it
+    sites: null,                // the configured sites and their settings, or null if not fetched
+    vpnConnect: null,           // {state, challenge, port} from a desktop app's redirect, while approving it
   };
 
   const $ = (id) => document.getElementById(id);
@@ -2765,6 +2767,8 @@ function boot() {
   let logQueryTimer = null;
   /* Last rendered firewall JSON, to rebuild that table only on change. */
   let firewallDrawn = "";
+  /* Last rendered system JSON, to rebuild that list only on change. */
+  let systemDrawn = "";
   /* Last rendered fleet strip, to rebuild those chips only on change. */
   let stripDrawn = "";
   /* Rail rows by service name, updated in place so focus survives a poll. */
@@ -2809,7 +2813,7 @@ function boot() {
 
   /* ── vpn device sign-in ───────────────────────────────────────────── */
 
-  /** Parses a `#vpn-connect?location=...&state=...&challenge=...&port=...`
+  /** Parses a `#vpn-connect?state=...&challenge=...&port=...`
    *  link from the SelfHost VPN desktop app, or null if the fragment does
    *  not match.
    *
@@ -2821,15 +2825,14 @@ function boot() {
     const match = /^#vpn-connect\?(.+)$/.exec(location.hash || "");
     if (!match) return null;
     const params = new URLSearchParams(match[1]);
-    const forLocation = params.get("location");
     const forState = params.get("state");
     const challenge = params.get("challenge");
     const port = Number(params.get("port"));
-    if (!forLocation || !forState || !challenge
+    if (!forState || !challenge
       || !Number.isInteger(port) || port <= 0 || port > 65535) {
       return null;
     }
-    return { location: forLocation, state: forState, challenge, port };
+    return { state: forState, challenge, port };
   }
 
   /** Finishes a desktop app's sign-in against *this* browser session.
@@ -2850,7 +2853,7 @@ function boot() {
     try {
       reply = await api("/api/vpn/authorize", {
         method: "POST",
-        body: { location: connect.location, codeChallenge: connect.challenge },
+        body: { codeChallenge: connect.challenge },
       });
     } catch { vpnConnectFailed("cannot reach the server"); return; }
 
@@ -3106,6 +3109,7 @@ function boot() {
     state.selected = null;
     state.spec = null;
     state.firewall = null;
+    state.system = null;
     state.notice = null;
     state.formOpen = false;
     state.passkeys = null;
@@ -3117,6 +3121,7 @@ function boot() {
     state.user = null;
     resetLogs("");
     firewallDrawn = "";
+    systemDrawn = "";
     for (const row of railRows.values()) row.remove();
     railRows.clear();
     showLogin("");
@@ -3158,6 +3163,8 @@ function boot() {
     refreshPeople();
     refreshVocabulary();
     refreshInvites();
+    // Sites are fetched once on load, like the audit trail.
+    refreshSites();
   }
 
   async function submitLogin(event) {
@@ -3930,7 +3937,7 @@ function boot() {
       hideConfirm();
     }
 
-    await Promise.all([refreshDefinition(), refreshLogs(), refreshFirewall(), refreshDesktop()]);
+    await Promise.all([refreshDefinition(), refreshLogs(), refreshFirewall(), refreshSystem(), refreshDesktop()]);
     render();
   }
 
@@ -3975,6 +3982,19 @@ function boot() {
     if (reply.status === 404) { state.firewall = null; return; }
     if (reply.status === 200 && reply.body && typeof reply.body.backend === "string") {
       state.firewall = reply.body;
+    }
+  }
+
+  /** Fetches the daemon's own internal parts — never the hosted Services list.
+   *  A 404 — a daemon without the feature — hides the panel silently, the same
+   *  as the firewall panel above. */
+  async function refreshSystem() {
+    let reply;
+    try { reply = await api("/api/system"); }
+    catch { return; }
+    if (reply.status === 404) { state.system = null; return; }
+    if (reply.status === 200 && reply.body && Array.isArray(reply.body.system)) {
+      state.system = reply.body.system;
     }
   }
 
@@ -4151,6 +4171,7 @@ function boot() {
     renderRail();
     renderDetail();
     renderFirewall();
+    renderSystem();
     renderDiagnostics();
     renderStorage();
     renderDesktop();
@@ -4500,6 +4521,47 @@ function boot() {
         row.append(cell);
       }
       body.append(row);
+    }
+  }
+
+  /* ── the system panel ─────────────────────────────────────────────── */
+
+  /** The daemon's own internal parts — proxy, admin API, VPN relays, the VPN
+   *  updater, reports, mail if configured. Never the hosted Services list:
+   *  see `is_system` in `crates/app/admin/src/lib.rs`. */
+  function renderSystem() {
+    const parts = state.system;
+    const panel = $("system");
+    panel.hidden = !parts;
+    if (!parts) { systemDrawn = ""; return; }
+    const drawn = JSON.stringify(parts);
+    if (drawn === systemDrawn) return;
+    systemDrawn = drawn;
+
+    const rows = $("system-rows");
+    rows.textContent = "";
+    for (const part of parts) {
+      if (!part || typeof part.name !== "string") continue;
+      const partState = typeof part.state === "string" ? part.state : "unknown";
+      const reason = typeof part.reason === "string" ? part.reason : null;
+      const status = reason ? "bad" : partState === "not configured" ? "warn" : "ok";
+
+      const row = document.createElement("li");
+      const lamp = document.createElement("span");
+      setLamp(lamp, status);
+      const name = document.createElement("span");
+      name.className = "sys-name";
+      name.textContent = part.name;
+      const word = document.createElement("span");
+      setStateWord(word, status, partState.toUpperCase());
+      row.append(lamp, name, word);
+      if (reason) {
+        const why = document.createElement("span");
+        why.className = "sys-reason";
+        why.textContent = reason;
+        row.append(why);
+      }
+      rows.append(row);
     }
   }
 
@@ -8251,6 +8313,49 @@ function boot() {
     return row;
   }
 
+  /** Fetches the list of configured sites and their settings. */
+  async function refreshSites() {
+    let reply;
+    try { reply = await api("/api/sites"); }
+    catch { return; }
+    state.sites = reply.status === 200 && reply.body && Array.isArray(reply.body.sites)
+      ? reply.body.sites : null;
+    renderSites();
+  }
+
+  /** Renders the sites table. */
+  function renderSites() {
+    const panel = $("sites");
+    if (!state.sites) {
+      panel.hidden = true;
+      return;
+    }
+    panel.hidden = false;
+    $("sites-count").textContent = state.sites.length.toString();
+
+    const rows = $("sites-rows");
+    rows.textContent = "";
+    for (const site of state.sites) {
+      const row = document.createElement("tr");
+      const name = document.createElement("td");
+      name.textContent = site.name || "";
+      const domains = document.createElement("td");
+      domains.textContent = (site.domains || []).join(", ") || "—";
+      const exposure = document.createElement("td");
+      exposure.textContent = site.exposure || "—";
+      const owner = document.createElement("td");
+      owner.textContent = site.owner || "—";
+      row.append(name, domains, exposure, owner);
+      rows.append(row);
+    }
+
+    $("sites-table").hidden = state.sites.length === 0;
+    $("sites-empty").hidden = state.sites.length > 0;
+    if (state.sites.length === 0) {
+      $("sites-empty").textContent = "No sites configured.";
+    }
+  }
+
   /* ── wiring ───────────────────────────────────────────────────────── */
 
   $("login-form").addEventListener("submit", submitLogin);
@@ -8691,6 +8796,10 @@ function boot() {
     auditLimit = Math.min(AUDIT_CEILING, auditLimit + AUDIT_STEP);
     refreshAudit();
   });
+
+  /* The sites plate. */
+
+  $("sites-reload").addEventListener("click", refreshSites);
 
   /* The people plate. */
 

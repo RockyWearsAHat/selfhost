@@ -288,8 +288,10 @@ mod tests {
 
     #[tokio::test]
     async fn a_dead_resolver_times_out_rather_than_hanging() {
-        // 203.0.113.0/24 is reserved for documentation and routes nowhere.
-        let resolver = Resolver::at("203.0.113.1:53".parse().unwrap())
+        // A loopback socket that is bound and never answers: dead, without
+        // depending on how this machine's network routes a reserved address.
+        let silent = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let resolver = Resolver::at(silent.local_addr().unwrap())
             .with_timeout(Duration::from_millis(300));
         assert!(matches!(
             resolver.query("example.com", RecordType::A).await,

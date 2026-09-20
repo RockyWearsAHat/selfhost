@@ -6,6 +6,7 @@
 mod acme_task;
 mod agent_command;
 mod app_command;
+mod arguments;
 mod assess;
 mod audit;
 mod converge;
@@ -21,6 +22,7 @@ mod health;
 mod home_task;
 mod identify;
 mod outside;
+mod init_owner_command;
 mod kill_switch;
 mod investigate;
 mod invite_email;
@@ -44,6 +46,7 @@ mod teardown;
 mod vpn_command;
 mod watch;
 
+use crate::arguments::value_of;
 use selfhost_admin::{Api, Fleet, Store, Token};
 use selfhost_config::{AcmeEnvironment, Config};
 use selfhost_dns::Resolver;
@@ -258,6 +261,14 @@ Commands
                              credential from SELFHOST_AGENT_TOKEN or
                              ~/.selfhost/agent-token — an agent token, never the
                              deployment's own.
+  init-owner <name> --email <address>
+                             Create the deployment's first owner: an ordinary
+                             Person holding the `owner` capability. Refuses if
+                             an owner already exists — an existing owner grants
+                             a second one with `people grant <name> owner`.
+                             The password is never a command-line argument: it
+                             is prompted for twice, no echo, on a terminal, or
+                             read as two lines from stdin otherwise.
   console-password [<password>]
                              Set the web console's login password; reads it
                              twice from stdin if omitted
@@ -347,6 +358,10 @@ fn main() -> ExitCode {
         "people" => load().and_then(|(config, project_dir)| {
             let data_dir = teardown::data_dir(&config, &project_dir);
             people_command::run(&arguments, &data_dir, &config)
+        }),
+        "init-owner" => load().and_then(|(config, project_dir)| {
+            let data_dir = teardown::data_dir(&config, &project_dir);
+            init_owner_command::run(&arguments, &data_dir)
         }),
         "agent" => load().and_then(|(config, project_dir)| {
             let data_dir = teardown::data_dir(&config, &project_dir);
@@ -475,6 +490,13 @@ fn init(arguments: &[String]) -> Result<(), String> {
 
     // Defaults are chosen so a first run cannot publish anything or burn a
     // certificate rate limit: loopback binds, self-signed certificates.
+    // Format the public API paths as a TOML inline array.
+    let auth_paths = selfhost_config::PUBLIC_AUTH_PATHS
+        .iter()
+        .map(|p| format!(r#""{}""#, p))
+        .collect::<Vec<_>>()
+        .join(", ");
+
     let starter = format!(
         r#"# selfhost — one file describes the whole deployment.
 version = 1
@@ -496,6 +518,16 @@ data_dir = "./data"
 [[nodes]]
 name = "home"
 role = "owner"
+
+# The auth site handles sign-in for gated sites. Its public_api_paths are
+# auto-configured with the same paths every deployment needs: /api/session for
+# login, /api/vpn/authorize for VPN enrollment, and /api/pass/authorize for
+# signing into gated sites. Change the domain to match your hostname.
+[[sites]]
+name = "auth"
+domains = ["auth.localhost"]
+static_root = "./sites/auth"
+public_api_paths = [{auth_paths}]
 
 [[sites]]
 name = "hello"
@@ -521,6 +553,11 @@ spa = false
 
     std::fs::write(&path, starter).map_err(|e| e.to_string())?;
     println!("• {CONFIG_FILENAME}");
+
+    // Create the auth site directory (empty for now; it will be populated by the daemon).
+    let auth_dir = PathBuf::from("sites/auth");
+    std::fs::create_dir_all(&auth_dir).map_err(|e| e.to_string())?;
+    println!("• sites/auth/");
 
     let page_dir = PathBuf::from("sites/hello");
     std::fs::create_dir_all(&page_dir).map_err(|e| e.to_string())?;
@@ -733,11 +770,6 @@ fn converge_command(arguments: &[String]) -> Result<(), String> {
         println!("  ESCALATED  {}  {}", entry.component, entry.detail);
     }
     Err(format!("supervision has given up on {} component(s)", outstanding.len()))
-}
-
-/// The value following a named option, if it was given.
-fn value_of(arguments: &[String], name: &str) -> Option<String> {
-    arguments.iter().position(|argument| argument == name).and_then(|at| arguments.get(at + 1)).cloned()
 }
 
 /// Watches the network's DNS to find the device behind a compromised-host listing.
@@ -1145,6 +1177,23 @@ async fn serve_everything(
             ))
         });
 
+    // The Pass key, generated once and owner-only. One value, cloned into the
+    // admin API (which mints sign-in codes) and the proxy (which redeems them
+    // and verifies the cookie), so the two halves are in-process by
+    // construction. A key that cannot be read is a start-up failure: the
+    // alternative is `people` Sites that sign nobody in, silently.
+    let site_passes = selfhost_identity::PassKey::load_or_create(
+        &data_dir,
+        selfhost_identity::registry::write_owner_only,
+    )
+    .map(selfhost_admin::site_pass::SitePasses::new)
+    .map_err(|error| format!("cannot load the Pass signing key: {error}"))?;
+
+    // The Deploy record. Built once and shared by `Arc` with the self-update
+    // watcher in the `select!` below, rather than each holding its own handle
+    // onto the same file — see `Api::with_deploys`'s documentation.
+    let deploys = Arc::new(selfhost_admin::deploys::Deploys::in_dir(&data_dir));
+
     let mut api = Api::new(supervisor.clone(), store, token, firewall.clone())
         .with_github_credentials(github_credentials.clone())
         .with_console_auth(&data_dir)
@@ -1162,7 +1211,13 @@ async fn serve_everything(
         // a `vpn.access:<location>` grant, the same side effect `selfhost
         // people grant/allow/deny` already performs — see
         // `people_api::vpn_side_effects`.
-        .with_vpn(config.vpn.clone(), data_dir.clone());
+        .with_vpn(config.vpn.clone(), data_dir.clone())
+        .with_site_passes(site_passes.clone())
+        // Shared with the self-update watcher below, via the same `Arc` — see
+        // `Api::with_deploys`'s documentation for why this is not built from
+        // a `data_dir` the way `with_agents` is.
+        .with_deploys(Arc::clone(&deploys))
+        .with_mail_configured(config.mail.is_some());
     // Only when the section is live: a route that answers 202 and pokes a
     // watcher that is not running would report a deployment nobody is doing.
     if config.self_update.as_ref().is_some_and(|update| update.enabled) {
@@ -1283,6 +1338,10 @@ async fn serve_everything(
     // loaded. Binding :443 first would open a window where the internet can
     // reach a proxy whose backends have not been started.
     let server = Arc::new(Server::build(&config, &project_dir));
+    server.attach_passes(selfhost_proxy::pass_gate::PassGate::new(
+        site_passes,
+        selfhost_identity::People::load(&data_dir),
+    ));
     server.spawn_health_tasks();
 
     // One place the live config is published from, so everything that has to
@@ -1317,6 +1376,10 @@ async fn serve_everything(
     }
 
     let certificates = CertificateStore::open(&data_dir).map_err(|e| e.to_string())?;
+    // Wired here rather than beside the rest of the builder chain above,
+    // because `certificates` does not exist until this line — see
+    // `Api::with_certificates` and `acme_task::CertificateExpiryReport`.
+    api = api.with_certificates(Arc::new(acme_task::CertificateExpiryReport(certificates.clone())));
 
     // The fallback identity: served on :443 the instant the listener binds, and
     // for any SNI that has no certificate of its own. A self-signed pair is
@@ -1416,6 +1479,32 @@ async fn serve_everything(
         let _ = scheduler.spawn_task();
     }
 
+    // If this boot followed a self-update's restart, prove the new build is
+    // actually serving before letting its Deploy record say so — see
+    // `self_update`'s "Proving the restart worked" module docs. A no-op,
+    // one failed file read, on every ordinary boot with nothing pending.
+    //
+    // Spawned rather than awaited: the health-check retries this can take
+    // must never delay the daemon's own startup, and the listeners it grades
+    // are already bound above by the time it runs. A rollback it decides on
+    // has already restored the previous binary and tree by the time this
+    // returns, so exiting here with the same restart code hands the box back
+    // to the one restart mechanism that brought this build up in the first
+    // place, rather than sitting on a build this process itself just proved
+    // broken.
+    tokio::spawn({
+        let data_dir = data_dir.clone();
+        let project_dir = project_dir.clone();
+        let config = config.clone();
+        let deploys = Arc::clone(&deploys);
+        async move {
+            let outcome = self_update::verify_after_restart(data_dir, project_dir, config, Some(deploys)).await;
+            if matches!(outcome, self_update::VerifyResult::RolledBack { .. }) {
+                std::process::exit(self_update::RESTART_EXIT);
+            }
+        }
+    });
+
     let mut updated_to: Option<String> = None;
     let outcome = tokio::select! {
         result = selfhost_admin::serve(listener, api) => {
@@ -1467,7 +1556,9 @@ async fn serve_everything(
         commit = self_update::watch_own_repository(
             config.self_update.clone(),
             project_dir.clone(),
+            data_dir.clone(),
             self_update_nudge.clone(),
+            Some(Arc::clone(&deploys)),
         ) => {
             updated_to = Some(commit);
             Ok(())

@@ -193,7 +193,7 @@ pub fn account_label() -> Option<String> {
 /// like the rest of the name, so it never changes underneath an enrolled
 /// device.
 pub(crate) fn generate_peer_name() -> String {
-    let raw = nix::unistd::gethostname().ok().and_then(|h| h.into_string().ok()).unwrap_or_default();
+    let raw = crate::hostname::hostname().unwrap_or_default();
     let host = raw.strip_suffix(".local").unwrap_or(&raw);
     let mut sanitized = String::new();
     let mut last_was_hyphen = true; // swallow a leading separator

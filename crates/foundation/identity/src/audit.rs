@@ -179,6 +179,17 @@ pub enum Authority {
     /// the desktop process presenting the code has no session to be `caller`
     /// checked through.
     VpnDeviceEnrolled,
+    /// A Person was signed in to a gated Site: a Pass was authorised for them.
+    SitePassAuthorised,
+    /// `selfhost init-owner` created the deployment's first owner, or granted
+    /// owner to an already-registered Person because none existed yet.
+    ///
+    /// Distinct from [`Self::GrantsChanged`] on purpose: this is the one
+    /// [`Authority`] act performed with no owner present to have authorised
+    /// it — the whole reason the command exists — and a reader of the trail
+    /// should be able to tell "the operator changed a grant" from "this is how
+    /// the operator came to exist" without reading the detail string.
+    OwnerInitialized,
 }
 
 impl Authority {
@@ -197,6 +208,8 @@ impl Authority {
             Self::PasskeyRegistered => "authority.enrol",
             Self::PasskeyRemoved => "authority.unenrol",
             Self::VpnDeviceEnrolled => "authority.vpn-enrol",
+            Self::SitePassAuthorised => "authority.site-pass",
+            Self::OwnerInitialized => "authority.init-owner",
         }
     }
 }
@@ -576,6 +589,7 @@ mod tests {
             Authority::PasskeyRegistered,
             Authority::PasskeyRemoved,
             Authority::VpnDeviceEnrolled,
+            Authority::SitePassAuthorised,
         ] {
             assert!(
                 Capability::parse(authority.name()).is_none(),

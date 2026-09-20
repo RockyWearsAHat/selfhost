@@ -54,7 +54,7 @@ use selfhost_config::Config;
 use selfhost_json::Json;
 use selfhost_reports::oauth::Provider;
 use selfhost_reports::service::{self, AccountsConfig, Service};
-use selfhost_reports::{Accounts, Mailbox, Owners, Plan, Store};
+use selfhost_reports::{Mailbox, Owners, Plan, ReportFilers, Store};
 
 /// Where the intake listens when nothing says otherwise.
 ///
@@ -805,7 +805,7 @@ fn save_oauth_providers(accounts_dir: &Path, providers: &[Provider]) -> Result<(
 /// `selfhost reports owners` — services owned by accounts, with the owner's email and plan.
 fn owners(accounts_dir: &Path, store: &Store) -> Result<(), String> {
     let owners = Owners::load(accounts_dir);
-    let accounts = Accounts::load(accounts_dir);
+    let accounts = ReportFilers::load(accounts_dir);
     let entries = owners.entries();
     if entries.is_empty() {
         println!("no services are owned by accounts");

@@ -433,6 +433,17 @@ impl Config {
                 });
             }
 
+            // Checked here, softly, rather than at TOML-deserialize time: an
+            // owner that is not a legal Person name (too long, an email
+            // address, a reserved word) is a mistake in this one site, not a
+            // reason to refuse the entire config file. See `SiteOwner`'s and
+            // `Site.owner`'s doc comments in `lib.rs`.
+            if let Some(owner) = &site.owner {
+                if let Err(message) = crate::SiteOwner::parse(owner) {
+                    problems.push(Problem { field: format!("sites[{i}].owner"), message });
+                }
+            }
+
             for (j, domain) in site.domains.iter().enumerate() {
                 let lowered = domain.to_ascii_lowercase();
                 if let Some(previous) = seen_domains.insert(lowered, i) {
@@ -533,6 +544,10 @@ impl Config {
                 }
             }
 
+            if let Some(refusal) = exposure_refusal(site) {
+                problems.push(Problem { field: format!("sites[{i}].exposure"), message: refusal });
+            }
+
             if site.console {
                 if let Some(previous) = console_site {
                     problems.push(Problem {
@@ -624,6 +639,76 @@ impl Config {
                 }
             }
         }
+
+        // A `people`- or `private`-gated Site is reached through a signed Pass, and
+        // getting one takes every path in `PUBLIC_AUTH_PATHS`: sign in
+        // (`/api/session`), be passed to the Site (`/api/pass/authorize`), enrol a
+        // Peer for a `private` one (`/api/vpn/authorize`). A deployment that gates a
+        // Site but relays only some of them has built a lock with part of a key: the
+        // proxy 302s a visitor to sign in and the missing step 404s. One Site — the
+        // auth site — must relay them all.
+        use crate::Exposure;
+        let gated = self
+            .sites
+            .iter()
+            .any(|site| matches!(site.exposure, Some(Exposure::People) | Some(Exposure::Private)));
+        if gated {
+            let missing_from = |site: &crate::Site| -> Vec<&str> {
+                crate::PUBLIC_AUTH_PATHS
+                    .iter()
+                    .copied()
+                    .filter(|path| !site.permits_public_api_path(path))
+                    .collect()
+            };
+            // The Site that relays the most of them is the auth site the message names.
+            let closest = self
+                .sites
+                .iter()
+                .enumerate()
+                .filter(|(_, site)| !site.public_api_paths.is_empty())
+                .map(|(i, site)| (i, missing_from(site)))
+                .min_by_key(|(_, missing)| missing.len());
+            match closest {
+                Some((_, missing)) if missing.is_empty() => {}
+                Some((i, missing)) => problems.push(Problem {
+                    field: format!("sites[{i}].public_api_paths"),
+                    message: format!(
+                        "a site is exposure = \"people\" or \"private\", but this auth site does \
+                         not relay {}; sign-in would 404 at that step. It must list all of: {}",
+                        missing.join(", "),
+                        crate::PUBLIC_AUTH_PATHS.join(", ")
+                    ),
+                }),
+                None => problems.push(Problem {
+                    field: "sites".into(),
+                    message: format!(
+                        "a site is exposure = \"people\" or \"private\", but no site's \
+                         public_api_paths relays the sign-in paths ({}); nobody could ever \
+                         sign in to reach it",
+                        crate::PUBLIC_AUTH_PATHS.join(", ")
+                    ),
+                }),
+            }
+        }
+
+        // A Site's `relay` names one of this deployment's `[[vpn]]` relays. A name
+        // that matches none is a Site no Peer can ever reach, and a phantom entry in
+        // every "which relays may you use" answer.
+        for (i, site) in self.sites.iter().enumerate() {
+            if let Some(relay) = site.relay_name() {
+                if !self.vpn.iter().any(|configured| configured.name == relay) {
+                    let known: Vec<&str> = self.vpn.iter().map(|configured| configured.name.as_str()).collect();
+                    problems.push(Problem {
+                        field: format!("sites[{i}].relay"),
+                        message: if known.is_empty() {
+                            format!("relay \"{relay}\" is named, but this deployment declares no [[vpn]] relay")
+                        } else {
+                            format!("no [[vpn]] relay is named \"{relay}\"; the relays are: {}", known.join(", "))
+                        },
+                    });
+                }
+            }
+        }
     }
 
     /// No two processes may claim the same port on the same machine.
@@ -676,6 +761,39 @@ const CONSOLE_GATE_RANGES: [&str; 7] = [
 /// hosts, and an operator who types it has almost certainly meant "the machines
 /// I own" while writing "every address any router might hand out".
 const CONSOLE_GATE_NARROWEST_IPV4: u8 = 24;
+
+/// Why a site's `exposure` contradicts the rest of its definition, if it does.
+///
+/// Each refusal is a config that reads one way and would behave another: a
+/// `public` site that still lists networks, a `private` one that lists none.
+/// The console and the sign-in gateway take no `exposure` at all — the console
+/// keeps its own login behind its own gate, and a sign-in page that demanded a
+/// Pass could never be reached by anyone who needs one.
+fn exposure_refusal(site: &crate::Site) -> Option<String> {
+    use crate::Exposure;
+    let exposure = site.exposure?;
+    if site.console {
+        return Some(
+            "the console site takes no exposure; it keeps its own login behind allowed_cidrs".into(),
+        );
+    }
+    if !site.public_api_paths.is_empty() && exposure != Exposure::Public {
+        return Some("a site with public_api_paths is how people sign in, so it must stay public".into());
+    }
+    match (exposure, site.allowed_cidrs.is_empty()) {
+        (Exposure::Public | Exposure::People, false) => Some(
+            "allowed_cidrs restricts the network, which is what exposure = \"private\" means; \
+             use that, or drop allowed_cidrs"
+                .into(),
+        ),
+        (Exposure::Private, true) => Some(
+            "exposure = \"private\" needs allowed_cidrs: the networks (the VPN's) a request must \
+             arrive from"
+                .into(),
+        ),
+        _ => None,
+    }
+}
 
 /// Why a console site may not name this CIDR, or `None` when it may.
 ///
@@ -800,6 +918,9 @@ mod tests {
             allowed_cidrs: vec![],
             console: false,
             public_api_paths: vec![],
+            exposure: None,
+            owner: None,
+            relay: None,
         }
     }
 
@@ -837,6 +958,31 @@ mod tests {
     #[test]
     fn a_minimal_deployment_is_valid() {
         assert!(config(vec![owner_node()], vec![site("a", "example.com")]).validate().is_ok());
+    }
+
+    #[test]
+    fn an_illegal_site_owner_is_a_reported_problem_not_a_hard_parse_failure() {
+        // Regression: `Site.owner` was once a `SiteOwner` newtype deserialized
+        // directly by serde, so an owner that is not a legal Person name (an
+        // email address, over the 32-character cap, a reserved word) failed at
+        // `toml::from_str` time with `ConfigError::Syntax` — refusing to load
+        // the *entire* file, including every other site and subsystem in it,
+        // rather than being collected here alongside every other per-site
+        // mistake the way `sites[i].domains`/`app_paths`/`health` already are.
+        let mut email_owner = site("a", "example.com");
+        email_owner.owner = Some("alex@example.com".into());
+        let problems = problems_of(&config(vec![owner_node()], vec![email_owner]));
+        assert!(problems.iter().any(|p| p.field == "sites[0].owner"), "{problems:?}");
+
+        let mut long_owner = site("b", "b.example.com");
+        long_owner.owner = Some("x".repeat(33));
+        let problems = problems_of(&config(vec![owner_node()], vec![long_owner]));
+        assert!(problems.iter().any(|p| p.field == "sites[0].owner"), "{problems:?}");
+
+        // A legal owner still validates clean.
+        let mut ok_owner = site("c", "c.example.com");
+        ok_owner.owner = Some("Alex".into());
+        assert!(problems_of(&config(vec![owner_node()], vec![ok_owner])).is_empty());
     }
 
     /// A relay in the shape the deployment actually runs: public on 8443,
@@ -1086,6 +1232,37 @@ mod tests {
     }
 
     #[test]
+    fn an_exposure_must_agree_with_the_rest_of_the_site() {
+        use crate::Exposure::{People, Private, Public};
+        let cidrs = || vec!["10.66.0.0/24".to_owned()];
+        // (exposure, allowed_cidrs, console, public_api_paths, valid)
+        let table = [
+            (None, vec![], false, false, true),
+            (None, cidrs(), false, false, true),
+            (Some(Public), vec![], false, false, true),
+            (Some(Public), cidrs(), false, false, false),
+            (Some(People), vec![], false, false, true),
+            (Some(People), cidrs(), false, false, false),
+            (Some(Private), cidrs(), false, false, true),
+            (Some(Private), vec![], false, false, false),
+            (Some(Private), cidrs(), true, false, false),
+            (Some(People), vec![], false, true, false),
+            (Some(Public), vec![], false, true, true),
+        ];
+        for (exposure, allowed_cidrs, console, gateway, valid) in table {
+            let mut subject = site("a", "a.com");
+            subject.exposure = exposure;
+            subject.allowed_cidrs = allowed_cidrs;
+            subject.console = console;
+            if gateway {
+                subject.public_api_paths = vec!["/api/session".into()];
+            }
+            let refused = exposure_refusal(&subject).is_some();
+            assert_eq!(!refused, valid, "{subject:?}");
+        }
+    }
+
+    #[test]
     fn a_gated_site_with_valid_cidrs_is_valid() {
         let mut gated = site("a", "a.com");
         gated.allowed_cidrs = vec!["10.66.0.0/24".into(), "fd00::/8".into(), "127.0.0.1".into()];
@@ -1184,6 +1361,39 @@ mod tests {
         let mut auth = site("auth", "auth.example.com");
         auth.public_api_paths = vec!["/api/session".into(), "/api/vpn/authorize".into()];
         assert!(config(vec![owner_node()], vec![auth]).validate().is_ok());
+    }
+
+    /// A `people`-gated Site beside an auth site relaying `paths`.
+    fn gated_with_auth_paths(paths: &[&str]) -> Vec<Problem> {
+        let mut auth = site("auth", "auth.example.com");
+        auth.public_api_paths = paths.iter().map(|path| (*path).to_owned()).collect();
+        let mut gated = site("family", "family.example.com");
+        gated.exposure = Some(crate::Exposure::People);
+        problems_of(&config(vec![owner_node()], vec![auth, gated]))
+    }
+
+    #[test]
+    fn a_gated_site_needs_every_sign_in_path_relayed_not_just_the_pass() {
+        // Regression: only /api/pass/authorize was demanded, so an old config
+        // listing just that one validated and then 404ed /api/session.
+        let problems = gated_with_auth_paths(&["/api/pass/authorize"]);
+        let problem = problems
+            .iter()
+            .find(|p| p.field == "sites[0].public_api_paths")
+            .unwrap_or_else(|| panic!("{problems:?}"));
+        assert!(problem.message.contains("/api/session"), "{problem:?}");
+        assert!(problem.message.contains("/api/vpn/authorize"), "{problem:?}");
+
+        assert!(gated_with_auth_paths(crate::PUBLIC_AUTH_PATHS).is_empty());
+        assert!(gated_with_auth_paths(&[]).iter().any(|p| p.field == "sites"));
+    }
+
+    #[test]
+    fn a_site_relay_must_name_a_configured_vpn_relay() {
+        let mut private = site("lab", "lab.example.com");
+        private.relay = Some("office".into());
+        let problems = problems_of(&config(vec![owner_node()], vec![private]));
+        assert!(problems.iter().any(|p| p.field == "sites[0].relay"), "{problems:?}");
     }
 
     #[test]

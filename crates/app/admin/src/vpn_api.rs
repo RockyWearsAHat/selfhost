@@ -6,7 +6,7 @@
 
 use selfhost_http::{Response, Status};
 use selfhost_json::Json;
-use selfhost_identity::{Capability, People, PersonName, VpnLocationId};
+use selfhost_identity::{Capability, Credential, Identity, People, Policy, PersonName, VpnLocationId};
 
 /// Checks if a user has access to a specific VPN location.
 ///
@@ -50,12 +50,12 @@ pub fn check_access(people: Option<&People>, body: &[u8]) -> Response {
     };
 
     // Check if user exists
-    let Some(person) = people.find(&name) else {
+    if people.find(&name).is_none() {
         return json_response(Status(200), Json::object([
             ("allowed", Json::Bool(false)),
             ("reason", Json::String("user not found".to_string())),
         ]));
-    };
+    }
 
     // A location that fails its own grammar can never have been granted —
     // same reasoning as an invalid user_id above.
@@ -66,7 +66,15 @@ pub fn check_access(people: Option<&People>, body: &[u8]) -> Response {
         ]));
     };
 
-    let has_access = person.grants.holds(&Capability::VpnAccess(location));
+    // Every access decision goes through `Policy::decide`, never a direct
+    // `.grants.holds()` — the same seam `crates/app/proxy/src/pass_gate.rs`
+    // uses, and the fix for the named bug: before this, an owner (no Person
+    // entry at all) was refused here outright, because this function looked
+    // only in the People registry. A Person who holds `Capability::Owner` is
+    // now allowed any location through the ordinary grants rule (`Grants::holds`,
+    // extended in `crate::policy::satisfies`), the same door as everyone else.
+    let caller = people.caller(Identity::Person(name), Credential::Passkey);
+    let has_access = Policy::locked_down().decide(&caller, &Capability::VpnAccess(location)).is_allowed();
 
     if has_access {
         json_response(
@@ -182,5 +190,20 @@ mod tests {
         let response =
             check_access(Some(&people), br#"{"user_id":"alex","location_id":"console"}"#);
         assert!(allowed(&response));
+    }
+
+    #[test]
+    fn an_owner_is_allowed_any_vpn_location_with_no_explicit_vpn_grant() {
+        // The named bug: an owner is a Person who holds `Capability::Owner`,
+        // not `Capability::VpnAccess(..)` for any particular location. Before
+        // routing this endpoint through `Policy::decide`, such a Person was
+        // refused their own VPN because this function looked for the exact
+        // location grant and found none.
+        let people = People::load(&scratch("owner-any-location"));
+        let owner_grants = Grants::new([Capability::Owner]).unwrap();
+        people.set_grants(&PersonName::parse("alex").unwrap(), owner_grants).expect("register alex");
+        let response =
+            check_access(Some(&people), br#"{"user_id":"alex","location_id":"ai-studio"}"#);
+        assert!(allowed(&response), "a holder of Capability::Owner is allowed any location");
     }
 }

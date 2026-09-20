@@ -116,36 +116,41 @@ pub fn grants_from_body(body: &[u8]) -> Result<Grants, BadGrants> {
 }
 
 /// Whether `grants` holds a console capability with no route to it, because
-/// the console's own HTTP surface is reachable only through the VPN tunnel and
-/// this set does not hold `vpn.access:console`.
+/// the console's own HTTP surface is reachable only through a VPN tunnel and
+/// this set holds `vpn.access` for none of the deployment's `relays`.
+///
+/// A deployment with no relay has no tunnel to be missing, so it never warns.
+/// A Grant on a Site (`site.access`, `site.admin:<site>`) is not a console
+/// capability: a Site is reached at its own hostname, behind its own Exposure.
 ///
 /// # Why this warns rather than granting or refusing
 ///
 /// [`Capability::VpnAccess`] is independent of every other capability by
-/// design — its own doc comment gives the reason: being able to reach a
-/// location says nothing about being able to administer it, the same
-/// separation that keeps `SiteAdmin`, `DnsAdmin` and `MailAdmin` from implying
-/// one another. Auto-granting `vpn.access:console` alongside a console
-/// capability would break that in the dangerous direction — a person given
-/// `vpn.access:console` for some unrelated reason would silently gain a route
-/// to console capabilities nobody meant to open to them, which is a reverse
-/// privilege escalation this deployment's own independence guarantee exists to
-/// rule out. So this never writes anything. It is the sibling of
-/// [`BadGrants::NotYetHonoured`] for a route that exists in general but is
-/// unreachable *for this person*: a promise the operator can act on, not a
-/// silent gap the audit trail has to discover later.
-pub fn unreachable_without_vpn(grants: &Grants) -> Option<String> {
-    let console = VpnLocationId::parse("console").expect("\"console\" is a valid location id");
-    let holds_console_capability =
-        grants.iter().any(|capability| !matches!(capability, Capability::VpnAccess(_)));
-    let holds_console_vpn_access = grants
-        .iter()
-        .any(|capability| matches!(capability, Capability::VpnAccess(location) if *location == console));
-    (holds_console_capability && !holds_console_vpn_access).then(|| {
-        "holds a console capability, but not vpn.access:console — the admin console's whole \
-         HTTP surface is reachable only through the VPN tunnel, so none of it is usable until \
-         they also hold vpn.access:console"
-            .to_owned()
+/// design: being able to reach a location says nothing about being able to
+/// administer it. Auto-granting it alongside a console capability would break
+/// that in the dangerous direction, so this never writes anything. It is the
+/// sibling of [`BadGrants::NotYetHonoured`] for a route that exists in general
+/// but is unreachable *for this person*.
+pub fn unreachable_without_vpn(grants: &Grants, relays: &[&str]) -> Option<String> {
+    if relays.is_empty() {
+        return None;
+    }
+    let holds_console_capability = grants.iter().any(|capability| {
+        !matches!(
+            capability,
+            Capability::VpnAccess(_) | Capability::SiteAccess(_) | Capability::SiteAdminOf(_)
+        )
+    });
+    let holds_a_relay = grants.iter().any(
+        |capability| matches!(capability, Capability::VpnAccess(location) if relays.contains(&location.as_str())),
+    );
+    (holds_console_capability && !holds_a_relay).then(|| {
+        let words: Vec<String> = relays.iter().map(|relay| format!("vpn.access:{relay}")).collect();
+        format!(
+            "holds a console capability, but none of {} — the admin console's HTTP surface is \
+             reachable only through the VPN tunnel, so none of it is usable until they hold one",
+            words.join(", ")
+        )
     })
 }
 
@@ -367,6 +372,18 @@ impl VpnWiring {
         self.relays.iter().any(|relay| relay.name == location)
     }
 
+    /// The data directory relay key directories, and the Peer bindings, live
+    /// under.
+    pub fn data_dir(&self) -> &Path {
+        &self.data_dir
+    }
+
+    /// The name of every `[[vpn]]` relay this deployment declares, in
+    /// configuration order.
+    pub fn relay_names(&self) -> Vec<&str> {
+        self.relays.iter().map(|relay| relay.name.as_str()).collect()
+    }
+
     /// Runs [`vpn_side_effects`] against the relays and data directory this
     /// was built with.
     pub fn side_effects(
@@ -378,6 +395,52 @@ impl VpnWiring {
         public_key: Option<&str>,
     ) -> Vec<String> {
         vpn_side_effects(&self.relays, &self.data_dir, subject, before, after, peer, public_key)
+    }
+
+    /// Every peer this deployment's relays know about, for `GET /api/vpn/peers`.
+    ///
+    /// A static entry comes straight from `[[vpn.peers]]` — reviewed and
+    /// committed like any other access decision, `person` required by the
+    /// schema itself. A dynamic entry was enrolled through a relay's roster
+    /// file with no config edit and no restart (see [`selfhost_vpn::enrol`]'s
+    /// module documentation for why that file exists at all); its `person`
+    /// comes from [`crate::peer_binding::owner_of`], the one record of who a
+    /// roster name belongs to, and is `null` for a name nothing has bound yet.
+    /// A roster name that also appears in `[[vpn.peers]]` is reported only
+    /// once, as the static entry — the config already speaks for it.
+    pub fn peers_json(&self) -> Json {
+        let mut peers = Vec::new();
+        for relay in &self.relays {
+            for peer in &relay.peers {
+                peers.push(Json::object([
+                    ("relay".to_owned(), Json::string(relay.name.as_str())),
+                    ("name".to_owned(), Json::string(peer.name.as_str())),
+                    ("person".to_owned(), Json::string(peer.person.as_str())),
+                    ("static".to_owned(), Json::Bool(true)),
+                    (
+                        "forwardPort".to_owned(),
+                        peer.forward_port.map_or(Json::Null, |port| Json::Number(port as f64)),
+                    ),
+                ]));
+            }
+
+            let key_dir = selfhost_vpn::keys::key_dir(relay, &self.data_dir);
+            let dynamic_names = selfhost_vpn::enrol::roster(&key_dir).unwrap_or_default();
+            for name in &dynamic_names {
+                if relay.peers.iter().any(|peer| &peer.name == name) {
+                    continue;
+                }
+                let person = crate::peer_binding::owner_of(&self.data_dir, name);
+                peers.push(Json::object([
+                    ("relay".to_owned(), Json::string(relay.name.as_str())),
+                    ("name".to_owned(), Json::string(name.as_str())),
+                    ("person".to_owned(), person.map_or(Json::Null, Json::string)),
+                    ("static".to_owned(), Json::Bool(false)),
+                    ("forwardPort".to_owned(), Json::Null),
+                ]));
+            }
+        }
+        Json::array(peers)
     }
 }
 
@@ -470,8 +533,8 @@ pub fn roster_json(people: &People, password_holders: &[PersonName]) -> Json {
 /// never consults a grant set for the owner, so an owner's authority is their
 /// identity and not a list that could be edited away. A client must read the
 /// flag, not the list, to decide whether to draw everything.
-pub fn whoami_json(caller: &Caller) -> Json {
-    Json::object([
+pub fn whoami_json(caller: &Caller, agents: Option<&crate::agent_store::AgentStore>) -> Json {
+    let mut fields = vec![
         ("name", Json::string(caller.identity().to_string())),
         ("owner", Json::Bool(caller.identity().is_owner())),
         // Its own flag rather than folded into `owner`, and this is the whole
@@ -485,7 +548,19 @@ pub fn whoami_json(caller: &Caller) -> Json {
         ("machine", Json::Bool(caller.identity().is_machine())),
         ("credential", Json::string(caller.credential().as_str())),
         ("grants", grants_json(caller.grants())),
-    ])
+    ];
+
+    // An Agent also names the Person it acts for.
+    if let selfhost_identity::Identity::Agent(name) = caller.identity() {
+        let person = agents
+            .and_then(|store| store.list().into_iter().find(|agent| &agent.name == name))
+            .and_then(|agent| agent.person);
+        if let Some(person) = person {
+            fields.push(("person", Json::string(person.as_str())));
+        }
+    }
+
+    Json::object(fields)
 }
 
 /// Every capability word this deployment understands, and whether it takes a
@@ -632,7 +707,7 @@ mod tests {
     #[test]
     fn a_console_capability_with_no_vpn_access_warns() {
         let grants = Grants::new([Capability::ConsoleRead]).unwrap();
-        let warning = unreachable_without_vpn(&grants).expect("must warn");
+        let warning = unreachable_without_vpn(&grants, &["console"]).expect("must warn");
         assert!(warning.contains("vpn.access:console"));
     }
 
@@ -643,7 +718,7 @@ mod tests {
             Capability::VpnAccess(VpnLocationId::parse("console").unwrap()),
         ])
         .unwrap();
-        assert_eq!(unreachable_without_vpn(&grants), None);
+        assert_eq!(unreachable_without_vpn(&grants, &["console"]), None);
     }
 
     #[test]
@@ -655,7 +730,7 @@ mod tests {
             Capability::VpnAccess(VpnLocationId::parse("ssh").unwrap()),
         ])
         .unwrap();
-        assert!(unreachable_without_vpn(&grants).is_some());
+        assert!(unreachable_without_vpn(&grants, &["console"]).is_some());
     }
 
     #[test]
@@ -665,7 +740,7 @@ mod tests {
         let grants =
             Grants::new([Capability::VpnAccess(VpnLocationId::parse("console").unwrap())])
                 .unwrap();
-        assert_eq!(unreachable_without_vpn(&grants), None);
+        assert_eq!(unreachable_without_vpn(&grants, &["console"]), None);
     }
 
     #[test]
