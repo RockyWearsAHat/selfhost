@@ -263,6 +263,7 @@ fn add(arguments: &[String], config_path: &Path) -> Result<(), String> {
         public_api_paths,
         exposure: None,
         owner: None,
+        relay: None,
     };
 
     let source = read_source(config_path)?;
@@ -613,6 +614,7 @@ mod tests {
             public_api_paths: vec![],
             exposure: None,
             owner: None,
+            relay: None,
         };
         assert_eq!(kind_of(&site), "static");
 
