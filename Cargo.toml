@@ -98,6 +98,10 @@ ring = "0.17"
 webpki-roots = "1"
 serde = { version = "1", features = ["derive"] }
 toml = "0.8"
+# No-echo terminal password reads, cross-platform (unix termios, Windows
+# console mode) without hand-written FFI in a crate that forbids unsafe code.
+# Used once, by `selfhost init-owner`'s TTY-aware prompt.
+rpassword = "7"
 
 selfhost-acme = { path = "crates/net/acme" }
 selfhost-admin = { path = "crates/app/admin" }

@@ -22,6 +22,7 @@ mod health;
 mod home_task;
 mod identify;
 mod outside;
+mod init_owner_command;
 mod kill_switch;
 mod investigate;
 mod invite_email;
@@ -260,6 +261,14 @@ Commands
                              credential from SELFHOST_AGENT_TOKEN or
                              ~/.selfhost/agent-token — an agent token, never the
                              deployment's own.
+  init-owner <name> --email <address>
+                             Create the deployment's first owner: an ordinary
+                             Person holding the `owner` capability. Refuses if
+                             an owner already exists — an existing owner grants
+                             a second one with `people grant <name> owner`.
+                             The password is never a command-line argument: it
+                             is prompted for twice, no echo, on a terminal, or
+                             read as two lines from stdin otherwise.
   console-password [<password>]
                              Set the web console's login password; reads it
                              twice from stdin if omitted
@@ -349,6 +358,10 @@ fn main() -> ExitCode {
         "people" => load().and_then(|(config, project_dir)| {
             let data_dir = teardown::data_dir(&config, &project_dir);
             people_command::run(&arguments, &data_dir, &config)
+        }),
+        "init-owner" => load().and_then(|(config, project_dir)| {
+            let data_dir = teardown::data_dir(&config, &project_dir);
+            init_owner_command::run(&arguments, &data_dir)
         }),
         "agent" => load().and_then(|(config, project_dir)| {
             let data_dir = teardown::data_dir(&config, &project_dir);

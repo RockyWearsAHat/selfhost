@@ -246,6 +246,17 @@ impl People {
         self.lock().entries.iter().filter(|entry| entry.grants.holds(&Capability::Owner)).cloned().collect()
     }
 
+    /// Whether any Person holds the owner grant.
+    ///
+    /// The refusal `selfhost init-owner` needs before it writes anything: an
+    /// owner already exists, so what is wanted is a second owner
+    /// (`selfhost people grant <name> owner`, run by one of the existing ones),
+    /// not a fresh bootstrap. A thin wrapper over [`Self::owners`] rather than a
+    /// second scan, so the two can never disagree about who counts.
+    pub fn any_owner(&self) -> bool {
+        !self.owners().is_empty()
+    }
+
     /// The entry whose login email is `email`, if one has it set.
     ///
     /// This is the lookup a person-password login runs before it ever touches
@@ -345,9 +356,10 @@ impl People {
     /// It does defend against a narrower thing: demoting the **last** Person
     /// who holds [`Capability::Owner`]. Several owners are allowed, and any of
     /// them may demote any other, but the set may never be emptied through
-    /// this door — a deployment with no owner has nobody who can create one
-    /// again except by re-running the `console.passwd` bootstrap, which this
-    /// registry has no way to know still exists.
+    /// this door — a deployment with no owner at all is recovered through
+    /// `selfhost init-owner`, which calls this same method to create the first
+    /// one directly against this registry when [`Self::any_owner`] answers
+    /// `false`, not through any exemption written into this method.
     pub fn set_grants(&self, name: &PersonName, grants: Grants) -> io::Result<()> {
         let mut state = self.lock();
         let was_the_only_owner = state
@@ -912,18 +924,22 @@ mod tests {
         let dir = scratch("owners-list");
         let people = People::load(&dir);
         assert!(people.owners().is_empty(), "a fresh registry has no owner");
+        assert!(!people.any_owner());
 
         people.set_grants(&person("Mom"), read_grants()).unwrap();
         assert!(people.owners().is_empty(), "an ordinary grant is not the owner grant");
+        assert!(!people.any_owner());
 
         people.set_grants(&person("Dad"), owner_grants()).unwrap();
         assert_eq!(people.owners().into_iter().map(|p| p.name).collect::<Vec<_>>(), vec![person("Dad")]);
+        assert!(people.any_owner());
 
         // Several owners are allowed at once.
         people.set_grants(&person("Mom"), owner_grants()).unwrap();
         let mut names: Vec<_> = people.owners().into_iter().map(|p| p.name).collect();
         names.sort();
         assert_eq!(names, vec![person("Dad"), person("Mom")]);
+        assert!(people.any_owner());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
