@@ -383,7 +383,7 @@ async fn build_and_swap(
 /// `dest`'s real name. The same "temp sibling, then rename" shape
 /// `proxy::tls::write_atomic` uses for the same reason, applied to copying an
 /// existing file rather than writing fresh bytes.
-fn install_atomically(built: &Path, dest: &Path) -> std::io::Result<()> {
+pub(crate) fn install_atomically(built: &Path, dest: &Path) -> std::io::Result<()> {
     let temp = dest.with_file_name(format!(
         "{}.installing",
         dest.file_name().and_then(|n| n.to_str()).unwrap_or("selfhost")
@@ -444,7 +444,7 @@ async fn roll_back(project_dir: &Path, previous: &str, reason: String) -> String
 
 /// Whether moving the working copy from `local` to what was fetched only adds
 /// commits — `git merge-base --is-ancestor`'s three-way answer, made explicit.
-async fn fast_forwards(project_dir: &Path, local: &str) -> Result<bool, String> {
+pub(crate) async fn fast_forwards(project_dir: &Path, local: &str) -> Result<bool, String> {
     match run::git(&plan::is_ancestor_args(project_dir, local), project_dir, LS_REMOTE_TIMEOUT)
         .await
     {
@@ -459,7 +459,7 @@ async fn fast_forwards(project_dir: &Path, local: &str) -> Result<bool, String> 
 /// place a rollback ([`restore_previous_binary`]) ever restores from. See this
 /// module's "Why the running binary is renamed aside before the build"
 /// documentation for why this is one fixed name rather than one per attempt.
-fn prev_path(exe: &Path) -> PathBuf {
+pub(crate) fn prev_path(exe: &Path) -> PathBuf {
     exe.with_file_name(format!("selfhost.prev{}", std::env::consts::EXE_SUFFIX))
 }
 
@@ -486,7 +486,7 @@ fn rollback_discard_path(exe: &Path) -> PathBuf {
 /// [`prev_path`]'s binary to take. Two independent renames, not one — see
 /// [`install_previous_over`] for what happens when the second of them is the
 /// one that fails.
-fn restore_previous_binary(exe: &Path) -> Result<(), String> {
+pub(crate) fn restore_previous_binary(exe: &Path) -> Result<(), String> {
     let prev = prev_path(exe);
     if !prev.exists() {
         return Err(format!("no previous binary at {} to restore", prev.display()));
@@ -712,7 +712,7 @@ where
 
 /// Where the configured build writes the binary, for an install running from
 /// somewhere other than `target/release`.
-fn built_binary_path(project_dir: &Path) -> PathBuf {
+pub(crate) fn built_binary_path(project_dir: &Path) -> PathBuf {
     project_dir
         .join("target")
         .join("release")
@@ -720,7 +720,7 @@ fn built_binary_path(project_dir: &Path) -> PathBuf {
 }
 
 /// Runs one git invocation and answers its stdout, or why it could not.
-async fn git(args: &[String], in_dir: &Path, deadline: Duration) -> Result<String, String> {
+pub(crate) async fn git(args: &[String], in_dir: &Path, deadline: Duration) -> Result<String, String> {
     match run::git(args, in_dir, deadline).await {
         Ok(ran) if ran.succeeded() => Ok(ran.stdout),
         Ok(ran) => Err(ran.complaint()),
