@@ -174,7 +174,7 @@ fn write_roster(path: &Path, names: &[String]) -> Result<(), EnrolError> {
 
 /// Writes a file at `0600` on a platform with POSIX modes, atomically enough
 /// for this purpose: the content is short, local, and this is the only writer.
-fn write_private_file(path: &Path, contents: String) -> Result<(), EnrolError> {
+pub(crate) fn write_private_file(path: &Path, contents: String) -> Result<(), EnrolError> {
     std::fs::write(path, contents)?;
     set_private_mode(path, 0o600)?;
     Ok(())

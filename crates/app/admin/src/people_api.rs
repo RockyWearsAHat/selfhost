@@ -378,6 +378,21 @@ impl VpnWiring {
         &self.data_dir
     }
 
+    /// The Person a Peer on `location` belongs to.
+    ///
+    /// A relay names whoever connected by their Peer — the device — and access
+    /// is a Person's. The relay's own roster is asked first, then the binding
+    /// enrolment recorded in `<data_dir>/vpn.peers`.
+    pub fn person_of_peer(&self, location: &str, peer: &str) -> Option<String> {
+        self.relays
+            .iter()
+            .filter(|relay| relay.name == location)
+            .flat_map(|relay| &relay.peers)
+            .find(|entry| entry.name == peer)
+            .map(|entry| entry.person.clone())
+            .or_else(|| crate::peer_binding::owner_of(&self.data_dir, peer))
+    }
+
     /// The name of every `[[vpn]]` relay this deployment declares, in
     /// configuration order.
     pub fn relay_names(&self) -> Vec<&str> {

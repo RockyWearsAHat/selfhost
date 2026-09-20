@@ -1733,7 +1733,7 @@ impl Api {
             Route::SiteFilePut(name) => self.sites_file_put(name, query, body),
             Route::SiteFileDelete(name) => self.sites_file_delete(name, query),
             Route::MaintenanceStatus => self.maintenance_status(),
-            Route::VpnCheckAccess => vpn_api::check_access(self.people.as_ref(), body),
+            Route::VpnCheckAccess => vpn_api::check_access(self.people.as_ref(), self.vpn.as_ref(), body),
             Route::VpnAuthorize => self.vpn_authorize(&caller, body),
             Route::VpnPeers => self.vpn_peers(),
             Route::PassAuthorize => self.pass_authorize(&caller, body),
@@ -2147,6 +2147,15 @@ impl Api {
                         );
                     }
                     1 => accessible[0].clone(),
+                    // An owner reaches every relay, so "which one" is never
+                    // ambiguous for them the way it is between two tenants:
+                    // they get the deployment's first declared relay.
+                    _ if self.policy().decide(caller, &Capability::Owner).is_allowed() => {
+                        match vpn.relay_names().first() {
+                            Some(first) => (*first).to_owned(),
+                            None => return problem(Status(404), "no relay is configured"),
+                        }
+                    }
                     _ => {
                         return problem(
                             Status(400),
@@ -4420,6 +4429,16 @@ fn query_value<'a>(query: &'a str, key: &str) -> Option<&'a str> {
 /// no-op survived four times in the security review.
 pub fn people_registry(data_dir: &Path) -> People {
     People::with_writer(data_dir, token::write_private)
+}
+
+/// The Pass signing key in `data_dir`, created the one correct way.
+///
+/// Beside [`people_registry`] for the same reason: the writer is chosen here,
+/// once. The daemon chose `write_owner_only` at its own call site, which
+/// refuses on Windows by design — and Windows is production, so the daemon
+/// would not start there (2026-09-19).
+pub fn pass_key(data_dir: &Path) -> std::io::Result<selfhost_identity::PassKey> {
+    selfhost_identity::PassKey::load_or_create(data_dir, token::write_private)
 }
 
 /// A JSON response.

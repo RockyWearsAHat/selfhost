@@ -1,16 +1,15 @@
 //! Which Person each Peer belongs to.
 //!
-//! A Peer is one device's roster entry on a relay. It is named by the device
-//! and bound here to the Person who signed it in, so that a roster name is
-//! never shared between two people: the name "laptop-4f2a" means one Person's
-//! laptop for as long as it exists.
+//! A Peer is one device's roster entry on a relay. Enrolment names it
+//! `<person>-<device>` and binds it here to the Person who signed it in, so a
+//! roster name is never shared between two people.
 //!
-//! The record is `<data_dir>/vpn.peers`, owner-only, one `peer person` pair a
-//! line. It holds no secret; it is private because who owns which device is
-//! nobody else's business.
+//! The record is `<data_dir>/vpn.peers`, one `peer person` pair a line, written
+//! as the roster file is. It holds no secret; it is private because who owns
+//! which device is nobody else's business.
 
+use crate::enrol::write_private_file;
 use selfhost_config::vpn::RESERVED_PEER_NAMES;
-use selfhost_identity::registry::write_owner_only;
 use std::path::{Path, PathBuf};
 
 /// Where the bindings live under `data_dir`.
@@ -38,7 +37,7 @@ pub fn bind(data_dir: &Path, peer: &str, person: &str) -> Result<(), String> {
         None => {}
     }
     text.push_str(&format!("{peer} {person}\n"));
-    write_owner_only(&path, &text).map_err(|error| format!("cannot write {}: {error}", path.display()))
+    write_private_file(&path, text).map_err(|error| format!("cannot write {}: {error}", path.display()))
 }
 
 /// The Person `peer` is bound to, if any.
@@ -68,7 +67,7 @@ pub fn unbind(data_dir: &Path, peer: &str) -> Result<(), String> {
         .filter(|line| line.split_once(' ').is_none_or(|(name, _)| name != peer))
         .map(|line| format!("{line}\n"))
         .collect();
-    write_owner_only(&path, &kept).map_err(|error| format!("cannot write {}: {error}", path.display()))
+    write_private_file(&path, kept).map_err(|error| format!("cannot write {}: {error}", path.display()))
 }
 
 fn owner_in<'a>(text: &'a str, peer: &str) -> Option<&'a str> {
