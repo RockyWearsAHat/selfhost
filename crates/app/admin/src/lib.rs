@@ -2019,27 +2019,6 @@ impl Api {
         }
     }
 
-    /// Whether `caller` holds a Grant on some network-gated Site (a `private`
-    /// Site, or one with `allowed_cidrs`) that stands in for `vpn.access:<location>`
-    /// on the one relay this deployment has.
-    ///
-    /// Only sound when there is exactly one relay: nothing in a Site's config
-    /// says *which* `[[vpn]]` relay it sits behind, so with a single relay
-    /// "reaches some network-gated Site" and "belongs on this network" are
-    /// the same fact, but with two or more relays (independent tenants on one
-    /// box) they are not — a Grant on tenant A's private Site must never
-    /// authorise enrolling a Peer onto tenant B's relay. Multi-relay
-    /// deployments have no such shortcut: a Peer there is only ever minted
-    /// from an explicit `vpn.access:<location>`.
-    fn holds_the_one_network_gated_site(&self, caller: &Caller) -> bool {
-        if self.vpn.as_ref().is_none_or(|vpn| vpn.relay_names().len() != 1) {
-            return false;
-        }
-        self.configured_sites()
-            .iter()
-            .any(|site| site.is_network_gated() && !site.console && self.may_reach_site(caller, site))
-    }
-
     /// Which relays a caller may authorize access to, based on their grants.
     /// Includes relays they can access via explicit `vpn.access:<relay>` grants,
     /// and relays that gate sites they have access to (via `site.access:<site>`).

@@ -94,6 +94,55 @@ const CONFIG_MULTI_TENANT: &str = "version = 1\n\
     listen = \"127.0.0.1:8445\"\n\
     forward = \"127.0.0.1:8443\"\n";
 
+/// `CONFIG_MULTI_TENANT`, but each private site names its own relay via
+/// `Site.relay` — the mapping `round2/relay-map` added so a Grant on a
+/// multi-tenant deployment's Site can name which relay it stands for, instead
+/// of only ever falling back to "the single relay" (which does not exist
+/// here) or requiring a separate `vpn.access` Grant.
+const CONFIG_MULTI_TENANT_MAPPED: &str = "version = 1\n\
+    [server]\n\
+    http_bind = \"127.0.0.1:8080\"\n\
+    https_bind = \"127.0.0.1:8443\"\n\
+    acme_email = \"a@b.com\"\n\
+    acme = \"self-signed\"\n\
+    data_dir = \"./data\"\n\
+    [[nodes]]\n\
+    name = \"home\"\n\
+    role = \"owner\"\n\
+    [[sites]]\n\
+    name = \"office-portal\"\n\
+    domains = [\"office.example.com\"]\n\
+    static_root = \"./sites/office\"\n\
+    exposure = \"private\"\n\
+    allowed_cidrs = [\"10.0.0.0/8\"]\n\
+    relay = \"office\"\n\
+    [[sites]]\n\
+    name = \"clientb-portal\"\n\
+    domains = [\"clientb.example.com\"]\n\
+    static_root = \"./sites/clientb\"\n\
+    exposure = \"private\"\n\
+    allowed_cidrs = [\"10.1.0.0/16\"]\n\
+    relay = \"clientb\"\n\
+    [[sites]]\n\
+    name = \"auth\"\n\
+    domains = [\"auth.example.com\"]\n\
+    static_root = \"./sites/auth\"\n\
+    public_api_paths = [\"/api/session\", \"/api/vpn/authorize\", \"/api/pass/authorize\"]\n\
+    [[vpn]]\n\
+    name = \"office\"\n\
+    backend = \"secure-vpn\"\n\
+    enabled = false\n\
+    public = false\n\
+    listen = \"127.0.0.1:8444\"\n\
+    forward = \"127.0.0.1:443\"\n\
+    [[vpn]]\n\
+    name = \"clientb\"\n\
+    backend = \"secure-vpn\"\n\
+    enabled = false\n\
+    public = false\n\
+    listen = \"127.0.0.1:8445\"\n\
+    forward = \"127.0.0.1:8443\"\n";
+
 /// A 32-byte key in base64: what a device would present.
 const PUBLIC_KEY: &str = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
 
@@ -233,7 +282,7 @@ async fn an_agent_with_the_same_name_as_a_site_owner_gets_none_of_their_authorit
     let dir = box_.dir.clone();
     let agents = selfhost_admin::agent_store::AgentStore::in_dir(&dir);
     let agent_name = selfhost_identity::AgentName::parse("carol").expect("a valid agent name");
-    let minted = agents.mint(&agent_name, Grants::none()).expect("mints");
+    let minted = agents.mint(&agent_name, Grants::none(), "bob").expect("mints");
 
     let body = r#"{"grants":["site.access:blog"]}"#;
     let text = format!(
@@ -430,6 +479,46 @@ async fn a_site_grant_never_authorises_a_relay_on_a_multi_relay_deployment() {
         &[Capability::SiteAccess(site("office-portal")), Capability::VpnAccess(VpnLocationId::parse("office").unwrap())],
     );
     assert_eq!(authorize_for(&box_, "mallory", "v-explicit", "office").await.status.code(), 200);
+}
+
+/// `Site.relay` is the mapping that lets a multi-tenant deployment's Site
+/// Grant stand in for its own relay without a separate `vpn.access` Grant: it
+/// names *which* relay the site sits behind, so "reaches this Site" stops
+/// being ambiguous the moment there is more than one relay to mean.
+#[tokio::test]
+async fn a_sites_explicit_relay_field_authorises_that_relay_from_a_site_grant_alone() {
+    let box_ = deployment_with_config("multi-tenant-mapped", CONFIG_MULTI_TENANT_MAPPED);
+    box_.grant("mallory", &[Capability::SiteAccess(site("office-portal"))]);
+
+    // office-portal names "office" as its relay: a site.access Grant alone reaches it.
+    assert_eq!(authorize_for(&box_, "mallory", "v-mapped", "office").await.status.code(), 200);
+    // The mapping is per-site: it never authorises the other tenant's relay.
+    assert_eq!(authorize_for(&box_, "mallory", "v-mapped-cross", "clientb").await.status.code(), 403);
+}
+
+/// Omitting `location` asks the server to pick: it may only do so when the
+/// caller's Grants resolve to exactly one relay (via `Site.relay` or explicit
+/// `vpn.access`), and must say so plainly, never guess, once there are two.
+#[tokio::test]
+async fn omitting_location_defaults_through_the_relay_mapping_and_refuses_once_ambiguous() {
+    let box_ = deployment_with_config("multi-tenant-mapped-default", CONFIG_MULTI_TENANT_MAPPED);
+    box_.grant("mallory", &[Capability::SiteAccess(site("office-portal"))]);
+
+    // Exactly one relay reachable through the mapping: the default resolves.
+    let response = authorize(&box_, "mallory", "v-default").await;
+    assert_eq!(response.status.code(), 200);
+    assert!(body_json(&response).get("code").and_then(Json::as_str).is_some());
+
+    // Two tenants' relays now reachable: no honest default exists, so the
+    // server refuses instead of picking one on the caller's behalf.
+    box_.grant(
+        "mallory",
+        &[
+            Capability::SiteAccess(site("office-portal")),
+            Capability::SiteAccess(site("clientb-portal")),
+        ],
+    );
+    assert_eq!(authorize(&box_, "mallory", "v-ambiguous").await.status.code(), 400);
 }
 
 #[tokio::test]
