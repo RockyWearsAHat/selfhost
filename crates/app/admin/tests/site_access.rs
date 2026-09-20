@@ -450,7 +450,7 @@ async fn a_grant_on_a_private_site_authorises_enrolling_a_peer() {
     let key_dir = selfhost_vpn::keys::key_dir(relay, &box_.dir);
     assert!(selfhost_vpn::keys::peer_key_file(&key_dir, "bob-laptop-4f2a").exists());
     assert_eq!(
-        selfhost_admin::peer_binding::owner_of(&box_.dir, "bob-laptop-4f2a").as_deref(),
+        selfhost_vpn::peer_binding::owner_of(&box_.dir, "bob-laptop-4f2a").as_deref(),
         Some("bob")
     );
 }
@@ -522,23 +522,44 @@ async fn omitting_location_defaults_through_the_relay_mapping_and_refuses_once_a
 }
 
 #[tokio::test]
-async fn a_peer_is_one_persons_and_never_the_shared_client() {
+async fn the_server_names_a_peer_for_its_person_and_only_they_re_key_it() {
     let box_ = deployment("enroll-binding");
     box_.grant("bob", &[Capability::SiteAccess(site("ledger"))]);
-    box_.grant("frank", &[Capability::SiteAccess(site("ledger"))]);
+    box_.grant("bob-work", &[Capability::SiteAccess(site("ledger"))]);
+    let relay = &selfhost_config::Config::parse(CONFIG).unwrap().vpn[0];
+    let key_dir = selfhost_vpn::keys::key_dir(relay, &box_.dir);
+    std::fs::create_dir_all(&key_dir).unwrap();
+    std::fs::write(key_dir.join("server.pub"), "securevpn-ed25519 AAAA server\n").unwrap();
 
     let code = |response: Response| body_json(&response).get("code").and_then(Json::as_str).unwrap().to_owned();
 
+    // The shared name is only a label here: it becomes bob's own device.
     let first = code(authorize(&box_, "bob", "v1").await);
-    assert_eq!(enroll(&box_, &first, "v1", "client").await.status.code(), 409);
+    let response = enroll(&box_, &first, "v1", "client").await;
+    assert_eq!(response.status.code(), 200);
+    let reply = body_json(&response);
+    assert_eq!(reply.get("peer").and_then(Json::as_str), Some("bob-client"));
+    assert_eq!(
+        reply.get("server_public_key").and_then(Json::as_str),
+        Some("securevpn-ed25519 AAAA server")
+    );
+    assert!(!selfhost_vpn::keys::peer_key_file(&key_dir, "client").exists());
 
     let second = code(authorize(&box_, "bob", "v2").await);
-    assert_eq!(enroll(&box_, &second, "v2", "shared-laptop").await.status.code(), 200);
+    let response = enroll(&box_, &second, "v2", "Work Laptop").await;
+    assert_eq!(body_json(&response).get("peer").and_then(Json::as_str), Some("bob-work-laptop"));
 
-    let third = code(authorize(&box_, "frank", "v3").await);
+    // Signing in again under the given name re-keys the same Peer.
+    let again = code(authorize(&box_, "bob", "v3").await);
+    let response = enroll(&box_, &again, "v3", "bob-work-laptop").await;
+    assert_eq!(response.status.code(), 200);
+    assert_eq!(body_json(&response).get("peer").and_then(Json::as_str), Some("bob-work-laptop"));
+    assert_eq!(selfhost_vpn::peer_binding::peers_of(&box_.dir, "bob"), ["bob-client", "bob-work-laptop"]);
+
+    let other = code(authorize(&box_, "bob-work", "v4").await);
     assert_eq!(
-        enroll(&box_, &third, "v3", "shared-laptop").await.status.code(),
+        enroll(&box_, &other, "v4", "laptop").await.status.code(),
         409,
-        "bob's Peer is not frank's to re-key"
+        "bob's Peer is not bob-work's to re-key"
     );
 }

@@ -47,9 +47,20 @@ pub fn check_access(
 
     // A relay asks about whoever connected, and names them by their Peer —
     // the device. Access is a Person's, so the Peer is resolved to its Person
-    // first; a `user_id` that is no Peer here is taken as a Person's name.
-    let person = vpn.and_then(|vpn| vpn.person_of_peer(location_id, user_id));
-    let user_id = person.as_deref().unwrap_or(user_id);
+    // first. A Peer nobody enrolled, or one since forgotten, is nobody.
+    let person = match vpn {
+        Some(vpn) => match vpn.person_of_peer(user_id) {
+            Some(person) => person,
+            None => {
+                return json_response(Status(200), Json::object([
+                    ("allowed", Json::Bool(false)),
+                    ("reason", Json::String("unknown device".to_string())),
+                ]));
+            }
+        },
+        None => user_id.to_owned(),
+    };
+    let user_id = person.as_str();
 
     // Look up the user
     let Ok(name) = PersonName::parse(user_id) else {
@@ -175,12 +186,31 @@ mod tests {
         )])
         .unwrap();
         people.set_grants(&PersonName::parse("alex").unwrap(), grants).expect("register alex");
-        crate::peer_binding::bind(&dir, "laptop-4f2a", "alex").expect("bind the peer");
+        selfhost_vpn::peer_binding::bind(&dir, "alex-laptop", "alex").expect("bind the peer");
         let vpn = crate::people_api::VpnWiring::new(Vec::new(), dir);
 
-        let body = br#"{"user_id":"laptop-4f2a","location_id":"console"}"#;
+        let body = br#"{"user_id":"alex-laptop","location_id":"console"}"#;
         assert!(allowed(&check_access(Some(&people), Some(&vpn), body)));
         assert!(!allowed(&check_access(Some(&people), None, body)), "unresolved, a Peer is nobody");
+    }
+
+    #[test]
+    fn a_forgotten_device_is_cut_off_and_a_person_name_is_not_a_device() {
+        let dir = scratch("forgotten-device");
+        let people = People::load(&dir);
+        people
+            .set_grants(&PersonName::parse("alex").unwrap(), Grants::new([Capability::Owner]).unwrap())
+            .expect("register alex");
+        selfhost_vpn::peer_binding::bind(&dir, "alex-laptop", "alex").expect("bind the peer");
+        let vpn = crate::people_api::VpnWiring::new(Vec::new(), dir);
+
+        let body = br#"{"user_id":"alex-laptop","location_id":"console"}"#;
+        assert!(allowed(&check_access(Some(&people), Some(&vpn), body)));
+        vpn.forget_device("mom", "alex-laptop").expect_err("not mom's to forget");
+        vpn.forget_device("alex", "alex-laptop").expect("forget it");
+        assert!(!allowed(&check_access(Some(&people), Some(&vpn), body)));
+        let by_name = br#"{"user_id":"alex","location_id":"console"}"#;
+        assert!(!allowed(&check_access(Some(&people), Some(&vpn), by_name)));
     }
 
     #[test]

@@ -9,8 +9,53 @@
 //! which device is nobody else's business.
 
 use crate::enrol::write_private_file;
-use selfhost_config::vpn::RESERVED_PEER_NAMES;
+use selfhost_config::vpn::{MAX_PEER_NAME_LEN, RESERVED_PEER_NAMES};
 use std::path::{Path, PathBuf};
+
+/// The Peer name for `person`'s device: `<person>-<device>` in roster grammar.
+///
+/// Decided by the server at enrolment, never by the device, so a roster name
+/// always reads as somebody's device and never as a second account. `device`
+/// is the label the device sent; a label that already carries the prefix (a
+/// device signing in again under the name it was given) is not prefixed twice.
+pub fn peer_name(person: &str, device: &str) -> String {
+    let person = slug(person);
+    let device = slug(device);
+    let device = device.strip_prefix(&format!("{person}-")).unwrap_or(&device);
+    let device = if device.is_empty() { "device" } else { device };
+    let name: String = format!("{person}-{device}").chars().take(MAX_PEER_NAME_LEN).collect();
+    name.trim_matches('-').to_owned()
+}
+
+/// `text` lowercased, with every run outside `[a-z0-9]` as one hyphen.
+fn slug(text: &str) -> String {
+    let mut out = String::new();
+    for c in text.chars().map(|c| c.to_ascii_lowercase()) {
+        if c.is_ascii_lowercase() || c.is_ascii_digit() {
+            out.push(c);
+        } else if !out.is_empty() && !out.ends_with('-') {
+            out.push('-');
+        }
+    }
+    out.trim_end_matches('-').to_owned()
+}
+
+/// Forgets `person`'s device `peer`: its key file and roster line on every
+/// relay, then its binding. Refuses a Peer that is not theirs.
+pub fn forget(
+    relays: &[selfhost_config::vpn::Relay],
+    data_dir: &Path,
+    person: &str,
+    peer: &str,
+) -> Result<(), String> {
+    if owner_of(data_dir, peer).as_deref() != Some(person) {
+        return Err(format!("\"{peer}\" is not one of {person}'s devices"));
+    }
+    for relay in relays {
+        crate::revoke(&crate::keys::key_dir(relay, data_dir), peer).map_err(|error| error.to_string())?;
+    }
+    unbind(data_dir, peer)
+}
 
 /// Where the bindings live under `data_dir`.
 pub fn path_in(data_dir: &Path) -> PathBuf {
@@ -96,6 +141,17 @@ mod tests {
         assert!(bind(&dir, "laptop-4f2a", "dad").is_err());
         assert_eq!(owner_of(&dir, "laptop-4f2a").as_deref(), Some("mom"));
         assert_eq!(owner_of(&dir, "phone-1"), None);
+    }
+
+    #[test]
+    fn a_peer_is_named_for_its_person_and_device() {
+        assert_eq!(peer_name("Mom", "Dad's MacBook Pro"), "mom-dad-s-macbook-pro");
+        assert_eq!(peer_name("Alex", "studio-4f2a1c"), "alex-studio-4f2a1c");
+        assert_eq!(peer_name("Alex", "alex-studio-4f2a1c"), "alex-studio-4f2a1c", "signing in again");
+        assert_eq!(peer_name("Alex", ""), "alex-device");
+        let long = peer_name("Alex", &"x".repeat(80));
+        assert_eq!(long.len(), MAX_PEER_NAME_LEN);
+        assert_eq!(selfhost_config::vpn::peer_name_problem(&long), None);
     }
 
     #[test]

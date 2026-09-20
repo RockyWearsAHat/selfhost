@@ -35,6 +35,19 @@ pub const PEER_KEY_SUFFIX: &str = ".pub";
 /// than by somebody remembering.
 pub const PEER_KEY_TAG: &str = "securevpn-ed25519";
 
+/// The base64 public key inside a `.pub` file, or `None` when the text is not one.
+///
+/// Two accepted shapes: `key_manager.py`'s three fields with [`PEER_KEY_TAG`]
+/// first, and the bare base64 line an operator pastes by hand.
+pub fn parse_public_key(text: &str) -> Option<&str> {
+    let mut fields = text.split_whitespace();
+    let first = fields.next()?;
+    if first == PEER_KEY_TAG {
+        return fields.next();
+    }
+    fields.next().is_none().then_some(first)
+}
+
 /// The permission bits a key directory must not grant, on a platform with modes.
 ///
 /// `0o077` is group and world, all three of read, write and execute. The private

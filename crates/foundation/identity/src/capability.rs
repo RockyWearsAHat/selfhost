@@ -356,7 +356,7 @@ pub enum Capability {
     /// Checked by `crates/app/admin::vpn_api::check_access`, which the VPN
     /// server (`Secure-VPN`'s `server.py`, via its `account_manager` client)
     /// calls once per handshake and again per subdomain — the door a valid
-    /// tunnel identity alone does not open; the roster in `[[vpn.peers]]`
+    /// tunnel identity alone does not open; the enrolment roster
     /// proves who is on the wire, this proves what they may reach through it.
     /// Independent of every other capability, for the same reason
     /// [`Capability::SiteAdmin`], [`Capability::DnsAdmin`] and

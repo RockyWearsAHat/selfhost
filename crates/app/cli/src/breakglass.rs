@@ -4,20 +4,11 @@
 //!
 //! # What already does not depend on People
 //!
-//! Before this module existed, the SSH relay's *key-pinning* layer already
-//! satisfied rule 9: `crates/services/vpn/src/roster.rs`'s `Roster::build`
-//! admits a `[[vpn.peers]]` entry using only `identity::PersonName::parse`, a
-//! pure format check, and never looks the name up in the People store. People
-//! is consulted exactly once, in `Roster::unregistered`, and only to *report*
-//! a peer whose person holds no grants — never to gate admission. So the
-//! narrow, honest gap was not "the relay trusts People for keys" (it does
-//! not) — it was that the *only* way to add a trusted key is to edit
-//! `selfhost.config.toml`'s `[[vpn.peers]]` block, which (a) requires a
-//! `person` field naming someone in the identity system, (b) is validated
-//! against the whole config loader, and (c) is the same file a broken
-//! deployment's own config problems can make hard to reason about mid
-//! incident. A break-glass device should not need any of that: an owner
-//! recovering a locked-out box wants to drop in a key and be done.
+//! The relay's key-pinning layer admits a device only because a signed-in
+//! account enrolled it (`crates/services/vpn/src/roster.rs`), which needs the
+//! daemon and the identity system to be working. A break-glass device should
+//! not need any of that: an owner recovering a locked-out box wants to drop in
+//! a key and be done.
 //!
 //! This module adds exactly that and nothing else: one flat file, one CLI,
 //! reusing the *same* key-file format and validation the ordinary roster

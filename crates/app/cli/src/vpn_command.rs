@@ -1,4 +1,4 @@
-//! `selfhost vpn` — running relays and identifying who is on them.
+//! `selfhost vpn` — running relays.
 //!
 //! A relay is one socket in front of one local service, and a roster of
 //! the people allowed through it. `crates/foundation/config/src/vpn.rs` is its
@@ -10,7 +10,7 @@
 //! decision is made by writing `enabled = true` in the config, not by adding a
 //! flag here.
 //!
-//! # Five subcommands:
+//! # Subcommands:
 //!
 //! - **`vpn list`** — every relay with its live state.
 //! - **`vpn status <name>`** — one relay's state.
@@ -27,13 +27,12 @@
 //!   long-lived supervisor (see `serve_everything` in `crates/app/cli/src/main.rs`
 //!   and `docs/VPN.md`); reach for `vpn up` only for manual diagnosis of a
 //!   relay the daemon is not (yet) running, or one deliberately left
-//!   `enabled = false`. A config change (`enabled`, peers, keys) takes
+//!   `enabled = false`. A config change (`enabled`, addresses) takes
 //!   effect at the daemon's next restart, not on this command.
 //! - **`vpn down <name>`** — take a relay down. Same caveat in reverse: this
 //!   stops whatever the *daemon's* supervisor is running, immediately, and a
 //!   daemon still declaring the relay `enabled = true` will not bring it back
 //!   up until it is restarted.
-//! - **`vpn who <address>`** — who arrived at a loopback socket on any relay.
 //!
 //! # Why the CLI loads the relays
 //!
@@ -45,8 +44,7 @@
 
 use selfhost_config::Config;
 use selfhost_supervisor::Supervisor;
-use selfhost_vpn::{Attribution, Install, Relays};
-use std::net::SocketAddr;
+use selfhost_vpn::{Install, Relays};
 use std::path::Path;
 
 /// Dispatches `vpn`'s subcommands.
@@ -57,14 +55,13 @@ pub fn vpn(arguments: &[String], config: &Config, project_dir: &Path) -> Result<
         Some("preflight") => preflight_relay(arguments, config, project_dir),
         Some("up") => up_relay(arguments, config, project_dir),
         Some("down") => down_relay(arguments, config, project_dir),
-        Some("who") => who_arrived(arguments, config, project_dir),
         Some(other) => Err(format!(
             "unknown vpn subcommand \"{other}\" — expected `list`, `status`, `preflight`, `up`, \
-             `down`, or `who`"
+             or `down`"
         )),
         None => Err(
             "vpn needs a subcommand: `list`, `status <name>`, `preflight <name>`, `up <name>`, \
-             `down <name>`, or `who <address>`"
+             or `down <name>`"
                 .to_owned(),
         ),
     }
@@ -145,8 +142,8 @@ fn preflight_relay(arguments: &[String], config: &Config, project_dir: &Path) ->
     }
     let enrolled_count = plan.roster.enrolled().len();
     println!("  peer keys    {} enrolled", enrolled_count);
-    if !keys.missing_peers.is_empty() {
-        println!("               {} missing: {}", keys.missing_peers.len(), keys.missing_peers.join(", "));
+    if !keys.shared_keys.is_empty() {
+        println!("  shared keys  ✗ delete: {}", keys.shared_keys.join(", "));
     }
     println!();
 
@@ -208,47 +205,6 @@ fn down_relay(arguments: &[String], config: &Config, project_dir: &Path) -> Resu
     Ok(())
 }
 
-/// Identifies who arrived at a loopback socket.
-fn who_arrived(arguments: &[String], config: &Config, project_dir: &Path) -> Result<(), String> {
-    let address_str = arguments.get(2).ok_or("who needs an address")?;
-    let address: SocketAddr = address_str.parse().map_err(|e| format!("invalid address: {e}"))?;
-
-    let relays = build_relays(config, project_dir)?;
-    let answer = relays.who_arrived_at(address);
-
-    println!("address        {address}");
-    println!("result         {}", answer.tag());
-    println!();
-
-    match &answer {
-        Attribution::Peer(attributed) => {
-            println!("✓ {}", attributed.person);
-            println!("  relay        {}", attributed.relay);
-            println!("  peer         {}", attributed.peer);
-            println!("  landed       {}", attributed.landed);
-        }
-        Attribution::Ambiguous { claims, .. } => {
-            println!("✗ ambiguous — more than one person claims this socket:");
-            for claim in claims {
-                println!("  {}", claim.person);
-                println!("    relay    {}", claim.relay);
-                println!("    peer     {}", claim.peer);
-            }
-            println!();
-            println!(
-                "Give one of these peers a forward_port nobody else uses, or check that two \
-                 [[vpn]] blocks are not both forwarding to {address}"
-            );
-        }
-        Attribution::Nobody { why, .. } => {
-            println!("✗ {}", why.tag());
-            println!("  {}", why);
-        }
-    }
-
-    Ok(())
-}
-
 /// Builds the relays from the config and the supervisor, with error handling.
 fn build_relays(config: &Config, project_dir: &Path) -> Result<Relays, String> {
     let data_dir = crate::teardown::data_dir(config, project_dir);
@@ -283,15 +239,13 @@ fn print_relay_table(rows: &[selfhost_vpn::RelaySummary]) {
 
     // Rows
     for row in rows {
-        let attributable = if row.attributable { "attr" } else { "" };
         println!(
-            "{:<width$} {:<state_w$} {:<8} {:<8} {} {}",
+            "{:<width$} {:<state_w$} {:<8} {:<8} {}",
             row.name,
             row.state.label(),
             row.peers,
             row.rejected,
             row.listen,
-            attributable,
             width = name_width,
             state_w = state_width
         );
@@ -301,28 +255,6 @@ fn print_relay_table(rows: &[selfhost_vpn::RelaySummary]) {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn who_arrived_needs_an_address() {
-        let arguments = vec!["vpn".to_owned(), "who".to_owned()];
-        let config = Config::parse(
-            "\
-version = 1
-
-[server]
-acme_email = \"a@b.com\"
-acme = \"self-signed\"
-
-[[nodes]]
-name = \"home\"
-role = \"owner\"
-",
-        )
-        .expect("config parses");
-        let result = who_arrived(&arguments, &config, Path::new("."));
-        assert!(result.is_err());
-        assert!(result.unwrap_err().contains("address"));
-    }
 
     #[test]
     fn an_unknown_subcommand_is_refused() {
