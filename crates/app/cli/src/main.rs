@@ -1264,10 +1264,7 @@ async fn serve_everything(
     // and verifies the cookie), so the two halves are in-process by
     // construction. A key that cannot be read is a start-up failure: the
     // alternative is `people` Sites that sign nobody in, silently.
-    let site_passes = selfhost_identity::PassKey::load_or_create(
-        &data_dir,
-        selfhost_identity::registry::write_owner_only,
-    )
+    let site_passes = selfhost_admin::pass_key(&data_dir)
     .map(selfhost_admin::site_pass::SitePasses::new)
     .map_err(|error| format!("cannot load the Pass signing key: {error}"))?;
 
