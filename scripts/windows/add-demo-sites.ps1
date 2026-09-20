@@ -19,7 +19,11 @@ Add-Site 'lvlup' '"leveluplongboarding.surf", "www.leveluplongboarding.surf"' '<
 $out = & "$dir\target\release\selfhost.exe" check 2>&1
 Write-Output ($out | Out-String)
 if ($LASTEXITCODE -eq 0) {
-  Stop-ScheduledTask selfhost | Out-Null; Start-Sleep 2; Start-ScheduledTask selfhost | Out-Null; Start-Sleep 6
+  # "selfhost-daemon" is the registered task name (crates/app/cli/src/service_install.rs
+  # TASK_NAME); "selfhost" is the legacy name it supersedes and removes on
+  # install/repair, so a task by that name will not exist on a correctly
+  # registered box.
+  Stop-ScheduledTask selfhost-daemon | Out-Null; Start-Sleep 2; Start-ScheduledTask selfhost-daemon | Out-Null; Start-Sleep 6
   Write-Output "restarted"
   & "$dir\target\release\selfhost.exe" routes
 } else {
