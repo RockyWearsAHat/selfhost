@@ -9,7 +9,7 @@
 //! line. It holds no secret; it is private because who owns which device is
 //! nobody else's business.
 
-use selfhost_identity::registry::write_owner_only;
+use crate::token::write_private;
 use std::path::{Path, PathBuf};
 
 /// Roster names that are a role rather than a device, and so can never be one
@@ -41,7 +41,7 @@ pub fn bind(data_dir: &Path, peer: &str, person: &str) -> Result<(), String> {
         None => {}
     }
     text.push_str(&format!("{peer} {person}\n"));
-    write_owner_only(&path, &text).map_err(|error| format!("cannot write {}: {error}", path.display()))
+    write_private(&path, &text).map_err(|error| format!("cannot write {}: {error}", path.display()))
 }
 
 /// The Person `peer` is bound to, if any.

@@ -4422,6 +4422,16 @@ pub fn people_registry(data_dir: &Path) -> People {
     People::with_writer(data_dir, token::write_private)
 }
 
+/// The Pass signing key in `data_dir`, created the one correct way.
+///
+/// Beside [`people_registry`] for the same reason: the writer is chosen here,
+/// once. The daemon chose `write_owner_only` at its own call site, which
+/// refuses on Windows by design — and Windows is production, so the daemon
+/// would not start there (2026-09-19).
+pub fn pass_key(data_dir: &Path) -> std::io::Result<selfhost_identity::PassKey> {
+    selfhost_identity::PassKey::load_or_create(data_dir, token::write_private)
+}
+
 /// A JSON response.
 fn json(status: Status, value: Json) -> Response {
     Response::bytes(status, "application/json; charset=utf-8", value.to_text().into_bytes())
