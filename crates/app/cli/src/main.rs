@@ -9,6 +9,7 @@ mod app_command;
 mod arguments;
 mod assess;
 mod audit;
+mod breakglass;
 mod converge;
 mod data_dir;
 mod desk_agent;
@@ -45,6 +46,7 @@ mod storage_command;
 mod teardown;
 mod vpn_command;
 mod watch;
+mod watchdog;
 
 use crate::arguments::value_of;
 use selfhost_admin::{Api, Fleet, Store, Token};
@@ -201,7 +203,11 @@ Commands
   service <install|uninstall|status|check> [--system] [--yes] [--repair]
                              Register this daemon with the OS service manager
                              (launchd, systemd, or a Windows scheduled task) so it
-                             starts on boot and restarts if it dies.
+                             starts on boot and restarts if it dies. Also installs
+                             and registers the watchdog (see `watchdog` below) as
+                             its own copy of the binary and its own service
+                             registration, so a bad deploy of the daemon can never
+                             take the watchdog down with it.
                              `check` compares every registration this deployment
                              owns against what it was meant to be — the run-time
                              limit, the restart policy — and names each
@@ -210,6 +216,26 @@ Commands
                              is the check that would have caught a nameserver
                              registered with Windows' 72-hour default months
                              before it took the sites down.
+  watchdog [--interval-secs N] [--failure-threshold K]
+                             Run in the foreground, forever, watching the daemon
+                             and its configured relays with no dependency on
+                             either — no People registry, no admin API, its own
+                             copy of the binary. Restarts the registered daemon
+                             task after K consecutive unhealthy checks; if that
+                             does not help, restores the previous binary; if the
+                             daemon's exe is missing or still unhealthy, rebuilds
+                             the deploy branch from source and installs it. This
+                             is what `selfhost service install` registers as its
+                             own scheduled task/launchd job/systemd unit —
+                             running it by hand is for diagnosing the watchdog
+                             itself.
+  breakglass <list|add|remove>
+                             Device public keys pinned for emergency SSH relay
+                             access, independent of the People registry: the
+                             recovery path when identity itself is broken.
+                             `add <label> <pubkey>` and `remove <label>` edit
+                             <data_dir>/breakglass.keys directly; no daemon
+                             needed.
   reports <serve|projects|list|close|token>
                              The public report intake: agents anywhere POST a
                              defect, this box stores it and mails it to the
@@ -352,6 +378,11 @@ fn main() -> ExitCode {
         }
         "teardown" => teardown_command(&arguments),
         "service" => service_command(&arguments),
+        "watchdog" => watchdog_command(&arguments),
+        "breakglass" => load().and_then(|(config, project_dir)| {
+            let data_dir = teardown::data_dir(&config, &project_dir);
+            breakglass::run(&arguments, &config, &data_dir)
+        }),
         "reports" => load().and_then(|(config, project_dir)| {
             reports_command::run(&arguments, &config, &project_dir)
         }),
@@ -952,6 +983,39 @@ fn append_startup_log(data_dir: &Path, message: &str) {
     {
         let _ = writeln!(file, "[{stamp}] {message}");
     }
+}
+
+/// Runs the recovery watchdog in the foreground, forever. See [`watchdog`]
+/// for why this exists and what it deliberately does not share with the
+/// daemon it watches: its own copy of the binary, its own service
+/// registration, no People registry, no admin API.
+fn watchdog_command(arguments: &[String]) -> Result<(), String> {
+    if arguments.iter().any(|argument| argument == "--help" || argument == "-h") {
+        print!("{}", watchdog::USAGE);
+        return Ok(());
+    }
+    let (config, project_dir) = load()?;
+    let interval = match value_of(arguments, "--interval-secs") {
+        Some(text) => Duration::from_secs(
+            text.parse::<u64>().map_err(|error| format!("--interval-secs {text}: {error}"))?,
+        ),
+        None => watchdog::DEFAULT_INTERVAL,
+    };
+    let threshold = match value_of(arguments, "--failure-threshold") {
+        Some(text) => text.parse::<u32>().map_err(|error| format!("--failure-threshold {text}: {error}"))?,
+        None => watchdog::DEFAULT_THRESHOLD,
+    };
+
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| format!("could not start the async runtime: {e}"))?;
+
+    // `watchdog::run` only ever returns by finding something wrong before its
+    // loop can even start (for example: it cannot locate its own exe path) —
+    // in ordinary operation it runs forever, exactly like `daemon_command`
+    // above.
+    Err(runtime.block_on(watchdog::run(config, project_dir, interval, threshold)))
 }
 
 /// Brings up every subsystem this deployment is configured for, and serves
@@ -2567,6 +2631,11 @@ fn service_install_command(system: bool, assumed_yes: bool) -> Result<(), String
     let exe = std::env::current_exe()
         .map_err(|error| format!("cannot find this executable to register it: {error}"))?;
     let plan = service_install::plan(&exe, &project_dir, system)?;
+    // Planned alongside the daemon's own, not carried out yet: if either plan
+    // is unsupported on this host, or the operator declines, nothing should
+    // be half-installed. See index.dx rule 9 — the watchdog is why this
+    // exists at all, so it is never optional here.
+    let watchdog_plan = service_install::watchdog_plan(&exe, &project_dir, system)?;
 
     println!("This will register selfhost as a {} service:\n", plan.mechanism);
     println!("  name          {}", plan.label);
@@ -2595,21 +2664,40 @@ fn service_install_command(system: bool, assumed_yes: bool) -> Result<(), String
         println!("  {}", step.argv.join(" "));
     }
 
-    if !assumed_yes && !service_install::confirm("\nRegister this service?") {
+    println!(
+        "\nAlongside it, a watchdog will be installed as its own copy of this\n\
+         binary ({}) and registered as its own {} service ({}) — so a bad\n\
+         deploy of the daemon can never take the watchdog down with it:",
+        service_install::watchdog_exe_path(&exe).display(),
+        watchdog_plan.mechanism,
+        watchdog_plan.label
+    );
+    println!("  runs          {}", watchdog_plan.argv.join(" "));
+    println!("  unit file     {}", watchdog_plan.path.display());
+
+    if !assumed_yes && !service_install::confirm("\nRegister these services?") {
         println!("\nNothing was installed.");
         return Ok(());
     }
 
     println!();
     service_install::carry_out(&plan)?;
-    println!("\n✓ installed — the daemon will start on boot and restart if it dies");
+    println!("✓ installed — the daemon will start on boot and restart if it dies");
+
+    service_install::install_watchdog_binary(&exe)
+        .map_err(|error| format!("daemon installed, but could not copy the watchdog binary: {error}"))?;
+    service_install::carry_out(&watchdog_plan)?;
+    println!("✓ installed — the watchdog will start on boot and watch the daemon independently");
     Ok(())
 }
 
 /// Unregisters the daemon's OS service and removes its unit file, after showing
-/// what it will do.
+/// what it will do. Also unregisters the watchdog's own service registration
+/// and leaves its binary copy in place — teardown, not this command, removes
+/// files.
 fn service_uninstall_command(system: bool, assumed_yes: bool) -> Result<(), String> {
     let plan = service_install::uninstall_plan(system)?;
+    let watchdog_plan = service_install::watchdog_uninstall_plan(system)?;
 
     println!("This will remove the selfhost daemon {} service:\n", plan.mechanism);
     println!("  name        {}", plan.label);
@@ -2621,14 +2709,23 @@ fn service_uninstall_command(system: bool, assumed_yes: bool) -> Result<(), Stri
         println!("  {}", step.argv.join(" "));
     }
 
-    if !assumed_yes && !service_install::confirm("\nRemove this service?") {
+    println!("\nAnd the watchdog {} service:\n", watchdog_plan.mechanism);
+    println!("  name        {}", watchdog_plan.label);
+    println!("\nCommands that will run:");
+    for step in &watchdog_plan.steps {
+        println!("  {}", step.argv.join(" "));
+    }
+
+    if !assumed_yes && !service_install::confirm("\nRemove these services?") {
         println!("\nNothing was removed.");
         return Ok(());
     }
 
     println!();
     service_install::carry_out_uninstall(&plan)?;
-    println!("\n✓ removed — the daemon no longer starts on boot");
+    println!("✓ removed — the daemon no longer starts on boot");
+    service_install::carry_out_uninstall(&watchdog_plan)?;
+    println!("✓ removed — the watchdog no longer starts on boot");
     Ok(())
 }
 

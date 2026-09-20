@@ -97,7 +97,61 @@ use std::process::Command;
 const LABEL: &str = "com.selfhost.daemon";
 
 /// The Windows scheduled-task name.
-const TASK_NAME: &str = "selfhost-daemon";
+///
+/// `pub(crate)` (not private) so [`crate::watchdog`] can name it in
+/// [`restart_steps`] calls — the watchdog restarts *this* task by name, the
+/// same way `selfhost service` itself would, rather than inventing a second
+/// idea of what the daemon's task is called.
+pub(crate) const TASK_NAME: &str = "selfhost-daemon";
+
+/// The Windows scheduled-task name for the recovery watchdog (index.dx rule 9:
+/// "control never depends on what it controls").
+///
+/// A second, independent registration — never a mode of [`TASK_NAME`] — run
+/// from its own copy of the binary ([`WATCHDOG_BINARY_STEM`]) so a bad deploy
+/// of the daemon cannot also disable the thing meant to recover from it. Still
+/// listed in [`MANAGED_TASK_NAMES`]: its own `<Settings>` block (execution
+/// limit, restart policy) is exactly as much this deployment's business as the
+/// daemon's — see [`audit_installed`], which only ever inspects `<Settings>`,
+/// never the `<Actions>` that make this a *different* task.
+pub const WATCHDOG_TASK_NAME: &str = "selfhost-watchdog";
+
+/// The launchd label the watchdog is registered under — a distinct job from
+/// [`LABEL`], for the same reason [`WATCHDOG_TASK_NAME`] is a distinct task.
+const WATCHDOG_LABEL: &str = "com.selfhost.watchdog";
+
+/// The systemd unit file name for the watchdog.
+const WATCHDOG_SYSTEMD_UNIT: &str = "selfhost-watchdog.service";
+
+/// The file stem the watchdog's own copy of the binary is installed under,
+/// beside the daemon's exe (`selfhost-watchdog.exe` on Windows,
+/// `selfhost-watchdog` elsewhere) — never `selfhost` itself, so a self-update
+/// swapping that file never touches this one.
+pub const WATCHDOG_BINARY_STEM: &str = "selfhost-watchdog";
+
+/// The file stem the daemon's own binary is installed under. Named here,
+/// beside [`WATCHDOG_BINARY_STEM`], so the two directions of translation
+/// between them ([`watchdog_exe_path`], [`daemon_exe_from_watchdog`]) read as
+/// the one pair of constants they actually are.
+const DAEMON_BINARY_STEM: &str = "selfhost";
+
+/// Where the watchdog's own copy of the executable lives, given the daemon's.
+///
+/// Same directory, so both are inside `project_dir` and neither installation
+/// step needs a second path to reason about — only a different file name.
+pub fn watchdog_exe_path(exe: &Path) -> PathBuf {
+    exe.with_file_name(format!("{WATCHDOG_BINARY_STEM}{}", std::env::consts::EXE_SUFFIX))
+}
+
+/// The inverse of [`watchdog_exe_path`]: given the watchdog's own
+/// `std::env::current_exe()`, the daemon binary it watches over.
+///
+/// `crate::watchdog` is the one caller — it only ever knows its own exe path
+/// (it *is* [`WATCHDOG_BINARY_STEM`]) and needs the daemon's, the same
+/// direction [`plan`]/[`watchdog_plan`] never need to go.
+pub fn daemon_exe_from_watchdog(watchdog_exe: &Path) -> PathBuf {
+    watchdog_exe.with_file_name(format!("{DAEMON_BINARY_STEM}{}", std::env::consts::EXE_SUFFIX))
+}
 
 /// The scheduled task that serves DNS for the LAN and the public zone.
 ///
@@ -121,7 +175,8 @@ pub const VPN_TASK_NAME: &str = "selfhost-vpn";
 /// One list, so "which registrations must hold to the policy" is a fact stated
 /// in one place rather than implied by three PowerShell scripts that were
 /// written months apart and had already stopped agreeing.
-pub const MANAGED_TASK_NAMES: &[&str] = &[TASK_NAME, LAN_DNS_TASK_NAME, VPN_TASK_NAME];
+pub const MANAGED_TASK_NAMES: &[&str] =
+    &[TASK_NAME, LAN_DNS_TASK_NAME, VPN_TASK_NAME, WATCHDOG_TASK_NAME];
 
 /// Scheduled tasks earlier versions installed, now folded into [`TASK_NAME`].
 ///
@@ -353,6 +408,129 @@ pub fn plan(exe: &Path, project_dir: &Path, system: bool) -> Result<Plan, String
     }
 }
 
+/// Builds the install plan for the recovery watchdog — [`plan`]'s sibling, not
+/// a mode of it.
+///
+/// index.dx rule 9 ("control never depends on what it controls") is why this
+/// is a wholly separate function rather than `plan` taking a "which service"
+/// argument: the two register different labels/tasks, run a different exe
+/// (`exe` is first rewritten to [`watchdog_exe_path`], the watchdog's own copy
+/// of the binary, never the daemon's), and must keep being registerable, and
+/// registered independently, even on a day the daemon-plan code path is the
+/// thing broken. What *is* shared — [`Step`], [`Plan`], [`carry_out`],
+/// [`intended_settings_xml`], [`xml_escape`] — is shared because those really
+/// are one concept (what any selfhost unit's settings must be), not because
+/// the two roles are secretly the same registration.
+///
+/// `exe` is still [`std::env::current_exe`] — the *daemon's* binary, exactly as
+/// callers already have it for [`plan`] — so callers do not need to separately
+/// resolve the watchdog's own path; this function does that translation once.
+pub fn watchdog_plan(exe: &Path, project_dir: &Path, system: bool) -> Result<Plan, String> {
+    let watchdog_exe = watchdog_exe_path(exe);
+    let argv = vec![watchdog_exe.display().to_string(), "watchdog".to_string()];
+    let working_dir = project_dir.to_path_buf();
+
+    match target() {
+        Target::Launchd => {
+            let path = watchdog_plist_path(system)?;
+            let domain = launchd_domain(system)?;
+            Ok(Plan {
+                mechanism: "launchd",
+                label: WATCHDOG_LABEL.to_string(),
+                contents: watchdog_launchd_plist(&watchdog_exe, project_dir),
+                wide: false,
+                companion: None,
+                argv,
+                working_dir,
+                activate: vec![
+                    Step::ignoring(vec![
+                        "launchctl".into(),
+                        "bootout".into(),
+                        format!("{domain}/{WATCHDOG_LABEL}"),
+                    ]),
+                    Step::required(vec![
+                        "launchctl".into(),
+                        "bootstrap".into(),
+                        domain,
+                        path.display().to_string(),
+                    ]),
+                ],
+                path,
+            })
+        }
+        Target::ScheduledTask => {
+            let path = project_dir.join("data").join("selfhost-watchdog.task.xml");
+            let wrapper = project_dir.join("data").join("selfhost-watchdog-keepalive.cmd");
+            Ok(Plan {
+                mechanism: "Windows scheduled task",
+                label: WATCHDOG_TASK_NAME.to_string(),
+                contents: watchdog_scheduled_task_xml(project_dir),
+                wide: true,
+                companion: Some((wrapper, watchdog_keep_alive_script(&watchdog_exe, project_dir))),
+                argv,
+                working_dir,
+                activate: vec![Step::required(vec![
+                    "schtasks".into(),
+                    "/Create".into(),
+                    "/TN".into(),
+                    WATCHDOG_TASK_NAME.into(),
+                    "/XML".into(),
+                    path.display().to_string(),
+                    "/F".into(),
+                ])],
+                path,
+            })
+        }
+        Target::Systemd => {
+            let path = watchdog_systemd_path(system)?;
+            let mut reload = vec!["systemctl".to_string()];
+            let mut enable = vec!["systemctl".to_string()];
+            if !system {
+                reload.push("--user".into());
+                enable.push("--user".into());
+            }
+            reload.push("daemon-reload".into());
+            enable.extend(["enable".into(), "--now".into(), WATCHDOG_SYSTEMD_UNIT.into()]);
+            Ok(Plan {
+                mechanism: "systemd",
+                label: WATCHDOG_SYSTEMD_UNIT.to_string(),
+                contents: watchdog_systemd_unit(&watchdog_exe, project_dir, system),
+                wide: false,
+                companion: None,
+                argv,
+                working_dir,
+                activate: vec![Step::required(reload), Step::required(enable)],
+                path,
+            })
+        }
+        Target::Unsupported => Err(unsupported()),
+    }
+}
+
+/// Copies the currently-running daemon exe to the watchdog's own sibling
+/// path, as a plain file copy — the "own copy of the binary" half of
+/// [`watchdog_plan`] that a [`Plan`]'s `activate` steps (external commands)
+/// cannot express.
+///
+/// Deliberately **not** run by [`carry_out`]: a copy has to happen once, at
+/// install time, before the plan's steps register a task that already points
+/// at [`watchdog_exe_path`]. Callers run this before `carry_out(&watchdog_plan)`,
+/// exactly as `selfhost service install` already prints the plan before doing
+/// anything, so a missing watchdog exe is visible before the task is
+/// registered to run it.
+///
+/// Overwrites any previous copy: the watchdog binary is reinstalled the same
+/// way the daemon's own registration is, on every `service install`, so it
+/// carries whatever fix this round of `selfhost watchdog` code needs — self-update
+/// never does this (see the module docs), only this explicit, operator-run step.
+pub fn install_watchdog_binary(exe: &Path) -> Result<PathBuf, String> {
+    let dest = watchdog_exe_path(exe);
+    std::fs::copy(exe, &dest)
+        .map(|_| ())
+        .map_err(|error| format!("cannot copy {} to {}: {error}", exe.display(), dest.display()))?;
+    Ok(dest)
+}
+
 /// Builds the uninstall plan for this host.
 ///
 /// Independent of the executable and project directory: a launchd label, a task
@@ -423,6 +601,55 @@ pub fn uninstall_plan(system: bool) -> Result<UninstallPlan, String> {
                 path: Some(systemd_path(system)?),
                 // Disable first (it stops and unlinks the unit), remove the file,
                 // then reload so systemd forgets the unit that is now gone.
+                steps: vec![Step::ignoring(disable), Step::required(reload)],
+            })
+        }
+        Target::Unsupported => Err(unsupported()),
+    }
+}
+
+/// Builds the uninstall plan for the recovery watchdog — [`uninstall_plan`]'s
+/// sibling, for the same reason [`watchdog_plan`] is [`plan`]'s.
+pub fn watchdog_uninstall_plan(system: bool) -> Result<UninstallPlan, String> {
+    match target() {
+        Target::Launchd => {
+            let domain = launchd_domain(system)?;
+            Ok(UninstallPlan {
+                mechanism: "launchd",
+                label: WATCHDOG_LABEL.to_string(),
+                path: Some(watchdog_plist_path(system)?),
+                steps: vec![Step::ignoring(vec![
+                    "launchctl".into(),
+                    "bootout".into(),
+                    format!("{domain}/{WATCHDOG_LABEL}"),
+                ])],
+            })
+        }
+        Target::ScheduledTask => Ok(UninstallPlan {
+            mechanism: "Windows scheduled task",
+            label: WATCHDOG_TASK_NAME.to_string(),
+            path: None,
+            steps: vec![Step::required(vec![
+                "schtasks".into(),
+                "/Delete".into(),
+                "/TN".into(),
+                WATCHDOG_TASK_NAME.into(),
+                "/F".into(),
+            ])],
+        }),
+        Target::Systemd => {
+            let mut disable = vec!["systemctl".to_string()];
+            let mut reload = vec!["systemctl".to_string()];
+            if !system {
+                disable.push("--user".into());
+                reload.push("--user".into());
+            }
+            disable.extend(["disable".into(), "--now".into(), WATCHDOG_SYSTEMD_UNIT.into()]);
+            reload.push("daemon-reload".into());
+            Ok(UninstallPlan {
+                mechanism: "systemd",
+                label: WATCHDOG_SYSTEMD_UNIT.to_string(),
+                path: Some(watchdog_systemd_path(system)?),
                 steps: vec![Step::ignoring(disable), Step::required(reload)],
             })
         }
@@ -560,6 +787,31 @@ fn launchd_plist(exe: &Path, working_dir: &Path) -> String {
     )
 }
 
+/// The launchd plist for `selfhost watchdog` — [`launchd_plist`]'s sibling.
+fn watchdog_launchd_plist(exe: &Path, working_dir: &Path) -> String {
+    let exe = xml_escape(&exe.display().to_string());
+    let dir = xml_escape(&working_dir.display().to_string());
+    format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n\
+<plist version=\"1.0\">\n\
+<dict>\n\
+    <key>Label</key><string>{WATCHDOG_LABEL}</string>\n\
+    <key>ProgramArguments</key>\n\
+    <array>\n\
+        <string>{exe}</string>\n\
+        <string>watchdog</string>\n\
+    </array>\n\
+    <key>WorkingDirectory</key><string>{dir}</string>\n\
+    <key>RunAtLoad</key><true/>\n\
+    <key>KeepAlive</key><true/>\n\
+    <key>StandardOutPath</key><string>{dir}/data/launchd-watchdog.log</string>\n\
+    <key>StandardErrorPath</key><string>{dir}/data/launchd-watchdog.log</string>\n\
+</dict>\n\
+</plist>\n"
+    )
+}
+
 /// The keep-alive wrapper the Windows task actually runs.
 ///
 /// Task Scheduler will not restart a program that exited, so this loop does it:
@@ -585,6 +837,27 @@ rem Edit the config, not this file: reinstalling the service overwrites it.\r\n\
 cd /d \"{dir}\"\r\n\
 :loop\r\n\
 \"{exe}\" daemon >> \"{dir}\\data\\selfhost-daemon.log\" 2>&1\r\n\
+timeout /t 5 /nobreak > nul\r\n\
+goto loop\r\n",
+        exe = exe.display(),
+        dir = working_dir.display(),
+    )
+}
+
+/// [`keep_alive_script`]'s sibling for `selfhost watchdog`: same loop, its own
+/// exe and log file, so a watchdog crash comes back exactly like a daemon
+/// crash does, using the mechanism this file already had to invent for
+/// Windows rather than a second one.
+fn watchdog_keep_alive_script(exe: &Path, working_dir: &Path) -> String {
+    format!(
+        "@echo off\r\n\
+rem Generated by `selfhost service install`. Task Scheduler cannot restart a\r\n\
+rem program that exited, so this loop is what makes the watchdog keep running.\r\n\
+rem This file is the recovery path's own supervision (index.dx rule 9) — it is\r\n\
+rem never touched by a daemon self-update.\r\n\
+cd /d \"{dir}\"\r\n\
+:loop\r\n\
+\"{exe}\" watchdog >> \"{dir}\\data\\selfhost-watchdog.log\" 2>&1\r\n\
 timeout /t 5 /nobreak > nul\r\n\
 goto loop\r\n",
         exe = exe.display(),
@@ -625,6 +898,39 @@ fn scheduled_task_xml(working_dir: &Path) -> String {
   <Actions Context=\"Author\">\n\
     <Exec>\n\
       <Command>{dir}\\data\\selfhost-keepalive.cmd</Command>\n\
+      <WorkingDirectory>{dir}</WorkingDirectory>\n\
+    </Exec>\n\
+  </Actions>\n\
+</Task>\n",
+        settings = intended_settings_xml()
+    )
+}
+
+/// [`scheduled_task_xml`]'s sibling for the recovery watchdog — its own
+/// description and its own wrapper file, sharing [`intended_settings_xml`]
+/// because the "don't get killed after 72 hours" policy is exactly as true of
+/// the recovery path as it is of the thing it recovers.
+fn watchdog_scheduled_task_xml(working_dir: &Path) -> String {
+    let dir = xml_escape(&working_dir.display().to_string());
+    format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-16\"?>\n\
+<Task version=\"1.2\" xmlns=\"http://schemas.microsoft.com/windows/2004/02/mit/task\">\n\
+  <RegistrationInfo>\n\
+    <Description>selfhost watchdog — recovery path for the daemon and the SSH relay, index.dx rule 9</Description>\n\
+  </RegistrationInfo>\n\
+  <Triggers>\n\
+    <BootTrigger><Enabled>true</Enabled></BootTrigger>\n\
+  </Triggers>\n\
+  <Principals>\n\
+    <Principal id=\"Author\">\n\
+      <UserId>S-1-5-18</UserId>\n\
+      <RunLevel>HighestAvailable</RunLevel>\n\
+    </Principal>\n\
+  </Principals>\n\
+{settings}\
+  <Actions Context=\"Author\">\n\
+    <Exec>\n\
+      <Command>{dir}\\data\\selfhost-watchdog-keepalive.cmd</Command>\n\
       <WorkingDirectory>{dir}</WorkingDirectory>\n\
     </Exec>\n\
   </Actions>\n\
@@ -696,6 +1002,29 @@ WantedBy={wanted_by}\n",
     )
 }
 
+/// [`systemd_unit`]'s sibling for `selfhost watchdog`.
+fn watchdog_systemd_unit(exe: &Path, working_dir: &Path, system: bool) -> String {
+    let wanted_by = if system { "multi-user.target" } else { "default.target" };
+    format!(
+        "[Unit]\n\
+Description=selfhost watchdog — recovery path for the daemon and the SSH relay, index.dx rule 9\n\
+After=network-online.target\n\
+Wants=network-online.target\n\
+\n\
+[Service]\n\
+Type=simple\n\
+ExecStart={exe} watchdog\n\
+WorkingDirectory={dir}\n\
+Restart=on-failure\n\
+RestartSec=5\n\
+\n\
+[Install]\n\
+WantedBy={wanted_by}\n",
+        exe = exe.display(),
+        dir = working_dir.display()
+    )
+}
+
 /// Escapes the three characters that would otherwise break XML text.
 ///
 /// `&` first, so the entities this introduces are not themselves re-escaped.
@@ -718,6 +1047,24 @@ fn systemd_path(system: bool) -> Result<PathBuf, String> {
         Ok(PathBuf::from("/etc/systemd/system").join(SYSTEMD_UNIT))
     } else {
         Ok(home()?.join(".config/systemd/user").join(SYSTEMD_UNIT))
+    }
+}
+
+/// The LaunchAgents/LaunchDaemons path for the watchdog's own job.
+fn watchdog_plist_path(system: bool) -> Result<PathBuf, String> {
+    if system {
+        Ok(PathBuf::from("/Library/LaunchDaemons").join(format!("{WATCHDOG_LABEL}.plist")))
+    } else {
+        Ok(home()?.join("Library/LaunchAgents").join(format!("{WATCHDOG_LABEL}.plist")))
+    }
+}
+
+/// The systemd unit path for the watchdog's own unit.
+fn watchdog_systemd_path(system: bool) -> Result<PathBuf, String> {
+    if system {
+        Ok(PathBuf::from("/etc/systemd/system").join(WATCHDOG_SYSTEMD_UNIT))
+    } else {
+        Ok(home()?.join(".config/systemd/user").join(WATCHDOG_SYSTEMD_UNIT))
     }
 }
 
@@ -1581,5 +1928,99 @@ mod tests {
         if plan.mechanism == "launchd" {
             assert!(plan.activate[0].ignore_failure, "the unload-first step is tolerant");
         }
+    }
+
+    // -- watchdog: index.dx rule 9, "control never depends on what it controls" --
+
+    #[test]
+    fn the_watchdog_task_is_named_and_managed_independently_of_the_daemon() {
+        assert_ne!(WATCHDOG_TASK_NAME, TASK_NAME);
+        assert!(MANAGED_TASK_NAMES.contains(&WATCHDOG_TASK_NAME));
+        // Never superseded/removed the way an old proxy task is: it is its own
+        // permanent registration, not something folded into another one.
+        assert!(!SUPERSEDED_TASK_NAMES.contains(&WATCHDOG_TASK_NAME));
+    }
+
+    #[test]
+    fn the_watchdog_and_daemon_exe_paths_round_trip() {
+        let daemon = Path::new("/opt/selfhost/selfhost");
+        let watchdog = watchdog_exe_path(daemon);
+        assert_eq!(daemon_exe_from_watchdog(&watchdog), daemon);
+    }
+
+    #[test]
+    fn the_watchdog_runs_its_own_copy_of_the_binary_not_the_daemons() {
+        let exe = watchdog_exe_path(Path::new("/opt/selfhost/selfhost"));
+        assert_ne!(exe, PathBuf::from("/opt/selfhost/selfhost"));
+        assert!(exe.to_string_lossy().contains("selfhost-watchdog"), "{exe:?}");
+        // Same directory: install ships both binaries side by side.
+        assert_eq!(exe.parent(), Some(Path::new("/opt/selfhost")));
+    }
+
+    #[test]
+    fn the_watchdog_plan_runs_the_watchdog_subcommand_on_its_own_binary() {
+        let plan = watchdog_plan(Path::new("/x/selfhost"), Path::new("/srv/site"), false)
+            .expect("this host has a supported service manager");
+        assert_eq!(plan.argv[0], watchdog_exe_path(Path::new("/x/selfhost")).display().to_string());
+        assert_eq!(plan.argv[1], "watchdog");
+        assert!(!plan.contents.is_empty());
+        assert!(!plan.activate.is_empty());
+    }
+
+    #[test]
+    fn the_watchdog_plan_and_the_daemon_plan_never_share_a_label() {
+        let daemon = plan(Path::new("/x/selfhost"), Path::new("/srv"), false).expect("supported");
+        let watchdog =
+            watchdog_plan(Path::new("/x/selfhost"), Path::new("/srv"), false).expect("supported");
+        assert_ne!(daemon.label, watchdog.label);
+        assert_ne!(daemon.path, watchdog.path);
+        if let (Some((daemon_wrapper, _)), Some((watchdog_wrapper, _))) =
+            (&daemon.companion, &watchdog.companion)
+        {
+            assert_ne!(daemon_wrapper, watchdog_wrapper);
+        }
+    }
+
+    #[test]
+    fn watchdog_install_and_uninstall_name_the_same_unit() {
+        let install =
+            watchdog_plan(Path::new("/x/selfhost"), Path::new("/srv"), false).expect("supported");
+        let uninstall = watchdog_uninstall_plan(false).expect("supported");
+        assert_eq!(install.label, uninstall.label);
+    }
+
+    #[test]
+    fn the_watchdog_task_xml_has_no_faults_against_its_own_settings_intent() {
+        // Same guard as the daemon's own task: the watchdog is exactly as
+        // vulnerable to the 72-hour default as anything else Task Scheduler runs.
+        let xml = watchdog_scheduled_task_xml(Path::new("C:\\site"));
+        assert!(settings_faults(&xml).is_empty(), "{:?}", settings_faults(&xml));
+        assert!(xml.contains("selfhost-watchdog-keepalive.cmd"), "{xml}");
+    }
+
+    #[test]
+    fn the_watchdog_keep_alive_wrapper_restarts_the_watchdog_not_the_daemon() {
+        let script = watchdog_keep_alive_script(
+            Path::new("C:\\selfhost\\selfhost-watchdog.exe"),
+            Path::new("C:\\site"),
+        );
+        assert!(script.contains(":loop") && script.contains("goto loop"), "{script}");
+        assert!(script.contains("\"C:\\selfhost\\selfhost-watchdog.exe\" watchdog"), "{script}");
+        assert!(script.contains("selfhost-watchdog.log"), "{script}");
+    }
+
+    #[test]
+    fn the_watchdog_launchd_plist_is_a_distinct_job_from_the_daemons() {
+        let plist = watchdog_launchd_plist(Path::new("/opt/selfhost/selfhost-watchdog"), Path::new("/srv"));
+        assert!(plist.contains("<string>com.selfhost.watchdog</string>"));
+        assert!(plist.contains("<string>watchdog</string>"));
+        assert!(launchd_faults(&plist).is_empty());
+    }
+
+    #[test]
+    fn the_watchdog_systemd_unit_runs_the_watchdog_subcommand() {
+        let unit = watchdog_systemd_unit(Path::new("/usr/bin/selfhost-watchdog"), Path::new("/srv"), true);
+        assert!(unit.contains("ExecStart=/usr/bin/selfhost-watchdog watchdog"));
+        assert!(systemd_faults(&unit).is_empty());
     }
 }
