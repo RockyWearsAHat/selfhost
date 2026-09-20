@@ -1,6 +1,4 @@
-//! VPN relays: a controlled door in front of one local service, the roster that
-//! says *whose* door it is, and the loopback port that says *which* of them is
-//! coming through it.
+//! VPN relays: a controlled door in front of one local service.
 //!
 //! Every other section in this file describes something this deployment serves.
 //! This one describes the thing that decides who gets to reach it at all, so what
@@ -18,9 +16,8 @@
 //! the copy a box installs can be diffed against a reviewed one; what a deployment
 //! *runs* is always a copy, and that is the part worth checking.
 //!
-//! This module does not carry the tunnel. It carries the *shape* of a relay, the
-//! *roster* of peers, and the binding between a roster entry and a person this
-//! deployment already knows. The transport cryptography stays where the workspace
+//! This module does not carry the tunnel. It carries the *shape* of a relay. The
+//! transport cryptography stays where the workspace
 //! dependency policy puts it — in the vetted implementation, run as a program,
 //! exactly as `ssh`, `git` and the platform's own SMB server are run
 //! (`crates/services/storage/src/smb/`). `docs/labs/vpn-lab.dx` is the design;
@@ -41,57 +38,12 @@
 //! by accident — see [`Config::check_vpn`](crate::Config)'s refusal of a relay
 //! that forwards to `server.admin_bind`.
 //!
-//! # What a peer is, and why `person` is not optional
+//! # What a peer is
 //!
-//! A peer is a key, a name, and **a person who holds it**. The name is the roster
-//! key — `scripts/securevpn/join-mac.sh` passes it as `--identity` and its own
-//! comment calls it "the entry the server looks you up under" — and the person is
-//! the entry in this deployment's people registry that the name resolves to.
-//!
-//! That third field is the whole reason this section exists in the shape it does.
-//! `docs/labs/vpn-identity-lab.dx` confirmed on 2026-08-17 that the tunnel already
-//! knows who each peer is and throws it away before anything above can ask, so
-//! every peer is identical to the proxy and the only remaining wall is a shared
-//! password that mints ownership. A roster entry with a key and no owner is
-//! exactly that state written down. So `person` is required, `"owner"` is refused
-//! as a person's name, and two peers may not share a public key — a key that maps
-//! to two names cannot answer "who did this", which is the question the audit
-//! record exists for.
-//!
-//! # `forward_port`: how a peer's identity survives the forward
-//!
-//! This is the seam the audit asked for, and the reason this section changed on
-//! 2026-08-17. The tunnel is a **stream forwarder**: a session is a TCP connection
-//! that exits on this box as a connection from `127.0.0.1`, so a *source* address
-//! names nobody and cannot be made to. That is why the deployed console gate is
-//! `["127.0.0.1/32", "::1/128"]` and why nothing downstream could tell two peers
-//! apart.
-//!
-//! What the tunnel *chooses*, and what the local service therefore observes, is
-//! the **destination**. `protocol.py`'s `CLIENT_AUTH` proves which Ed25519
-//! identity completed the handshake before a byte of payload moves, so the server
-//! knows exactly which roster entry a session belongs to at the moment it opens
-//! the loopback connection. Giving each peer its own loopback port makes that
-//! knowledge survive: peer A's sessions land on `127.0.0.1:9443`, peer B's on
-//! `127.0.0.1:9444`, and the socket a local service accepted on **is** the roster
-//! entry. Nothing is added to the wire, nothing is parsed out of the payload, and
-//! no attribution travels in bytes a stranger could have written.
-//!
-//! A peer's port is written in the file rather than derived from its position in
-//! the roster, and that is deliberate: a derived port would silently reassign
-//! everybody's identity the day a peer was removed, and every audit line written
-//! before that day would then name the wrong person.
-//!
-//! **What this is not.** A destination port is evidence, not authentication. Any
-//! process already running on this box can connect to `127.0.0.1:9443` and be
-//! taken for peer A, exactly as it could send a forged preamble — `docs/SECURITY.md`
-//! VPN-02 is explicit that the loopback gate admits everything already executing
-//! here, including a co-hosted app with an SSRF. What the port buys over an in-band
-//! preamble is that the daemon learns the identity from the kernel *before* it
-//! reads a byte, so no new parser is fed unauthenticated input inside a process
-//! that builds with `panic = "abort"` and also serves 80, 443 and mail. Read the
-//! reasoning in full in `docs/labs/vpn-lab.dx`; do not read a `forward_port` as
-//! proof of who connected.
+//! A Peer is one device, and it exists only because a signed-in account enrolled
+//! it: `<key_dir>/roster` lists it, `<key_dir>/<peer>.pub` pins it, and
+//! `<data_dir>/vpn.peers` binds it to its Person (`selfhost_vpn::peer_binding`).
+//! None of that is config. A `[[vpn.peers]]` block is refused at load.
 //!
 //! # Why the backend is still an enum with one member
 //!
@@ -110,18 +62,6 @@
 //! variant is exhaustive, so the day a second transport is genuinely run here, the
 //! compiler names every place that has to decide about it — which is exactly how
 //! this removal was carried out.
-//!
-//! # This crate does not depend on `selfhost-identity`
-//!
-//! The person-name limit below is **mirrored** from `identity::PersonName`, the
-//! same way [`crate::mesh`] mirrors the node-name limit and [`crate::storage`]
-//! mirrors the share-id character set. What a *legal* person name is stays
-//! `PersonName::parse`'s to decide, run by the runtime crate when it builds the
-//! roster, so the refusal an operator reads is that crate's own sentence rather
-//! than a second opinion invented here. What is checked here is what an operator
-//! can fix by reading their own config: emptiness, over-length, the reserved
-//! owner name, and the whitespace that would make two identical-looking names two
-//! different strings.
 
 use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
@@ -140,19 +80,9 @@ pub const MAX_RELAY_NAME_LEN: usize = 32;
 /// Longest peer name, in characters.
 pub const MAX_PEER_NAME_LEN: usize = 32;
 
-/// Longest person name, in characters. Mirrors
-/// `identity::MAX_PERSON_NAME_CHARS`, kept local so `config` stays free of a
-/// dependency on `identity`.
-const MAX_PERSON_NAME_CHARS: usize = 32;
-
-/// The identity name this deployment's *own* credentials answer to. Mirrors
-/// `identity::OWNER_NAME`.
-///
-/// Refused as a peer's `person` for the reason the whole section exists: the
-/// owner is the console password and the bearer token, which are held by whoever
-/// installed the box and name nobody. A peer whose person is "owner" is a key
-/// with no holder wearing a label that says otherwise.
-const OWNER_NAME: &str = "owner";
+/// Roster names that are a role rather than a device, and so are never a Peer.
+/// `client` was the single shared key every device once used.
+pub const RESERVED_PEER_NAMES: [&str; 2] = ["client", "server"];
 
 /// Default ceiling on concurrent sessions a relay will hold.
 ///
@@ -188,16 +118,6 @@ pub const MAX_HANDSHAKE_TIMEOUT_SECS: u64 = 120;
 /// place of a public one only insofar as the length differs — it says nothing
 /// about whether the key is any good.
 pub const PEER_KEY_BYTES: usize = 32;
-
-/// The lowest port a peer's own loopback forward may claim.
-///
-/// Below 1024 are the well-known ports, which on this box are already spoken for
-/// by things that are not identities: 22 is SSH, 443 is the proxy, 445 is SMB.
-/// A `forward_port` is a *new* loopback listener this deployment has to open
-/// purely so that the socket names a person, and one that shadows or fails to
-/// bind beside a real service is a relay that takes a working service down in
-/// order to answer a question about who connected.
-pub const MIN_PEER_FORWARD_PORT: u16 = 1024;
 
 /// Who carries the transport cryptography for a relay.
 ///
@@ -241,68 +161,14 @@ impl Backend {
     }
 }
 
-/// One roster entry: a key, the name it is looked up under, the person who holds
-/// it, and the loopback port their sessions land on.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Peer {
-    /// The roster key. `[a-z0-9-]`, because it is a filename under the relay's
-    /// key directory as well as the value `--identity` carries on the wire.
-    pub name: String,
+/// A key this schema no longer has, remembered only so it can be refused by name.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Removed(bool);
 
-    /// Who holds this key, as they appear in the people registry.
-    ///
-    /// **Required.** A key with no owner is the state
-    /// `docs/labs/vpn-identity-lab.dx` found and named; see the module
-    /// documentation. Checked here for shape only — `identity::PersonName::parse`
-    /// is the authority on what a legal name is.
-    pub person: String,
-
-    /// The peer's public key, base64, 32 bytes decoded.
-    ///
-    /// Not a secret and deliberately in the config rather than in a data file: a
-    /// roster that can be diffed and reverted is a roster that can be reviewed,
-    /// which is the property this subsystem lacked for as long as its
-    /// implementation was believed to be missing.
-    pub public_key: String,
-
-    /// The loopback port **this peer's** sessions are forwarded to, instead of
-    /// the relay's shared `forward`.
-    ///
-    /// The identity carry. The address is the relay's — only the port is per
-    /// peer — so a roster entry cannot smuggle a target off this box past the
-    /// loopback rule that was checked once on `forward`.
-    ///
-    /// Optional, and a relay may carry a mix: a peer with no port lands on the
-    /// shared socket alongside everyone else who has none, and is honestly
-    /// reported as naming nobody. Optional rather than required because this
-    /// relay is the only door to the console, and a schema that demanded every
-    /// peer be migrated in one edit would demand it of a live deployment whose
-    /// operator is on the far side of the tunnel.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub forward_port: Option<u16>,
-}
-
-impl Peer {
-    /// A peer that lands on the relay's shared forward, which is the shape a
-    /// roster takes before anybody has been given a port of their own.
-    pub fn new(
-        name: impl Into<String>,
-        person: impl Into<String>,
-        public_key: impl Into<String>,
-    ) -> Self {
-        Self {
-            name: name.into(),
-            person: person.into(),
-            public_key: public_key.into(),
-            forward_port: None,
-        }
-    }
-
-    /// The same peer with a loopback port of its own — the entry a session can
-    /// be attributed from.
-    pub fn forwarded_to(mut self, port: u16) -> Self {
-        self.forward_port = Some(port);
-        self
+impl<'de> Deserialize<'de> for Removed {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        serde::de::IgnoredAny::deserialize(deserializer)?;
+        Ok(Self(true))
     }
 }
 
@@ -313,8 +179,8 @@ impl Peer {
 /// `[desktop]`.
 pub const EXAMPLE: &str = "\
 # ─── VPN relays ────────────────────────────────────────────────────────────────
-# A relay is one socket in front of ONE local service, and a roster of the people
-# allowed through it. `forward` must be a loopback address — a relay forwards to
+# A relay is one socket in front of ONE local service. Who may come through it is
+# not written here: each account enrols its own devices by signing in. `forward` must be a loopback address — a relay forwards to
 # this box and nowhere else — and it may not be server.admin_bind: the control
 # API answers the bearer token as the owner, so a relay in front of it would be
 # the deployment's root credential on a public port.
@@ -324,9 +190,8 @@ pub const EXAMPLE: &str = "\
 # every wildcard bind needs a written justification, and this is where writing it
 # starts. Adding one to a box with a public IP is adding an inbound surface.
 #
-# Every peer names a PERSON. That is the point of the block: the roster is where
-# a tunnel identity becomes somebody this deployment already knows about, so that
-# `selfhost people` and the audit record can answer \"who did this\".
+# Nobody is listed here. A device is on a relay because a signed-in account
+# enrolled it, and `selfhost people` shows and removes them.
 
 [[vpn]]
 name = \"console\"                    # [a-z0-9-]; names the key directory and the log line
@@ -334,21 +199,10 @@ backend = \"secure-vpn\"              # the only transport this deployment runs
 enabled = false                     # declared is not running; this is the switch
 public = true                       # this relay is reachable from off this machine
 listen = \"0.0.0.0:8443\"             # the one inbound socket, sanctioned as VPN-01
-forward = \"127.0.0.1:443\"           # where a session with no port of its own lands
+forward = \"127.0.0.1:443\"           # where an admitted session lands
 key_dir = \"vpn/console\"             # relative to data_dir, 0700; omit for vpn/<name>
 max_sessions = 256                  # concurrent, including handshakes not yet proved
 handshake_timeout_secs = 30         # a slow drip must not hold a slot for ever
-
-  # One roster entry per device, not per person: a person with a laptop and a
-  # phone holds two keys and both resolve to them.
-  [[vpn.peers]]
-  name = \"alex-mac\"                 # what --identity carries; the entry the server looks you up under
-  person = \"Alex\"                   # who holds it — required, and never \"owner\"
-  public_key = \"3xJ7Nn4x0Qm2vQe1Zr8sT5uYw9Ab2Cd4Ef6Gh8Ij0Kw=\"
-  forward_port = 9443               # THIS peer lands here, on 127.0.0.1, and nobody else does.
-                                    # The port is how the identity survives the forward — see
-                                    # docs/labs/vpn-lab.dx. Something local must listen on it.
-                                    # Omit the line to share `forward` and name nobody.
 
 # A second relay, same identity and roster shape, pointed at SSH instead of the
 # proxy — SSH-02's sanctioned remote-SSH path (docs/SECURITY.md). Not a second
@@ -362,11 +216,6 @@ enabled = false
 public = true
 listen = \"0.0.0.0:8444\"            # a distinct port from the console relay's 8443
 forward = \"127.0.0.1:22\"           # the box's own sshd, loopback-only either way
-
-  [[vpn.peers]]
-  name = \"alex-mac\"
-  person = \"Alex\"
-  public_key = \"3xJ7Nn4x0Qm2vQe1Zr8sT5uYw9Ab2Cd4Ef6Gh8Ij0Kw=\"
 ";
 
 /// One `[[vpn]]` block: a door, and who may come through it.
@@ -404,14 +253,11 @@ pub struct Relay {
     /// The socket this relay accepts sessions on, e.g. `0.0.0.0:8443`.
     pub listen: String,
 
-    /// Where a session with no `forward_port` of its own is handed, e.g.
-    /// `127.0.0.1:443`.
+    /// Where an admitted session is handed, e.g. `127.0.0.1:443`.
     ///
     /// Must be loopback. A relay that can forward elsewhere is an authenticated
     /// tunnel into whatever else the LAN runs, with an access list nobody
-    /// reviewed; see the module documentation. Its **address** is also the
-    /// address every per-peer forward uses, which is why the loopback rule is
-    /// checked once here and cannot be dodged by a roster entry.
+    /// reviewed; see the module documentation.
     pub forward: String,
 
     /// Where this relay's key material lives, relative to `server.data_dir`.
@@ -432,11 +278,10 @@ pub struct Relay {
     #[serde(default = "default_handshake_timeout_secs")]
     pub handshake_timeout_secs: u64,
 
-    /// The roster. Empty means this relay admits nobody, which validation refuses
-    /// on an enabled relay: a bound port that can admit nobody is an exposure
-    /// with no purpose.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub peers: Vec<Peer>,
+    /// Where `[[vpn.peers]]` used to be. Kept only so [`Relay::check`] can refuse
+    /// it by name instead of serde ignoring it.
+    #[serde(default, skip_serializing)]
+    peers: Removed,
 }
 
 fn default_max_sessions() -> u32 {
@@ -469,7 +314,7 @@ impl Relay {
             key_dir: None,
             max_sessions: DEFAULT_MAX_SESSIONS,
             handshake_timeout_secs: DEFAULT_HANDSHAKE_TIMEOUT_SECS,
-            peers: Vec::new(),
+            peers: Removed::default(),
         }
     }
 
@@ -499,84 +344,6 @@ impl Relay {
         Duration::from_secs(self.handshake_timeout_secs)
     }
 
-    /// The roster entry with this name, which is what a peer's `--identity`
-    /// carries.
-    pub fn peer(&self, name: &str) -> Option<&Peer> {
-        self.peers.iter().find(|peer| peer.name == name)
-    }
-
-    /// Where this peer's sessions land: its own loopback port, or the relay's
-    /// shared `forward` when it has none.
-    ///
-    /// `None` only when `forward` itself does not parse, which validation has
-    /// already reported. The address always comes from `forward`, never from the
-    /// peer — that is what makes "a relay forwards to loopback and nowhere else"
-    /// a property of the type rather than a rule repeated per entry.
-    pub fn forward_for(&self, peer: &Peer) -> Option<SocketAddr> {
-        let shared = self.forward_addr()?;
-        Some(match peer.forward_port {
-            Some(port) => SocketAddr::new(shared.ip(), port),
-            None => shared,
-        })
-    }
-
-    /// The roster entry whose own loopback socket this is — **the identity
-    /// carry**.
-    ///
-    /// This is the function everything above the tunnel asks, and it is
-    /// deliberately total and honest about the case the audit is about. It
-    /// answers `None` for the relay's shared `forward`, because every peer
-    /// without a port of its own lands there and the socket names nobody; a
-    /// relay that cannot name the session in front of it must say so, since the
-    /// alternative — returning "the first peer" — is how a network gate gets
-    /// mistaken for a doorman.
-    ///
-    /// `landed` is the **local** address of the accepted connection: the socket
-    /// the local service was listening on, not the address the connection came
-    /// from. A source address here would be `127.0.0.1` for every peer alive,
-    /// which is the finding this whole subsystem exists to answer.
-    pub fn peer_forwarded_to(&self, landed: SocketAddr) -> Option<&Peer> {
-        let shared = self.forward_addr()?;
-        if landed.ip() != shared.ip() || landed.port() == shared.port() {
-            return None;
-        }
-        self.peers.iter().find(|peer| peer.forward_port == Some(landed.port()))
-    }
-
-    /// Whether any peer on this relay can be named from the socket it lands on.
-    ///
-    /// The single fact everything above the tunnel has to reason about, answered
-    /// from the roster rather than from the backend: with one transport left,
-    /// what decides attribution is whether an operator has given anybody a port,
-    /// not which program holds the socket.
-    pub fn attributes(&self) -> bool {
-        self.peers.iter().any(|peer| peer.forward_port.is_some())
-    }
-
-    /// Whether any peer still lands on the shared `forward`, where they are
-    /// indistinguishable from each other.
-    pub fn shares_forward(&self) -> bool {
-        self.peers.iter().any(|peer| peer.forward_port.is_none())
-    }
-
-    /// Every loopback socket this relay hands sessions to: the shared one, and
-    /// one per peer that has its own.
-    ///
-    /// The list `docs/SECURITY.md`'s bind ledger has to account for, and the list
-    /// collision checking is done against — gathered in one place so a rule added
-    /// later cannot forget the per-peer half.
-    pub fn forward_sockets(&self) -> Vec<SocketAddr> {
-        let Some(shared) = self.forward_addr() else {
-            return Vec::new();
-        };
-        let mut sockets = vec![shared];
-        for peer in &self.peers {
-            if let Some(port) = peer.forward_port {
-                sockets.push(SocketAddr::new(shared.ip(), port));
-            }
-        }
-        sockets
-    }
 
     /// Collects every structural problem with this one block.
     ///
@@ -664,7 +431,7 @@ impl Relay {
                     field: format!("{at}.forward"),
                     message: format!(
                         "\"{}\" is not an address like \"127.0.0.1:443\"; a relay hands every \
-                         session that has no port of its own to one local socket, named in full",
+                         session to one local socket, named in full",
                         self.forward
                     ),
                 });
@@ -680,10 +447,7 @@ impl Relay {
                         "\"{}\" is not a loopback address. A relay forwards to a service on \
                          this box and nowhere else: one that can reach the LAN or the internet \
                          is an authenticated tunnel into whatever else is on the network, \
-                         governed by an access list nobody wrote and nobody reviewed. This \
-                         address is also the address every peer's forward_port is joined to, so \
-                         one non-loopback line here would take every per-peer forward off this \
-                         box with it. Front a remote service by running a relay on the machine \
+                         governed by an access list nobody wrote and nobody reviewed. Front a remote service by running a relay on the machine \
                          that serves it.",
                         self.forward
                     ),
@@ -720,8 +484,7 @@ impl Relay {
         }
     }
 
-    /// The bounds, and the one refusal that is about the relay as a whole: an
-    /// enabled relay with an empty roster.
+    /// The session and handshake bounds.
     fn check_limits(&self, at: &str, problems: &mut Vec<Problem>) {
         if self.max_sessions == 0 || self.max_sessions > MAX_MAX_SESSIONS {
             let why = if self.max_sessions == 0 {
@@ -758,130 +521,17 @@ impl Relay {
                 ),
             });
         }
-
-        if self.enabled && self.peers.is_empty() {
-            problems.push(Problem {
-                field: format!("{at}.peers"),
-                message: format!(
-                    "is empty while {at}.enabled is true. A running relay with no roster binds \
-                     a socket that can admit nobody: an inbound surface with no purpose, and \
-                     one that looks deliberate to whoever reads the file next. Enrol a peer, \
-                     or set enabled = false until there is one."
-                ),
-            });
-        }
     }
 
-    /// The roster: each entry's shape, its loopback port, and the four things no
-    /// two entries may share.
+    /// Refuses the `[[vpn.peers]]` block this schema used to have.
     fn check_peers(&self, at: &str, problems: &mut Vec<Problem>) {
-        let shared = self.forward_addr();
-        let listen = self.listen_addr();
-
-        for (i, peer) in self.peers.iter().enumerate() {
-            let at = format!("{at}.peers[{i}]");
-
-            if let Some(message) = peer_name_problem(&peer.name) {
-                problems.push(Problem { field: format!("{at}.name"), message });
-            }
-            if let Some(message) = person_problem(&peer.person) {
-                problems.push(Problem { field: format!("{at}.person"), message });
-            }
-            if let Some(message) = public_key_problem(&peer.public_key) {
-                problems.push(Problem { field: format!("{at}.public_key"), message });
-            }
-
-            if let Some(port) = peer.forward_port {
-                if port < MIN_PEER_FORWARD_PORT {
-                    problems.push(Problem {
-                        field: format!("{at}.forward_port"),
-                        message: format!(
-                            "{port} is below {MIN_PEER_FORWARD_PORT}. A peer's forward port is a \
-                             new loopback listener this deployment has to open purely so that the \
-                             socket names \"{}\", and the well-known ports are already spoken for \
-                             by things that are not identities — 22 is SSH, 443 is the proxy, 445 \
-                             is SMB. One that shadows or fails to bind beside a real service \
-                             takes that service down to answer a question about who connected.",
-                            peer.person
-                        ),
-                    });
-                }
-                if let Some(shared) = shared {
-                    if port == shared.port() {
-                        problems.push(Problem {
-                            field: format!("{at}.forward_port"),
-                            message: format!(
-                                "is {at}'s relay's own forward (\"{}\"), which is where every peer \
-                                 that declares no port lands. A peer sharing that socket is \
-                                 indistinguishable from all of them, while this line says \
-                                 otherwise — and the next reader would take a request arriving \
-                                 there as \"{}\". Give this peer a port nothing else uses, or \
-                                 remove the line and let it share honestly.",
-                                self.forward, peer.person
-                            ),
-                        });
-                    }
-                }
-                if let (Some(shared), Some(listen)) = (shared, listen) {
-                    if collides(SocketAddr::new(shared.ip(), port), listen) {
-                        problems.push(Problem {
-                            field: format!("{at}.forward_port"),
-                            message: format!(
-                                "is {at}'s relay's own listening port (\"{}\"), so this peer's \
-                                 sessions would be handed straight back to the relay. That is a \
-                                 loop that consumes the session cap and serves nothing.",
-                                self.listen
-                            ),
-                        });
-                    }
-                }
-            }
-
-            // The three collisions that were always here, and the one the
-            // identity carry adds. A repeated *person* is not one of them: a
-            // person with a laptop and a phone holds two keys, and both resolve
-            // to them, which is the model working rather than failing.
-            if let Some(previous) = self.peers[..i].iter().position(|other| other.name == peer.name)
-            {
-                problems.push(Problem {
-                    field: format!("{at}.name"),
-                    message: format!(
-                        "\"{}\" is already the name of peers[{previous}]. The name is what the \
-                         relay looks a peer up under, so two entries answering to one make the \
-                         lookup ambiguous and the record meaningless.",
-                        peer.name
-                    ),
-                });
-            }
-            if let Some(previous) =
-                self.peers[..i].iter().position(|other| other.public_key == peer.public_key)
-            {
-                problems.push(Problem {
-                    field: format!("{at}.public_key"),
-                    message: format!(
-                        "is already peers[{previous}]'s key. A key that maps to two roster \
-                         entries cannot answer \"who did this\", which is the one question a \
-                         roster exists to answer — and the question docs/labs/vpn-identity-lab.dx \
-                         found this deployment unable to answer at all."
-                    ),
-                });
-            }
-            if peer.forward_port.is_some() {
-                if let Some(previous) = self.peers[..i]
-                    .iter()
-                    .position(|other| other.forward_port == peer.forward_port)
-                {
-                    problems.push(Problem {
-                        field: format!("{at}.forward_port"),
-                        message: format!(
-                            "is already peers[{previous}]'s. The whole value of a per-peer \
-                             forward is that the socket a session lands on names exactly one \
-                             person; two peers on one port is two people behind one identity, \
-                             and the audit record would name whichever entry was listed first."
-                        ),
-                    });
-                }
-            }
+        if self.peers.0 {
+            problems.push(Problem {
+                field: format!("{at}.peers"),
+                message: "is no longer read: a relay's devices now come from signing in \
+                          (each account enrols its own). Delete the [[vpn.peers]] blocks."
+                    .into(),
+            });
         }
     }
 }
@@ -889,9 +539,8 @@ impl Relay {
 /// Collects every structural problem with the whole `[[vpn]]` list.
 ///
 /// Runs each relay's own [`Relay::check`] and then the rules that only exist
-/// between blocks: two relays may not share a name or a listening socket, no two
-/// relays may claim the same loopback forward socket, and a public key may not
-/// name two different people anywhere in the document.
+/// between blocks: two relays may not share a name or a listening socket, and no
+/// relay may forward to another relay's front door.
 ///
 /// `at` is the dotted path the list is reported under (`vpn`). Public so
 /// `selfhost doctor` can report the same judgement on a running deployment
@@ -937,115 +586,30 @@ pub fn check_relays(relays: &[Relay], at: &str, problems: &mut Vec<Problem>) {
         }
 
         check_forward_collisions(relays, i, at, problems);
-
-        // One key, one person, deployment-wide. A device may legitimately appear
-        // on two relays — the same laptop reaching the console and a private app
-        // — but if the two blocks disagree about whose laptop it is, the roster
-        // has stopped being an answer to "who".
-        for (j, peer) in relay.peers.iter().enumerate() {
-            for (k, earlier) in relays[..i].iter().enumerate() {
-                let Some(clash) = earlier
-                    .peers
-                    .iter()
-                    .find(|other| other.public_key == peer.public_key && other.person != peer.person)
-                else {
-                    continue;
-                };
-                problems.push(Problem {
-                    field: format!("{at}[{i}].peers[{j}].person"),
-                    message: format!(
-                        "says \"{}\" holds this key while {at}[{k}] says \"{}\" does. One key \
-                         is one device and one device has one holder; two answers here means \
-                         the audit record's answer depends on which relay a request came \
-                         through.",
-                        peer.person, clash.person
-                    ),
-                });
-            }
-        }
     }
 }
 
-/// Every way relay `i`'s loopback forwards can clash with an earlier relay's.
+/// Whether relay `i` forwards into an earlier relay's own front door.
 ///
-/// Split out because the rules differ by *kind* of socket and that distinction is
-/// easy to lose. A relay's shared `forward` is an ordinary target: two relays
-/// pointing at one service is two doors onto one thing, which is what several
-/// relays are for, and is allowed. A **per-peer** socket is an *identity*: if one
-/// relay says `127.0.0.1:9443` is Alex and another says it is Dad, a service
-/// reading that socket has two answers and the record is worth nothing. And any
-/// forward that lands on another relay's `listen` is a session handed to a tunnel
-/// expecting a handshake, which fails as a malformed packet.
+/// Two relays sharing a `forward` is two doors onto one service, which is what
+/// several relays are for. A forward that lands on another relay's `listen` is a
+/// session handed to a tunnel expecting a handshake, which fails as a malformed
+/// packet.
 fn check_forward_collisions(relays: &[Relay], i: usize, at: &str, problems: &mut Vec<Problem>) {
-    /// One socket a relay forwards to: where it came from, whether it names one
-    /// person, and the field an operator would edit to change it.
-    struct Target {
-        field: String,
-        socket: SocketAddr,
-        /// True for a `forward_port`. Carried as a fact rather than re-derived
-        /// from the field's spelling: a check that recognised an identity by
-        /// matching text would stop recognising it the day the path changed.
-        names_one_person: bool,
-    }
-
-    fn targets(relay: &Relay, at: &str, index: usize) -> Vec<Target> {
-        let Some(shared) = relay.forward_addr() else {
-            return Vec::new();
-        };
-        let mut targets = vec![Target {
-            field: format!("{at}[{index}].forward"),
-            socket: shared,
-            names_one_person: false,
-        }];
-        for (j, peer) in relay.peers.iter().enumerate() {
-            if let Some(port) = peer.forward_port {
-                targets.push(Target {
-                    field: format!("{at}[{index}].peers[{j}].forward_port"),
-                    socket: SocketAddr::new(shared.ip(), port),
-                    names_one_person: true,
-                });
-            }
-        }
-        targets
-    }
-
-    for mine in targets(&relays[i], at, i) {
-        for (k, earlier) in relays[..i].iter().enumerate() {
-            if earlier.listen_addr().is_some_and(|listen| collides(listen, mine.socket)) {
-                problems.push(Problem {
-                    field: mine.field.clone(),
-                    message: format!(
-                        "sends sessions to {}, which is {at}[{k}].listen — another relay's own \
-                         front door. An admitted session would arrive at a tunnel expecting a \
-                         handshake, fail it, and be dropped with a message about a malformed \
-                         packet.",
-                        mine.socket
-                    ),
-                });
-            }
-
-            for theirs in targets(earlier, at, k) {
-                // Two shared forwards on one socket is two doors onto one
-                // service, which is what several relays are for. It only
-                // becomes a collision when at least one side is claiming that
-                // socket names a particular person.
-                if theirs.socket != mine.socket
-                    || !(mine.names_one_person || theirs.names_one_person)
-                {
-                    continue;
-                }
-                problems.push(Problem {
-                    field: mine.field.clone(),
-                    message: format!(
-                        "sends sessions to {}, which {} also forwards to. A per-peer forward is \
-                         an identity: the whole point is that a service reading that socket knows \
-                         which person is on the other end of it, and two relays claiming it \
-                         leaves that service with two answers and the audit record with none.",
-                        mine.socket, theirs.field
-                    ),
-                });
-                break;
-            }
+    let Some(forward) = relays[i].forward_addr() else {
+        return;
+    };
+    for (k, earlier) in relays[..i].iter().enumerate() {
+        if earlier.listen_addr().is_some_and(|listen| collides(listen, forward)) {
+            problems.push(Problem {
+                field: format!("{at}[{i}].forward"),
+                message: format!(
+                    "sends sessions to {forward}, which is {at}[{k}].listen — another relay's own \
+                     front door. An admitted session would arrive at a tunnel expecting a \
+                     handshake, fail it, and be dropped with a message about a malformed \
+                     packet."
+                ),
+            });
         }
     }
 }
@@ -1101,10 +665,15 @@ fn relay_name_problem(name: &str) -> Option<String> {
 /// filename under the key directory *and* the value `--identity` carries on the
 /// wire (`scripts/securevpn/join-mac.sh`), so it must be safe in both.
 ///
-/// `pub` so a peer name typed outside this crate — `selfhost people grant`'s
-/// `--peer`, the console's grant form — is checked against the exact same rule
-/// a `[[vpn.peers]]` block is, rather than a hand-copied approximation of it.
+/// `pub` so every door a peer name comes through — enrolment, `selfhost people`
+/// — is held to this one rule. [`RESERVED_PEER_NAMES`] are refused here, so a
+/// role name can never be listed or authorised as a device.
 pub fn peer_name_problem(name: &str) -> Option<String> {
+    if RESERVED_PEER_NAMES.contains(&name) {
+        return Some(format!(
+            "\"{name}\" is a shared role name, not a device; a Peer needs its own name"
+        ));
+    }
     if name.is_empty() {
         return Some(
             "must not be empty; this is the entry the relay looks a peer up under, and it is \
@@ -1127,44 +696,6 @@ pub fn peer_name_problem(name: &str) -> Option<String> {
     None
 }
 
-/// Why this text cannot name the person holding a key, or `None` when it can.
-///
-/// Shape only. `identity::PersonName::parse` is the authority, and the runtime
-/// crate runs it when it builds the roster; what is caught here is what an
-/// operator can fix by reading their own config.
-fn person_problem(person: &str) -> Option<String> {
-    if person.trim().is_empty() {
-        return Some(
-            "must name the person who holds this key. A key with no owner is exactly the state \
-             docs/labs/vpn-identity-lab.dx records: the tunnel knows who connected and nothing \
-             above it can ask, so every peer is the same peer and the audit record cannot \
-             answer \"who did this\"."
-                .into(),
-        );
-    }
-    if person != person.trim() {
-        return Some(format!(
-            "\"{person}\" has leading or trailing whitespace, so it prints identically to the \
-             registry entry it is meant to be and matches nothing"
-        ));
-    }
-    if person.chars().count() > MAX_PERSON_NAME_CHARS {
-        return Some(format!(
-            "is {} characters, over the {MAX_PERSON_NAME_CHARS}-character limit the people \
-             registry enforces on a person's name",
-            person.chars().count()
-        ));
-    }
-    if person.eq_ignore_ascii_case(OWNER_NAME) {
-        return Some(format!(
-            "\"{OWNER_NAME}\" names this deployment's own credentials — the console password \
-             and the bearer token — and not a person. A peer whose holder is the owner is a key \
-             with nobody behind it, wearing a label that says otherwise."
-        ));
-    }
-    None
-}
-
 /// Why this text is not usable as a peer's public key, or `None` when it is.
 ///
 /// Shape, not cryptography: the character set and the decoded length. Whether the
@@ -1173,14 +704,12 @@ fn person_problem(person: &str) -> Option<String> {
 /// dependency policy is that cryptography is not hand-written here, and that
 /// includes half-checking a key.
 ///
-/// `pub` for the same reason [`peer_name_problem`] is: a key a person pastes
-/// into `selfhost people grant` or the console's grant form gets the same shape
-/// check a `[[vpn.peers]]` block does, rather than a second, hand-copied one.
+/// `pub` for the same reason [`peer_name_problem`] is.
 pub fn public_key_problem(key: &str) -> Option<String> {
     if key.is_empty() {
         return Some(
             "must be the peer's public key in base64. It is not a secret — it is what pins \
-             this peer, and what makes the roster reviewable"
+             this peer"
                 .into(),
         );
     }
@@ -1260,28 +789,10 @@ mod tests {
         problems.iter().any(|p| p.field == field)
     }
 
-    /// A 32-byte key in base64, with padding, differing in the last character so
-    /// a test can make two distinct ones.
-    fn key(tail: char) -> String {
-        format!("{}{tail}=", "A".repeat(42))
-    }
-
     fn relay() -> Relay {
-        let mut relay = Relay::new("console", "127.0.0.1:8443", "127.0.0.1:443");
-        relay.peers.push(Peer::new("alex-mac", "Alex", key('B')));
-        relay
+        Relay::new("console", "127.0.0.1:8443", "127.0.0.1:443")
     }
 
-    /// The same relay with the identity carry turned on for its one peer.
-    fn attributing() -> Relay {
-        let mut relay = relay();
-        relay.peers[0].forward_port = Some(9443);
-        relay
-    }
-
-    fn socket(text: &str) -> SocketAddr {
-        text.parse().expect("a literal socket in a test")
-    }
 
     #[test]
     fn a_minimal_relay_is_valid_and_starts_closed() {
@@ -1374,25 +885,14 @@ mod tests {
     }
 
     #[test]
-    fn an_enabled_relay_with_an_empty_roster_is_refused() {
-        let mut empty = relay();
-        empty.peers.clear();
-        empty.enabled = true;
-        assert!(has(&problems_of(&empty), "vpn[0].peers"));
-
-        // Declared but not enabled is a plan, not an exposure, and is allowed:
-        // a relay has to exist in the file before a peer can be enrolled into it.
-        empty.enabled = false;
-        assert!(problems_of(&empty).is_empty(), "{:?}", problems_of(&empty));
-    }
-
-    #[test]
-    fn a_peer_must_name_a_person_and_the_person_may_not_be_the_owner() {
-        for person in ["", "   ", " Alex", "Alex ", "owner", "OWNER", &"n".repeat(33)] {
-            let mut broken = relay();
-            broken.peers[0].person = person.into();
-            assert!(has(&problems_of(&broken), "vpn[0].peers[0].person"), "{person:?}");
-        }
+    fn a_peers_block_is_refused_because_devices_come_from_signing_in() {
+        let refused = crate::Config::parse(&format!(
+            "{}\n[[vpn]]\nname = \"console\"\nlisten = \"127.0.0.1:8443\"\nforward = \
+             \"127.0.0.1:443\"\n[[vpn.peers]]\nname = \"alex-mac\"\nperson = \"Alex\"\n",
+            crate::BASE_DOCUMENT
+        ))
+        .expect_err("a [[vpn.peers]] block must not load");
+        assert!(refused.to_string().contains("signing in"), "{refused}");
     }
 
     #[test]
@@ -1404,104 +904,21 @@ mod tests {
             &"A".repeat(64),                   // a hex-length string of base64 characters
             &format!("{}\n{}", "A".repeat(21), "A".repeat(22)), // pasted across a line break
         ] {
-            let mut broken = relay();
-            broken.peers[0].public_key = (*bad).to_owned();
-            assert!(has(&problems_of(&broken), "vpn[0].peers[0].public_key"), "{bad:?}");
+            assert!(public_key_problem(bad).is_some(), "{bad:?}");
         }
 
         // Padded and unpadded spellings of 32 bytes are both accepted, because
         // the tools that print keys disagree about padding.
-        let mut padded = relay();
-        padded.peers[0].public_key = format!("{}=", "A".repeat(43));
-        assert!(problems_of(&padded).is_empty(), "{:?}", problems_of(&padded));
-        let mut unpadded = relay();
-        unpadded.peers[0].public_key = "A".repeat(43);
-        assert!(problems_of(&unpadded).is_empty(), "{:?}", problems_of(&unpadded));
+        assert_eq!(public_key_problem(&format!("{}=", "A".repeat(43))), None);
+        assert_eq!(public_key_problem(&"A".repeat(43)), None);
     }
 
     #[test]
-    fn a_peer_with_its_own_port_lands_somewhere_nobody_else_does() {
-        // The identity carry, asserted rather than described. The address is the
-        // relay's; only the port is the peer's.
-        let relay = attributing();
-        assert!(problems_of(&relay).is_empty(), "{:?}", problems_of(&relay));
-        assert!(relay.attributes());
-        assert!(!relay.shares_forward(), "the only peer has a port of its own");
-        assert_eq!(relay.forward_for(&relay.peers[0]), Some(socket("127.0.0.1:9443")));
-        assert_eq!(
-            relay.peer_forwarded_to(socket("127.0.0.1:9443")).map(|p| p.person.as_str()),
-            Some("Alex")
-        );
-        assert_eq!(relay.forward_sockets(), vec![socket("127.0.0.1:443"), socket("127.0.0.1:9443")]);
-    }
-
-    #[test]
-    fn the_shared_forward_names_nobody_however_many_peers_are_on_it() {
-        // The refusal the whole subsystem turns on: a session that landed where
-        // everybody lands is not evidence about anybody, and answering with the
-        // first peer would be how a network gate becomes a doorman.
-        let relay = relay();
-        assert!(!relay.attributes());
-        assert!(relay.shares_forward());
-        assert_eq!(relay.peer_forwarded_to(socket("127.0.0.1:443")), None);
-        assert_eq!(relay.peer_forwarded_to(socket("127.0.0.1:9443")), None);
-        // Including on a relay that does attribute somebody else.
-        let mut mixed = attributing();
-        mixed.peers.push(Peer::new("dad-mac", "Dad", key('C')));
-        assert!(problems_of(&mixed).is_empty(), "{:?}", problems_of(&mixed));
-        assert!(mixed.attributes() && mixed.shares_forward(), "a mixed roster is allowed");
-        assert_eq!(mixed.peer_forwarded_to(socket("127.0.0.1:443")), None);
-        assert_eq!(mixed.forward_for(&mixed.peers[1]), Some(socket("127.0.0.1:443")));
-    }
-
-    #[test]
-    fn a_forward_on_the_wrong_loopback_family_names_nobody() {
-        // The relay's outgoing connection uses `forward`'s own address, so a
-        // session that arrived on the other loopback family did not come from
-        // this relay and must not borrow its roster.
-        let relay = attributing();
-        assert_eq!(relay.peer_forwarded_to(socket("[::1]:9443")), None);
-        assert_eq!(relay.peer_forwarded_to(socket("192.168.1.8:9443")), None);
-    }
-
-    #[test]
-    fn a_peer_port_may_not_be_privileged_the_shared_forward_or_the_listener() {
-        for (port, field) in [
-            (443u16, "vpn[0].peers[0].forward_port"),   // the shared forward
-            (8443, "vpn[0].peers[0].forward_port"),     // the relay's own listener
-            (22, "vpn[0].peers[0].forward_port"),       // well-known: SSH
-            (0, "vpn[0].peers[0].forward_port"),        // below the floor, and not a service
-        ] {
-            let mut broken = attributing();
-            broken.peers[0].forward_port = Some(port);
-            assert!(has(&problems_of(&broken), field), "{port}: {:?}", problems_of(&broken));
+    fn the_role_names_are_never_a_peer() {
+        for name in RESERVED_PEER_NAMES {
+            assert!(peer_name_problem(name).is_some(), "{name}");
         }
-        assert_eq!(MIN_PEER_FORWARD_PORT, 1024);
-    }
-
-    #[test]
-    fn two_peers_may_not_share_a_name_a_key_or_a_port() {
-        let mut twice = relay();
-        twice.peers.push(Peer::new("alex-mac", "Alex", key('C')));
-        assert!(has(&problems_of(&twice), "vpn[0].peers[1].name"));
-
-        let mut shared_key = relay();
-        shared_key.peers.push(Peer::new("alex-phone", "Alex", key('B')));
-        assert!(has(&problems_of(&shared_key), "vpn[0].peers[1].public_key"));
-
-        // Two people behind one port is two people behind one identity.
-        let mut shared_port = attributing();
-        shared_port.peers.push(Peer::new("dad-mac", "Dad", key('C')).forwarded_to(9443));
-        assert!(has(&problems_of(&shared_port), "vpn[0].peers[1].forward_port"));
-
-        // One person, two devices, two keys, two ports — the model working.
-        let mut two_devices = attributing();
-        two_devices.peers.push(Peer::new("alex-phone", "Alex", key('C')).forwarded_to(9444));
-        assert!(problems_of(&two_devices).is_empty(), "{:?}", problems_of(&two_devices));
-        assert_eq!(
-            two_devices.peer_forwarded_to(socket("127.0.0.1:9444")).map(|p| p.name.as_str()),
-            Some("alex-phone")
-        );
+        assert_eq!(peer_name_problem("alex-mac"), None);
     }
 
     #[test]
@@ -1576,19 +993,14 @@ mod tests {
     }
 
     #[test]
-    fn two_relays_may_not_claim_one_peer_socket() {
-        // A per-peer socket is an identity deployment-wide: two relays claiming
-        // it leaves whatever reads that socket with two answers.
-        let mut first = attributing();
-        first.name = "console".into();
-        let mut second = attributing();
-        second.name = "private".into();
-        second.listen = "127.0.0.1:8444".into();
-        second.peers[0] = Peer::new("dad-mac", "Dad", key('C')).forwarded_to(9443);
-
+    fn a_forward_may_not_be_another_relays_front_door() {
+        let mut into_a_tunnel = relay();
+        into_a_tunnel.name = "private".into();
+        into_a_tunnel.listen = "127.0.0.1:8444".into();
+        into_a_tunnel.forward = "127.0.0.1:8443".into();
         let mut problems = Vec::new();
-        check_relays(&[first.clone(), second], "vpn", &mut problems);
-        assert!(has(&problems, "vpn[1].peers[0].forward_port"), "{problems:?}");
+        check_relays(&[relay(), into_a_tunnel], "vpn", &mut problems);
+        assert!(has(&problems, "vpn[1].forward"), "{problems:?}");
 
         // Two relays sharing an ordinary `forward` is fine and normal — two
         // doors onto one service is what several relays are for.
@@ -1597,38 +1009,6 @@ mod tests {
         plain.listen = "127.0.0.1:8444".into();
         let mut problems = Vec::new();
         check_relays(&[relay(), plain], "vpn", &mut problems);
-        assert!(problems.is_empty(), "{problems:?}");
-
-        // And a peer socket may not be another relay's front door.
-        let mut into_a_tunnel = relay();
-        into_a_tunnel.name = "private".into();
-        into_a_tunnel.listen = "127.0.0.1:8444".into();
-        into_a_tunnel.peers[0] = Peer::new("dad-mac", "Dad", key('C')).forwarded_to(8443);
-        let mut problems = Vec::new();
-        check_relays(&[relay(), into_a_tunnel], "vpn", &mut problems);
-        assert!(has(&problems, "vpn[1].peers[0].forward_port"), "{problems:?}");
-    }
-
-    #[test]
-    fn one_key_may_not_name_two_people_across_relays() {
-        let mut first = relay();
-        first.name = "console".into();
-        let mut second = relay();
-        second.name = "private".into();
-        second.listen = "127.0.0.1:8444".into();
-        second.peers[0].person = "Dad".into();
-
-        let mut problems = Vec::new();
-        check_relays(&[first.clone(), second], "vpn", &mut problems);
-        assert!(has(&problems, "vpn[1].peers[0].person"), "{problems:?}");
-
-        // The same device on two relays under the same name is fine — that is a
-        // laptop reaching two services, which is what several relays are for.
-        let mut agreeing = relay();
-        agreeing.name = "private".into();
-        agreeing.listen = "127.0.0.1:8444".into();
-        let mut problems = Vec::new();
-        check_relays(&[first, agreeing], "vpn", &mut problems);
         assert!(problems.is_empty(), "{problems:?}");
     }
 
@@ -1655,12 +1035,6 @@ name = "console"
 public = true
 listen = "0.0.0.0:8443"
 forward = "127.0.0.1:443"
-
-[[vpn.peers]]
-name = "alex-mac"
-person = "Alex"
-public_key = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAB="
-forward_port = 9443
 "#,
         )
         .expect("valid");
@@ -1668,9 +1042,6 @@ forward_port = 9443
         assert_eq!(relay.name, "console");
         assert!(!relay.enabled, "a block that does not say enabled does not run");
         assert_eq!(relay.backend, Backend::SecureVpn);
-        assert_eq!(relay.peers[0].person, "Alex");
-        assert_eq!(relay.peers[0].forward_port, Some(9443));
-        assert!(relay.attributes());
 
         let without = crate::Config::parse(
             r#"
@@ -1701,8 +1072,6 @@ static_root = "./public"
         assert_eq!(relay.name, "console");
         assert!(!relay.enabled, "the example must not arm a relay");
         assert!(relay.public, "the example binds 0.0.0.0, so it must say so");
-        assert_eq!(relay.peers.len(), 1);
-        assert!(relay.attributes(), "the example must show the identity carry, not omit it");
     }
 
     #[test]

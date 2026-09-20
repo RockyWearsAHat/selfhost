@@ -55,7 +55,7 @@ pub use validate::{ConfigError, Problem};
 // both honestly called a relay. Renaming either one to break the tie would give a
 // type a name nobody would think to look for, so the VPN one is reached as
 // `vpn::Relay` — which is also how the section is spelled in the config file.
-pub use vpn::{Backend, Peer};
+pub use vpn::Backend;
 
 /// The public API paths that are auto-configured for the auth site.
 ///
@@ -363,8 +363,7 @@ impl fmt::Display for SiteOwner {
 // Deliberately no `Serialize`/`Deserialize` for `SiteOwner` itself: `Site.owner`
 // is a raw `Option<String>` (see its field doc below) so that one unparseable
 // owner is a reported `Problem` on that one site, not a `ConfigError::Syntax`
-// that refuses the whole file before `validate()` ever runs — the same
-// "checked here for shape only" split `vpn.rs`'s `Peer::person` uses. Write-time
+// that refuses the whole file before `validate()` ever runs. Write-time
 // validation (`PUT /api/sites/<name>/owner`, `site_api::parse_owner`) still
 // goes through `SiteOwner::parse` directly, without needing a serde impl.
 

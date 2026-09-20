@@ -18,52 +18,20 @@
 //! 8443 and justified there as VPN-01, and the loader refuses a non-loopback
 //! `listen` that has not been acknowledged with `public = true`.
 //!
-//! # Where the argument vector comes from
+//! # Who the tunnel admits
 //!
-//! Not invented. It is the command line the production box has been running since
-//! the tunnel was installed, read out of
-//! `scripts/securevpn/install-vpn-service.ps1`, with `--peer` repeated per roster
-//! entry as the multi-peer change made it. Writing it down here rather than in a
-//! PowerShell script is the point of the exercise: the scheduled task and this
-//! crate now derive the same invocation from the same roster.
-//!
-//! # The argument that carries the identity, and which server understands it
-//!
-//! `--peer-forward <peer>=<socket>` is the identity carry on the wire between
-//! this crate and the tunnel: it tells the server to open peer `<peer>`'s
-//! loopback connection to `<socket>` instead of to `--ssh-host`/`--ssh-port`, so
-//! that the socket a local service accepts on names the person. It is emitted
-//! **only** for roster entries that declare a `forward_port`, which means a
-//! deployment that has given nobody a port produces byte-for-byte the invocation
-//! the production box already runs — asserted by a test, so that this change
-//! cannot silently alter a live tunnel's command line.
-//!
-//! `server.py` is where the flag is implemented, and it lives in the operator's
-//! own repository — `https://github.com/RockyWearsAHat/Secure-VPN.git` — beside
-//! the rest of the implementation, not in this one. Earlier revisions of this
-//! comment said it existed nowhere but a single Windows disk; that was wrong, and
-//! the error started from a path in `crates/app/cli/src/service_install.rs` that
-//! named a file this repository never had. What is true is narrower and still
-//! worth stating: the copy a deployment *runs* is the one installed at
-//! `C:\ProgramData\selfhost\securevpn\server.py` by
-//! `scripts/securevpn/install-vpn-service.ps1`, and an installed copy that
-//! predates the `--peer-forward` support will be started with an argument it
-//! rejects, because Python's `argparse` exits non-zero on an unrecognised
-//! argument. That failure is loud on purpose. The alternative considered and
-//! rejected was folding the socket into the existing `--peer` value
-//! (`--peer alex-mac=127.0.0.1:9443`): an old server would take the whole string
-//! as a key-file stem, fail to find `alex-mac=127.0.0.1:9443.pub`, and silently
-//! refuse that one peer — a person locked out with no message that says so, on a
-//! relay that came up looking healthy. [`crate::Preflight`] carries a note naming
-//! the requirement so it lands in the relay's own service log before the first
-//! start rather than after it.
+//! Nobody is named on the command line. `--roster <key_dir>/roster` points the
+//! server at the file enrolment writes, re-read on every handshake, so a device
+//! signed in a minute ago is admitted with no restart. `server.py` pins the
+//! shared `client` key when it is given no `--peer`, so [`PINNED_PEERS_ENV`] is
+//! set to an empty list to pin nobody: the roster is the only way in.
 
 use selfhost_config::vpn::Relay;
 use selfhost_config::{RestartPolicy, ServiceSpec, StartMode};
 use std::path::{Path, PathBuf};
 
 use crate::VpnError;
-use crate::roster::Roster;
+use crate::enrol::roster_file;
 
 /// The identity the *server* end answers to on a Secure-VPN relay.
 ///
@@ -72,6 +40,14 @@ use crate::roster::Roster;
 /// (`server.key`), and every Mac already joined to this tunnel pins that identity.
 /// Renaming it per relay would invalidate every client that has already joined.
 pub const SERVER_IDENTITY: &str = "server";
+
+/// The variable `server.py` reads its pinned peers from when no `--peer` is
+/// given: a comma-separated list. Unset, it pins `client`.
+pub const PINNED_PEERS_ENV: &str = "SECUREVPN_SERVER_PEER";
+
+/// A list with no names in it. Not the empty string, because Windows cannot be
+/// relied on to hand a child an empty variable.
+const NOBODY_PINNED: &str = ",";
 
 /// The prefix a relay's supervised service is named under.
 ///
@@ -225,8 +201,8 @@ impl Launch {
 
 /// Builds a relay's invocation, or says why this backend has none.
 ///
-/// Pure: the arguments are a function of the relay, its usable roster, the install
-/// and the key directory, and nothing here touches the disk. That is what lets the
+/// Pure: the arguments are a function of the relay, the install and the key
+/// directory, and nothing here touches the disk. That is what lets the
 /// exact command line the production box runs be asserted in a test.
 ///
 /// `key_dir` is passed already resolved against `server.data_dir` rather than
@@ -245,7 +221,6 @@ impl Launch {
 /// protection, not process isolation.
 pub fn plan(
     relay: &Relay,
-    roster: &Roster,
     install: &Install,
     key_dir: &Path,
     admin_bind: &str,
@@ -287,25 +262,10 @@ pub fn plan(
     args.push("--location".to_owned());
     args.push(relay.name.clone());
 
-    // One `--peer` per *usable* entry, in roster order. A peer the roster
-    // rejected is absent from this vector, which is what makes "dropped because
-    // nobody could be named" an actual loss of access rather than a note in a
-    // report nobody reads.
-    for entry in roster.enrolled() {
-        args.push("--peer".to_owned());
-        args.push(entry.peer.clone());
-    }
-
-    // The identity carry, and only for the entries that asked for it. A roster
-    // where nobody declared a `forward_port` produces exactly the vector the
-    // production box already runs, which is what lets this change land without
-    // altering a live tunnel's command line.
-    for entry in roster.enrolled() {
-        if let Some(forward) = entry.forward {
-            args.push("--peer-forward".to_owned());
-            args.push(format!("{}={forward}", entry.peer));
-        }
-    }
+    // Explicit rather than the server's default, so the file enrolment writes
+    // and the file the tunnel reads are one path by construction.
+    args.push("--roster".to_owned());
+    args.push(roster_file(key_dir).display().to_string());
 
     Ok(Launch { program: install.program.clone(), args, cwd: install.directory() })
 }
@@ -329,13 +289,11 @@ pub fn plan(
 /// in the config. `Automatic` would mean the act of loading a config binds an
 /// inbound socket on a box with a real public IP.
 ///
-/// # Why the environment is empty
+/// # Why the environment holds no secret
 ///
-/// Stated rather than left implicit: `docs/SECURITY.md`'s checklist forbids a
-/// secret in a service environment, and the tunnel needs none — its private key
-/// is a file in the key directory with the directory's permissions in front of
-/// it, which is the same "the ACL is the authentication" answer the remote-desktop
-/// channel uses (SCR-02).
+/// `docs/SECURITY.md`'s checklist forbids a secret in a service environment, and
+/// the tunnel needs none — its private key is a file in the key directory. The
+/// one variable set is [`PINNED_PEERS_ENV`], naming nobody, which is not a secret.
 pub fn service(relay: &Relay, launch: &Launch) -> ServiceSpec {
     let mut spec = ServiceSpec::new(service_name(&relay.name), launch.program.clone());
     spec.display_name = Some(format!("VPN relay \"{}\"", relay.name));
@@ -347,6 +305,7 @@ pub fn service(relay: &Relay, launch: &Launch) -> ServiceSpec {
     spec.cwd = launch.cwd.clone();
     spec.start_mode = StartMode::Manual;
     spec.restart = RestartPolicy::Always;
+    spec.env.insert(PINNED_PEERS_ENV.to_owned(), NOBODY_PINNED.to_owned());
     // No `stop_command`: the tunnel has no documented graceful-shutdown
     // invocation, so the supervisor's own ladder applies — a signal on Unix, a
     // terminate on Windows. Sessions in flight are TCP forwards, not a database;
@@ -357,8 +316,7 @@ pub fn service(relay: &Relay, launch: &Launch) -> ServiceSpec {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tests::{attributing_relay, forwarding_relay};
-    use selfhost_config::vpn::Peer;
+    use crate::tests::forwarding_relay;
 
     fn install() -> Install {
         Install::new(
@@ -382,21 +340,14 @@ mod tests {
 
     #[test]
     fn the_invocation_is_the_one_the_production_box_already_runs() {
-        // Read off scripts/securevpn/install-vpn-service.ps1, with `--peer`
-        // repeated as the multi-peer change made it, and now the account-manager
-        // arguments `Relays::preflight` adds so a completed handshake still has to
-        // clear `vpn.access:<relay>`. If this ever has to change, the script has
-        // to change in the same commit — that is what the test is for.
+        // Read off scripts/securevpn/install-vpn-service.ps1, plus the
+        // account-manager arguments so a completed handshake still has to clear
+        // `vpn.access:<relay>`, and the roster file in place of any `--peer`.
         let mut relay = forwarding_relay();
         relay.listen = "0.0.0.0:8443".into();
         relay.public = true;
-        relay.peers = vec![
-            Peer::new("client", "Alex", "A".repeat(43)),
-            Peer::new("dad", "Dad", "B".repeat(43)),
-        ];
-        let roster = Roster::build(&relay);
 
-        let launch = plan(&relay, &roster, &install(), &keys(), &admin_bind(), &admin_token_path())
+        let launch = plan(&relay, &install(), &keys(), &admin_bind(), &admin_token_path())
             .expect("a runnable relay");
         assert_eq!(launch.program, PathBuf::from("python"));
         assert_eq!(
@@ -424,78 +375,21 @@ mod tests {
                 r"C:\ProgramData\selfhost\admin.token",
                 "--location",
                 "console",
-                "--peer",
-                "client",
-                "--peer",
-                "dad",
+                "--roster",
+                &roster_file(&keys()).display().to_string(),
             ]
         );
     }
 
     #[test]
-    fn a_peer_the_roster_rejected_is_not_admitted_by_the_tunnel() {
-        // The loss of access has to be real. A peer that stays on the command
-        // line while being reported as rejected is a peer that still gets in.
-        let mut relay = forwarding_relay();
-        relay.peers.push(Peer::new("dad-mac", "Dad!", "B".repeat(43)));
-        let roster = Roster::build(&relay);
-
-        let launch = plan(&relay, &roster, &install(), &keys(), &admin_bind(), &admin_token_path()).expect("still runnable");
-        assert!(launch.args.contains(&"alex-mac".to_owned()));
-        assert!(!launch.args.contains(&"dad-mac".to_owned()), "{:?}", launch.args);
-    }
-
-    #[test]
-    fn a_roster_with_no_per_peer_ports_produces_the_command_line_it_always_did() {
-        // The regression this guards: the identity carry must not change the
-        // invocation of a relay nobody has migrated. `server.py` does not know
-        // `--peer-forward`, so an unconditional one would stop every deployed
-        // tunnel from starting.
+    fn nobody_is_pinned_on_the_command_line_or_by_the_servers_default() {
+        // `server.py` with no `--peer` pins the shared `client` key unless this
+        // variable is set to a list naming nobody.
         let relay = forwarding_relay();
-        let roster = Roster::build(&relay);
-        let launch = plan(&relay, &roster, &install(), &keys(), &admin_bind(), &admin_token_path()).expect("runnable");
-        assert!(
-            !launch.args.iter().any(|arg| arg == "--peer-forward"),
-            "{:?}",
-            launch.args
-        );
-    }
-
-    #[test]
-    fn a_peer_with_its_own_port_is_told_to_the_tunnel_as_its_own_argument() {
-        // Its own flag rather than a richer `--peer` value, and the reason is
-        // the failure mode of the other spelling: an old server would read
-        // "alex-mac=127.0.0.1:9443" as a key-file stem, find no such .pub, and
-        // refuse that one peer while coming up looking healthy.
-        let relay = attributing_relay();
-        let roster = Roster::build(&relay);
-        let launch = plan(&relay, &roster, &install(), &keys(), &admin_bind(), &admin_token_path()).expect("runnable");
-
-        let at = launch.args.iter().position(|arg| arg == "--peer-forward").expect("emitted");
-        assert_eq!(launch.args[at + 1], "alex-mac=127.0.0.1:9443");
-        // The roster entry is still declared the ordinary way: the forward is an
-        // addition to admission, never a replacement for it.
-        assert!(launch.args.contains(&"--peer".to_owned()));
-        assert!(launch.args.contains(&"alex-mac".to_owned()));
-    }
-
-    #[test]
-    fn a_rejected_peer_gets_no_forward_either() {
-        // A peer nobody can name must not be handed a socket that would have
-        // named them.
-        let mut relay = attributing_relay();
-        relay.peers[0].person = "Alex/Bob".into();
-        relay.peers.push(
-            selfhost_config::vpn::Peer::new("dad-mac", "Dad", "B".repeat(43)).forwarded_to(9444),
-        );
-        let roster = Roster::build(&relay);
-        let launch = plan(&relay, &roster, &install(), &keys(), &admin_bind(), &admin_token_path()).expect("still runnable");
-        assert!(
-            !launch.args.iter().any(|arg| arg.starts_with("alex-mac=")),
-            "{:?}",
-            launch.args
-        );
-        assert!(launch.args.contains(&"dad-mac=127.0.0.1:9444".to_owned()), "{:?}", launch.args);
+        let launch = plan(&relay, &install(), &keys(), &admin_bind(), &admin_token_path()).expect("runnable");
+        assert!(!launch.args.iter().any(|arg| arg == "--peer"), "{:?}", launch.args);
+        let spec = service(&relay, &launch);
+        assert_eq!(spec.env.get(PINNED_PEERS_ENV).map(String::as_str), Some(NOBODY_PINNED));
     }
 
     #[test]
@@ -505,9 +399,8 @@ mod tests {
         // reporting a Python traceback.
         let mut relay = forwarding_relay();
         relay.listen = "8443".into();
-        let roster = Roster::build(&relay);
         assert!(matches!(
-            plan(&relay, &roster, &install(), &keys(), &admin_bind(), &admin_token_path()),
+            plan(&relay, &install(), &keys(), &admin_bind(), &admin_token_path()),
             Err(VpnError::Unaddressable { field: "listen", .. })
         ));
     }
@@ -515,8 +408,7 @@ mod tests {
     #[test]
     fn the_service_is_named_once_and_the_same_everywhere() {
         let relay = forwarding_relay();
-        let roster = Roster::build(&relay);
-        let launch = plan(&relay, &roster, &install(), &keys(), &admin_bind(), &admin_token_path()).expect("runnable");
+        let launch = plan(&relay, &install(), &keys(), &admin_bind(), &admin_token_path()).expect("runnable");
         let spec = service(&relay, &launch);
         assert_eq!(spec.name, service_name(&relay.name));
         assert_eq!(spec.name, "vpn-console");
@@ -525,13 +417,12 @@ mod tests {
     #[test]
     fn the_service_starts_manually_restarts_always_and_carries_no_secret() {
         let relay = forwarding_relay();
-        let roster = Roster::build(&relay);
-        let launch = plan(&relay, &roster, &install(), &keys(), &admin_bind(), &admin_token_path()).expect("runnable");
+        let launch = plan(&relay, &install(), &keys(), &admin_bind(), &admin_token_path()).expect("runnable");
         let spec = service(&relay, &launch);
 
         assert_eq!(spec.start_mode, StartMode::Manual, "loading a config must not bind a port");
         assert_eq!(spec.restart, RestartPolicy::Always, "the only door must come back up");
-        assert!(spec.env.is_empty(), "docs/SECURITY.md: no secret in a service environment");
+        assert_eq!(spec.env.len(), 1, "docs/SECURITY.md: no secret in a service environment");
         // Asserted against the install rather than a literal, because `Path`
         // only splits on this platform's separators and the fixture is the
         // production box's Windows path.
@@ -552,8 +443,7 @@ mod tests {
         // The name becomes a log filename, so `vpn-<relay>` has to survive the
         // same rules every other service is held to.
         let relay = forwarding_relay();
-        let roster = Roster::build(&relay);
-        let launch = plan(&relay, &roster, &install(), &keys(), &admin_bind(), &admin_token_path()).expect("runnable");
+        let launch = plan(&relay, &install(), &keys(), &admin_bind(), &admin_token_path()).expect("runnable");
         let mut problems = Vec::new();
         service(&relay, &launch).check("vpn", &[], &mut problems);
         assert!(problems.is_empty(), "{problems:?}");
@@ -562,8 +452,7 @@ mod tests {
     #[test]
     fn a_command_line_is_for_reading_and_never_for_running() {
         let relay = forwarding_relay();
-        let roster = Roster::build(&relay);
-        let launch = plan(&relay, &roster, &install(), &keys(), &admin_bind(), &admin_token_path()).expect("runnable");
+        let launch = plan(&relay, &install(), &keys(), &admin_bind(), &admin_token_path()).expect("runnable");
         let line = launch.command_line();
         assert!(line.starts_with("python -X utf8 -u"), "{line}");
         assert!(line.contains("--identity server"), "{line}");

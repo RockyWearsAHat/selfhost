@@ -170,14 +170,6 @@ impl RelayState {
 }
 
 /// One relay as a console row: what it is, and where it is.
-///
-/// `attributable` is here rather than left to be inferred from the roster,
-/// because it is the single fact everything above the tunnel has to reason about
-/// — whether a session on this relay can be traced to a person — and a front-end
-/// that re-derives it will one day derive it wrongly. It is true when at least
-/// one peer holds a `forward_port` of its own; a relay where everybody shares
-/// `forward` answers "nobody" for every session, which is the state the audit
-/// found and which must be visible in the listing rather than inferred from it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RelaySummary {
     /// The relay's name.
@@ -196,8 +188,6 @@ pub struct RelaySummary {
     pub peers: usize,
     /// How many roster entries were dropped because nobody could be named.
     pub rejected: usize,
-    /// Whether a session on this relay can be traced to a person at all.
-    pub attributable: bool,
     /// Where it is.
     pub state: RelayState,
 }
@@ -217,7 +207,6 @@ impl RelaySummary {
         object.insert("forward".into(), Json::string(&self.forward));
         object.insert("peers".into(), Json::Number(self.peers as f64));
         object.insert("rejected".into(), Json::Number(self.rejected as f64));
-        object.insert("attributable".into(), Json::Bool(self.attributable));
         Json::Object(object)
     }
 }
@@ -305,7 +294,7 @@ mod tests {
     }
 
     #[test]
-    fn a_summary_carries_whether_this_relay_can_name_anybody() {
+    fn a_summary_carries_the_relay_and_where_it_is() {
         let relay = forwarding_relay();
         let summary = RelaySummary {
             name: relay.name.clone(),
@@ -316,11 +305,9 @@ mod tests {
             forward: relay.forward.clone(),
             peers: 1,
             rejected: 0,
-            attributable: relay.attributes(),
             state: RelayState::of(&relay, None),
         };
         let text = summary.to_json().to_text();
-        assert!(text.contains(r#""attributable":false"#), "{text}");
         assert!(text.contains(r#""state":"declared""#), "{text}");
         assert!(text.contains(r#""name":"console""#), "{text}");
     }

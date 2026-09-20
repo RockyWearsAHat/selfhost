@@ -9,25 +9,12 @@
 //! generated on the person's own machine by `key_manager.py`), and this module
 //! never does anything with it but write it down.
 //!
-//! # Why the roster file, not `[[vpn.peers]]`
+//! # Why no restart
 //!
-//! A config edit is a restart: `server.py`'s own docstring on
-//! [`crate::roster::Roster`] (the config-side reconciliation) is that a config
-//! peer becomes a `--peer` flag baked into the argv a relay was launched with.
-//! `~/Secure-VPN/server.py`'s *own* `Roster` class is the other half of that
-//! story and the reason this module can exist at all: it resolves `--roster`,
-//! when the flag is omitted, to `<key-dir>/roster` by default — so every relay
-//! `crates/services/vpn/src/runner.rs::plan` has ever started is *already*
-//! watching that file, re-read on every handshake attempt. Writing a name into
-//! it and a key into the directory beside it is therefore enrolment with no
-//! restart and no dropped tunnels, using a mechanism this deployment was
-//! already running and not exercising.
-//!
-//! A permanent, reviewed key — the operator's own — still belongs in
-//! `[[vpn.peers]]`, diffed and committed like any other access decision. This
-//! module is the fast lane for a capability grant made through the console or
-//! the CLI, with the people registry's `vpn.access:<location>` grant serving as
-//! the audited record of *why* the name is there.
+//! `server.py` re-reads its roster file on every handshake attempt, and
+//! `runner::plan` points it at [`roster_file`]. Writing a name into it and a key
+//! into the directory beside it is enrolment with no dropped tunnels. Who the
+//! name belongs to is [`crate::peer_binding`]'s record.
 
 use selfhost_config::vpn::{peer_name_problem, public_key_problem};
 use std::fmt;
@@ -36,9 +23,8 @@ use std::path::{Path, PathBuf};
 
 use crate::keys::{PEER_KEY_TAG, peer_key_file};
 
-/// The file `server.py` reads a roster from when none is passed on its command
-/// line — see the module documentation. Named here so a caller never has to
-/// spell `"roster"` themselves.
+/// The roster file's name inside a key directory. Named here so a caller never
+/// has to spell `"roster"` themselves.
 pub const ROSTER_FILE: &str = "roster";
 
 /// Where a relay's roster file lives, inside its key directory.
@@ -46,10 +32,8 @@ pub fn roster_file(key_dir: &Path) -> PathBuf {
     key_dir.join(ROSTER_FILE)
 }
 
-/// The names currently enrolled through this relay's roster file — the
-/// dynamic peers `[[vpn.peers]]` does not know about, because they never went
-/// through a config edit (see the module documentation). A missing roster
-/// file reads as no dynamic peers, matching [`revoke`] and [`enrol`]'s own
+/// The names currently in this relay's roster file. A missing roster file
+/// reads as nobody, matching [`revoke`] and [`enrol`]'s own
 /// treatment of one.
 pub fn roster(key_dir: &Path) -> io::Result<Vec<String>> {
     read_roster(&roster_file(key_dir))
@@ -91,9 +75,7 @@ impl From<io::Error> for EnrolError {
 /// `key_manager.py` writes and reads, and adds `peer` to `<key_dir>/roster` if
 /// it is not already there.
 ///
-/// `public_key` is base64, exactly what a `[[vpn.peers]].public_key` line
-/// holds — checked against the same shape rule that field is, so a value that
-/// would be rejected in the config is rejected here before it touches disk.
+/// `public_key` is base64, checked for shape before it touches disk.
 /// Idempotent: enrolling an already-enrolled peer overwrites its key file with
 /// the one given (the operator's own re-enrolment after a lost device) and
 /// leaves the roster line as it was.
@@ -130,10 +112,8 @@ pub fn enrol(key_dir: &Path, peer: &str, public_key: &str) -> Result<(), EnrolEr
 /// Revokes a peer: removes it from `<key_dir>/roster` and deletes its `.pub`
 /// file.
 ///
-/// A peer never enrolled through this module — one only in `[[vpn.peers]]`, or
-/// already gone — is not an error: revoking twice, or revoking somebody who
-/// was only ever a config peer, both leave the roster in the state the caller
-/// wanted. Peer name is checked for shape so a caller cannot be tricked into
+/// A peer already gone is not an error: revoking twice leaves the roster in
+/// the state the caller wanted. Peer name is checked for shape so a caller cannot be tricked into
 /// touching a path outside the key directory, but a name that is well-formed
 /// and simply absent is silently a no-op.
 pub fn revoke(key_dir: &Path, peer: &str) -> Result<(), EnrolError> {
