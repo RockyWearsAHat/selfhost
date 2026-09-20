@@ -323,10 +323,30 @@ async fn build_and_swap(
     if let Err(error) = std::fs::rename(&exe, &prev) {
         // The tree is already on the new commit; leaving it there would make
         // the next poll read "up to date" while the old binary keeps running.
+        // Nothing was moved, so there is nothing for `SwapGuard` to restore —
+        // this failure is reported directly, before it exists.
         let reason =
             format!("cannot move {} aside for the new build: {error}", exe.display());
-        return Err(roll_back(project_dir, previous, &exe, &prev, reason).await);
+        return Err(roll_back(project_dir, previous, reason).await);
     }
+
+    // From this point on, `exe` names nothing on disk until either the build
+    // finishes and installs a fresh binary there, or a failure below restores
+    // `prev`. Everything between here and one of those two outcomes is an
+    // `.await` — and `watch_own_repository` runs as one arm of the daemon's
+    // `tokio::select!` in `serve_everything`, so a sibling arm resolving first
+    // (the shutdown signal, a listener stopping) drops this whole future right
+    // here, exactly as if it had been cancelled. Rust runs a dropped future's
+    // local destructors synchronously at the point it is torn down, even
+    // mid-`.await` — unlike an early `return`, which only happens when this
+    // function's own code decides to leave — so `guard` is what actually
+    // stands between a cancellation and a deployment left with no `selfhost`
+    // binary at all and no code path remaining to put one back.
+    // Owns restoring `prev` from here on — on every path out of this function,
+    // `return`ed or cancelled alike, since a local's `Drop` runs either way.
+    // `roll_back` below therefore no longer touches the binary at all; it only
+    // ever rolls the tree back and reports.
+    let guard = SwapGuard { exe: exe.clone(), prev: prev.clone() };
 
     let command = update.build_command();
     let failure = match run::build_step(&command, project_dir, BUILD_TIMEOUT).await {
@@ -335,41 +355,85 @@ async fn build_and_swap(
         Err(error) => Some(error.to_string()),
     };
     if let Some(reason) = failure {
-        return Err(roll_back(project_dir, previous, &exe, &prev, format!("build failed: {reason}")).await);
+        return Err(roll_back(project_dir, previous, format!("build failed: {reason}")).await);
     }
 
     // The usual deployment runs from `target/release`, where the build already
     // put the fresh binary at `exe`'s own path. An install that runs the binary
     // from somewhere else gets the built one copied over — permissions ride
-    // along with the copy.
+    // along with the copy. Copied to a temporary sibling and renamed into
+    // place, never written to `exe` directly: a crash or a cancellation
+    // mid-copy must never leave a half-written file at the one path the
+    // service manager restarts, only ever the complete new binary or nothing
+    // — and "nothing" is exactly what `guard` is still watching for.
     if !exe.exists() {
         let built = built_binary_path(project_dir);
-        if let Err(error) = std::fs::copy(&built, &exe) {
+        if let Err(error) = install_atomically(&built, &exe) {
             let reason = format!("cannot install {} as {}: {error}", built.display(), exe.display());
-            return Err(roll_back(project_dir, previous, &exe, &prev, reason).await);
+            return Err(roll_back(project_dir, previous, reason).await);
         }
     }
+    drop(guard); // `exe` now holds the new build; nothing left to restore.
     Ok(())
 }
 
-/// Undoes a failed update — binary back in place, tree back on `previous` —
-/// and returns the reason, annotated with any undo that itself failed.
-async fn roll_back(
-    project_dir: &Path,
-    previous: &str,
-    exe: &Path,
-    prev: &Path,
-    reason: String,
-) -> String {
-    let mut report = format!("{reason}; still running {}", plan::short(previous));
-    if !exe.exists()
-        && let Err(error) = std::fs::rename(prev, exe)
-    {
-        report.push_str(&format!(
-            " — and the running binary could not be renamed back from {}: {error}",
-            prev.display()
-        ));
+/// Copies `built` to `dest` without ever leaving a partial file at `dest`
+/// itself: the copy lands at a temporary sibling first, and only a rename —
+/// one atomic directory-entry update, not a byte-by-byte copy — puts it at
+/// `dest`'s real name. The same "temp sibling, then rename" shape
+/// `proxy::tls::write_atomic` uses for the same reason, applied to copying an
+/// existing file rather than writing fresh bytes.
+fn install_atomically(built: &Path, dest: &Path) -> std::io::Result<()> {
+    let temp = dest.with_file_name(format!(
+        "{}.installing",
+        dest.file_name().and_then(|n| n.to_str()).unwrap_or("selfhost")
+    ));
+    let _ = std::fs::remove_file(&temp);
+    std::fs::copy(built, &temp)?;
+    std::fs::rename(&temp, dest)
+}
+
+/// Watches the window between renaming the running binary aside
+/// ([`build_and_swap`]'s first step) and the swap finishing, and restores it
+/// if that window ever ends without `exe` holding a binary — including when
+/// it ends because the future itself was dropped out from under the swap,
+/// which an early `return` inside the same function could never observe or
+/// undo. See [`build_and_swap`]'s own doc comment for why this has to be a
+/// `Drop` guard rather than a check at the end of the function.
+///
+/// Idempotent by construction: once `exe` exists again — the swap finished
+/// normally, or an earlier drop of a sibling guard (there is only ever one in
+/// practice) already restored it — restoring again would overwrite a good
+/// binary with a stale rename, so the guard only acts when `exe` is genuinely
+/// missing.
+struct SwapGuard {
+    exe: PathBuf,
+    prev: PathBuf,
+}
+
+impl Drop for SwapGuard {
+    fn drop(&mut self) {
+        if !self.exe.exists()
+            && let Err(error) = std::fs::rename(&self.prev, &self.exe)
+        {
+            // Said loudly: this is the one path left when even the guard's
+            // own restore fails, and the box may now have no `selfhost`
+            // binary at all.
+            eprintln!(
+                "self-update: {} is missing and could not be restored from {}: {error}",
+                self.exe.display(),
+                self.prev.display()
+            );
+        }
     }
+}
+
+/// Undoes a failed update's tree change — back to `previous` — and returns
+/// the reason, annotated with any undo that itself failed. Never touches the
+/// binary: that is [`SwapGuard`]'s job alone, run via `Drop` so it also
+/// covers a cancellation this function's own return could never see.
+async fn roll_back(project_dir: &Path, previous: &str, reason: String) -> String {
+    let mut report = format!("{reason}; still running {}", plan::short(previous));
     if let Err(error) =
         git(&plan::reset_to_args(project_dir, previous), project_dir, TRANSFER_TIMEOUT).await
     {
@@ -419,7 +483,9 @@ fn rollback_discard_path(exe: &Path) -> PathBuf {
 /// reverse: the unhealthy build cannot be deleted or overwritten while this
 /// process is running it, but it can be renamed out of the way
 /// ([`rollback_discard_path`]), which frees the original path for
-/// [`prev_path`]'s binary to take.
+/// [`prev_path`]'s binary to take. Two independent renames, not one — see
+/// [`install_previous_over`] for what happens when the second of them is the
+/// one that fails.
 fn restore_previous_binary(exe: &Path) -> Result<(), String> {
     let prev = prev_path(exe);
     if !prev.exists() {
@@ -430,8 +496,43 @@ fn restore_previous_binary(exe: &Path) -> Result<(), String> {
     std::fs::rename(exe, &discard).map_err(|error| {
         format!("cannot move the unhealthy build aside ({}): {error}", exe.display())
     })?;
-    std::fs::rename(&prev, exe)
-        .map_err(|error| format!("cannot restore {} from {}: {error}", exe.display(), prev.display()))
+    install_previous_over(exe, &prev, &discard)
+}
+
+/// The second of [`restore_previous_binary`]'s two renames: installs `prev`
+/// at `exe`, which by this point has already been vacated (`discard` holds
+/// what used to be there).
+///
+/// If this rename itself fails — a lock, a permissions error, a full disk —
+/// the naive version of this left `exe` renamed away with nothing put back in
+/// its place: an update meant to *recover* from an unhealthy build would
+/// instead have deleted the last known-good one from the path the service
+/// manager restarts. So a failure here puts `discard` back at `exe` before
+/// reporting: the unhealthy build restored is still a binary something can
+/// run and this same rollback retried against later, which is what "an
+/// update may never take the box down" (index.dx rule 8) actually requires —
+/// never *no* binary at that path at all.
+fn install_previous_over(exe: &Path, prev: &Path, discard: &Path) -> Result<(), String> {
+    if let Err(error) = std::fs::rename(prev, exe) {
+        return Err(match std::fs::rename(discard, exe) {
+            Ok(()) => format!(
+                "cannot restore {} from {}: {error} — put the unhealthy build back at {} \
+                 rather than leave nothing runnable there",
+                exe.display(),
+                prev.display(),
+                exe.display()
+            ),
+            Err(second_error) => format!(
+                "cannot restore {} from {}: {error} — and could not even put the unhealthy \
+                 build back from {} ({second_error}); {} now has no binary at all",
+                exe.display(),
+                prev.display(),
+                discard.display(),
+                exe.display()
+            ),
+        });
+    }
+    Ok(())
 }
 
 /// What a successful swap hands the next boot to verify, before this process
@@ -688,6 +789,101 @@ mod tests {
             std::fs::read(rollback_discard_path(&exe)).expect("the bad build was kept, not deleted"),
             b"unhealthy new build"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn when_installing_the_previous_binary_fails_the_unhealthy_build_is_put_back() {
+        // Regression: the naive two-rename `restore_previous_binary` left
+        // `exe` renamed away with nothing at all put back when the *second*
+        // rename (installing `prev`) was the one that failed — an update
+        // meant to recover from an unhealthy build instead deleted the last
+        // known-good binary from the one path the service manager restarts.
+        // `prev` is deliberately never created, so `std::fs::rename(prev,
+        // exe)` fails exactly the way a lock, a permissions error, or a full
+        // disk would.
+        let dir = temp_dir("install-over-fails");
+        let exe = dir.join(format!("selfhost{}", std::env::consts::EXE_SUFFIX));
+        let prev = prev_path(&exe);
+        let discard = rollback_discard_path(&exe);
+        std::fs::write(&discard, b"unhealthy new build").expect("already moved aside");
+
+        let outcome = install_previous_over(&exe, &prev, &discard);
+
+        assert!(outcome.is_err(), "a prev that cannot be installed must be reported, not ignored");
+        assert!(
+            exe.exists(),
+            "the exe path must never end up with nothing there at all, even when the \
+             restore itself fails"
+        );
+        assert_eq!(
+            std::fs::read(&exe).expect("the unhealthy build was put back"),
+            b"unhealthy new build",
+            "putting the unhealthy build back is the fallback when prev cannot be installed"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn install_atomically_never_leaves_a_temporary_file_behind_on_success() {
+        let dir = temp_dir("install-atomically");
+        let built = dir.join("built-binary");
+        std::fs::write(&built, b"a freshly built binary").expect("a fake built binary");
+        let dest = dir.join(format!("selfhost{}", std::env::consts::EXE_SUFFIX));
+
+        install_atomically(&built, &dest).expect("both paths are ordinary and writable");
+
+        assert_eq!(std::fs::read(&dest).expect("installed"), b"a freshly built binary");
+        let leftovers: Vec<_> = std::fs::read_dir(&dir)
+            .expect("the temp dir")
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .filter(|name| name.contains(".installing"))
+            .collect();
+        assert!(leftovers.is_empty(), "no temp sibling should survive a successful install: {leftovers:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn a_swap_cancelled_mid_build_is_restored_by_the_guards_drop_not_left_missing() {
+        // Regression: `watch_own_repository` runs as one arm of the daemon's
+        // `tokio::select!` in `serve_everything` — a sibling arm resolving
+        // first drops this whole future, mid-`.await`, exactly as
+        // `tokio::time::timeout` does here. Before `SwapGuard` existed, that
+        // drop happened between the rename-aside and the build finishing,
+        // and nothing was left to put `exe` back: the deployment lost its own
+        // binary with no code path left to restore it. A "build" that sleeps
+        // far longer than the timeout guarantees the cancellation lands
+        // inside `run::build_step`'s own `.await`, not before or after it.
+        let dir = temp_dir("cancelled-swap");
+        let exe = dir.join(format!("selfhost{}", std::env::consts::EXE_SUFFIX));
+        std::fs::write(&exe, b"currently running").expect("a fake exe");
+
+        let mut update = selfhost_config::SelfUpdate::new("https://127.0.0.1:1/none.git");
+        let (program, args) = selfhost_supervisor::shell_command("sleep 30");
+        let mut command = vec![program.display().to_string()];
+        command.extend(args);
+        update.build = Some(command);
+
+        // `build_and_swap` reads its own exe path from `std::env::current_exe`,
+        // so it cannot be pointed at `exe` directly here; the guard mechanics
+        // under test — restoring `prev` over a missing `exe` on drop — do not
+        // depend on which real exe is being swapped, so the swap machinery
+        // is exercised directly at the level `SwapGuard` actually operates:
+        // rename aside, then cancel before the swap finishes.
+        let prev = prev_path(&exe);
+        std::fs::rename(&exe, &prev).expect("the rename-aside `build_and_swap` itself performs");
+        let guarded = async {
+            let _guard = SwapGuard { exe: exe.clone(), prev: prev.clone() };
+            run::build_step(&update.build_command(), &dir, BUILD_TIMEOUT).await
+        };
+
+        let outcome = tokio::time::timeout(Duration::from_millis(50), guarded).await;
+        assert!(outcome.is_err(), "the timeout must actually have fired mid-build, or this proves nothing");
+
+        assert!(exe.exists(), "the guard's Drop must restore the binary even though the future never completed");
+        assert_eq!(std::fs::read(&exe).expect("restored"), b"currently running");
+        assert!(!prev.exists(), "prev is consumed by the restore, not copied");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

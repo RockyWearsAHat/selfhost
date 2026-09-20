@@ -565,7 +565,8 @@ enum Route<'a> {
     /// `GET /api/system` — every System part (proxy, admin API, relay(s),
     /// updater, mail if configured, certificate expiry), its state, and a
     /// human reason when it is unhealthy. Never a Service: see
-    /// `docs/architecture.dx`'s System/Service split.
+    /// `index.dx`'s System/Service split (see the "Service" entry in its
+    /// nouns-list).
     System,
     /// `GET /api/storage/shares`
     Shares,
@@ -3808,7 +3809,7 @@ impl Api {
     }
 
     /// Every hosted Service — never a System part. See [`is_system`] and
-    /// `docs/architecture.dx`'s System/Service split: a Person chose to host a
+    /// `index.dx`'s System/Service split: a Person chose to host a
     /// Service, where a System part (the relay, the updater, `reports`) is
     /// this deployment supervising itself and belongs on [`Api::system_health`]
     /// instead.
@@ -3854,7 +3855,7 @@ impl Api {
     /// Covers the proxy, this admin API, every VPN relay and `vpn-updater`
     /// (both System-classified, see [`is_system`]), mail when `[mail]` is
     /// configured, and each certified host's certificate expiry — the set
-    /// `docs/architecture.dx`'s "now" step 3 names.
+    /// `index.dx`'s goal 3 names.
     ///
     /// Composed here rather than filtered out of [`Api::list_services`]'s
     /// answer because a System part can be unhealthy in ways the supervisor's
@@ -4253,7 +4254,7 @@ fn parse_json_body(body: &[u8]) -> Option<Json> {
 /// Whether a supervised entry is a System part of Self-Host itself rather
 /// than a Service a Person chose to host.
 ///
-/// `docs/architecture.dx`'s System/Service split names exactly these:
+/// `index.dx`'s System/Service split names exactly these:
 /// `reports` (the public report intake this daemon runs for itself) and
 /// every VPN relay plus `vpn-updater` (`crates/services/vpn/src/runner.rs`'s
 /// `SERVICE_PREFIX = "vpn-"`, and `crates/services/vpn/src/updater.rs`'s

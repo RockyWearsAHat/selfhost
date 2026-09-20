@@ -433,6 +433,17 @@ impl Config {
                 });
             }
 
+            // Checked here, softly, rather than at TOML-deserialize time: an
+            // owner that is not a legal Person name (too long, an email
+            // address, a reserved word) is a mistake in this one site, not a
+            // reason to refuse the entire config file. See `SiteOwner`'s and
+            // `Site.owner`'s doc comments in `lib.rs`.
+            if let Some(owner) = &site.owner {
+                if let Err(message) = crate::SiteOwner::parse(owner) {
+                    problems.push(Problem { field: format!("sites[{i}].owner"), message });
+                }
+            }
+
             for (j, domain) in site.domains.iter().enumerate() {
                 let lowered = domain.to_ascii_lowercase();
                 if let Some(previous) = seen_domains.insert(lowered, i) {
@@ -947,6 +958,31 @@ mod tests {
     #[test]
     fn a_minimal_deployment_is_valid() {
         assert!(config(vec![owner_node()], vec![site("a", "example.com")]).validate().is_ok());
+    }
+
+    #[test]
+    fn an_illegal_site_owner_is_a_reported_problem_not_a_hard_parse_failure() {
+        // Regression: `Site.owner` was once a `SiteOwner` newtype deserialized
+        // directly by serde, so an owner that is not a legal Person name (an
+        // email address, over the 32-character cap, a reserved word) failed at
+        // `toml::from_str` time with `ConfigError::Syntax` — refusing to load
+        // the *entire* file, including every other site and subsystem in it,
+        // rather than being collected here alongside every other per-site
+        // mistake the way `sites[i].domains`/`app_paths`/`health` already are.
+        let mut email_owner = site("a", "example.com");
+        email_owner.owner = Some("alex@example.com".into());
+        let problems = problems_of(&config(vec![owner_node()], vec![email_owner]));
+        assert!(problems.iter().any(|p| p.field == "sites[0].owner"), "{problems:?}");
+
+        let mut long_owner = site("b", "b.example.com");
+        long_owner.owner = Some("x".repeat(33));
+        let problems = problems_of(&config(vec![owner_node()], vec![long_owner]));
+        assert!(problems.iter().any(|p| p.field == "sites[0].owner"), "{problems:?}");
+
+        // A legal owner still validates clean.
+        let mut ok_owner = site("c", "c.example.com");
+        ok_owner.owner = Some("Alex".into());
+        assert!(problems_of(&config(vec![owner_node()], vec![ok_owner])).is_empty());
     }
 
     /// A relay in the shape the deployment actually runs: public on 8443,
