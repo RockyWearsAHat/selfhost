@@ -14,6 +14,7 @@ pub mod dav;
 pub mod files;
 pub mod health;
 pub mod mime;
+pub mod pass_gate;
 pub mod server;
 pub mod sni;
 pub mod tls;

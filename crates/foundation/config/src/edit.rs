@@ -334,6 +334,18 @@ fn render_site_block(site: &Site) -> String {
         out.push_str(&format!("public_api_paths = {}\n", quote_array(&site.public_api_paths)));
     }
 
+    if let Some(exposure) = site.exposure {
+        let word = match exposure {
+            crate::Exposure::Public => "public",
+            crate::Exposure::People => "people",
+            crate::Exposure::Private => "private",
+        };
+        out.push_str(&format!("exposure = {}\n", quote(word)));
+    }
+    if let Some(owner) = &site.owner {
+        out.push_str(&format!("owner = {}\n", quote(owner.as_str())));
+    }
+
     for instance in &site.instances {
         out.push_str("\n[[sites.instances]]\n");
         out.push_str(&format!("node = {}\n", quote(&instance.node)));
@@ -458,6 +470,124 @@ fn header_first_segment(line: &str) -> Option<&str> {
         .or_else(|| trimmed.strip_prefix('[').and_then(|rest| rest.strip_suffix(']')))?;
     let segment = inner.split('.').next().unwrap_or("").trim();
     (!segment.is_empty()).then_some(segment)
+}
+
+/// Sets or clears the `target` site's `exposure` line.
+///
+/// `Some(exposure)` writes it (replacing whatever was there); `None` removes
+/// the line entirely, which is the same state a site that never had one is
+/// in. Returns `Ok(None)` when no site by that name exists, on the same terms
+/// [`remove_domain`] does.
+pub fn set_exposure(
+    source: &str,
+    name: &str,
+    exposure: Option<crate::Exposure>,
+) -> Result<Option<String>, ConfigError> {
+    let word = exposure.map(|exposure| match exposure {
+        crate::Exposure::Public => "public",
+        crate::Exposure::People => "people",
+        crate::Exposure::Private => "private",
+    });
+    set_scalar_field(source, name, "exposure", word)
+}
+
+/// Sets or clears the `target` site's `owner` line, on the same terms
+/// [`set_exposure`] sets `exposure`.
+pub fn set_owner(source: &str, name: &str, owner: Option<&str>) -> Result<Option<String>, ConfigError> {
+    set_scalar_field(source, name, "owner", owner)
+}
+
+/// The shared machinery behind [`set_exposure`] and [`set_owner`]: replaces,
+/// inserts or removes one top-level `key = "value"` line inside the named
+/// site's own span — never a sub-table's — and validates the whole document
+/// before returning it.
+///
+/// `value: None` removes the line if present (both fields are optional: a
+/// bare site is legal). `value: Some` replaces it in place if the key is
+/// already there, or — if not — inserts a new line right where
+/// [`render_site_block`] would have written it: after the site's other flat
+/// keys, before its first sub-table (or the next site, or the end of file),
+/// so a site edited once and one written once read identically.
+fn set_scalar_field(
+    source: &str,
+    name: &str,
+    key: &str,
+    value: Option<&str>,
+) -> Result<Option<String>, ConfigError> {
+    let config = Config::parse(source)?;
+    let Some(target) = config.sites.iter().position(|site| site.name == name) else {
+        return Ok(None);
+    };
+
+    let parts: Vec<&str> = source.split('\n').collect();
+
+    let mut seen = 0usize;
+    let mut start = None;
+    for (i, line) in parts.iter().enumerate() {
+        if is_site_header(line) {
+            if seen == target {
+                start = Some(i);
+                break;
+            }
+            seen += 1;
+        }
+    }
+    // `target` came from `config.sites`, so a matching header must exist —
+    // the config and the text it was parsed from cannot disagree about how
+    // many `[[sites]]` blocks there are.
+    let start = start.expect("the site index came from parsing this same source");
+
+    // The same top-of-block boundary `remove_nth_site_block` finds: where
+    // this site's own flat keys end and its first sub-table (or the next
+    // site, or the file) begins. `key_line` is recorded along the way rather
+    // than searched for separately, so the two searches cannot disagree
+    // about where the block ends.
+    let mut top_end = parts.len();
+    let mut key_line = None;
+    for (offset, line) in parts.iter().enumerate().skip(start + 1) {
+        if is_site_header(line) {
+            top_end = offset;
+            break;
+        }
+        match header_first_segment(line) {
+            Some(_) => {
+                top_end = offset;
+                break;
+            }
+            None => {
+                if is_key(line, key) {
+                    key_line = Some(offset);
+                }
+            }
+        }
+    }
+
+    let mut lines: Vec<String> = parts.iter().map(|line| (*line).to_owned()).collect();
+    match (key_line, value) {
+        (Some(offset), Some(value)) => lines[offset] = format!("{key} = {}", quote(value)),
+        (Some(offset), None) => {
+            lines.remove(offset);
+        }
+        (None, Some(value)) => lines.insert(top_end, format!("{key} = {}", quote(value))),
+        (None, None) => {}
+    }
+
+    let mut result = lines.join("\n");
+    if source.ends_with('\n') && !result.ends_with('\n') {
+        result.push('\n');
+    }
+    Config::parse(&result)?;
+    Ok(Some(result))
+}
+
+/// Whether `line` assigns exactly `key`, on the same terms [`is_domains_key`]
+/// checks `domains`.
+fn is_key(line: &str, key: &str) -> bool {
+    let trimmed = line.trim_start();
+    let Some(rest) = trimmed.strip_prefix(key) else {
+        return false;
+    };
+    rest.trim_start().starts_with('=')
 }
 
 /// Returns the config text with `mailbox` appended as a new `[[mail.mailboxes]]`
@@ -597,7 +727,22 @@ role = \"owner\"
             allowed_cidrs: vec![],
             console: false,
             public_api_paths: vec![],
+            exposure: None,
+            owner: None,
+            relay: None,
         }
+    }
+
+    /// A site that relays the public auth paths, including `/api/pass/authorize`,
+    /// which every `people`- or `private`-gated site's sign-in depends on — see
+    /// `validate.rs`'s whole-config check. Tests that set a gated `exposure` need
+    /// one of these present, exactly as a real deployment would need its own auth
+    /// site configured, or validation (which every one of these edit functions runs
+    /// before returning) refuses the result.
+    fn auth_site() -> Site {
+        let mut site = static_site("auth", "auth.example.com");
+        site.public_api_paths = crate::PUBLIC_AUTH_PATHS.iter().map(|s| (*s).to_string()).collect();
+        site
     }
 
     #[test]
@@ -1106,5 +1251,116 @@ domains = [\"example.com\", \"lab.example.com\"]
             original_mail, after_remove_mail,
             "remove_site must preserve [mail] section exactly"
         );
+    }
+
+    #[test]
+    fn set_exposure_writes_a_fresh_line_when_the_site_has_none() {
+        let text = add_site(EMPTY, &static_site("blog", "blog.example.com")).unwrap();
+        let text = add_site(&text, &auth_site()).unwrap();
+        let updated = set_exposure(&text, "blog", Some(crate::Exposure::People)).unwrap().unwrap();
+        let config = Config::parse(&updated).unwrap();
+        assert_eq!(config.sites[0].exposure, Some(crate::Exposure::People));
+        assert!(updated.contains("exposure = \"people\""), "{updated}");
+    }
+
+    #[test]
+    fn set_exposure_replaces_an_existing_line_in_place() {
+        let mut site = static_site("blog", "blog.example.com");
+        site.exposure = Some(crate::Exposure::Public);
+        let text = add_site(EMPTY, &site).unwrap();
+        let text = add_site(&text, &auth_site()).unwrap();
+        let updated = set_exposure(&text, "blog", Some(crate::Exposure::People)).unwrap().unwrap();
+        let config = Config::parse(&updated).unwrap();
+        assert_eq!(config.sites[0].exposure, Some(crate::Exposure::People));
+        // One line, not two: the old value was replaced, not left beside the new one.
+        assert_eq!(updated.matches("exposure =").count(), 1, "{updated}");
+    }
+
+    #[test]
+    fn set_exposure_none_clears_the_line_entirely() {
+        let mut site = static_site("blog", "blog.example.com");
+        site.exposure = Some(crate::Exposure::Public);
+        let text = add_site(EMPTY, &site).unwrap();
+        let updated = set_exposure(&text, "blog", None).unwrap().unwrap();
+        let config = Config::parse(&updated).unwrap();
+        assert_eq!(config.sites[0].exposure, None);
+        assert!(!updated.contains("exposure ="), "{updated}");
+    }
+
+    #[test]
+    fn set_exposure_on_an_unknown_site_answers_none() {
+        let text = add_site(EMPTY, &static_site("blog", "blog.example.com")).unwrap();
+        assert_eq!(set_exposure(&text, "nonesuch", Some(crate::Exposure::Public)).unwrap(), None);
+    }
+
+    #[test]
+    fn set_owner_writes_reads_and_clears_the_same_way() {
+        let text = add_site(EMPTY, &static_site("blog", "blog.example.com")).unwrap();
+        let with_owner = set_owner(&text, "blog", Some("carol")).unwrap().unwrap();
+        assert_eq!(Config::parse(&with_owner).unwrap().sites[0].owner.as_ref().map(|o| o.as_str()), Some("carol"));
+
+        let reassigned = set_owner(&with_owner, "blog", Some("dave")).unwrap().unwrap();
+        assert_eq!(Config::parse(&reassigned).unwrap().sites[0].owner.as_ref().map(|o| o.as_str()), Some("dave"));
+        assert_eq!(reassigned.matches("owner =").count(), 1, "{reassigned}");
+
+        let cleared = set_owner(&reassigned, "blog", None).unwrap().unwrap();
+        assert_eq!(Config::parse(&cleared).unwrap().sites[0].owner, None);
+    }
+
+    #[test]
+    fn set_owner_preserves_sibling_sites_and_sub_tables() {
+        // The auth site has to exist before blog is gated, or `add_site` refuses the
+        // gated site outright — see `auth_site`'s documentation.
+        let with_auth = add_site(EMPTY, &auth_site()).unwrap();
+        let mut first = static_site("blog", "blog.example.com");
+        first.exposure = Some(crate::Exposure::People);
+        let with_first = add_site(&with_auth, &first).unwrap();
+        let with_second = add_site(&with_first, &static_site("shop", "shop.example.com")).unwrap();
+
+        let updated = set_owner(&with_second, "shop", Some("erin")).unwrap().unwrap();
+        let config = Config::parse(&updated).unwrap();
+        assert_eq!(config.sites.len(), 3);
+        // The untouched site keeps every field it had, including one set earlier
+        // by this same family of function.
+        assert_eq!(config.sites[1].exposure, Some(crate::Exposure::People));
+        assert_eq!(config.sites[1].owner, None);
+        assert_eq!(config.sites[2].owner.as_ref().map(|o| o.as_str()), Some("erin"));
+    }
+
+    #[test]
+    fn a_console_site_rejects_an_exposure_but_still_takes_an_owner() {
+        // `set_exposure`/`set_owner` are pure text edits with no notion of the
+        // console *by themselves*; the refusal to touch the console at all lives
+        // one layer up, in `crates/app/admin/src/site_api.rs::refuse_if_console`,
+        // which must run before either of these is ever called for real. But
+        // `set_exposure` still validates the whole document afterward, and the
+        // schema itself refuses any exposure on a console site — so even without
+        // that outer guard, the worst this function can do is answer an error,
+        // never silently write an inconsistent config. `set_owner` carries no such
+        // restriction and round-trips normally.
+        let text = "\
+version = 1
+
+[server]
+acme_email = \"a@b.com\"
+acme = \"self-signed\"
+
+[[nodes]]
+name = \"home\"
+role = \"owner\"
+
+[[sites]]
+name = \"console\"
+domains = [\"admin.example.com\"]
+static_root = \"./sites/console\"
+console = true
+allowed_cidrs = [\"127.0.0.1/32\"]
+";
+        assert!(set_exposure(text, "console", Some(crate::Exposure::Private)).is_err());
+
+        let updated = set_owner(text, "console", Some("alex")).unwrap().unwrap();
+        let config = Config::parse(&updated).unwrap();
+        assert!(config.sites[0].console);
+        assert_eq!(config.sites[0].owner.as_ref().map(|o| o.as_str()), Some("alex"));
     }
 }

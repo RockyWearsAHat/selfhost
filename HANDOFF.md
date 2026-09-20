@@ -16,12 +16,13 @@ unrestricted, load balanced.
 > **Start at `index.dx`.** It routes, and it *computes* its own answers about
 > which crates make up which binary. Then:
 >
-> - `docs/status.dx` — where the project stands, what blocks publishing, what to
->   build next. **Read this before choosing work.**
+> - `index.dx` itself — where the project stands, the design, the words, the
+>   rules, the gaps and the goals in order. **Read this before choosing work.**
 > - `docs/principles.dx` — how to work here: the layering law (with a runnable
 >   check), what travels with the repository and what does not, and how to move a
 >   dx document without destroying it.
-> - `docs/architecture.dx` — the platform in one page (was `selfhost.dx`).
+> - `docs/labs/redesign-history.dx` — the round-by-round record of what changed
+>   and why (was `docs/architecture.dx`, folded and deleted 2026-09-19).
 > - `docs/surfaces.dx` — every socket, path and credential.
 > - `docs/labs/` — one runnable document per subsystem, verdicts recorded.
 > - `docs/SECURITY.md` — read before writing anything networked.

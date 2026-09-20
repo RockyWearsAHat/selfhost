@@ -40,6 +40,7 @@
 //! and because that is destructive it is confirmed on the terminal (or with
 //! `--yes`) and refused outright for any directory outside the project.
 
+use crate::arguments::value_of;
 use selfhost_config::{Config, Health, Instance, Site};
 use std::path::{Path, PathBuf};
 
@@ -261,6 +262,9 @@ fn add(arguments: &[String], config_path: &Path) -> Result<(), String> {
         allowed_cidrs: vec![],
         console: false,
         public_api_paths,
+        exposure: None,
+        owner: None,
+        relay: None,
     };
 
     let source = read_source(config_path)?;
@@ -499,15 +503,6 @@ fn flag(arguments: &[String], name: &str) -> bool {
     arguments.iter().any(|argument| argument == name)
 }
 
-/// The value immediately following the first occurrence of `name`.
-fn value_of(arguments: &[String], name: &str) -> Option<String> {
-    arguments
-        .iter()
-        .position(|argument| argument == name)
-        .and_then(|at| arguments.get(at + 1))
-        .cloned()
-}
-
 /// Every value given for a repeatable option.
 fn values_of(arguments: &[String], name: &str) -> Vec<String> {
     let mut values = Vec::new();
@@ -609,6 +604,9 @@ mod tests {
             allowed_cidrs: vec![],
             console: false,
             public_api_paths: vec![],
+            exposure: None,
+            owner: None,
+            relay: None,
         };
         assert_eq!(kind_of(&site), "static");
 
@@ -660,12 +658,14 @@ role = \"owner\"
             "/api/session",
             "--public-api-path",
             "/api/vpn/authorize",
+            "--public-api-path",
+            "/api/pass/authorize",
         ]);
         add(&a, &path).expect("a public-api-path site is accepted");
 
         let config = load(&path).expect("the written config still parses");
         let site = config.sites.iter().find(|s| s.name == "auth").expect("the site was added");
-        assert_eq!(site.public_api_paths, vec!["/api/session", "/api/vpn/authorize"]);
+        assert_eq!(site.public_api_paths, selfhost_config::PUBLIC_AUTH_PATHS.iter().map(|s| s.to_string()).collect::<Vec<_>>());
         assert!(site.allowed_cidrs.is_empty(), "a public gateway must not be network-gated");
 
         let _ = std::fs::remove_file(&path);

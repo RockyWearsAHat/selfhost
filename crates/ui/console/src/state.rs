@@ -87,6 +87,40 @@ pub struct Notice {
     pub kind: NoticeKind,
 }
 
+/// One part `GET /api/system` reported — see `crates/app/admin/src/lib.rs`'s
+/// `system_health`, which this reads.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SystemPart {
+    /// Its name, as the daemon names it (`proxy`, `admin-api`, `vpn-home`, …).
+    pub name: String,
+    /// Its state, in the daemon's own word (`running`, `stopped`, `configured`, …).
+    pub state: String,
+    /// Why it is unhealthy, in a sentence a person can act on — `None` when it is not.
+    pub reason: Option<String>,
+}
+
+impl SystemPart {
+    /// Reads the array `{"system": [...]}` answers with, skipping any entry
+    /// that is not shaped as expected rather than failing the whole poll over
+    /// it — the same tolerance [`selfhost_firewall::FirewallState::from_json`]
+    /// gives a malformed rule.
+    pub fn list_from_json(value: &Json) -> Option<Vec<Self>> {
+        let entries = value.get("system")?.as_array()?;
+        Some(
+            entries
+                .iter()
+                .filter_map(|entry| {
+                    Some(Self {
+                        name: entry.get("name")?.as_str()?.to_owned(),
+                        state: entry.get("state")?.as_str()?.to_owned(),
+                        reason: entry.get("reason").and_then(Json::as_str).map(str::to_owned),
+                    })
+                })
+                .collect(),
+        )
+    }
+}
+
 /// One captured line of a service's output.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LogLine {
@@ -317,11 +351,13 @@ pub enum Screen {
     Desktop,
     /// The identity registry and the audit tail.
     People,
+    /// The site roster with exposure and access configuration.
+    Sites,
 }
 
 impl Screen {
     /// The screens, in the order the tabs draw them.
-    pub const ALL: [Screen; 4] = [Self::Services, Self::Files, Self::Desktop, Self::People];
+    pub const ALL: [Screen; 5] = [Self::Services, Self::Files, Self::Desktop, Self::People, Self::Sites];
 
     /// The word on the tab.
     pub fn label(self) -> &'static str {
@@ -330,6 +366,7 @@ impl Screen {
             Self::Files => "FILES",
             Self::Desktop => "DESKTOP",
             Self::People => "PEOPLE",
+            Self::Sites => "SITES",
         }
     }
 
@@ -455,6 +492,9 @@ impl Viewer {
             // The roster and the audit trail are both owner-only routes, so for
             // anybody else this screen is two refusals and nothing else.
             Screen::People => false,
+            // Sites management is owner-only; site.admin does not open this screen
+            // because the page lists all sites and permissions are global.
+            Screen::Sites => false,
         }
     }
 }
@@ -578,7 +618,16 @@ impl Desk {
     }
 }
 
-/// Who holds authority on this box, and what it has been used for.
+/// The Sites plate: every web domain and its configuration.
+#[derive(Debug, Clone, Default)]
+pub struct Sites {
+    /// Every site configured on this deployment, or `None` until first fetched.
+    pub sites: Option<Vec<crate::view::sites::Site>>,
+    /// Why the site roster could not be read — on a deployment where this
+    /// console's credential is not the owner.
+    pub trouble: Option<String>,
+}
+
 #[derive(Debug, Default)]
 pub struct People {
     /// Everyone who holds a credential, or `None` until first fetched.
@@ -691,12 +740,22 @@ pub struct Snapshot {
     /// polled yet" from "the daemon reports no managed firewall" and draw neither
     /// as the other.
     pub firewall: Option<FirewallState>,
+    /// The daemon's own internal parts — proxy, admin API, VPN relays, the VPN
+    /// updater, reports, mail — or `None` until first fetched.
+    ///
+    /// Held as an option for the same reason [`Snapshot::firewall`] is: "not
+    /// polled yet" and "the daemon reports none" must not draw the same as
+    /// each other. Never the hosted [`Snapshot::services`] list — see `is_system`
+    /// in `crates/app/admin/src/lib.rs`, which this mirrors.
+    pub system: Option<Vec<SystemPart>>,
     /// Which screen is open, and so what the poller fetches.
     pub screen: Screen,
     /// Where the FILES plate is looking, and what it found.
     pub files: Files,
     /// What the DESKTOP plate knows about the deployment and the fleet.
     pub desk: Desk,
+    /// The configured sites and their access settings.
+    pub sites: Sites,
     /// Who holds authority here, and what it has been used for.
     pub people: People,
     /// Commands the interface has asked for and the poller has not run yet.
@@ -1025,5 +1084,34 @@ mod tests {
         // A body this console cannot read leaves it drawing everything, rather
         // than hiding screens the person may in fact use.
         assert!(Viewer::from_json(&selfhost_json::parse(r#"{"name":"mom"}"#).unwrap()).is_none());
+    }
+
+    #[test]
+    fn system_parts_are_read_with_their_reason_when_unhealthy() {
+        let value = selfhost_json::parse(
+            r#"{"system":[
+                {"name":"proxy","state":"running","reason":null},
+                {"name":"vpn-home","state":"stopped","reason":"exited: no such certificate"},
+                {"name":"mail","state":"not configured","reason":null}
+            ]}"#,
+        )
+        .expect("legal JSON");
+        let parts = SystemPart::list_from_json(&value).expect("a system array");
+        assert_eq!(parts.len(), 3);
+        assert_eq!(parts[0], SystemPart { name: "proxy".into(), state: "running".into(), reason: None });
+        assert_eq!(
+            parts[1],
+            SystemPart {
+                name: "vpn-home".into(),
+                state: "stopped".into(),
+                reason: Some("exited: no such certificate".into()),
+            }
+        );
+        assert_eq!(parts[2].state, "not configured");
+    }
+
+    #[test]
+    fn a_body_with_no_system_array_reads_as_nothing_rather_than_an_empty_list() {
+        assert!(SystemPart::list_from_json(&selfhost_json::parse(r#"{}"#).unwrap()).is_none());
     }
 }

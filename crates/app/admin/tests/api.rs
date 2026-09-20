@@ -558,6 +558,131 @@ async fn deploying_a_watched_service_is_accepted() {
     assert_eq!(body.get("service").and_then(Json::as_str), Some("site"));
 }
 
+// ---- Deploy records ---------------------------------------------------------
+
+#[tokio::test]
+async fn an_api_with_no_deploy_store_lists_no_deploys() {
+    // `with_deploys` is optional — a daemon that has not wired one (there is
+    // none in practice, but the field is `Option` so the route must not panic)
+    // answers an empty list rather than failing.
+    let (api, _dir) = api("deploys-unwired");
+    let (status, body) = send(&api, "GET", "/api/deploys", "").await;
+    assert_eq!(status, 200);
+    assert_eq!(body.get("deploys").and_then(Json::as_array).map(<[Json]>::len), Some(0));
+}
+
+#[tokio::test]
+async fn an_unknown_deploy_id_is_a_404() {
+    let (api, dir) = api("deploy-unknown");
+    let api = api.with_deploys(std::sync::Arc::new(selfhost_admin::deploys::Deploys::in_dir(dir.path())));
+
+    let (status, body) = send(&api, "GET", "/api/deploys/no-such-id", "").await;
+    assert_eq!(status, 404);
+    assert!(body.get("error").is_some());
+}
+
+#[tokio::test]
+async fn deploying_a_watched_service_records_a_deploy_reachable_by_id() {
+    let (api, dir) = api("deploy-recorded");
+    let api = api.with_deploys(std::sync::Arc::new(selfhost_admin::deploys::Deploys::in_dir(dir.path())));
+    send(&api, "PUT", "/api/services/site", &watched_body("site")).await;
+
+    let (status, body) = send(&api, "POST", "/api/services/site/deploy", "").await;
+    assert_eq!(status, 202);
+    let id = body.get("deploy").and_then(Json::as_str).expect("a deploy id in the 202 body").to_owned();
+
+    let (_, listed) = send(&api, "GET", "/api/deploys", "").await;
+    let deploys = listed.get("deploys").and_then(Json::as_array).expect("an array");
+    assert_eq!(deploys.len(), 1);
+    assert_eq!(deploys[0].get("id").and_then(Json::as_str), Some(id.as_str()));
+    assert_eq!(deploys[0].get("target").and_then(Json::as_str), Some("site"));
+    // A call through the CLI/admin route, not the webhook relay's own marker.
+    assert_eq!(deploys[0].get("trigger").and_then(Json::as_str), Some("api"));
+
+    let (status, shown) = send(&api, "GET", &format!("/api/deploys/{id}"), "").await;
+    assert_eq!(status, 200);
+    assert_eq!(shown.get("id").and_then(Json::as_str), Some(id.as_str()));
+
+    api.supervisor().shutdown().await;
+}
+
+#[tokio::test]
+async fn a_webhook_relayed_deploy_is_recorded_with_the_webhook_trigger() {
+    // `?via=webhook` is the marker `relay_deploy` (in the proxy) appends to its
+    // own call — see `crates/app/proxy/src/server.rs`. This proves the admin
+    // side of that contract: the query parameter, not the caller's identity,
+    // decides the recorded `Trigger`.
+    let (api, dir) = api("deploy-webhook-trigger");
+    let api = api.with_deploys(std::sync::Arc::new(selfhost_admin::deploys::Deploys::in_dir(dir.path())));
+    send(&api, "PUT", "/api/services/site", &watched_body("site")).await;
+
+    let (status, _) = send(&api, "POST", "/api/services/site/deploy?via=webhook", "").await;
+    assert_eq!(status, 202);
+
+    let (_, listed) = send(&api, "GET", "/api/deploys", "").await;
+    let deploys = listed.get("deploys").and_then(Json::as_array).expect("an array");
+    assert_eq!(deploys[0].get("trigger").and_then(Json::as_str), Some("webhook"));
+
+    api.supervisor().shutdown().await;
+}
+
+// ---- System vs Service --------------------------------------------------
+
+#[tokio::test]
+async fn system_parts_are_never_listed_among_hosted_services() {
+    let (api, _dir) = api("system-hidden-from-services");
+    api.supervisor().install(selfhost_supervisor::scripted_service("vpn-home", "true")).await;
+    api.supervisor().install(selfhost_supervisor::scripted_service("reports", "true")).await;
+    send(&api, "PUT", "/api/services/site", &watched_body("site")).await;
+
+    let (status, body) = send(&api, "GET", "/api/services", "").await;
+    assert_eq!(status, 200);
+    let names: Vec<&str> = body
+        .get("services")
+        .and_then(Json::as_array)
+        .expect("an array")
+        .iter()
+        .filter_map(|entry| entry.get("name").and_then(Json::as_str))
+        .collect();
+    assert_eq!(names, vec!["site"], "System parts must never appear in the hosted Services list");
+
+    api.supervisor().shutdown().await;
+}
+
+#[tokio::test]
+async fn system_health_lists_every_system_part_with_state() {
+    let (api, _dir) = api("system-health");
+    api.supervisor().install(selfhost_supervisor::scripted_service("vpn-home", "true")).await;
+    api.supervisor().install(selfhost_supervisor::scripted_service("reports", "true")).await;
+    let api = api.with_mail_configured(true);
+
+    let (status, body) = send(&api, "GET", "/api/system", "").await;
+    assert_eq!(status, 200);
+    let names: Vec<&str> = body
+        .get("system")
+        .and_then(Json::as_array)
+        .expect("an array")
+        .iter()
+        .filter_map(|entry| entry.get("name").and_then(Json::as_str))
+        .collect();
+    assert!(names.contains(&"admin-api"), "{names:?}");
+    assert!(names.contains(&"proxy"), "{names:?}");
+    assert!(names.contains(&"vpn-home"), "{names:?}");
+    assert!(names.contains(&"reports"), "{names:?}");
+    assert!(names.contains(&"mail"), "{names:?}");
+
+    api.supervisor().shutdown().await;
+}
+
+#[tokio::test]
+async fn mail_is_reported_unconfigured_when_the_daemon_has_no_mail_section() {
+    let (api, _dir) = api("system-no-mail");
+    let (_, body) = send(&api, "GET", "/api/system", "").await;
+    let system = body.get("system").and_then(Json::as_array).expect("an array");
+    let mail = system.iter().find(|entry| entry.get("name").and_then(Json::as_str) == Some("mail")).expect("a mail entry");
+    assert_eq!(mail.get("state").and_then(Json::as_str), Some("not configured"));
+}
+
 // ---- cookie-session authentication -----------------------------------------
 
 #[tokio::test]
@@ -3638,7 +3763,7 @@ fn site_admin_api(name: &str) -> (Api, ScratchDir, std::path::PathBuf) {
     let (api, dir) = api(name);
     let config_path = dir.path().join("selfhost.config.toml");
     std::fs::write(&config_path, MINIMAL_CONFIG).expect("writes a starter config");
-    let api = api.with_agents(dir.path()).with_site_admin(config_path.clone(), dir.path().to_path_buf());
+    let api = api.with_people(People::load(dir.path())).with_agents(dir.path()).with_site_admin(config_path.clone(), dir.path().to_path_buf());
     (api, dir, config_path)
 }
 
@@ -3651,7 +3776,11 @@ fn mint_agent(
     let store = selfhost_admin::agent_store::AgentStore::in_dir(dir);
     let agent_name = selfhost_identity::AgentName::parse(name).expect("a valid agent name");
     let grants = selfhost_identity::Grants::new(capabilities).expect("under the grant cap");
-    store.mint(&agent_name, grants).expect("mints").as_str().to_owned()
+    // An Agent holds nothing its Person does not, so each gets a registered
+    // Person of the same name holding exactly the same Grants.
+    let person = selfhost_identity::PersonName::parse(name).expect("a valid person name");
+    People::load(dir).set_grants(&person, grants.clone()).expect("registers the person");
+    store.mint(&agent_name, grants, &person).expect("mints").as_str().to_owned()
 }
 
 /// The console site is not administrable through this API, by anybody.

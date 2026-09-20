@@ -47,6 +47,7 @@
 //! consistent with this project's posture in `docs/SECURITY.md` of making
 //! trust boundaries explicit rather than automatic.
 
+use crate::arguments::value_of;
 use selfhost_app_deploy::AppSpec;
 use selfhost_config::{Config, RepoManifest};
 use selfhost_github_app::{InstallationState, Store, TrackedRepo};
@@ -657,11 +658,6 @@ fn find_config_path() -> Option<std::path::PathBuf> {
 }
 
 // --- small argument helpers, matching `site.rs`'s conventions ---
-
-/// The value immediately following the first occurrence of `name`.
-fn value_of(arguments: &[String], name: &str) -> Option<String> {
-    arguments.iter().position(|argument| argument == name).and_then(|at| arguments.get(at + 1)).cloned()
-}
 
 /// Every value given for a repeatable option.
 fn values_of(arguments: &[String], name: &str) -> Vec<String> {

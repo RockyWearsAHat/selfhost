@@ -36,14 +36,14 @@
 //! - [`clock`] — the two time formats the others write.
 //! - [`accounts`] — who filed a report and how they prove it later: email/password, an optional
 //!   passkey, an optional linked OAuth identity, all additive to the anonymous door above.
-//! - [`ownership`] — which account owns a service, the reader token scoped to that one
+//! - [`ownership`] — which report filer owns a service, the reader token scoped to that one
 //!   service, and what a plan's caps let it hold — the layer that makes the intake meterable.
-//! - [`sessions`] — the cookie that keeps an account signed in across visits.
-//! - [`webauthn`] — passkey registration and login for an account, mirrored from
+//! - [`sessions`] — the cookie that keeps a report filer signed in across visits.
+//! - [`webauthn`] — passkey registration and login for a report filer, mirrored from
 //!   `crates/admin/src/webauthn.rs`.
 //! - [`oauth`] — "sign in with…" against a configured provider, PKCE-protected, with its own
 //!   hand-rolled outbound HTTPS client mirrored from `crates/acme/src/transport.rs`.
-//! - [`verify`] — confirming an account's email is reachable, and spooling that message into
+//! - [`verify`] — confirming a report filer's email is reachable, and spooling that message into
 //!   this box's own outbound mail queue.
 //!
 //! # What this crate never does
@@ -71,7 +71,7 @@ pub mod store;
 pub mod verify;
 pub mod webauthn;
 
-pub use accounts::{Account, Accounts};
+pub use accounts::{ReportFiler, ReportFilers};
 pub use limit::{Limiter, Rate};
 pub use notify::Mailbox;
 pub use ownership::{Caps, Owned, Owners, Plan};

@@ -238,6 +238,25 @@ impl People {
         self.lock().entries.iter().find(|entry| &entry.name == name).cloned()
     }
 
+    /// Every registered Person who holds the owner grant, in registry order.
+    ///
+    /// Several owners are allowed at once — this is the list [`Self::set_grants`]
+    /// and [`Self::remove`] both consult to refuse taking the last one away.
+    pub fn owners(&self) -> Vec<Person> {
+        self.lock().entries.iter().filter(|entry| entry.grants.holds(&Capability::Owner)).cloned().collect()
+    }
+
+    /// Whether any Person holds the owner grant.
+    ///
+    /// The refusal `selfhost init-owner` needs before it writes anything: an
+    /// owner already exists, so what is wanted is a second owner
+    /// (`selfhost people grant <name> owner`, run by one of the existing ones),
+    /// not a fresh bootstrap. A thin wrapper over [`Self::owners`] rather than a
+    /// second scan, so the two can never disagree about who counts.
+    pub fn any_owner(&self) -> bool {
+        !self.owners().is_empty()
+    }
+
     /// The entry whose login email is `email`, if one has it set.
     ///
     /// This is the lookup a person-password login runs before it ever touches
@@ -333,8 +352,27 @@ impl People {
     /// spelling in every casing — so there is no entry here that could revoke
     /// the operator's own authority, and no need for this method to defend
     /// against one.
+    ///
+    /// It does defend against a narrower thing: demoting the **last** Person
+    /// who holds [`Capability::Owner`]. Several owners are allowed, and any of
+    /// them may demote any other, but the set may never be emptied through
+    /// this door — a deployment with no owner at all is recovered through
+    /// `selfhost init-owner`, which calls this same method to create the first
+    /// one directly against this registry when [`Self::any_owner`] answers
+    /// `false`, not through any exemption written into this method.
     pub fn set_grants(&self, name: &PersonName, grants: Grants) -> io::Result<()> {
         let mut state = self.lock();
+        let was_the_only_owner = state
+            .entries
+            .iter()
+            .find(|entry| &entry.name == name)
+            .is_some_and(|entry| entry.grants.holds(&Capability::Owner))
+            && state.entries.iter().filter(|entry| entry.grants.holds(&Capability::Owner)).count() == 1;
+        if was_the_only_owner && !grants.holds(&Capability::Owner) {
+            return Err(io::Error::other(format!(
+                "{name} is the last owner; grant owner to another Person first"
+            )));
+        }
         match state.entries.iter_mut().find(|entry| &entry.name == name) {
             Some(entry) => entry.grants = grants,
             None => {
@@ -362,8 +400,20 @@ impl People {
     /// leave the person holding nothing — but it is the honest one when the
     /// operator means "this person is gone", because an entry with no grants
     /// still renders as a row in the console.
+    ///
+    /// Refuses to remove the last remaining owner, for the same reason
+    /// [`Self::set_grants`] refuses to demote them.
     pub fn remove(&self, name: &PersonName) -> io::Result<bool> {
         let mut state = self.lock();
+        let is_the_only_owner = state
+            .entries
+            .iter()
+            .find(|entry| &entry.name == name)
+            .is_some_and(|entry| entry.grants.holds(&Capability::Owner))
+            && state.entries.iter().filter(|entry| entry.grants.holds(&Capability::Owner)).count() == 1;
+        if is_the_only_owner {
+            return Err(io::Error::other(format!("{name} is the last owner and cannot be removed")));
+        }
         let before = state.entries.len();
         state.entries.retain(|entry| &entry.name != name);
         if state.entries.len() == before {
@@ -862,6 +912,71 @@ mod tests {
         // as an entry with nothing in it.
         let stranger = people.caller(Identity::Person(person("Nobody")), Credential::Passkey);
         assert!(stranger.grants().is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn owner_grants() -> Grants {
+        Grants::new([Capability::Owner]).unwrap()
+    }
+
+    #[test]
+    fn owners_reports_who_holds_the_grant() {
+        let dir = scratch("owners-list");
+        let people = People::load(&dir);
+        assert!(people.owners().is_empty(), "a fresh registry has no owner");
+        assert!(!people.any_owner());
+
+        people.set_grants(&person("Mom"), read_grants()).unwrap();
+        assert!(people.owners().is_empty(), "an ordinary grant is not the owner grant");
+        assert!(!people.any_owner());
+
+        people.set_grants(&person("Dad"), owner_grants()).unwrap();
+        assert_eq!(people.owners().into_iter().map(|p| p.name).collect::<Vec<_>>(), vec![person("Dad")]);
+        assert!(people.any_owner());
+
+        // Several owners are allowed at once.
+        people.set_grants(&person("Mom"), owner_grants()).unwrap();
+        let mut names: Vec<_> = people.owners().into_iter().map(|p| p.name).collect();
+        names.sort();
+        assert_eq!(names, vec![person("Dad"), person("Mom")]);
+        assert!(people.any_owner());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_last_owner_cannot_be_demoted_or_removed() {
+        let dir = scratch("last-owner");
+        let people = People::load(&dir);
+        people.set_grants(&person("Dad"), owner_grants()).unwrap();
+
+        // Demoting the only owner is refused.
+        assert!(
+            people.set_grants(&person("Dad"), Grants::none()).is_err(),
+            "the last owner must not be demoted"
+        );
+        assert!(people.grants_for(&Identity::Person(person("Dad"))).holds(&Capability::Owner));
+
+        // Removing the only owner is refused the same way.
+        assert!(people.remove(&person("Dad")).is_err(), "the last owner must not be removed");
+        assert!(people.find(&person("Dad")).is_some());
+
+        // Once a second owner exists, the first may be demoted.
+        people.set_grants(&person("Mom"), owner_grants()).unwrap();
+        people.set_grants(&person("Dad"), Grants::none()).expect("no longer the last owner");
+        assert!(!people.grants_for(&Identity::Person(person("Dad"))).holds(&Capability::Owner));
+        assert!(!people.owners().is_empty(), "Mom is still an owner");
+
+        // That demotion leaves Mom as the sole owner again, so she cannot be
+        // removed either — the rule is about the *set* of owners, not any
+        // one person, and applies again as soon as it is down to one.
+        assert!(people.remove(&person("Mom")).is_err(), "Mom is the last owner again");
+        assert!(!people.owners().is_empty(), "the refused removal must not have taken Mom out");
+
+        // With two owners at once, either may be removed.
+        people.set_grants(&person("Dad"), owner_grants()).unwrap();
+        assert!(people.remove(&person("Mom")).expect("Dad still holds owner, so Mom is not last"));
+        assert!(!people.grants_for(&Identity::Person(person("Mom"))).holds(&Capability::Owner));
+        assert!(!people.owners().is_empty(), "Dad is still an owner");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

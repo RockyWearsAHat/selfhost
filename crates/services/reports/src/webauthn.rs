@@ -48,7 +48,7 @@ const MAX_CHALLENGES: usize = 4_096;
 pub const MAX_PASSKEYS: usize = 50_000;
 
 /// The most passkeys one account may register — several devices, never an unbounded number.
-pub const MAX_PASSKEYS_PER_ACCOUNT: usize = 10;
+pub const MAX_PASSKEYS_PER_FILER: usize = 10;
 
 /// The longest device label accepted.
 const MAX_LABEL_CHARS: usize = 64;
@@ -242,9 +242,9 @@ impl Passkeys {
             .iter()
             .filter(|entry| entry.account_id == passkey.account_id)
             .count();
-        if held_by_account >= MAX_PASSKEYS_PER_ACCOUNT {
+        if held_by_account >= MAX_PASSKEYS_PER_FILER {
             return Err(io::Error::other(format!(
-                "an account may register at most {MAX_PASSKEYS_PER_ACCOUNT} passkeys"
+                "an account may register at most {MAX_PASSKEYS_PER_FILER} passkeys"
             )));
         }
         if entries.len() >= MAX_PASSKEYS {
@@ -1133,7 +1133,7 @@ mod tests {
     fn a_per_account_cap_stops_a_registration_loop() {
         let dir = scratch("per-account-cap");
         let webauthn = webauthn(&dir);
-        for nth in 0..MAX_PASSKEYS_PER_ACCOUNT {
+        for nth in 0..MAX_PASSKEYS_PER_FILER {
             let device = Authenticator::new(&format!("credential-{nth}"));
             webauthn
                 .register("acct-1", &device.register_body(&webauthn, "device"))

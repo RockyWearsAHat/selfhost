@@ -58,11 +58,13 @@
 mod desktop;
 mod detail;
 mod exposure;
+mod system;
 pub(crate) mod files;
 mod install;
 mod lock;
 mod machines;
 mod people;
+pub mod sites;
 mod style;
 
 use crate::channel::{Live, Session};
@@ -1104,7 +1106,7 @@ pub fn view(console: &Console) -> El<Console> {
         snapshot.notice.clone().map(notice),
         match screen {
             Screen::Services => services(console, &snapshot),
-            // The three new screens are drawn from the console rather than from
+            // The new screens are drawn from the console rather than from
             // this borrow of the snapshot, so each takes its own: a plate that
             // needs the session as well as the snapshot cannot be handed a
             // guard this function is still holding.
@@ -1119,6 +1121,10 @@ pub fn view(console: &Console) -> El<Console> {
             Screen::People => {
                 drop(snapshot);
                 people::view(console)
+            }
+            Screen::Sites => {
+                drop(snapshot);
+                sites::view(console)
             }
         },
     ))
@@ -1163,6 +1169,10 @@ fn services(console: &Console, snapshot: &Snapshot) -> El<Console> {
         // and only when the firewall is managed — it returns `None` otherwise, so
         // on the common unmanaged deployment it costs the log below it nothing.
         exposure::view(snapshot.firewall.as_ref()),
+        // The SYSTEM panel: the daemon's own internal parts, drawn the same
+        // way and in the same slot — a full-width strip that costs nothing
+        // before it has anything to say. See `system::view`.
+        system::view(snapshot.system.as_deref()),
         row((rail(snapshot), pane(console, snapshot))).gap(8.0).grow(),
     ))
     .gap(8.0)

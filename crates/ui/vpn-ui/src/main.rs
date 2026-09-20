@@ -18,6 +18,7 @@ mod actions;
 mod app;
 mod dns;
 mod hero;
+mod hostname;
 mod hud;
 mod keys;
 #[cfg(target_os = "macos")]

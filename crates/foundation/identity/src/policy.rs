@@ -273,6 +273,23 @@ impl Grants {
         self.0.iter().any(|held| satisfies(held, want))
     }
 
+    /// The part of this set that `ceiling` also holds.
+    ///
+    /// This is how an Agent is confined to its Person: the Agent's stored
+    /// Grants are narrowed to what the Person holds *now*, on every request, so
+    /// a Grant taken from the Person is taken from every Agent acting for them
+    /// in the same moment. "Holds" is [`Grants::holds`], implications included
+    /// — a Person with `files.admin` covers an Agent's `files.read:<share>`.
+    pub fn within(&self, ceiling: &Grants) -> Grants {
+        Self(self.0.iter().filter(|capability| ceiling.holds(capability)).cloned().collect())
+    }
+
+    /// The capabilities here that `ceiling` does not hold — what a mint must
+    /// refuse, named so the refusal can say which words were too much.
+    pub fn beyond(&self, ceiling: &Grants) -> Vec<Capability> {
+        self.0.iter().filter(|capability| !ceiling.holds(capability)).cloned().collect()
+    }
+
     /// The granted capabilities, in the order they were granted.
     pub fn iter(&self) -> impl Iterator<Item = &Capability> {
         self.0.iter()
@@ -306,6 +323,15 @@ fn satisfies(held: &Capability, want: &Capability) -> bool {
     if held == want {
         return true;
     }
+    // A held `Capability::Owner` satisfies any `want`: it is the deployment's
+    // full authority expressed as a grant rather than as an identity, so it
+    // must open exactly what `Identity::Owner`'s blanket allow in
+    // `Policy::decide` opens for the same caller. This is the one arm that
+    // makes "make owner a Grant held by an ordinary Person" true; every other
+    // arm below is a narrower, capability-specific implication.
+    if matches!(held, Capability::Owner) {
+        return true;
+    }
     match (held, want) {
         (
             Capability::FilesAdmin,
@@ -313,6 +339,7 @@ fn satisfies(held: &Capability, want: &Capability) -> bool {
         ) => true,
         (Capability::FilesWrite(held), Capability::FilesRead(want)) => held == want,
         (Capability::DesktopControl(held), Capability::DesktopView(want)) => held == want,
+        (Capability::SiteAdminOf(held), Capability::SiteAccess(want)) => held == want,
         _ => false,
     }
 }
@@ -730,10 +757,19 @@ fn the_machine_may(want: &Capability) -> bool {
         | Capability::SiteAdmin
         | Capability::DnsAdmin
         | Capability::MailAdmin
+        // A Site's Grants name the *people* let into it and the Person who
+        // decides that; the box's own automation token is neither.
+        | Capability::SiteAccess(_)
+        | Capability::SiteAdminOf(_)
         // A VPN location grant belongs to a *person* — it is what the
         // account-manager checks the tunnel's peer against, not something the
         // box's own automation token needs to assert about itself.
-        | Capability::VpnAccess(_) => false,
+        | Capability::VpnAccess(_)
+        // The deployment's full authority, expressed as a grant. A leaked
+        // bearer token must stay the fixed, explicit list above and never
+        // become an owner by holding this — the same reasoning that keeps it
+        // off every other `*Admin` capability, taken to its limit.
+        | Capability::Owner => false,
     }
 }
 
@@ -748,7 +784,7 @@ impl Default for Policy {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::capability::{NodeName, ShareId, VpnLocationId};
+    use crate::capability::{NodeName, ShareId, SiteName, VpnLocationId};
     use crate::credential::Opening;
     use crate::identity::{AgentName, PersonName};
     use std::time::{Duration, Instant};
@@ -783,6 +819,10 @@ mod tests {
         NodeName::parse("home").expect("a valid node name")
     }
 
+    fn site() -> SiteName {
+        SiteName::parse("blog").expect("a valid site name")
+    }
+
     fn location() -> VpnLocationId {
         VpnLocationId::parse("console").expect("a valid vpn location id")
     }
@@ -801,7 +841,7 @@ mod tests {
         vec![Identity::Owner, Identity::Machine, person(), agent()]
     }
 
-    /// The five capabilities the bearer token does not hold, written out here
+    /// The capabilities the bearer token does not hold, written out here
     /// rather than read off [`the_machine_may`] so the sweep is checking the
     /// model against a second statement of the rule and not against itself.
     fn withheld_from_the_machine(want: &Capability) -> bool {
@@ -812,7 +852,10 @@ mod tests {
                 | Capability::SiteAdmin
                 | Capability::DnsAdmin
                 | Capability::MailAdmin
+                | Capability::SiteAccess(_)
+                | Capability::SiteAdminOf(_)
                 | Capability::VpnAccess(_)
+                | Capability::Owner
         )
     }
 
@@ -827,7 +870,7 @@ mod tests {
             [Capability::SiteAdmin, Capability::DnsAdmin, Capability::MailAdmin];
         for held in &configuring {
             let grants = Grants::new([held.clone()]).expect("one grant");
-            for want in Capability::every_shape(&share(), &node(), &location()) {
+            for want in Capability::every_shape(&share(), &node(), &location(), &site()) {
                 assert_eq!(
                     grants.holds(&want),
                     *held == want,
@@ -898,7 +941,7 @@ mod tests {
         // Swept under both policies, because neither the arming switch nor the
         // passkey fact has anything to say about this credential.
         for policy in [Policy::locked_down(), Policy::new(true).with_passkey_enrolled(true)] {
-            for want in Capability::every_shape(&share(), &node(), &location()) {
+            for want in Capability::every_shape(&share(), &node(), &location(), &site()) {
                 let expected = if withheld_from_the_machine(&want) {
                     Decision::Refuse(Refusal::OutsideTheMachinesScope)
                 } else if want.drives_a_machine() && !policy.unattended_may_control() {
@@ -913,7 +956,7 @@ mod tests {
         }
         // A grant set cannot widen it: there is no registry entry for a token,
         // and a hand-edited one naming the machine must buy nothing.
-        let everything = Grants::new(Capability::every_shape(&share(), &node(), &location())).unwrap();
+        let everything = Grants::new(Capability::every_shape(&share(), &node(), &location(), &site())).unwrap();
         let forged = Caller::new(Identity::Machine, Credential::Bearer, everything);
         assert_eq!(
             Policy::new(true).decide(&forged, &Capability::SiteAdmin),
@@ -930,7 +973,7 @@ mod tests {
         let logged_in = Caller::new(Identity::Owner, session_of(Opening::Password), Grants::none());
         let fresh = Policy::locked_down();
         let enrolled = fresh.with_passkey_enrolled(true);
-        for want in Capability::every_shape(&share(), &node(), &location()) {
+        for want in Capability::every_shape(&share(), &node(), &location(), &site()) {
             // Everything, including the keyboard: a cookie is not unattended,
             // so how recently a person proved themselves is the freshness rule's
             // question and is answered at the ticket rather than here.
@@ -958,7 +1001,7 @@ mod tests {
         let enrolled = Policy::locked_down().with_passkey_enrolled(true);
         let by_passkey =
             Caller::new(Identity::Owner, session_of(Opening::Passkey), Grants::none());
-        for want in Capability::every_shape(&share(), &node(), &location()) {
+        for want in Capability::every_shape(&share(), &node(), &location(), &site()) {
             assert_eq!(enrolled.decide(&by_passkey, &want), Decision::Allow, "{want}");
             assert_eq!(
                 enrolled.decide(&Caller::passkey(Identity::Owner, Grants::none()), &want),
@@ -981,7 +1024,7 @@ mod tests {
         // Asymmetry two: the grant set is not consulted for the owner, so no
         // registry state can lock the operator out of their own console.
         let stripped = Caller::new(Identity::Owner, Credential::Passkey, Grants::none());
-        for want in Capability::every_shape(&share(), &node(), &location()) {
+        for want in Capability::every_shape(&share(), &node(), &location(), &site()) {
             assert_eq!(
                 Policy::locked_down().decide(&stripped, &want),
                 Decision::Allow,
@@ -1006,7 +1049,7 @@ mod tests {
             // whether or not the keyboard is armed. This rule is about the other
             // seven, and the two credentials answer identically across them.
             let machine = unattended.identity().is_machine();
-            for want in Capability::every_shape(&share(), &node(), &location()) {
+            for want in Capability::every_shape(&share(), &node(), &location(), &site()) {
                 if machine && withheld_from_the_machine(&want) {
                     continue;
                 }
@@ -1067,9 +1110,9 @@ mod tests {
         {
             // Even fully granted, and even with the bearer armed: the pair is
             // incoherent and the refusal comes first.
-            let grants = Grants::new(Capability::every_shape(&share(), &node(), &location())).unwrap();
+            let grants = Grants::new(Capability::every_shape(&share(), &node(), &location(), &site())).unwrap();
             let caller = Caller::new(person(), credential, grants);
-            for want in Capability::every_shape(&share(), &node(), &location()) {
+            for want in Capability::every_shape(&share(), &node(), &location(), &site()) {
                 assert_eq!(
                     Policy::new(true).decide(&caller, &want),
                     Decision::Refuse(Refusal::CredentialIsNotThisIdentitys),
@@ -1105,7 +1148,7 @@ mod tests {
     #[test]
     fn a_person_with_no_grants_is_refused_everything() {
         let caller = Caller::passkey(person(), Grants::none());
-        for want in Capability::every_shape(&share(), &node(), &location()) {
+        for want in Capability::every_shape(&share(), &node(), &location(), &site()) {
             assert_eq!(
                 Policy::new(true).decide(&caller, &want),
                 Decision::Refuse(Refusal::NotGranted),
@@ -1116,7 +1159,7 @@ mod tests {
 
     #[test]
     fn a_person_holds_exactly_what_they_were_granted_and_what_it_implies() {
-        let shapes = Capability::every_shape(&share(), &node(), &location());
+        let shapes = Capability::every_shape(&share(), &node(), &location(), &site());
         for granted in &shapes {
             let caller =
                 Caller::passkey(person(), Grants::new([granted.clone()]).expect("one grant"));
@@ -1141,7 +1184,7 @@ mod tests {
         // agent scoped to `site.admin` alone can do site things and nothing
         // else — not console reads, not service control, not another site's
         // capability by accident, and never the owner's blanket allow.
-        let shapes = Capability::every_shape(&share(), &node(), &location());
+        let shapes = Capability::every_shape(&share(), &node(), &location(), &site());
         for granted in &shapes {
             let scoped = Caller::agent(
                 AgentName::parse("claude-mac").unwrap(),
@@ -1195,7 +1238,19 @@ mod tests {
     }
 
     #[test]
-    fn the_three_implications_are_exactly_these_and_no_others() {
+    fn the_four_implications_are_exactly_these_and_no_others() {
+        let delegate = Grants::new([Capability::SiteAdminOf(site())]).unwrap();
+        let elsewhere = SiteName::parse("shop").unwrap();
+        assert!(delegate.holds(&Capability::SiteAccess(site())), "whoever decides who gets in, gets in");
+        assert!(!delegate.holds(&Capability::SiteAccess(elsewhere.clone())), "one site only");
+        assert!(!delegate.holds(&Capability::SiteAdminOf(elsewhere)), "one site only");
+        assert!(!delegate.holds(&Capability::SiteAdmin), "delegating access is not editing sites");
+        let sites = Grants::new([Capability::SiteAdmin]).unwrap();
+        assert!(!sites.holds(&Capability::SiteAdminOf(site())), "editing sites is not deciding who enters");
+        assert!(!sites.holds(&Capability::SiteAccess(site())));
+        let visitor = Grants::new([Capability::SiteAccess(site())]).unwrap();
+        assert!(!visitor.holds(&Capability::SiteAdminOf(site())), "entering is never deciding");
+
         let admin = Grants::new([Capability::FilesAdmin]).unwrap();
         assert!(admin.holds(&Capability::FilesRead(other_share())), "admin covers every share");
         assert!(admin.holds(&Capability::FilesWrite(other_share())));
@@ -1226,7 +1281,7 @@ mod tests {
         // The exhaustive sweep. It asserts the model against an independently
         // written expectation rather than against itself: if `decide` grows a
         // rule that this table does not describe, the sweep fails.
-        let shapes = Capability::every_shape(&share(), &node(), &location());
+        let shapes = Capability::every_shape(&share(), &node(), &location(), &site());
         let full = Grants::new(shapes.clone()).expect("every shape fits under the cap");
         let policies = [
             Policy::locked_down(),
@@ -1457,5 +1512,80 @@ mod tests {
             Decision::Refuse(Refusal::CredentialIsNotThisIdentitys),
             "there is one console password; a session it opened cannot name a person"
         );
+    }
+
+    #[test]
+    fn grants_are_narrowed_to_a_ceiling_with_implications() {
+        let agent = Grants::new([Capability::SiteAdmin, Capability::ConsoleRead, Capability::DnsAdmin])
+            .unwrap();
+        let person = Grants::new([Capability::SiteAdmin, Capability::ConsoleRead]).unwrap();
+
+        let narrowed = agent.within(&person);
+        assert!(narrowed.holds(&Capability::SiteAdmin));
+        assert!(narrowed.holds(&Capability::ConsoleRead));
+        assert!(!narrowed.holds(&Capability::DnsAdmin), "the Person never held it");
+        assert_eq!(agent.beyond(&person), vec![Capability::DnsAdmin]);
+
+        assert!(agent.within(&Grants::none()).is_empty(), "a Person holding nothing caps to nothing");
+        assert!(person.beyond(&agent).is_empty());
+    }
+
+    #[test]
+    fn a_person_holding_the_owner_capability_is_allowed_everything_through_their_grants() {
+        // The bug this capability exists to fix: today's `Identity::Owner` (the
+        // console password) has no Person entry, so any seam that checks the
+        // People registry directly refuses the owner on their own deployment.
+        // Making "owner" a Grant a Person can hold routes that same authority
+        // through `Policy::decide`'s ordinary grants rule (check 6) rather than
+        // through the identity rule (check 5) — same outcome, reachable for a
+        // named account.
+        let shapes = Capability::every_shape(&share(), &node(), &location(), &site());
+        let owner_grant = Grants::new([Capability::Owner]).expect("one grant");
+        let caller = Caller::passkey(person(), owner_grant);
+        for want in &shapes {
+            assert_eq!(
+                Policy::new(true).decide(&caller, want),
+                Decision::Allow,
+                "a Person holding Capability::Owner must be allowed {want}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_agent_is_still_capped_even_when_its_person_holds_owner() {
+        // The other half: an agent's ceiling is its Person's grants, but
+        // `Grants::within` only ever *filters* the agent's own explicit list —
+        // it never adds capabilities the agent was not itself granted, even
+        // when the ceiling "holds everything" via `Capability::Owner`. An
+        // agent must be handed `Capability::Owner` itself to reach that
+        // authority; inheriting it through the Person would be exactly the
+        // widening `Grants::within` exists to prevent.
+        let owners_grants = Grants::new([Capability::Owner]).expect("one grant");
+        let agents_own_grant =
+            Grants::new([Capability::SiteAdmin]).expect("one grant").within(&owners_grants);
+        assert!(agents_own_grant.holds(&Capability::SiteAdmin), "explicitly granted, and kept");
+        assert!(
+            !agents_own_grant.holds(&Capability::FilesAdmin),
+            "never granted, so never inherited from an owning Person"
+        );
+
+        let scoped = Caller::agent(AgentName::parse("claude-mac").unwrap(), agents_own_grant);
+        assert_eq!(Policy::new(true).decide(&scoped, &Capability::SiteAdmin), Decision::Allow);
+        assert_eq!(
+            Policy::new(true).decide(&scoped, &Capability::FilesAdmin),
+            Decision::Refuse(Refusal::NotGranted),
+            "an agent never becomes an owner by way of the Person that owns it"
+        );
+    }
+
+    #[test]
+    fn owner_is_withheld_from_the_bearer_token() {
+        for policy in [Policy::locked_down(), Policy::new(true).with_passkey_enrolled(true)] {
+            assert_eq!(
+                policy.decide(&Caller::bearer(), &Capability::Owner),
+                Decision::Refuse(Refusal::OutsideTheMachinesScope),
+                "a leaked bearer token must never become an owner by holding this"
+            );
+        }
     }
 }

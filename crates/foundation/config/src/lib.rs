@@ -57,6 +57,17 @@ pub use validate::{ConfigError, Problem};
 // `vpn::Relay` — which is also how the section is spelled in the config file.
 pub use vpn::{Backend, Peer};
 
+/// The public API paths that are auto-configured for the auth site.
+///
+/// Every deployment has an auth site that relays these paths to the admin API,
+/// so a first-time visitor can sign in and enroll in the VPN without needing
+/// a session or VPN access yet. This list must include `/api/pass/authorize`,
+/// which every gated (people/private) site's sign-in depends on.
+///
+/// Kept as one list so a change is reflected everywhere at once: tests, the
+/// init command, and any site that needs these paths.
+pub const PUBLIC_AUTH_PATHS: &[&str] = &["/api/session", "/api/vpn/authorize", "/api/pass/authorize"];
+
 /// A complete deployment.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
@@ -318,6 +329,45 @@ pub struct Node {
     pub mesh_ip: Option<String>,
 }
 
+/// A Site's owner: a Person's name, validated at write time.
+///
+/// A thin serde wrapper over [`selfhost_identity::PersonName`] — the one
+/// definition of what a Person may be called — so a name this config accepts
+/// is a `PersonName` by construction, not by two rule lists happening to agree.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SiteOwner(selfhost_identity::PersonName);
+
+impl SiteOwner {
+    /// Validates `text` as a Person's name.
+    pub fn parse(text: &str) -> Result<Self, String> {
+        selfhost_identity::PersonName::parse(text).map(Self).map_err(|error| error.to_string())
+    }
+
+    /// The Person who owns the Site.
+    pub fn person(&self) -> &selfhost_identity::PersonName {
+        &self.0
+    }
+
+    /// The name as written.
+    pub fn as_str(&self) -> &str {
+        self.0.as_str()
+    }
+}
+
+impl fmt::Display for SiteOwner {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+// Deliberately no `Serialize`/`Deserialize` for `SiteOwner` itself: `Site.owner`
+// is a raw `Option<String>` (see its field doc below) so that one unparseable
+// owner is a reported `Problem` on that one site, not a `ConfigError::Syntax`
+// that refuses the whole file before `validate()` ever runs — the same
+// "checked here for shape only" split `vpn.rs`'s `Peer::person` uses. Write-time
+// validation (`PUT /api/sites/<name>/owner`, `site_api::parse_owner`) still
+// goes through `SiteOwner::parse` directly, without needing a serde impl.
+
 /// A website.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Site {
@@ -379,6 +429,47 @@ pub struct Site {
     /// and a site cannot be both at once.
     #[serde(default)]
     pub public_api_paths: Vec<String>,
+    /// Who may reach this site. See [`Exposure`].
+    ///
+    /// Absent — the default, so existing configs keep parsing and keep meaning
+    /// what they meant — is `public` for a site with no `allowed_cidrs`, and
+    /// for a site that lists them it is the source-address gate alone, exactly
+    /// as before this field existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exposure: Option<Exposure>,
+    /// The Person who owns this site: they reach it, and they decide who else
+    /// does, as though they held `site.admin:<site>`. Absent means only the
+    /// deployment's owner and explicit Grants decide.
+    ///
+    /// Stored raw rather than as a validated [`SiteOwner`] so that a value
+    /// [`SiteOwner::parse`] rejects (too long, an email address, a reserved
+    /// word) is a `Problem` naming this one site, checked in
+    /// [`validate::Config::check_sites`] — not a hard `toml::from_str` failure
+    /// that refuses to load every other site and every other subsystem in the
+    /// same file. See `SiteOwner`'s doc for why the shape check still lives
+    /// with `identity::PersonName` and not here.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner: Option<String>,
+    /// Which VPN relay gates this private site. Absent for public/people sites.
+    /// When present, POST /api/vpn/authorize only authorises this relay for
+    /// callers who hold a grant on this site. Default: the single relay if
+    /// exactly one exists; required if zero or multiple relays are configured.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub relay: Option<String>,
+}
+
+/// Who may reach a site.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Exposure {
+    /// Open to the internet. The normal case.
+    Public,
+    /// Anyone may try; every request must carry a Pass naming a Person who
+    /// holds `site.access:<site>`.
+    People,
+    /// `people`, and the request must also arrive from `allowed_cidrs` — in
+    /// practice, through the VPN.
+    Private,
 }
 
 fn default_true() -> bool {
@@ -487,6 +578,25 @@ impl Site {
                 .any(|entry| Cidr::parse(entry).is_ok_and(|cidr| cidr.contains(ip)))
     }
 
+    /// Whether every request to this site must carry a Pass.
+    pub fn requires_pass(&self) -> bool {
+        matches!(self.exposure, Some(Exposure::People | Exposure::Private))
+    }
+
+    /// Whether this site is reached through the VPN: `private`, or gated by
+    /// `allowed_cidrs` without saying so. A Grant on such a site is a reason
+    /// to enroll a Peer.
+    pub fn is_network_gated(&self) -> bool {
+        self.exposure == Some(Exposure::Private) || !self.allowed_cidrs.is_empty()
+    }
+
+    /// The VPN relay that gates this site, if one is explicitly configured.
+    /// For sites without an explicit relay setting, callers must determine
+    /// defaulting (single relay, if exactly one exists) at the API layer.
+    pub fn relay_name(&self) -> Option<&str> {
+        self.relay.as_deref()
+    }
+
     /// Whether `path` is on this site's [`public_api_paths`](Self::public_api_paths)
     /// allowlist.
     ///
@@ -580,6 +690,47 @@ impl fmt::Display for Config {
 }
 
 #[cfg(test)]
+mod exposure_tests {
+    use super::*;
+
+    fn parsed(extra: &str) -> Result<Site, String> {
+        let text = format!("name = \"a\"\ndomains = [\"a.com\"]\n{extra}");
+        toml::from_str::<Site>(&text).map_err(|error| error.to_string())
+    }
+
+    #[test]
+    fn exposure_parses_its_three_words_and_nothing_else() {
+        let table = [
+            ("", Ok(None)),
+            ("exposure = \"public\"", Ok(Some(Exposure::Public))),
+            ("exposure = \"people\"", Ok(Some(Exposure::People))),
+            ("exposure = \"private\"", Ok(Some(Exposure::Private))),
+            ("exposure = \"Public\"", Err(())),
+            ("exposure = \"vpn\"", Err(())),
+            ("exposure = \"\"", Err(())),
+            ("exposure = true", Err(())),
+        ];
+        for (extra, expected) in table {
+            let got = parsed(extra).map(|site| site.exposure).map_err(|_| ());
+            assert_eq!(got, expected, "{extra:?}");
+        }
+    }
+
+    #[test]
+    fn what_an_exposure_asks_of_a_request() {
+        let mut site = parsed("").unwrap();
+        assert!(!site.requires_pass() && !site.is_network_gated(), "neither field: public");
+        site.exposure = Some(Exposure::People);
+        assert!(site.requires_pass() && !site.is_network_gated());
+        site.exposure = Some(Exposure::Private);
+        site.allowed_cidrs = vec!["10.66.0.0/24".into()];
+        assert!(site.requires_pass() && site.is_network_gated());
+        assert!(!site.permits("8.8.8.8".parse().unwrap()), "private keeps the network check");
+        assert_eq!(parsed("owner = \"mom\"").unwrap().owner.as_ref().map(|o| o.as_str()), Some("mom"));
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -592,6 +743,58 @@ mod tests {
             data_dir: default_data_dir(),
             admin_bind: default_admin_bind(),
             firewall: Firewall::default(),
+        }
+    }
+
+    #[test]
+    fn a_site_owner_is_exactly_a_person_name() {
+        // Regression: SiteOwner once hand-copied PersonName's rules. It now
+        // *is* one, so the two can never disagree on any input.
+        for text in ["Alex", "J. Alex", "Jane Doe", "", "owner", "MACHINE", "a  b", "-x", "x/y"] {
+            assert_eq!(
+                SiteOwner::parse(text).is_ok(),
+                selfhost_identity::PersonName::parse(text).is_ok(),
+                "{text:?}"
+            );
+        }
+        assert_eq!(SiteOwner::parse("Jane Doe").unwrap().person().as_str(), "Jane Doe");
+    }
+
+    #[test]
+    fn a_site_with_an_email_as_owner_fails_to_validate_not_to_parse() {
+        // Regression (root cause of the bug `SiteOwner`'s old custom
+        // `Deserialize` impl caused): an owner value `PersonName` rejects must
+        // surface as `ConfigError::Invalid`, collected with every other
+        // problem `validate()` finds — never `ConfigError::Syntax`, which
+        // `toml::from_str` raises before `validate()` runs at all and which
+        // would refuse to even look at the rest of the file. Two unrelated
+        // mistakes (a bad owner on one site, a duplicate name on two others)
+        // must both be reported from the one `Config::parse` call.
+        let text = "version = 1\n\
+             [server]\n\
+             acme_email = \"a@b.com\"\n\
+             acme = \"self-signed\"\n\n\
+             [[nodes]]\n\
+             name = \"home\"\n\
+             role = \"owner\"\n\n\
+             [[sites]]\n\
+             name = \"a\"\n\
+             domains = [\"a.example.com\"]\n\
+             static_root = \"./public\"\n\
+             owner = \"alex@example.com\"\n\n\
+             [[sites]]\n\
+             name = \"a\"\n\
+             domains = [\"b.example.com\"]\n\
+             static_root = \"./public\"\n";
+        match Config::parse(text) {
+            Err(ConfigError::Invalid(problems)) => {
+                assert!(problems.iter().any(|p| p.field == "sites[0].owner"), "{problems:?}");
+                assert!(
+                    problems.iter().any(|p| p.field == "sites[1].name"),
+                    "the unrelated duplicate-name problem must still be reported: {problems:?}"
+                );
+            }
+            other => panic!("expected ConfigError::Invalid with both problems collected, got {other:?}"),
         }
     }
 
@@ -626,6 +829,9 @@ mod tests {
             allowed_cidrs: vec![],
             console: false,
             public_api_paths: vec![],
+            exposure: None,
+            owner: None,
+            relay: None,
         };
         assert!(!site.routes_to_app("/api/health"));
     }
@@ -644,6 +850,9 @@ mod tests {
             allowed_cidrs: vec![],
             console: false,
             public_api_paths: vec![],
+            exposure: None,
+            owner: None,
+            relay: None,
         };
         assert!(site.routes_to_app("/anything"));
     }
@@ -701,6 +910,9 @@ mod tests {
                 allowed_cidrs: vec![],
                 console: false,
                 public_api_paths: vec![],
+                exposure: None,
+                owner: None,
+                relay: None,
             }],
             dns: None,
             mail: None,
@@ -786,6 +998,10 @@ static_root = "./public"
         // Old configs never mention the new fields; they must default open.
         assert!(!config.sites[1].console);
         assert!(config.sites[1].allowed_cidrs.is_empty());
+        // Neither site says `exposure`, and both mean what they always meant.
+        assert_eq!(config.sites[0].exposure, None);
+        assert!(!config.sites[0].requires_pass() && config.sites[0].is_network_gated());
+        assert!(!config.sites[1].requires_pass() && !config.sites[1].is_network_gated());
     }
 
     #[test]
@@ -802,6 +1018,9 @@ static_root = "./public"
             allowed_cidrs: vec![],
             console: true,
             public_api_paths: vec![],
+            exposure: None,
+            owner: None,
+            relay: None,
         };
         let vpn_client: IpAddr = "10.66.0.2".parse().unwrap();
         let stranger: IpAddr = "203.0.113.9".parse().unwrap();
@@ -834,6 +1053,9 @@ static_root = "./public"
             allowed_cidrs: vec![],
             console: false,
             public_api_paths: vec!["/api/session".into(), "/api/vpn/authorize".into()],
+            exposure: None,
+            owner: None,
+            relay: None,
         };
         assert!(site.permits_public_api_path("/api/session"));
         assert!(site.permits_public_api_path("/api/vpn/authorize"));

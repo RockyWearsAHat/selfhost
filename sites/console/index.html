@@ -168,6 +168,18 @@
     </table></div>
   </section>
 
+  <!-- SYSTEM: the daemon's own internal parts (proxy, admin API, VPN relays,
+       the VPN updater, reports, mail) — never listed among hosted Services.
+       Hidden only while nothing has been fetched yet; functionality over
+       looks, per the parts this reports on being infrastructure, not a
+       feature. -->
+  <section id="system" class="plate" hidden>
+    <div class="section-rule">
+      <h2>SYSTEM</h2><span class="rule"></span>
+    </div>
+    <ul id="system-rows"></ul>
+  </section>
+
   <div id="panes">
 
     <!-- SERVICE RAIL -->
@@ -686,6 +698,25 @@
       <button id="pk-register" class="btn ghost small" type="button">REGISTER A PASSKEY</button>
     </div>
     <ul id="pk-list"></ul>
+  </section>
+
+  <!-- SITES: the configured web domains and their access configuration.
+       Owner-only on the daemon; shows exposure (public/people/private), owner,
+       and grants for each site. -->
+  <section id="sites" class="plate" hidden>
+    <div class="section-rule">
+      <h2>SITES</h2><span class="rule"></span>
+      <span id="sites-count" class="mono micro"></span>
+      <button id="sites-reload" class="btn ghost small" type="button">RELOAD</button>
+    </div>
+    <p id="sites-note" class="caption" hidden></p>
+    <table id="sites-table" hidden>
+      <thead><tr>
+        <th>NAME</th><th>DOMAINS</th><th>EXPOSURE</th><th>OWNER</th>
+      </tr></thead>
+      <tbody id="sites-rows"></tbody>
+    </table>
+    <div id="sites-empty" class="caption centered" hidden></div>
   </section>
 
   <!-- PEOPLE: everybody this deployment has granted capabilities to, and the

@@ -50,6 +50,8 @@ tokio-rustls = { workspace = true }
 # is deterministic across the Win/mac/Linux matrix where reading the OS store
 # would vary by platform. Nothing new enters the workspace by naming it here.
 webpki-roots = { workspace = true }
+# `selfhost init-owner`'s password prompt, no echo, on a real terminal.
+rpassword = { workspace = true }
 
 [dev-dependencies]
 # `test-util` only, and only for tests: the kill switch's requirement is that an

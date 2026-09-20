@@ -53,14 +53,32 @@ const DEVICE_OWNER: isize = 2;
 /// leak nobody notices.
 const PATIENCE: Duration = Duration::from_secs(600);
 
+// `LocalAuthentication` is a framework, loaded so `objc_getClass("LAContext")`
+// can find the class it declares — but the framework carries no C symbols of
+// its own that this file calls, so the extern block naming it is empty. The
+// Objective-C runtime entry points below are `libobjc`'s, a separate dylib
+// from any framework; grouping them under `LocalAuthentication` instead would
+// still pass `-framework LocalAuthentication` to the linker, but never
+// `-lobjc`, and `objc_getClass`/`objc_msgSend`/`sel_registerName` would be
+// left undefined at link time — exactly the failure a standalone build (this
+// crate's own test binary, with nothing else in the link line to drag
+// `libobjc` in by accident) surfaces and a build sharing a binary with AppKit
+// or Foundation can happen to hide.
 #[link(name = "LocalAuthentication", kind = "framework")]
+unsafe extern "C" {}
+
+#[link(name = "objc", kind = "dylib")]
 unsafe extern "C" {
     fn objc_getClass(name: *const c_char) -> Id;
     fn sel_registerName(name: *const c_char) -> Sel;
     fn objc_msgSend();
     /// The isa every block that is never copied points at.
     static _NSConcreteGlobalBlock: [*const c_void; 32];
-    /// Non-zero on the thread that draws the window.
+}
+
+unsafe extern "C" {
+    /// Non-zero on the thread that draws the window. Part of `libSystem`,
+    /// which every Rust binary on macOS already links.
     fn pthread_main_np() -> i32;
 }
 

@@ -204,6 +204,9 @@ impl AppSpec {
             allowed_cidrs: Vec::new(),
             console: false,
             public_api_paths: vec![],
+            exposure: None,
+            owner: None,
+            relay: None,
         }
     }
 
