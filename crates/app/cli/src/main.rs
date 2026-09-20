@@ -9,6 +9,7 @@ mod app_command;
 mod arguments;
 mod assess;
 mod audit;
+mod breakglass;
 mod converge;
 mod data_dir;
 mod desk_agent;
@@ -45,6 +46,7 @@ mod storage_command;
 mod teardown;
 mod vpn_command;
 mod watch;
+mod watchdog;
 
 use crate::arguments::value_of;
 use selfhost_admin::{Api, Fleet, Store, Token};
@@ -201,7 +203,11 @@ Commands
   service <install|uninstall|status|check> [--system] [--yes] [--repair]
                              Register this daemon with the OS service manager
                              (launchd, systemd, or a Windows scheduled task) so it
-                             starts on boot and restarts if it dies.
+                             starts on boot and restarts if it dies. Also installs
+                             and registers the watchdog (see `watchdog` below) as
+                             its own copy of the binary and its own service
+                             registration, so a bad deploy of the daemon can never
+                             take the watchdog down with it.
                              `check` compares every registration this deployment
                              owns against what it was meant to be — the run-time
                              limit, the restart policy — and names each
@@ -210,6 +216,26 @@ Commands
                              is the check that would have caught a nameserver
                              registered with Windows' 72-hour default months
                              before it took the sites down.
+  watchdog [--interval-secs N] [--failure-threshold K]
+                             Run in the foreground, forever, watching the daemon
+                             and its configured relays with no dependency on
+                             either — no People registry, no admin API, its own
+                             copy of the binary. Restarts the registered daemon
+                             task after K consecutive unhealthy checks; if that
+                             does not help, restores the previous binary; if the
+                             daemon's exe is missing or still unhealthy, rebuilds
+                             the deploy branch from source and installs it. This
+                             is what `selfhost service install` registers as its
+                             own scheduled task/launchd job/systemd unit —
+                             running it by hand is for diagnosing the watchdog
+                             itself.
+  breakglass <list|add|remove>
+                             Device public keys pinned for emergency SSH relay
+                             access, independent of the People registry: the
+                             recovery path when identity itself is broken.
+                             `add <label> <pubkey>` and `remove <label>` edit
+                             <data_dir>/breakglass.keys directly; no daemon
+                             needed.
   reports <serve|projects|list|close|token>
                              The public report intake: agents anywhere POST a
                              defect, this box stores it and mails it to the
@@ -352,6 +378,11 @@ fn main() -> ExitCode {
         }
         "teardown" => teardown_command(&arguments),
         "service" => service_command(&arguments),
+        "watchdog" => watchdog_command(&arguments),
+        "breakglass" => load().and_then(|(config, project_dir)| {
+            let data_dir = teardown::data_dir(&config, &project_dir);
+            breakglass::run(&arguments, &config, &data_dir)
+        }),
         "reports" => load().and_then(|(config, project_dir)| {
             reports_command::run(&arguments, &config, &project_dir)
         }),
@@ -861,6 +892,33 @@ async fn watch_dns(bind: SocketAddr, upstream: SocketAddr) -> Result<(), String>
 fn daemon_command(arguments: &[String]) -> Result<(), String> {
     let (config, project_dir) = load()?;
     let config_path = project_dir.join(CONFIG_FILENAME);
+
+    // Everything from here down runs unattended, possibly for months, with
+    // nobody's terminal reading its stderr — see `install_startup_crash_log`.
+    // The config parsed, so its data_dir is known even if a later step
+    // (an unparsable --bind, a port already in use, a panic deep in
+    // `serve_everything`) is what actually stops the daemon: whatever it is,
+    // it belongs in the same log an operator already knows to look in.
+    let data_dir = teardown::data_dir(&config, &project_dir);
+    install_startup_crash_log(data_dir.clone());
+
+    let result = run_daemon(arguments, config, project_dir, config_path);
+    if let Err(message) = &result {
+        append_startup_log(&data_dir, message);
+    }
+    result
+}
+
+/// The part of [`daemon_command`] that can still fail after the
+/// startup-crash log is already installed, kept separate so every one of
+/// those failures — not just the ones inside `serve_everything` — is
+/// guaranteed to pass back through its caller's `append_startup_log`.
+fn run_daemon(
+    arguments: &[String],
+    config: Config,
+    project_dir: PathBuf,
+    config_path: PathBuf,
+) -> Result<(), String> {
     let bind = value_of(arguments, "--bind").unwrap_or_else(|| config.server.admin_bind.clone());
     let address: SocketAddr = bind.parse().map_err(|e| format!("--bind {bind}: {e}"))?;
 
@@ -870,6 +928,94 @@ fn daemon_command(arguments: &[String]) -> Result<(), String> {
         .map_err(|e| format!("could not start the async runtime: {e}"))?;
 
     runtime.block_on(serve_everything(config, project_dir, config_path, address))
+}
+
+/// The file a fatal daemon exit is recorded to, in the data directory, in
+/// addition to stderr.
+///
+/// Stderr is not a reliable diagnostic on every platform this runs on: a
+/// Windows Scheduled Task run without the keep-alive wrapper's own
+/// `>> ...\data\selfhost-daemon.log 2>&1` redirection has no console at all, a
+/// systemd journal can be rotated away, and an operator testing a fresh build
+/// over RDP or SSH loses their scrollback the moment the session drops. This
+/// file lives beside the data the daemon already owns, so "why did it stop"
+/// survives all three.
+const STARTUP_LOG_FILENAME: &str = "daemon-startup.log";
+
+/// Installs a panic hook that keeps the default terminal report and also
+/// appends it to [`STARTUP_LOG_FILENAME`] under `data_dir`.
+///
+/// This workspace builds with `panic = "abort"` (see the root `Cargo.toml`),
+/// so a panic never unwinds back to a `catch_unwind` further up this call
+/// stack — the process is simply gone the instant the hook returns. That
+/// makes the hook the only point in the whole program that ever sees a
+/// panic's message, which is why it is installed here rather than relying on
+/// an `Err` this function's caller ([`finish`]) already prints: `finish`
+/// never runs for a panic. Installed only for `daemon`, not in `main` before
+/// dispatch, because every other command is short-lived and interactive with
+/// a terminal already attached — the daemon is the one command meant to run
+/// with nobody watching.
+fn install_startup_crash_log(data_dir: PathBuf) {
+    let previous = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        previous(info);
+        append_startup_log(&data_dir, &info.to_string());
+    }));
+}
+
+/// Appends one timestamped line to the daemon's startup-failure log, creating
+/// the data directory first if this is the very first thing ever written to
+/// it (a startup failure can happen before anything else has).
+///
+/// A failure to write here is swallowed rather than propagated or panicked
+/// on: the process is already on its way out over one problem, and a full
+/// disk must not turn that into a second, unrelated panic inside the panic
+/// handler itself.
+fn append_startup_log(data_dir: &Path, message: &str) {
+    use std::io::Write as _;
+    let _ = std::fs::create_dir_all(data_dir);
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|since| since.as_secs())
+        .unwrap_or(0);
+    if let Ok(mut file) =
+        std::fs::OpenOptions::new().create(true).append(true).open(data_dir.join(STARTUP_LOG_FILENAME))
+    {
+        let _ = writeln!(file, "[{stamp}] {message}");
+    }
+}
+
+/// Runs the recovery watchdog in the foreground, forever. See [`watchdog`]
+/// for why this exists and what it deliberately does not share with the
+/// daemon it watches: its own copy of the binary, its own service
+/// registration, no People registry, no admin API.
+fn watchdog_command(arguments: &[String]) -> Result<(), String> {
+    if arguments.iter().any(|argument| argument == "--help" || argument == "-h") {
+        print!("{}", watchdog::USAGE);
+        return Ok(());
+    }
+    let (config, project_dir) = load()?;
+    let interval = match value_of(arguments, "--interval-secs") {
+        Some(text) => Duration::from_secs(
+            text.parse::<u64>().map_err(|error| format!("--interval-secs {text}: {error}"))?,
+        ),
+        None => watchdog::DEFAULT_INTERVAL,
+    };
+    let threshold = match value_of(arguments, "--failure-threshold") {
+        Some(text) => text.parse::<u32>().map_err(|error| format!("--failure-threshold {text}: {error}"))?,
+        None => watchdog::DEFAULT_THRESHOLD,
+    };
+
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| format!("could not start the async runtime: {e}"))?;
+
+    // `watchdog::run` only ever returns by finding something wrong before its
+    // loop can even start (for example: it cannot locate its own exe path) —
+    // in ordinary operation it runs forever, exactly like `daemon_command`
+    // above.
+    Err(runtime.block_on(watchdog::run(config, project_dir, interval, threshold)))
 }
 
 /// Brings up every subsystem this deployment is configured for, and serves
@@ -1182,10 +1328,7 @@ async fn serve_everything(
     // and verifies the cookie), so the two halves are in-process by
     // construction. A key that cannot be read is a start-up failure: the
     // alternative is `people` Sites that sign nobody in, silently.
-    let site_passes = selfhost_identity::PassKey::load_or_create(
-        &data_dir,
-        selfhost_identity::registry::write_owner_only,
-    )
+    let site_passes = selfhost_admin::pass_key(&data_dir)
     .map(selfhost_admin::site_pass::SitePasses::new)
     .map_err(|error| format!("cannot load the Pass signing key: {error}"))?;
 
@@ -2488,6 +2631,11 @@ fn service_install_command(system: bool, assumed_yes: bool) -> Result<(), String
     let exe = std::env::current_exe()
         .map_err(|error| format!("cannot find this executable to register it: {error}"))?;
     let plan = service_install::plan(&exe, &project_dir, system)?;
+    // Planned alongside the daemon's own, not carried out yet: if either plan
+    // is unsupported on this host, or the operator declines, nothing should
+    // be half-installed. See index.dx rule 9 — the watchdog is why this
+    // exists at all, so it is never optional here.
+    let watchdog_plan = service_install::watchdog_plan(&exe, &project_dir, system)?;
 
     println!("This will register selfhost as a {} service:\n", plan.mechanism);
     println!("  name          {}", plan.label);
@@ -2516,21 +2664,40 @@ fn service_install_command(system: bool, assumed_yes: bool) -> Result<(), String
         println!("  {}", step.argv.join(" "));
     }
 
-    if !assumed_yes && !service_install::confirm("\nRegister this service?") {
+    println!(
+        "\nAlongside it, a watchdog will be installed as its own copy of this\n\
+         binary ({}) and registered as its own {} service ({}) — so a bad\n\
+         deploy of the daemon can never take the watchdog down with it:",
+        service_install::watchdog_exe_path(&exe).display(),
+        watchdog_plan.mechanism,
+        watchdog_plan.label
+    );
+    println!("  runs          {}", watchdog_plan.argv.join(" "));
+    println!("  unit file     {}", watchdog_plan.path.display());
+
+    if !assumed_yes && !service_install::confirm("\nRegister these services?") {
         println!("\nNothing was installed.");
         return Ok(());
     }
 
     println!();
     service_install::carry_out(&plan)?;
-    println!("\n✓ installed — the daemon will start on boot and restart if it dies");
+    println!("✓ installed — the daemon will start on boot and restart if it dies");
+
+    service_install::install_watchdog_binary(&exe)
+        .map_err(|error| format!("daemon installed, but could not copy the watchdog binary: {error}"))?;
+    service_install::carry_out(&watchdog_plan)?;
+    println!("✓ installed — the watchdog will start on boot and watch the daemon independently");
     Ok(())
 }
 
 /// Unregisters the daemon's OS service and removes its unit file, after showing
-/// what it will do.
+/// what it will do. Also unregisters the watchdog's own service registration
+/// and leaves its binary copy in place — teardown, not this command, removes
+/// files.
 fn service_uninstall_command(system: bool, assumed_yes: bool) -> Result<(), String> {
     let plan = service_install::uninstall_plan(system)?;
+    let watchdog_plan = service_install::watchdog_uninstall_plan(system)?;
 
     println!("This will remove the selfhost daemon {} service:\n", plan.mechanism);
     println!("  name        {}", plan.label);
@@ -2542,14 +2709,23 @@ fn service_uninstall_command(system: bool, assumed_yes: bool) -> Result<(), Stri
         println!("  {}", step.argv.join(" "));
     }
 
-    if !assumed_yes && !service_install::confirm("\nRemove this service?") {
+    println!("\nAnd the watchdog {} service:\n", watchdog_plan.mechanism);
+    println!("  name        {}", watchdog_plan.label);
+    println!("\nCommands that will run:");
+    for step in &watchdog_plan.steps {
+        println!("  {}", step.argv.join(" "));
+    }
+
+    if !assumed_yes && !service_install::confirm("\nRemove these services?") {
         println!("\nNothing was removed.");
         return Ok(());
     }
 
     println!();
     service_install::carry_out_uninstall(&plan)?;
-    println!("\n✓ removed — the daemon no longer starts on boot");
+    println!("✓ removed — the daemon no longer starts on boot");
+    service_install::carry_out_uninstall(&watchdog_plan)?;
+    println!("✓ removed — the watchdog no longer starts on boot");
     Ok(())
 }
 
@@ -2737,6 +2913,59 @@ role = \"owner\"
         std::fs::create_dir_all(&dir).expect("create the temp project dir");
         let config_path = dir.join(CONFIG_FILENAME);
         (dir, config_path)
+    }
+
+    /// A startup failure is appended to the log rather than only printed,
+    /// so it survives a Scheduled Task with no console and a dropped RDP
+    /// session alike (see [`append_startup_log`]'s doc comment).
+    ///
+    /// The data directory here is seeded the way a real upgrade finds one:
+    /// already populated by an old build (a pre-existing `console.passwd`
+    /// this call must not disturb), never created for the first time by this
+    /// call alone. That is the scenario the daemon actually fails in — an
+    /// old data directory, a new binary — not a pristine one.
+    #[test]
+    fn a_startup_failure_is_appended_to_the_data_dir_log() {
+        let (dir, _config_path) = temp_project("startup-log");
+        std::fs::write(dir.join("console.passwd"), "pbkdf2-sha256$old$stuff$here")
+            .expect("seed a pre-existing, old-format file");
+
+        append_startup_log(&dir, "could not bind 127.0.0.1:8443: address in use");
+        append_startup_log(&dir, "could not bind 127.0.0.1:8443: address in use (retry)");
+
+        let logged = std::fs::read_to_string(dir.join(STARTUP_LOG_FILENAME))
+            .expect("the log file exists after a failure");
+        assert!(logged.contains("address in use"), "the failure reason is recorded: {logged}");
+        assert_eq!(
+            logged.lines().count(),
+            2,
+            "a second failure appends a new line rather than truncating the first — the reason a \
+             restart happened is in the run before it: {logged}"
+        );
+        assert!(
+            std::fs::read_to_string(dir.join("console.passwd")).unwrap().contains("old$stuff"),
+            "an old file already in the data directory is left exactly as it was"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The same mechanism also creates the data directory when a failure
+    /// happens before anything else ever has — the config parsed, so
+    /// `daemon_command` knows where `data_dir` is, but nothing has written
+    /// into it yet (a `--bind` argument that fails to parse, for instance,
+    /// is returned before any file is touched).
+    #[test]
+    fn a_startup_failure_creates_the_data_dir_if_nothing_has_yet() {
+        let (project, _config_path) = temp_project("startup-log-fresh");
+        let data_dir = project.join("data");
+        assert!(!data_dir.exists(), "nothing has created it yet");
+
+        append_startup_log(&data_dir, "the async runtime could not start");
+
+        let logged = std::fs::read_to_string(data_dir.join(STARTUP_LOG_FILENAME))
+            .expect("the log file exists, in a data directory this call created");
+        assert!(logged.contains("the async runtime could not start"));
+        let _ = std::fs::remove_dir_all(&project);
     }
 
     #[test]
