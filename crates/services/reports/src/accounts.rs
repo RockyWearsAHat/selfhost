@@ -1,18 +1,18 @@
-//! Accounts: who filed a report, and how they prove it later.
+//! Report Filers: who filed a report, and how they prove it later.
 //!
 //! Filing itself stays anonymous by default — [`crate::service`]'s open `POST` door is
-//! unchanged. An account is what lets the *same* person come back, see the reports they filed,
-//! and manage them, without changing anything about the door a stranger with no account still
-//! walks through.
+//! unchanged. A report filer is what lets the *same* person come back, see the reports they filed,
+//! and manage them, without changing anything about the door a stranger with no filer credentials
+//! still walks through.
 //!
 //! # Email is the identity; the id is not
 //!
-//! An account is created with an email address and keyed by a random id (`acct-` and 32 hex
+//! A report filer is created with an email address and keyed by a random id (`acct-` and 32 hex
 //! digits) rather than by the email itself, so a later email change never has to rewrite every
-//! [`crate::store::Entry::account_id`] that already points at this account. Lookup by email
+//! [`crate::store::Entry::account_id`] that already points at this filer. Lookup by email
 //! re-parses the stored address and compares with [`selfhost_mail::Address::matches`] — the same
 //! case-folding rule the mail crate uses for routing — rather than a raw string compare, so
-//! `Alice@example.com` and `alice@Example.com` are one account exactly as they are one mailbox.
+//! `Alice@example.com` and `alice@Example.com` are one filer exactly as they are one mailbox.
 //!
 //! # The store is one file, like the sibling credential stores
 //!
@@ -33,7 +33,7 @@
 //!
 //! # What a plan is, today
 //!
-//! [`Account::plan`] is a free-form, capped word — `"free"` unless something else writes it.
+//! [`ReportFiler::plan`] is a free-form, capped word — `"free"` unless something else writes it.
 //! Nothing in this crate charges anyone anything; the field exists so a later billing
 //! integration has somewhere to write `"supporter"` rather than a schema migration to add one.
 
@@ -117,99 +117,99 @@ impl std::fmt::Display for AccountError {
 
 impl std::error::Error for AccountError {}
 
-/// One OAuth identity linked to an account.
+/// One OAuth identity linked to a report filer.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct OAuthLink {
+pub struct FilingOAuthLink {
     /// The provider's configured name — `"google"`, `"github"` — matching
     /// [`crate::oauth::Provider::name`].
     pub provider: String,
-    /// The provider's own subject identifier for this person, stable for their account there.
+    /// The provider's own subject identifier for this person, stable for their filing identity there.
     pub subject: String,
 }
 
-/// A pointer to one report this account filed — enough to look it up in
+/// A reference to one report this filer filed — enough to look it up in
 /// [`crate::store::Store`], never a copy of its content.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct FiledRef {
+pub struct FiledReport {
     /// The project the report is about.
     pub project: String,
     /// The report's own id.
     pub id: String,
 }
 
-/// One registered account.
+/// One registered report filer.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Account {
+pub struct ReportFiler {
     /// `acct-` and 32 hex digits, random and never reused.
     pub id: String,
-    /// The address this account was registered with, in [`Address`]'s canonical form.
+    /// The address this filer was registered with, in [`Address`]'s canonical form.
     pub email: String,
     /// Whether that address has been confirmed reachable — by a clicked verification link, or
     /// because an OAuth provider vouched for it at sign-in.
     pub email_verified: bool,
-    /// The PBKDF2 hash of this account's password, or `None` when it has none — a passkey- or
-    /// OAuth-only account is not weaker for lacking one.
+    /// The PBKDF2 hash of this filer's password, or `None` when it has none — a passkey- or
+    /// OAuth-only filer is not weaker for lacking one.
     pub password: Option<String>,
-    /// Every OAuth identity that may sign in as this account.
-    pub oauth_links: Vec<OAuthLink>,
-    /// The reports this account filed while signed in, newest last, capped at
+    /// Every OAuth identity that may sign in as this filer.
+    pub oauth_links: Vec<FilingOAuthLink>,
+    /// The reports this filer filed while signed in, newest last, capped at
     /// [`MAX_FILED_PER_ACCOUNT`]. The dashboard's "my reports" list reads this and then asks
     /// [`crate::store::Store::get`] for each one's current content.
-    pub filed: Vec<FiledRef>,
-    /// When this account was created, seconds since the Unix epoch.
+    pub filed: Vec<FiledReport>,
+    /// When this filer was created, seconds since the Unix epoch.
     pub created_unix: u64,
-    /// A free-form, capped word naming what this account is entitled to. `"free"` until
+    /// A free-form, capped word naming what this filer's plan is. `"free"` until
     /// something else writes it — see the module documentation.
     pub plan: String,
 }
 
-impl Account {
-    /// Whether anybody ever *proved* that whoever holds this account also holds the address on
+impl ReportFiler {
+    /// Whether anybody ever *proved* that whoever holds this filer account also holds the address on
     /// it — as opposed to merely having typed that address in.
     ///
     /// This is the question [`crate::service::Service::oauth_account`] must ask before it lets a
-    /// sign-in provider merge a new identity into an account it found **by email address alone**,
-    /// and it is a different question from "does this account have a credential". Every door
-    /// into this store — [`Accounts::create_with_password`], [`Accounts::create_pending`], an
-    /// [`Accounts::create_with_oauth`] from a provider that does not vouch — lets a stranger name
+    /// sign-in provider merge a new identity into a filer it found **by email address alone**,
+    /// and it is a different question from "does this filer have a credential". Every door
+    /// into this store — [`ReportFilers::create_with_password`], [`ReportFilers::create_pending`], an
+    /// [`ReportFilers::create_with_oauth`] from a provider that does not vouch — lets a stranger name
     /// any address at all, including one that is not theirs, and hang their own password or
-    /// passkey off it. Exactly two things write [`Account::email_verified`], and both are proof:
-    /// [`Accounts::mark_verified`], reached only by clicking a link this box mailed *to that
-    /// address*, and [`Accounts::create_with_oauth`] with a provider's own verified-email claim.
+    /// passkey off it. Exactly two things write [`ReportFiler::email_verified`], and both are proof:
+    /// [`ReportFilers::mark_verified`], reached only by clicking a link this box mailed *to that
+    /// address*, and [`ReportFilers::create_with_oauth`] with a provider's own verified-email claim.
     ///
     /// So the flag is the whole answer, and this method exists to say so by name at the one call
-    /// site where being wrong is an account takeover rather than a cosmetic bug.
+    /// site where being wrong is a filer takeover rather than a cosmetic bug.
     #[must_use]
     pub fn email_proven(&self) -> bool {
         self.email_verified
     }
 }
 
-/// The durable account store: `<data_dir>/reports/accounts.json`, owner-only, JSON.
+/// The durable report filer store: `<data_dir>/reports/accounts.json`, owner-only, JSON.
 ///
 /// A cheap-clone handle over shared state, like `crates/admin`'s `Passkeys`/`Invites`: every
 /// clone reads and writes the same file through the same lock, so a registration made through
 /// one handle is visible to a lookup through another in the same process.
 #[derive(Clone)]
-pub struct Accounts {
+pub struct ReportFilers {
     path: PathBuf,
-    entries: Arc<Mutex<Vec<Account>>>,
+    entries: Arc<Mutex<Vec<ReportFiler>>>,
 }
 
-impl Accounts {
+impl ReportFilers {
     /// Loads the store from `<data_dir>/accounts.json`.
     ///
     /// A missing file is an empty store. A malformed one loads empty and says so once, the same
-    /// fail-closed shape every credential file in this workspace takes: an account store nobody
+    /// fail-closed shape every credential file in this workspace takes: a filer store nobody
     /// can read a stranger's password out of is worth more than one that limps on half-parsed.
     pub fn load(data_dir: &Path) -> Self {
         let path = Self::path_in(data_dir);
         let entries = match std::fs::read_to_string(&path) {
-            Ok(text) => match parse_accounts(&text) {
+            Ok(text) => match parse_filers(&text) {
                 Some(entries) => entries,
                 None => {
                     eprintln!(
-                        "reports: {} is not a valid account file; accounts are unreachable \
+                        "reports: {} is not a valid filer file; filers are unreachable \
                          until it is repaired or removed",
                         path.display()
                     );
@@ -219,7 +219,7 @@ impl Accounts {
             Err(error) if error.kind() == io::ErrorKind::NotFound => Vec::new(),
             Err(error) => {
                 eprintln!(
-                    "reports: could not read {}: {error}; accounts are unreachable",
+                    "reports: could not read {}: {error}; filers are unreachable",
                     path.display()
                 );
                 Vec::new()
@@ -237,25 +237,25 @@ impl Accounts {
         data_dir.join(ACCOUNTS_FILENAME)
     }
 
-    /// The account with this id, if any.
+    /// The filer with this id, if any.
     #[must_use]
-    pub fn find_by_id(&self, id: &str) -> Option<Account> {
+    pub fn find_by_id(&self, id: &str) -> Option<ReportFiler> {
         self.lock().iter().find(|entry| entry.id == id).cloned()
     }
 
-    /// The account registered under this email, if any — compared the way
+    /// The filer registered under this email, if any — compared the way
     /// [`selfhost_mail::Address::matches`] compares, never as raw strings.
     #[must_use]
-    pub fn find_by_email(&self, email: &Address) -> Option<Account> {
+    pub fn find_by_email(&self, email: &Address) -> Option<ReportFiler> {
         self.lock()
             .iter()
             .find(|entry| Address::parse(&entry.email).is_ok_and(|stored| stored.matches(email)))
             .cloned()
     }
 
-    /// The account linked to this OAuth identity, if any.
+    /// The filer linked to this OAuth identity, if any.
     #[must_use]
-    pub fn find_by_oauth(&self, provider: &str, subject: &str) -> Option<Account> {
+    pub fn find_by_oauth(&self, provider: &str, subject: &str) -> Option<ReportFiler> {
         self.lock()
             .iter()
             .find(|entry| {
@@ -267,17 +267,17 @@ impl Accounts {
             .cloned()
     }
 
-    /// Creates an account with `email` and `password`, hashed here.
+    /// Creates a filer with `email` and `password`, hashed here.
     ///
     /// # Errors
     /// [`AccountError::BadEmail`] when the address does not parse, [`AccountError::WeakPassword`]
-    /// outside [`MIN_PASSWORD`]..=[`MAX_PASSWORD`], [`AccountError::EmailTaken`] when an account
+    /// outside [`MIN_PASSWORD`]..=[`MAX_PASSWORD`], [`AccountError::EmailTaken`] when a filer
     /// already answers to this address, [`AccountError::Full`] at [`MAX_ACCOUNTS`].
     pub fn create_with_password(
         &self,
         email: &str,
         password: &str,
-    ) -> Result<Account, AccountError> {
+    ) -> Result<ReportFiler, AccountError> {
         let address = Address::parse(email.trim()).map_err(|error| {
             AccountError::BadEmail(format!("`email` is not an address: {error}"))
         })?;
@@ -287,7 +287,7 @@ impl Accounts {
         }
         let hashed =
             hash_password(password).map_err(|error| AccountError::Io(error.to_string()))?;
-        self.insert(Account {
+        self.insert(ReportFiler {
             id: String::new(), // filled in by `insert`
             email: address.to_string(),
             email_verified: false,
@@ -299,7 +299,7 @@ impl Accounts {
         })
     }
 
-    /// Creates an account linked to one OAuth identity, with no password.
+    /// Creates a filer linked to one OAuth identity, with no password.
     ///
     /// `email_verified` is the provider's own claim, passed in rather than assumed — see
     /// [`crate::oauth`] for what this box requires before it trusts it.
@@ -312,16 +312,16 @@ impl Accounts {
         email_verified: bool,
         provider: &str,
         subject: &str,
-    ) -> Result<Account, AccountError> {
+    ) -> Result<ReportFiler, AccountError> {
         let address = Address::parse(email.trim()).map_err(|error| {
             AccountError::BadEmail(format!("`email` is not an address: {error}"))
         })?;
-        self.insert(Account {
+        self.insert(ReportFiler {
             id: String::new(),
             email: address.to_string(),
             email_verified,
             password: None,
-            oauth_links: vec![OAuthLink {
+            oauth_links: vec![FilingOAuthLink {
                 provider: provider.to_string(),
                 subject: subject.to_string(),
             }],
@@ -331,17 +331,17 @@ impl Accounts {
         })
     }
 
-    /// Creates an account with `email` and no credential at all yet — the passkey self-service
-    /// door, which mints the account first and adds the passkey once the ceremony that proves it
+    /// Creates a filer with `email` and no credential at all yet — the passkey self-service
+    /// door, which mints the filer first and adds the passkey once the ceremony that proves it
     /// succeeds. See `crate::webauthn`.
     ///
     /// # Errors
     /// The same as [`Self::create_with_password`], minus the password checks.
-    pub fn create_pending(&self, email: &str) -> Result<Account, AccountError> {
+    pub fn create_pending(&self, email: &str) -> Result<ReportFiler, AccountError> {
         let address = Address::parse(email.trim()).map_err(|error| {
             AccountError::BadEmail(format!("`email` is not an address: {error}"))
         })?;
-        self.insert(Account {
+        self.insert(ReportFiler {
             id: String::new(),
             email: address.to_string(),
             email_verified: false,
@@ -353,28 +353,28 @@ impl Accounts {
         })
     }
 
-    /// Links `provider`/`subject` to the account `id`, so a later OAuth login with the same
+    /// Links `provider`/`subject` to the filer `id`, so a later OAuth login with the same
     /// identity finds it. A link already present for this provider is left as it was rather
     /// than duplicated.
     ///
     /// # Errors
-    /// [`AccountError::NotFound`] when `id` names no account, or an [`AccountError::Io`] naming
+    /// [`AccountError::NotFound`] when `id` names no filer, or an [`AccountError::Io`] naming
     /// what could not be persisted.
     pub fn link_oauth(&self, id: &str, provider: &str, subject: &str) -> Result<(), AccountError> {
-        self.update(id, |account| {
-            if account
+        self.update(id, |filer| {
+            if filer
                 .oauth_links
                 .iter()
                 .any(|link| link.provider == provider)
             {
                 return Ok(());
             }
-            if account.oauth_links.len() >= MAX_OAUTH_LINKS {
+            if filer.oauth_links.len() >= MAX_OAUTH_LINKS {
                 return Err(AccountError::Io(format!(
-                    "an account may link at most {MAX_OAUTH_LINKS} sign-in providers"
+                    "a filer may link at most {MAX_OAUTH_LINKS} sign-in providers"
                 )));
             }
-            account.oauth_links.push(OAuthLink {
+            filer.oauth_links.push(FilingOAuthLink {
                 provider: provider.to_string(),
                 subject: subject.to_string(),
             });
@@ -382,18 +382,18 @@ impl Accounts {
         })
     }
 
-    /// Marks the account's email verified.
+    /// Marks the filer's email verified.
     ///
     /// # Errors
     /// [`AccountError::NotFound`] or an [`AccountError::Io`].
     pub fn mark_verified(&self, id: &str) -> Result<(), AccountError> {
-        self.update(id, |account| {
-            account.email_verified = true;
+        self.update(id, |filer| {
+            filer.email_verified = true;
             Ok(())
         })
     }
 
-    /// Replaces the account's password.
+    /// Replaces the filer's password.
     ///
     /// # Errors
     /// [`AccountError::WeakPassword`], [`AccountError::NotFound`], or an [`AccountError::Io`].
@@ -404,13 +404,13 @@ impl Accounts {
         }
         let hashed =
             hash_password(password).map_err(|error| AccountError::Io(error.to_string()))?;
-        self.update(id, |account| {
-            account.password = Some(hashed);
+        self.update(id, |filer| {
+            filer.password = Some(hashed);
             Ok(())
         })
     }
 
-    /// Records that this account filed `project`/`id` — called once, when the report is fresh;
+    /// Records that this filer filed `project`/`id` — called once, when the report is fresh;
     /// see `crate::store::Entry::account_id` for why a repeat sighting never calls this again.
     /// Past [`MAX_FILED_PER_ACCOUNT`] the oldest reference is dropped; the report itself is
     /// unaffected and stays reachable through the owner's feed.
@@ -423,20 +423,20 @@ impl Accounts {
         project: &str,
         id: &str,
     ) -> Result<(), AccountError> {
-        self.update(account_id, |account| {
-            account.filed.push(FiledRef {
+        self.update(account_id, |filer| {
+            filer.filed.push(FiledReport {
                 project: project.to_string(),
                 id: id.to_string(),
             });
-            if account.filed.len() > MAX_FILED_PER_ACCOUNT {
-                let excess = account.filed.len() - MAX_FILED_PER_ACCOUNT;
-                account.filed.drain(..excess);
+            if filer.filed.len() > MAX_FILED_PER_ACCOUNT {
+                let excess = filer.filed.len() - MAX_FILED_PER_ACCOUNT;
+                filer.filed.drain(..excess);
             }
             Ok(())
         })
     }
 
-    /// Removes `project`/`id` from this account's filed list — called when its own report is
+    /// Removes `project`/`id` from this filer's filed list — called when its own report is
     /// withdrawn, so a closed report does not linger in a dashboard's list.
     ///
     /// # Errors
@@ -447,29 +447,29 @@ impl Accounts {
         project: &str,
         id: &str,
     ) -> Result<(), AccountError> {
-        self.update(account_id, |account| {
-            account
+        self.update(account_id, |filer| {
+            filer
                 .filed
                 .retain(|reference| !(reference.project == project && reference.id == id));
             Ok(())
         })
     }
 
-    /// Whether `password` matches the account's stored hash. `false` for an account with no
-    /// password set — a passkey- or OAuth-only account never has a password to guess.
+    /// Whether `password` matches the filer's stored hash. `false` for a filer with no
+    /// password set — a passkey- or OAuth-only filer never has a password to guess.
     #[must_use]
-    pub fn verify_password(&self, account: &Account, password: &str) -> bool {
-        match &account.password {
+    pub fn verify_password(&self, filer: &ReportFiler, password: &str) -> bool {
+        match &filer.password {
             Some(stored) => selfhost_login::password::verify(stored, password),
             None => false,
         }
     }
 
-    /// Inserts `account`, assigning it a fresh id, enforcing [`MAX_ACCOUNTS`] and the one
-    /// account per email rule, and persisting.
-    fn insert(&self, mut account: Account) -> Result<Account, AccountError> {
+    /// Inserts `filer`, assigning it a fresh id, enforcing [`MAX_ACCOUNTS`] and the one
+    /// filer per email rule, and persisting.
+    fn insert(&self, mut filer: ReportFiler) -> Result<ReportFiler, AccountError> {
         let mut entries = self.lock();
-        let address = Address::parse(&account.email).expect("just parsed by the caller");
+        let address = Address::parse(&filer.email).expect("just parsed by the caller");
         if entries
             .iter()
             .any(|entry| Address::parse(&entry.email).is_ok_and(|stored| stored.matches(&address)))
@@ -479,54 +479,54 @@ impl Accounts {
         if entries.len() >= MAX_ACCOUNTS {
             return Err(AccountError::Full);
         }
-        account.id = fresh_id().map_err(|error| AccountError::Io(error.to_string()))?;
-        entries.push(account.clone());
+        filer.id = fresh_id().map_err(|error| AccountError::Io(error.to_string()))?;
+        entries.push(filer.clone());
         self.persist(&entries)
             .map_err(|error| AccountError::Io(error.to_string()))?;
-        Ok(account)
+        Ok(filer)
     }
 
-    /// Applies `change` to the account named `id` and persists.
+    /// Applies `change` to the filer named `id` and persists.
     fn update(
         &self,
         id: &str,
-        change: impl FnOnce(&mut Account) -> Result<(), AccountError>,
+        change: impl FnOnce(&mut ReportFiler) -> Result<(), AccountError>,
     ) -> Result<(), AccountError> {
         let mut entries = self.lock();
-        let account = entries
+        let filer = entries
             .iter_mut()
             .find(|entry| entry.id == id)
             .ok_or(AccountError::NotFound)?;
-        change(account)?;
+        change(filer)?;
         self.persist(&entries)
             .map_err(|error| AccountError::Io(error.to_string()))
     }
 
     /// Writes the store owner-only via a temporary file and rename, like every sibling
     /// credential store.
-    fn persist(&self, entries: &[Account]) -> io::Result<()> {
+    fn persist(&self, entries: &[ReportFiler]) -> io::Result<()> {
         if let Some(parent) = self.path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        let text = accounts_to_json(entries).to_text();
+        let text = filers_to_json(entries).to_text();
         let temporary = self.path.with_extension("json.tmp");
         std::fs::write(&temporary, &text)?;
         restrict(&temporary);
         std::fs::rename(&temporary, &self.path)
     }
 
-    fn lock(&self) -> std::sync::MutexGuard<'_, Vec<Account>> {
+    fn lock(&self) -> std::sync::MutexGuard<'_, Vec<ReportFiler>> {
         self.entries
             .lock()
-            .expect("the account store lock was poisoned")
+            .expect("the filer store lock was poisoned")
     }
 }
 
 // Deliberately not a revealing `Debug`: a password hash in a log line is a head start for an
 // offline guesser, and an email list is a target list.
-impl std::fmt::Debug for Accounts {
+impl std::fmt::Debug for ReportFilers {
     fn fmt(&self, out: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(out, "Accounts({} registered)", self.lock().len())
+        write!(out, "ReportFilers({} registered)", self.lock().len())
     }
 }
 
@@ -594,21 +594,22 @@ pub fn email_fingerprint(email: &str) -> String {
 
 /// The stored file's JSON shape: `{"accounts": [{id, email, emailVerified, password,
 /// oauthLinks: [{provider, subject}], createdUnix, plan}]}`.
-fn accounts_to_json(entries: &[Account]) -> Json {
+/// Field names match the original for wire format compatibility.
+fn filers_to_json(entries: &[ReportFiler]) -> Json {
     Json::object([(
         "accounts",
-        Json::array(entries.iter().map(|account| {
+        Json::array(entries.iter().map(|filer| {
             Json::object([
-                ("id", Json::string(&account.id)),
-                ("email", Json::string(&account.email)),
-                ("emailVerified", Json::Bool(account.email_verified)),
+                ("id", Json::string(&filer.id)),
+                ("email", Json::string(&filer.email)),
+                ("emailVerified", Json::Bool(filer.email_verified)),
                 (
                     "password",
-                    account.password.as_ref().map_or(Json::Null, Json::string),
+                    filer.password.as_ref().map_or(Json::Null, Json::string),
                 ),
                 (
                     "oauthLinks",
-                    Json::array(account.oauth_links.iter().map(|link| {
+                    Json::array(filer.oauth_links.iter().map(|link| {
                         Json::object([
                             ("provider", Json::string(&link.provider)),
                             ("subject", Json::string(&link.subject)),
@@ -617,15 +618,15 @@ fn accounts_to_json(entries: &[Account]) -> Json {
                 ),
                 (
                     "filed",
-                    Json::array(account.filed.iter().map(|reference| {
+                    Json::array(filer.filed.iter().map(|reference| {
                         Json::object([
                             ("project", Json::string(&reference.project)),
                             ("id", Json::string(&reference.id)),
                         ])
                     })),
                 ),
-                ("createdUnix", Json::Number(account.created_unix as f64)),
-                ("plan", Json::string(&account.plan)),
+                ("createdUnix", Json::Number(filer.created_unix as f64)),
+                ("plan", Json::string(&filer.plan)),
             ])
         })),
     )])
@@ -633,14 +634,14 @@ fn accounts_to_json(entries: &[Account]) -> Json {
 
 /// Parses the stored file. `None` for anything malformed — a duplicate email or id included,
 /// since either could only be corruption and both would otherwise let one email answer to two
-/// accounts.
-fn parse_accounts(text: &str) -> Option<Vec<Account>> {
+/// filers.
+fn parse_filers(text: &str) -> Option<Vec<ReportFiler>> {
     let value = selfhost_json::parse(text).ok()?;
     let items = value.get("accounts")?.as_array()?;
     if items.len() > MAX_ACCOUNTS {
         return None;
     }
-    let mut entries: Vec<Account> = Vec::new();
+    let mut entries: Vec<ReportFiler> = Vec::new();
     for item in items {
         let id = item.get("id")?.as_str()?.to_owned();
         let email = item.get("email")?.as_str()?.to_owned();
@@ -660,7 +661,7 @@ fn parse_accounts(text: &str) -> Option<Vec<Account>> {
                 items
                     .iter()
                     .filter_map(|item| {
-                        Some(OAuthLink {
+                        Some(FilingOAuthLink {
                             provider: item.get("provider")?.as_str()?.to_owned(),
                             subject: item.get("subject")?.as_str()?.to_owned(),
                         })
@@ -675,7 +676,7 @@ fn parse_accounts(text: &str) -> Option<Vec<Account>> {
                 items
                     .iter()
                     .filter_map(|item| {
-                        Some(FiledRef {
+                        Some(FiledReport {
                             project: item.get("project")?.as_str()?.to_owned(),
                             id: item.get("id")?.as_str()?.to_owned(),
                         })
@@ -683,7 +684,7 @@ fn parse_accounts(text: &str) -> Option<Vec<Account>> {
                     .collect()
             })
             .unwrap_or_default();
-        entries.push(Account {
+        entries.push(ReportFiler {
             id,
             email,
             email_verified: item
@@ -722,39 +723,39 @@ mod tests {
     }
 
     #[test]
-    fn a_registered_account_verifies_its_own_password_and_no_other() {
+    fn a_registered_filer_verifies_its_own_password_and_no_other() {
         let dir = scratch("password");
-        let accounts = Accounts::load(&dir);
-        let account = accounts
+        let filers = ReportFilers::load(&dir);
+        let filer = filers
             .create_with_password("Alice@example.com", "hunter2fish")
             .expect("registers");
-        assert!(account.id.starts_with("acct-"));
-        assert!(!account.email_verified);
-        assert!(accounts.verify_password(&account, "hunter2fish"));
-        assert!(!accounts.verify_password(&account, "wrong"));
+        assert!(filer.id.starts_with("acct-"));
+        assert!(!filer.email_verified);
+        assert!(filers.verify_password(&filer, "hunter2fish"));
+        assert!(!filers.verify_password(&filer, "wrong"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
-    fn an_account_with_no_password_never_verifies_one() {
+    fn a_filer_with_no_password_never_verifies_one() {
         let dir = scratch("no-password");
-        let accounts = Accounts::load(&dir);
-        let account = accounts
+        let filers = ReportFilers::load(&dir);
+        let filer = filers
             .create_with_oauth("alex@example.com", true, "google", "sub-1")
             .expect("registers");
-        assert!(!accounts.verify_password(&account, ""));
-        assert!(!accounts.verify_password(&account, "anything"));
+        assert!(!filers.verify_password(&filer, ""));
+        assert!(!filers.verify_password(&filer, "anything"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn email_lookup_folds_case_the_way_the_mail_crate_routes() {
         let dir = scratch("case");
-        let accounts = Accounts::load(&dir);
-        accounts
+        let filers = ReportFilers::load(&dir);
+        filers
             .create_with_password("Alice@Example.com", "hunter2fish")
             .expect("registers");
-        let found = accounts
+        let found = filers
             .find_by_email(&Address::parse("alice@example.com").unwrap())
             .expect("found despite different case");
         assert_eq!(
@@ -765,13 +766,13 @@ mod tests {
     }
 
     #[test]
-    fn two_accounts_cannot_share_one_email() {
+    fn two_filers_cannot_share_one_email() {
         let dir = scratch("taken");
-        let accounts = Accounts::load(&dir);
-        accounts
+        let filers = ReportFilers::load(&dir);
+        filers
             .create_with_password("alice@example.com", "hunter2fish")
             .expect("first registers");
-        let error = accounts
+        let error = filers
             .create_with_password("Alice@Example.com", "differentpw")
             .expect_err("refused");
         assert_eq!(error, AccountError::EmailTaken);
@@ -781,21 +782,21 @@ mod tests {
     #[test]
     fn a_password_outside_the_bounds_is_refused_before_anything_is_hashed() {
         let dir = scratch("weak");
-        let accounts = Accounts::load(&dir);
+        let filers = ReportFilers::load(&dir);
         assert_eq!(
-            accounts
+            filers
                 .create_with_password("a@example.com", "short")
                 .unwrap_err(),
             AccountError::WeakPassword
         );
         assert_eq!(
-            accounts
+            filers
                 .create_with_password("a@example.com", &"x".repeat(MAX_PASSWORD + 1))
                 .unwrap_err(),
             AccountError::WeakPassword
         );
         assert!(
-            accounts
+            filers
                 .find_by_email(&Address::parse("a@example.com").unwrap())
                 .is_none()
         );
@@ -805,8 +806,8 @@ mod tests {
     #[test]
     fn an_address_that_is_not_an_address_is_refused_by_name() {
         let dir = scratch("bad-email");
-        let accounts = Accounts::load(&dir);
-        let error = accounts
+        let filers = ReportFilers::load(&dir);
+        let error = filers
             .create_with_password("not an address", "hunter2fish")
             .expect_err("refused");
         assert!(matches!(error, AccountError::BadEmail(_)), "{error}");
@@ -819,16 +820,16 @@ mod tests {
     #[test]
     fn a_refused_address_names_the_field_and_never_repeats_what_was_sent() {
         let dir = scratch("bad-email-not-echoed");
-        let accounts = Accounts::load(&dir);
+        let filers = ReportFilers::load(&dir);
         let payload = "<script>alert(1)</script>";
         let refusals = [
-            accounts
+            filers
                 .create_with_password(payload, "hunter2fish")
                 .expect_err("refused"),
-            accounts
+            filers
                 .create_with_oauth(payload, true, "google", "sub-1")
                 .expect_err("refused"),
-            accounts.create_pending(payload).expect_err("refused"),
+            filers.create_pending(payload).expect_err("refused"),
         ];
         for error in refusals {
             let message = error.to_string();
@@ -844,15 +845,15 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// The seam an account takeover ran through: "this account has a credential" is not
+    /// The seam a filer takeover ran through: "this filer has a credential" is not
     /// "somebody proved this address is theirs", and only the second may be merged into by
     /// address alone.
     #[test]
     fn an_address_counts_as_proven_only_once_something_actually_proved_it() {
         let dir = scratch("email-proven");
-        let accounts = Accounts::load(&dir);
+        let filers = ReportFilers::load(&dir);
 
-        let squatted = accounts
+        let squatted = filers
             .create_pending("victim@example.com")
             .expect("registers");
         assert!(
@@ -860,7 +861,7 @@ mod tests {
             "naming an address is not proving it"
         );
 
-        let with_password = accounts
+        let with_password = filers
             .create_with_password("typed-it-in@example.com", "hunter2fish")
             .expect("registers");
         assert!(
@@ -868,19 +869,19 @@ mod tests {
             "a password proves a password, not an address"
         );
 
-        let unvouched = accounts
+        let unvouched = filers
             .create_with_oauth("unvouched@example.com", false, "example", "sub-1")
             .expect("registers");
         assert!(!unvouched.email_proven());
 
-        let vouched = accounts
+        let vouched = filers
             .create_with_oauth("vouched@example.com", true, "example", "sub-2")
             .expect("registers");
         assert!(vouched.email_proven(), "the provider checked");
 
-        accounts.mark_verified(&squatted.id).expect("verified");
+        filers.mark_verified(&squatted.id).expect("verified");
         assert!(
-            accounts
+            filers
                 .find_by_id(&squatted.id)
                 .expect("still there")
                 .email_proven(),
@@ -890,22 +891,22 @@ mod tests {
     }
 
     #[test]
-    fn oauth_linking_finds_the_account_back_by_provider_and_subject() {
+    fn oauth_linking_finds_the_filer_back_by_provider_and_subject() {
         let dir = scratch("oauth-link");
-        let accounts = Accounts::load(&dir);
-        let account = accounts
+        let filers = ReportFilers::load(&dir);
+        let filer = filers
             .create_pending("alex@example.com")
             .expect("registers");
-        accounts
-            .link_oauth(&account.id, "google", "sub-42")
+        filers
+            .link_oauth(&filer.id, "google", "sub-42")
             .expect("linked");
-        let found = accounts
+        let found = filers
             .find_by_oauth("google", "sub-42")
             .expect("found by the link");
-        assert_eq!(found.id, account.id);
-        assert!(accounts.find_by_oauth("google", "sub-99").is_none());
+        assert_eq!(found.id, filer.id);
+        assert!(filers.find_by_oauth("google", "sub-99").is_none());
         assert!(
-            accounts.find_by_oauth("github", "sub-42").is_none(),
+            filers.find_by_oauth("github", "sub-42").is_none(),
             "the provider must match too"
         );
         let _ = std::fs::remove_dir_all(&dir);
@@ -914,17 +915,17 @@ mod tests {
     #[test]
     fn linking_the_same_provider_twice_does_not_duplicate() {
         let dir = scratch("oauth-relink");
-        let accounts = Accounts::load(&dir);
-        let account = accounts
+        let filers = ReportFilers::load(&dir);
+        let filer = filers
             .create_pending("alex@example.com")
             .expect("registers");
-        accounts
-            .link_oauth(&account.id, "google", "sub-1")
+        filers
+            .link_oauth(&filer.id, "google", "sub-1")
             .expect("linked");
-        accounts
-            .link_oauth(&account.id, "google", "sub-1")
+        filers
+            .link_oauth(&filer.id, "google", "sub-1")
             .expect("linked again is a no-op");
-        let reloaded = accounts.find_by_id(&account.id).expect("found");
+        let reloaded = filers.find_by_id(&filer.id).expect("found");
         assert_eq!(reloaded.oauth_links.len(), 1);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -932,23 +933,23 @@ mod tests {
     #[test]
     fn filed_reports_are_recorded_and_withdrawn_ones_are_removed() {
         let dir = scratch("filed");
-        let accounts = Accounts::load(&dir);
-        let account = accounts
+        let filers = ReportFilers::load(&dir);
+        let filer = filers
             .create_pending("alex@example.com")
             .expect("registers");
-        accounts
-            .record_filed(&account.id, "dx", "report-aaaa1111")
+        filers
+            .record_filed(&filer.id, "dx", "report-aaaa1111")
             .expect("recorded");
-        accounts
-            .record_filed(&account.id, "dx", "report-bbbb2222")
+        filers
+            .record_filed(&filer.id, "dx", "report-bbbb2222")
             .expect("recorded");
-        let reloaded = accounts.find_by_id(&account.id).expect("found");
+        let reloaded = filers.find_by_id(&filer.id).expect("found");
         assert_eq!(reloaded.filed.len(), 2);
 
-        accounts
-            .remove_filed(&account.id, "dx", "report-aaaa1111")
+        filers
+            .remove_filed(&filer.id, "dx", "report-aaaa1111")
             .expect("removed");
-        let after = accounts.find_by_id(&account.id).expect("found");
+        let after = filers.find_by_id(&filer.id).expect("found");
         assert_eq!(after.filed.len(), 1);
         assert_eq!(after.filed[0].id, "report-bbbb2222");
         let _ = std::fs::remove_dir_all(&dir);
@@ -957,16 +958,16 @@ mod tests {
     #[test]
     fn the_filed_list_is_capped_and_drops_the_oldest() {
         let dir = scratch("filed-cap");
-        let accounts = Accounts::load(&dir);
-        let account = accounts
+        let filers = ReportFilers::load(&dir);
+        let filer = filers
             .create_pending("alex@example.com")
             .expect("registers");
         for nth in 0..(MAX_FILED_PER_ACCOUNT + 10) {
-            accounts
-                .record_filed(&account.id, "dx", &format!("report-{nth:08x}"))
+            filers
+                .record_filed(&filer.id, "dx", &format!("report-{nth:08x}"))
                 .expect("recorded");
         }
-        let reloaded = accounts.find_by_id(&account.id).expect("found");
+        let reloaded = filers.find_by_id(&filer.id).expect("found");
         assert_eq!(reloaded.filed.len(), MAX_FILED_PER_ACCOUNT);
         assert_eq!(
             reloaded.filed.last().unwrap().id,
@@ -979,18 +980,18 @@ mod tests {
     #[test]
     fn verifying_an_email_and_setting_a_password_persist_across_a_reload() {
         let dir = scratch("persist");
-        let accounts = Accounts::load(&dir);
-        let account = accounts
+        let filers = ReportFilers::load(&dir);
+        let filer = filers
             .create_pending("alex@example.com")
             .expect("registers");
-        accounts.mark_verified(&account.id).expect("verified");
-        accounts
-            .set_password(&account.id, "brandnewpassword")
+        filers.mark_verified(&filer.id).expect("verified");
+        filers
+            .set_password(&filer.id, "brandnewpassword")
             .expect("password set");
 
-        let reloaded = Accounts::load(&dir);
+        let reloaded = ReportFilers::load(&dir);
         let found = reloaded
-            .find_by_id(&account.id)
+            .find_by_id(&filer.id)
             .expect("found after reload");
         assert!(found.email_verified);
         assert!(reloaded.verify_password(&found, "brandnewpassword"));
@@ -998,18 +999,18 @@ mod tests {
     }
 
     #[test]
-    fn an_account_file_written_before_the_plan_field_existed_still_parses() {
-        // `plan` did not exist when the account store's format was first written; a stored
-        // account with no such field must still load rather than being treated as corruption.
+    fn a_filer_file_written_before_the_plan_field_existed_still_parses() {
+        // `plan` did not exist when the filer store's format was first written; a stored
+        // filer with no such field must still load rather than being treated as corruption.
         let dir = scratch("pre-plan");
         std::fs::write(
-            Accounts::path_in(&dir),
+            ReportFilers::path_in(&dir),
             r#"{"accounts":[
                 {"id":"acct-1","email":"a@example.com","emailVerified":false,"password":null,"oauthLinks":[],"createdUnix":1}
             ]}"#,
         )
         .unwrap();
-        let found = Accounts::load(&dir)
+        let found = ReportFilers::load(&dir)
             .find_by_id("acct-1")
             .expect("still parses");
         assert_eq!(found.plan, "free");
@@ -1019,13 +1020,13 @@ mod tests {
     #[test]
     fn an_unknown_id_is_refused_by_name_rather_than_panicking() {
         let dir = scratch("not-found");
-        let accounts = Accounts::load(&dir);
+        let filers = ReportFilers::load(&dir);
         assert_eq!(
-            accounts.mark_verified("acct-deadbeef").unwrap_err(),
+            filers.mark_verified("acct-deadbeef").unwrap_err(),
             AccountError::NotFound
         );
         assert_eq!(
-            accounts
+            filers
                 .set_password("acct-deadbeef", "longenoughpassword")
                 .unwrap_err(),
             AccountError::NotFound
@@ -1034,15 +1035,15 @@ mod tests {
     }
 
     #[test]
-    fn registration_past_the_cap_is_refused_while_existing_accounts_keep_working() {
+    fn registration_past_the_cap_is_refused_while_existing_filers_keep_working() {
         let dir = scratch("cap");
         // Seeded directly at `MAX_ACCOUNTS - 1` in one write, rather than by looping
         // `create_*` that many times: `insert` rewrites the whole file on every call, so a
         // tight loop to the cap pays for that rewrite ten thousand times over just to reach
         // the boundary this test actually cares about. One seed write plus the two calls
         // at the boundary prove the same bound `insert` enforces.
-        let accounts = Accounts::load(&dir);
-        let seeded = (0..MAX_ACCOUNTS - 1).map(|nth| Account {
+        let filers = ReportFilers::load(&dir);
+        let seeded = (0..MAX_ACCOUNTS - 1).map(|nth| ReportFiler {
             id: format!("acct-{nth:028x}"),
             email: format!("user{nth}@example.com"),
             email_verified: false,
@@ -1052,33 +1053,33 @@ mod tests {
             created_unix: 0,
             plan: "free".to_string(),
         });
-        accounts.lock().extend(seeded);
+        filers.lock().extend(seeded);
 
-        accounts
+        filers
             .create_pending("last-one-under-the-cap@example.com")
             .expect("the final slot is still open");
-        let error = accounts
+        let error = filers
             .create_pending("one-too-many@example.com")
             .expect_err("refused");
         assert_eq!(error, AccountError::Full);
         assert!(
-            accounts
+            filers
                 .find_by_email(&Address::parse("user0@example.com").unwrap())
                 .is_some(),
-            "accounts already registered keep working"
+            "filers already registered keep working"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[cfg(unix)]
     #[test]
-    fn the_account_file_is_readable_only_by_its_owner() {
+    fn the_filer_file_is_readable_only_by_its_owner() {
         use std::os::unix::fs::PermissionsExt;
         let dir = scratch("perms");
-        Accounts::load(&dir)
+        ReportFilers::load(&dir)
             .create_with_password("alex@example.com", "hunter2fish")
             .expect("registers");
-        let mode = std::fs::metadata(Accounts::path_in(&dir))
+        let mode = std::fs::metadata(ReportFilers::path_in(&dir))
             .unwrap()
             .permissions()
             .mode();
@@ -1087,20 +1088,20 @@ mod tests {
     }
 
     #[test]
-    fn a_malformed_account_file_loads_empty_rather_than_half_open() {
+    fn a_malformed_filer_file_loads_empty_rather_than_half_open() {
         let dir = scratch("malformed");
-        std::fs::write(Accounts::path_in(&dir), "not json").unwrap();
-        assert!(Accounts::load(&dir).find_by_id("acct-anything").is_none());
+        std::fs::write(ReportFilers::path_in(&dir), "not json").unwrap();
+        assert!(ReportFilers::load(&dir).find_by_id("acct-anything").is_none());
         // A duplicate email is corruption, not a legal state: it must load empty.
         std::fs::write(
-            Accounts::path_in(&dir),
+            ReportFilers::path_in(&dir),
             r#"{"accounts":[
                 {"id":"acct-1","email":"a@example.com","emailVerified":false,"password":null,"oauthLinks":[],"createdUnix":1,"plan":"free"},
                 {"id":"acct-2","email":"a@example.com","emailVerified":false,"password":null,"oauthLinks":[],"createdUnix":1,"plan":"free"}
             ]}"#,
         )
         .unwrap();
-        assert!(Accounts::load(&dir).find_by_id("acct-1").is_none());
+        assert!(ReportFilers::load(&dir).find_by_id("acct-1").is_none());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
