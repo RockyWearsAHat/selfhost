@@ -138,6 +138,13 @@ const SURFACE: &[(&str, &str, Reach)] = &[
     // The same shape: signed in is enough to ask, and the Grant on the Site
     // named in the body is checked inside `Api::pass_authorize`.
     ("POST", "/api/pass/authorize", Reach::Granted),
+    // My devices — same shape again: signed in is enough to ask, and which
+    // devices come back (or may be forgotten) is decided inside the handler
+    // by identity, never by a grant. This newcomer has none of their own yet,
+    // so `Api::vpn_devices` answers an empty list and `Api::vpn_forget_device`
+    // a 404 — both still reached, not the wall's 401.
+    ("GET", "/api/vpn/devices", Reach::Granted),
+    ("DELETE", "/api/vpn/devices/anything", Reach::Granted),
     // Capability::SiteAdmin — the newcomer holds console.read and files.read on
     // one share, never site.admin, so every one of these is withheld exactly
     // like the service-control routes above. The wall is checked before

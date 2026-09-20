@@ -50,6 +50,48 @@ pub fn owner_of(data_dir: &Path, peer: &str) -> Option<String> {
     owner_in(&text, peer).map(str::to_owned)
 }
 
+/// Every Peer name currently bound to `person`, in the order their bindings
+/// appear in the file.
+///
+/// Used to answer "what are my devices" — see
+/// [`crate::people_api::VpnWiring::devices_of`]. A missing file is no
+/// devices, the same reading [`owner_of`] gives it.
+pub fn peers_of(data_dir: &Path, person: &str) -> Vec<String> {
+    let text = std::fs::read_to_string(path_in(data_dir)).unwrap_or_default();
+    text.lines()
+        .filter_map(|line| {
+            let (peer, owner) = line.split_once(' ')?;
+            (owner == person).then(|| peer.to_owned())
+        })
+        .collect()
+}
+
+/// Removes `peer`'s binding, if it has one.
+///
+/// Unbinding a Peer nobody has ever bound, or unbinding one twice, is not an
+/// error — both leave the file in the state the caller wanted, the same
+/// idempotence [`selfhost_vpn::enrol::revoke`] gives the key file and roster
+/// line this is meant to be forgotten alongside. See
+/// [`crate::people_api::VpnWiring::forget_device`], the one place this and
+/// that revoke are called together.
+pub fn unbind(data_dir: &Path, peer: &str) -> Result<(), String> {
+    let path = path_in(data_dir);
+    let text = match std::fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(format!("cannot read {}: {error}", path.display())),
+    };
+    let kept: String = text
+        .lines()
+        .filter(|line| line.split_once(' ').map(|(name, _)| name) != Some(peer))
+        .map(|line| format!("{line}\n"))
+        .collect();
+    if kept == text {
+        return Ok(());
+    }
+    write_owner_only(&path, &kept).map_err(|error| format!("cannot write {}: {error}", path.display()))
+}
+
 fn owner_in<'a>(text: &'a str, peer: &str) -> Option<&'a str> {
     text.lines().find_map(|line| {
         let (name, person) = line.split_once(' ')?;
@@ -94,5 +136,36 @@ mod tests {
         bind(&dir, "phone-1", "mom").unwrap();
         let mode = std::fs::metadata(path_in(&dir)).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600);
+    }
+
+    #[test]
+    fn peers_of_lists_only_that_persons_devices() {
+        let dir = scratch("peers-of");
+        bind(&dir, "laptop-4f2a", "mom").unwrap();
+        bind(&dir, "phone-1", "mom").unwrap();
+        bind(&dir, "tablet-9", "dad").unwrap();
+        let mut mine = peers_of(&dir, "mom");
+        mine.sort();
+        assert_eq!(mine, vec!["laptop-4f2a".to_owned(), "phone-1".to_owned()]);
+        assert_eq!(peers_of(&dir, "nobody"), Vec::<String>::new());
+    }
+
+    #[test]
+    fn unbind_drops_the_binding_and_leaves_the_rest() {
+        let dir = scratch("unbind");
+        bind(&dir, "laptop-4f2a", "mom").unwrap();
+        bind(&dir, "phone-1", "mom").unwrap();
+        unbind(&dir, "laptop-4f2a").unwrap();
+        assert_eq!(owner_of(&dir, "laptop-4f2a"), None);
+        assert_eq!(owner_of(&dir, "phone-1").as_deref(), Some("mom"));
+        // A Peer forgotten this way is free for somebody else to enrol.
+        bind(&dir, "laptop-4f2a", "dad").expect("the name is free again");
+    }
+
+    #[test]
+    fn unbinding_an_unbound_peer_is_not_an_error() {
+        let dir = scratch("unbind-absent");
+        unbind(&dir, "nobody").expect("unbind of an absent binding is a no-op");
+        assert!(!path_in(&dir).exists(), "no file is created just to record nothing");
     }
 }

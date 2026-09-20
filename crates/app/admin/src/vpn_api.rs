@@ -10,8 +10,19 @@ use selfhost_identity::{Capability, Credential, Identity, People, Policy, Person
 
 /// Checks if a user has access to a specific VPN location.
 ///
+/// `vpn` resolves `user_id` from a Peer (the device the relay actually saw)
+/// to its Person before anything else is checked, via
+/// [`crate::people_api::VpnWiring::owner_of_peer`] — the same binding
+/// [`crate::people_api::forget_device`] removes. A Peer nobody has ever bound,
+/// or one since forgotten, is nobody: this is what makes forgetting a device
+/// actually cut it off, rather than merely tidying the roster file. `vpn` is
+/// `None` only where no `[[vpn]]` relay is configured at all, in which case
+/// `user_id` is taken as a Person's own name, unresolved — the pre-binding
+/// behaviour, kept so a deployment with no relay yet does not have to carry a
+/// `VpnWiring` just to ask this question.
+///
 /// Returns a JSON response with `allowed` field and optional `reason` if denied.
-pub fn check_access(people: Option<&People>, body: &[u8]) -> Response {
+pub fn check_access(people: Option<&People>, vpn: Option<&crate::people_api::VpnWiring>, body: &[u8]) -> Response {
     // Parse request body
     let text = match std::str::from_utf8(body) {
         Ok(t) => t,
@@ -39,6 +50,28 @@ pub fn check_access(people: Option<&People>, body: &[u8]) -> Response {
             ("allowed", Json::Bool(false)),
             ("reason", Json::String("no permission registry".to_string())),
         ]));
+    };
+
+    // A relay asks about whoever actually connected, and names them by their
+    // Peer — the device, never the Person directly. Resolve it to a Person
+    // before anything else is checked; an unbound Peer (never enrolled, or
+    // forgotten since) is nobody, not a fallback onto treating its name as a
+    // Person's.
+    let owner;
+    let user_id = match vpn {
+        Some(vpn) => match vpn.owner_of_peer(user_id) {
+            Some(person) => {
+                owner = person;
+                owner.as_str()
+            }
+            None => {
+                return json_response(Status(200), Json::object([
+                    ("allowed", Json::Bool(false)),
+                    ("reason", Json::String("unknown device".to_string())),
+                ]));
+            }
+        },
+        None => user_id,
     };
 
     // Look up the user
@@ -136,13 +169,13 @@ mod tests {
 
     #[test]
     fn test_check_access_missing_user_id() {
-        let response = check_access(None, b"{}");
+        let response = check_access(None, None, b"{}");
         assert_eq!(response.status.0, 400);
     }
 
     #[test]
     fn test_check_access_no_registry() {
-        let response = check_access(None, b"{\"user_id\":\"test\",\"location_id\":\"us-east-1\"}");
+        let response = check_access(None, None, b"{\"user_id\":\"test\",\"location_id\":\"us-east-1\"}");
         assert_eq!(response.status.0, 200);
         assert!(!allowed(&response), "no registry means nobody is allowed");
     }
@@ -151,7 +184,7 @@ mod tests {
     fn an_unknown_user_is_denied() {
         let people = People::load(&scratch("unknown-user"));
         let response =
-            check_access(Some(&people), br#"{"user_id":"nobody","location_id":"console"}"#);
+            check_access(Some(&people), None, br#"{"user_id":"nobody","location_id":"console"}"#);
         assert!(!allowed(&response));
     }
 
@@ -162,7 +195,7 @@ mod tests {
             .set_grants(&PersonName::parse("alex").unwrap(), Grants::none())
             .expect("register alex");
         let response =
-            check_access(Some(&people), br#"{"user_id":"alex","location_id":"console"}"#);
+            check_access(Some(&people), None, br#"{"user_id":"alex","location_id":"console"}"#);
         assert!(!allowed(&response), "no vpn.access grant must not open the door");
     }
 
@@ -175,7 +208,7 @@ mod tests {
         .unwrap();
         people.set_grants(&PersonName::parse("alex").unwrap(), grants).expect("register alex");
         let response =
-            check_access(Some(&people), br#"{"user_id":"alex","location_id":"console"}"#);
+            check_access(Some(&people), None, br#"{"user_id":"alex","location_id":"console"}"#);
         assert!(!allowed(&response), "a grant for one location must not open another");
     }
 
@@ -188,7 +221,7 @@ mod tests {
         .unwrap();
         people.set_grants(&PersonName::parse("alex").unwrap(), grants).expect("register alex");
         let response =
-            check_access(Some(&people), br#"{"user_id":"alex","location_id":"console"}"#);
+            check_access(Some(&people), None, br#"{"user_id":"alex","location_id":"console"}"#);
         assert!(allowed(&response));
     }
 
@@ -203,7 +236,57 @@ mod tests {
         let owner_grants = Grants::new([Capability::Owner]).unwrap();
         people.set_grants(&PersonName::parse("alex").unwrap(), owner_grants).expect("register alex");
         let response =
-            check_access(Some(&people), br#"{"user_id":"alex","location_id":"ai-studio"}"#);
+            check_access(Some(&people), None, br#"{"user_id":"alex","location_id":"ai-studio"}"#);
         assert!(allowed(&response), "a holder of Capability::Owner is allowed any location");
+    }
+
+    #[test]
+    fn a_device_answers_for_the_person_it_is_bound_to() {
+        let dir = scratch("device-resolves");
+        let people = People::load(&dir);
+        let grants =
+            Grants::new([Capability::VpnAccess(selfhost_identity::VpnLocationId::parse("console").unwrap())])
+                .unwrap();
+        people.set_grants(&PersonName::parse("alex").unwrap(), grants).expect("register alex");
+        crate::peer_binding::bind(&dir, "alex-laptop", "alex").expect("bind the peer");
+        let vpn = crate::people_api::VpnWiring::new(Vec::new(), dir);
+
+        let body = br#"{"user_id":"alex-laptop","location_id":"console"}"#;
+        assert!(allowed(&check_access(Some(&people), Some(&vpn), body)));
+        // With no VpnWiring at all (no `[[vpn]]` relay configured), the raw
+        // `user_id` is never taken as a Person's name behind its back — that
+        // fallback exists only for a deployment with no relay to bind against.
+        assert!(!allowed(&check_access(Some(&people), None, body)), "a Peer name is not a Person's name");
+    }
+
+    #[test]
+    fn a_forgotten_device_is_denied_even_though_the_person_still_holds_the_grant() {
+        // The point of resolving a Peer to its Person here: forgetting a
+        // device (`crate::people_api::forget_device` — the same function
+        // `selfhost people forget-device` and `DELETE /api/vpn/devices/<peer>`
+        // call) must actually cut that device off, not just tidy a roster
+        // file nothing else reads. The Person's own grant is untouched
+        // throughout — what changes is which devices answer for them.
+        let dir = scratch("forgotten-device-denied");
+        let people = People::load(&dir);
+        let grants =
+            Grants::new([Capability::VpnAccess(selfhost_identity::VpnLocationId::parse("console").unwrap())])
+                .unwrap();
+        people.set_grants(&PersonName::parse("alex").unwrap(), grants).expect("register alex");
+        crate::peer_binding::bind(&dir, "alex-laptop", "alex").expect("bind the peer");
+        let vpn = crate::people_api::VpnWiring::new(Vec::new(), dir);
+        let body = br#"{"user_id":"alex-laptop","location_id":"console"}"#;
+        assert!(allowed(&check_access(Some(&people), Some(&vpn), body)), "bound and granted: allowed");
+
+        vpn.forget_device("mom", "alex-laptop").expect_err("not mom's device to forget");
+        assert!(allowed(&check_access(Some(&people), Some(&vpn), body)), "a refused forget changes nothing");
+
+        vpn.forget_device("alex", "alex-laptop").expect("alex's own device");
+        assert!(!allowed(&check_access(Some(&people), Some(&vpn), body)), "the device is gone; alex still holds the grant");
+
+        // Trying the Person's own name in place of the forgotten device's
+        // does not somehow still work — a name is never a device.
+        let by_person_name = br#"{"user_id":"alex","location_id":"console"}"#;
+        assert!(!allowed(&check_access(Some(&people), Some(&vpn), by_person_name)));
     }
 }

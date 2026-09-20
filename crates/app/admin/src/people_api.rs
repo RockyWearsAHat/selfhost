@@ -339,6 +339,37 @@ pub fn vpn_side_effects(
     lines
 }
 
+/// Removes one of `person`'s VPN devices entirely: the key file and roster
+/// line on every relay that knows it, and the ownership binding.
+///
+/// The one forget path shared by `selfhost people forget-device` and the
+/// console's self-service `DELETE /api/vpn/devices/<peer>`, so a fix here
+/// reaches both without being written twice — the same reason
+/// [`vpn_side_effects`] is a free function rather than logic folded into
+/// either door.
+///
+/// Refuses a `peer` not bound to `person` — unbound, or bound to somebody
+/// else — before touching any relay, with one message for both cases: a
+/// caller must not be able to tell "no such device" from "not yours" by
+/// trying names.
+pub fn forget_device(
+    relays: &[selfhost_config::vpn::Relay],
+    data_dir: &Path,
+    person: &str,
+    peer: &str,
+) -> Result<(), String> {
+    match crate::peer_binding::owner_of(data_dir, peer) {
+        Some(owner) if owner == person => {}
+        _ => return Err(format!("\"{peer}\" is not one of {person}'s devices")),
+    }
+    for relay in relays {
+        let key_dir = selfhost_vpn::keys::key_dir(relay, data_dir);
+        selfhost_vpn::revoke(&key_dir, peer)
+            .map_err(|error| format!("could not revoke \"{peer}\" on \"{}\": {error}", relay.name))?;
+    }
+    crate::peer_binding::unbind(data_dir, peer)
+}
+
 /// What `PUT /api/people/<name>` needs to run [`vpn_side_effects`]: the relays
 /// this deployment declares, and the data directory their key directories are
 /// resolved relative to.
@@ -382,6 +413,30 @@ impl VpnWiring {
     /// configuration order.
     pub fn relay_names(&self) -> Vec<&str> {
         self.relays.iter().map(|relay| relay.name.as_str()).collect()
+    }
+
+    /// The Person `peer` is bound to, if any — for scoping a self-service
+    /// route to the caller's own devices before it touches one. See
+    /// [`crate::peer_binding::owner_of`].
+    pub fn owner_of_peer(&self, peer: &str) -> Option<String> {
+        crate::peer_binding::owner_of(&self.data_dir, peer)
+    }
+
+    /// Every device currently bound to `person`, for `GET /api/vpn/devices`.
+    /// See [`crate::peer_binding::peers_of`].
+    pub fn devices_of(&self, person: &str) -> Vec<String> {
+        crate::peer_binding::peers_of(&self.data_dir, person)
+    }
+
+    /// Forgets one of `person`'s devices: the same [`forget_device`] function
+    /// `selfhost people forget-device` calls.
+    ///
+    /// Refuses a `peer` that is not bound to `person` — including one bound
+    /// to somebody else, or one nothing has ever bound — with the same
+    /// message either way, so a caller cannot tell "no such device" from
+    /// "not yours" by trying names.
+    pub fn forget_device(&self, person: &str, peer: &str) -> Result<(), String> {
+        forget_device(&self.relays, &self.data_dir, person, peer)
     }
 
     /// Runs [`vpn_side_effects`] against the relays and data directory this
