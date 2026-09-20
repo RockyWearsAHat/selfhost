@@ -9,12 +9,9 @@
 //! line. It holds no secret; it is private because who owns which device is
 //! nobody else's business.
 
+use selfhost_config::vpn::RESERVED_PEER_NAMES;
 use selfhost_identity::registry::write_owner_only;
 use std::path::{Path, PathBuf};
-
-/// Roster names that are a role rather than a device, and so can never be one
-/// Person's Peer. `client` was the single shared key every device once used.
-const SHARED_NAMES: [&str; 2] = ["client", "server"];
 
 /// Where the bindings live under `data_dir`.
 pub fn path_in(data_dir: &Path) -> PathBuf {
@@ -26,7 +23,7 @@ pub fn path_in(data_dir: &Path) -> PathBuf {
 /// Refuses a shared role name, and a Peer that already belongs to somebody
 /// else. A Person re-enrolling their own Peer (a rotated key) is allowed.
 pub fn bind(data_dir: &Path, peer: &str, person: &str) -> Result<(), String> {
-    if SHARED_NAMES.contains(&peer) {
+    if RESERVED_PEER_NAMES.contains(&peer) {
         return Err(format!("\"{peer}\" is a shared role name, not a device; a Peer needs its own name"));
     }
     let path = path_in(data_dir);
@@ -48,6 +45,30 @@ pub fn bind(data_dir: &Path, peer: &str, person: &str) -> Result<(), String> {
 pub fn owner_of(data_dir: &Path, peer: &str) -> Option<String> {
     let text = std::fs::read_to_string(path_in(data_dir)).ok()?;
     owner_in(&text, peer).map(str::to_owned)
+}
+
+/// Every Peer bound to `person`, in the order they were enrolled.
+pub fn peers_of(data_dir: &Path, person: &str) -> Vec<String> {
+    let text = std::fs::read_to_string(path_in(data_dir)).unwrap_or_default();
+    text.lines()
+        .filter_map(|line| line.split_once(' '))
+        .filter(|(_, owner)| *owner == person)
+        .map(|(peer, _)| peer.to_owned())
+        .collect()
+}
+
+/// Forgets `peer`. A Peer that was never bound is not an error.
+pub fn unbind(data_dir: &Path, peer: &str) -> Result<(), String> {
+    let path = path_in(data_dir);
+    let Ok(text) = std::fs::read_to_string(&path) else {
+        return Ok(());
+    };
+    let kept: String = text
+        .lines()
+        .filter(|line| line.split_once(' ').is_none_or(|(name, _)| name != peer))
+        .map(|line| format!("{line}\n"))
+        .collect();
+    write_owner_only(&path, &kept).map_err(|error| format!("cannot write {}: {error}", path.display()))
 }
 
 fn owner_in<'a>(text: &'a str, peer: &str) -> Option<&'a str> {
@@ -76,6 +97,17 @@ mod tests {
         assert!(bind(&dir, "laptop-4f2a", "dad").is_err());
         assert_eq!(owner_of(&dir, "laptop-4f2a").as_deref(), Some("mom"));
         assert_eq!(owner_of(&dir, "phone-1"), None);
+    }
+
+    #[test]
+    fn a_forgotten_peer_belongs_to_nobody() {
+        let dir = scratch("unbind");
+        bind(&dir, "mom-laptop", "mom").unwrap();
+        bind(&dir, "mom-phone", "mom").unwrap();
+        assert_eq!(peers_of(&dir, "mom"), ["mom-laptop", "mom-phone"]);
+        unbind(&dir, "mom-laptop").unwrap();
+        assert_eq!(owner_of(&dir, "mom-laptop"), None);
+        assert_eq!(peers_of(&dir, "mom"), ["mom-phone"]);
     }
 
     #[test]

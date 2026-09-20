@@ -244,9 +244,8 @@ impl Config {
     /// Each block's own rules — the loopback forward, the roster, the bounds —
     /// are [`crate::vpn::check_relays`]'s, which can judge them without the rest
     /// of the document. What is here needs `[server]`: a relay's listening socket
-    /// against the three sockets this deployment already binds, and **every**
-    /// socket it forwards to — the shared `forward` and each peer's own
-    /// `forward_port` — against `admin_bind` and the proxy's binds.
+    /// against the three sockets this deployment already binds, and its
+    /// `forward` against `admin_bind`.
     ///
     /// **The `admin_bind` rule is the sharpest refusal in this file.** The admin
     /// API answers the bearer token as the deployment's owner and binds loopback
@@ -291,66 +290,22 @@ impl Config {
                 }
             }
 
-            // Every socket this relay hands a session to, not just the shared
-            // one. A per-peer `forward_port` is a second way to name a target,
-            // and a rule that only looked at `forward` would let the roster
-            // reach what the relay itself may not.
-            let Some(shared) = relay.forward_addr() else {
-                continue;
-            };
-            let mut targets: Vec<(String, SocketAddr)> = vec![(format!("vpn[{i}].forward"), shared)];
-            for (j, peer) in relay.peers.iter().enumerate() {
-                if let Some(port) = peer.forward_port {
-                    targets.push((
-                        format!("vpn[{i}].peers[{j}].forward_port"),
-                        SocketAddr::new(shared.ip(), port),
-                    ));
-                }
-            }
-
-            for (field, target) in targets {
-                if admin.is_some_and(|admin| admin == target) {
-                    problems.push(Problem {
-                        field: field.clone(),
-                        message: format!(
-                            "is server.admin_bind (\"{}\"). That API starts, stops and \
-                             reconfigures every service on this machine, and it answers the \
-                             bearer token as a machine identity that outranks every person on \
-                             the roster — it binds loopback precisely so that nothing off this \
-                             box can reach it. A relay in front of it would put the \
-                             deployment's control plane behind a VPN key and nothing else, and \
-                             docs/labs/vpn-identity-lab.dx is the record of what a VPN key is \
-                             worth as authorisation. Forward to the proxy (server.https_bind) \
-                             and let the console site's own gate and credentials decide.",
-                            self.server.admin_bind
-                        ),
-                    });
-                }
-
-                // A per-peer socket exists so that landing on it names one
-                // person. A socket the public web already answers names
-                // everybody who ever reached this box, so it names nobody — and
-                // it would read in the file as though it did.
-                if !field.ends_with("forward_port") {
-                    continue;
-                }
-                for (bind_field, existing) in &bound {
-                    if *bind_field == "server.admin_bind" {
-                        continue;
-                    }
-                    if existing.is_some_and(|existing| crate::vpn::collides(existing, target)) {
-                        problems.push(Problem {
-                            field: field.clone(),
-                            message: format!(
-                                "sends this peer to {target}, which is {bind_field}. A per-peer \
-                                 forward is only an identity while that socket carries this peer \
-                                 and nobody else; one the public proxy already answers carries \
-                                 every request that ever reached this box, so it names nobody \
-                                 while the file says it names somebody."
-                            ),
-                        });
-                    }
-                }
+            if admin.is_some() && relay.forward_addr() == admin {
+                problems.push(Problem {
+                    field: format!("vpn[{i}].forward"),
+                    message: format!(
+                        "is server.admin_bind (\"{}\"). That API starts, stops and \
+                         reconfigures every service on this machine, and it answers the \
+                         bearer token as a machine identity that outranks every person on \
+                         the roster — it binds loopback precisely so that nothing off this \
+                         box can reach it. A relay in front of it would put the \
+                         deployment's control plane behind a VPN key and nothing else, and \
+                         docs/labs/vpn-identity-lab.dx is the record of what a VPN key is \
+                         worth as authorisation. Forward to the proxy (server.https_bind) \
+                         and let the console site's own gate and credentials decide.",
+                        self.server.admin_bind
+                    ),
+                });
             }
         }
     }
@@ -986,15 +941,10 @@ mod tests {
     }
 
     /// A relay in the shape the deployment actually runs: public on 8443,
-    /// forwarding to the proxy, with one peer who is a person.
+    /// forwarding to the proxy.
     fn relay() -> crate::vpn::Relay {
         let mut relay = crate::vpn::Relay::new("console", "0.0.0.0:8443", "127.0.0.1:443");
         relay.public = true;
-        relay.peers.push(crate::vpn::Peer::new(
-            "alex-mac",
-            "Alex",
-            "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
-        ));
         relay
     }
 
@@ -1038,56 +988,14 @@ mod tests {
     }
 
     #[test]
-    fn a_peers_own_forward_may_not_be_put_in_front_of_the_admin_api_either() {
-        // The rule that would be trivial to leave behind. `forward_port` is a
-        // second way to name a target, and a check that only read `forward`
-        // would let one roster entry reach the control plane while the relay
-        // itself was refused it.
-        let mut smuggling = relay();
-        smuggling.peers[0].forward_port = Some(9191);
-        let problems = problems_of(&with_relays(vec![smuggling]));
-        assert!(
-            problems.iter().any(|p| p.field == "vpn[0].peers[0].forward_port"),
-            "{problems:?}"
-        );
-        assert!(problems[0].message.contains("admin_bind"), "{problems:?}");
-    }
-
-    #[test]
-    fn a_peers_own_forward_may_not_be_a_socket_the_public_proxy_answers() {
-        // A per-peer socket is only an identity while it carries that peer and
-        // nobody else. The proxy's own socket carries every request that ever
-        // reached this box.
-        let mut config = with_relays(Vec::new());
-        config.server.https_bind = "0.0.0.0:9443".into();
-        let mut shadowing = relay();
-        shadowing.peers[0].forward_port = Some(9443);
-        config.vpn = vec![shadowing];
-        let problems = problems_of(&config);
-        assert!(
-            problems.iter().any(|p| p.field == "vpn[0].peers[0].forward_port"),
-            "{problems:?}"
-        );
-        assert!(problems[0].message.contains("names nobody"), "{problems:?}");
-    }
-
-    #[test]
-    fn a_peer_with_a_port_of_its_own_validates_as_part_of_the_whole_document() {
-        let mut attributing = relay();
-        attributing.peers[0].forward_port = Some(9443);
-        assert!(with_relays(vec![attributing]).validate().is_ok());
-    }
-
-    #[test]
     fn per_block_relay_problems_reach_the_whole_document_validator() {
         // check_relays is delegated to, not reimplemented: one rule of its own
         // is asserted here so that a future refactor cannot quietly drop the
         // delegation and still pass every test in the vpn module.
-        let mut armed_and_empty = relay();
-        armed_and_empty.enabled = true;
-        armed_and_empty.peers.clear();
-        let problems = problems_of(&with_relays(vec![armed_and_empty]));
-        assert!(problems.iter().any(|p| p.field == "vpn[0].peers"), "{problems:?}");
+        let mut off_box = relay();
+        off_box.forward = "10.0.0.5:443".into();
+        let problems = problems_of(&with_relays(vec![off_box]));
+        assert!(problems.iter().any(|p| p.field == "vpn[0].forward"), "{problems:?}");
     }
 
     #[test]

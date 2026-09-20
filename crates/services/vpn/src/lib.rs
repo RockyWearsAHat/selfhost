@@ -1,11 +1,10 @@
 //! Running the relays a deployment has declared, and answering who is on one.
 //!
-//! A *relay* is one socket in front of one local service, and a roster of the
-//! people allowed through it. `crates/foundation/config/src/vpn.rs` is its schema
+//! A *relay* is one socket in front of one local service. Who may come through
+//! it is enrolment state: each signed-in account enrols its own devices. `crates/foundation/config/src/vpn.rs` is its schema
 //! and `docs/labs/vpn-lab.dx` is its design; this crate is the half that runs.
-//! It does two things and deliberately nothing else.
 //!
-//! # 1. It runs the vetted implementation as a supervised child
+//! # It runs the vetted implementation as a supervised child
 //!
 //! **selfhost binds no VPN socket.** The listener is opened by the tunnel program,
 //! supervised by [`selfhost_supervisor`], exactly as `crates/services/storage`'s
@@ -26,38 +25,18 @@
 //! loopback, and refuses a `forward` that is `server.admin_bind`. None of those
 //! rules is re-decided here.
 //!
-//! # 2. It answers who arrived at a socket, or refuses to
+//! # Who is on it
 //!
-//! This is the point of the subsystem. `docs/labs/vpn-identity-lab.dx` confirmed
-//! on 2026-08-17 that the tunnel knows which peer connected and discards that
-//! before anything above can ask — so every peer is identical to the proxy, and
-//! the only remaining wall is a shared password that mints ownership.
-//! [`Relays::who_arrived_at`] is the question that was previously unaskable.
-//!
-//! The transport is a stream forwarder, so a session's *source* address is
-//! `127.0.0.1` for every peer alive and always will be. What survives is the
-//! **destination**: `scripts/securevpn/app/protocol.py` proves which Ed25519
-//! identity completed the handshake before any payload moves, so a peer given a
-//! `forward_port` of its own lands on a loopback socket nobody else lands on, and
-//! that socket is the roster entry. A peer without one shares `forward` with
-//! everybody else who has none, and the honest answer there is "nobody", with the
-//! reason. [`Attribution`] is shaped so a caller cannot mistake either for the
-//! other: three variants, no `Default`, no `unwrap_or`, and the only route to an
-//! [`Identity`](selfhost_identity::Identity) hangs off the variant that actually
-//! named somebody.
-//!
-//! A destination port is evidence, not authentication — any local process can
-//! connect to it, exactly as it could forge a preamble (`docs/SECURITY.md`
-//! VPN-02). What it buys is that the daemon learns the identity from the accept
-//! rather than from bytes it had to parse, which is why this and not a
-//! PROXY-protocol header. `docs/labs/vpn-lab.dx` carries the comparison in full.
+//! The tunnel proves which Peer completed the handshake and asks the admin API
+//! (`POST /api/vpn/check-access`) whether that Peer's Person holds
+//! `vpn.access:<relay>`. [`peer_binding`] is the record of which Person that is.
 //!
 //! # The shape of the crate
 //!
 //! | Module | Pure? | What it holds |
 //! |---|---|---|
-//! | [`roster`] | **pure** | the peer set that will be admitted, and the entries that will not |
-//! | [`attribution`] | **pure** | address → person, and the four honest ways to fail |
+//! | [`roster`] | impure | reads the peer set that will be admitted, and the entries that will not |
+//! | [`peer_binding`] | impure | which Person each Peer belongs to |
 //! | [`runner`] | **pure** | the argument vector, and the refusal for a backend with no runner |
 //! | [`state`] | **pure** | declared, down, up, failed — named states rather than errors |
 //! | [`keys`] | impure | reads the key directory; never writes it, never generates a key |
@@ -73,31 +52,20 @@
 //! Said plainly, because a green suite is easy to read for more than it is worth.
 //! No relay in this deployment has been started by this code on the production
 //! box; the tunnel carrying the operator's console traffic today is still the
-//! scheduled task described in `docs/VPN.md`. **No per-peer forward has carried a
-//! byte on this deployment.** `runner::plan` emits `--peer-forward` for every
-//! roster entry that declares a port, and `server.py` implements it — in the
-//! operator's own repository, `https://github.com/RockyWearsAHat/Secure-VPN.git`,
-//! which is where the whole implementation has always lived. What is unproven
-//! here is the *installed* copy: a box still running a `server.py` from before
-//! that support will reject the argument and fail to start, loudly, until it is
-//! updated. Nothing here has ever named a person to a real request,
-//! because nothing in `crates/app` calls this crate. And none of this reduces
-//! what a shared credential is worth: an attributed session belonging to a named
-//! guest is still only as separate as the credentials behind it.
+//! scheduled task described in `docs/VPN.md`.
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
-pub mod attribution;
 pub mod enrol;
 pub mod image_auth;
 pub mod keys;
+pub mod peer_binding;
 pub mod roster;
 pub mod runner;
 pub mod state;
 pub mod updater;
 
-pub use attribution::{Attributed, Attribution, Unanswered, who_arrived_at};
 pub use enrol::{EnrolError, enrol, revoke};
 pub use image_auth::{ImageAuthConfig, validate_image_auth_key};
 pub use keys::KeyReport;
@@ -110,7 +78,6 @@ use selfhost_config::vpn::Relay;
 use selfhost_supervisor::Supervisor;
 use selfhost_supervisor::state::ServiceState;
 use std::fmt;
-use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 
 /// Why a relay could not be run, or could not be found.
@@ -142,7 +109,7 @@ pub enum VpnError {
         /// What was written there.
         value: String,
     },
-    /// Every roster entry was dropped, so the relay would bind a port and admit
+    /// Nobody usable is enrolled, so the relay would bind a port and admit
     /// nobody.
     NoUsablePeers {
         /// The relay.
@@ -190,8 +157,8 @@ impl fmt::Display for VpnError {
             Self::NoUsablePeers { relay, rejected } => {
                 write!(
                     formatter,
-                    "relay \"{relay}\" has no peer whose holder this deployment can name, so it \
-                     would bind a socket that admits nobody"
+                    "relay \"{relay}\" has no device enrolled, so it would bind a socket that \
+                     admits nobody. Sign in on a device to enrol it"
                 )?;
                 for entry in rejected {
                     write!(formatter, "; \"{}\": {}", entry.peer, entry.reason)?;
@@ -216,22 +183,9 @@ impl fmt::Display for VpnError {
                 if !report.server_key {
                     write!(formatter, "; there is no {}", keys::SERVER_KEY_FILE)?;
                 }
-                if !report.missing_peers.is_empty() {
-                    write!(
-                        formatter,
-                        "; no public key for {}",
-                        report
-                            .missing_peers
-                            .iter()
-                            .map(|peer| format!("\"{peer}\""))
-                            .collect::<Vec<_>>()
-                            .join(", ")
-                    )?;
-                }
                 write!(
                     formatter,
-                    ". Starting anyway would bind a port and then refuse somebody who has been \
-                     told they have access"
+                    ". Starting anyway would bind a port nobody can complete a handshake on"
                 )
             }
         }
@@ -272,16 +226,10 @@ pub struct Relays {
     admin_bind: String,
     install: Install,
     relays: Vec<Relay>,
-    rosters: Vec<Roster>,
 }
 
 impl Relays {
     /// Reads a deployment's `[[vpn]]` blocks into a drivable set.
-    ///
-    /// The rosters are built once, here, rather than on every call: building one
-    /// is pure and cheap, but doing it per request would mean two callers could
-    /// see different rosters from the same config, and "who is at this address"
-    /// is exactly the question that must not have two answers.
     ///
     /// `admin_bind` is `server.admin_bind` (`127.0.0.1:9191`) — where a started
     /// relay points its `--account-manager` so a completed handshake still has
@@ -294,14 +242,12 @@ impl Relays {
         install: Install,
         relays: Vec<Relay>,
     ) -> Self {
-        let rosters = relays.iter().map(Roster::build).collect();
         Self {
             supervisor,
             data_dir: data_dir.into(),
             admin_bind: admin_bind.into(),
             install,
             relays,
-            rosters,
         }
     }
 
@@ -315,9 +261,13 @@ impl Relays {
         self.relays.iter().find(|relay| relay.name == name)
     }
 
-    /// One relay's usable peer set, by name.
-    pub fn roster(&self, name: &str) -> Option<&Roster> {
-        self.rosters.iter().find(|roster| roster.relay() == name)
+    /// One relay's usable peer set, by name, as enrolment has it now.
+    ///
+    /// Read on every call rather than kept: a device signed in a minute ago is
+    /// a Peer now, and the tunnel re-reads the same files per handshake.
+    pub fn roster(&self, name: &str) -> Option<Roster> {
+        let relay = self.relay(name)?;
+        Some(Roster::read(relay, &self.key_dir(relay), &self.data_dir))
     }
 
     /// Where this relay's key material is expected.
@@ -328,7 +278,8 @@ impl Relays {
     /// Every relay as a console row, with its live state.
     pub async fn list(&self) -> Vec<RelaySummary> {
         let mut rows = Vec::with_capacity(self.relays.len());
-        for (relay, roster) in self.relays.iter().zip(&self.rosters) {
+        for relay in &self.relays {
+            let roster = Roster::read(relay, &self.key_dir(relay), &self.data_dir);
             rows.push(RelaySummary {
                 name: relay.name.clone(),
                 backend: relay.backend.tag(),
@@ -338,8 +289,7 @@ impl Relays {
                 forward: relay.forward.clone(),
                 peers: roster.enrolled().len(),
                 rejected: roster.rejected().len(),
-                attributable: relay.attributes(),
-                state: self.state_of(relay, roster).await,
+                state: self.state_of(relay).await,
             });
         }
         rows
@@ -347,8 +297,8 @@ impl Relays {
 
     /// Where one relay is.
     pub async fn state(&self, name: &str) -> Result<RelayState, VpnError> {
-        let (relay, roster) = self.find(name)?;
-        Ok(self.state_of(relay, roster).await)
+        let relay = self.find(name)?;
+        Ok(self.state_of(relay).await)
     }
 
     /// Everything that would happen, without doing any of it.
@@ -359,22 +309,24 @@ impl Relays {
     /// are cheapest to fix: the config first, then the implementation, then the
     /// disk.
     pub async fn preflight(&self, name: &str) -> Result<Preflight, VpnError> {
-        let (relay, roster) = self.find(name)?;
+        let relay = self.find(name)?;
 
         if !relay.enabled {
             return Err(VpnError::NotEnabled { relay: relay.name.clone() });
         }
-        if !roster.is_startable() {
+        let key_dir = self.key_dir(relay);
+        let roster = Roster::read(relay, &key_dir, &self.data_dir);
+        // `server.py` exits when its roster names nobody; say so here instead.
+        if roster.enrolled().is_empty() {
             return Err(VpnError::NoUsablePeers {
                 relay: relay.name.clone(),
                 rejected: roster.rejected().to_vec(),
             });
         }
 
-        let key_dir = self.key_dir(relay);
         let admin_token_path = self.data_dir.join("admin.token");
         let launch =
-            runner::plan(relay, roster, &self.install, &key_dir, &self.admin_bind, &admin_token_path)?;
+            runner::plan(relay, &self.install, &key_dir, &self.admin_bind, &admin_token_path)?;
 
         if !self.install.present().await {
             return Err(VpnError::ImplementationMissing {
@@ -383,7 +335,7 @@ impl Relays {
             });
         }
 
-        let report = keys::inspect(&key_dir, roster).await;
+        let report = keys::inspect(&key_dir).await;
         if !report.is_startable() {
             return Err(VpnError::KeysMissing {
                 relay: relay.name.clone(),
@@ -394,23 +346,6 @@ impl Relays {
         // A dropped peer is a person who has lost access. It is not fatal while
         // somebody is still admitted, and it must not be silent either.
         let mut notes = report.notes();
-        // And the one thing an operator cannot find out by reading their own
-        // config: whether the `server.py` actually installed on this box is new
-        // enough to understand `--peer-forward`. The flag is implemented in the
-        // Secure-VPN repository, but what runs here is a copy somebody installed,
-        // and Python exits non-zero on an argument it does not recognise. Said
-        // before the first start, in the relay's own log, rather than discovered
-        // as a child that exits immediately.
-        if roster.attributes() {
-            notes.push(
-                "[vpn] this roster declares per-peer forwards, so the tunnel is launched with \
-                 --peer-forward. The server.py installed on this box must be new enough to \
-                 understand that argument — it is implemented in \
-                 https://github.com/RockyWearsAHat/Secure-VPN.git — and Python exits non-zero \
-                 on an unrecognised one. See scripts/securevpn/app/README.md"
-                    .to_owned(),
-            );
-        }
         for entry in roster.rejected() {
             notes.push(format!(
                 "[vpn] peer \"{}\" is NOT admitted: {}",
@@ -421,7 +356,7 @@ impl Relays {
         Ok(Preflight {
             relay: relay.name.clone(),
             launch,
-            roster: roster.clone(),
+            roster,
             keys: report,
             notes,
         })
@@ -437,7 +372,7 @@ impl Relays {
     /// which is the same reason `smb::sync` re-reads the host after applying.
     pub async fn up(&self, name: &str) -> Result<RelayState, VpnError> {
         let plan = self.preflight(name).await?;
-        let (relay, roster) = self.find(name)?;
+        let relay = self.find(name)?;
         let service = service_name(&relay.name);
 
         self.supervisor.install(runner::service(relay, &plan.launch)).await;
@@ -449,7 +384,7 @@ impl Relays {
         }
         self.supervisor.start(&service).await;
 
-        Ok(self.state_of(relay, roster).await)
+        Ok(self.state_of(relay).await)
     }
 
     /// Brings up every relay declared `enabled = true`, into *this* `Relays`'
@@ -488,48 +423,14 @@ impl Relays {
     /// closed, and reporting a failure because it was closed already would be a
     /// refusal that means "you got what you asked for".
     pub async fn down(&self, name: &str) -> Result<RelayState, VpnError> {
-        let (relay, roster) = self.find(name)?;
+        let relay = self.find(name)?;
         self.supervisor.stop(&service_name(&relay.name)).await;
-        Ok(self.state_of(relay, roster).await)
+        Ok(self.state_of(relay).await)
     }
 
-    /// Who arrived at this loopback socket, asking every relay.
-    ///
-    /// The deployment-wide question, and the one the proxy and the admin API
-    /// would ask. `landed` is the **local** address of the accepted connection —
-    /// `TcpStream::local_addr`, not `peer_addr` — because the source address of
-    /// a forwarded session is `127.0.0.1` for every peer alive. Read
-    /// [`Attribution`] before acting on it: two of its three variants name
-    /// nobody, and they name nobody for different reasons.
-    pub fn who_arrived_at(&self, landed: SocketAddr) -> Attribution {
-        let answers = self
-            .relays
-            .iter()
-            .zip(&self.rosters)
-            .map(|(relay, roster)| who_arrived_at(relay, roster, landed))
-            .collect();
-        attribution::combine(landed, answers)
-    }
-
-    /// Who arrived at this loopback socket on one named relay.
-    pub fn who_arrived_at_on(
-        &self,
-        relay: &str,
-        landed: SocketAddr,
-    ) -> Result<Attribution, VpnError> {
-        let (relay, roster) = self.find(relay)?;
-        Ok(who_arrived_at(relay, roster, landed))
-    }
-
-    /// The block and the roster for a name, or the refusal that names it.
-    fn find(&self, name: &str) -> Result<(&Relay, &Roster), VpnError> {
-        let relay = self
-            .relay(name)
-            .ok_or_else(|| VpnError::UnknownRelay { name: name.to_owned() })?;
-        let roster = self
-            .roster(name)
-            .expect("every relay gets a roster in `new`, and both lists are built from one input");
-        Ok((relay, roster))
+    /// The block for a name, or the refusal that names it.
+    fn find(&self, name: &str) -> Result<&Relay, VpnError> {
+        self.relay(name).ok_or_else(|| VpnError::UnknownRelay { name: name.to_owned() })
     }
 
     /// One relay's lifecycle position, read from the supervisor.
@@ -540,21 +441,10 @@ impl Relays {
     /// plan on every row would be answering "can this start" in a function whose
     /// question is "is it running". Whether a relay *would* start is
     /// [`Relays::preflight`]'s to say, in one place, with the reason.
-    async fn state_of(&self, relay: &Relay, _roster: &Roster) -> RelayState {
+    async fn state_of(&self, relay: &Relay) -> RelayState {
         let service = self.supervisor.status(&service_name(&relay.name)).await.map(|s| s.state);
         RelayState::of(relay, service.as_ref())
     }
-}
-
-/// Whether a live session on `relay` could ever be traced to a person.
-///
-/// A free function, and public, because it is the one thing a caller outside this
-/// crate has to know before it decides what a landed socket means — the proxy's
-/// site gate, in particular. `false` means every session on this relay exits on
-/// one shared socket, so a check there reads as identity and is really "which
-/// network", which is exactly the shape the audit found.
-pub fn carries_identity(relay: &Relay) -> bool {
-    relay.attributes()
 }
 
 /// The service state of a relay, for a caller that already holds a supervisor.
@@ -574,32 +464,52 @@ pub fn relay_key_dir(relay: &Relay, data_dir: &Path) -> PathBuf {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
-    use selfhost_config::vpn::{Peer, Relay};
+    use selfhost_config::vpn::Relay;
     use selfhost_supervisor::await_state;
     use std::time::Duration;
 
-    /// The deployed shape: a Secure-VPN relay in front of the proxy, one peer.
+    /// A well-formed public key, as a device sends one at enrolment.
+    pub(crate) const A_KEY: &str = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
+
+    /// The deployed shape: a Secure-VPN relay in front of the proxy.
     ///
     /// Loopback rather than `0.0.0.0` so the fixture is a relay validation
-    /// accepts without `public = true` — the tests that care about the public
-    /// bind widen it themselves.
+    /// accepts without `public = true`.
     pub(crate) fn forwarding_relay() -> Relay {
-        let mut relay = Relay::new("console", "127.0.0.1:8443", "127.0.0.1:443");
-        relay.peers.push(Peer::new("alex-mac", "Alex", "A".repeat(43)));
-        relay
+        Relay::new("console", "127.0.0.1:8443", "127.0.0.1:443")
     }
 
-    /// The same relay with the identity carry turned on: its one peer holds a
-    /// loopback port nobody else lands on.
-    pub(crate) fn attributing_relay() -> Relay {
-        let mut relay = forwarding_relay();
-        relay.peers[0].forward_port = Some(9443);
-        relay
+    /// A data directory holding [`forwarding_relay`]'s enrolment state.
+    pub(crate) struct Scratch(PathBuf);
+
+    impl Scratch {
+        pub(crate) fn new(tag: &str) -> Self {
+            Self(scratch(tag))
+        }
+
+        pub(crate) fn data_dir(&self) -> &Path {
+            &self.0
+        }
+
+        pub(crate) fn key_dir(&self) -> PathBuf {
+            keys::key_dir(&forwarding_relay(), &self.0)
+        }
+
+        /// What signing in on a device does: key file, roster line, binding.
+        pub(crate) fn enrol(&self, peer: &str, person: &str) {
+            enrol::enrol(&self.key_dir(), peer, A_KEY).expect("enrol");
+            peer_binding::bind(&self.0, peer, person).expect("bind");
+        }
+
+        pub(crate) fn roster(&self) -> Roster {
+            Roster::read(&forwarding_relay(), &self.key_dir(), &self.0)
+        }
     }
 
-    /// A socket written as a literal in a test.
-    pub(crate) fn socket(text: &str) -> SocketAddr {
-        text.parse().expect("a literal socket in a test")
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
     }
 
     /// A scratch directory unique to one test.
@@ -630,14 +540,15 @@ pub(crate) mod tests {
         }
     }
 
-    /// A relay whose key directory is complete, under `data_dir`.
+    /// A relay whose key directory is complete and has one device enrolled,
+    /// under `data_dir`.
     fn armed_relay(data_dir: &Path) -> Relay {
         let mut relay = forwarding_relay();
         relay.enabled = true;
         let key_dir = keys::key_dir(&relay, data_dir);
-        std::fs::create_dir_all(&key_dir).expect("a key directory");
+        enrol::enrol(&key_dir, "alex-mac", A_KEY).expect("enrol");
+        peer_binding::bind(data_dir, "alex-mac", "Alex").expect("bind");
         std::fs::write(keys::server_key_file(&key_dir), "private").expect("write");
-        std::fs::write(keys::peer_key_file(&key_dir, "alex-mac"), "A".repeat(43)).expect("write");
         relay
     }
 
@@ -646,27 +557,23 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn both_fixtures_are_relays_the_loader_would_actually_accept() {
-        // Everything in this crate is tested against these two blocks, so if
-        // either one is a relay `Config::parse` would refuse, the whole suite is
-        // measuring a shape no deployment can have.
-        for relay in [forwarding_relay(), attributing_relay()] {
-            let mut problems = Vec::new();
-            relay.check("vpn[0]", &mut problems);
-            assert!(problems.is_empty(), "{}: {problems:?}", relay.name);
-        }
+    fn the_fixture_is_a_relay_the_loader_would_actually_accept() {
+        let mut problems = Vec::new();
+        forwarding_relay().check("vpn[0]", &mut problems);
+        assert!(problems.is_empty(), "{problems:?}");
     }
 
     #[tokio::test]
     async fn a_declared_relay_is_listed_and_not_running() {
         let dir = scratch("declared");
-        let subject = relays(&dir, fake_install(&dir), vec![forwarding_relay()]);
+        let mut relay = armed_relay(&dir);
+        relay.enabled = false;
+        let subject = relays(&dir, fake_install(&dir), vec![relay]);
 
         let rows = subject.list().await;
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].state, RelayState::Declared);
         assert_eq!(rows[0].peers, 1);
-        assert!(!rows[0].attributable, "the deployed backend cannot name anybody");
         assert!(!rows[0].state.needs_attention());
 
         let _ = std::fs::remove_dir_all(&dir);
@@ -697,22 +604,15 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    async fn a_relay_with_no_key_material_refuses_before_it_binds_anything() {
-        // The whole point of the preflight: the failure is "there is no key for
-        // alex-mac", not a child in a restart loop printing a traceback.
+    async fn a_relay_with_no_private_key_refuses_before_it_binds_anything() {
         let dir = scratch("no-keys");
-        let mut relay = forwarding_relay();
-        relay.enabled = true;
+        let relay = armed_relay(&dir);
+        std::fs::remove_file(keys::server_key_file(&keys::key_dir(&relay, &dir))).expect("remove");
         let subject = relays(&dir, fake_install(&dir), vec![relay]);
 
         let error = subject.up("console").await.expect_err("no keys, no start");
-        match &error {
-            VpnError::KeysMissing { report, .. } => {
-                assert_eq!(report.missing_peers, vec!["alex-mac".to_owned()]);
-            }
-            other => panic!("expected missing keys, got {other}"),
-        }
-        assert!(error.to_string().contains("alex-mac"), "{error}");
+        assert!(matches!(error, VpnError::KeysMissing { .. }), "{error}");
+        assert!(error.to_string().contains("server.key"), "{error}");
         assert!(subject.state("console").await.expect("declared").needs_attention());
 
         let _ = std::fs::remove_dir_all(&dir);
@@ -739,54 +639,28 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    async fn a_relay_whose_every_peer_is_unnameable_binds_nothing() {
+    async fn a_relay_nobody_has_enrolled_on_binds_nothing() {
         let dir = scratch("no-peers");
-        let mut relay = armed_relay(&dir);
-        relay.peers[0].person = "Alex/Bob".into();
+        let mut relay = forwarding_relay();
+        relay.enabled = true;
+        // Listed, but no account enrolled it: the old shared key's shape.
+        enrol::enrol(&keys::key_dir(&relay, &dir), "stray", A_KEY).expect("enrol");
         let subject = relays(&dir, fake_install(&dir), vec![relay]);
 
         let error = subject.up("console").await.expect_err("nobody to admit");
         assert!(matches!(error, VpnError::NoUsablePeers { .. }), "{error}");
-        assert!(error.to_string().contains("alex-mac"), "{error}");
+        assert!(error.to_string().contains("stray"), "{error}");
 
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]
-    async fn a_relay_that_attributes_says_so_in_the_listing_and_warns_about_the_tunnel() {
-        // The two halves of the identity carry that a caller can see without
-        // starting anything: the row says this relay can name somebody, and the
-        // preflight says the deployed server does not understand the argument
-        // that makes it true.
-        let dir = scratch("attributing");
-        let mut relay = armed_relay(&dir);
-        relay.peers[0].forward_port = Some(9443);
-        let subject = relays(&dir, fake_install(&dir), vec![relay]);
-
-        let rows = subject.list().await;
-        assert_eq!(rows.len(), 1);
-        assert!(rows[0].attributable, "a peer with a port of its own can be named");
-        assert_eq!(rows[0].state, RelayState::Down, "armed and not started");
-
-        let plan = subject.preflight("console").await.expect("startable");
-        assert!(
-            plan.launch.command_line().contains("--peer-forward alex-mac=127.0.0.1:9443"),
-            "{}",
-            plan.launch.command_line()
-        );
-        assert!(
-            plan.notes.iter().any(|note| note.contains("server.py")),
-            "the preflight must warn that the tunnel does not know the flag yet: {:?}",
-            plan.notes
-        );
-
-        // And the question the whole subsystem exists for now has an answer.
-        assert_eq!(
-            subject.who_arrived_at(socket("127.0.0.1:9443")).person().map(|p| p.as_str()),
-            Some("Alex")
-        );
-        assert!(carries_identity(subject.relay("console").expect("declared")));
-
+    async fn a_device_enrolled_after_the_relays_were_read_is_a_peer_at_once() {
+        let dir = scratch("live-roster");
+        let subject = relays(&dir, fake_install(&dir), vec![forwarding_relay()]);
+        assert!(subject.roster("console").expect("declared").enrolled().is_empty());
+        armed_relay(&dir);
+        assert!(subject.roster("console").expect("declared").enrolled_peer("alex-mac").is_some());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -797,7 +671,8 @@ pub(crate) mod tests {
         let subject = relays(&dir, fake_install(&dir), vec![relay]);
 
         let plan = subject.preflight("console").await.expect("startable");
-        assert!(plan.launch.command_line().contains("--peer alex-mac"), "{}", plan.launch.command_line());
+        assert!(plan.launch.command_line().contains("--roster "), "{}", plan.launch.command_line());
+        assert!(!plan.launch.command_line().contains("--peer"), "{}", plan.launch.command_line());
 
         subject.up("console").await.expect("starts");
         let service = service_name("console");
@@ -874,57 +749,10 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    async fn the_deployments_own_shape_attributes_nobody_and_says_why() {
-        // The relay this deployment actually runs — every peer on one shared
-        // forward — asked the question the audit is about. If this ever answers
-        // with a person, something has started inventing attribution.
-        let dir = scratch("deployed-shape");
-        let subject = relays(&dir, fake_install(&dir), vec![armed_relay(&dir)]);
-
-        let answer = subject.who_arrived_at(socket("127.0.0.1:443"));
-        assert!(!answer.is_attributed(), "{answer}");
-        assert!(matches!(answer, Attribution::Nobody { why: Unanswered::Shared { .. }, .. }));
-        assert!(!carries_identity(subject.relay("console").expect("declared")));
-
-        // And the preflight of such a relay says nothing about --peer-forward,
-        // because it emits none: an unmigrated relay is launched exactly as it
-        // always was.
-        let plan = subject.preflight("console").await.expect("startable");
-        assert!(!plan.launch.command_line().contains("--peer-forward"), "{}", plan.launch.command_line());
-        assert!(!plan.notes.iter().any(|note| note.contains("server.py")), "{:?}", plan.notes);
-
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[tokio::test]
-    async fn asking_one_relay_and_asking_them_all_agree() {
-        let dir = scratch("one-and-all");
-        let mut relay = attributing_relay();
-        relay.enabled = true;
-        let subject = relays(&dir, fake_install(&dir), vec![relay]);
-
-        let landed = socket("127.0.0.1:9443");
-        assert_eq!(
-            subject.who_arrived_at_on("console", landed).expect("declared"),
-            subject.who_arrived_at(landed)
-        );
-        assert!(matches!(
-            subject.who_arrived_at_on("absent", landed),
-            Err(VpnError::UnknownRelay { .. })
-        ));
-
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[tokio::test]
-    async fn a_deployment_with_no_relay_at_all_answers_nobody() {
+    async fn a_deployment_with_no_relay_at_all_lists_nothing() {
         let dir = scratch("no-relays");
         let subject = relays(&dir, fake_install(&dir), Vec::new());
         assert!(subject.list().await.is_empty());
-        assert!(matches!(
-            subject.who_arrived_at(socket("127.0.0.1:9443")),
-            Attribution::Nobody { why: Unanswered::NoRelay, .. }
-        ));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
