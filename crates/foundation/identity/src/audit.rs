@@ -179,6 +179,13 @@ pub enum Authority {
     /// the desktop process presenting the code has no session to be `caller`
     /// checked through.
     VpnDeviceEnrolled,
+    /// A VPN roster entry and its key were removed: a device is no longer one
+    /// of a Person's, and the relay refuses it from here on. Written whether
+    /// the Person removed their own device (`selfhost people forget-device`,
+    /// or the console's self-service `DELETE /api/vpn/devices/<peer>`) or the
+    /// owner did it on their behalf — both go through the same shared forget
+    /// function, so both land here.
+    VpnDeviceForgotten,
     /// A Person was signed in to a gated Site: a Pass was authorised for them.
     SitePassAuthorised,
     /// `selfhost init-owner` created the deployment's first owner, or granted
@@ -208,6 +215,7 @@ impl Authority {
             Self::PasskeyRegistered => "authority.enrol",
             Self::PasskeyRemoved => "authority.unenrol",
             Self::VpnDeviceEnrolled => "authority.vpn-enrol",
+            Self::VpnDeviceForgotten => "authority.vpn-forget",
             Self::SitePassAuthorised => "authority.site-pass",
             Self::OwnerInitialized => "authority.init-owner",
         }
@@ -589,6 +597,7 @@ mod tests {
             Authority::PasskeyRegistered,
             Authority::PasskeyRemoved,
             Authority::VpnDeviceEnrolled,
+            Authority::VpnDeviceForgotten,
             Authority::SitePassAuthorised,
         ] {
             assert!(

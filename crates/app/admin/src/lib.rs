@@ -651,6 +651,12 @@ enum Route<'a> {
     /// `GET /api/vpn/peers` — every peer this deployment's relays know about,
     /// static and dynamic alike. See [`people_api::VpnWiring::peers_json`].
     VpnPeers,
+    /// `GET /api/vpn/devices` — the signed-in Person's own devices, never
+    /// anybody else's. See [`Api::vpn_devices`].
+    VpnDevices,
+    /// `DELETE /api/vpn/devices/<peer>` — forgets one of the signed-in
+    /// Person's own devices. See [`Api::vpn_forget_device`].
+    VpnForgetDevice(&'a str),
 }
 
 /// The `[[vpn]]` relay a network-gated Site is reached through, out of the
@@ -796,7 +802,16 @@ impl<'a> Route<'a> {
             (Method::Get, ["api", "maintenance", "status"]) => Some(Self::MaintenanceStatus),
             (Method::Post, ["api", "vpn", "check-access"]) => Some(Self::VpnCheckAccess),
             (Method::Post, ["api", "vpn", "authorize"]) => Some(Self::VpnAuthorize),
+            // Pre-existing gap found while adding the two routes below: this arm
+            // was missing entirely, so `Self::VpnPeers` (demand `OwnerOnly`, a
+            // working handler) was unreachable — every call 404'd before the
+            // wall ever ran, never a 401. Not something this change caused; the
+            // variant, its demand and its handler were all already here.
             (Method::Get, ["api", "vpn", "peers"]) => Some(Self::VpnPeers),
+            (Method::Get, ["api", "vpn", "devices"]) => Some(Self::VpnDevices),
+            (Method::Delete, ["api", "vpn", "devices", peer]) => {
+                Some(Self::VpnForgetDevice(peer))
+            }
             (Method::Post, ["api", "pass", "authorize"]) => Some(Self::PassAuthorize),
             _ => None,
         }
@@ -941,9 +956,19 @@ impl<'a> Route<'a> {
             //
             // `PassAuthorize` is the same shape: which Site is in the body, and
             // the Grant is checked against it inside the handler.
-            Self::Vocabulary | Self::WhoAmI | Self::VpnAuthorize | Self::PassAuthorize => {
-                Demand::Authenticated
-            }
+            //
+            // `VpnDevices` and `VpnForgetDevice` join them for the same reason
+            // `WhoAmI` does: a caller may always ask about, and act on, their
+            // own devices — nobody's grant set decides that, their identity
+            // does, exactly as `is_site_owner` decides Site ownership.
+            // `Api::vpn_devices` and `Api::vpn_forget_device` hold every other
+            // identity to an empty answer, never another Person's devices.
+            Self::Vocabulary
+            | Self::WhoAmI
+            | Self::VpnAuthorize
+            | Self::PassAuthorize
+            | Self::VpnDevices
+            | Self::VpnForgetDevice(_) => Demand::Authenticated,
         }
     }
 }
@@ -1735,6 +1760,8 @@ impl Api {
             Route::VpnCheckAccess => vpn_api::check_access(self.people.as_ref(), self.vpn.as_ref(), body),
             Route::VpnAuthorize => self.vpn_authorize(&caller, body),
             Route::VpnPeers => self.vpn_peers(),
+            Route::VpnDevices => self.vpn_devices(&caller),
+            Route::VpnForgetDevice(peer) => self.vpn_forget_device(&caller, peer),
             Route::PassAuthorize => self.pass_authorize(&caller, body),
         }
     }
@@ -2214,6 +2241,71 @@ impl Api {
         match &self.vpn {
             Some(wiring) => json(Status(200), wiring.peers_json()),
             None => problem(Status(404), "no `[[vpn]]` relay is configured on this deployment"),
+        }
+    }
+
+    /// Answers `GET /api/vpn/devices`: the signed-in Person's own devices —
+    /// each a `{"name", "last_connected"}` pair — never anybody else's.
+    ///
+    /// `last_connected` is always `null`: no deployment anywhere records when
+    /// a VPN Peer last connected (see `docs/VPN.md`), and this route reports
+    /// that honestly rather than inventing a tracking system to fill it.
+    ///
+    /// Only [`Identity::Person`] has devices of its own; every other caller
+    /// this route can be reached by — the console password as
+    /// [`Identity::Owner`], a bearer token, an Agent — gets an empty list
+    /// rather than an error, the same "honest empty answer" [`Demand::Authenticated`]
+    /// documents for `WhoAmI`. An owner reaches everybody's devices through
+    /// [`people_api::VpnWiring::peers_json`] (`GET /api/vpn/peers`) instead.
+    fn vpn_devices(&self, caller: &Caller) -> Response {
+        let Some(vpn) = &self.vpn else {
+            return problem(Status(404), "no `[[vpn]]` relay is configured on this deployment");
+        };
+        let Identity::Person(name) = caller.identity() else {
+            return json(Status(200), Json::object([("devices", Json::array([]))]));
+        };
+        let devices = vpn
+            .devices_of(name.as_str())
+            .into_iter()
+            .map(|peer| Json::object([("name", Json::string(&peer)), ("last_connected", Json::Null)]));
+        json(Status(200), Json::object([("devices", Json::array(devices))]))
+    }
+
+    /// Answers `DELETE /api/vpn/devices/<peer>`: forgets one of the *caller's
+    /// own* devices. Never another Person's — that is `DELETE
+    /// /api/people/<name>`'s reach, not this route's, and an Owner acts on
+    /// somebody else's device only through it.
+    ///
+    /// Refuses a `peer` this caller does not own — unbound, bound to
+    /// somebody else, or the caller is not a Person at all — with the one
+    /// message `"not one of your devices"` in every case, so a caller
+    /// cannot tell "no such device" from "not yours" by trying names, the
+    /// same anti-enumeration shape [`Demand::Unsatisfiable`] documents.
+    ///
+    /// Reuses [`people_api::forget_device`] — the exact function `selfhost
+    /// people forget-device` calls — so there is exactly one place a device
+    /// is forgotten. See [`people_api::VpnWiring::forget_device`].
+    fn vpn_forget_device(&self, caller: &Caller, peer: &str) -> Response {
+        let Some(vpn) = &self.vpn else {
+            return problem(Status(404), "no `[[vpn]]` relay is configured on this deployment");
+        };
+        let Identity::Person(name) = caller.identity() else {
+            return problem(Status(404), "not one of your devices");
+        };
+        if vpn.person_of_peer(peer).as_deref() != Some(name.as_str()) {
+            return problem(Status(404), "not one of your devices");
+        }
+        match vpn.forget_device(name.as_str(), peer) {
+            Ok(()) => {
+                self.record_authority(
+                    caller,
+                    selfhost_identity::audit::Authority::VpnDeviceForgotten,
+                    name.as_str(),
+                    format!("device-forgotten:{peer}"),
+                );
+                json(Status(200), Json::object([("forgot", Json::string(peer))]))
+            }
+            Err(refusal) => problem(Status(500), &refusal),
         }
     }
 

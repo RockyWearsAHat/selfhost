@@ -25,6 +25,8 @@ const HUMAN_ONLY_ROUTES: &[(&str, &str)] = &[
     ("POST /api/firewall/reconcile", "Firewall reconcile: deployment-level operation, not yet exposed as MCP tool"),
     // VPN access check: part of VPN enrollment flow, requires person context.
     ("POST /api/vpn/check-access", "VPN check-access: person-scoped, part of VPN enrollment flow"),
+    // My devices: self-service removal of the caller's own device, not an owner/agent operation.
+    ("DELETE /api/vpn/devices/<peer>", "My devices: self-service, a Person removes only their own device"),
     // VPN sign-in flow: console-session half, requires browser and PKCE binding.
     ("POST /api/vpn/authorize", "VPN sign-in: console-session half of the enrollment exchange, requires browser and PKCE binding"),
     // Site sign-in: person asks to be signed in to a gated site, requires browser redirect flow.
@@ -84,6 +86,7 @@ mod tests {
             // VPN
             ("POST", "/api/vpn/check-access", "VpnCheckAccess"),
             ("POST", "/api/vpn/authorize", "VpnAuthorize"),
+            ("DELETE", "/api/vpn/devices/<peer>", "VpnForgetDevice"),
             // Pass
             ("POST", "/api/pass/authorize", "PassAuthorize"),
         ];
@@ -179,6 +182,7 @@ mod tests {
             ("DELETE", "/api/sites/<name>/files/entry"),
             ("POST", "/api/vpn/check-access"),
             ("POST", "/api/vpn/authorize"),
+            ("DELETE", "/api/vpn/devices/<peer>"),
             ("POST", "/api/pass/authorize"),
         ];
 

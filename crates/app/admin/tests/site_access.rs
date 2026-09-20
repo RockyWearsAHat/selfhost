@@ -563,3 +563,121 @@ async fn the_server_names_a_peer_for_its_person_and_only_they_re_key_it() {
         "bob's Peer is not bob-work's to re-key"
     );
 }
+
+// ─── My devices (self-service) ─────────────────────────────────────────────────
+
+/// Runs the full authorize→enroll flow and returns the enrolled Peer name, so
+/// each "my devices" test starts from a real, roster-backed device rather
+/// than a binding written straight to the file.
+async fn enrol_device(box_: &Deployment, person: &str, verifier: &str, peer: &str) -> String {
+    let code = body_json(&authorize(box_, person, verifier).await).get("code").and_then(Json::as_str).unwrap().to_owned();
+    let response = enroll(box_, &code, verifier, peer).await;
+    assert_eq!(response.status.code(), 200, "enrolling {peer} for {person}");
+    peer.to_owned()
+}
+
+#[tokio::test]
+async fn a_person_lists_only_their_own_devices() {
+    let box_ = deployment("devices-own-list");
+    box_.grant("bob", &[Capability::SiteAccess(site("ledger"))]);
+    box_.grant("frank", &[Capability::SiteAccess(site("ledger"))]);
+    enrol_device(&box_, "bob", "v-bob", "bob-laptop").await;
+    enrol_device(&box_, "frank", "v-frank", "frank-phone").await;
+
+    let response = box_.call_as("bob", "GET", "/api/vpn/devices", "").await;
+    assert_eq!(response.status.code(), 200);
+    let devices = body_json(&response).get("devices").cloned().expect("a devices array");
+    let names: Vec<String> =
+        devices.as_array().unwrap().iter().map(|d| d.get("name").and_then(Json::as_str).unwrap().to_owned()).collect();
+    assert_eq!(names, vec!["bob-laptop".to_owned()], "bob sees only his own device, never frank's");
+    // No deployment anywhere records when a device last connected (see
+    // `docs/VPN.md`); the field is reported honestly as absent rather than
+    // inventing a tracking system to fill it.
+    assert_eq!(devices.as_array().unwrap()[0].get("last_connected"), Some(&Json::Null));
+}
+
+#[tokio::test]
+async fn removing_your_own_device_erases_its_key_roster_line_and_binding() {
+    let box_ = deployment("devices-remove-own");
+    box_.grant("bob", &[Capability::SiteAccess(site("ledger"))]);
+    enrol_device(&box_, "bob", "v-bob", "bob-laptop").await;
+
+    let relay = &selfhost_config::Config::parse(CONFIG).unwrap().vpn[0];
+    let key_dir = selfhost_vpn::keys::key_dir(relay, &box_.dir);
+    assert!(selfhost_vpn::keys::peer_key_file(&key_dir, "bob-laptop").exists());
+
+    let response = box_.call_as("bob", "DELETE", "/api/vpn/devices/bob-laptop", "").await;
+    assert_eq!(response.status.code(), 200);
+    assert_eq!(body_json(&response).get("forgot").and_then(Json::as_str), Some("bob-laptop"));
+
+    assert!(!selfhost_vpn::keys::peer_key_file(&key_dir, "bob-laptop").exists(), "key file gone");
+    assert_eq!(selfhost_vpn::peer_binding::owner_of(&box_.dir, "bob-laptop"), None, "binding gone");
+    let after = body_json(&box_.call_as("bob", "GET", "/api/vpn/devices", "").await);
+    assert!(after.get("devices").unwrap().as_array().unwrap().is_empty(), "no longer listed");
+
+    // Idempotent shape: asking again refuses the same way a device that was
+    // never bound would, never a second success and never a crash.
+    assert_eq!(box_.call_as("bob", "DELETE", "/api/vpn/devices/bob-laptop", "").await.status.code(), 404);
+}
+
+#[tokio::test]
+async fn a_caller_can_neither_see_nor_remove_someone_elses_device() {
+    let box_ = deployment("devices-refuse-other");
+    box_.grant("bob", &[Capability::SiteAccess(site("ledger"))]);
+    box_.grant("frank", &[Capability::SiteAccess(site("ledger"))]);
+    enrol_device(&box_, "bob", "v-bob", "bob-laptop").await;
+
+    // frank's own list never contains bob's device.
+    let franks_list = body_json(&box_.call_as("frank", "GET", "/api/vpn/devices", "").await);
+    assert!(franks_list.get("devices").unwrap().as_array().unwrap().is_empty());
+
+    // Trying to remove it by name is refused with the same 404 an unbound or
+    // unknown name gets — a caller cannot tell "not yours" from "no such
+    // device" by trying names.
+    let response = box_.call_as("frank", "DELETE", "/api/vpn/devices/bob-laptop", "").await;
+    assert_eq!(response.status.code(), 404);
+    assert_eq!(
+        box_.call_as("frank", "DELETE", "/api/vpn/devices/no-such-device", "").await.status.code(),
+        404,
+        "the same refusal an unknown name gets"
+    );
+
+    // Untouched: bob still has it.
+    assert_eq!(selfhost_vpn::peer_binding::owner_of(&box_.dir, "bob-laptop").as_deref(), Some("bob"));
+    let bobs_list = body_json(&box_.call_as("bob", "GET", "/api/vpn/devices", "").await);
+    assert_eq!(bobs_list.get("devices").unwrap().as_array().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn forgetting_your_own_device_is_then_denied_by_check_access() {
+    // Ties the self-service door to the relay's own gate: `check_access` is
+    // what the relay asks on every connection (`crates/services/vpn/src/runner.rs`),
+    // so a device removed here must be one `check_access` refuses next, not
+    // merely a roster line that happens to be gone.
+    let box_ = deployment("devices-then-check-access");
+    box_.grant("bob", &[Capability::VpnAccess(VpnLocationId::parse("home").unwrap())]);
+    enrol_device(&box_, "bob", "v-bob", "bob-laptop").await;
+    // `check-access` is the relay's own door, not a device's: it demands
+    // `Capability::ConsoleRead` (`Route::demand`), the same as the console
+    // token the relay actually authenticates with in `crates/app/admin/tests/api.rs`.
+    // Anonymous never reaches `vpn_api::check_access` at all here.
+    box_.grant("relay", &[Capability::ConsoleRead]);
+
+    let check = |peer: &str| {
+        Json::object([("user_id", Json::string(peer)), ("location_id", Json::string("home"))]).to_text()
+    };
+    let allowed = |response: &Response| {
+        body_json(response).get("allowed").and_then(Json::as_bool).expect("an allowed field")
+    };
+
+    let before = box_.call_as("relay", "POST", "/api/vpn/check-access", &check("bob-laptop")).await;
+    assert!(allowed(&before), "freshly enrolled and granted: allowed");
+
+    assert_eq!(box_.call_as("bob", "DELETE", "/api/vpn/devices/bob-laptop", "").await.status.code(), 200);
+
+    let after = box_.call_as("relay", "POST", "/api/vpn/check-access", &check("bob-laptop")).await;
+    assert!(!allowed(&after), "the device is forgotten; the relay must now refuse it");
+    // bob's own name was never a valid way to ask this, before or after.
+    let by_name = box_.call_as("relay", "POST", "/api/vpn/check-access", &check("bob")).await;
+    assert!(!allowed(&by_name));
+}
