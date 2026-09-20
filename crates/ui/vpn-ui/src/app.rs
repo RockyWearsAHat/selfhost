@@ -199,6 +199,21 @@ fn confirm_quit() -> bool {
     }
 }
 
+/// Confirms removing this device from "My devices" (see
+/// [`Panel::remove_current_device`]), the same native-`NSAlert` pattern as
+/// [`confirm_quit`] and for the same reason: a destructive action a stray
+/// Return or Escape must never wave through.
+fn confirm_remove_device() -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        crate::macos_native::confirm_remove_device_native()
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        true
+    }
+}
+
 /// The console URL, reached portless through the loopback 443 gate.
 pub const CONSOLE_URL: &str = "https://admin.rockywearsahat.com/";
 
@@ -277,6 +292,15 @@ pub struct Panel {
     /// callback (an AppKit thread with no reference to this `Panel`) and
     /// drained on the next frame.
     mini_actions: Arc<Mutex<Vec<MiniAction>>>,
+    /// Whether "My devices" (see [`devices_screen`]) is the screen on
+    /// display, in place of the ordinary tunnel window. A toggle rather than
+    /// a second window: this app has always been one `view()`, and a second
+    /// real window would need its own menu-bar/tray wiring this app has
+    /// never had. Defaults `false` in both [`Panel::new`] and [`Panel::demo`],
+    /// so every existing frame test (built at the smallest window size,
+    /// where every row is already exactly accounted for) renders the same
+    /// tree it always has.
+    show_devices: bool,
 }
 
 impl Panel {
@@ -315,6 +339,7 @@ impl Panel {
             panel_should_show: false,
             panel_anchor_pos: None,
             mini_actions: Arc::new(Mutex::new(Vec::new())),
+            show_devices: false,
         }
     }
 
@@ -343,6 +368,7 @@ impl Panel {
             panel_should_show: false,
             panel_anchor_pos: None,
             mini_actions: Arc::new(Mutex::new(Vec::new())),
+            show_devices: false,
         }
     }
 
@@ -372,6 +398,45 @@ impl Panel {
     /// through both.
     fn sign_in(&mut self) {
         actions::sign_in(self.activity_handle());
+    }
+
+    /// Opens "My devices" (see [`devices_screen`]) in place of the ordinary
+    /// window.
+    fn open_devices(&mut self) {
+        self.show_devices = true;
+    }
+
+    /// Leaves "My devices", back to the ordinary window.
+    fn close_devices(&mut self) {
+        self.show_devices = false;
+    }
+
+    /// Removes the device this install itself is, after confirming — the
+    /// only device "My devices" can act on from here (see
+    /// [`devices_screen`]'s doc comment for why the others are read-only).
+    ///
+    /// "Remove" on the current device is a sign-out: it clears the local
+    /// account labels ([`keys::sign_out`]) and tears the tunnel down, the
+    /// same shape as `confirm_quit`'s "quitting disconnects the tunnel"
+    /// warning, because being connected under an identity that is about to
+    /// stop being recognized is not a state to leave the tunnel in.
+    fn remove_current_device(&mut self) {
+        if !confirm_remove_device() {
+            return;
+        }
+        self.tunnel.disconnect();
+        if let Err(error) = keys::sign_out() {
+            let mut activity = self.activity();
+            activity.notice = Some((false, format!("could not sign out: {error}")));
+            return;
+        }
+        {
+            let mut activity = self.activity();
+            activity.account = None;
+            activity.client = None;
+            activity.notice = Some((true, "Removed this device. Signed out.".to_string()));
+        }
+        self.show_devices = false;
     }
 
     /// Hands a peer identity a background sign-in just bound this install to
@@ -754,6 +819,9 @@ pub const MIN_HEIGHT: f32 = 620.0;
 /// control never moves, and the route rows stay where they are, dimmed rather
 /// than gone.
 pub fn view(ui: &Panel) -> El<Panel> {
+    if ui.show_devices {
+        return devices_screen(ui);
+    }
     let link = ui.tunnel.link();
     let activity = ui.activity();
     let auto = ui.auto_rotate.load(Ordering::Relaxed);
@@ -793,6 +861,7 @@ fn masthead(link: &Link, account: Option<&str>) -> El<Panel> {
         title("SELFHOST").bold().tracking(1.0),
         caption("VPN").color(Tone::Exact(style::CYAN)).tracking(2.0),
         spacer().grow(),
+        account.is_some().then(devices_control),
         sign_in_control(account),
         dot(status_of(link), 4.0),
         micro(state_word(link)).color(word_tone(link)).tracking(1.5),
@@ -800,6 +869,12 @@ fn masthead(link: &Link, account: Option<&str>) -> El<Panel> {
     .gap(space::S)
     .h(22.0)
     .align(rui::Align::Center)
+}
+
+/// Opens ["My devices"](devices_screen), next to the account control — only
+/// once signed in, since "My devices" is a signed-in account's own devices.
+fn devices_control() -> El<Panel> {
+    button("Devices").h(20.0).label("My devices").on_click(|panel: &mut Panel| panel.open_devices())
 }
 
 /// The one account control: "Sign in" when no identity is bound yet, or
@@ -999,6 +1074,70 @@ fn rotated_reading(raw: Option<&str>) -> El<Panel> {
         }
         None => caption(raw.to_string()).color(Tone::Muted),
     }
+}
+
+/// "My devices": the signed-in account's own devices, with a Remove control.
+///
+/// The admin API this was built alongside (`GET`/`DELETE
+/// /api/vpn/devices...`, `Demand::Authenticated`) answers a live console
+/// session or an Agent bearer — this desktop process has never held either.
+/// `oauth.rs`'s own doc comment says why: `POST /api/vpn/enroll`'s code
+/// redemption is deliberately one-time and never a durable credential, and
+/// the only thing this process keeps from it is the account's display name
+/// (see [`keys::set_signed_in`]). So this screen shows and acts on the one
+/// device it can always answer for honestly without inventing a new
+/// credential store — the install it is running on — rather than drawing a
+/// live list of every device on the account that it has no safe way to fetch
+/// or remove from here today. Removing a *different* device is still only
+/// done by signing in at the console (`selfhost people forget-device`'s own
+/// door, or the console's own use of this same
+/// `DELETE /api/vpn/devices/<peer>` route).
+fn devices_screen(ui: &Panel) -> El<Panel> {
+    let activity = ui.activity();
+    let peer = keys::account();
+    let label = activity.account.clone();
+    col((
+        row((
+            title("MY DEVICES").bold().tracking(1.0),
+            spacer().grow(),
+            button("Done").h(20.0).label("Done, back to the tunnel").on_click(|panel: &mut Panel| panel.close_devices()),
+        ))
+        .gap(space::S)
+        .align(rui::Align::Center)
+        .h(22.0),
+        match &peer {
+            Some(name) => device_row(name, label.as_deref()),
+            None => hud::glass_row((caption("Not signed in on this device.").color(Tone::Muted), spacer().grow()))
+                .align(rui::Align::Center),
+        },
+        caption(
+            "Other devices on this account are managed by signing in and removing them from there — this screen only ever acts on the device it runs on.",
+        )
+        .color(Tone::Muted),
+        spacer().grow(),
+    ))
+    .pad(space::L)
+    .gap(space::M)
+    .role(Role::Dialog)
+    .label("My devices")
+}
+
+/// One row in [`devices_screen`]: the device's peer name, marked as this
+/// device (it is the only one this screen can ever show), and Remove.
+fn device_row(peer: &str, label: Option<&str>) -> El<Panel> {
+    let subtitle = match label {
+        Some(name) => format!("@{name} · this device"),
+        None => "this device".to_string(),
+    };
+    hud::glass_row((
+        col((text(peer).color(Tone::Text), caption(subtitle).color(Tone::Muted))).gap(2.0),
+        spacer().grow(),
+        button("Remove")
+            .h(24.0)
+            .label(format!("Remove {peer}"))
+            .on_click(|panel: &mut Panel| panel.remove_current_device()),
+    ))
+    .align(rui::Align::Center)
 }
 
 /// A small two-state switch bound to the auto-rotation flag.
@@ -1361,6 +1500,64 @@ mod tests {
         assert!(
             ((keys_large.y - routes_large.y) - (keys_small.y - routes_small.y)).abs() < 0.5,
             "the blocks under the hero kept their spacing"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // My devices
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn devices_is_reachable_only_once_signed_in() {
+        // `Panel::demo` reads the real signed-in state off disk (see
+        // `keys::account_label`) rather than a mock, like every other field
+        // this window shows from `Activity::default()`'s overrides in `new`/
+        // `demo` — so this only asserts the masthead's "Devices" entry point
+        // tracks that state, in whichever direction it actually is, rather
+        // than assuming this test box is signed out.
+        let signed_in = keys::account_label().is_some();
+        let mut harness = window(state("offline"), SIZES[0]);
+        harness.frame();
+        assert_eq!(
+            harness.shows("Devices"),
+            signed_in,
+            "\"Devices\" is offered exactly when an account is signed in"
+        );
+    }
+
+    #[test]
+    fn the_devices_screen_replaces_the_window_and_can_be_left() {
+        // A toggle, not a second window: turning it on swaps the whole tree,
+        // and every ordinary control (the primary connect/disconnect
+        // control, the routes) is gone while it is up.
+        for size in SIZES {
+            let mut panel = Panel::demo(state("connected"));
+            panel.show_devices = true;
+            let mut harness = Harness::with_app(application("SelfHost VPN", panel)).size(size.0, size.1);
+            harness.frame();
+            assert!(harness.shows("MY DEVICES"), "at {size:?}");
+            assert!(harness.shows("Done"), "at {size:?}");
+            assert!(!harness.shows("ROUTES"), "the ordinary window is not drawn underneath, at {size:?}");
+            harness.assert_accessible();
+            harness.assert_tab_order();
+        }
+    }
+
+    #[test]
+    fn a_signed_out_install_says_so_on_the_devices_screen() {
+        // `keys::account()` reads the real `~/.securevpn/account` file, which
+        // a test box may or may not have — this only asserts the screen
+        // renders one of its two honest states, not which one.
+        let mut panel = Panel::demo(state("offline"));
+        panel.show_devices = true;
+        let mut harness = Harness::with_app(application("SelfHost VPN", panel)).size(SIZES[1].0, SIZES[1].1);
+        harness.frame();
+        let signed_in = keys::account().is_some();
+        assert_eq!(harness.shows("Remove"), signed_in, "Remove is offered exactly when there is a device to remove");
+        assert_eq!(
+            harness.shows("Not signed in on this device."),
+            !signed_in,
+            "the empty state says so plainly when there is no device"
         );
     }
 }

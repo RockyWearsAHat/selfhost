@@ -10,6 +10,17 @@ use selfhost_identity::{Capability, Credential, Identity, People, Policy, Person
 
 /// Checks if a user has access to a specific VPN location.
 ///
+/// `vpn` resolves `user_id` from a Peer (the device the relay actually saw)
+/// to its Person before anything else is checked, via
+/// [`crate::people_api::VpnWiring::person_of_peer`] — the same binding
+/// [`crate::people_api::forget_device`] removes. A Peer nobody has ever bound,
+/// or one since forgotten, is nobody: this is what makes forgetting a device
+/// actually cut it off, rather than merely tidying the roster file. `vpn` is
+/// `None` only where no `[[vpn]]` relay is configured at all, in which case
+/// `user_id` is taken as a Person's own name, unresolved — the pre-binding
+/// behaviour, kept so a deployment with no relay yet does not have to carry a
+/// `VpnWiring` just to ask this question.
+///
 /// Returns a JSON response with `allowed` field and optional `reason` if denied.
 pub fn check_access(
     people: Option<&People>,
@@ -263,5 +274,55 @@ mod tests {
         let response =
             check_access(Some(&people), None, br#"{"user_id":"alex","location_id":"ai-studio"}"#);
         assert!(allowed(&response), "a holder of Capability::Owner is allowed any location");
+    }
+
+    #[test]
+    fn a_device_answers_for_the_person_it_is_bound_to() {
+        let dir = scratch("device-resolves");
+        let people = People::load(&dir);
+        let grants =
+            Grants::new([Capability::VpnAccess(selfhost_identity::VpnLocationId::parse("console").unwrap())])
+                .unwrap();
+        people.set_grants(&PersonName::parse("alex").unwrap(), grants).expect("register alex");
+        selfhost_vpn::peer_binding::bind(&dir, "alex-laptop", "alex").expect("bind the peer");
+        let vpn = crate::people_api::VpnWiring::new(Vec::new(), dir);
+
+        let body = br#"{"user_id":"alex-laptop","location_id":"console"}"#;
+        assert!(allowed(&check_access(Some(&people), Some(&vpn), body)));
+        // With no VpnWiring at all (no `[[vpn]]` relay configured), the raw
+        // `user_id` is never taken as a Person's name behind its back — that
+        // fallback exists only for a deployment with no relay to bind against.
+        assert!(!allowed(&check_access(Some(&people), None, body)), "a Peer name is not a Person's name");
+    }
+
+    #[test]
+    fn a_forgotten_device_is_denied_even_though_the_person_still_holds_the_grant() {
+        // The point of resolving a Peer to its Person here: forgetting a
+        // device (`crate::people_api::forget_device` — the same function
+        // `selfhost people forget-device` and `DELETE /api/vpn/devices/<peer>`
+        // call) must actually cut that device off, not just tidy a roster
+        // file nothing else reads. The Person's own grant is untouched
+        // throughout — what changes is which devices answer for them.
+        let dir = scratch("forgotten-device-denied");
+        let people = People::load(&dir);
+        let grants =
+            Grants::new([Capability::VpnAccess(selfhost_identity::VpnLocationId::parse("console").unwrap())])
+                .unwrap();
+        people.set_grants(&PersonName::parse("alex").unwrap(), grants).expect("register alex");
+        selfhost_vpn::peer_binding::bind(&dir, "alex-laptop", "alex").expect("bind the peer");
+        let vpn = crate::people_api::VpnWiring::new(Vec::new(), dir);
+        let body = br#"{"user_id":"alex-laptop","location_id":"console"}"#;
+        assert!(allowed(&check_access(Some(&people), Some(&vpn), body)), "bound and granted: allowed");
+
+        vpn.forget_device("mom", "alex-laptop").expect_err("not mom's device to forget");
+        assert!(allowed(&check_access(Some(&people), Some(&vpn), body)), "a refused forget changes nothing");
+
+        vpn.forget_device("alex", "alex-laptop").expect("alex's own device");
+        assert!(!allowed(&check_access(Some(&people), Some(&vpn), body)), "the device is gone; alex still holds the grant");
+
+        // Trying the Person's own name in place of the forgotten device's
+        // does not somehow still work — a name is never a device.
+        let by_person_name = br#"{"user_id":"alex","location_id":"console"}"#;
+        assert!(!allowed(&check_access(Some(&people), Some(&vpn), by_person_name)));
     }
 }

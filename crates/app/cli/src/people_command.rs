@@ -57,6 +57,10 @@ Usage
   roster entry are independent, the same way the console's own grant is — but a
   grant with neither is a promise with nobody who can use it yet.
   selfhost people forget <name>              Remove the entry entirely
+  selfhost people forget-device <name> <device>
+                                             Remove one of their devices: key, roster
+                                             line and binding. Their other grants and
+                                             devices are untouched.
   selfhost people capabilities               Every capability word, and its target
 
 Letting somebody in
@@ -248,7 +252,9 @@ pub fn run(arguments: &[String], data_dir: &Path, config: &Config) -> Result<(),
             pubkey_argument(arguments)?,
         ),
         Some("forget") => forget(&people, data_dir, name_argument(arguments)?),
-        Some("forget-device") => forget_device(data_dir, config, name_argument(arguments)?, arguments.get(3)),
+        Some("forget-device") => {
+            forget_device(data_dir, config, name_argument(arguments)?, device_argument(arguments)?)
+        }
         Some("invite") => invite(&people, data_dir, config, arguments),
         Some("invited") => invited(data_dir),
         Some("uninvite") => uninvite(data_dir, name_argument(arguments)?),
@@ -496,6 +502,24 @@ fn peer_argument(arguments: &[String]) -> Result<Option<String>, String> {
         return Err(format!("\"{text}\" is not a usable roster name: {problem}"));
     }
     Ok(Some(text.clone()))
+}
+
+/// The third positional argument to `forget-device <name> <device>`: which of
+/// that Person's roster entries to remove.
+///
+/// Positional rather than `--peer` like [`peer_argument`]: `grant`/`allow`/
+/// `deny` take a device name as one flag among several optional ones on a
+/// capability-editing command, but `forget-device` has nothing else to parse
+/// — `<name> <device>` is the whole command, the same shape `forget <name>`
+/// already is.
+fn device_argument(arguments: &[String]) -> Result<&String, String> {
+    let text = arguments
+        .get(3)
+        .ok_or_else(|| "usage: selfhost people forget-device <name> <device>".to_owned())?;
+    if let Some(problem) = selfhost_config::vpn::peer_name_problem(text) {
+        return Err(format!("\"{text}\" is not a usable roster name: {problem}"));
+    }
+    Ok(text)
 }
 
 /// The `--pubkey <base64>` pair, if given.
@@ -963,16 +987,27 @@ fn forget(people: &People, data_dir: &Path, name: PersonName) -> Result<(), Stri
     }
 }
 
-/// Removes one of a person's VPN devices: key file, roster line and binding.
+/// Removes one of a person's VPN devices: its key file and roster line on
+/// every relay, and the binding that made it theirs.
+///
+/// Calls [`selfhost_admin::people_api::forget_device`] — the same function
+/// the console's self-service `DELETE /api/vpn/devices/<peer>` calls — so an
+/// operator forgetting a device from here and a Person forgetting their own
+/// from the desktop app go through exactly one path, never two that could
+/// drift apart.
 fn forget_device(
     data_dir: &Path,
     config: &Config,
     name: PersonName,
-    peer: Option<&String>,
+    peer: &str,
 ) -> Result<(), String> {
-    let peer = peer.ok_or("usage: selfhost people forget-device <name> <device>")?;
-    selfhost_vpn::peer_binding::forget(&config.vpn, data_dir, name.as_str(), peer)?;
-    record(data_dir, Authority::GrantsChanged, name.as_str(), &format!("device-forgotten:{peer}"));
+    selfhost_admin::people_api::forget_device(&config.vpn, data_dir, name.as_str(), peer)?;
+    record(
+        data_dir,
+        Authority::VpnDeviceForgotten,
+        name.as_str(),
+        &format!("device-forgotten:{peer}"),
+    );
     println!("✓ {peer} is no longer one of {name}'s devices; the relay refuses it from now on");
     Ok(())
 }

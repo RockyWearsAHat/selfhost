@@ -345,6 +345,27 @@ pub fn vpn_side_effects(
     lines
 }
 
+/// Removes one of `person`'s VPN devices entirely: the key file and roster
+/// line on every relay that knows it, and the ownership binding.
+///
+/// The one forget path shared by `selfhost people forget-device` and the
+/// console's self-service `DELETE /api/vpn/devices/<peer>`, so a fix here
+/// reaches both without being written twice — the same reason
+/// [`vpn_side_effects`] is a free function rather than logic folded into
+/// either door. Wraps [`selfhost_vpn::peer_binding::forget`], which already
+/// refuses a `peer` not bound to `person` — unbound, or bound to somebody
+/// else — before touching any relay, with one message for both cases: a
+/// caller must not be able to tell "no such device" from "not yours" by
+/// trying names.
+pub fn forget_device(
+    relays: &[selfhost_config::vpn::Relay],
+    data_dir: &Path,
+    person: &str,
+    peer: &str,
+) -> Result<(), String> {
+    selfhost_vpn::peer_binding::forget(relays, data_dir, person, peer)
+}
+
 /// What `PUT /api/people/<name>` needs to run [`vpn_side_effects`]: the relays
 /// this deployment declares, and the data directory their key directories are
 /// resolved relative to.

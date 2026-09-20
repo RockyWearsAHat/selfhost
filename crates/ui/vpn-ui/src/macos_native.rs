@@ -172,3 +172,34 @@ pub fn confirm_quit_native() -> bool {
     }
 }
 
+/// Runs a native, modal "Remove this device?" alert and reports whether the
+/// destructive button ("Remove") was chosen.
+///
+/// Same shape as [`confirm_quit_native`] and for the same reason: removing
+/// the device this install itself is signs it out immediately, so a stray
+/// Return or Escape must never be read as "yes".
+pub fn confirm_remove_device_native() -> bool {
+    let alert: Object = unsafe { send(class(c"NSAlert"), sel(c"alloc")) };
+    let alert: Object = unsafe { send(alert, sel(c"init")) };
+    if alert.is_null() {
+        // No alert could be built at all — refuse the destructive path rather
+        // than silently signing this device out unconfirmed.
+        return false;
+    }
+    unsafe {
+        let _: () = send1(alert, sel(c"setMessageText:"), ns_string(c"Remove this device?"));
+        let _: () = send1(
+            alert,
+            sel(c"setInformativeText:"),
+            ns_string(c"This will sign you out and disconnect the tunnel on this device."),
+        );
+        // Same right-to-left button order as `confirm_quit_native`: "Cancel"
+        // added first (rightmost, the Return-key default), "Remove" second,
+        // reported as `NSAlertSecondButtonReturn`.
+        let _: Object = send1(alert, sel(c"addButtonWithTitle:"), ns_string(c"Cancel"));
+        let _: Object = send1(alert, sel(c"addButtonWithTitle:"), ns_string(c"Remove"));
+        let response: isize = send(alert, sel(c"runModal"));
+        response == ALERT_SECOND_BUTTON
+    }
+}
+
