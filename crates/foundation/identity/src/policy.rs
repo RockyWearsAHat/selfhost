@@ -323,6 +323,15 @@ fn satisfies(held: &Capability, want: &Capability) -> bool {
     if held == want {
         return true;
     }
+    // A held `Capability::Owner` satisfies any `want`: it is the deployment's
+    // full authority expressed as a grant rather than as an identity, so it
+    // must open exactly what `Identity::Owner`'s blanket allow in
+    // `Policy::decide` opens for the same caller. This is the one arm that
+    // makes "make owner a Grant held by an ordinary Person" true; every other
+    // arm below is a narrower, capability-specific implication.
+    if matches!(held, Capability::Owner) {
+        return true;
+    }
     match (held, want) {
         (
             Capability::FilesAdmin,
@@ -755,7 +764,12 @@ fn the_machine_may(want: &Capability) -> bool {
         // A VPN location grant belongs to a *person* — it is what the
         // account-manager checks the tunnel's peer against, not something the
         // box's own automation token needs to assert about itself.
-        | Capability::VpnAccess(_) => false,
+        | Capability::VpnAccess(_)
+        // The deployment's full authority, expressed as a grant. A leaked
+        // bearer token must stay the fixed, explicit list above and never
+        // become an owner by holding this — the same reasoning that keeps it
+        // off every other `*Admin` capability, taken to its limit.
+        | Capability::Owner => false,
     }
 }
 
@@ -827,7 +841,7 @@ mod tests {
         vec![Identity::Owner, Identity::Machine, person(), agent()]
     }
 
-    /// The five capabilities the bearer token does not hold, written out here
+    /// The capabilities the bearer token does not hold, written out here
     /// rather than read off [`the_machine_may`] so the sweep is checking the
     /// model against a second statement of the rule and not against itself.
     fn withheld_from_the_machine(want: &Capability) -> bool {
@@ -841,6 +855,7 @@ mod tests {
                 | Capability::SiteAccess(_)
                 | Capability::SiteAdminOf(_)
                 | Capability::VpnAccess(_)
+                | Capability::Owner
         )
     }
 
@@ -1513,5 +1528,64 @@ mod tests {
 
         assert!(agent.within(&Grants::none()).is_empty(), "a Person holding nothing caps to nothing");
         assert!(person.beyond(&agent).is_empty());
+    }
+
+    #[test]
+    fn a_person_holding_the_owner_capability_is_allowed_everything_through_their_grants() {
+        // The bug this capability exists to fix: today's `Identity::Owner` (the
+        // console password) has no Person entry, so any seam that checks the
+        // People registry directly refuses the owner on their own deployment.
+        // Making "owner" a Grant a Person can hold routes that same authority
+        // through `Policy::decide`'s ordinary grants rule (check 6) rather than
+        // through the identity rule (check 5) — same outcome, reachable for a
+        // named account.
+        let shapes = Capability::every_shape(&share(), &node(), &location(), &site());
+        let owner_grant = Grants::new([Capability::Owner]).expect("one grant");
+        let caller = Caller::passkey(person(), owner_grant);
+        for want in &shapes {
+            assert_eq!(
+                Policy::new(true).decide(&caller, want),
+                Decision::Allow,
+                "a Person holding Capability::Owner must be allowed {want}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_agent_is_still_capped_even_when_its_person_holds_owner() {
+        // The other half: an agent's ceiling is its Person's grants, but
+        // `Grants::within` only ever *filters* the agent's own explicit list —
+        // it never adds capabilities the agent was not itself granted, even
+        // when the ceiling "holds everything" via `Capability::Owner`. An
+        // agent must be handed `Capability::Owner` itself to reach that
+        // authority; inheriting it through the Person would be exactly the
+        // widening `Grants::within` exists to prevent.
+        let owners_grants = Grants::new([Capability::Owner]).expect("one grant");
+        let agents_own_grant =
+            Grants::new([Capability::SiteAdmin]).expect("one grant").within(&owners_grants);
+        assert!(agents_own_grant.holds(&Capability::SiteAdmin), "explicitly granted, and kept");
+        assert!(
+            !agents_own_grant.holds(&Capability::FilesAdmin),
+            "never granted, so never inherited from an owning Person"
+        );
+
+        let scoped = Caller::agent(AgentName::parse("claude-mac").unwrap(), agents_own_grant);
+        assert_eq!(Policy::new(true).decide(&scoped, &Capability::SiteAdmin), Decision::Allow);
+        assert_eq!(
+            Policy::new(true).decide(&scoped, &Capability::FilesAdmin),
+            Decision::Refuse(Refusal::NotGranted),
+            "an agent never becomes an owner by way of the Person that owns it"
+        );
+    }
+
+    #[test]
+    fn owner_is_withheld_from_the_bearer_token() {
+        for policy in [Policy::locked_down(), Policy::new(true).with_passkey_enrolled(true)] {
+            assert_eq!(
+                policy.decide(&Caller::bearer(), &Capability::Owner),
+                Decision::Refuse(Refusal::OutsideTheMachinesScope),
+                "a leaked bearer token must never become an owner by holding this"
+            );
+        }
     }
 }
