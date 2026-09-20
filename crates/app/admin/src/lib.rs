@@ -1733,7 +1733,7 @@ impl Api {
             Route::SiteFilePut(name) => self.sites_file_put(name, query, body),
             Route::SiteFileDelete(name) => self.sites_file_delete(name, query),
             Route::MaintenanceStatus => self.maintenance_status(),
-            Route::VpnCheckAccess => vpn_api::check_access(self.people.as_ref(), body),
+            Route::VpnCheckAccess => vpn_api::check_access(self.people.as_ref(), self.vpn.as_ref(), body),
             Route::VpnAuthorize => self.vpn_authorize(&caller, body),
             Route::VpnPeers => self.vpn_peers(),
             Route::PassAuthorize => self.pass_authorize(&caller, body),

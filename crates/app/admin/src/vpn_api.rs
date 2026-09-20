@@ -11,7 +11,11 @@ use selfhost_identity::{Capability, Credential, Identity, People, Policy, Person
 /// Checks if a user has access to a specific VPN location.
 ///
 /// Returns a JSON response with `allowed` field and optional `reason` if denied.
-pub fn check_access(people: Option<&People>, body: &[u8]) -> Response {
+pub fn check_access(
+    people: Option<&People>,
+    vpn: Option<&crate::people_api::VpnWiring>,
+    body: &[u8],
+) -> Response {
     // Parse request body
     let text = match std::str::from_utf8(body) {
         Ok(t) => t,
@@ -40,6 +44,12 @@ pub fn check_access(people: Option<&People>, body: &[u8]) -> Response {
             ("reason", Json::String("no permission registry".to_string())),
         ]));
     };
+
+    // A relay asks about whoever connected, and names them by their Peer —
+    // the device. Access is a Person's, so the Peer is resolved to its Person
+    // first; a `user_id` that is no Peer here is taken as a Person's name.
+    let person = vpn.and_then(|vpn| vpn.person_of_peer(location_id, user_id));
+    let user_id = person.as_deref().unwrap_or(user_id);
 
     // Look up the user
     let Ok(name) = PersonName::parse(user_id) else {
@@ -136,13 +146,13 @@ mod tests {
 
     #[test]
     fn test_check_access_missing_user_id() {
-        let response = check_access(None, b"{}");
+        let response = check_access(None, None, b"{}");
         assert_eq!(response.status.0, 400);
     }
 
     #[test]
     fn test_check_access_no_registry() {
-        let response = check_access(None, b"{\"user_id\":\"test\",\"location_id\":\"us-east-1\"}");
+        let response = check_access(None, None, b"{\"user_id\":\"test\",\"location_id\":\"us-east-1\"}");
         assert_eq!(response.status.0, 200);
         assert!(!allowed(&response), "no registry means nobody is allowed");
     }
@@ -151,8 +161,26 @@ mod tests {
     fn an_unknown_user_is_denied() {
         let people = People::load(&scratch("unknown-user"));
         let response =
-            check_access(Some(&people), br#"{"user_id":"nobody","location_id":"console"}"#);
+            check_access(Some(&people), None, br#"{"user_id":"nobody","location_id":"console"}"#);
         assert!(!allowed(&response));
+    }
+
+    /// A relay names whoever connected by their Peer, never by their Person.
+    #[test]
+    fn a_peer_is_answered_as_the_person_it_belongs_to() {
+        let dir = scratch("peer-to-person");
+        let people = People::load(&dir);
+        let grants = Grants::new([Capability::VpnAccess(
+            selfhost_identity::VpnLocationId::parse("console").unwrap(),
+        )])
+        .unwrap();
+        people.set_grants(&PersonName::parse("alex").unwrap(), grants).expect("register alex");
+        crate::peer_binding::bind(&dir, "laptop-4f2a", "alex").expect("bind the peer");
+        let vpn = crate::people_api::VpnWiring::new(Vec::new(), dir);
+
+        let body = br#"{"user_id":"laptop-4f2a","location_id":"console"}"#;
+        assert!(allowed(&check_access(Some(&people), Some(&vpn), body)));
+        assert!(!allowed(&check_access(Some(&people), None, body)), "unresolved, a Peer is nobody");
     }
 
     #[test]
@@ -162,7 +190,7 @@ mod tests {
             .set_grants(&PersonName::parse("alex").unwrap(), Grants::none())
             .expect("register alex");
         let response =
-            check_access(Some(&people), br#"{"user_id":"alex","location_id":"console"}"#);
+            check_access(Some(&people), None, br#"{"user_id":"alex","location_id":"console"}"#);
         assert!(!allowed(&response), "no vpn.access grant must not open the door");
     }
 
@@ -175,7 +203,7 @@ mod tests {
         .unwrap();
         people.set_grants(&PersonName::parse("alex").unwrap(), grants).expect("register alex");
         let response =
-            check_access(Some(&people), br#"{"user_id":"alex","location_id":"console"}"#);
+            check_access(Some(&people), None, br#"{"user_id":"alex","location_id":"console"}"#);
         assert!(!allowed(&response), "a grant for one location must not open another");
     }
 
@@ -188,7 +216,7 @@ mod tests {
         .unwrap();
         people.set_grants(&PersonName::parse("alex").unwrap(), grants).expect("register alex");
         let response =
-            check_access(Some(&people), br#"{"user_id":"alex","location_id":"console"}"#);
+            check_access(Some(&people), None, br#"{"user_id":"alex","location_id":"console"}"#);
         assert!(allowed(&response));
     }
 
@@ -203,7 +231,7 @@ mod tests {
         let owner_grants = Grants::new([Capability::Owner]).unwrap();
         people.set_grants(&PersonName::parse("alex").unwrap(), owner_grants).expect("register alex");
         let response =
-            check_access(Some(&people), br#"{"user_id":"alex","location_id":"ai-studio"}"#);
+            check_access(Some(&people), None, br#"{"user_id":"alex","location_id":"ai-studio"}"#);
         assert!(allowed(&response), "a holder of Capability::Owner is allowed any location");
     }
 }
