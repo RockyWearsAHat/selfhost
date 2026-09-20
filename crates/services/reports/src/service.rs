@@ -48,18 +48,18 @@
 //! GET  <route>/favicon.svg                   the page's icon           open, page budget
 //! ```
 //!
-//! # No invite code, because nothing here is readable outside the account it belongs to
+//! # No invite code, because nothing here is readable outside the filer it belongs to
 //!
 //! This subsystem never gates itself behind an invite. Registering is open to anyone — nothing
-//! a report account can see or do (its own filed reports, its own password, its own passkeys)
-//! is visible to anyone but the account itself, so there is nothing an invite would need to
+//! a report filer can see or do (its own filed reports, its own password, its own passkeys)
+//! is visible to anyone but the filer itself, so there is nothing an invite would need to
 //! protect. Invite-gating is reserved for *direct server access* — the NAS, the VPN, the admin
 //! console, the mesh — services built into the box itself, with real roles and grants behind
 //! them, owned by `crates/admin`'s own invite door. Confusing the two once already cost a
-//! redesign: an earlier draft of this subsystem linked a reports account to a
+//! redesign: an earlier draft of this subsystem linked a reports filer to a
 //! `selfhost_identity::PersonName` and displayed that name's `People::grants_for` back to it,
 //! on the theory that "download the source" was a privileged act. It never was — downloading
-//! source code is not server access — so that entire wire (`invite.rs`, `Account::linked_person`,
+//! source code is not server access — so that entire wire (`invite.rs`, `ReportFiler::linked_person`,
 //! the `linkedPerson`/`grants` fields below) was removed rather than kept as an unused option.
 //!
 //! # The one page this crate serves, and the three files it is made of
@@ -252,7 +252,7 @@ use selfhost_mail::OutboundQueue;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
-use crate::accounts::{self, Account, AccountError, Accounts};
+use crate::accounts::{self, ReportFiler, ReportFilers, AccountError};
 use crate::clock;
 use crate::limit::{Decision, Limiter, Meter, Rate};
 use crate::notify::{self, Mailbox};
@@ -495,7 +495,7 @@ pub struct AccountsConfig {
 /// and shared for the life of the [`Service`].
 struct AccountsRuntime {
     config: AccountsConfig,
-    accounts: Accounts,
+    accounts: ReportFilers,
     sessions: Sessions,
     webauthn: Option<Webauthn>,
     oauth_providers: std::collections::HashMap<String, oauth::Provider>,
@@ -513,7 +513,7 @@ struct AccountsRuntime {
 
 impl AccountsRuntime {
     fn open(config: AccountsConfig) -> Self {
-        let accounts = Accounts::load(&config.data_dir);
+        let accounts = ReportFilers::load(&config.data_dir);
         let sessions = Sessions::load(&config.data_dir);
         // The ceremony origin is derived from this deployment's own `public_base_url` rather
         // than taken as a second configuration value, and rather than rebuilt out of the
@@ -841,11 +841,11 @@ impl Service {
             Ok(report) => report,
             Err(refusal) => return refuse(Status::BAD_REQUEST, refusal.message()),
         };
-        let account = self
+        let filer = self
             .accounts
             .as_ref()
             .and_then(|runtime| self.caller(runtime, request));
-        report.account_id = account.as_ref().map(|account| account.id.clone());
+        report.account_id = filer.as_ref().map(|filer| filer.id.clone());
 
         // The plan gate, before the write so a refusal costs nothing. Only a *fresh* defect can
         // grow an owned service's meter, so only a fresh one is ever refused — another sighting
@@ -859,10 +859,10 @@ impl Service {
         match self.store.record(&report) {
             Ok(recorded) => {
                 if recorded.fresh {
-                    if let Some(account) = &account {
+                    if let Some(filer) = &filer {
                         if let Some(runtime) = &self.accounts {
                             if let Err(error) = runtime.accounts.record_filed(
-                                &account.id,
+                                &filer.id,
                                 &recorded.entry.project,
                                 &recorded.entry.id,
                             ) {
@@ -1139,7 +1139,7 @@ impl Service {
 
     /// The account a request's session cookie names, if any — live, not expired, found. Used
     /// only to *attribute* a filing; its absence is never a refusal.
-    fn caller(&self, runtime: &AccountsRuntime, request: &Request) -> Option<Account> {
+    fn caller(&self, runtime: &AccountsRuntime, request: &Request) -> Option<ReportFiler> {
         let presented = sessions::cookie_value(request.headers.get_str("cookie"));
         let account_id = runtime.sessions.account_of(presented.as_deref()?)?;
         runtime.accounts.find_by_id(&account_id)
@@ -1520,12 +1520,12 @@ impl Service {
         }
     }
 
-    /// The email/password validation and account creation [`Self::register_password`] uses.
+    /// The email/password validation and filer creation [`Self::register_password`] uses.
     fn create_password_account(
         &self,
         runtime: &AccountsRuntime,
         value: &Json,
-    ) -> Result<Account, Response> {
+    ) -> Result<ReportFiler, Response> {
         let email = text_field(value, "email");
         let password = text_field(value, "password");
         if email.is_empty() || password.is_empty() {
@@ -1553,13 +1553,13 @@ impl Service {
         let Ok(address) = selfhost_mail::Address::parse(email) else {
             return wrong();
         };
-        let Some(account) = runtime.accounts.find_by_email(&address) else {
+        let Some(filer) = runtime.accounts.find_by_email(&address) else {
             return wrong();
         };
-        if !runtime.accounts.verify_password(&account, password) {
+        if !runtime.accounts.verify_password(&filer, password) {
             return wrong();
         }
-        self.session_response(runtime, &account.id)
+        self.session_response(runtime, &filer.id)
     }
 
     /// `POST <route>/logout` — ends the presented session, if any. Never an error: a caller
@@ -1671,11 +1671,11 @@ impl Service {
     /// [`Config::mail`] gives report notifications: the account still works, it is simply
     /// unverified until an operator wires up mail or the account sets a password it can prove
     /// some other way.
-    fn send_verification(&self, runtime: &AccountsRuntime, account: &Account, wall: SystemTime) {
+    fn send_verification(&self, runtime: &AccountsRuntime, filer: &ReportFiler, wall: SystemTime) {
         let Some(queue) = &runtime.mail_queue else {
             return;
         };
-        let Ok(token) = runtime.verify.mint(&account.id) else {
+        let Ok(token) = runtime.verify.mint(&filer.id) else {
             return;
         };
         let verify_url = format!(
@@ -1686,7 +1686,7 @@ impl Service {
         if let Err(error) = crate::verify::send_verification(
             queue,
             &runtime.config.verify_from,
-            &account.email,
+            &filer.email,
             &runtime.config.verify_helo,
             &runtime.config.site_name,
             &verify_url,
@@ -1695,31 +1695,31 @@ impl Service {
         }
     }
 
-    /// `GET <route>/me` — the account's own view of itself.
+    /// `GET <route>/me` — the filer's own view of itself.
     fn whoami(&self, runtime: &AccountsRuntime, request: &Request) -> Response {
-        let Some(account) = self.caller(runtime, request) else {
+        let Some(filer) = self.caller(runtime, request) else {
             return refuse(Status::UNAUTHORIZED, "sign in first");
         };
-        answer(Status::OK, self.me_json(runtime, &account))
+        answer(Status::OK, self.me_json(runtime, &filer))
     }
 
     /// The `me`-shaped body [`Self::whoami`] answers with.
-    fn me_json(&self, runtime: &AccountsRuntime, account: &Account) -> Json {
+    fn me_json(&self, runtime: &AccountsRuntime, filer: &ReportFiler) -> Json {
         let passkeys = runtime
             .webauthn
             .as_ref()
-            .map(|webauthn| webauthn.passkeys().list_for(&account.id))
+            .map(|webauthn| webauthn.passkeys().list_for(&filer.id))
             .unwrap_or_default();
         Json::object([
-            ("id", Json::string(&account.id)),
-            ("email", Json::string(&account.email)),
-            ("emailVerified", Json::Bool(account.email_verified)),
-            ("plan", Json::string(&account.plan)),
-            ("hasPassword", Json::Bool(account.password.is_some())),
+            ("id", Json::string(&filer.id)),
+            ("email", Json::string(&filer.email)),
+            ("emailVerified", Json::Bool(filer.email_verified)),
+            ("plan", Json::string(&filer.plan)),
+            ("hasPassword", Json::Bool(filer.password.is_some())),
             (
                 "oauthProviders",
                 Json::array(
-                    account
+                    filer
                         .oauth_links
                         .iter()
                         .map(|link| Json::string(&link.provider)),
@@ -1735,7 +1735,7 @@ impl Service {
                     ])
                 })),
             ),
-            ("createdUnix", Json::Number(account.created_unix as f64)),
+            ("createdUnix", Json::Number(filer.created_unix as f64)),
         ])
     }
 
@@ -2057,7 +2057,7 @@ impl Service {
         }
     }
 
-    /// The whole of completing an OAuth sign-in: the account it lands on, or the refusal the
+    /// The whole of completing an OAuth sign-in: the filer it lands on, or the refusal the
     /// JSON caller gets. Split out of [`Self::oauth_callback`] so that deciding *what happened*
     /// and deciding *how to say it* are two different functions, and only the second one knows
     /// whether it is talking to a browser.
@@ -2067,7 +2067,7 @@ impl Service {
         provider_name: &str,
         query: &str,
         request: &Request,
-    ) -> Result<Account, Response> {
+    ) -> Result<ReportFiler, Response> {
         let Some(provider) = runtime.oauth_providers.get(provider_name) else {
             return Err(refuse(
                 Status::NOT_FOUND,
@@ -2129,42 +2129,42 @@ impl Service {
         self.oauth_account(runtime, provider_name, &identity)
     }
 
-    /// Finds or creates the account an OAuth identity signs in as.
+    /// Finds or creates the filer an OAuth identity signs in as.
     ///
     /// Looked up by the provider link first — a returning sign-in never re-decides anything.
-    /// For a first sign-in, an account found **by email address** is merged into only when *both*
-    /// sides of that address have been proven: the provider must vouch for it, and the account
-    /// standing here must already carry [`Account::email_proven`]. Anything else mints a fresh
-    /// account when the address is free, and refuses when it is not.
+    /// For a first sign-in, a filer found **by email address** is merged into only when *both*
+    /// sides of that address have been proven: the provider must vouch for it, and the filer
+    /// standing here must already carry [`ReportFiler::email_proven`]. Anything else mints a fresh
+    /// filer when the address is free, and refuses when it is not.
     ///
-    /// # The exact seam an account takeover ran through
+    /// # The exact seam a filer takeover ran through
     ///
-    /// Two rules, each defensible alone, combined into a way to walk into somebody's account:
+    /// Two rules, each defensible alone, combined into a way to walk into somebody's filer:
     ///
     /// 1. `POST <route>/passkey/register/start` lets an unauthenticated caller name an address
-    ///    and get an account for it — reasonable, because a passkey has to be registered
+    ///    and get a filer for it — reasonable, because a passkey has to be registered
     ///    *somewhere* before the person holding it has any other way to prove who they are.
-    /// 2. A provider that vouches for an address may merge into the account already holding that
+    /// 2. A provider that vouches for an address may merge into the filer already holding that
     ///    address — reasonable, because that is what "sign in with Google" means to a person who
     ///    registered with a password last year and forgot.
     ///
     /// Run together: an attacker posts `victim@example.com` to rule 1, finishes the ceremony
-    /// with *their own* authenticator, and now this box holds an account for the victim's
+    /// with *their own* authenticator, and now this box holds a filer for the victim's
     /// address with the attacker's passkey on it and `email_verified: false`. The victim later
     /// clicks "sign in with Google", the provider truthfully vouches for their own address, and
-    /// rule 2 hands them a session on the squatted account — with the attacker's credential
+    /// rule 2 hands them a session on the squatted filer — with the attacker's credential
     /// still attached, and every report the victim files from then on readable by whoever holds
     /// it. Nothing anywhere was bypassed; the second rule simply trusted a *record* that the
     /// first rule let a stranger create.
     ///
-    /// The fix is to make rule 2 ask what rule 1 never established: not "does this account
+    /// The fix is to make rule 2 ask what rule 1 never established: not "does this filer
     /// exist" but "did anyone ever prove this address belongs to whoever holds it". A password,
     /// a passkey, an unvouched provider link — all of them prove possession of a credential and
     /// none of them prove possession of the address, which is exactly what
-    /// [`Account::email_proven`] is named after.
+    /// [`ReportFiler::email_proven`] is named after.
     ///
-    /// Legitimate merges are untouched: an account that clicked its verification link, or that
-    /// was created by a provider that vouched, still merges. An account that never proved its
+    /// Legitimate merges are untouched: a filer that clicked its verification link, or that
+    /// was created by a provider that vouched, still merges. A filer that never proved its
     /// address does not, and its holder is told the same sentence an unverified provider claim
     /// gets — byte for byte, so this route cannot be used to sort addresses into "squatted" and
     /// "merely unverified". Its holder can still sign in with the credential they do have, and
@@ -2174,12 +2174,12 @@ impl Service {
         runtime: &AccountsRuntime,
         provider_name: &str,
         identity: &oauth::Identity,
-    ) -> Result<Account, Response> {
-        if let Some(account) = runtime
+    ) -> Result<ReportFiler, Response> {
+        if let Some(filer) = runtime
             .accounts
             .find_by_oauth(provider_name, &identity.subject)
         {
-            return Ok(account);
+            return Ok(filer);
         }
         let Ok(address) = selfhost_mail::Address::parse(&identity.email) else {
             return Err(refuse(
