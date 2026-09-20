@@ -98,6 +98,21 @@ impl DeployId {
     fn random() -> std::io::Result<Self> {
         Ok(Self(crate::token::hex(&crate::token::random_bytes(ID_BYTES)?)))
     }
+
+    /// Reconstructs a `DeployId` from its stored string form.
+    ///
+    /// [`DeployId::random`] is the only other constructor, and it is called
+    /// exactly once, the instant [`Deploys::start`] accepts a deploy. This one
+    /// exists for the one case an id has to survive a process boundary: a
+    /// self-update's post-restart health verification
+    /// (`selfhost_cli::self_update::verify_after_restart`) runs in a
+    /// *different process* from the one whose [`Deploys::start`] minted the
+    /// id — the update exited on purpose so the service manager could restart
+    /// it — so the id crosses that boundary as the plain string persisted to
+    /// a pending-verification marker, with no live `DeployId` to hand along.
+    pub fn from_stored(id: impl Into<String>) -> Self {
+        Self(id.into())
+    }
 }
 
 impl std::fmt::Display for DeployId {

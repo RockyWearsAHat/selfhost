@@ -1466,6 +1466,32 @@ async fn serve_everything(
         let _ = scheduler.spawn_task();
     }
 
+    // If this boot followed a self-update's restart, prove the new build is
+    // actually serving before letting its Deploy record say so — see
+    // `self_update`'s "Proving the restart worked" module docs. A no-op,
+    // one failed file read, on every ordinary boot with nothing pending.
+    //
+    // Spawned rather than awaited: the health-check retries this can take
+    // must never delay the daemon's own startup, and the listeners it grades
+    // are already bound above by the time it runs. A rollback it decides on
+    // has already restored the previous binary and tree by the time this
+    // returns, so exiting here with the same restart code hands the box back
+    // to the one restart mechanism that brought this build up in the first
+    // place, rather than sitting on a build this process itself just proved
+    // broken.
+    tokio::spawn({
+        let data_dir = data_dir.clone();
+        let project_dir = project_dir.clone();
+        let config = config.clone();
+        let deploys = Arc::clone(&deploys);
+        async move {
+            let outcome = self_update::verify_after_restart(data_dir, project_dir, config, Some(deploys)).await;
+            if matches!(outcome, self_update::VerifyResult::RolledBack { .. }) {
+                std::process::exit(self_update::RESTART_EXIT);
+            }
+        }
+    });
+
     let mut updated_to: Option<String> = None;
     let outcome = tokio::select! {
         result = selfhost_admin::serve(listener, api) => {
@@ -1517,6 +1543,7 @@ async fn serve_everything(
         commit = self_update::watch_own_repository(
             config.self_update.clone(),
             project_dir.clone(),
+            data_dir.clone(),
             self_update_nudge.clone(),
             Some(Arc::clone(&deploys)),
         ) => {
