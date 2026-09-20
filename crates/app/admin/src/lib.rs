@@ -2822,16 +2822,25 @@ impl Api {
             // demoted the same way by check 4 once a passkey names somebody),
             // and a Person who now holds `Capability::Owner` as an ordinary
             // grant satisfies it too, through check 6 — one seam for both.
-            Demand::OwnerOnly | Demand::OwnerReads
-                if self.policy().decide(caller, &Capability::Owner).is_allowed() =>
-            {
+            Demand::OwnerOnly if self.policy().decide(caller, &Capability::Owner).is_allowed() => {
                 true
             }
             Demand::OwnerOnly => false,
-            // The native console over its SSH tunnel is the one other reader
-            // of `OwnerReads`: it holds the bearer token, never a grant, so
-            // this stays a direct identity check rather than a policy one.
-            Demand::OwnerReads => caller.identity().is_machine(),
+            // `OwnerReads` keeps the guarantee `Demand::OwnerOnly` does not:
+            // reading stays open even once the console password is demoted to
+            // `ConsoleRead` by an enrolled passkey (`Policy::decide` check 4) —
+            // the demotion is about acts that change the box, not about
+            // looking at it, so the literal `Identity::Owner` check has to
+            // stand beside the policy one rather than be replaced by it. The
+            // native console over its SSH tunnel is the other direct-identity
+            // reader, holding the bearer token and never a grant. A Person
+            // who holds `Capability::Owner` as an ordinary grant reaches this
+            // through the policy check exactly as `OwnerOnly` does.
+            Demand::OwnerReads => {
+                caller.identity().is_owner()
+                    || caller.identity().is_machine()
+                    || self.policy().decide(caller, &Capability::Owner).is_allowed()
+            }
             // Enrolment asks only that this is the owner, by whichever credential
             // they still have. That is the whole recovery path: the credential
             // that names them is the one that was lost. Deliberately still the
