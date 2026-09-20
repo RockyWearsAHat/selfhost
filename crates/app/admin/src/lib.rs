@@ -2147,6 +2147,15 @@ impl Api {
                         );
                     }
                     1 => accessible[0].clone(),
+                    // An owner reaches every relay, so "which one" is never
+                    // ambiguous for them the way it is between two tenants:
+                    // they get the deployment's first declared relay.
+                    _ if self.policy().decide(caller, &Capability::Owner).is_allowed() => {
+                        match vpn.relay_names().first() {
+                            Some(first) => (*first).to_owned(),
+                            None => return problem(Status(404), "no relay is configured"),
+                        }
+                    }
                     _ => {
                         return problem(
                             Status(400),
