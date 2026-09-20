@@ -455,22 +455,26 @@ enum Demand {
     /// A capability from [`selfhost_identity`]'s closed vocabulary, decided by
     /// [`Policy::decide`].
     Held(Capability),
-    /// The owner's own identity, proved by a credential that names whoever is
-    /// acting.
+    /// The owner's own authority, proved by a credential that names whoever is
+    /// acting — decided through [`Policy::decide`] against [`Capability::Owner`]
+    /// rather than a bare identity check, so a Person who holds that grant
+    /// reaches this exactly as the console password does.
     ///
     /// Creating authority: writing the people registry, minting an invitation,
     /// and taking somebody's passkey away. Registering or revoking a credential
     /// is not *using* a power, it is *minting* or *destroying* one — a passkey
     /// registered under a name is a way to authenticate as that name for ever
-    /// after — and the capability vocabulary has no word for "may create
-    /// authority" because no grant should ever confer it. So these routes ask for
-    /// the identity that cannot be granted to anybody.
+    /// after. [`Capability::Owner`] is the one word in the vocabulary that may
+    /// confer it, and deliberately the only one: nothing else implies it and it
+    /// is never composed from combining lesser `*Admin` grants, so "may create
+    /// authority" stays a single, explicit toggle rather than an emergent
+    /// property of enough narrower ones.
     ///
     /// The console password satisfies this **only while no passkey is enrolled**,
     /// which is the same rule [`Policy::decide`] applies to capabilities and the
     /// same argument: a shared secret that names nobody may set a deployment up,
     /// and once the deployment has a credential that names somebody, handing out
-    /// authority needs one. See [`Api::names_who_is_acting`].
+    /// authority needs one.
     OwnerOnly,
     /// Enrolling a passkey for the deployment's owner.
     ///
@@ -1774,13 +1778,13 @@ impl Api {
         let Some(people) = &self.people else {
             return problem(Status(404), NO_REGISTRY);
         };
-        if !caller.identity().is_owner() {
+        // The bar `Demand::OwnerOnly` sets, through the same `Policy::decide`
+        // seam rather than a direct `.identity().is_owner()`: a Person who
+        // holds `Capability::Owner` is the full owner exactly as the legacy
+        // console password is, and must reach every other Person's grants
+        // here rather than falling through to the delegate's narrower door.
+        if !self.policy().decide(caller, &Capability::Owner).is_allowed() {
             return self.delegate_site_access(caller, people, name, body).await;
-        }
-        // The bar `Demand::OwnerOnly` sets, held here because the route's own
-        // demand had to loosen to let a delegate in.
-        if !self.names_who_is_acting(caller) {
-            return problem(Status(401), "authorisation required");
         }
         let Ok(person) = PersonName::parse(name) else {
             return problem(
@@ -2812,37 +2816,34 @@ impl Api {
     fn permits(&self, caller: &Caller, demand: &Demand) -> bool {
         match demand {
             Demand::Held(capability) => self.policy().decide(caller, capability).is_allowed(),
-            Demand::OwnerOnly => caller.identity().is_owner() && self.names_who_is_acting(caller),
+            // Through `Policy::decide` against `Capability::Owner` rather than
+            // a direct `.identity().is_owner()`: the legacy console-password
+            // owner satisfies it exactly as before (check 5's blanket allow,
+            // demoted the same way by check 4 once a passkey names somebody),
+            // and a Person who now holds `Capability::Owner` as an ordinary
+            // grant satisfies it too, through check 6 — one seam for both.
+            Demand::OwnerOnly | Demand::OwnerReads
+                if self.policy().decide(caller, &Capability::Owner).is_allowed() =>
+            {
+                true
+            }
+            Demand::OwnerOnly => false,
+            // The native console over its SSH tunnel is the one other reader
+            // of `OwnerReads`: it holds the bearer token, never a grant, so
+            // this stays a direct identity check rather than a policy one.
+            Demand::OwnerReads => caller.identity().is_machine(),
             // Enrolment asks only that this is the owner, by whichever credential
             // they still have. That is the whole recovery path: the credential
-            // that names them is the one that was lost.
+            // that names them is the one that was lost. Deliberately still the
+            // literal identity and not `Capability::Owner`: the credential lost
+            // is the console password, which only `Identity::Owner` ever wore,
+            // and a Person's grant is not a way back into a box whose passkeys
+            // are gone.
             Demand::Enrolment => caller.identity().is_owner(),
-            Demand::OwnerReads => {
-                caller.identity().is_owner() || caller.identity().is_machine()
-            }
             // The wall above already decided this, and reaching here proves it.
             Demand::Authenticated => true,
             Demand::Unsatisfiable => false,
         }
-    }
-
-    /// Whether this credential says *which* person is behind the request.
-    ///
-    /// The demand-side half of the rule [`Policy::decide`] applies to
-    /// capabilities, and it lives here rather than there because it needs a fact
-    /// the policy is not allowed to hold: whether this deployment has a passkey
-    /// enrolled, read from the store on this request. Keeping the fact out of the
-    /// pure function is the same division of labour the freshness rule already
-    /// uses — `decide` answers *who may ever*, and the seam that owns the state
-    /// answers *what is true right now*.
-    ///
-    /// A passkey, and the session it opened, always name their holder. The
-    /// console password names nobody, so it answers `true` only while there is
-    /// nobody it could have been: a deployment with no passkey enrolled has one
-    /// credential and one operator, and refusing them would brick a box that is
-    /// still being installed.
-    fn names_who_is_acting(&self, caller: &Caller) -> bool {
-        !caller.credential().is_a_password_login() || !self.a_passkey_is_enrolled()
     }
 
     /// Answers `POST /api/session`: verifies the password and mints a session.
@@ -2884,7 +2885,7 @@ impl Api {
         // than here. While no passkey is enrolled it is everything, because it
         // is the only way into a box somebody has just installed; from the
         // first enrolled passkey it reads the console and enrols another one.
-        // See `Policy::decide` and `Api::names_who_is_acting`.
+        // See `Policy::decide`.
         match console.sessions.create(OWNER, Opening::Password) {
             Ok(id) => with_session_cookie(
                 json(Status(200), session_granted(OWNER)),
@@ -5103,6 +5104,171 @@ mod tests {
 
         let unissued = find("certificate:unissued.example.com");
         assert_eq!(unissued.get("state").and_then(Json::as_str), Some("unknown"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A minimal, sites-free config good enough to build an [`Api`] over —
+    /// the owner-grant tests below never touch site admin, so there is
+    /// nothing to declare beyond the one node every config requires.
+    fn owner_grant_test_config() -> selfhost_config::Config {
+        selfhost_config::Config::parse(
+            "version = 1\n\
+             [server]\n\
+             http_bind = \"127.0.0.1:8080\"\n\
+             https_bind = \"127.0.0.1:8443\"\n\
+             acme_email = \"a@b.com\"\n\
+             acme = \"self-signed\"\n\
+             data_dir = \"./data\"\n\
+             [[nodes]]\n\
+             name = \"home\"\n\
+             role = \"owner\"\n",
+        )
+        .expect("a valid config")
+    }
+
+    /// Regression for the round-3 owner/person work: `Demand::OwnerOnly` and
+    /// `Demand::OwnerReads` used to check `caller.identity().is_owner()`
+    /// directly — the legacy `Identity::Owner` console password only — so a
+    /// Person who holds the new `Capability::Owner` grant was refused every
+    /// owner-only route (`ListPeople`, `ForgetPerson`, minting an invite,
+    /// removing a passkey) even though [`Policy::decide`] already treats them
+    /// as holding everything. `permits` must now route both demands through
+    /// that same seam.
+    #[test]
+    fn a_person_holding_owner_satisfies_owner_only_and_owner_reads() {
+        let dir = std::env::temp_dir()
+            .join(format!("selfhost-admin-lib-owner-permits-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let config = owner_grant_test_config();
+
+        let people = People::load(&dir);
+        let owner = PersonName::parse("alex").unwrap();
+        people.set_grants(&owner, Grants::new([Capability::Owner]).unwrap()).expect("register alex");
+        let stranger = PersonName::parse("dana").unwrap();
+        people.set_grants(&stranger, Grants::none()).expect("register dana");
+
+        let api = Api::new(
+            Supervisor::new(&dir),
+            Store::new(&dir),
+            Token::load_or_create(&dir).unwrap(),
+            Manager::for_config(&config),
+        )
+        .with_people(people.clone());
+
+        let owner_caller =
+            people.caller(Identity::Person(owner), selfhost_identity::Credential::Passkey);
+        let stranger_caller =
+            people.caller(Identity::Person(stranger), selfhost_identity::Credential::Passkey);
+
+        assert!(
+            api.permits(&owner_caller, &Demand::OwnerOnly),
+            "a Capability::Owner holder is owner-only authority"
+        );
+        assert!(
+            api.permits(&owner_caller, &Demand::OwnerReads),
+            "and reads owner-only material too"
+        );
+        assert!(
+            !api.permits(&stranger_caller, &Demand::OwnerOnly),
+            "an ordinary person with no grant is refused owner-only routes"
+        );
+        assert!(
+            !api.permits(&stranger_caller, &Demand::OwnerReads),
+            "and refused owner-only reads too"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The `set_grants` half of the same regression: before routing its
+    /// owner branch through [`Policy::decide`], a Person holding
+    /// `Capability::Owner` fell through to [`Api::delegate_site_access`],
+    /// which only ever lets a caller add or remove `site.access:<site>` for
+    /// sites it already administers and refuses everything else outright —
+    /// so such a Person could not grant an ordinary console capability like
+    /// `services.admin` to anybody.
+    #[tokio::test]
+    async fn a_person_holding_owner_reaches_full_grant_authority_through_set_grants() {
+        let dir = std::env::temp_dir()
+            .join(format!("selfhost-admin-lib-owner-set-grants-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let config = owner_grant_test_config();
+
+        let people = People::load(&dir);
+        let owner = PersonName::parse("alex").unwrap();
+        people.set_grants(&owner, Grants::new([Capability::Owner]).unwrap()).expect("register alex");
+        let carol = PersonName::parse("carol").unwrap();
+        people.set_grants(&carol, Grants::none()).expect("register carol");
+
+        let api = Api::new(
+            Supervisor::new(&dir),
+            Store::new(&dir),
+            Token::load_or_create(&dir).unwrap(),
+            Manager::for_config(&config),
+        )
+        .with_people(people.clone());
+
+        let owner_caller =
+            people.caller(Identity::Person(owner), selfhost_identity::Credential::Passkey);
+
+        // Before the fix, this fell into `delegate_site_access`, which
+        // refuses outright because `services.admin` is not a `site.access`
+        // grant.
+        let response =
+            api.set_grants(&owner_caller, "carol", br#"{"grants":["services.admin"]}"#).await;
+        assert_eq!(
+            response.status.code(),
+            200,
+            "an owner-grant holder reaches full set_grants authority: {response:?}"
+        );
+        assert!(
+            people.grants_for(&Identity::Person(carol.clone())).holds(&Capability::ServicesAdmin),
+            "the grant was actually written"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The companion negative case: an ordinary Person — holding neither the
+    /// legacy `Identity::Owner` nor the new `Capability::Owner` — must stay
+    /// confined to `delegate_site_access`'s narrower door through this same
+    /// route, never reaching full grant authority by it.
+    #[tokio::test]
+    async fn a_person_without_the_owner_grant_is_confined_to_delegated_site_access() {
+        let dir = std::env::temp_dir()
+            .join(format!("selfhost-admin-lib-non-owner-set-grants-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let config = owner_grant_test_config();
+
+        let people = People::load(&dir);
+        let editor = PersonName::parse("edna").unwrap();
+        people.set_grants(&editor, Grants::none()).expect("register edna");
+        let carol = PersonName::parse("carol").unwrap();
+        people.set_grants(&carol, Grants::none()).expect("register carol");
+
+        let api = Api::new(
+            Supervisor::new(&dir),
+            Store::new(&dir),
+            Token::load_or_create(&dir).unwrap(),
+            Manager::for_config(&config),
+        )
+        .with_people(people.clone());
+
+        let editor_caller =
+            people.caller(Identity::Person(editor), selfhost_identity::Credential::Passkey);
+
+        let response =
+            api.set_grants(&editor_caller, "carol", br#"{"grants":["services.admin"]}"#).await;
+        assert_eq!(
+            response.status.code(),
+            401,
+            "delegate_site_access refuses a grant that is not site.access: {response:?}"
+        );
+        assert!(!people.grants_for(&Identity::Person(carol)).holds(&Capability::ServicesAdmin));
 
         let _ = std::fs::remove_dir_all(&dir);
     }

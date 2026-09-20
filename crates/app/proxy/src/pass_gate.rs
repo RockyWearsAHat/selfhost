@@ -13,7 +13,7 @@
 
 use selfhost_admin::site_pass::{Redeemed, SitePasses};
 use selfhost_config::Site;
-use selfhost_identity::{Capability, Identity, People, PersonName, SiteName};
+use selfhost_identity::{Capability, Credential, Identity, People, Policy, SiteName};
 
 /// The cookie a Pass travels in. The `__Host-` prefix makes the browser
 /// itself refuse it unless it is `Secure`, has `Path=/` and names no
@@ -78,16 +78,19 @@ impl PassGate {
         self.passes.redeem(code, &name)
     }
 
-    /// The owner, the Site's own `owner`, or a Person who holds
-    /// `site.access:<site>` in the registry as it stands this instant.
+    /// The legacy console owner, the Site's own `owner`, or somebody who
+    /// holds `site.access:<site>` — through [`Policy::decide`], never a
+    /// direct `.grants.holds()`, so a Person holding [`Capability::Owner`]
+    /// is let in here exactly the same way `vpn_api.rs::check_access` lets
+    /// one onto their own VPN: through the ordinary grants rule, now
+    /// satisfied by an owner grant for any `want` (see
+    /// `crate::policy::satisfies` in `selfhost_identity`).
     fn holds_a_grant(&self, person: &Identity, site: &Site, name: &SiteName) -> bool {
         if person.is_owner() || site.owner.as_ref().is_some_and(|owner| owner.as_str() == person.as_str()) {
             return true;
         }
-        PersonName::parse(person.as_str())
-            .ok()
-            .and_then(|person| self.people.find(&person))
-            .is_some_and(|entry| entry.grants.holds(&Capability::SiteAccess(name.clone())))
+        let caller = self.people.caller(person.clone(), Credential::Passkey);
+        Policy::locked_down().decide(&caller, &Capability::SiteAccess(name.clone())).is_allowed()
     }
 }
 
@@ -140,6 +143,73 @@ fn percent_encode(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use selfhost_admin::site_pass::SitePasses;
+    use selfhost_identity::{Grants, PassKey, People, PersonName};
+    use std::path::PathBuf;
+
+    fn scratch(name: &str) -> PathBuf {
+        let path = std::env::temp_dir()
+            .join(format!("selfhost-pass-gate-test-{}-{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&path);
+        std::fs::create_dir_all(&path).unwrap();
+        path
+    }
+
+    fn ordinary_site(name: &str) -> Site {
+        Site {
+            name: name.to_owned(),
+            domains: vec![format!("{name}.example.com")],
+            static_root: Some(std::path::PathBuf::from("./sites").join(name)),
+            spa: false,
+            app_paths: Vec::new(),
+            instances: Vec::new(),
+            health: selfhost_config::Health::default(),
+            canonical_redirect: true,
+            allowed_cidrs: Vec::new(),
+            console: false,
+            public_api_paths: vec![],
+            exposure: None,
+            owner: None,
+            relay: None,
+        }
+    }
+
+    #[test]
+    fn an_owner_grant_is_let_through_a_site_the_person_was_never_named_on() {
+        // The named bug's sibling: an owner is a Person who holds
+        // `Capability::Owner`, not `site.access:<site>` for any particular
+        // site. Before routing this through `Policy::decide`, such a Person
+        // was refused every site's Pass gate unless they were that site's
+        // named `owner` field or the legacy `Identity::Owner`.
+        let dir = scratch("owner-any-site");
+        let people = People::load(&dir);
+        let owner_grants = Grants::new([Capability::Owner]).unwrap();
+        people.set_grants(&PersonName::parse("alex").unwrap(), owner_grants).expect("register alex");
+        let passes = SitePasses::new(PassKey::ephemeral().expect("a key"));
+        let gate = PassGate::new(passes, people);
+        let site = ordinary_site("blog");
+        let name = SiteName::parse(&site.name).unwrap();
+        let alex = Identity::Person(PersonName::parse("alex").unwrap());
+        assert!(
+            gate.holds_a_grant(&alex, &site, &name),
+            "a holder of Capability::Owner is let onto any site's Pass gate"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_person_with_no_grant_at_all_is_refused_the_site() {
+        let dir = scratch("no-grant");
+        let people = People::load(&dir);
+        people.set_grants(&PersonName::parse("alex").unwrap(), Grants::none()).expect("register alex");
+        let passes = SitePasses::new(PassKey::ephemeral().expect("a key"));
+        let gate = PassGate::new(passes, people);
+        let site = ordinary_site("blog");
+        let name = SiteName::parse(&site.name).unwrap();
+        let alex = Identity::Person(PersonName::parse("alex").unwrap());
+        assert!(!gate.holds_a_grant(&alex, &site, &name), "no grant must not open the gate");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn a_cookie_is_found_by_exact_name_among_others() {
