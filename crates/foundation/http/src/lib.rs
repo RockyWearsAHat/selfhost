@@ -29,6 +29,7 @@
 pub mod chunked;
 pub mod date;
 pub mod headers;
+pub mod percent;
 pub mod range;
 pub mod request;
 pub mod response;

@@ -40,6 +40,7 @@
 //! and because that is destructive it is confirmed on the terminal (or with
 //! `--yes`) and refused outright for any directory outside the project.
 
+use crate::arguments::value_of;
 use selfhost_config::{Config, Health, Instance, Site};
 use std::path::{Path, PathBuf};
 
@@ -500,15 +501,6 @@ fn positional(arguments: &[String]) -> Option<String> {
 /// Whether a bare flag is present.
 fn flag(arguments: &[String], name: &str) -> bool {
     arguments.iter().any(|argument| argument == name)
-}
-
-/// The value immediately following the first occurrence of `name`.
-fn value_of(arguments: &[String], name: &str) -> Option<String> {
-    arguments
-        .iter()
-        .position(|argument| argument == name)
-        .and_then(|at| arguments.get(at + 1))
-        .cloned()
 }
 
 /// Every value given for a repeatable option.

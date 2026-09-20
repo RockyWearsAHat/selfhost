@@ -6,6 +6,7 @@
 mod acme_task;
 mod agent_command;
 mod app_command;
+mod arguments;
 mod assess;
 mod audit;
 mod converge;
@@ -44,6 +45,7 @@ mod teardown;
 mod vpn_command;
 mod watch;
 
+use crate::arguments::value_of;
 use selfhost_admin::{Api, Fleet, Store, Token};
 use selfhost_config::{AcmeEnvironment, Config};
 use selfhost_dns::Resolver;
@@ -755,11 +757,6 @@ fn converge_command(arguments: &[String]) -> Result<(), String> {
         println!("  ESCALATED  {}  {}", entry.component, entry.detail);
     }
     Err(format!("supervision has given up on {} component(s)", outstanding.len()))
-}
-
-/// The value following a named option, if it was given.
-fn value_of(arguments: &[String], name: &str) -> Option<String> {
-    arguments.iter().position(|argument| argument == name).and_then(|at| arguments.get(at + 1)).cloned()
 }
 
 /// Watches the network's DNS to find the device behind a compromised-host listing.

@@ -3763,7 +3763,7 @@ fn site_admin_api(name: &str) -> (Api, ScratchDir, std::path::PathBuf) {
     let (api, dir) = api(name);
     let config_path = dir.path().join("selfhost.config.toml");
     std::fs::write(&config_path, MINIMAL_CONFIG).expect("writes a starter config");
-    let api = api.with_agents(dir.path()).with_site_admin(config_path.clone(), dir.path().to_path_buf());
+    let api = api.with_people(People::load(dir.path())).with_agents(dir.path()).with_site_admin(config_path.clone(), dir.path().to_path_buf());
     (api, dir, config_path)
 }
 
@@ -3776,7 +3776,11 @@ fn mint_agent(
     let store = selfhost_admin::agent_store::AgentStore::in_dir(dir);
     let agent_name = selfhost_identity::AgentName::parse(name).expect("a valid agent name");
     let grants = selfhost_identity::Grants::new(capabilities).expect("under the grant cap");
-    store.mint(&agent_name, grants, "owner").expect("mints").as_str().to_owned()
+    // An Agent holds nothing its Person does not, so each gets a registered
+    // Person of the same name holding exactly the same Grants.
+    let person = selfhost_identity::PersonName::parse(name).expect("a valid person name");
+    People::load(dir).set_grants(&person, grants.clone()).expect("registers the person");
+    store.mint(&agent_name, grants, &person).expect("mints").as_str().to_owned()
 }
 
 /// The console site is not administrable through this API, by anybody.

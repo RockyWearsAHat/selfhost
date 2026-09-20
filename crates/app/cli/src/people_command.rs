@@ -14,7 +14,7 @@
 //! re-reads, and both writers persist the same way (private temporary file and rename),
 //! so a change made here is a change the running daemon honours immediately.
 //!
-//! The fallback path is documented as such in write_grants_via_api(), and never used
+//! The fallback path is `write_grants`' `DaemonAbsent` arm, and never used
 //! while a daemon is reachable. Grant validation happens in one place: the API's
 //! people_api module, not replicated here.
 //!
@@ -32,7 +32,7 @@ use selfhost_identity::audit::{AuditLog, AuditRecord, Authority};
 use selfhost_identity::{Credential, Decision, Identity};
 use selfhost_config::Config;
 use selfhost_identity::{Capability, Grants, People, Person, PersonName};
-use selfhost_json;
+use selfhost_json::Json;
 use std::io::{Read, Write};
 use std::net::{TcpStream, SocketAddr};
 use std::path::Path;
@@ -89,117 +89,118 @@ grant, so it cannot be edited away here — which is what keeps a mistake in thi
 file from locking the operator out of the console they would fix it with.
 ";
 
-/// Why write_grants_via_api did not reach the daemon.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Why a grant write did not go through the daemon.
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum ApiUnavailable {
-    /// No daemon is listening on the admin address (bootstrap case).
+    /// Nothing is listening on the admin address: the connection was refused.
+    /// The one honest "no daemon here", and the only case that writes the
+    /// registry file directly (bootstrap).
     DaemonAbsent,
-    /// The daemon is there, but it rejected the request.
-    DaemonRejected,
+    /// Something is there, or something is wrong — a refusal, a timeout, an
+    /// unreadable token. Never a reason to write around the daemon; the reason
+    /// is carried so the operator is told what happened.
+    DaemonSaid(String),
 }
 
-/// Attempts to write grants to the admin API, returning whether it succeeded.
-///
-/// # Bootstrap path and daemon absence
-///
-/// If no daemon is listening on the admin address, this returns `Err(ApiUnavailable::DaemonAbsent)`,
-/// which signals the caller to fall back to direct file write (the bootstrap path: no daemon
-/// running yet, or first owner creation). This is the only case where direct write is used.
-///
-/// If the daemon is there but rejects the request (bad token, validation error, etc), returns
-/// `Err(ApiUnavailable::DaemonRejected)` and an error message is printed — this is not a
-/// bootstrap fallback case, it is an error the operator should see.
-fn write_grants_via_api(
+/// How long to wait for the loopback admin port to accept. A filtered port
+/// sends no RST, and without a bound the CLI would wait on it forever.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// How long to wait on the daemon once connected.
+const IO_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// The `PUT /api/people/<name>` body: the whole grant set, plus the roster
+/// pair when given. Built with the workspace's JSON crate, never by hand.
+fn grants_body(grants: &Grants, peer: Option<&str>, pubkey: Option<&str>) -> String {
+    let mut fields = vec![(
+        "grants",
+        Json::array(grants.iter().map(|cap| Json::string(selfhost_admin::people_api::wire_word(cap)))),
+    )];
+    if let Some(peer) = peer {
+        fields.push(("peer", Json::string(peer)));
+    }
+    if let Some(pubkey) = pubkey {
+        fields.push(("public_key", Json::string(pubkey)));
+    }
+    Json::object(fields).to_text()
+}
+
+/// The request head for a grant write. The name is percent-encoded: a
+/// [`PersonName`] may contain a space, and a raw one splits the request line.
+fn grants_request_head(admin_addr: SocketAddr, token: &str, name: &PersonName, body_len: usize) -> String {
+    format!(
+        "PUT /api/people/{} HTTP/1.1\r\nHost: {admin_addr}\r\nAuthorization: Bearer {token}\r\n\
+         Content-Length: {body_len}\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n",
+        selfhost_http::percent::encode_segment(name.as_str()),
+    )
+}
+
+/// Sends one grant write to the daemon at `admin_addr`.
+fn send_grants(
+    admin_addr: SocketAddr,
+    token: &str,
+    name: &PersonName,
+    body: &str,
+) -> Result<(), ApiUnavailable> {
+    let said = |what: &str, error: std::io::Error| {
+        ApiUnavailable::DaemonSaid(format!("{what} the daemon on {admin_addr}: {error}"))
+    };
+    let mut stream = match TcpStream::connect_timeout(&admin_addr, CONNECT_TIMEOUT) {
+        Ok(stream) => stream,
+        Err(error) if error.kind() == std::io::ErrorKind::ConnectionRefused => {
+            return Err(ApiUnavailable::DaemonAbsent);
+        }
+        Err(error) => return Err(said("could not reach", error)),
+    };
+    stream.set_read_timeout(Some(IO_TIMEOUT)).map_err(|error| said("could not configure the connection to", error))?;
+    stream.set_write_timeout(Some(IO_TIMEOUT)).map_err(|error| said("could not configure the connection to", error))?;
+
+    let head = grants_request_head(admin_addr, token, name, body.len());
+    stream.write_all(head.as_bytes()).map_err(|error| said("could not write to", error))?;
+    stream.write_all(body.as_bytes()).map_err(|error| said("could not write to", error))?;
+
+    let mut response = Vec::new();
+    stream.read_to_end(&mut response).map_err(|error| said("could not read from", error))?;
+    let response = String::from_utf8_lossy(&response);
+    if response.starts_with("HTTP/1.1 2") {
+        return Ok(());
+    }
+    let status = response.lines().next().unwrap_or("no reply").to_owned();
+    let reason = response
+        .split_once("\r\n\r\n")
+        .and_then(|(_, body)| selfhost_json::parse(body.trim()).ok())
+        .and_then(|json| json.get("error").and_then(Json::as_str).map(str::to_owned));
+    Err(ApiUnavailable::DaemonSaid(match reason {
+        Some(reason) => format!("the daemon refused the write: {reason}"),
+        None => format!("the daemon refused the write: {status}"),
+    }))
+}
+
+/// Writes one Person's whole grant set: through the admin API (rule 2, one
+/// writer), or straight to the registry file only when no daemon exists yet.
+fn write_grants(
+    people: &People,
     data_dir: &Path,
     config: &Config,
     name: &PersonName,
     grants: &Grants,
     peer: Option<&str>,
     pubkey: Option<&str>,
-) -> Result<(), ApiUnavailable> {
+) -> Result<(), String> {
     let admin_addr: SocketAddr = config
         .server
         .admin_bind
         .parse()
-        .map_err(|_| ApiUnavailable::DaemonRejected)?;
-
-    // Build JSON request body with grants and optional VPN fields
-    let mut json = String::from(r#"{"grants":["#);
-    let grant_words: Vec<String> = grants
-        .iter()
-        .map(|cap| {
-            format!(r#""{}""#, selfhost_admin::people_api::wire_word(cap))
-        })
-        .collect();
-    json.push_str(&grant_words.join(","));
-    json.push_str("]}");
-
-    // Add optional peer and public_key fields if present
-    if peer.is_some() || pubkey.is_some() {
-        json.truncate(json.len() - 1); // Remove trailing }
-        if let Some(peer) = peer {
-            json.push_str(&format!(r#","peer":"{}""#, peer));
-        }
-        if let Some(pubkey) = pubkey {
-            json.push_str(&format!(r#","public_key":"{}""#, pubkey));
-        }
-        json.push('}');
-    }
-
-    // Connect to the admin API
-    let mut stream = match TcpStream::connect(admin_addr) {
-        Ok(stream) => stream,
-        Err(error) if error.kind() == std::io::ErrorKind::ConnectionRefused => {
-            // Daemon is not running — bootstrap case
-            return Err(ApiUnavailable::DaemonAbsent);
-        }
-        Err(_) => {
-            return Err(ApiUnavailable::DaemonRejected);
-        }
-    };
-
-    stream
-        .set_read_timeout(Some(Duration::from_secs(5)))
-        .map_err(|_| ApiUnavailable::DaemonRejected)?;
-    stream
-        .set_write_timeout(Some(Duration::from_secs(5)))
-        .map_err(|_| ApiUnavailable::DaemonRejected)?;
-
-    // Read the admin token
-    let token_path = Token::path_in(data_dir);
-    let token = std::fs::read_to_string(&token_path)
-        .map_err(|_| ApiUnavailable::DaemonRejected)?;
-    let token = token.trim();
-
-    // Build HTTP request
-    let request = format!(
-        "PUT /api/people/{} HTTP/1.1\r\nHost: {}\r\nAuthorization: Bearer {}\r\n\
-         Content-Length: {}\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n",
-        name, admin_addr, token, json.len()
-    );
-
-    // Send request
-    stream.write_all(request.as_bytes())
-        .map_err(|_| ApiUnavailable::DaemonRejected)?;
-    stream.write_all(json.as_bytes())
-        .map_err(|_| ApiUnavailable::DaemonRejected)?;
-
-    // Read response
-    let mut response = Vec::new();
-    stream.read_to_end(&mut response)
-        .map_err(|_| ApiUnavailable::DaemonRejected)?;
-
-    let response_str = String::from_utf8_lossy(&response);
-    if response_str.starts_with("HTTP/1.1 2") {
-        Ok(())
-    } else {
-        // Extract error message from response if available
-        if let Ok(json) = selfhost_json::parse(response_str.trim()) {
-            if let Some(error) = json.get("error").and_then(selfhost_json::Json::as_str) {
-                eprintln!("✗ the daemon refused: {error}");
-            }
-        }
-        Err(ApiUnavailable::DaemonRejected)
+        .map_err(|_| format!("admin_bind \"{}\" is not an address", config.server.admin_bind))?;
+    let via_api = std::fs::read_to_string(Token::path_in(data_dir))
+        .map_err(|error| ApiUnavailable::DaemonSaid(format!("could not read the admin token: {error}")))
+        .and_then(|token| send_grants(admin_addr, token.trim(), name, &grants_body(grants, peer, pubkey)));
+    match via_api {
+        Ok(()) => Ok(()),
+        Err(ApiUnavailable::DaemonAbsent) => people
+            .set_grants(name, grants.clone())
+            .map_err(|error| format!("could not write the registry: {error}")),
+        Err(ApiUnavailable::DaemonSaid(reason)) => Err(reason),
     }
 }
 
@@ -301,22 +302,7 @@ fn invite(
             .map_err(|_| "too many capabilities for one person".to_owned())?;
         let written = spell(&after);
 
-        // Try to write through the API first; fall back to direct write only if daemon is absent
-        match write_grants_via_api(data_dir, config, &name, &after, None, None) {
-            Ok(()) => {
-                // API write succeeded; grant is now in the store via the daemon
-            }
-            Err(ApiUnavailable::DaemonAbsent) => {
-                // Bootstrap case: no daemon running yet. Write directly to the file.
-                people
-                    .set_grants(&name, after.clone())
-                    .map_err(|error| format!("could not write the registry: {error}"))?;
-            }
-            Err(ApiUnavailable::DaemonRejected) => {
-                // Daemon rejected the request — this is an error, not a bootstrap case
-                return Err("the daemon rejected the write request".to_owned());
-            }
-        }
+        write_grants(people, data_dir, config, &name, &after, None, None)?;
 
         record(data_dir, Authority::GrantsChanged, name.as_str(), &format!("now:{written}"));
         println!("✓ {name}");
@@ -869,22 +855,7 @@ fn write(
     let unchanged = before == &after;
     let written = spell(&after);
 
-    // Try to write through the API first; fall back to direct write only if daemon is absent
-    match write_grants_via_api(data_dir, config, name, &after, peer.as_deref(), pubkey.as_deref()) {
-        Ok(()) => {
-            // API write succeeded; grant is now in the store via the daemon
-        }
-        Err(ApiUnavailable::DaemonAbsent) => {
-            // Bootstrap case: no daemon running yet. Write directly to the file.
-            people
-                .set_grants(name, after.clone())
-                .map_err(|error| format!("could not write the registry: {error}"))?;
-        }
-        Err(ApiUnavailable::DaemonRejected) => {
-            // Daemon rejected the request — this is an error, not a bootstrap case
-            return Err("the daemon rejected the write request".to_owned());
-        }
-    }
+    write_grants(people, data_dir, config, name, &after, peer.as_deref(), pubkey.as_deref())?;
 
     if unchanged {
         // No record: the trail says what changed, and nothing did. A line here
@@ -967,10 +938,18 @@ fn spell(grants: &Grants) -> String {
 
 /// Removes an entry entirely.
 fn forget(people: &People, data_dir: &Path, name: PersonName) -> Result<(), String> {
+    // Agents first, as `DELETE /api/people/<name>` does: no Agent credential
+    // outlives the Person it acts for.
+    let revoked = selfhost_admin::AgentStore::in_dir(data_dir)
+        .revoke_for_person(&name)
+        .map_err(|error| format!("could not revoke {name}'s Agents: {error}"))?;
     match people.remove(&name) {
         Ok(true) => {
             record(data_dir, Authority::PersonForgotten, name.as_str(), "removed from the registry");
             println!("✓ {name} is no longer in the registry and holds nothing");
+            if revoked > 0 {
+                println!("  {revoked} Agent credential(s) acting for {name} were revoked with them");
+            }
             println!();
             println!(
                 "  Their passkey is a separate store and still exists. Take it out from the \
@@ -1179,15 +1158,63 @@ allowed_cidrs = ["10.66.0.0/24"]
     }
 
     #[test]
-    fn api_unavailable_indicates_bootstrap_vs_rejection() {
-        // The distinction between daemon absent (bootstrap fallback) and daemon
-        // present but rejecting (error) is critical to correct behavior.
-        // DaemonAbsent = try direct write; DaemonRejected = error, no fallback.
-        let absent = ApiUnavailable::DaemonAbsent;
-        let rejected = ApiUnavailable::DaemonRejected;
-        assert_ne!(absent, rejected, "the two cases must be distinct");
-        assert_eq!(absent, ApiUnavailable::DaemonAbsent);
-        assert_eq!(rejected, ApiUnavailable::DaemonRejected);
+    fn a_name_with_a_space_makes_a_well_formed_request_line() {
+        // Regression: "PUT /api/people/Jane Doe HTTP/1.1" is four tokens and
+        // the daemon's parser refuses it.
+        let name = PersonName::parse("Jane Doe").unwrap();
+        let head = grants_request_head("127.0.0.1:9191".parse().unwrap(), "t", &name, 2);
+        let line = head.lines().next().unwrap();
+        assert_eq!(line, "PUT /api/people/Jane%20Doe HTTP/1.1");
+        assert_eq!(line.split(' ').count(), 3);
+    }
+
+    #[test]
+    fn the_body_is_real_json_even_with_awkward_values() {
+        let grants = Grants::new([Capability::ConsoleRead]).unwrap();
+        let body = grants_body(&grants, Some("lap\"top"), None);
+        let parsed = selfhost_json::parse(&body).expect("valid JSON");
+        assert_eq!(parsed.get("peer").and_then(Json::as_str), Some("lap\"top"));
+        assert_eq!(parsed.get("grants").and_then(Json::as_array).map(<[Json]>::len), Some(1));
+    }
+
+    #[test]
+    fn a_refused_connection_is_absent_and_anything_else_is_said() {
+        let name = PersonName::parse("Jane Doe").unwrap();
+        // A loopback port that was just released: refused, so "no daemon".
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+        assert_eq!(send_grants(addr, "t", &name, "{}"), Err(ApiUnavailable::DaemonAbsent));
+
+        // A daemon that answers 400 is there: its reason is reported, and the
+        // request it saw carried the encoded name.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            // Read the whole request (it ends with its `{}` body): closing
+            // with bytes unread resets the connection instead of answering.
+            let mut seen = Vec::new();
+            let mut chunk = [0u8; 512];
+            while !seen.ends_with(b"\r\n\r\n{}") {
+                let read = stream.read(&mut chunk).unwrap();
+                assert!(read > 0, "the request ended early");
+                seen.extend_from_slice(&chunk[..read]);
+            }
+            let reply = "HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\n{\"error\":\"nope\"}";
+            stream.write_all(reply.as_bytes()).unwrap();
+            String::from_utf8_lossy(&seen).into_owned()
+        });
+        let outcome = send_grants(addr, "t", &name, "{}");
+        assert_eq!(outcome, Err(ApiUnavailable::DaemonSaid("the daemon refused the write: nope".to_owned())));
+        assert!(server.join().unwrap().starts_with("PUT /api/people/Jane%20Doe HTTP/1.1\r\n"));
+    }
+
+    #[test]
+    fn connecting_is_bounded() {
+        // Regression: `TcpStream::connect` had no timeout, so a filtered admin
+        // port hung the CLI forever. The bound exists and is short.
+        assert!(CONNECT_TIMEOUT <= Duration::from_secs(5));
     }
 
     /// A config declaring one `[[vpn]]` relay named "console", disabled — the

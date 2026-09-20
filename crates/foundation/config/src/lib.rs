@@ -329,84 +329,34 @@ pub struct Node {
     pub mesh_ip: Option<String>,
 }
 
-/// A Person's name as a Site owner: validated and parsed at write time.
+/// A Site's owner: a Person's name, validated at write time.
 ///
-/// The owner of a Site must be a valid person name from the identity registry.
-/// This newtype enforces the same validation rules as [`selfhost_identity::PersonName`]:
-/// no empty strings, no over-length names, no reserved names ("owner", "machine"),
-/// and only alphanumeric characters plus a small set of interior separators.
+/// A thin serde wrapper over [`selfhost_identity::PersonName`] — the one
+/// definition of what a Person may be called — so a name this config accepts
+/// is a `PersonName` by construction, not by two rule lists happening to agree.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SiteOwner(String);
+pub struct SiteOwner(selfhost_identity::PersonName);
 
 impl SiteOwner {
-    /// Maximum length of a site owner name, in characters.
-    ///
-    /// Matched to the identity crate's PersonName maximum so that a validated
-    /// SiteOwner can always parse as a PersonName.
-    pub const MAX_CHARS: usize = 32;
-
-    /// Validates `text` as a Site owner's name.
-    ///
-    /// Refuses, in this order: emptiness, over-length, the reserved owner name
-    /// in any casing, the reserved machine name in any casing, edges that are not
-    /// alphanumeric, forbidden characters, and adjacent separators.
-    ///
-    /// These rules match [`selfhost_identity::PersonName`]'s validation so that
-    /// a SiteOwner can always parse as a PersonName at runtime.
+    /// Validates `text` as a Person's name.
     pub fn parse(text: &str) -> Result<Self, String> {
-        if text.is_empty() {
-            return Err("owner name cannot be empty".to_owned());
-        }
+        selfhost_identity::PersonName::parse(text).map(Self).map_err(|error| error.to_string())
+    }
 
-        let chars = text.chars().count();
-        if chars > Self::MAX_CHARS {
-            return Err(format!("owner name is {chars} characters, but the limit is {}", Self::MAX_CHARS));
-        }
-
-        if text.eq_ignore_ascii_case("owner") {
-            return Err("\"owner\" is a reserved name and cannot be a site owner".to_owned());
-        }
-
-        if text.eq_ignore_ascii_case("machine") {
-            return Err("\"machine\" is a reserved name and cannot be a site owner".to_owned());
-        }
-
-        // Same separators as identity crate's PersonName
-        const SEPARATORS: &[char] = &[' ', '-', '_', '.', '\''];
-
-        let mut previous_separator = None;
-        let mut last_was_separator = false;
-        for (index, character) in text.chars().enumerate() {
-            let separator = SEPARATORS.contains(&character);
-            if !separator && !character.is_alphanumeric() {
-                return Err(format!("owner name contains forbidden character: '{character}'"));
-            }
-            if index == 0 && separator {
-                return Err("owner name must start with a letter or digit".to_owned());
-            }
-            // One pair of adjacent separators is allowed: a full stop followed by a space ("J. Alex")
-            if separator && previous_separator.is_some_and(|previous| (previous, character) != ('.', ' ')) {
-                return Err("owner name cannot have adjacent separators".to_owned());
-            }
-            previous_separator = separator.then_some(character);
-            last_was_separator = separator;
-        }
-        if last_was_separator {
-            return Err("owner name must end with a letter or digit".to_owned());
-        }
-
-        Ok(Self(text.to_owned()))
+    /// The Person who owns the Site.
+    pub fn person(&self) -> &selfhost_identity::PersonName {
+        &self.0
     }
 
     /// The name as written.
     pub fn as_str(&self) -> &str {
-        &self.0
+        self.0.as_str()
     }
 }
 
 impl fmt::Display for SiteOwner {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.0)
+        f.write_str(self.as_str())
     }
 }
 
@@ -415,7 +365,7 @@ impl Serialize for SiteOwner {
     where
         S: serde::Serializer,
     {
-        self.0.serialize(serializer)
+        self.as_str().serialize(serializer)
     }
 }
 
@@ -797,6 +747,20 @@ mod tests {
             admin_bind: default_admin_bind(),
             firewall: Firewall::default(),
         }
+    }
+
+    #[test]
+    fn a_site_owner_is_exactly_a_person_name() {
+        // Regression: SiteOwner once hand-copied PersonName's rules. It now
+        // *is* one, so the two can never disagree on any input.
+        for text in ["Alex", "J. Alex", "Jane Doe", "", "owner", "MACHINE", "a  b", "-x", "x/y"] {
+            assert_eq!(
+                SiteOwner::parse(text).is_ok(),
+                selfhost_identity::PersonName::parse(text).is_ok(),
+                "{text:?}"
+            );
+        }
+        assert_eq!(SiteOwner::parse("Jane Doe").unwrap().person().as_str(), "Jane Doe");
     }
 
     #[test]

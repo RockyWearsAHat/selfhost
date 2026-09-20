@@ -273,6 +273,23 @@ impl Grants {
         self.0.iter().any(|held| satisfies(held, want))
     }
 
+    /// The part of this set that `ceiling` also holds.
+    ///
+    /// This is how an Agent is confined to its Person: the Agent's stored
+    /// Grants are narrowed to what the Person holds *now*, on every request, so
+    /// a Grant taken from the Person is taken from every Agent acting for them
+    /// in the same moment. "Holds" is [`Grants::holds`], implications included
+    /// — a Person with `files.admin` covers an Agent's `files.read:<share>`.
+    pub fn within(&self, ceiling: &Grants) -> Grants {
+        Self(self.0.iter().filter(|capability| ceiling.holds(capability)).cloned().collect())
+    }
+
+    /// The capabilities here that `ceiling` does not hold — what a mint must
+    /// refuse, named so the refusal can say which words were too much.
+    pub fn beyond(&self, ceiling: &Grants) -> Vec<Capability> {
+        self.0.iter().filter(|capability| !ceiling.holds(capability)).cloned().collect()
+    }
+
     /// The granted capabilities, in the order they were granted.
     pub fn iter(&self) -> impl Iterator<Item = &Capability> {
         self.0.iter()
@@ -1480,5 +1497,21 @@ mod tests {
             Decision::Refuse(Refusal::CredentialIsNotThisIdentitys),
             "there is one console password; a session it opened cannot name a person"
         );
+    }
+
+    #[test]
+    fn grants_are_narrowed_to_a_ceiling_with_implications() {
+        let agent = Grants::new([Capability::SiteAdmin, Capability::ConsoleRead, Capability::DnsAdmin])
+            .unwrap();
+        let person = Grants::new([Capability::SiteAdmin, Capability::ConsoleRead]).unwrap();
+
+        let narrowed = agent.within(&person);
+        assert!(narrowed.holds(&Capability::SiteAdmin));
+        assert!(narrowed.holds(&Capability::ConsoleRead));
+        assert!(!narrowed.holds(&Capability::DnsAdmin), "the Person never held it");
+        assert_eq!(agent.beyond(&person), vec![Capability::DnsAdmin]);
+
+        assert!(agent.within(&Grants::none()).is_empty(), "a Person holding nothing caps to nothing");
+        assert!(person.beyond(&agent).is_empty());
     }
 }
