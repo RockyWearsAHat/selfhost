@@ -1,119 +1,126 @@
-//! The panel's holographic house style: a cyan-on-void HUD, and the atmosphere
-//! behind it.
+//! The panel's house style: a precision instrument on a near-black ground.
 //!
-//! The look is sculpted, not assembled from box-flags — the ground and every
-//! instrument are signed-distance shapes painted with fields and lit with
-//! additive glow (see rui's `sdf` module and `SHAPING.md`). This file owns the
-//! palette, hands it to rui once through [`rui::App::theme`], and paints the
-//! ground: a deep void, a radial reactor-glow behind the hero, a perspective
-//! grid receding to a horizon, and fine scanlines.
+//! The look is a calm control panel — a high-end audio interface, a camera's
+//! menu — rather than a holographic display. There is no decoration behind
+//! the controls: no grid, no scanlines, no brackets. One saturated colour, the
+//! signature cyan, is spent on exactly two things: the live state and the
+//! primary action. Everything else is neutral ink on neutral surfaces, so that
+//! when the cyan lights up it means something.
+//!
+//! This file owns the palette, hands it to rui once through
+//! [`rui::App::theme`], owns the spacing scale every layout in the crate
+//! draws from, and paints the ground.
 
-use rui::{Appearance, Canvas, Color, CornerStyle, FontId, Palette, Point, Theme};
-use rui::{Sculpt, circle, radial};
+use rui::{Appearance, Canvas, Color, CornerStyle, FontId, Palette, Theme};
 
-// ---- the holographic palette, as raw colours the sculptors paint with -------
+// ---- the spacing scale ------------------------------------------------------
 
-/// The void the HUD floats on.
-pub const VOID: Color = Color::rgb(0x04, 0x07, 0x0d);
-/// The deeper void at the window's foot.
-pub const VOID_DEEP: Color = Color::rgb(0x01, 0x02, 0x05);
-/// The signature: arc-reactor cyan.
+/// The one 4-based spacing scale the panel is laid out on.
+///
+/// Every gap and every pad in the crate names one of these rather than a
+/// number of its own, so the rhythm down the window is one rhythm. Control
+/// heights live beside them for the same reason.
+pub mod space {
+    /// The tightest gap: between a value and its unit, a word and its dot.
+    pub const XS: f32 = 4.0;
+    /// The gap between things that belong together: rows of one list.
+    pub const S: f32 = 8.0;
+    /// A control's inner padding, and the gap between one section and the
+    /// next — the whole window has to fit its smallest size with every row
+    /// drawn, and this is the step that does.
+    pub const M: f32 = 12.0;
+    /// The window's margin, and the gap between the ring and its words.
+    pub const L: f32 = 16.0;
+    /// The height of the one control the window is mostly for.
+    pub const PRIMARY_HEIGHT: f32 = 40.0;
+    /// The height of a route row: a name, a host, a chevron.
+    pub const ROW_HEIGHT: f32 = 32.0;
+    /// The height of the readout strip.
+    pub const STRIP_HEIGHT: f32 = 40.0;
+    /// The height of one labelled field row, as rui's `field_row` reserves it.
+    pub const FIELD_HEIGHT: f32 = 20.0;
+    /// The height of a single-line footer.
+    pub const LINE_HEIGHT: f32 = 16.0;
+}
+
+// ---- the palette, as raw colours the instruments paint with ------------------
+
+/// The ground: near black, faintly cool.
+pub const VOID: Color = Color::rgb(0x0b, 0x0c, 0x10);
+/// The ground at the window's foot, a shade deeper.
+pub const VOID_DEEP: Color = Color::rgb(0x08, 0x09, 0x0c);
+/// The signature: the one saturated colour, for the live state and the
+/// primary action.
 pub const CYAN: Color = Color::rgb(0x3a, 0xe1, 0xff);
-/// Cyan at its brightest, for cores and surges.
-pub const CYAN_BRIGHT: Color = Color::rgb(0xd4, 0xf7, 0xff);
-/// Cyan gone deep, for the cold end of a conduit gradient.
-pub const CYAN_DEEP: Color = Color::rgb(0x0b, 0x4f, 0x66);
-/// Reaching amber, while the tunnel is still dialling.
-pub const AMBER: Color = Color::rgb(0xff, 0xb4, 0x54);
-/// Fault red, when the tunnel breaks.
-pub const RED: Color = Color::rgb(0xff, 0x4d, 0x5a);
-/// Cold slate, when the tunnel is down.
-pub const SLATE: Color = Color::rgb(0x54, 0x64, 0x72);
+/// Cyan at its brightest, for a knob or a core.
+pub const CYAN_BRIGHT: Color = Color::rgb(0xc4, 0xf3, 0xff);
+/// Cyan shaded down, for the bottom of the primary button.
+pub const CYAN_DEEP: Color = Color::rgb(0x1c, 0xa8, 0xc8);
+/// Reaching amber, while the tunnel is still dialling — with cause only.
+pub const AMBER: Color = Color::rgb(0xf2, 0xb0, 0x4f);
+/// Fault red, when the tunnel breaks — with cause only.
+pub const RED: Color = Color::rgb(0xff, 0x5a, 0x66);
+/// Cold slate, when the tunnel is down and a control is unavailable.
+pub const SLATE: Color = Color::rgb(0x6a, 0x73, 0x80);
 /// The ink readouts are set in.
-pub const INK: Color = Color::rgb(0xe3, 0xf1, 0xf7);
-/// Muted ink, for labels.
-pub const MUTED: Color = Color::rgb(0x6d, 0x84, 0x91);
-/// The translucent fill of a glass panel.
-pub const GLASS: Color = Color::rgba(0x0c, 0x18, 0x22, 0xb0);
-/// The edge-light run along a glass panel's frame.
-pub const EDGE: Color = Color::rgb(0x49, 0xc7, 0xe6);
+pub const INK: Color = Color::rgb(0xec, 0xf0, 0xf3);
+/// Muted ink, for labels and explanations.
+pub const MUTED: Color = Color::rgb(0x8b, 0x93, 0x9e);
+/// A surface lying on the ground: a list, a strip.
+pub const SURFACE: Color = Color::rgb(0x14, 0x16, 0x1b);
+/// The same surface a step up, for a row under the pointer.
+pub const RAISED: Color = Color::rgb(0x1c, 0x1f, 0x26);
+/// The hairline where two surfaces meet.
+pub const BORDER: Color = Color::rgb(0x26, 0x2a, 0x32);
 
-/// The palette handed to rui, so text, tags, and lamps share the HUD's hues.
-pub const HUD: Palette = Palette {
+/// The palette handed to rui, so text, tags, and controls share the panel's
+/// hues. Chrome is neutral; the accent is the only saturated entry, and `ok`
+/// is the same cyan on purpose — "up" is the live state this window exists
+/// to show, and it wears the signature.
+pub const INSTRUMENT: Palette = Palette {
     background: VOID,
     background_deep: VOID_DEEP,
-    surface: Color::rgb(0x0a, 0x14, 0x1d),
-    surface_deep: Color::rgb(0x07, 0x0f, 0x16),
-    sheen: Color::rgb(0x14, 0x2a, 0x38),
-    raised: Color::rgb(0x0f, 0x1e, 0x29),
-    sunken: Color::rgb(0x03, 0x08, 0x0d),
-    border: Color::rgb(0x1c, 0x3a, 0x49),
+    surface: SURFACE,
+    surface_deep: Color::rgb(0x11, 0x13, 0x18),
+    sheen: Color::rgb(0x22, 0x26, 0x2e),
+    raised: RAISED,
+    sunken: Color::rgb(0x08, 0x09, 0x0c),
+    border: BORDER,
     border_focus: CYAN,
     text: INK,
     text_muted: MUTED,
-    text_on_accent: Color::rgb(0x03, 0x10, 0x16),
+    text_on_accent: Color::rgb(0x05, 0x19, 0x1f),
     accent: CYAN,
     accent_deep: CYAN_DEEP,
     accent_light: CYAN_BRIGHT,
     ok: CYAN,
-    ok_tint: Color::rgb(0x06, 0x1c, 0x25),
+    ok_tint: Color::rgb(0x0b, 0x2a, 0x33),
     warn: AMBER,
-    warn_tint: Color::rgb(0x24, 0x18, 0x08),
+    warn_tint: Color::rgb(0x2b, 0x1f, 0x0c),
     bad: RED,
-    bad_tint: Color::rgb(0x26, 0x0c, 0x11),
+    bad_tint: Color::rgb(0x2c, 0x10, 0x15),
     idle: SLATE,
-    idle_tint: Color::rgb(0x0b, 0x12, 0x18),
+    idle_tint: Color::rgb(0x15, 0x18, 0x1d),
     shadow: Color::rgba(0x00, 0x00, 0x00, 0x40),
 };
 
-/// The window's theme: always the dark HUD palette, chamfered corners.
+/// The window's theme: always the dark instrument palette, softly rounded.
+///
+/// Rounded rather than chamfered: a cut corner on every card is the costume
+/// this revision takes off, and rui's own note on [`rui::style::Radius::Cut`]
+/// says the same.
 pub fn theme(_appearance: Appearance, ui_font: FontId, mono_font: FontId) -> Theme {
-    Theme::new(Appearance::Dark, ui_font, mono_font).with_palette(HUD).with_corners(CornerStyle::Cut)
+    Theme::new(Appearance::Dark, ui_font, mono_font).with_palette(INSTRUMENT).with_corners(CornerStyle::Round)
 }
 
-/// The atmosphere behind everything: void wash, a reactor-glow bloom high on the
-/// window behind the hero, a perspective grid receding to a horizon, scanlines.
+/// The ground behind everything: the void, shading a touch deeper toward the
+/// foot of the window so the surfaces lying on it read as lit from above.
+/// Nothing else — no grid, no bloom, no scanlines.
 pub fn ground(canvas: &mut Canvas, _theme: &Theme) {
     canvas.clear_vertical(VOID, VOID_DEEP);
-    let bounds = canvas.bounds();
-
-    // The reactor-glow: a broad radial bloom seated where the hero sits, so the
-    // whole panel reads as lit from its own core.
-    let glow_center = Point::new(bounds.center().x, bounds.y + bounds.h * 0.28);
-    let bloom = circle(glow_center, bounds.w * 0.62);
-    canvas.sculpt(
-        &bloom,
-        &radial(glow_center, 0.0, bounds.w * 0.62, CYAN.fade(0.16), CYAN.with_alpha(0)),
-        Sculpt::Fill,
-    );
-
-    // A perspective grid: horizontal rules drawing closer toward a high horizon,
-    // and verticals fanning from a vanishing point — faint, cold, receding.
-    let horizon = bounds.y + bounds.h * 0.16;
-    let grid = CYAN.fade(0.05);
-    let vanish = Point::new(bounds.center().x, horizon);
-    let floor = bounds.max_y();
-    let mut depth = 0.06_f32;
-    while depth < 1.0 {
-        let y = horizon + (floor - horizon) * depth * depth;
-        canvas.line(Point::new(bounds.x, y), Point::new(bounds.max_x(), y), 1.0, grid);
-        depth += 0.10;
-    }
-    for i in -6..=6 {
-        let x = bounds.center().x + (bounds.w * 0.5) * (i as f32 / 6.0);
-        canvas.line(vanish, Point::new(x, floor), 1.0, grid.fade(0.6));
-    }
-
-    // Scanlines: a fine dark comb over the whole ground, the CRT tell.
-    let scan = VOID_DEEP.with_alpha(0x22);
-    let mut y = bounds.y;
-    while y < bounds.max_y() {
-        canvas.line(Point::new(bounds.x, y), Point::new(bounds.max_x(), y), 1.0, scan);
-        y += 3.0;
-    }
 }
 
-/// The signature colour for a given state hue, for the sculptors.
+/// The signature colour for a given state hue, for the instruments.
 pub fn hue(kind: Hue) -> Color {
     match kind {
         Hue::Up => CYAN,
@@ -134,4 +141,17 @@ pub enum Hue {
     Failed,
     /// Down — cold slate.
     Off,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_palette_is_legible() {
+        // rui's own contrast gate: text ≥ 7, secondary ≥ 4.5 against the
+        // ground — asserted here so a palette tweak that dims the labels
+        // fails a test rather than a reviewer's eyes.
+        INSTRUMENT.assert_legible("instrument");
+    }
 }
