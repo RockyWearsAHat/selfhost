@@ -1,53 +1,92 @@
-//! The panel's one bold instrument: the tunnel drawn as an energy conduit
-//! between two arc-reactor nodes.
+//! The window's one instrument: a soft light whose colour is the tunnel's
+//! state, with the state set in words beneath it.
 //!
-//! It is the whole status at a glance and the only thing that moves. Each end is
-//! a reactor — concentric rings, a spinning tick collar, a radiant core — and
-//! the link between them is a beam that carries luminous packets from this
-//! machine to the box. Dormant, the reactors are cold and the beam is dim.
-//! Reaching, packets stream amber. Up, everything runs cyan and the cores
-//! breathe. Failed, the beam ruptures. Every mark is a sculpted signed-distance
-//! shape lit with additive glow — not a box with flags.
+//! There is no diagram. What a person wants from this window at a glance is
+//! *are we up*, and a large word in a field of its own colour answers that
+//! faster than any picture of a tunnel could. The light is one broad radial
+//! bloom falling from above the window's top edge — slate when there is no
+//! tunnel, amber while one is being made, cyan once it is up, red when it has
+//! failed — and it is the only thing in the window that moves: it breathes
+//! slowly while the tunnel is up and drifts side to side while reaching, so
+//! that motion always means the tunnel is doing something.
+//!
+//! The words are painted here rather than laid out as text elements because
+//! the light animates. rui replays an animating drawing on its own, restoring
+//! what was under it first (see `AnimatedDraw` in rui's `paint`), so anything
+//! laid *over* this drawing would vanish on every replayed frame. Keeping the
+//! word inside the drawing is what lets it sit in the light at all.
 
-use crate::style::{self, CYAN_BRIGHT};
+use crate::style::{self, INK, MUTED};
 use crate::tunnel::{Link, Phase};
-use rui::{
-    El, Point, Role, Size, Tone, capsule, circle, col, linear, micro, radial, ring, row, solid,
-    spacer,
-};
+use rui::style::{Face, Ink, Length};
+use rui::{Align, El, Point, Rect, Role, Size, Tone, circle, radial};
 use rui::{Painter, Sculpt};
 use std::f32::consts::TAU;
 
-/// The tunnel hero for the given link, sized to fill the width it is given.
-pub fn tunnel_hero<S: 'static>(link: &Link) -> El<S> {
-    let motion = Motion::from(&link.phase);
-    col((
-        rui::draw(Size::new(300.0, 92.0), move |painter, rect| paint(painter, rect, motion))
-            .h(92.0)
-            .w(rui::style::Length::Fill(1.0))
-            .role(Role::Image)
-            .label(motion.spoken()),
-        row((label("THIS MAC"), spacer().grow(), label("THE BOX"))).pad_x(24.0),
-    ))
-    .gap(4.0)
+/// How tall the hero is, in every state. The button under it never moves.
+pub const HEIGHT: f32 = 164.0;
+
+/// The size the state word is set at: the largest thing in the window, and
+/// the only run at this size.
+const WORD_SIZE: f32 = 34.0;
+
+/// Where the word's baseline block sits within the hero.
+const WORD_TOP: f32 = 62.0;
+/// The word's line box.
+const WORD_HEIGHT: f32 = 40.0;
+/// Where the endpoint line sits.
+const ENDPOINT_TOP: f32 = 110.0;
+/// Where the detail line sits.
+const DETAIL_TOP: f32 = 130.0;
+/// The two small lines' line box.
+const LINE_HEIGHT: f32 = 18.0;
+
+/// The hero for the given link, sized to fill the width it is given.
+pub fn hero<S: 'static>(link: &Link, endpoint: &str) -> El<S> {
+    let scene = Scene::of(link, endpoint);
+    let spoken = format!("{}. {}. {}", scene.word, scene.endpoint, scene.detail);
+    rui::draw(Size::new(320.0, HEIGHT), move |painter, rect| paint(painter, rect, &scene))
+        .h(HEIGHT)
+        .w(Length::Fill(1.0))
+        .role(Role::Status)
+        .label(spoken)
 }
 
-/// A node caption in the muted mono the machine text is set in.
-fn label<S: 'static>(text: &str) -> El<S> {
-    micro(text).color(Tone::Muted).tracking(1.6)
+/// The link reduced to what the drawing shows: which light, which words.
+#[derive(Clone)]
+struct Scene {
+    motion: Motion,
+    word: String,
+    endpoint: String,
+    detail: String,
+    detail_tone: Tone,
 }
 
-/// The link reduced to what the drawing switches on. `Copy`, so the paint
+impl Scene {
+    fn of(link: &Link, endpoint: &str) -> Self {
+        let motion = Motion::from(&link.phase);
+        let (word, detail, detail_tone) = match &link.phase {
+            Phase::Off => ("Offline", "Not connected".to_string(), Tone::Muted),
+            Phase::Dialling => ("Connecting", "Reaching the box…".to_string(), Tone::Muted),
+            Phase::Authenticated => ("Connecting", "Authenticating…".to_string(), Tone::Muted),
+            Phase::Up => ("Connected", "Secure tunnel to the box".to_string(), Tone::Muted),
+            Phase::Failed(reason) => ("Failed", reason.clone(), Tone::Exact(style::RED)),
+        };
+        Self { motion, word: word.into(), endpoint: endpoint.into(), detail, detail_tone }
+    }
+}
+
+/// The link reduced to what the light switches on. `Copy`, so the paint
 /// closure can hold it.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Motion {
-    /// No tunnel — cold reactors, a dim dotted beam.
+    /// No tunnel — a faint slate light, still.
     Off,
-    /// Dialling/authenticating — amber packets seeking the box.
+    /// Dialling/authenticating — amber, drifting side to side.
     Reaching,
-    /// Up — full cyan flow, cores breathing.
+    /// Up — cyan, breathing.
     Up,
-    /// Broken — a red, ruptured beam.
+    /// Broken — red, still.
     Failed,
 }
 
@@ -60,14 +99,6 @@ impl Motion {
             Phase::Failed(_) => Motion::Failed,
         }
     }
-    fn spoken(self) -> &'static str {
-        match self {
-            Motion::Off => "Tunnel down",
-            Motion::Reaching => "Tunnel connecting",
-            Motion::Up => "Tunnel up",
-            Motion::Failed => "Tunnel failed",
-        }
-    }
     fn hue(self) -> style::Hue {
         match self {
             Motion::Off => style::Hue::Off,
@@ -76,168 +107,75 @@ impl Motion {
             Motion::Failed => style::Hue::Failed,
         }
     }
-    /// How energised the reactors are, 0..1 — drives glow and core brightness.
+    /// How bright the light is, 0..1.
     fn charge(self) -> f32 {
         match self {
-            Motion::Off => 0.08,
-            Motion::Reaching => 0.75,
+            Motion::Off => 0.7,
+            Motion::Reaching => 0.9,
             Motion::Up => 1.0,
-            Motion::Failed => 0.42,
+            Motion::Failed => 0.85,
         }
     }
 }
 
-/// The whole instrument, on the shared canvas.
-fn paint(painter: &mut Painter<'_>, rect: rui::Rect, motion: Motion) {
-    let color = style::hue(motion.hue());
-    let charge = motion.charge();
-    // Up breathes; everything else holds steady. Off asks for no phases at all:
-    // a phase requested is a frame requested, and a dormant window draws none.
-    //
-    // A phase requested is also, on this renderer, a full relayout-and-paint of
-    // the whole window every frame for as long as it runs (see Surface::draw
-    // in rui's shell/mod.rs) — real, measured CPU. The animation cadence
-    // itself is tuned down for exactly that reason (see the App builder in
-    // app.rs's Panel::run: animation_interval, idle_timeout), rather than by
-    // cutting the motion someone is actually looking at. A window that is not
-    // visible does not pay this at all — rui skips the redraw entirely then.
-    let breath = if matches!(motion, Motion::Up) { 0.7 + 0.3 * wave(painter.phase("breath", 3.4)) } else { 1.0 };
-    let spin = if matches!(motion, Motion::Off) { 0.0 } else { painter.phase("spin", 9.0) };
-    let flow = if matches!(motion, Motion::Up | Motion::Reaching) { painter.phase("flow", 1.6) } else { 0.0 };
+/// The whole hero: the light, then the words in it.
+fn paint(painter: &mut Painter<'_>, rect: Rect, scene: &Scene) {
+    let color = style::hue(scene.motion.hue());
+    let charge = scene.motion.charge();
 
-    let mid = rect.y + rect.h * 0.48;
-    let inset = 34.0;
-    let r = 15.0;
-    let left = Point::new(rect.x + inset, mid);
-    let right = Point::new(rect.max_x() - inset, mid);
-    let beam_a = Point::new(left.x + r + 3.0, mid);
-    let beam_b = Point::new(right.x - r - 3.0, mid);
+    // Up breathes; Reaching drifts. Off and Failed ask for no phase at all: a
+    // phase requested is a frame requested, and a window with nothing to
+    // report should draw nothing new.
+    let breath = match scene.motion {
+        Motion::Up => 0.84 + 0.16 * wave(painter.phase("breath", 4.6)),
+        _ => 1.0,
+    };
+    let drift = match scene.motion {
+        Motion::Reaching => (painter.phase("drift", 3.6) * TAU).sin() * rect.w * 0.10,
+        _ => 0.0,
+    };
 
-    conduit(painter, beam_a, beam_b, color, charge * breath, motion, flow);
-    reactor(painter, left, r, color, charge * breath, spin, motion);
-    reactor(painter, right, r, color, charge * breath, -spin, motion);
-}
+    // Everything stays inside the hero's own rectangle — the drawing is
+    // replayed alone while it animates, and only this rectangle is restored
+    // under it first.
+    let previous = painter.canvas().push_clip(rect);
 
-/// One arc-reactor: an outer halo, an outer ring, a spinning tick collar, an
-/// inner ring turning the other way, and a radiant core with a specular
-/// glint — all lit additively in proportion to `charge`.
-fn reactor(painter: &mut Painter<'_>, c: Point, r: f32, color: rui::Color, charge: f32, spin: f32, motion: Motion) {
-    // A faint outer halo of long dashes, contra-rotating slowly at half rate —
-    // the "outermost gear" that reads as depth behind the main ring, at the
-    // cost of no new phase (it rides the existing `spin`).
-    let halo = r * 1.22;
-    let halo_ticks = 8;
-    for i in 0..halo_ticks {
-        let ang = spin * -0.5 * TAU + (i as f32 / halo_ticks as f32) * TAU;
-        let (dx, dy) = (ang.cos(), ang.sin());
-        let inner = Point::new(c.x + dx * (halo - 2.0), c.y + dy * (halo - 2.0));
-        let outer = Point::new(c.x + dx * (halo + 2.0), c.y + dy * (halo + 2.0));
-        painter.sculpt(&capsule(inner, outer, 0.9), &solid(color.fade(0.12 + 0.28 * charge)), Sculpt::Fill);
+    // The light: three blooms on one centre just above the window's top
+    // edge, each smaller and a little denser than the last. One linear
+    // radial ends in a visible rim where it reaches nothing; three stacked
+    // approximate a bell, so the light simply thins out. All of them fall to
+    // nothing well inside the rect.
+    let center = Point::new(rect.center().x + drift, rect.y - 24.0);
+    let bloom = charge * breath;
+    for (reach, alpha) in [(rect.h * 1.15, 0.22), (rect.h * 0.82, 0.24), (rect.h * 0.52, 0.26)] {
+        painter.sculpt(
+            &circle(center, reach),
+            &radial(center, 0.0, reach, color.fade(alpha * bloom), color.with_alpha(0)),
+            Sculpt::Fill,
+        );
     }
 
-    // Outer ring — always drawn, brighter with charge.
-    painter.sculpt(&ring(c, r, 1.4), &solid(color.fade(0.35 + 0.55 * charge)), Sculpt::Stroke { width: 1.4 });
-    if charge > 0.2 {
-        painter.sculpt(&ring(c, r, 1.4), &solid(color), Sculpt::Glow { radius: 7.0 * charge, intensity: 0.45 * charge });
-    }
-    // Inner ring.
-    painter.sculpt(&ring(c, r * 0.60, 1.0), &solid(color.fade(0.25 + 0.5 * charge)), Sculpt::Stroke { width: 1.0 });
+    // The words. One size for the state, the toolkit's own two small sizes
+    // for the lines under it — hierarchy by weight and ink, not by inventing
+    // a fourth size.
+    let word = Ink { size: WORD_SIZE, tone: Tone::Exact(INK), face: Face::Ui, tracking: -0.4, bold: true };
+    painter.text(Rect::new(rect.x, rect.y + WORD_TOP, rect.w, WORD_HEIGHT), word, Align::Center, &scene.word);
 
-    // Spinning tick collar — twelve short radial bars turning with `spin`,
-    // every third one brighter so the collar reads as machined, not uniform.
-    let ticks = 12;
-    let collar = r * 0.82;
-    for i in 0..ticks {
-        let ang = spin * TAU + (i as f32 / ticks as f32) * TAU;
-        let (dx, dy) = (ang.cos(), ang.sin());
-        let accent = i % 3 == 0;
-        let len = if accent { 3.2 } else { 2.5 };
-        let inner = Point::new(c.x + dx * (collar - len), c.y + dy * (collar - len));
-        let outer = Point::new(c.x + dx * (collar + len), c.y + dy * (collar + len));
-        let base = if matches!(motion, Motion::Off) { 0.3 } else { 0.4 + 0.6 * charge };
-        let lit = if accent { (base * 1.3).min(1.0) } else { base };
-        painter.sculpt(&capsule(inner, outer, if accent { 1.3 } else { 1.0 }), &solid(color.fade(lit)), Sculpt::Fill);
-    }
+    let endpoint = Ink { size: 11.5, tone: Tone::Exact(MUTED), face: Face::Mono, tracking: 0.0, bold: false };
+    painter.text(
+        Rect::new(rect.x, rect.y + ENDPOINT_TOP, rect.w, LINE_HEIGHT),
+        endpoint,
+        Align::Center,
+        &scene.endpoint,
+    );
 
-    // The core — a radial well from white-hot to the hue, its bloom, and a
-    // small off-centre specular glint so it reads as a lit sphere rather
-    // than a flat disc. The glint is a fixed offset (no extra phase).
-    let core_r = r * 0.34;
-    let hot = CYAN_BRIGHT.mix(color, 1.0 - charge);
-    painter.sculpt(&circle(c, core_r), &radial(c, 0.0, core_r, hot, color.fade(0.2)), Sculpt::Fill);
-    if charge > 0.15 {
-        painter.sculpt(&circle(c, core_r * 0.9), &solid(color), Sculpt::Glow { radius: 9.0 * charge, intensity: 0.75 * charge });
-    }
-    if charge > 0.3 {
-        let glint_c = Point::new(c.x - core_r * 0.32, c.y - core_r * 0.38);
-        painter.sculpt(&circle(glint_c, core_r * 0.24), &solid(CYAN_BRIGHT.fade(0.6 * charge)), Sculpt::Fill);
-    }
-}
+    let detail = Ink { size: 12.0, tone: scene.detail_tone, face: Face::Ui, tracking: 0.0, bold: false };
+    painter.text(Rect::new(rect.x, rect.y + DETAIL_TOP, rect.w, LINE_HEIGHT), detail, Align::Center, &scene.detail);
 
-/// The beam between the reactors: a base capsule with a gradient, a bloom, and
-/// packets flowing across — or, when failed, a ruptured beam with a spark.
-fn conduit(painter: &mut Painter<'_>, a: Point, b: Point, color: rui::Color, charge: f32, motion: Motion, flow: f32) {
-    if matches!(motion, Motion::Failed) {
-        let cx = (a.x + b.x) / 2.0;
-        let gap = 18.0;
-        let l = Point::new(cx - gap, a.y);
-        let rr = Point::new(cx + gap, a.y);
-        painter.sculpt(&capsule(a, l, 3.0), &linear(a, l, color.fade(0.5), color.fade(0.85)), Sculpt::Fill);
-        painter.sculpt(&capsule(rr, b, 3.0), &linear(rr, b, color.fade(0.85), color.fade(0.5)), Sculpt::Fill);
-        // Each half-capsule blooms on its own, so the break stays dark and the
-        // rupture reads in silhouette, not only in hue.
-        painter.sculpt(&capsule(a, l, 3.0), &solid(color), Sculpt::Glow { radius: 5.0, intensity: 0.3 });
-        painter.sculpt(&capsule(rr, b, 3.0), &solid(color), Sculpt::Glow { radius: 5.0, intensity: 0.3 });
-        // A spark at the break.
-        for end in [l, rr] {
-            painter.sculpt(&circle(end, 2.2), &solid(CYAN_BRIGHT), Sculpt::Fill);
-            painter.sculpt(&circle(end, 2.2), &solid(color), Sculpt::Glow { radius: 6.0, intensity: 0.9 });
-        }
-        return;
-    }
-
-    if matches!(motion, Motion::Off) {
-        // A dim dotted run: short capsule segments, unlit.
-        let dim = color.fade(0.45);
-        let mut x = a.x;
-        while x < b.x {
-            let seg = (x + 5.0).min(b.x);
-            painter.sculpt(&capsule(Point::new(x, a.y), Point::new(seg, a.y), 2.0), &solid(dim), Sculpt::Fill);
-            x += 11.0;
-        }
-        return;
-    }
-
-    // Live beam: a slim hot core line under the broad gradient bloom, so the
-    // conduit reads as a taut wire of light rather than a soft bar.
-    painter.sculpt(&capsule(a, b, 3.0), &linear(a, b, color.fade(0.45), color.fade(0.8)), Sculpt::Fill);
-    painter.sculpt(&capsule(a, b, 3.0), &solid(color), Sculpt::Glow { radius: 7.0 * charge, intensity: 0.5 * charge });
-    painter.sculpt(&capsule(a, b, 1.0), &solid(CYAN_BRIGHT.fade(0.5 * charge)), Sculpt::Fill);
-
-    // Packets streaming from this machine to the box — four, at varying sizes
-    // and phase offsets so the flow reads as irregular traffic rather than a
-    // metronome, each dragging a short fading trail. All reuse the single
-    // `flow` phase already paid for; no extra animated element is added.
-    let span = b.x - a.x;
-    let packets: [(f32, f32); 4] = [(0.00, 1.15), (0.27, 0.75), (0.52, 1.5), (0.78, 0.9)];
-    for (offset, scale) in packets {
-        let t = (flow + offset).fract();
-        let x = a.x + span * t;
-        let p = Point::new(x, a.y);
-        let rad = 2.6 * scale;
-
-        // A short trail behind the packet (toward `a`), fading with distance.
-        let trail_len = 9.0 * scale;
-        let tail = Point::new((x - trail_len).max(a.x), a.y);
-        painter.sculpt(&capsule(tail, p, rad * 0.55), &linear(tail, p, color.with_alpha(0), color.fade(0.55)), Sculpt::Fill);
-
-        painter.sculpt(&circle(p, rad), &solid(CYAN_BRIGHT), Sculpt::Fill);
-        painter.sculpt(&circle(p, rad), &solid(color), Sculpt::Glow { radius: 7.0 * scale, intensity: 0.95 });
-    }
+    painter.canvas().pop_clip(previous);
 }
 
 /// A 0..1 breathing curve from a 0..1 looping phase.
 fn wave(phase: f32) -> f32 {
     (phase * TAU).sin() * 0.5 + 0.5
 }
-
