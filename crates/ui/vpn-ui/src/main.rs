@@ -18,7 +18,7 @@ mod actions;
 mod app;
 mod dns;
 mod hero;
-mod hud;
+mod surface;
 mod keys;
 #[cfg(target_os = "macos")]
 mod macos_native;
@@ -154,15 +154,32 @@ fn render(dir: &str) -> Result<(), String> {
         ),
     ];
 
-    for (name, link) in states {
-        let mut application = app::application("SelfHost VPN", Panel::demo(link));
-        let canvas = application.render(430, 620, 2.0, rui::Appearance::Dark, &mut fonts);
-        let pixels = rui::image::rgba(&canvas);
-        let png = rui::image::png(canvas.width(), canvas.height(), &pixels)
-            .ok_or("the frame could not be encoded")?;
-        let path = format!("{dir}/vpn-{name}.png");
-        std::fs::write(&path, png).map_err(|error| format!("cannot write {path}: {error}"))?;
-        println!("wrote {path}");
+    let (width, height) = (app::WINDOW_WIDTH as u32, app::WINDOW_HEIGHT as u32);
+    for (name, link) in &states {
+        write_frame(dir, name, Panel::demo(link.clone()), width, height, &mut fonts)?;
     }
+    // The smallest window the app allows, in the state with the most on
+    // screen: what proves no label truncates when the window is dragged down.
+    let (name, link) = &states[2];
+    let (min_w, min_h) = (app::MIN_WIDTH as u32, app::MIN_HEIGHT as u32);
+    write_frame(dir, &format!("{name}-min"), Panel::demo(link.clone()), min_w, min_h, &mut fonts)
+}
+
+/// Draws one state at one size to `<dir>/vpn-<name>.png`, at 2x.
+fn write_frame(
+    dir: &str,
+    name: &str,
+    panel: Panel,
+    width: u32,
+    height: u32,
+    fonts: &mut rui::shell::LoadedFonts,
+) -> Result<(), String> {
+    let mut application = app::application("SelfHost VPN", panel);
+    let canvas = application.render(width, height, 2.0, rui::Appearance::Dark, fonts);
+    let pixels = rui::image::rgba(&canvas);
+    let png = rui::image::png(canvas.width(), canvas.height(), &pixels).ok_or("the frame could not be encoded")?;
+    let path = format!("{dir}/vpn-{name}.png");
+    std::fs::write(&path, png).map_err(|error| format!("cannot write {path}: {error}"))?;
+    println!("wrote {path}");
     Ok(())
 }

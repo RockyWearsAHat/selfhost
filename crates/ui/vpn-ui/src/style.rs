@@ -1,119 +1,129 @@
-//! The panel's holographic house style: a cyan-on-void HUD, and the atmosphere
-//! behind it.
+//! The window's house style: a quiet, native-feeling dark palette, the one
+//! spacing scale every gap on screen is drawn from, and the ground everything
+//! sits on.
 //!
-//! The look is sculpted, not assembled from box-flags — the ground and every
-//! instrument are signed-distance shapes painted with fields and lit with
-//! additive glow (see rui's `sdf` module and `SHAPING.md`). This file owns the
-//! palette, hands it to rui once through [`rui::App::theme`], and paints the
-//! ground: a deep void, a radial reactor-glow behind the hero, a perspective
-//! grid receding to a horizon, and fine scanlines.
+//! The look is editorial rather than instrumental. Chrome is neutral navy and
+//! lifts by lightness, not shadow; there is one accent (a calm blue, for the
+//! one action the window is mostly for) and four state hues that belong to
+//! the tunnel alone — slate when it is down, amber while it is reaching, cyan
+//! once it is up, red when it has broken. The state hue is never the accent:
+//! a Connect button is blue in every state, and a status is never dressed as a
+//! button. This file owns the palette, hands it to rui once through
+//! [`rui::App::theme`], and paints the ground: a plain vertical wash from deep
+//! navy to near-black, with nothing drawn on it. The light itself belongs to
+//! [`crate::hero`], because its colour is the tunnel's state.
 
-use rui::{Appearance, Canvas, Color, CornerStyle, FontId, Palette, Point, Theme};
-use rui::{Sculpt, circle, radial};
+use rui::{Appearance, Canvas, Color, CornerStyle, FontId, Palette, Theme};
 
-// ---- the holographic palette, as raw colours the sculptors paint with -------
+// ---- the spacing scale ------------------------------------------------------
+//
+// Every pad and gap in the window is one of these five, so two blocks can
+// never be a unit apart by accident. Four-based, like the toolkit's own.
 
-/// The void the HUD floats on.
-pub const VOID: Color = Color::rgb(0x04, 0x07, 0x0d);
-/// The deeper void at the window's foot.
-pub const VOID_DEEP: Color = Color::rgb(0x01, 0x02, 0x05);
-/// The signature: arc-reactor cyan.
-pub const CYAN: Color = Color::rgb(0x3a, 0xe1, 0xff);
-/// Cyan at its brightest, for cores and surges.
-pub const CYAN_BRIGHT: Color = Color::rgb(0xd4, 0xf7, 0xff);
-/// Cyan gone deep, for the cold end of a conduit gradient.
-pub const CYAN_DEEP: Color = Color::rgb(0x0b, 0x4f, 0x66);
-/// Reaching amber, while the tunnel is still dialling.
-pub const AMBER: Color = Color::rgb(0xff, 0xb4, 0x54);
-/// Fault red, when the tunnel breaks.
-pub const RED: Color = Color::rgb(0xff, 0x4d, 0x5a);
-/// Cold slate, when the tunnel is down.
-pub const SLATE: Color = Color::rgb(0x54, 0x64, 0x72);
-/// The ink readouts are set in.
-pub const INK: Color = Color::rgb(0xe3, 0xf1, 0xf7);
-/// Muted ink, for labels.
-pub const MUTED: Color = Color::rgb(0x6d, 0x84, 0x91);
-/// The translucent fill of a glass panel.
-pub const GLASS: Color = Color::rgba(0x0c, 0x18, 0x22, 0xb0);
-/// The edge-light run along a glass panel's frame.
-pub const EDGE: Color = Color::rgb(0x49, 0xc7, 0xe6);
+/// Hairline company: the gap between a label and the value it names.
+pub const SPACE_XS: f32 = 4.0;
+/// Within a group: between rows of one card, between a control and its note.
+pub const SPACE_S: f32 = 8.0;
+/// A card's own inset, and the gap between a glyph and its label.
+pub const SPACE_M: f32 = 12.0;
+/// Between blocks that belong together: a card and the line under it.
+pub const SPACE_L: f32 = 16.0;
+/// The window's side margin, and the breath between the hero and the rest.
+pub const SPACE_XL: f32 = 20.0;
 
-/// The palette handed to rui, so text, tags, and lamps share the HUD's hues.
-pub const HUD: Palette = Palette {
-    background: VOID,
-    background_deep: VOID_DEEP,
-    surface: Color::rgb(0x0a, 0x14, 0x1d),
-    surface_deep: Color::rgb(0x07, 0x0f, 0x16),
-    sheen: Color::rgb(0x14, 0x2a, 0x38),
-    raised: Color::rgb(0x0f, 0x1e, 0x29),
-    sunken: Color::rgb(0x03, 0x08, 0x0d),
-    border: Color::rgb(0x1c, 0x3a, 0x49),
-    border_focus: CYAN,
+// ---- the palette, as raw colours the drawings paint with --------------------
+
+/// The ground at the top of the window: deep navy.
+pub const NIGHT: Color = Color::rgb(0x0b, 0x10, 0x1f);
+/// The ground at the foot of the window: nearly black.
+pub const ABYSS: Color = Color::rgb(0x04, 0x06, 0x0c);
+/// A card's face, one step lighter than the ground — that is its whole
+/// elevation.
+pub const SURFACE: Color = Color::rgb(0x12, 0x19, 0x2b);
+/// The lower edge of a card's face.
+pub const SURFACE_DEEP: Color = Color::rgb(0x0f, 0x15, 0x26);
+/// A control's face, a step above a card.
+pub const RAISED: Color = Color::rgb(0x1b, 0x24, 0x3a);
+/// A well: the inside of a field, the track of a switch that is off.
+pub const SUNKEN: Color = Color::rgb(0x08, 0x0c, 0x16);
+/// The one hairline colour, used sparingly.
+pub const BORDER: Color = Color::rgb(0x20, 0x2a, 0x42);
+/// The ink readings are set in.
+pub const INK: Color = Color::rgb(0xec, 0xf0, 0xf8);
+/// Muted ink, for labels, hosts, and explanations.
+pub const MUTED: Color = Color::rgb(0x8b, 0x96, 0xac);
+/// The accent: a calm blue, for the one action the window is mostly for.
+pub const ACCENT: Color = Color::rgb(0x5d, 0x8c, 0xf5);
+/// The accent's deep end, for a pressed or tinted control.
+pub const ACCENT_DEEP: Color = Color::rgb(0x2f, 0x55, 0xb0);
+/// The accent's light end, for a focus ring.
+pub const ACCENT_LIGHT: Color = Color::rgb(0xb9, 0xcd, 0xff);
+/// Up: the tunnel's own cyan.
+pub const CYAN: Color = Color::rgb(0x3c, 0xd9, 0xe6);
+/// Reaching: amber, while the tunnel is still dialling.
+pub const AMBER: Color = Color::rgb(0xf6, 0xb1, 0x4a);
+/// Failed: red, only ever with a reason beside it.
+pub const RED: Color = Color::rgb(0xf2, 0x5f, 0x6b);
+/// Off: cold slate, when there is no tunnel.
+pub const SLATE: Color = Color::rgb(0x6b, 0x78, 0x90);
+
+/// The palette handed to rui, so text, buttons, tags, and lamps share the
+/// window's hues.
+pub const NATIVE: Palette = Palette {
+    background: NIGHT,
+    background_deep: ABYSS,
+    surface: SURFACE,
+    surface_deep: SURFACE_DEEP,
+    sheen: Color::rgb(0x24, 0x2f, 0x4a),
+    raised: RAISED,
+    sunken: SUNKEN,
+    border: BORDER,
+    border_focus: ACCENT_LIGHT,
     text: INK,
     text_muted: MUTED,
-    text_on_accent: Color::rgb(0x03, 0x10, 0x16),
-    accent: CYAN,
-    accent_deep: CYAN_DEEP,
-    accent_light: CYAN_BRIGHT,
+    text_on_accent: Color::rgb(0xf6, 0xf9, 0xff),
+    accent: ACCENT,
+    accent_deep: ACCENT_DEEP,
+    accent_light: ACCENT_LIGHT,
     ok: CYAN,
-    ok_tint: Color::rgb(0x06, 0x1c, 0x25),
+    ok_tint: Color::rgb(0x0d, 0x2a, 0x33),
     warn: AMBER,
-    warn_tint: Color::rgb(0x24, 0x18, 0x08),
+    warn_tint: Color::rgb(0x33, 0x24, 0x0c),
     bad: RED,
-    bad_tint: Color::rgb(0x26, 0x0c, 0x11),
+    bad_tint: Color::rgb(0x36, 0x12, 0x18),
     idle: SLATE,
-    idle_tint: Color::rgb(0x0b, 0x12, 0x18),
+    idle_tint: Color::rgb(0x15, 0x1b, 0x2a),
     shadow: Color::rgba(0x00, 0x00, 0x00, 0x40),
 };
 
-/// The window's theme: always the dark HUD palette, chamfered corners.
+/// The window's theme: always the dark native palette, rounded corners.
 pub fn theme(_appearance: Appearance, ui_font: FontId, mono_font: FontId) -> Theme {
-    Theme::new(Appearance::Dark, ui_font, mono_font).with_palette(HUD).with_corners(CornerStyle::Cut)
+    Theme::new(Appearance::Dark, ui_font, mono_font).with_palette(NATIVE).with_corners(CornerStyle::Round)
 }
 
-/// The atmosphere behind everything: void wash, a reactor-glow bloom high on the
-/// window behind the hero, a perspective grid receding to a horizon, scanlines.
+/// The ground behind everything: a plain wash from navy to near-black.
+///
+/// Nothing else is drawn here on purpose. The one light in the window is the
+/// hero's, and its colour is the tunnel's state — which the ground, painted
+/// before the view is described, cannot know.
 pub fn ground(canvas: &mut Canvas, _theme: &Theme) {
-    canvas.clear_vertical(VOID, VOID_DEEP);
-    let bounds = canvas.bounds();
-
-    // The reactor-glow: a broad radial bloom seated where the hero sits, so the
-    // whole panel reads as lit from its own core.
-    let glow_center = Point::new(bounds.center().x, bounds.y + bounds.h * 0.28);
-    let bloom = circle(glow_center, bounds.w * 0.62);
-    canvas.sculpt(
-        &bloom,
-        &radial(glow_center, 0.0, bounds.w * 0.62, CYAN.fade(0.16), CYAN.with_alpha(0)),
-        Sculpt::Fill,
-    );
-
-    // A perspective grid: horizontal rules drawing closer toward a high horizon,
-    // and verticals fanning from a vanishing point — faint, cold, receding.
-    let horizon = bounds.y + bounds.h * 0.16;
-    let grid = CYAN.fade(0.05);
-    let vanish = Point::new(bounds.center().x, horizon);
-    let floor = bounds.max_y();
-    let mut depth = 0.06_f32;
-    while depth < 1.0 {
-        let y = horizon + (floor - horizon) * depth * depth;
-        canvas.line(Point::new(bounds.x, y), Point::new(bounds.max_x(), y), 1.0, grid);
-        depth += 0.10;
-    }
-    for i in -6..=6 {
-        let x = bounds.center().x + (bounds.w * 0.5) * (i as f32 / 6.0);
-        canvas.line(vanish, Point::new(x, floor), 1.0, grid.fade(0.6));
-    }
-
-    // Scanlines: a fine dark comb over the whole ground, the CRT tell.
-    let scan = VOID_DEEP.with_alpha(0x22);
-    let mut y = bounds.y;
-    while y < bounds.max_y() {
-        canvas.line(Point::new(bounds.x, y), Point::new(bounds.max_x(), y), 1.0, scan);
-        y += 3.0;
-    }
+    canvas.clear_vertical(NIGHT, ABYSS);
 }
 
-/// The signature colour for a given state hue, for the sculptors.
+/// The four state hues the window is ever lit in.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Hue {
+    /// Connected — cyan.
+    Up,
+    /// Dialling or authenticating — amber.
+    Reaching,
+    /// Broken — red.
+    Failed,
+    /// Down — slate.
+    Off,
+}
+
+/// The colour of a state hue.
 pub fn hue(kind: Hue) -> Color {
     match kind {
         Hue::Up => CYAN,
@@ -121,17 +131,4 @@ pub fn hue(kind: Hue) -> Color {
         Hue::Failed => RED,
         Hue::Off => SLATE,
     }
-}
-
-/// The four state hues the panel is ever drawn in.
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub enum Hue {
-    /// Connected — the signature cyan.
-    Up,
-    /// Dialling or authenticating — amber.
-    Reaching,
-    /// Broken — red.
-    Failed,
-    /// Down — cold slate.
-    Off,
 }

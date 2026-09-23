@@ -2,18 +2,19 @@
 
 A small native window, built in this project's own `rui` toolkit (the same one
 behind the console), that brings up the Secure-VPN tunnel and opens the admin
-console. It reads as one machine with the console: the same instrument palette,
-the same hairline rules and status lamps.
+console. It is meant to feel like a first-class menu-bar VPN — quiet navy
+chrome, one accent for the one action, and a single soft light at the top whose
+colour is the tunnel's state.
 
 Render its looks any time with `cargo run -p selfhost-vpn-ui -- --render <dir>`
 (see the end of this file).
 
 ## What it does
 
-- **Connect / Disconnect** the tunnel. The hero at the top *is* the status: two
-  nodes and the link between them — dormant and dashed when off, a charge
-  travelling along it while it reaches the server, solid and breathing when up,
-  broken when it fails.
+- **Connect / Disconnect** the tunnel. The hero at the top *is* the status: the
+  state word set large in a field of light — slate when off, amber and drifting
+  while it reaches the server, cyan and breathing when up, red with the reason
+  when it fails. One pill button under it, in the same place in every state.
 - **Open Admin Console** — opens `https://admin.rockywearsahat.com` (no port).
   First use runs a one-time privileged setup (one password prompt) that installs
   the scoped resolver file and the loopback 443 gate, and removes the legacy
@@ -22,8 +23,8 @@ Render its looks any time with `cargo run -p selfhost-vpn-ui -- --render <dir>`
   the tunnel's local end. Mechanism details live in `docs/VPN.md` (*Using it*).
   Enabled only while the tunnel is up.
 - **Keys** — shows the client and server identity fingerprints and when the key
-  last rotated. **Rotate now** runs the safe rotation; **AUTO** rotates the
-  identity key weekly on its own. (Session keys already rotate every connection.)
+  last rotated. **Rotate now** runs the safe rotation; the **Auto-rotate weekly**
+  switch rotates the identity key weekly on its own. (Session keys already rotate every connection.)
 
 It never blocks: the tunnel client runs as a child process and the slow actions
 (rotation, the console's password prompt) run off the window thread, reported
