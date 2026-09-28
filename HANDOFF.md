@@ -486,6 +486,10 @@ have a config switch. All three are small and all three are named in the labs.
 - **A repository URL is untrusted input.** It arrives over the control API, and
   `git`'s `ext::` transport runs its argument as a command. The transports are an
   allow-list in `selfhost_config::git`; do not widen it to "whatever git accepts".
+  Updated 2026-09-28 (owner decision, report-ac46a57c): `file://` was added to
+  that allow-list, deliberately, not as "whatever git accepts" — it names no
+  program, so unlike `ext::` it cannot become an arbitrary command. A bare local
+  path with no scheme stays refused.
 - **The console writes `data/services.toml` and nothing else.** The old rule was
   that the GUI must stay read-only, so `selfhost.config.toml` remained the single
   source of truth; that is gone, because a service manager that cannot install a
