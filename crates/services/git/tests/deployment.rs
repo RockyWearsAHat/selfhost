@@ -7,13 +7,16 @@
 //!
 //! # Why the repository is a local path
 //!
-//! `selfhost_config::GitWatch::check` refuses a local path, and rightly: a
-//! repository URL arriving over the control API must not name a program or a file
-//! on the daemon's own disk. That rule governs *what an operator may install*.
-//! What is under test here is the machinery underneath it — clone, fetch, reset,
-//! build, restart — which has to work identically whatever the transport is, and
-//! which cannot be exercised offline any other way. The watch is therefore built
-//! directly rather than parsed from a catalogue.
+//! `selfhost_config::GitWatch::check` refuses a *bare* local path (no scheme),
+//! and rightly: a repository URL arriving over the control API must not name a
+//! program on the daemon's own disk. Since 2026-09-28 it does accept an explicit
+//! `file://` URL (report-ac46a57c) — git runs its own local `upload-pack`
+//! against that path in-process, with no argument position for a command to
+//! hide in, unlike `ext::`. Either way, that rule governs *what an operator may
+//! install*. What is under test here is the machinery underneath it — clone,
+//! fetch, reset, build, restart — which has to work identically whatever the
+//! transport is, and which cannot be exercised offline any other way. The watch
+//! is therefore built directly rather than parsed from a catalogue.
 
 use selfhost_config::{GitWatch, RestartPolicy, ServiceSpec, StartMode};
 use selfhost_git::{Outcome, check_once};
