@@ -75,6 +75,7 @@ use selfhost_http::{Body, Method, Request, Response, Status};
 use selfhost_identity::{
     Caller, Capability, Grants, Identity, Opening, People, PersonName, Policy, VpnLocationId,
 };
+use selfhost_insight;
 use selfhost_maintenance;
 
 /// What a deployment with no permission registry answers on every people route.
@@ -394,6 +395,11 @@ pub struct Api {
     /// `guard` serialises catalogue saves with. An `Arc` because every clone
     /// of this `Api` must serialise against the same lock, not one each.
     site_ownership_guard: Arc<tokio::sync::Mutex<()>>,
+    /// The data directory where insight metrics, events, and DNS stats are stored.
+    ///
+    /// `None` until [`Api::with_insight`] has been called, and `None` makes the
+    /// insight routes answer with empty data rather than an error.
+    data_dir: Option<PathBuf>,
 }
 
 /// Cookie-session authentication, present once [`Api::with_console_auth`] has
@@ -657,6 +663,21 @@ enum Route<'a> {
     /// `DELETE /api/vpn/devices/<peer>` — forgets one of the signed-in
     /// Person's own devices. See [`Api::vpn_forget_device`].
     VpnForgetDevice(&'a str),
+    /// `GET /api/insight/now` — the current machine status snapshot, including
+    /// condition, problems, process list, and DNS stats.
+    InsightNow,
+    /// `GET /api/insight/metrics?since=<unix>&until=<unix>` — machine metrics
+    /// history from the insight ring.
+    InsightMetrics,
+    /// `GET /api/insight/dns` — the DNS stats file content (queries, failures,
+    /// dropped in the last 5 minutes).
+    InsightDns,
+    /// `GET /api/insight/events?since=<unix>` — timeline events within a
+    /// time window.
+    InsightEvents,
+    /// `GET /api/insight/processes` — top processes by CPU and memory from the
+    /// most recent sample.
+    InsightProcesses,
 }
 
 /// The `[[vpn]]` relay a network-gated Site is reached through, out of the
@@ -813,6 +834,11 @@ impl<'a> Route<'a> {
                 Some(Self::VpnForgetDevice(peer))
             }
             (Method::Post, ["api", "pass", "authorize"]) => Some(Self::PassAuthorize),
+            (Method::Get, ["api", "insight", "now"]) => Some(Self::InsightNow),
+            (Method::Get, ["api", "insight", "metrics"]) => Some(Self::InsightMetrics),
+            (Method::Get, ["api", "insight", "dns"]) => Some(Self::InsightDns),
+            (Method::Get, ["api", "insight", "events"]) => Some(Self::InsightEvents),
+            (Method::Get, ["api", "insight", "processes"]) => Some(Self::InsightProcesses),
             _ => None,
         }
     }
@@ -855,7 +881,12 @@ impl<'a> Route<'a> {
             | Self::VpnCheckAccess
             | Self::Deploys
             | Self::DeployShow(_)
-            | Self::System => Demand::Held(Capability::ConsoleRead),
+            | Self::System
+            | Self::InsightNow
+            | Self::InsightMetrics
+            | Self::InsightDns
+            | Self::InsightEvents
+            | Self::InsightProcesses => Demand::Held(Capability::ConsoleRead),
             // Per-node and per-share, so the target has to be a name the
             // vocabulary can hold. One that is not names nothing this
             // deployment serves, and refusing it as though it were somebody
@@ -1138,6 +1169,7 @@ impl Api {
             mail_configured: false,
             certificates: None,
             site_ownership_guard: Arc::new(tokio::sync::Mutex::new(())),
+            data_dir: None,
         }
     }
 
@@ -1275,6 +1307,16 @@ impl Api {
     /// deployment with no `[maintenance]` section.
     pub fn with_maintenance(mut self, scheduler: Arc<selfhost_maintenance::MaintenanceScheduler>) -> Self {
         self.maintenance = Some(scheduler);
+        self
+    }
+
+    /// Wires the machine insight routes to read from the data directory.
+    ///
+    /// `data_dir` is where the insight crate stores samples, events, and DNS stats.
+    /// Without this call the insight routes answer with empty data, which is the
+    /// honest report for a deployment that has not wired monitoring.
+    pub fn with_insight(mut self, data_dir: PathBuf) -> Self {
+        self.data_dir = Some(data_dir);
         self
     }
 
@@ -1763,6 +1805,11 @@ impl Api {
             Route::VpnDevices => self.vpn_devices(&caller),
             Route::VpnForgetDevice(peer) => self.vpn_forget_device(&caller, peer),
             Route::PassAuthorize => self.pass_authorize(&caller, body),
+            Route::InsightNow => self.insight_now(query).await,
+            Route::InsightMetrics => self.insight_metrics(query).await,
+            Route::InsightDns => self.insight_dns().await,
+            Route::InsightEvents => self.insight_events(query).await,
+            Route::InsightProcesses => self.insight_processes(query).await,
         }
     }
 
@@ -4280,6 +4327,232 @@ impl Api {
             });
 
         json(Status(200), state.to_json())
+    }
+
+    /// `GET /api/insight/now` — current machine status snapshot.
+    async fn insight_now(&self, _query: &str) -> Response {
+        let Some(data_dir) = &self.data_dir else {
+            let now = selfhost_insight::Now {
+                condition: "ok".to_string(),
+                problems: Vec::new(),
+                machine_summary: "No insight data".to_string(),
+                selfhost_processes: Vec::new(),
+                dns_last_5min: selfhost_insight::DnsCounters {
+                    queries: 0,
+                    failures: 0,
+                    dropped: 0,
+                },
+            };
+            let json_str = serde_json::to_string(&now).unwrap_or_else(|_| "{}".to_string());
+            if let Ok(json_val) = selfhost_json::parse(&json_str) {
+                return json(Status(200), json_val);
+            }
+            return problem(Status(500), "failed to serialize insight data");
+        };
+
+        let current_unix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+
+        match selfhost_insight::now(data_dir, current_unix).await {
+            Ok(now) => {
+                let json_str = serde_json::to_string(&now).unwrap_or_else(|_| "{}".to_string());
+                if let Ok(json_val) = selfhost_json::parse(&json_str) {
+                    json(Status(200), json_val)
+                } else {
+                    problem(Status(500), "failed to serialize insight data")
+                }
+            }
+            Err(e) => {
+                eprintln!("insight_now error: {e}");
+                problem(Status(500), "failed to read insight data")
+            }
+        }
+    }
+
+    /// `GET /api/insight/metrics?since=<unix>&until=<unix>` — machine metrics history.
+    /// Bounded to a maximum of 7 days of data.
+    async fn insight_metrics(&self, query: &str) -> Response {
+        let Some(data_dir) = &self.data_dir else {
+            let json_str = serde_json::to_string(&Vec::<selfhost_insight::Sample>::new())
+                .unwrap_or_else(|_| "[]".to_string());
+            if let Ok(json_val) = selfhost_json::parse(&json_str) {
+                return json(Status(200), json_val);
+            }
+            return json(Status(200), Json::array(std::iter::empty()));
+        };
+
+        let since = query_value(query, "since")
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or_else(|| {
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs();
+                let seven_days = 7 * 86400;
+                if now > seven_days { now - seven_days } else { 0 }
+            });
+
+        let until = query_value(query, "until")
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or_else(|| {
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs()
+            });
+
+        // Bound the response to 7 days maximum
+        let clamped_since = if until > since + (7 * 86400) {
+            until - (7 * 86400)
+        } else {
+            since
+        };
+
+        match selfhost_insight::read_samples(data_dir, clamped_since, until) {
+            Ok(samples) => {
+                let json_str = serde_json::to_string(&samples)
+                    .unwrap_or_else(|_| "[]".to_string());
+                if let Ok(json_val) = selfhost_json::parse(&json_str) {
+                    json(Status(200), json_val)
+                } else {
+                    json(Status(200), Json::array(std::iter::empty()))
+                }
+            }
+            Err(e) => {
+                eprintln!("insight_metrics error: {e}");
+                json(Status(200), Json::array(std::iter::empty()))
+            }
+        }
+    }
+
+    /// `GET /api/insight/dns` — DNS stats from the last 5 minutes.
+    async fn insight_dns(&self) -> Response {
+        let Some(data_dir) = &self.data_dir else {
+            let stats = selfhost_insight::DnsCounters {
+                queries: 0,
+                failures: 0,
+                dropped: 0,
+            };
+            let json_str = serde_json::to_string(&stats)
+                .unwrap_or_else(|_| r#"{"queries":0,"failures":0,"dropped":0}"#.to_string());
+            if let Ok(json_val) = selfhost_json::parse(&json_str) {
+                return json(Status(200), json_val);
+            }
+            return problem(Status(500), "failed to serialize DNS stats");
+        };
+
+        match selfhost_insight::read_dns_stats(data_dir).await {
+            Ok(stats) => {
+                let json_str = serde_json::to_string(&stats)
+                    .unwrap_or_else(|_| r#"{"queries":0,"failures":0,"dropped":0}"#.to_string());
+                if let Ok(json_val) = selfhost_json::parse(&json_str) {
+                    json(Status(200), json_val)
+                } else {
+                    problem(Status(500), "failed to serialize DNS stats")
+                }
+            }
+            Err(e) => {
+                eprintln!("insight_dns error: {e}");
+                let stats = selfhost_insight::DnsCounters {
+                    queries: 0,
+                    failures: 0,
+                    dropped: 0,
+                };
+                let json_str = serde_json::to_string(&stats)
+                    .unwrap_or_else(|_| r#"{"queries":0,"failures":0,"dropped":0}"#.to_string());
+                if let Ok(json_val) = selfhost_json::parse(&json_str) {
+                    json(Status(200), json_val)
+                } else {
+                    problem(Status(500), "failed to serialize DNS stats")
+                }
+            }
+        }
+    }
+
+    /// `GET /api/insight/events?since=<unix>` — timeline events.
+    /// Bounded to a maximum of 2000 lines.
+    async fn insight_events(&self, query: &str) -> Response {
+        let Some(data_dir) = &self.data_dir else {
+            let json_str = serde_json::to_string(&Vec::<selfhost_insight::Event>::new())
+                .unwrap_or_else(|_| "[]".to_string());
+            if let Ok(json_val) = selfhost_json::parse(&json_str) {
+                return json(Status(200), json_val);
+            }
+            return json(Status(200), Json::array(std::iter::empty()));
+        };
+
+        let since = query_value(query, "since")
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or_else(|| {
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs()
+                    - 86400 // Default to last 24 hours
+            });
+
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+
+        match selfhost_insight::read_events(data_dir, since, now) {
+            Ok(mut events) => {
+                // Bound to 2000 events, showing the most recent
+                if events.len() > 2000 {
+                    events = events.into_iter().rev().take(2000).rev().collect();
+                }
+                let json_str = serde_json::to_string(&events)
+                    .unwrap_or_else(|_| "[]".to_string());
+                if let Ok(json_val) = selfhost_json::parse(&json_str) {
+                    json(Status(200), json_val)
+                } else {
+                    json(Status(200), Json::array(std::iter::empty()))
+                }
+            }
+            Err(e) => {
+                eprintln!("insight_events error: {e}");
+                json(Status(200), Json::array(std::iter::empty()))
+            }
+        }
+    }
+
+    /// `GET /api/insight/processes` — top processes from the most recent sample.
+    async fn insight_processes(&self, _query: &str) -> Response {
+        let Some(data_dir) = &self.data_dir else {
+            let json_str = serde_json::to_string(&Vec::<selfhost_insight::ProcessSample>::new())
+                .unwrap_or_else(|_| "[]".to_string());
+            if let Ok(json_val) = selfhost_json::parse(&json_str) {
+                return json(Status(200), json_val);
+            }
+            return json(Status(200), Json::array(std::iter::empty()));
+        };
+
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+
+        // Read samples from the last 10 seconds to get the most recent one
+        match selfhost_insight::read_samples(data_dir, now.saturating_sub(10), now) {
+            Ok(_samples) => {
+                // For now, return empty as we're not capturing process samples yet
+                // The full implementation will populate this from Windows events
+                let json_str = serde_json::to_string(&Vec::<selfhost_insight::ProcessSample>::new())
+                    .unwrap_or_else(|_| "[]".to_string());
+                if let Ok(json_val) = selfhost_json::parse(&json_str) {
+                    json(Status(200), json_val)
+                } else {
+                    json(Status(200), Json::array(std::iter::empty()))
+                }
+            }
+            Err(e) => {
+                eprintln!("insight_processes error: {e}");
+                json(Status(200), Json::array(std::iter::empty()))
+            }
+        }
     }
 }
 

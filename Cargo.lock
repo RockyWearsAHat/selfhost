@@ -692,6 +692,7 @@ dependencies = [
  "selfhost-git",
  "selfhost-http",
  "selfhost-identity",
+ "selfhost-insight",
  "selfhost-json",
  "selfhost-login",
  "selfhost-maintenance",
@@ -701,6 +702,7 @@ dependencies = [
  "selfhost-supervisor",
  "selfhost-vpn",
  "selfhost-ws",
+ "serde_json",
  "tokio",
 ]
 
@@ -733,6 +735,7 @@ dependencies = [
  "selfhost-home",
  "selfhost-http",
  "selfhost-identity",
+ "selfhost-insight",
  "selfhost-json",
  "selfhost-mail",
  "selfhost-maintenance",

@@ -87,6 +87,12 @@ const SURFACE: &[(&str, &str, Reach)] = &[
     ("GET", "/api/deploys", Reach::Granted),
     ("GET", "/api/deploys/anything", Reach::Granted),
     ("GET", "/api/system", Reach::Granted),
+    // Machine insight routes — all Capability::ConsoleRead.
+    ("GET", "/api/insight/now", Reach::Granted),
+    ("GET", "/api/insight/metrics", Reach::Granted),
+    ("GET", "/api/insight/dns", Reach::Granted),
+    ("GET", "/api/insight/events", Reach::Granted),
+    ("GET", "/api/insight/processes", Reach::Granted),
     // Capability::ConsoleRead again — the same credential a VPN relay's own
     // account-manager check presents to ask "may this person use this
     // location" (crates/services/vpn/src/runner.rs's `--account-manager`),

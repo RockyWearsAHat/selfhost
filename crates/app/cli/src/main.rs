@@ -1359,7 +1359,8 @@ async fn serve_everything(
         // `Api::with_deploys`'s documentation for why this is not built from
         // a `data_dir` the way `with_agents` is.
         .with_deploys(Arc::clone(&deploys))
-        .with_mail_configured(config.mail.is_some());
+        .with_mail_configured(config.mail.is_some())
+        .with_insight(data_dir.clone());
     // Only when the section is live: a route that answers 202 and pokes a
     // watcher that is not running would report a deployment nobody is doing.
     if config.self_update.as_ref().is_some_and(|update| update.enabled) {
@@ -1676,6 +1677,10 @@ async fn serve_everything(
             project_dir.clone(),
             data_dir.clone(),
         ) => Ok(()),
+        // Samples machine metrics (CPU, memory, disk, network) every 10 seconds
+        // and stores them in the insight ring. Errors are logged and sampling
+        // continues; never returns, so it occupies an arm without firing.
+        _ = sample_metrics_forever(data_dir.clone()) => Ok(()),
         // Serves :53 for the configured zones. When DNS is not configured this
         // future pends forever, so the arm exists without ever firing. A bind
         // failure returns here and stops the daemon (see the note above).
@@ -1879,6 +1884,31 @@ async fn track_wan_ip_if_enabled(dns: Option<Authority>, config: &Config) {
         selfhost_dns::updater::DEFAULT_INTERVAL,
     )
     .await;
+}
+
+/// Samples machine metrics every 10 seconds and stores them in the insight ring.
+///
+/// Logs errors and continues sampling; never returns. This arm occupies a slot
+/// in the daemon's tokio::select! so the daemon never stops sampling the machine
+/// even if other subsystems are down or slow.
+async fn sample_metrics_forever(data_dir: PathBuf) {
+    let mut interval = tokio::time::interval(Duration::from_secs(10));
+    loop {
+        interval.tick().await;
+
+        // Sample the machine's current state
+        match selfhost_insight::sample() {
+            Ok(sample) => {
+                // Append the sample to the ring
+                if let Err(e) = selfhost_insight::append_sample(&data_dir, &sample).await {
+                    eprintln!("failed to append insight sample: {e}");
+                }
+            }
+            Err(e) => {
+                eprintln!("failed to sample machine metrics: {e}");
+            }
+        }
+    }
 }
 
 /// Turns a DNS bind failure into a message that says what to do about it.

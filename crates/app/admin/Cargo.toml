@@ -19,6 +19,7 @@ selfhost-desk = { workspace = true }
 selfhost-firewall = { workspace = true }
 selfhost-git = { workspace = true }
 selfhost-http = { workspace = true }
+selfhost-insight = { workspace = true }
 # Who the caller is and what they may do. Every route here answers a capability
 # question rather than a boolean, and the answer comes from one pure function in
 # a crate that sits below this one — so the storage and desktop subsystems can
@@ -28,6 +29,7 @@ selfhost-json = { workspace = true }
 # PBKDF2-HMAC-SHA256 password hashing, shared with `selfhost-reports` rather than each crate
 # hand-rolling its own copy — see `selfhost_login`'s crate documentation.
 selfhost-login = { workspace = true }
+serde_json = { workspace = true }
 # Visual-entropy image storage for VPN authentication.
 selfhost-orchid-images = { workspace = true }
 # The owner's half of a peer link. `GET /api/mesh/link` is the one route on this
