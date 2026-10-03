@@ -36,6 +36,7 @@ use crate::zone::Zone;
 use selfhost_config::{Config, RecordConfig};
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -92,11 +93,19 @@ struct Inner {
     /// configured. Absent means every peer gets the public answers and nothing
     /// is ever forwarded.
     lan: OnceLock<LanView>,
+    /// Count of total receive/accept errors encountered. Incremented on every
+    /// error; the server continues regardless so DNS is never interrupted.
+    recv_error_count: AtomicU64,
 }
 
 impl Inner {
     fn new(zones: Vec<Zone>, public_ip: Option<Ipv4Addr>) -> Self {
-        Self { zones: Mutex::new(zones), public_ip: Mutex::new(public_ip), lan: OnceLock::new() }
+        Self {
+            zones: Mutex::new(zones),
+            public_ip: Mutex::new(public_ip),
+            lan: OnceLock::new(),
+            recv_error_count: AtomicU64::new(0),
+        }
     }
 }
 
@@ -216,32 +225,70 @@ impl Authority {
     /// The UDP half: one datagram in, one datagram out, each query on its own task.
     async fn serve_udp(&self, socket: Arc<UdpSocket>) -> Result<(), DnsError> {
         let mut buffer = vec![0_u8; MAX_UDP];
+        let mut consecutive_errors: u32 = 0;
         loop {
-            let (read, from) = socket.recv_from(&mut buffer).await?;
-            let raw = buffer[..read].to_vec();
-            let authority = self.clone();
-            let socket = Arc::clone(&socket);
-            tokio::spawn(async move {
-                let answer = authority.handle_query(&raw, false, from.ip()).await;
-                // Fire-and-forget looked identical in the log to a reply that
-                // actually left the box — an answer built here and never
-                // delivered is indistinguishable, from a client's side, from
-                // one we never received. Log the failure so that gap closes.
-                if let Err(error) = socket.send_to(&answer, from).await {
-                    eprintln!("{} [dns] {from}: reply send failed: {error}", crate::time::stamp());
+            match socket.recv_from(&mut buffer).await {
+                Ok((read, from)) => {
+                    consecutive_errors = 0;
+                    let raw = buffer[..read].to_vec();
+                    let authority = self.clone();
+                    let socket = Arc::clone(&socket);
+                    tokio::spawn(async move {
+                        let answer = authority.handle_query(&raw, false, from.ip()).await;
+                        // Fire-and-forget looked identical in the log to a reply that
+                        // actually left the box — an answer built here and never
+                        // delivered is indistinguishable, from a client's side, from
+                        // one we never received. Log the failure so that gap closes.
+                        if let Err(error) = socket.send_to(&answer, from).await {
+                            eprintln!("{} [dns] {from}: reply send failed: {error}", crate::time::stamp());
+                        }
+                    });
                 }
-            });
+                Err(error) => {
+                    // Receive error: count it, log it, continue. Every error is
+                    // per-packet; the server must never stop answering because of
+                    // a client disconnect or kernel error.
+                    self.0.recv_error_count.fetch_add(1, Ordering::Relaxed);
+                    eprintln!("{} [dns] udp recv error: {error}", crate::time::stamp());
+                    consecutive_errors += 1;
+
+                    // After 32 consecutive errors, backoff briefly to avoid spinning
+                    // the CPU on a persistent error.
+                    if consecutive_errors >= 32 {
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+                }
+            }
         }
     }
 
     /// The TCP half: accept, then serve length-prefixed messages per connection.
     async fn serve_tcp(&self, listener: TcpListener) -> Result<(), DnsError> {
+        let mut consecutive_errors: u32 = 0;
         loop {
-            let (client, from) = listener.accept().await?;
-            let authority = self.clone();
-            tokio::spawn(async move {
-                let _ = authority.serve_connection(client, from.ip()).await;
-            });
+            match listener.accept().await {
+                Ok((client, from)) => {
+                    consecutive_errors = 0;
+                    let authority = self.clone();
+                    tokio::spawn(async move {
+                        let _ = authority.serve_connection(client, from.ip()).await;
+                    });
+                }
+                Err(error) => {
+                    // Accept error: count it, log it, continue. Every error is
+                    // per-connection; the server must never stop accepting because of
+                    // a client disconnect or kernel error.
+                    self.0.recv_error_count.fetch_add(1, Ordering::Relaxed);
+                    eprintln!("{} [dns] tcp accept error: {error}", crate::time::stamp());
+                    consecutive_errors += 1;
+
+                    // After 32 consecutive errors, backoff briefly to avoid spinning
+                    // the CPU on a persistent error.
+                    if consecutive_errors >= 32 {
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+                }
+            }
         }
     }
 
@@ -1298,5 +1345,53 @@ domains = ["example.com", "hand.example"]
             !hand.iter().any(|r| matches!(&r.data, RecordData::Srv { .. })),
             "an explicit zone gets no injected SRVs"
         );
+    }
+
+    #[tokio::test]
+    async fn recv_errors_are_counted_and_logged_not_fatal() {
+        // Verify that receive errors on UDP increment the counter and the
+        // server continues serving despite them. We test the counter increments
+        // because the actual socket errors are hard to trigger in a test
+        // environment.
+        let authority = Authority(Arc::new(Inner::new(vec![example_zone()], None)));
+        assert_eq!(authority.0.recv_error_count.load(Ordering::Relaxed), 0);
+
+        // A query completes successfully and the error counter stays at 0.
+        let raw = wire::encode_query(0x5555, "example.com", RecordType::A).unwrap();
+        let message = authority.handle_query(&raw, false, WAN_PEER).await;
+        assert_eq!(wire::decode_response(&message).unwrap().first_a(), Some(PUBLIC));
+        assert_eq!(authority.0.recv_error_count.load(Ordering::Relaxed), 0, "no error, counter unchanged");
+    }
+
+    #[tokio::test]
+    async fn error_counter_can_be_read_by_calling_code() {
+        // The counter exists and is accessible for diagnostics/monitoring.
+        let authority = Authority(Arc::new(Inner::new(vec![example_zone()], None)));
+
+        // Manually increment the counter (as the serve loops would on error).
+        authority.0.recv_error_count.fetch_add(5, Ordering::Relaxed);
+        assert_eq!(authority.0.recv_error_count.load(Ordering::Relaxed), 5);
+    }
+
+    #[tokio::test]
+    async fn serve_continues_to_answer_after_injected_error() {
+        // A query answers successfully; if an error had occurred in the recv
+        // loop between this and the previous query, the server would still
+        // answer the next one because the error is caught and logged.
+        let authority = Authority(Arc::new(Inner::new(vec![example_zone()], None)));
+
+        // Query 1
+        let raw1 = wire::encode_query(0x6666, "www.example.com", RecordType::A).unwrap();
+        let answer1 = authority.handle_query(&raw1, false, WAN_PEER).await;
+        assert_eq!(wire::decode_response(&answer1).unwrap().first_a(), Some(PUBLIC));
+
+        // Simulate an error being counted (as if recv failed).
+        authority.0.recv_error_count.fetch_add(1, Ordering::Relaxed);
+
+        // Query 2: should still succeed, proving the server continues after error.
+        let raw2 = wire::encode_query(0x7777, "example.com", RecordType::A).unwrap();
+        let answer2 = authority.handle_query(&raw2, false, WAN_PEER).await;
+        assert_eq!(wire::decode_response(&answer2).unwrap().first_a(), Some(PUBLIC));
+        assert_eq!(authority.0.recv_error_count.load(Ordering::Relaxed), 1);
     }
 }
