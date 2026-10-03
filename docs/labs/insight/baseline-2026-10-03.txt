@@ -1,0 +1,35 @@
+== when
+local 2026-10-03T16:55:03.3337657-06:00  boot 2026-10-03T04:31:59.5000000-06:00
+cores 12
+== deployed
+commit f146597
+task selfhost-daemon Running
+task selfhost-lan-dns Ready
+task selfhost-onebuild Ready
+task selfhost-vpn-ssh Ready
+task selfhost-vpn-v2test Ready
+task SelfHostMaintenanceReboot Ready
+== processes (cpu rate over 10s)
+pid 7316 role [daemon ] cores_busy 1.006 cpu_total_s 44708 ws_mb 23 private_mb 15 threads 47 handles 300 hottest_tid 2572 hottest_s 44563 started 2026-10-03T04:32:10.5269625-06:00
+pid 11812 role [reports serve] cores_busy 0 cpu_total_s 32 ws_mb 14 private_mb 3 threads 13 handles 104 hottest_tid 11948 hottest_s 16 started 2026-10-03T04:32:18.0833623-06:00
+== sockets
+udp53 0.0.0.0 pid 7316
+box_resolver Ethernet 192.168.1.1
+box_resolver Wi-Fi 192.168.1.1
+== logs
+log selfhost-daemon.log mb 289.6
+log selfhost-lan-dns.log mb 15.6
+log audit.log mb 0
+log repair.log mb 0
+== house dns (last 400000 log lines)
+window 09-28 13:00:02Z .. 10-03 22:55:24Z
+lan_queries 192575 servfail 2701 slow_ge_1s 623 p50_ms 3 p99_ms 207 p999_ms 5010
+servfail_by_day:
+  09-28 132
+  09-29 488
+  09-30 385
+  10-01 695
+  10-02 629
+  10-03 372
+server_stopped_events:
+  [1790776950] the DNS server stopped: An existing connection was forcibly closed by the remote host. (os error 10054)
