@@ -83,6 +83,17 @@ pub struct Dns {
     /// Defaults to `["1.1.1.1:53", "9.9.9.9:53"]` (Cloudflare and Quad9).
     #[serde(default = "default_upstreams")]
     pub upstreams: Vec<String>,
+
+    /// Whether the daemon binds and serves DNS on `:53`. Defaults to true.
+    ///
+    /// When false, the daemon does not bind `:53` at all and instead leaves DNS
+    /// serving to a separate `selfhost lan-dns` process. This enables zero-drop
+    /// handoff: the lan-dns process binds and proves it answers queries before
+    /// the daemon's old instance exits, ensuring uninterrupted DNS service across
+    /// deployments. Keep this true for most deployments; set false only when
+    /// using out-of-process DNS through a scheduled task.
+    #[serde(default = "default_true")]
+    pub serve_in_daemon: bool,
 }
 
 impl Dns {
@@ -780,5 +791,36 @@ domain = "example.com"
 "#,
         ));
         assert!(problems.iter().any(|p| p.field == "dns.upstreams[0]"), "{problems:?}");
+    }
+
+    #[test]
+    fn serve_in_daemon_defaults_to_true() {
+        let text = config_with_dns(
+            r#"
+[dns]
+
+[[dns.zone]]
+domain = "example.com"
+"#,
+        );
+        let config = Config::parse(&text).expect("valid");
+        let dns = config.dns.expect("dns present");
+        assert!(dns.serve_in_daemon, "serve_in_daemon should default to true");
+    }
+
+    #[test]
+    fn serve_in_daemon_can_be_set_to_false() {
+        let text = config_with_dns(
+            r#"
+[dns]
+serve_in_daemon = false
+
+[[dns.zone]]
+domain = "example.com"
+"#,
+        );
+        let config = Config::parse(&text).expect("valid");
+        let dns = config.dns.expect("dns present");
+        assert!(!dns.serve_in_daemon, "serve_in_daemon should be settable to false");
     }
 }

@@ -247,8 +247,19 @@ impl Authority {
         Ok(())
     }
 
+    /// Serves DNS on pre-configured sockets, for use when special socket options
+    /// like SO_REUSEADDR need to be set before binding.
+    pub async fn serve_with_sockets(
+        &self,
+        udp: UdpSocket,
+        tcp: TcpListener,
+    ) -> Result<(), DnsError> {
+        tokio::try_join!(self.serve_udp(Arc::new(udp)), self.serve_tcp(tcp))?;
+        Ok(())
+    }
+
     /// The UDP half: one datagram in, one datagram out, each query on its own task.
-    async fn serve_udp(&self, socket: Arc<UdpSocket>) -> Result<(), DnsError> {
+    pub async fn serve_udp(&self, socket: Arc<UdpSocket>) -> Result<(), DnsError> {
         let mut buffer = vec![0_u8; MAX_UDP];
         let mut consecutive_errors: u32 = 0;
         loop {
@@ -289,7 +300,7 @@ impl Authority {
     }
 
     /// The TCP half: accept, then serve length-prefixed messages per connection.
-    async fn serve_tcp(&self, listener: TcpListener) -> Result<(), DnsError> {
+    pub async fn serve_tcp(&self, listener: TcpListener) -> Result<(), DnsError> {
         let mut consecutive_errors: u32 = 0;
         loop {
             match listener.accept().await {

@@ -274,10 +274,19 @@ pub async fn probe(component: Component, config: &Config, project_dir: &Path) ->
 /// section, production registration — are all testable on a machine that has
 /// none of them.
 pub fn dns_duty(config: &Config, separate_registration: Option<&str>) -> DnsDuty {
-    if config.dns.is_some() {
-        return DnsDuty::Declared(
-            "this deployment has a [dns] section, so the daemon serves :53 itself".to_owned(),
-        );
+    if let Some(dns) = config.dns.as_ref() {
+        if dns.serve_in_daemon {
+            return DnsDuty::Declared(
+                "this deployment has a [dns] section with serve_in_daemon = true (the default), \
+                 so the daemon serves :53 itself".to_owned(),
+            );
+        } else {
+            return DnsDuty::Declared(
+                "this deployment has a [dns] section with serve_in_daemon = false, so DNS is \
+                 served from a separate process registered on this machine"
+                    .to_owned(),
+            );
+        }
     }
     match separate_registration {
         Some(name) => DnsDuty::Declared(format!(
