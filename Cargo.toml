@@ -98,6 +98,7 @@ ring = "0.17"
 # ACME work adds above the socket; verification is never disabled.
 webpki-roots = "1"
 serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 toml = "0.8"
 # No-echo terminal password reads, cross-platform (unix termios, Windows
 # console mode) without hand-written FFI in a crate that forbids unsafe code.
