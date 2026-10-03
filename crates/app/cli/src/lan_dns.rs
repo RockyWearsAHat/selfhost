@@ -33,11 +33,11 @@
 //! `[dns]` zones is served exactly those.
 
 use selfhost_config::{Config, Dns, RecordConfig, ZoneConfig, psl};
-use selfhost_mail::Dkim;
 use selfhost_dns::authority::{Authority, LanView};
+use selfhost_mail::Dkim;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
-use tokio::net::{UdpSocket, TcpListener};
+use tokio::net::{TcpListener, UdpSocket};
 
 /// Builds the authority every DNS-serving path shares.
 ///
@@ -61,7 +61,10 @@ pub fn build_authority(
                 .iter()
                 .map(|domain| {
                     let pacc = pacc_digest(config, domain);
-                    (domain.clone(), mail.dns_records(domain, dkim.as_deref(), pacc.as_deref()))
+                    (
+                        domain.clone(),
+                        mail.dns_records(domain, dkim.as_deref(), pacc.as_deref()),
+                    )
                 })
                 .collect()
         }
@@ -95,7 +98,9 @@ fn pacc_digest(config: &Config, domain: &str) -> Option<String> {
 fn dkim_public(config: &Config, project_dir: &Path) -> Option<String> {
     let mail = config.mail.as_ref()?;
     let dkim = mail.dkim.as_ref()?;
-    let key_path = project_dir.join(&config.server.data_dir).join(&dkim.private_key);
+    let key_path = project_dir
+        .join(&config.server.data_dir)
+        .join(&dkim.private_key);
     match Dkim::load(&key_path) {
         Ok(key) => Some(key.public_txt()),
         Err(error) => {
@@ -150,7 +155,12 @@ fn with_synthesised_zones(config: &Config) -> Config {
     let mut augmented = config.clone();
     let zones = origins
         .into_iter()
-        .map(|domain| ZoneConfig { domain, soa: None, nameservers: Vec::new(), records: Vec::new() })
+        .map(|domain| ZoneConfig {
+            domain,
+            soa: None,
+            nameservers: Vec::new(),
+            records: Vec::new(),
+        })
         .collect();
     match &mut augmented.dns {
         Some(dns) => dns.zones = zones,
@@ -185,7 +195,12 @@ pub fn served_origins(config: &Config) -> Vec<String> {
         .map(|dns| {
             dns.zones
                 .into_iter()
-                .map(|zone| zone.domain.trim().trim_end_matches('.').to_ascii_lowercase())
+                .map(|zone| {
+                    zone.domain
+                        .trim()
+                        .trim_end_matches('.')
+                        .to_ascii_lowercase()
+                })
                 .filter(|origin| !origin.is_empty())
                 .collect()
         })
@@ -216,7 +231,12 @@ pub async fn lan_dns_command(
     let upstreams: Vec<SocketAddr> = augmented
         .dns
         .as_ref()
-        .map(|dns| dns.upstreams.iter().filter_map(|s| s.parse().ok()).collect())
+        .map(|dns| {
+            dns.upstreams
+                .iter()
+                .filter_map(|s| s.parse().ok())
+                .collect()
+        })
         .unwrap_or_else(|| vec!["1.1.1.1:53".parse().unwrap(), "9.9.9.9:53".parse().unwrap()]);
 
     // Validate that we're not forwarding to ourselves.
@@ -244,7 +264,10 @@ pub async fn lan_dns_command(
     };
 
     let authority = build_authority(&augmented, project_dir, Some(public_ip));
-    authority.set_lan(LanView { lan_ip, upstreams: upstreams.clone() });
+    authority.set_lan(LanView {
+        lan_ip,
+        upstreams: upstreams.clone(),
+    });
 
     println!("selfhost split-horizon DNS");
     println!("  bind      {bind}");
@@ -271,16 +294,20 @@ pub async fn lan_dns_command(
 
     // Bind UDP and TCP with SO_REUSEADDR set so new instances can bind alongside
     // old ones during zero-drop handoff.
-    let udp = bind_udp_with_reuse(bind).map_err(|e| format!(
-        "cannot bind {bind} (UDP): {e}\n  \
+    let udp = bind_udp_with_reuse(bind).map_err(|e| {
+        format!(
+            "cannot bind {bind} (UDP): {e}\n  \
          This usually means port 53 needs privilege or something is already listening.\n  \
          On macOS that is usually a VPN client or Internet Sharing."
-    ))?;
-    let tcp = bind_tcp_with_reuse(bind).map_err(|e| format!(
-        "cannot bind {bind} (TCP): {e}\n  \
+        )
+    })?;
+    let tcp = bind_tcp_with_reuse(bind).map_err(|e| {
+        format!(
+            "cannot bind {bind} (TCP): {e}\n  \
          This usually means port 53 needs privilege or something is already listening.\n  \
          On macOS that is usually a VPN client or Internet Sharing."
-    ))?;
+        )
+    })?;
 
     println!("{} [dns] bound with SO_REUSEADDR", selfhost_dns::stamp());
 
@@ -288,9 +315,17 @@ pub async fn lan_dns_command(
     let origins_vec = authority.origins().await;
     if !origins_vec.is_empty() {
         let test_zone = &origins_vec[0];
-        let resolver = selfhost_dns::Resolver::at(bind).with_timeout(std::time::Duration::from_secs(1));
-        if resolver.query(test_zone, selfhost_dns::RecordType::Soa).await.is_ok() {
-            eprintln!("{} [dns] self-test passed for {test_zone}", selfhost_dns::stamp());
+        let resolver =
+            selfhost_dns::Resolver::at(bind).with_timeout(std::time::Duration::from_secs(1));
+        if resolver
+            .query(test_zone, selfhost_dns::RecordType::Soa)
+            .await
+            .is_ok()
+        {
+            eprintln!(
+                "{} [dns] self-test passed for {test_zone}",
+                selfhost_dns::stamp()
+            );
         } else {
             return Err(format!(
                 "self-test failed: could not query {test_zone} from this machine"
@@ -300,8 +335,12 @@ pub async fn lan_dns_command(
 
     // Write this process's PID to the handoff file, signaling we're ready to serve.
     let data_dir = project_dir.join(&config.server.data_dir);
-    let this_pid = write_handoff(&data_dir).map_err(|e| format!("could not write handoff file: {e}"))?;
-    println!("{} [dns] wrote handoff file with PID {this_pid}", selfhost_dns::stamp());
+    let this_pid =
+        write_handoff(&data_dir).map_err(|e| format!("could not write handoff file: {e}"))?;
+    println!(
+        "{} [dns] wrote handoff file with PID {this_pid}",
+        selfhost_dns::stamp()
+    );
 
     // Spawn the telemetry writer task.
     selfhost_dns::writer::spawn_stats_writer(authority.clone(), &data_dir, "lan-dns").await;
@@ -354,8 +393,8 @@ fn bind_hint(bind: SocketAddr, error: selfhost_dns::authority::DnsError) -> Stri
 }
 
 /// Binds a UDP socket with SO_REUSEADDR set so multiple instances can bind the
-/// same address on Windows. Uses socket2 to configure the socket before binding,
-/// then converts it to a tokio UdpSocket.
+/// same address on Windows; on Unix also sets SO_REUSEPORT so multiple
+/// processes can bind the same address.
 fn bind_udp_with_reuse(bind: SocketAddr) -> std::io::Result<UdpSocket> {
     use socket2::Socket;
 
@@ -364,8 +403,11 @@ fn bind_udp_with_reuse(bind: SocketAddr) -> std::io::Result<UdpSocket> {
         SocketAddr::V6(_) => Socket::new(socket2::Domain::IPV6, socket2::Type::DGRAM, None)?,
     };
 
-    // Enable SO_REUSEADDR so a new instance can bind alongside a running one.
+    // Enable SO_REUSEADDR so a new instance can bind alongside a running one on Windows;
+    // on Unix also set SO_REUSEPORT so multiple processes can bind the same address.
     socket.set_reuse_address(true)?;
+    #[cfg(unix)]
+    socket.set_reuse_port(true)?;
 
     // Bind the socket, then set it to non-blocking so tokio can use it.
     socket.bind(&bind.into())?;
@@ -377,8 +419,9 @@ fn bind_udp_with_reuse(bind: SocketAddr) -> std::io::Result<UdpSocket> {
 }
 
 /// Binds a TCP listener with SO_REUSEADDR set so multiple instances can bind
-/// the same address on Windows. Uses socket2 to configure the socket before
-/// binding, then converts it to a tokio TcpListener.
+/// the same address on Windows; on Unix also sets SO_REUSEPORT so multiple
+/// processes can bind the same address. Uses socket2 to configure the socket
+/// before binding, then converts it to a tokio TcpListener.
 fn bind_tcp_with_reuse(bind: SocketAddr) -> std::io::Result<TcpListener> {
     use socket2::Socket;
 
@@ -387,8 +430,11 @@ fn bind_tcp_with_reuse(bind: SocketAddr) -> std::io::Result<TcpListener> {
         SocketAddr::V6(_) => Socket::new(socket2::Domain::IPV6, socket2::Type::STREAM, None)?,
     };
 
-    // Enable SO_REUSEADDR so a new instance can bind alongside a running one.
+    // Enable SO_REUSEADDR so a new instance can bind alongside a running one on Windows;
+    // on Unix also set SO_REUSEPORT so multiple processes can bind the same address.
     socket.set_reuse_address(true)?;
+    #[cfg(unix)]
+    socket.set_reuse_port(true)?;
 
     // Bind the socket, then set it to non-blocking so tokio can use it.
     socket.bind(&bind.into())?;
@@ -435,9 +481,9 @@ fn read_handoff(data_dir: &Path) -> Option<u32> {
 /// drain and exit.
 fn should_keep_serving(this_pid: u32, file_pid: Option<u32>) -> bool {
     match file_pid {
-        None => true, // File missing: no handoff yet, keep serving.
+        None => true,                         // File missing: no handoff yet, keep serving.
         Some(pid) if pid == this_pid => true, // Same PID: keep serving.
-        Some(_) => false, // Different PID: hand off.
+        Some(_) => false,                     // Different PID: hand off.
     }
 }
 
@@ -496,7 +542,11 @@ mod tests {
                 admin_bind: "127.0.0.1:9191".into(),
                 firewall: Firewall::default(),
             },
-            nodes: vec![Node { name: "home".into(), role: Role::Owner, mesh_ip: None }],
+            nodes: vec![Node {
+                name: "home".into(),
+                role: Role::Owner,
+                mesh_ip: None,
+            }],
             sites,
             dns,
             mail: None,
@@ -551,7 +601,10 @@ mod tests {
     fn ip_literals_and_localhost_synthesise_no_zone() {
         // An IP needs no resolving and `localhost` has no registrable domain;
         // both would be config typos amplified into a LAN-wide fault.
-        let config = config_with(vec![site(&["192.168.1.8", "localhost", "real.example.com"])], None);
+        let config = config_with(
+            vec![site(&["192.168.1.8", "localhost", "real.example.com"])],
+            None,
+        );
         assert_eq!(zone_origins(&config), vec!["example.com"]);
     }
 
@@ -569,6 +622,7 @@ mod tests {
                 records: vec![],
             }],
             upstreams: vec!["1.1.1.1:53".into(), "9.9.9.9:53".into()],
+            serve_in_daemon: true,
         };
         // The site domain does NOT grow a zone: the operator's [dns] wins.
         let config = config_with(vec![site(&["other.net"])], Some(dns));
@@ -578,19 +632,28 @@ mod tests {
     #[test]
     fn handoff_decision_fn_keeps_serving_with_same_pid() {
         let this_pid = 1234;
-        assert!(should_keep_serving(this_pid, Some(1234)), "should keep serving with same PID");
+        assert!(
+            should_keep_serving(this_pid, Some(1234)),
+            "should keep serving with same PID"
+        );
     }
 
     #[test]
     fn handoff_decision_fn_stops_serving_with_different_pid() {
         let this_pid = 1234;
-        assert!(!should_keep_serving(this_pid, Some(5678)), "should stop serving with different PID");
+        assert!(
+            !should_keep_serving(this_pid, Some(5678)),
+            "should stop serving with different PID"
+        );
     }
 
     #[test]
     fn handoff_decision_fn_keeps_serving_with_missing_file() {
         let this_pid = 1234;
-        assert!(should_keep_serving(this_pid, None), "should keep serving when file is missing");
+        assert!(
+            should_keep_serving(this_pid, None),
+            "should keep serving when file is missing"
+        );
     }
 
     #[tokio::test]
@@ -635,7 +698,8 @@ mod tests {
         use std::fs;
 
         // Use a temporary directory path without actually creating tempfile crate dependency
-        let base_dir = std::path::PathBuf::from(format!("/tmp/selfhost-dns-test-{}", std::process::id()));
+        let base_dir =
+            std::path::PathBuf::from(format!("/tmp/selfhost-dns-test-{}", std::process::id()));
         let _ = fs::create_dir_all(&base_dir);
 
         let this_pid = std::process::id();
@@ -654,10 +718,16 @@ mod tests {
         use std::fs;
 
         // Use a non-existent temporary directory path
-        let base_dir = std::path::PathBuf::from(format!("/tmp/selfhost-dns-test-missing-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&base_dir);  // Ensure it doesn't exist
+        let base_dir = std::path::PathBuf::from(format!(
+            "/tmp/selfhost-dns-test-missing-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&base_dir); // Ensure it doesn't exist
 
         let read_pid = read_handoff(&base_dir);
-        assert_eq!(read_pid, None, "should return None for missing handoff file");
+        assert_eq!(
+            read_pid, None,
+            "should return None for missing handoff file"
+        );
     }
 }

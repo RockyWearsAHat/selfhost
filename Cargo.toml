@@ -103,7 +103,7 @@ toml = "0.8"
 # Used once, by `selfhost init-owner`'s TTY-aware prompt.
 rpassword = "7"
 # Socket configuration for SO_REUSEADDR and other socket options in DNS handoff.
-socket2 = "0.5"
+socket2 = "0.6"
 libc = "0.2"
 
 selfhost-acme = { path = "crates/net/acme" }

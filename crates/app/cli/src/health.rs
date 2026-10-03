@@ -122,8 +122,12 @@ impl Component {
     ///
     /// The control API is first because its answer grades the rest — see
     /// [`probe_all`] — so this is an order with meaning rather than a list.
-    pub const ALL: [Component; 4] =
-        [Component::ControlApi, Component::Dns, Component::Http, Component::Https];
+    pub const ALL: [Component; 4] = [
+        Component::ControlApi,
+        Component::Dns,
+        Component::Http,
+        Component::Https,
+    ];
 
     /// What this component is called in a report and in the repair ledger.
     pub fn label(self) -> &'static str {
@@ -200,7 +204,12 @@ impl Probe {
         serving: Serving,
         detail: impl Into<String>,
     ) -> Self {
-        Self { component, target: target.into(), serving, detail: detail.into() }
+        Self {
+            component,
+            target: target.into(),
+            serving,
+            detail: detail.into(),
+        }
     }
 }
 
@@ -278,7 +287,8 @@ pub fn dns_duty(config: &Config, separate_registration: Option<&str>) -> DnsDuty
         if dns.serve_in_daemon {
             return DnsDuty::Declared(
                 "this deployment has a [dns] section with serve_in_daemon = true (the default), \
-                 so the daemon serves :53 itself".to_owned(),
+                 so the daemon serves :53 itself"
+                    .to_owned(),
             );
         } else {
             return DnsDuty::Declared(
@@ -330,8 +340,11 @@ async fn probe_dns(config: &Config, _project_dir: &Path) -> Probe {
     // settles the question — and on Windows this answer costs a `schtasks`
     // process. A convergence pass runs every sixty seconds, so a lookup that
     // cannot change the verdict is one this loop should not pay for.
-    let registration =
-        config.dns.is_none().then(crate::service_install::separate_dns_registration).flatten();
+    let registration = config
+        .dns
+        .is_none()
+        .then(crate::service_install::separate_dns_registration)
+        .flatten();
     probe_dns_declared(config, registration.as_deref()).await
 }
 
@@ -524,7 +537,9 @@ async fn probe_https(config: &Config) -> Probe {
 async fn probe_control_api(config: &Config) -> Probe {
     let bind = match parse_bind(&config.server.admin_bind) {
         Ok(bind) => bind,
-        Err(detail) => return Probe::new(Component::ControlApi, "control-api", Serving::No, detail),
+        Err(detail) => {
+            return Probe::new(Component::ControlApi, "control-api", Serving::No, detail);
+        }
     };
     let address = loopback_target(bind);
     let target = format!("GET /api/health @ {address}");
@@ -609,7 +624,10 @@ async fn exchange(
     tokio::time::timeout(PROBE_DEADLINE, attempt)
         .await
         .map_err(|_| {
-            format!("{address} did not answer within {}s", PROBE_DEADLINE.as_secs())
+            format!(
+                "{address} did not answer within {}s",
+                PROBE_DEADLINE.as_secs()
+            )
         })?
 }
 
@@ -806,7 +824,8 @@ fn probe_host(config: &Config) -> String {
 
 /// A bind string as an address, or the reason it is not one.
 fn parse_bind(bind: &str) -> Result<SocketAddr, String> {
-    bind.parse().map_err(|error| format!("the configured bind {bind} is not an address: {error}"))
+    bind.parse()
+        .map_err(|error| format!("the configured bind {bind} is not an address: {error}"))
 }
 
 #[cfg(test)]
@@ -831,7 +850,10 @@ mod tests {
     fn any_http_status_line_is_read_as_the_proxy_answering() {
         // A redirect and a 404 are both the proxy answering. The probe asks
         // whether it answers at all, not whether it likes the request.
-        assert_eq!(http_status(b"HTTP/1.1 301 Moved Permanently\r\n\r\n"), Some(301));
+        assert_eq!(
+            http_status(b"HTTP/1.1 301 Moved Permanently\r\n\r\n"),
+            Some(301)
+        );
         assert_eq!(http_status(b"HTTP/1.0 404 Not Found\r\n\r\n"), Some(404));
         assert_eq!(http_status(b"HTTP/1.1 200 OK\r\n"), Some(200));
     }
@@ -851,38 +873,59 @@ mod tests {
         // The probe offers no key share, so a correct TLS 1.3 server replies
         // with a HelloRetryRequest and a fussier one replies with an alert.
         // Reading only the first as "serving" would report a healthy proxy dead.
-        assert_eq!(classify_tls_reply(&[0x16, 0x03, 0x03, 0x00, 0x7a]), TlsReply::Handshake);
-        assert_eq!(classify_tls_reply(&[0x15, 0x03, 0x03, 0x00, 0x02]), TlsReply::Alert);
+        assert_eq!(
+            classify_tls_reply(&[0x16, 0x03, 0x03, 0x00, 0x7a]),
+            TlsReply::Handshake
+        );
+        assert_eq!(
+            classify_tls_reply(&[0x15, 0x03, 0x03, 0x00, 0x02]),
+            TlsReply::Alert
+        );
     }
 
     #[test]
     fn silence_and_a_plaintext_reply_are_both_not_serving() {
         assert_eq!(classify_tls_reply(&[]), TlsReply::Nothing);
-        assert_eq!(classify_tls_reply(b"HTTP/1.1 400 Bad Request\r\n"), TlsReply::NotTls);
+        assert_eq!(
+            classify_tls_reply(b"HTTP/1.1 400 Bad Request\r\n"),
+            TlsReply::NotTls
+        );
         // A first byte that looks like a handshake but no record behind it.
         assert_eq!(classify_tls_reply(&[0x16, 0x03]), TlsReply::NotTls);
         // Right length, wrong version family.
-        assert_eq!(classify_tls_reply(&[0x16, 0x02, 0x00, 0x00, 0x01]), TlsReply::NotTls);
+        assert_eq!(
+            classify_tls_reply(&[0x16, 0x02, 0x00, 0x00, 0x01]),
+            TlsReply::NotTls
+        );
     }
 
     #[test]
     fn the_client_hello_is_a_well_formed_record_whose_lengths_agree() {
         let hello = client_hello("example.com");
         assert_eq!(hello.first(), Some(&0x16), "a handshake record");
-        let record_length =
-            u16::from_be_bytes([hello[3], hello[4]]) as usize;
-        assert_eq!(record_length, hello.len() - 5, "the record length covers the handshake");
+        let record_length = u16::from_be_bytes([hello[3], hello[4]]) as usize;
+        assert_eq!(
+            record_length,
+            hello.len() - 5,
+            "the record length covers the handshake"
+        );
         assert_eq!(hello.get(5), Some(&0x01), "the handshake is a ClientHello");
         let body_length =
             ((hello[6] as usize) << 16) | ((hello[7] as usize) << 8) | hello[8] as usize;
-        assert_eq!(body_length, hello.len() - 9, "the handshake length covers the body");
+        assert_eq!(
+            body_length,
+            hello.len() - 9,
+            "the handshake length covers the body"
+        );
     }
 
     #[test]
     fn the_client_hello_carries_the_name_it_was_asked_for() {
         let hello = client_hello("rockywearsahat.com");
         assert!(
-            hello.windows(18).any(|window| window == b"rockywearsahat.com"),
+            hello
+                .windows(18)
+                .any(|window| window == b"rockywearsahat.com"),
             "the SNI name is on the wire"
         );
     }
@@ -899,7 +942,10 @@ mod tests {
         );
         // Still a valid record: the rest of the hello does not depend on SNI.
         assert_eq!(hello.first(), Some(&0x16));
-        assert_eq!(u16::from_be_bytes([hello[3], hello[4]]) as usize, hello.len() - 5);
+        assert_eq!(
+            u16::from_be_bytes([hello[3], hello[4]]) as usize,
+            hello.len() - 5
+        );
     }
 
     #[test]
@@ -937,7 +983,11 @@ mod tests {
                 admin_bind: format!("127.0.0.1:{admin}"),
                 firewall: Firewall::default(),
             },
-            nodes: vec![Node { name: "home".into(), role: Role::Owner, mesh_ip: None }],
+            nodes: vec![Node {
+                name: "home".into(),
+                role: Role::Owner,
+                mesh_ip: None,
+            }],
             sites: Vec::new(),
             dns: None,
             mail: None,
@@ -957,12 +1007,15 @@ mod tests {
     /// Returns the port it is on. The task ends with the test, and it accepts
     /// exactly the connections it is asked for, so nothing is left listening.
     async fn answering_with(reply: &'static [u8], connections: usize) -> u16 {
-        let listener =
-            tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("an ephemeral loopback port");
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("an ephemeral loopback port");
         let port = listener.local_addr().expect("a bound address").port();
         tokio::spawn(async move {
             for _ in 0..connections {
-                let Ok((mut stream, _)) = listener.accept().await else { return };
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    return;
+                };
                 // The request is read before the reply is written. A server that
                 // closes with unread bytes in its receive buffer sends a reset
                 // rather than a clean close, which is a fixture artefact and not
@@ -980,7 +1033,8 @@ mod tests {
     async fn a_proxy_that_answers_any_http_status_is_serving() {
         // A redirect to HTTPS is what the real proxy answers `GET /` on :80
         // with, and it is a pass: the question is whether it answers.
-        let port = answering_with(b"HTTP/1.1 301 Moved Permanently\r\nLocation: /\r\n\r\n", 1).await;
+        let port =
+            answering_with(b"HTTP/1.1 301 Moved Permanently\r\nLocation: /\r\n\r\n", 1).await;
         let probe = probe_http(&config(port, 1, 2)).await;
         assert_eq!(probe.serving, Serving::Yes, "{}", probe.detail);
         assert!(probe.detail.contains("301"), "{}", probe.detail);
@@ -993,7 +1047,13 @@ mod tests {
         let port = answering_with(b"SSH-2.0-OpenSSH_9.6\r\n", 1).await;
         let probe = probe_http(&config(port, 1, 2)).await;
         assert_eq!(probe.serving, Serving::No, "{}", probe.detail);
-        assert!(probe.detail.contains("did not answer with an HTTP status line"), "{}", probe.detail);
+        assert!(
+            probe
+                .detail
+                .contains("did not answer with an HTTP status line"),
+            "{}",
+            probe.detail
+        );
     }
 
     #[tokio::test]
@@ -1016,18 +1076,24 @@ mod tests {
         // `selfhost_proxy`, not against a fixture.
         let _ = rustls::crypto::ring::default_provider().install_default();
 
-        let directory = std::env::temp_dir()
-            .join(format!("selfhost-health-tls-{}-{}", std::process::id(), line!()));
+        let directory = std::env::temp_dir().join(format!(
+            "selfhost-health-tls-{}-{}",
+            std::process::id(),
+            line!()
+        ));
         let _ = std::fs::remove_dir_all(&directory);
         std::fs::create_dir_all(&directory).expect("a temporary directory");
-        let store = selfhost_proxy::CertificateStore::open(&directory).expect("a certificate store");
-        let (chain, key) =
-            store.load_or_generate_self_signed("probe.example", &[]).expect("a self-signed pair");
+        let store =
+            selfhost_proxy::CertificateStore::open(&directory).expect("a certificate store");
+        let (chain, key) = store
+            .load_or_generate_self_signed("probe.example", &[])
+            .expect("a self-signed pair");
         let server = selfhost_proxy::server_config(chain, key).expect("a server configuration");
         let acceptor = tokio_rustls::TlsAcceptor::from(server);
 
-        let listener =
-            tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("an ephemeral loopback port");
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("an ephemeral loopback port");
         let port = listener.local_addr().expect("a bound address").port();
         tokio::spawn(async move {
             if let Ok((stream, _)) = listener.accept().await {
@@ -1053,7 +1119,11 @@ mod tests {
         // `/api/health` answers 200 unconditionally and without a credential,
         // which is why it is the probe whose answer decides whether the others'
         // silence is a fault or a laptop.
-        let port = answering_with(b"HTTP/1.1 200 OK\r\nContent-Length: 11\r\n\r\n{\"ok\":true}", 1).await;
+        let port = answering_with(
+            b"HTTP/1.1 200 OK\r\nContent-Length: 11\r\n\r\n{\"ok\":true}",
+            1,
+        )
+        .await;
         let probe = probe_control_api(&config(1, 2, port)).await;
         assert_eq!(probe.serving, Serving::Yes, "{}", probe.detail);
     }
@@ -1063,13 +1133,13 @@ mod tests {
         // A development tree with no daemon is not a deployment that has failed.
         // Three red lines on a laptop is how a health check teaches its reader
         // to ignore it.
-        let listener =
-            tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("an ephemeral loopback port");
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("an ephemeral loopback port");
         let closed = listener.local_addr().expect("a bound address").port();
         drop(listener);
 
-        let probes =
-            probe_all(&config(closed, closed, closed), std::path::Path::new(".")).await;
+        let probes = probe_all(&config(closed, closed, closed), std::path::Path::new(".")).await;
         assert_eq!(probes.len(), Component::ALL.len());
         for probe in &probes {
             assert!(
@@ -1106,8 +1176,9 @@ mod tests {
     /// A loopback port with nothing behind it, for the probes that have to be
     /// asked a question and get silence.
     async fn closed_port() -> u16 {
-        let listener =
-            tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("an ephemeral loopback port");
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("an ephemeral loopback port");
         let port = listener.local_addr().expect("a bound address").port();
         drop(listener);
         port
@@ -1143,8 +1214,12 @@ mod tests {
             lan_ip: None,
             zones: Vec::new(),
             upstreams: vec!["1.1.1.1:53".into(), "9.9.9.9:53".into()],
+            serve_in_daemon: true,
         });
-        assert!(matches!(dns_duty(&with_section, None), DnsDuty::Declared(_)));
+        assert!(matches!(
+            dns_duty(&with_section, None),
+            DnsDuty::Declared(_)
+        ));
 
         // The production shape: no section at all, and a separate registration.
         let mut production = config(1, 2, 3);
@@ -1170,7 +1245,9 @@ mod tests {
         // serving DNS learns nothing from a line that says "not declared".
         assert!(probe.detail.contains("[dns] section"), "{}", probe.detail);
         assert!(
-            probe.detail.contains(crate::service_install::LAN_DNS_TASK_NAME),
+            probe
+                .detail
+                .contains(crate::service_install::LAN_DNS_TASK_NAME),
             "{}",
             probe.detail
         );
@@ -1190,12 +1267,17 @@ mod tests {
             lan_ip: None,
             zones: Vec::new(),
             upstreams: vec!["1.1.1.1:53".into(), "9.9.9.9:53".into()],
+            serve_in_daemon: true,
         });
 
         let probe = probe_dns_declared(&config, None).await;
         assert_eq!(probe.serving, Serving::No, "{}", probe.detail);
         assert!(probe.serving.is_fault());
-        assert!(probe.target.starts_with("SOA example.com @"), "{}", probe.target);
+        assert!(
+            probe.target.starts_with("SOA example.com @"),
+            "{}",
+            probe.target
+        );
         // The declaration travels into the detail, which is the text the repair
         // ledger and the escalation carry. "Why does supervision think DNS is
         // this box's job" is the first question a `NOT SERVING` line raises, and
@@ -1234,6 +1316,7 @@ mod tests {
             lan_ip: None,
             zones: Vec::new(),
             upstreams: vec!["1.1.1.1:53".into(), "9.9.9.9:53".into()],
+            serve_in_daemon: true,
         });
         let probe = probe_dns_declared(&config, None).await;
         assert_eq!(probe.serving, Serving::Untestable, "{}", probe.detail);
