@@ -1,0 +1,28 @@
+[package]
+name = "selfhost-insight"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Machine sampler: cheap monitoring of CPU, memory, disk, and network."
+
+[dependencies]
+selfhost-json = { workspace = true }
+tokio = { workspace = true, features = ["fs"] }
+serde = { workspace = true, features = ["derive"] }
+serde_json = "1"
+
+[target.'cfg(windows)'.dependencies]
+libc = "0.2"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[dev-dependencies]
+tempfile = "3"
+serde_json = "1"
+
+[lints.rust]
+unsafe_code = "allow"
+missing_docs = "warn"
