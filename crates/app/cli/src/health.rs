@@ -1133,6 +1133,7 @@ mod tests {
             dynamic_ip: false,
             lan_ip: None,
             zones: Vec::new(),
+            upstreams: vec!["1.1.1.1:53".into(), "9.9.9.9:53".into()],
         });
         assert!(matches!(dns_duty(&with_section, None), DnsDuty::Declared(_)));
 
@@ -1179,6 +1180,7 @@ mod tests {
             dynamic_ip: false,
             lan_ip: None,
             zones: Vec::new(),
+            upstreams: vec!["1.1.1.1:53".into(), "9.9.9.9:53".into()],
         });
 
         let probe = probe_dns_declared(&config, None).await;
@@ -1222,6 +1224,7 @@ mod tests {
             dynamic_ip: false,
             lan_ip: None,
             zones: Vec::new(),
+            upstreams: vec!["1.1.1.1:53".into(), "9.9.9.9:53".into()],
         });
         let probe = probe_dns_declared(&config, None).await;
         assert_eq!(probe.serving, Serving::Untestable, "{}", probe.detail);

@@ -72,6 +72,17 @@ pub struct Dns {
     /// The zones served. A single-domain deployment writes one, often bare.
     #[serde(default, rename = "zone")]
     pub zones: Vec<ZoneConfig>,
+
+    /// Upstream resolvers for failover. Each entry is "ip:port" (e.g., "1.1.1.1:53").
+    ///
+    /// When a LAN client asks for a name outside the served zones, the query is
+    /// forwarded to these upstreams. The first upstream is tried first; if it
+    /// answers within ~700ms, that answer is returned. If not, the next upstream
+    /// is tried (hedging: the first is still listened to). An upstream that
+    /// answers with SERVFAIL or REFUSED is considered failed and the next is tried.
+    /// Defaults to `["1.1.1.1:53", "9.9.9.9:53"]` (Cloudflare and Quad9).
+    #[serde(default = "default_upstreams")]
+    pub upstreams: Vec<String>,
 }
 
 impl Dns {
@@ -109,6 +120,15 @@ impl Dns {
 
         for (i, zone) in self.zones.iter().enumerate() {
             zone.check(&format!("{at}.zone[{i}]"), problems);
+        }
+
+        for (i, upstream) in self.upstreams.iter().enumerate() {
+            if upstream.parse::<SocketAddr>().is_err() {
+                problems.push(Problem {
+                    field: format!("{at}.upstreams[{i}]"),
+                    message: format!("\"{}\" must be a socket address like 1.1.1.1:53", upstream),
+                });
+            }
         }
     }
 }
@@ -392,6 +412,10 @@ pub fn registered_domains(config: &crate::Config) -> BTreeSet<String> {
 
 fn default_dns_bind() -> String {
     "0.0.0.0:53".to_owned()
+}
+
+fn default_upstreams() -> Vec<String> {
+    vec!["1.1.1.1:53".to_owned(), "9.9.9.9:53".to_owned()]
 }
 
 fn default_ttl() -> u32 {
@@ -711,5 +735,50 @@ domain = "example.com"
         let written = toml::to_string(&config).expect("serialise");
         let read = Config::parse(&written).expect("re-parse");
         assert_eq!(read.dns.unwrap().zones[0].records[0].name, "www");
+    }
+
+    #[test]
+    fn upstreams_defaults_to_cloudflare_and_quad9() {
+        let text = config_with_dns(
+            r#"
+[dns]
+
+[[dns.zone]]
+domain = "example.com"
+"#,
+        );
+        let config = Config::parse(&text).expect("valid");
+        let dns = config.dns.expect("dns present");
+        assert_eq!(dns.upstreams, vec!["1.1.1.1:53".to_owned(), "9.9.9.9:53".to_owned()]);
+    }
+
+    #[test]
+    fn upstreams_can_be_overridden() {
+        let text = config_with_dns(
+            r#"
+[dns]
+upstreams = ["8.8.8.8:53", "8.8.4.4:53"]
+
+[[dns.zone]]
+domain = "example.com"
+"#,
+        );
+        let config = Config::parse(&text).expect("valid");
+        let dns = config.dns.expect("dns present");
+        assert_eq!(dns.upstreams, vec!["8.8.8.8:53".to_owned(), "8.8.4.4:53".to_owned()]);
+    }
+
+    #[test]
+    fn rejects_a_malformed_upstream_socket_address() {
+        let problems = problems_of(&config_with_dns(
+            r#"
+[dns]
+upstreams = ["not-an-address"]
+
+[[dns.zone]]
+domain = "example.com"
+"#,
+        ));
+        assert!(problems.iter().any(|p| p.field == "dns.upstreams[0]"), "{problems:?}");
     }
 }

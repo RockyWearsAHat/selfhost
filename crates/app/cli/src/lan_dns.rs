@@ -33,7 +33,6 @@
 //! `[dns]` zones is served exactly those.
 
 use selfhost_config::{Config, Dns, RecordConfig, ZoneConfig, psl};
-use selfhost_dns::Resolver;
 use selfhost_mail::Dkim;
 use selfhost_dns::authority::{Authority, LanView};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
@@ -161,6 +160,7 @@ fn with_synthesised_zones(config: &Config) -> Config {
                 dynamic_ip: false,
                 lan_ip: None,
                 zones,
+                upstreams: vec!["1.1.1.1:53".into(), "9.9.9.9:53".into()],
             });
         }
     }
@@ -203,20 +203,28 @@ pub async fn lan_dns_command(
     lan_ip: Ipv4Addr,
     bind: SocketAddr,
 ) -> Result<(), String> {
-    let upstream = Resolver::system().address();
+    let augmented = with_synthesised_zones(config);
 
-    // Forwarding to ourselves would answer every question with the question.
-    if upstream.port() == bind.port()
-        && (upstream.ip() == bind.ip()
-            || upstream.ip() == IpAddr::V4(lan_ip)
-            || upstream.ip().is_loopback())
-    {
-        return Err(format!(
-            "the system resolver is {upstream}, which is this machine, so every query would \
-             be forwarded back here.\n  \
-             Point this machine's own network adapter at a public resolver (for example \
-             1.1.1.1), then re-run."
-        ));
+    // Parse upstreams from config.
+    let upstreams: Vec<SocketAddr> = augmented
+        .dns
+        .as_ref()
+        .map(|dns| dns.upstreams.iter().filter_map(|s| s.parse().ok()).collect())
+        .unwrap_or_else(|| vec!["1.1.1.1:53".parse().unwrap(), "9.9.9.9:53".parse().unwrap()]);
+
+    // Validate that we're not forwarding to ourselves.
+    for upstream in &upstreams {
+        if upstream.port() == bind.port()
+            && (upstream.ip() == bind.ip()
+                || upstream.ip() == IpAddr::V4(lan_ip)
+                || upstream.ip().is_loopback())
+        {
+            return Err(format!(
+                "upstream {upstream} is this machine, so every query would be forwarded back here.\n  \
+                 Point this machine's own network adapter at a public resolver (for example \
+                 1.1.1.1), then re-run."
+            ));
+        }
     }
 
     // The public address the zones' records point at. Discovery can fail on a
@@ -228,13 +236,18 @@ pub async fn lan_dns_command(
         None => config_apex_a(config).unwrap_or(lan_ip),
     };
 
-    let augmented = with_synthesised_zones(config);
     let authority = build_authority(&augmented, project_dir, Some(public_ip));
-    authority.set_lan(LanView { lan_ip, upstream });
+    authority.set_lan(LanView { lan_ip, upstreams: upstreams.clone() });
 
     println!("selfhost split-horizon DNS");
     println!("  bind      {bind}");
-    println!("  upstream  {upstream}");
+    for (i, upstream) in upstreams.iter().enumerate() {
+        if i == 0 {
+            println!("  upstream  {upstream}");
+        } else {
+            println!("  upstream  {upstream} (failover)");
+        }
+    }
     println!("  lan ip    {lan_ip} (answers for LAN peers)");
     println!("  public ip {public_ip} (answers for everyone else)");
     let origins = authority.origins().await;
@@ -398,6 +411,7 @@ mod tests {
                 nameservers: vec![],
                 records: vec![],
             }],
+            upstreams: vec!["1.1.1.1:53".into(), "9.9.9.9:53".into()],
         };
         // The site domain does NOT grow a zone: the operator's [dns] wins.
         let config = config_with(vec![site(&["other.net"])], Some(dns));

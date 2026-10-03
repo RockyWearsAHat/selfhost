@@ -41,7 +41,7 @@ use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, Semaphore};
 
 /// Largest UDP datagram accepted on receive, matching the EDNS0 size clients
 /// advertise and the resolver/forwarder buffers elsewhere in the crate.
@@ -55,21 +55,31 @@ const MAX_UDP_RESPONSE: usize = 512;
 /// TTL used for a freshly written apex A when the zone had none to inherit from.
 const DEFAULT_A_TTL: u32 = 3600;
 
-/// How long a LAN client's forwarded query waits on the upstream resolver.
-const UPSTREAM_TIMEOUT: Duration = Duration::from_secs(5);
+/// Maximum in-flight forwards. When this limit is reached, new forwards answer SERVFAIL.
+const MAX_IN_FLIGHT_FORWARDS: usize = 256;
+
+/// Timeout per upstream attempt. If an upstream doesn't answer within this time,
+/// the next upstream in the list is tried (hedged).
+const UPSTREAM_ATTEMPT_TIMEOUT: Duration = Duration::from_millis(700);
+
+/// Total budget for forwarding a query across all upstreams.
+const UPSTREAM_TOTAL_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// The split-horizon view LAN peers are answered from.
 ///
-/// `lan_ip` replaces the public address in answers, and `upstream` receives the
-/// queries for names outside every served zone. Held in a `OnceLock` on the
-/// authority because it is decided once at startup, from config, before the
-/// first query arrives.
-#[derive(Debug, Clone, Copy)]
+/// `lan_ip` replaces the public address in answers, and `upstreams` are the
+/// resolvers queries for names outside every served zone are forwarded to.
+/// Held in a `OnceLock` on the authority because it is decided once at startup,
+/// from config, before the first query arrives.
+#[derive(Debug, Clone)]
 pub struct LanView {
     /// The address LAN peers should reach this machine at.
     pub lan_ip: Ipv4Addr,
-    /// The resolver LAN peers' foreign queries are forwarded to.
-    pub upstream: SocketAddr,
+    /// The list of upstream resolvers. Forwarding tries them in order,
+    /// with hedging: if the first doesn't answer within ~700ms, the next is
+    /// tried while still listening to the first. An upstream that answers with
+    /// SERVFAIL or REFUSED counts as failed and the next is tried.
+    pub upstreams: Vec<SocketAddr>,
 }
 
 /// The set of zones this machine is authoritative for.
@@ -96,6 +106,11 @@ struct Inner {
     /// Count of total receive/accept errors encountered. Incremented on every
     /// error; the server continues regardless so DNS is never interrupted.
     recv_error_count: AtomicU64,
+    /// Semaphore bounding in-flight forwards to MAX_IN_FLIGHT_FORWARDS.
+    /// When at capacity, new forwards answer SERVFAIL immediately.
+    forward_limit: Semaphore,
+    /// Count of forwards dropped due to semaphore being at capacity.
+    dropped_forwards: AtomicU64,
 }
 
 impl Inner {
@@ -105,6 +120,8 @@ impl Inner {
             public_ip: Mutex::new(public_ip),
             lan: OnceLock::new(),
             recv_error_count: AtomicU64::new(0),
+            forward_limit: Semaphore::new(MAX_IN_FLIGHT_FORWARDS),
+            dropped_forwards: AtomicU64::new(0),
         }
     }
 }
@@ -336,7 +353,7 @@ impl Authority {
             let zones = self.0.zones.lock().await;
             zones.iter().find(|zone| zone.contains(&query.name)).cloned()
         };
-        let lan = self.0.lan.get().copied().filter(|_| is_lan_peer(peer));
+        let lan = self.0.lan.get().cloned().filter(|_| is_lan_peer(peer));
 
         let answer = match (zone, lan) {
             (Some(zone), Some(view)) => {
@@ -347,17 +364,38 @@ impl Authority {
             // A LAN peer's foreign question is forwarded so the router can hand
             // this box out as the network's one resolver. SERVFAIL when the
             // upstream gives nothing usable — honest, and the client retries.
-            (None, Some(view)) => match forward(raw, view.upstream, over_tcp).await {
-                Some(answer) => answer,
-                None => wire::encode_response(
-                    &query,
-                    ResponseCode::ServerFailure,
-                    plain_flags(),
-                    &[],
-                    &[],
-                    &[],
-                ),
-            },
+            (None, Some(view)) => {
+                // Try to acquire a permit for this forward. If the semaphore is at
+                // capacity, immediately answer SERVFAIL and count it as dropped.
+                match self.0.forward_limit.try_acquire() {
+                    Ok(permit) => {
+                        let answer = forward(raw, &view.upstreams, over_tcp).await;
+                        drop(permit); // Release the semaphore permit.
+                        answer.unwrap_or_else(|| {
+                            wire::encode_response(
+                                &query,
+                                ResponseCode::ServerFailure,
+                                plain_flags(),
+                                &[],
+                                &[],
+                                &[],
+                            )
+                        })
+                    }
+                    Err(_) => {
+                        // Semaphore at capacity: count as dropped and answer SERVFAIL.
+                        self.0.dropped_forwards.fetch_add(1, Ordering::Relaxed);
+                        wire::encode_response(
+                            &query,
+                            ResponseCode::ServerFailure,
+                            plain_flags(),
+                            &[],
+                            &[],
+                            &[],
+                        )
+                    }
+                }
+            }
             (None, None) => respond(&query, None, over_tcp),
         };
         log_query(peer, &query.name, query.record_type, over_tcp, started.elapsed(), &answer);
@@ -618,12 +656,69 @@ fn is_lan_peer(peer: IpAddr) -> bool {
     }
 }
 
-/// Relays one raw query to the upstream resolver and returns its raw answer,
-/// or `None` on timeout or failure. UDP queries forward over UDP and TCP over
-/// TCP, so a truncated upstream answer keeps meaning "retry over TCP" to the
-/// client that receives it. A fresh ephemeral socket per query keeps
-/// concurrent answers from crossing without tracking message ids ourselves.
-async fn forward(raw: &[u8], upstream: SocketAddr, over_tcp: bool) -> Option<Vec<u8>> {
+/// Hedged failover forwarding to a list of upstreams.
+///
+/// Tries upstreams in order: the first is given UPSTREAM_ATTEMPT_TIMEOUT, and
+/// if it doesn't answer by then, the next is tried (while still listening to the
+/// first). Takes whichever answers first. An upstream that answers with SERVFAIL
+/// or REFUSED is considered failed and the next is tried. Total timeout is
+/// UPSTREAM_TOTAL_TIMEOUT regardless of how many upstreams are tried.
+/// Returns `Some(answer)` on success, or `None` if all fail or timeout.
+async fn forward(raw: &[u8], upstreams: &[SocketAddr], over_tcp: bool) -> Option<Vec<u8>> {
+    if upstreams.is_empty() {
+        return None;
+    }
+
+    let start = Instant::now();
+    let mut pending_tasks = Vec::new();
+
+    for (idx, upstream) in upstreams.iter().enumerate() {
+        // Calculate delay before starting this upstream's attempt.
+        // The first starts immediately, the second after ~700ms, etc.
+        let delay = Duration::from_millis(700 * idx as u64);
+        if start.elapsed() + delay >= UPSTREAM_TOTAL_TIMEOUT {
+            // Already out of time for this upstream.
+            break;
+        }
+
+        let raw_copy = raw.to_vec();
+        let upstream = *upstream;
+        let task = tokio::spawn(async move {
+            // Wait before attempting (for hedging).
+            if delay > Duration::ZERO {
+                tokio::time::sleep(delay).await;
+            }
+
+            // Attempt to reach this upstream with per-attempt timeout.
+            try_upstream(&raw_copy, upstream, over_tcp).await
+        });
+        pending_tasks.push(task);
+    }
+
+    // Wait for the first successful answer or total timeout.
+    let remaining = UPSTREAM_TOTAL_TIMEOUT.saturating_sub(start.elapsed());
+    let mut result = None;
+    let _ = tokio::time::timeout(remaining, async {
+        for task in pending_tasks {
+            if let Ok(Some(answer)) = task.await {
+                // Check if this is a failure response code.
+                if !is_failure_response(&answer) {
+                    result = Some(answer);
+                    break;
+                }
+            }
+        }
+    })
+    .await;
+
+    result
+}
+
+/// Attempts to reach one upstream resolver.
+///
+/// Returns the raw answer on success, or `None` if the connection failed,
+/// the query timed out, or the response could not be read.
+async fn try_upstream(raw: &[u8], upstream: SocketAddr, over_tcp: bool) -> Option<Vec<u8>> {
     let exchange = async {
         if over_tcp {
             let mut server = TcpStream::connect(upstream).await.ok()?;
@@ -639,7 +734,24 @@ async fn forward(raw: &[u8], upstream: SocketAddr, over_tcp: bool) -> Option<Vec
             Some(buffer)
         }
     };
-    tokio::time::timeout(UPSTREAM_TIMEOUT, exchange).await.ok().flatten()
+    tokio::time::timeout(UPSTREAM_ATTEMPT_TIMEOUT, exchange)
+        .await
+        .ok()
+        .flatten()
+}
+
+/// Checks if a response is a failure code (SERVFAIL or REFUSED).
+///
+/// These responses should trigger failover to the next upstream.
+fn is_failure_response(raw: &[u8]) -> bool {
+    // DNS response format: bytes 3-4 contain the response code in the second byte's
+    // lower 4 bits (bits 0-3 of byte 3 are RCode).
+    if raw.len() < 4 {
+        return false;
+    }
+    let rcode = raw[3] & 0x0f;
+    // ResponseCode::ServerFailure = 2, ResponseCode::Refused = 5
+    matches!(rcode, 2 | 5)
 }
 
 /// Builds the reply for one decoded query against its (maybe-absent) zone.
@@ -1118,7 +1230,7 @@ mod tests {
         // The split horizon: a record pointing at the public IP answers with
         // the LAN address for a private peer, because the NAT does not hairpin.
         let authority = Authority(Arc::new(Inner::new(vec![example_zone()], Some(PUBLIC))));
-        authority.set_lan(LanView { lan_ip: LAN_IP, upstream: "203.0.113.53:53".parse().unwrap() });
+        authority.set_lan(LanView { lan_ip: LAN_IP, upstreams: vec!["203.0.113.53:53".parse().unwrap()] });
 
         let raw = wire::encode_query(1, "www.example.com", RecordType::A).unwrap();
         let from_lan = authority.handle_query(&raw, false, LAN_PEER).await;
@@ -1134,7 +1246,7 @@ mod tests {
         // The forwarding path must never open to the internet: even with the
         // LAN view configured, a public peer asking a foreign name is REFUSED.
         let authority = Authority(Arc::new(Inner::new(vec![example_zone()], Some(PUBLIC))));
-        authority.set_lan(LanView { lan_ip: LAN_IP, upstream: "203.0.113.53:53".parse().unwrap() });
+        authority.set_lan(LanView { lan_ip: LAN_IP, upstreams: vec!["203.0.113.53:53".parse().unwrap()] });
 
         let raw = wire::encode_query(2, "elsewhere.net", RecordType::A).unwrap();
         let message = authority.handle_query(&raw, false, WAN_PEER).await;
@@ -1393,5 +1505,77 @@ domains = ["example.com", "hand.example"]
         let answer2 = authority.handle_query(&raw2, false, WAN_PEER).await;
         assert_eq!(wire::decode_response(&answer2).unwrap().first_a(), Some(PUBLIC));
         assert_eq!(authority.0.recv_error_count.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn forward_semaphore_allows_up_to_max_in_flight_forwards() {
+        // The semaphore bounds concurrent forwards. When at capacity, new
+        // forwards answer SERVFAIL immediately.
+        let authority = Authority(Arc::new(Inner::new(vec![example_zone()], None)));
+
+        // Acquire all permits to simulate a full semaphore.
+        let mut permits = Vec::new();
+        for _ in 0..MAX_IN_FLIGHT_FORWARDS {
+            permits.push(authority.0.forward_limit.acquire().await.unwrap());
+        }
+
+        // The next attempt to acquire should fail (semaphore is full).
+        assert!(authority.0.forward_limit.try_acquire().is_err());
+
+        // Release one permit.
+        drop(permits.pop());
+
+        // Now we should be able to acquire again.
+        assert!(authority.0.forward_limit.try_acquire().is_ok());
+    }
+
+    #[tokio::test]
+    async fn forward_at_capacity_answers_servfail_and_counts_dropped() {
+        // When the forward semaphore is at capacity, a forwarding query gets
+        // SERVFAIL and increments the dropped counter.
+        let authority = Authority(Arc::new(Inner::new(vec![example_zone()], None)));
+        authority.set_lan(LanView {
+            lan_ip: LAN_IP,
+            upstreams: vec!["203.0.113.53:53".parse().unwrap()],
+        });
+
+        // Fill the semaphore.
+        let mut permits = Vec::new();
+        for _ in 0..MAX_IN_FLIGHT_FORWARDS {
+            permits.push(authority.0.forward_limit.acquire().await.unwrap());
+        }
+
+        // A foreign query from a LAN peer should get SERVFAIL.
+        let raw = wire::encode_query(8888, "elsewhere.net", RecordType::A).unwrap();
+        let message = authority.handle_query(&raw, false, LAN_PEER).await;
+        let response = wire::decode_response(&message).unwrap();
+        assert_eq!(response.code, ResponseCode::ServerFailure);
+        assert_eq!(authority.0.dropped_forwards.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn is_failure_response_detects_servfail_and_refused() {
+        // SERVFAIL (code 2) and REFUSED (code 5) should be detected.
+        // Response format: byte 3 contains the response code in the lower 4 bits.
+
+        // Build a SERVFAIL response (rcode = 2).
+        let mut servfail = vec![0u8; 12];
+        servfail[3] = 0x80 | 2; // QR=1, Opcode=0, AA=0, TC=0, RD=0, RA=0, Z=0, RCODE=2
+        assert!(is_failure_response(&servfail));
+
+        // Build a REFUSED response (rcode = 5).
+        let mut refused = vec![0u8; 12];
+        refused[3] = 0x80 | 5; // QR=1, ..., RCODE=5
+        assert!(is_failure_response(&refused));
+
+        // A normal response (rcode = 0) is not a failure.
+        let mut normal = vec![0u8; 12];
+        normal[3] = 0x80; // QR=1, ..., RCODE=0
+        assert!(!is_failure_response(&normal));
+
+        // A NXDOMAIN response (rcode = 3) is not a failure for forwarding purposes.
+        let mut nxdomain = vec![0u8; 12];
+        nxdomain[3] = 0x80 | 3; // QR=1, ..., RCODE=3
+        assert!(!is_failure_response(&nxdomain));
     }
 }
