@@ -589,11 +589,21 @@ impl<H: selfhost_screen::AgentHost, C: AgentChannel> Supervised<H, C> {
     /// a 2560x1440 desktop fill in over half a minute.
     ///
     /// So a turn decides, and this carries, and the loop spends the rest of its
-    /// second here. It cannot spin: [`AgentChannel::pump`] blocks for its own
-    /// short wait when there is nothing to read.
-    pub(crate) fn carry(&mut self, now: std::time::Instant) {
-        self.forward_input();
-        self.listen(now);
+    /// second here. Returns `true` if work was done or a pipe wait occurred, so
+    /// the caller can avoid spinning when there is no pipe and nothing to carry.
+    ///
+    /// # When there is no pipe yet
+    ///
+    /// In production (session 0 before the first agent spawn, or while nobody is
+    /// logged in), there is no pipe and nothing arrives. Without reporting
+    /// whether work was done, the loop would call this thousands of times per
+    /// second and burn 100% of one core. This method returns `false` when nothing
+    /// happened and no pipe wait occurred, so the loop can sleep for the rest of
+    /// the turn.
+    pub(crate) fn carry(&mut self, now: std::time::Instant) -> bool {
+        let sent = self.forward_input();
+        let listened = self.listen(now);
+        sent || listened
     }
 
     /// Writes whatever the attached session has queued for the agent.
@@ -601,7 +611,10 @@ impl<H: selfhost_screen::AgentHost, C: AgentChannel> Supervised<H, C> {
     /// Non-blocking, and bounded by what is already in the queue: this runs on
     /// the supervision thread, between a spawn decision and a pipe read, and a
     /// blocking drain here would delay both.
-    fn forward_input(&mut self) {
+    ///
+    /// Returns `true` if any message was sent, `false` if the queue was empty.
+    fn forward_input(&mut self) -> bool {
+        let mut sent = false;
         loop {
             let next = {
                 let mut held = match self.shared.attached.lock() {
@@ -610,14 +623,15 @@ impl<H: selfhost_screen::AgentHost, C: AgentChannel> Supervised<H, C> {
                 };
                 match held.as_mut() {
                     Some(attached) => attached.input.try_recv().ok(),
-                    None => return,
+                    None => return sent,
                 }
             };
-            let Some(message) = next else { return };
+            let Some(message) = next else { return sent };
             if let Err(fault) = self.channel.send(&message) {
                 self.fault = Some(fault);
-                return;
+                return sent;
             }
+            sent = true;
         }
     }
 
@@ -682,7 +696,10 @@ impl<H: selfhost_screen::AgentHost, C: AgentChannel> Supervised<H, C> {
     /// optional: without it the supervisor kills the agent at its start deadline
     /// as `NeverConnected` and charges it a failure, so an unpumped channel turns
     /// a working agent into a crash loop.
-    fn listen(&mut self, now: std::time::Instant) {
+    ///
+    /// Returns `true` if pump() would have waited on the pipe or if data arrived,
+    /// `false` if pump() would return instantly (no pipe, no buffered data).
+    fn listen(&mut self, now: std::time::Instant) -> bool {
         loop {
             match self.channel.pump() {
                 Ok(Some(payload)) => {
@@ -692,16 +709,22 @@ impl<H: selfhost_screen::AgentHost, C: AgentChannel> Supervised<H, C> {
                         self.phase = self.agent.supervision().phase(now);
                     }
                     self.absorb(&payload);
+                    // Data arrived; there is at least buffered data or a pipe to wait on.
+                    // Continue looping to drain any remaining buffered messages, then
+                    // return true to signal that something happened.
                 }
-                Ok(None) => return,
+                Ok(None) => {
+                    // No data arrived. Check if there's a pipe: if there is, pump()
+                    // would have waited, so this is productive. If there isn't, pump()
+                    // returned instantly and the loop is spinning.
+                    return self.channel.session().is_some();
+                }
                 Err(fault) => {
-                    // A channel that faults is a channel with nothing on it. The
-                    // process handle decides whether the agent is gone, so this
-                    // is recorded and the supervisor is left to conclude.
+                    // A channel that faults tried to do I/O (even if it failed).
                     self.fault = Some(fault);
                     self.channel.recycle();
                     self.forget_agent();
-                    return;
+                    return true;
                 }
             }
         }
@@ -880,7 +903,7 @@ fn observed_console(
 /// tighter loop would spend the machine's power watching a login screen. The
 /// waits inside one turn are shorter than this, so an agent's `Hello` is seen
 /// within a fraction of a turn rather than at the end of one.
-#[cfg(windows)]
+#[cfg(any(windows, test))]
 const TURN: Duration = Duration::from_secs(1);
 
 /// How long one turn waits for an agent to connect to the pipe.
@@ -983,11 +1006,18 @@ fn begin(input: InputPolicy, limits: Limits) -> Arc<Shared> {
             // The rest of the second is spent carrying the stream rather than
             // asleep. Deciding is a once-a-second job; a desktop is not, and
             // running both on one clock is what made a local pipe deliver frames
-            // in one-second bursts. `carry` blocks on the pipe's own short wait
-            // when there is nothing there, so an idle agent costs no more here
-            // than the sleep it replaces.
+            // in one-second bursts. `carry` is called until the TURN expires, but
+            // it returns false when there is no pipe and nothing to carry. In that
+            // case (production session 0 before the first agent, or no user logged
+            // in), sleep out the rest of the turn to avoid spinning at 100% CPU.
             while started.elapsed() < TURN {
-                supervised.carry(std::time::Instant::now());
+                if !supervised.carry(std::time::Instant::now()) {
+                    // Nothing to do and no pipe to wait on. Sleep for the rest
+                    // of this turn so the loop does not spin.
+                    let remaining = TURN.saturating_sub(started.elapsed());
+                    std::thread::sleep(remaining);
+                    break;
+                }
             }
         }
     });
@@ -1218,12 +1248,13 @@ mod tests {
         let opens_before = machine.borrow().opened().len();
 
         supervised.channel.inbox.push(hello(2));
-        supervised.carry(now + Duration::from_millis(10));
+        let did_work = supervised.carry(now + Duration::from_millis(10));
 
         assert_eq!(machine.borrow().spawned().len(), spawns_before, "carrying spawns nothing");
         assert_eq!(machine.borrow().opened().len(), opens_before, "and opens no channel");
         assert_eq!(supervised.monitors, 2, "but it did take the message off the pipe");
         assert!(supervised.connected, "and the message is what marks the agent connected");
+        assert!(did_work, "carrying data should return true");
     }
 
     /// A credit grant becomes the link's own credit frame; everything else does
@@ -1808,5 +1839,83 @@ mod tests {
     #[test]
     fn an_armed_deployment_carries_its_policy_to_the_spawner() {
         assert!(CaptureAgent::start(true, 10).input_policy().allows());
+    }
+
+    #[test]
+    fn with_no_pipe_carry_returns_false_and_does_not_spin() {
+        // F1: When there's no pipe and nothing to carry (production session 0
+        // before the first agent, or no user logged in), carry() must return
+        // false so the loop knows to sleep rather than spinning.
+        //
+        // Drive one TURN of the loop logic with no pipe: call carry() repeatedly
+        // until TURN expires. Verify that carry() is invoked a small bounded
+        // number of times (the test timing is approximate, so we check <=100
+        // as a reasonable bound).
+        let (mut supervised, machine) = driver(InputPolicy::ViewOnly, 5);
+        // console remains Attaching (no user), so channel.open_for remains None
+        let now = Instant::now();
+        supervised.turn(now, quiet());
+        assert!(
+            supervised.channel.session().is_none(),
+            "no pipe exists when there is no user"
+        );
+
+        // Simulate the production loop: call carry() repeatedly, counting
+        // iterations. With FakeChannel, pump() returns instantly, so without
+        // the fix, this would loop thousands of times. With the fix, carry()
+        // returns false on the first call (no pipe, no data), so the loop would
+        // exit immediately and sleep.
+        //
+        // In a test with FakeChannel, we see the true return value without
+        // needing the sleep to happen, so this test verifies that carry()
+        // reports the condition correctly.
+        let mut iterations = 0;
+        let max_iterations = 100;
+        let mut turn_start = Instant::now();
+        while turn_start.elapsed() < TURN && iterations < max_iterations {
+            if !supervised.carry(Instant::now()) {
+                // carry() correctly reported that there's nothing to do and no
+                // pipe to wait on. The production loop would sleep here.
+                break;
+            }
+            iterations += 1;
+        }
+
+        assert!(iterations < max_iterations, "carry() returned false quickly, not spinning");
+        assert!(iterations <= 2, "with no pipe and no data, carry() does minimal work: {iterations}");
+    }
+
+    #[test]
+    fn with_a_live_pipe_frames_flow_within_the_turn() {
+        // F1: With a live pipe carrying frames, frames must flow normally within
+        // a turn, and carry() must return true to indicate work is happening.
+        let now = Instant::now();
+        let (mut supervised, machine) = driver(InputPolicy::ViewOnly, 5);
+        machine.borrow_mut().console = ConsoleSession::User(1);
+        supervised.turn(now, quiet());
+        // Channel is open for session 1
+        assert_eq!(supervised.channel.session(), Some(1));
+
+        // Put some frames on the pipe
+        supervised.channel.inbox.push(hello(2));
+        let status_msg = selfhost_desk::wire::Message::Status {
+            notice: selfhost_desk::state::Notice::Live,
+            detail: "test status".to_owned(),
+        }
+        .encode()
+        .expect("encodes");
+        supervised.channel.inbox.push(status_msg);
+
+        // Call carry() with the frames available
+        let did_work = supervised.carry(now + Duration::from_millis(10));
+        assert!(did_work, "carry() returns true when there's a pipe with data");
+        assert!(supervised.connected, "first message connected the agent");
+        assert_eq!(supervised.monitors, 2, "frames were processed");
+
+        // Call carry() again with no more frames
+        let did_work = supervised.carry(now + Duration::from_millis(20));
+        // With a live pipe, pump() would wait for more data, so carry() should
+        // report that the pipe was consulted (even if no data arrived).
+        assert!(did_work, "carry() returns true when there's a pipe to wait on");
     }
 }
