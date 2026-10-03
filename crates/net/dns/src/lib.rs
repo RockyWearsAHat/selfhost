@@ -25,7 +25,7 @@
 pub mod authority;
 pub mod cache;
 pub mod resolver;
-mod time;
+pub mod time;
 pub mod telemetry;
 pub mod updater;
 pub mod wire;
@@ -37,6 +37,7 @@ pub use cache::DnsCache;
 pub use resolver::{
     ResolveError, Resolver, ResolverSource, blocklist_name, is_real_listing, reverse_name,
 };
+pub use time::stamp;
 pub use updater::{ApexWriter, DEFAULT_INTERVAL, Movement, assess, next_serial, track_wan_ip};
 pub use wire::{Record, RecordData, RecordType, Response, ResponseCode, WireError};
 pub use zone::{Soa, Zone, default_zone};

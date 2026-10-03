@@ -1278,17 +1278,19 @@ async fn serve_everything(
     // silently not listening, so the domain and its mail stop resolving with no
     // sign why. Better to fail loudly at startup than to look healthy and be deaf.
     let dns = match config.dns.as_ref() {
-        Some(_) => {
+        Some(dns_config) if dns_config.serve_in_daemon => {
             let public_ip = doctor::discover_public_ip().await;
             let authority = lan_dns::build_authority(&config, &project_dir, public_ip);
             enable_lan_view_if_configured(&authority, &config);
             Some(authority)
         }
-        None => None,
+        _ => None,
     };
     let dns_bind: Option<SocketAddr> = match config.dns.as_ref() {
-        Some(dns) => Some(dns.bind.parse().map_err(|e| format!("dns.bind {}: {e}", dns.bind))?),
-        None => None,
+        Some(dns) if dns.serve_in_daemon => {
+            Some(dns.bind.parse().map_err(|e| format!("dns.bind {}: {e}", dns.bind))?)
+        }
+        _ => None,
     };
     if let (Some(authority), Some(bind), Some(dns_config)) =
         (dns.as_ref(), dns_bind, config.dns.as_ref())
@@ -1874,7 +1876,7 @@ async fn track_wan_ip_if_enabled(dns: Option<Authority>, config: &Config) {
     let Some(authority) = dns else {
         return std::future::pending().await;
     };
-    let dynamic = config.dns.as_ref().is_some_and(|dns| dns.dynamic_ip);
+    let dynamic = config.dns.as_ref().is_some_and(|dns| dns.serve_in_daemon && dns.dynamic_ip);
     if !dynamic {
         return std::future::pending().await;
     }
