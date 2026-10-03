@@ -10,14 +10,17 @@
 //! - `GlobalMemoryStatusEx`: Physical memory usage
 //! - `GetLogicalDriveStringsW` + `GetDiskFreeSpaceExW`: Fixed disk usage
 //! - `GetIfTable2` + `FreeMibTable`: Network interface statistics
+//! - `CreateToolhelp32Snapshot` + `Process32FirstW` + `Process32NextW`: Process enumeration
+//! - `OpenProcess`, `GetProcessTimes`, `K32GetProcessMemoryInfo`, `CloseHandle`: Process metrics
 //!
 //! All addresses are re-derived at each call; no global state is retained.
 
 #![allow(unsafe_code)]
 
-use crate::{DiskSample, NetSample, Sample};
+use crate::{DiskSample, NetSample, ProcessSample, Sample, WindowsEvent};
 use std::io;
 use std::mem;
+use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 pub fn sample() -> io::Result<Sample> {
@@ -215,6 +218,254 @@ fn read_network() -> io::Result<Vec<NetSample>> {
     }
 }
 
+/// Samples running processes, returning the top 8 by CPU and top 8 by memory,
+/// plus all processes whose names start with "selfhost".
+pub fn sample_processes() -> io::Result<Vec<ProcessSample>> {
+    unsafe {
+        let mut snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+        if snapshot == libc::INVALID_HANDLE_VALUE {
+            return Err(io::Error::last_os_error());
+        }
+
+        let mut processes = Vec::new();
+        let mut pe: PROCESSENTRY32W = mem::zeroed();
+        pe.dwSize = mem::size_of::<PROCESSENTRY32W>() as u32;
+
+        // Collect all process information
+        if Process32FirstW(snapshot, &mut pe) != 0 {
+            loop {
+                let name = String::from_utf16_lossy(&pe.szExeFile[..pe.szExeFile.iter().position(|&c| c == 0).unwrap_or(pe.szExeFile.len())])
+                    .to_string();
+
+                // Try to read process times and memory
+                if let Ok((cpu_cores, working_set_mb)) = read_process_metrics(pe.th32ProcessID) {
+                    processes.push(ProcessSample {
+                        pid: pe.th32ProcessID,
+                        name,
+                        cpu_cores,
+                        working_set_mb,
+                    });
+                }
+
+                if Process32NextW(snapshot, &mut pe) == 0 {
+                    break;
+                }
+            }
+        }
+
+        CloseHandle(snapshot);
+
+        // Sort by CPU cores (descending)
+        processes.sort_by(|a, b| b.cpu_cores.partial_cmp(&a.cpu_cores).unwrap_or(std::cmp::Ordering::Equal));
+        let mut top_cpu: Vec<ProcessSample> = processes.iter().take(8).cloned().collect();
+
+        // Sort by memory (descending)
+        processes.sort_by(|a, b| b.working_set_mb.cmp(&a.working_set_mb));
+        let mut top_memory: Vec<ProcessSample> = processes.iter().take(8).cloned().collect();
+
+        // Add all selfhost processes
+        let selfhost_processes: Vec<ProcessSample> = processes
+            .iter()
+            .filter(|p| p.name.to_lowercase().starts_with("selfhost"))
+            .cloned()
+            .collect();
+
+        // Combine and deduplicate
+        let mut combined = top_cpu;
+        combined.extend(top_memory);
+        combined.extend(selfhost_processes);
+        combined.sort_by_key(|p| (p.pid, p.name.clone()));
+        combined.dedup_by_key(|p| (p.pid, p.name.clone()));
+
+        Ok(combined)
+    }
+}
+
+/// Reads process metrics (CPU cores and working set memory).
+unsafe fn read_process_metrics(pid: u32) -> io::Result<(f64, u64)> {
+    let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+    if handle == std::ptr::null_mut() {
+        return Err(io::Error::last_os_error());
+    }
+
+    let mut creation_time: u64 = 0;
+    let mut exit_time: u64 = 0;
+    let mut kernel_time: u64 = 0;
+    let mut user_time: u64 = 0;
+
+    // Get process times
+    if GetProcessTimes(
+        handle,
+        &mut creation_time as *mut u64 as *mut libc::c_void,
+        &mut exit_time as *mut u64 as *mut libc::c_void,
+        &mut kernel_time as *mut u64 as *mut libc::c_void,
+        &mut user_time as *mut u64 as *mut libc::c_void,
+    ) == 0
+    {
+        CloseHandle(handle);
+        return Err(io::Error::last_os_error());
+    }
+
+    // Get process memory
+    let mut mem_info: PROCESS_MEMORY_COUNTERS_EX = mem::zeroed();
+    mem_info.cb = mem::size_of::<PROCESS_MEMORY_COUNTERS_EX>() as u32;
+
+    if K32GetProcessMemoryInfo(
+        handle,
+        &mut mem_info as *mut PROCESS_MEMORY_COUNTERS_EX as *mut PROCESS_MEMORY_COUNTERS,
+        mem::size_of::<PROCESS_MEMORY_COUNTERS_EX>() as u32,
+    ) == 0
+    {
+        CloseHandle(handle);
+        return Err(io::Error::last_os_error());
+    }
+
+    CloseHandle(handle);
+
+    let total_time = kernel_time + user_time;
+    // Convert 100-nanosecond intervals to seconds and then to cores
+    let total_seconds = total_time as f64 / 10_000_000.0;
+    let cpu_cores = total_seconds / 30.0; // Assuming 30-second sample window
+
+    let working_set_mb = mem_info.WorkingSetSize / (1024 * 1024);
+
+    Ok((cpu_cores, working_set_mb))
+}
+
+/// Reads Windows events using wevtutil.
+pub fn read_windows_events() -> io::Result<Vec<WindowsEvent>> {
+    // Run wevtutil to get recent events from the System log
+    // Query: Level 1 or 2 (critical or error) in the last 5 minutes (300 seconds)
+    let output = Command::new("wevtutil")
+        .args(&[
+            "qe",
+            "System",
+            "/q:*[System[(Level=1 or Level=2) and TimeCreated[timediff(@SystemTime) <= 330000]]]",
+            "/f:text",
+            "/c:50",
+        ])
+        .output()?;
+
+    let mut events = Vec::new();
+
+    if !output.status.success() {
+        // wevtutil might not be available on all systems
+        return Ok(Vec::new());
+    }
+
+    let output_str = String::from_utf8_lossy(&output.stdout);
+    let lines: Vec<&str> = output_str.lines().collect();
+
+    let mut i = 0;
+    while i < lines.len() {
+        let line = lines[i];
+
+        if line.starts_with("Provider Name:") {
+            let provider = line
+                .strip_prefix("Provider Name:")
+                .unwrap_or("")
+                .trim()
+                .to_string();
+
+            // Extract Event ID
+            let mut event_id = 0u32;
+            let mut at_unix = 0u64;
+            let mut message = String::new();
+
+            i += 1;
+            while i < lines.len() {
+                let line = lines[i];
+
+                if line.starts_with("Event ID:") {
+                    event_id = line
+                        .strip_prefix("Event ID:")
+                        .unwrap_or("")
+                        .trim()
+                        .parse()
+                        .unwrap_or(0);
+                } else if line.starts_with("TimeCreated:") {
+                    // Parse ISO timestamp to Unix time
+                    if let Some(time_str) = line.strip_prefix("TimeCreated:") {
+                        if let Ok(time) = parse_iso_timestamp(time_str.trim()) {
+                            at_unix = time;
+                        }
+                    }
+                } else if line.starts_with("Message:") {
+                    // Capture first line of message
+                    message = line
+                        .strip_prefix("Message:")
+                        .unwrap_or("")
+                        .trim()
+                        .to_string();
+                    // Take only the first 100 characters
+                    if message.len() > 100 {
+                        message.truncate(100);
+                    }
+                    break;
+                }
+
+                i += 1;
+            }
+
+            if !provider.is_empty() && event_id > 0 && at_unix > 0 {
+                events.push(WindowsEvent {
+                    provider,
+                    id: event_id,
+                    at_unix,
+                    message,
+                });
+            }
+        }
+
+        i += 1;
+    }
+
+    Ok(events)
+}
+
+/// Parses an ISO 8601 timestamp to Unix time.
+fn parse_iso_timestamp(ts: &str) -> Result<u64, String> {
+    // Expected format: 2025-10-03T14:30:45.123Z
+    // This is a simplified parser; in production, use chrono
+    if ts.len() < 19 {
+        return Err("timestamp too short".to_string());
+    }
+
+    // Simple approximation: count days since epoch
+    let year: u32 = ts[0..4].parse().map_err(|_| "invalid year")?;
+    let month: u32 = ts[5..7].parse().map_err(|_| "invalid month")?;
+    let day: u32 = ts[8..10].parse().map_err(|_| "invalid day")?;
+    let hour: u32 = ts[11..13].parse().map_err(|_| "invalid hour")?;
+    let minute: u32 = ts[14..16].parse().map_err(|_| "invalid minute")?;
+    let second: u32 = ts[17..19].parse().map_err(|_| "invalid second")?;
+
+    // Calculate Unix timestamp (approximate)
+    let mut unix_time = 0u64;
+
+    // Days since epoch (1970)
+    let mut days = 0u64;
+    for y in 1970..year as u64 {
+        days += if y % 4 == 0 && (y % 100 != 0 || y % 400 == 0) { 366 } else { 365 };
+    }
+
+    // Days in current year
+    let days_in_months = if year % 4 == 0 && (year % 100 != 0 || year % 400 == 0) {
+        [31, 29, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
+    } else {
+        [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
+    };
+
+    for m in 1..month as usize {
+        days += days_in_months[m - 1] as u64;
+    }
+
+    days += (day - 1) as u64;
+
+    unix_time = days * 86400 + hour as u64 * 3600 + minute as u64 * 60 + second as u64;
+
+    Ok(unix_time)
+}
+
 // === FFI Declarations ===
 
 /// Retrieves system timing information.
@@ -359,4 +610,115 @@ extern "system" {
 #[link(name = "iphlpapi")]
 extern "system" {
     fn FreeMibTable(Memory: *mut libc::c_void);
+}
+
+// Process enumeration and information
+
+/// Process snapshot flags
+const TH32CS_SNAPPROCESS: u32 = 0x00000002;
+const PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x1000;
+
+/// PROCESSENTRY32W structure for process enumeration.
+#[repr(C)]
+struct PROCESSENTRY32W {
+    dwSize: u32,
+    cntUsage: u32,
+    th32ProcessID: u32,
+    th32ParentProcessID: u32,
+    th32PriorityBase: i32,
+    th32MemoryBase: i32,
+    cntThreads: u32,
+    th32ModuleID: u32,
+    cntPriority: u32,
+    szExeFile: [u16; 260],
+}
+
+/// FILETIME structure for process times.
+#[repr(C)]
+struct FILETIME {
+    dwLowDateTime: u32,
+    dwHighDateTime: u32,
+}
+
+/// PROCESS_MEMORY_COUNTERS structure.
+#[repr(C)]
+struct PROCESS_MEMORY_COUNTERS {
+    cb: u32,
+    PageFaultCount: u32,
+    PeakWorkingSetSize: u64,
+    WorkingSetSize: u64,
+    QuotaPeakPagedPoolUsage: u64,
+    QuotaPagedPoolUsage: u64,
+    QuotaPeakNonPagedPoolUsage: u64,
+    QuotaNonPagedPoolUsage: u64,
+    PagefileUsage: u64,
+    PeakPagefileUsage: u64,
+}
+
+/// PROCESS_MEMORY_COUNTERS_EX structure (extends PROCESS_MEMORY_COUNTERS).
+#[repr(C)]
+struct PROCESS_MEMORY_COUNTERS_EX {
+    cb: u32,
+    PageFaultCount: u32,
+    PeakWorkingSetSize: u64,
+    WorkingSetSize: u64,
+    QuotaPeakPagedPoolUsage: u64,
+    QuotaPagedPoolUsage: u64,
+    QuotaPeakNonPagedPoolUsage: u64,
+    QuotaNonPagedPoolUsage: u64,
+    PagefileUsage: u64,
+    PeakPagefileUsage: u64,
+    PrivateUsage: u64,
+}
+
+/// Creates a snapshot of the specified processes.
+#[link(name = "kernel32")]
+extern "system" {
+    fn CreateToolhelp32Snapshot(dwFlags: u32, th32ProcessID: u32) -> *mut libc::c_void;
+}
+
+/// Retrieves information about the first process in the system.
+#[link(name = "kernel32")]
+extern "system" {
+    fn Process32FirstW(hSnapshot: *mut libc::c_void, lppe: *mut PROCESSENTRY32W) -> i32;
+}
+
+/// Retrieves information about the next process in the system.
+#[link(name = "kernel32")]
+extern "system" {
+    fn Process32NextW(hSnapshot: *mut libc::c_void, lppe: *mut PROCESSENTRY32W) -> i32;
+}
+
+/// Opens a process object.
+#[link(name = "kernel32")]
+extern "system" {
+    fn OpenProcess(dwDesiredAccess: u32, bInheritHandle: i32, dwProcessId: u32) -> *mut libc::c_void;
+}
+
+/// Retrieves timing information for the specified process.
+#[link(name = "kernel32")]
+extern "system" {
+    fn GetProcessTimes(
+        hProcess: *mut libc::c_void,
+        lpCreationTime: *mut libc::c_void,
+        lpExitTime: *mut libc::c_void,
+        lpKernelTime: *mut libc::c_void,
+        lpUserTime: *mut libc::c_void,
+    ) -> i32;
+}
+
+/// Retrieves memory statistics for the specified process.
+#[link(name = "kernel32")]
+extern "system" {
+    fn K32GetProcessMemoryInfo(
+        Process: *mut libc::c_void,
+        ppsmemCounters: *mut PROCESS_MEMORY_COUNTERS,
+        cb: u32,
+    ) -> i32;
+}
+
+/// Closes an open object handle.
+#[link(name = "kernel32")]
+extern "system" {
+    fn CloseHandle(hObject: *mut libc::c_void) -> i32;
 }

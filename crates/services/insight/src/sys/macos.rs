@@ -2,8 +2,9 @@
 //!
 //! Uses `host_statistics64` for CPU metrics and `sysctl` for memory information.
 //! Network and disk statistics are not yet implemented; fields will be empty/zero.
+//! Process and Windows event sampling are not supported on macOS.
 
-use crate::Sample;
+use crate::{ProcessSample, Sample, WindowsEvent};
 use std::io;
 use std::mem;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -75,4 +76,18 @@ fn read_memory() -> io::Result<(u64, u64)> {
 
         Ok((total_mb, used_mb))
     }
+}
+
+/// Samples running processes (not implemented on macOS).
+///
+/// Returns an empty vector.
+pub fn sample_processes() -> io::Result<Vec<ProcessSample>> {
+    Ok(Vec::new())
+}
+
+/// Reads Windows events (not available on macOS).
+///
+/// Returns an empty vector.
+pub fn read_windows_events() -> io::Result<Vec<WindowsEvent>> {
+    Ok(Vec::new())
 }
