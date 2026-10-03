@@ -32,6 +32,7 @@
 //! and a secondary bootstraps out of band via [`Authority::export`].
 
 use crate::cache::DnsCache;
+use crate::telemetry::Telemetry;
 use crate::wire::{self, Query, Record, RecordData, RecordType, ResponseCode, ResponseFlags};
 use crate::zone::Zone;
 use selfhost_config::{Config, RecordConfig};
@@ -114,6 +115,8 @@ struct Inner {
     dropped_forwards: AtomicU64,
     /// Cache for upstream DNS answers on the LAN forward path.
     forward_cache: DnsCache,
+    /// Telemetry: DNS query statistics and upstream tracking.
+    telemetry: Telemetry,
 }
 
 impl Inner {
@@ -126,6 +129,7 @@ impl Inner {
             forward_limit: Semaphore::new(MAX_IN_FLIGHT_FORWARDS),
             dropped_forwards: AtomicU64::new(0),
             forward_cache: DnsCache::new(),
+            telemetry: Telemetry::new(),
         }
     }
 }
@@ -270,6 +274,7 @@ impl Authority {
                     // per-packet; the server must never stop answering because of
                     // a client disconnect or kernel error.
                     self.0.recv_error_count.fetch_add(1, Ordering::Relaxed);
+                    self.0.telemetry.record_recv_error();
                     eprintln!("{} [dns] udp recv error: {error}", crate::time::stamp());
                     consecutive_errors += 1;
 
@@ -300,6 +305,7 @@ impl Authority {
                     // per-connection; the server must never stop accepting because of
                     // a client disconnect or kernel error.
                     self.0.recv_error_count.fetch_add(1, Ordering::Relaxed);
+                    self.0.telemetry.record_recv_error();
                     eprintln!("{} [dns] tcp accept error: {error}", crate::time::stamp());
                     consecutive_errors += 1;
 
@@ -337,6 +343,8 @@ impl Authority {
     /// upstream; every other peer gets the pure authoritative behaviour.
     async fn handle_query(&self, raw: &[u8], over_tcp: bool, peer: IpAddr) -> Vec<u8> {
         let started = Instant::now();
+        self.0.telemetry.record_query();
+
         let query = match wire::decode_query(raw) {
             Ok(query) => query,
             Err(_) => {
@@ -351,29 +359,42 @@ impl Authority {
                 return answer;
             }
         };
+
+        // Track LAN vs public queries.
+        let lan = self.0.lan.get().cloned().filter(|_| is_lan_peer(peer));
+        if lan.is_some() {
+            self.0.telemetry.record_lan();
+        } else {
+            self.0.telemetry.record_public();
+        }
+
         // Clone the matched zone out from under the lock so the response is built
         // without holding it — the updater must be able to write meanwhile.
         let zone = {
             let zones = self.0.zones.lock().await;
             zones.iter().find(|zone| zone.contains(&query.name)).cloned()
         };
-        let lan = self.0.lan.get().cloned().filter(|_| is_lan_peer(peer));
 
         // Check cache for LAN forward queries before the main dispatch.
         if let (None, Some(_view)) = (&zone, &lan) {
             if let Some(cached) = self.0.forward_cache.lookup(&query.name, query.record_type, query.id)
             {
-                log_query(peer, &query.name, query.record_type, over_tcp, started.elapsed(), &cached);
+                self.0.telemetry.record_cache_hit();
+                log_query(peer, &query.name, query.record_type, over_tcp, started.elapsed(), &cached, &self.0.telemetry);
                 return cached;
             }
         }
 
-        let answer = match (zone, lan) {
-            (Some(zone), Some(view)) => {
+        let answer = match (zone.clone(), lan) {
+            (Some(_), Some(view)) => {
+                self.0.telemetry.record_zone();
                 let public = *self.0.public_ip.lock().await;
-                respond(&query, Some(&lan_horizon(zone, public, view.lan_ip)), over_tcp)
+                respond(&query, Some(&lan_horizon(zone.clone().unwrap(), public, view.lan_ip)), over_tcp)
             }
-            (Some(zone), None) => respond(&query, Some(&zone), over_tcp),
+            (Some(_), None) => {
+                self.0.telemetry.record_zone();
+                respond(&query, Some(&zone.clone().unwrap()), over_tcp)
+            }
             // A LAN peer's foreign question is forwarded so the router can hand
             // this box out as the network's one resolver. SERVFAIL when the
             // upstream gives nothing usable — honest, and the client retries.
@@ -387,15 +408,18 @@ impl Authority {
 
                         // Cache successful answers; serve stale if all fail.
                         if let Some(ref resp) = answer {
+                            self.0.telemetry.record_forwarded();
                             self.0.forward_cache.insert(&query.name, query.record_type, resp);
                             resp.clone()
                         } else {
                             // All upstreams failed. Try to serve stale.
                             if let Some(stale) = self.0.forward_cache.lookup_stale(&query.name, query.record_type, query.id)
                             {
+                                self.0.telemetry.record_stale();
                                 stale
                             } else {
                                 // No stale available; answer SERVFAIL.
+                                self.0.telemetry.record_servfail();
                                 wire::encode_response(
                                     &query,
                                     ResponseCode::ServerFailure,
@@ -410,6 +434,8 @@ impl Authority {
                     Err(_) => {
                         // Semaphore at capacity: count as dropped and answer SERVFAIL.
                         self.0.dropped_forwards.fetch_add(1, Ordering::Relaxed);
+                        self.0.telemetry.record_dropped();
+                        self.0.telemetry.record_servfail();
                         wire::encode_response(
                             &query,
                             ResponseCode::ServerFailure,
@@ -423,7 +449,13 @@ impl Authority {
             }
             (None, None) => respond(&query, None, over_tcp),
         };
-        log_query(peer, &query.name, query.record_type, over_tcp, started.elapsed(), &answer);
+
+        let elapsed = started.elapsed();
+        if elapsed.as_millis() >= 500 {
+            self.0.telemetry.record_slow();
+        }
+
+        log_query(peer, &query.name, query.record_type, over_tcp, elapsed, &answer, &self.0.telemetry);
         answer
     }
 
@@ -593,6 +625,16 @@ impl Authority {
     /// The origins served, for startup logging and the doctor.
     pub async fn origins(&self) -> Vec<String> {
         self.0.zones.lock().await.iter().map(|zone| zone.origin.clone()).collect()
+    }
+
+    /// Returns a telemetry snapshot of DNS statistics.
+    pub fn telemetry_snapshot(&self, process: &str) -> crate::telemetry::Snapshot {
+        self.0.telemetry.snapshot(process)
+    }
+
+    /// Returns a reference to the telemetry tracker for direct counter updates.
+    pub fn telemetry(&self) -> &Telemetry {
+        &self.0.telemetry
     }
 }
 
@@ -906,17 +948,30 @@ fn glue(zone: &Zone, records: &[Record]) -> Vec<Record> {
 /// it simply took too long for a caller with a tight inline timeout — the
 /// live case this was added for was a DKIM lookup Gmail marked "no key" in
 /// the same second this line recorded a correct answer.
-fn log_query(peer: IpAddr, name: &str, qtype: RecordType, over_tcp: bool, elapsed: Duration, answer: &[u8]) {
+fn log_query(peer: IpAddr, name: &str, qtype: RecordType, over_tcp: bool, elapsed: Duration, answer: &[u8], _telemetry: &Telemetry) {
     let transport = transport_label(over_tcp);
     let ms = elapsed.as_millis();
-    match wire::decode_response(answer) {
-        Ok(response) => eprintln!(
-            "{} [dns] {peer} {name} {qtype} {transport} {} answers={} {ms}ms",
+
+    // Decode the response to check the response code.
+    let response_code = match wire::decode_response(answer) {
+        Ok(response) => Some(response.code),
+        Err(_) => None,
+    };
+
+    // Log SERVFAIL responses.
+    if response_code == Some(ResponseCode::ServerFailure) {
+        eprintln!(
+            "{} [dns] {peer} {name} {qtype} {transport} SERVFAIL {ms}ms",
             crate::time::stamp(),
-            response.code,
-            response.answers.len()
-        ),
-        Err(_) => eprintln!("{} [dns] {peer} {name} {qtype} {transport} ? {ms}ms", crate::time::stamp()),
+        );
+    }
+
+    // Log slow responses (>= 500ms).
+    if elapsed.as_millis() >= 500 && response_code != Some(ResponseCode::ServerFailure) {
+        eprintln!(
+            "{} [dns] {peer} {name} {qtype} {transport} slow {ms}ms",
+            crate::time::stamp(),
+        );
     }
 }
 
@@ -1576,6 +1631,31 @@ domains = ["example.com", "hand.example"]
         let response = wire::decode_response(&message).unwrap();
         assert_eq!(response.code, ResponseCode::ServerFailure);
         assert_eq!(authority.0.dropped_forwards.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn telemetry_tracks_query_counters() {
+        // Telemetry tracks queries, zones answered, and failures.
+        let authority = Authority(Arc::new(Inner::new(vec![example_zone()], None)));
+        authority.set_lan(LanView {
+            lan_ip: LAN_IP,
+            upstreams: vec!["203.0.113.53:53".parse().unwrap()],
+        });
+
+        // A query from a LAN peer for a zone name.
+        let raw = wire::encode_query(0x1111, "www.example.com", RecordType::A).unwrap();
+        let _answer = authority.handle_query(&raw, false, LAN_PEER).await;
+
+        // A query from a public peer.
+        let raw2 = wire::encode_query(0x2222, "example.com", RecordType::A).unwrap();
+        let _answer2 = authority.handle_query(&raw2, false, WAN_PEER).await;
+
+        // Check the telemetry snapshot.
+        let snapshot = authority.telemetry_snapshot("test");
+        assert_eq!(snapshot.counters.queries, 2);
+        assert_eq!(snapshot.counters.lan, 1);
+        assert_eq!(snapshot.counters.public, 1);
+        assert_eq!(snapshot.counters.zone, 2);
     }
 
     #[test]

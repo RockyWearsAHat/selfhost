@@ -748,6 +748,7 @@ version = "0.1.0"
 dependencies = [
  "selfhost-config",
  "selfhost-igd",
+ "selfhost-json",
  "tokio",
 ]
 

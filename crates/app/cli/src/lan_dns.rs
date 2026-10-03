@@ -262,6 +262,10 @@ pub async fn lan_dns_command(
     println!("Public peers: zone names answer authoritatively; everything else is refused.");
     println!("Ctrl-C to stop.\n");
 
+    // Spawn the telemetry writer task.
+    let data_dir = project_dir.join(&config.server.data_dir);
+    selfhost_dns::writer::spawn_stats_writer(authority.clone(), &data_dir, "lan-dns").await;
+
     tokio::select! {
         result = authority.serve(bind) => result.map_err(|error| bind_hint(bind, error)),
         _ = tokio::signal::ctrl_c() => Ok(()),
