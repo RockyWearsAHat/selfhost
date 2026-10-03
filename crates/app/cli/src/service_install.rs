@@ -836,6 +836,7 @@ rem program that exited, so this loop is what makes the daemon keep running.\r\n
 rem Edit the config, not this file: reinstalling the service overwrites it.\r\n\
 cd /d \"{dir}\"\r\n\
 :loop\r\n\
+for %%A in (\"{dir}\\data\\selfhost-daemon.log\") do if %%~zA GTR 16777216 move /y \"{dir}\\data\\selfhost-daemon.log\" \"{dir}\\data\\selfhost-daemon.log.1\" >nul\r\n\
 \"{exe}\" daemon >> \"{dir}\\data\\selfhost-daemon.log\" 2>&1\r\n\
 timeout /t 5 /nobreak > nul\r\n\
 goto loop\r\n",
@@ -857,6 +858,7 @@ rem This file is the recovery path's own supervision (index.dx rule 9) — it is
 rem never touched by a daemon self-update.\r\n\
 cd /d \"{dir}\"\r\n\
 :loop\r\n\
+for %%A in (\"{dir}\\data\\selfhost-watchdog.log\") do if %%~zA GTR 16777216 move /y \"{dir}\\data\\selfhost-watchdog.log\" \"{dir}\\data\\selfhost-watchdog.log.1\" >nul\r\n\
 \"{exe}\" watchdog >> \"{dir}\\data\\selfhost-watchdog.log\" 2>&1\r\n\
 timeout /t 5 /nobreak > nul\r\n\
 goto loop\r\n",
@@ -1679,6 +1681,66 @@ mod tests {
         // Appended, not truncated: the reason for a restart is in the previous
         // run's output.
         assert!(script.contains(">> "), "{script}");
+    }
+
+    #[test]
+    fn the_daemon_keep_alive_wrapper_rotates_logs_before_launch() {
+        let script = keep_alive_script(
+            Path::new("C:\\selfhost\\selfhost.exe"),
+            Path::new("C:\\site"),
+        );
+        // Log rotation must be present using pure cmd syntax (for-loop with size check).
+        assert!(
+            script.contains("for %%A in (\"C:\\site\\data\\selfhost-daemon.log\") do if %%~zA GTR 16777216 move /y"),
+            "rotation line not found in {script}"
+        );
+        // Rotation threshold must be exactly 16 MiB (16777216 bytes).
+        assert!(
+            script.contains("GTR 16777216"),
+            "16 MiB threshold (16777216) not found in {script}"
+        );
+        // Rotation must move to .1 file.
+        assert!(
+            script.contains("\"C:\\site\\data\\selfhost-daemon.log.1\""),
+            ".1 extension not found in rotation in {script}"
+        );
+        // Rotation must happen before the daemon launch, not after.
+        let rotation_pos = script.find("for %%A in").expect("rotation not found");
+        let launch_pos = script.find("\"C:\\selfhost\\selfhost.exe\" daemon").expect("daemon launch not found");
+        assert!(
+            rotation_pos < launch_pos,
+            "rotation must come before launch: rotation at {rotation_pos}, launch at {launch_pos}"
+        );
+    }
+
+    #[test]
+    fn the_watchdog_keep_alive_wrapper_rotates_logs_before_launch() {
+        let script = watchdog_keep_alive_script(
+            Path::new("C:\\selfhost\\selfhost-watchdog.exe"),
+            Path::new("C:\\site"),
+        );
+        // Log rotation must be present using pure cmd syntax.
+        assert!(
+            script.contains("for %%A in (\"C:\\site\\data\\selfhost-watchdog.log\") do if %%~zA GTR 16777216 move /y"),
+            "rotation line not found in {script}"
+        );
+        // Rotation threshold must be exactly 16 MiB.
+        assert!(
+            script.contains("GTR 16777216"),
+            "16 MiB threshold not found in {script}"
+        );
+        // Rotation must move to .1 file.
+        assert!(
+            script.contains("\"C:\\site\\data\\selfhost-watchdog.log.1\""),
+            ".1 extension not found in rotation in {script}"
+        );
+        // Rotation must happen before the watchdog launch.
+        let rotation_pos = script.find("for %%A in").expect("rotation not found");
+        let launch_pos = script.find("\"C:\\selfhost\\selfhost-watchdog.exe\" watchdog").expect("watchdog launch not found");
+        assert!(
+            rotation_pos < launch_pos,
+            "rotation must come before launch"
+        );
     }
 
     #[test]
