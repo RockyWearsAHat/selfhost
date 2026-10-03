@@ -23,6 +23,7 @@
 #![warn(missing_docs)]
 
 pub mod authority;
+pub mod cache;
 pub mod resolver;
 mod time;
 pub mod updater;
@@ -30,6 +31,7 @@ pub mod wire;
 pub mod zone;
 
 pub use authority::{Authority, DnsError};
+pub use cache::DnsCache;
 pub use resolver::{
     ResolveError, Resolver, ResolverSource, blocklist_name, is_real_listing, reverse_name,
 };

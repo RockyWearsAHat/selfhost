@@ -31,6 +31,7 @@
 //! spoofable where a zone transfer would leak data, so transfers stay refused
 //! and a secondary bootstraps out of band via [`Authority::export`].
 
+use crate::cache::DnsCache;
 use crate::wire::{self, Query, Record, RecordData, RecordType, ResponseCode, ResponseFlags};
 use crate::zone::Zone;
 use selfhost_config::{Config, RecordConfig};
@@ -111,6 +112,8 @@ struct Inner {
     forward_limit: Semaphore,
     /// Count of forwards dropped due to semaphore being at capacity.
     dropped_forwards: AtomicU64,
+    /// Cache for upstream DNS answers on the LAN forward path.
+    forward_cache: DnsCache,
 }
 
 impl Inner {
@@ -122,6 +125,7 @@ impl Inner {
             recv_error_count: AtomicU64::new(0),
             forward_limit: Semaphore::new(MAX_IN_FLIGHT_FORWARDS),
             dropped_forwards: AtomicU64::new(0),
+            forward_cache: DnsCache::new(),
         }
     }
 }
@@ -355,6 +359,15 @@ impl Authority {
         };
         let lan = self.0.lan.get().cloned().filter(|_| is_lan_peer(peer));
 
+        // Check cache for LAN forward queries before the main dispatch.
+        if let (None, Some(_view)) = (&zone, &lan) {
+            if let Some(cached) = self.0.forward_cache.lookup(&query.name, query.record_type, query.id)
+            {
+                log_query(peer, &query.name, query.record_type, over_tcp, started.elapsed(), &cached);
+                return cached;
+            }
+        }
+
         let answer = match (zone, lan) {
             (Some(zone), Some(view)) => {
                 let public = *self.0.public_ip.lock().await;
@@ -371,16 +384,28 @@ impl Authority {
                     Ok(permit) => {
                         let answer = forward(raw, &view.upstreams, over_tcp).await;
                         drop(permit); // Release the semaphore permit.
-                        answer.unwrap_or_else(|| {
-                            wire::encode_response(
-                                &query,
-                                ResponseCode::ServerFailure,
-                                plain_flags(),
-                                &[],
-                                &[],
-                                &[],
-                            )
-                        })
+
+                        // Cache successful answers; serve stale if all fail.
+                        if let Some(ref resp) = answer {
+                            self.0.forward_cache.insert(&query.name, query.record_type, resp);
+                            resp.clone()
+                        } else {
+                            // All upstreams failed. Try to serve stale.
+                            if let Some(stale) = self.0.forward_cache.lookup_stale(&query.name, query.record_type, query.id)
+                            {
+                                stale
+                            } else {
+                                // No stale available; answer SERVFAIL.
+                                wire::encode_response(
+                                    &query,
+                                    ResponseCode::ServerFailure,
+                                    plain_flags(),
+                                    &[],
+                                    &[],
+                                    &[],
+                                )
+                            }
+                        }
                     }
                     Err(_) => {
                         // Semaphore at capacity: count as dropped and answer SERVFAIL.
