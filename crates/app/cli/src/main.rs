@@ -1514,7 +1514,13 @@ async fn serve_everything(
         config_now,
     ));
     if let Some(authority) = dns.clone() {
-        tokio::spawn(readopt_zones(authority, config_changes.clone(), project_dir.clone()));
+        tokio::spawn(readopt_zones(authority.clone(), config_changes.clone(), project_dir.clone()));
+        // Spawn the telemetry writer task for the daemon.
+        let authority_for_telemetry = authority.clone();
+        let data_dir_for_telemetry = data_dir.clone();
+        tokio::spawn(async move {
+            selfhost_dns::writer::spawn_stats_writer(authority_for_telemetry, &data_dir_for_telemetry, "daemon").await;
+        });
     }
 
     let certificates = CertificateStore::open(&data_dir).map_err(|e| e.to_string())?;

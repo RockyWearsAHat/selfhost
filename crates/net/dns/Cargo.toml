@@ -11,6 +11,7 @@ description = "DNS wire format and a stub resolver, written from RFC 1035. Share
 tokio = { workspace = true }
 selfhost-config = { workspace = true }
 selfhost-igd = { workspace = true }
+selfhost-json = { workspace = true }
 
 [lints.rust]
 unsafe_code = "forbid"

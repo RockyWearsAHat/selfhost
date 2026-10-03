@@ -26,8 +26,10 @@ pub mod authority;
 pub mod cache;
 pub mod resolver;
 mod time;
+pub mod telemetry;
 pub mod updater;
 pub mod wire;
+pub mod writer;
 pub mod zone;
 
 pub use authority::{Authority, DnsError};
