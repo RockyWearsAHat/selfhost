@@ -2119,7 +2119,7 @@ fn enable_lan_view_if_configured(authority: &Authority, config: &Config) {
     match lan_ip.parse() {
         Ok(lan_ip) => authority.set_lan(selfhost_dns::authority::LanView {
             lan_ip,
-            upstream: selfhost_dns::Resolver::system().address(),
+            upstreams: vec![selfhost_dns::Resolver::system().address()],
         }),
         Err(error) => eprintln!(
             "warning: [dns].lan_ip {lan_ip} is not an IPv4 address ({error}); \

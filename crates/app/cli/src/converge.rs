@@ -1153,6 +1153,7 @@ mod tests {
             dynamic_ip: false,
             lan_ip: None,
             zones: Vec::new(),
+            upstreams: vec!["1.1.1.1:53".into(), "9.9.9.9:53".into()],
         });
 
         let directory = scratch(line!());
@@ -1190,6 +1191,7 @@ mod tests {
             dynamic_ip: false,
             lan_ip: None,
             zones: Vec::new(),
+            upstreams: vec!["1.1.1.1:53".into(), "9.9.9.9:53".into()],
         });
         assert!(matches!(repair_for(Component::Dns, &config), Repair::Unavailable { .. }));
     }
