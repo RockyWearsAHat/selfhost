@@ -747,6 +747,7 @@ dependencies = [
  "selfhost-supervisor",
  "selfhost-vpn",
  "selfhost-ws",
+ "serde_json",
  "tokio",
  "tokio-rustls",
  "webpki-roots",

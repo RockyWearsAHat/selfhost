@@ -223,7 +223,7 @@ fn read_network() -> io::Result<Vec<NetSample>> {
 pub fn sample_processes() -> io::Result<Vec<ProcessSample>> {
     unsafe {
         let mut snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
-        if snapshot == libc::INVALID_HANDLE_VALUE {
+        if snapshot == (-1i64 as *mut libc::c_void) {
             return Err(io::Error::last_os_error());
         }
 
@@ -470,7 +470,7 @@ fn parse_iso_timestamp(ts: &str) -> Result<u64, String> {
 
 /// Retrieves system timing information.
 #[link(name = "kernel32")]
-extern "system" {
+unsafe extern "system" {
     fn GetSystemTimes(
         lpIdleTime: *mut libc::c_void,
         lpKernelTime: *mut libc::c_void,
@@ -494,19 +494,19 @@ struct MEMORYSTATUSEX {
 
 /// Retrieves memory status.
 #[link(name = "kernel32")]
-extern "system" {
+unsafe extern "system" {
     fn GlobalMemoryStatusEx(lpBuffer: *mut MEMORYSTATUSEX) -> i32;
 }
 
 /// Retrieves strings identifying physical drives.
 #[link(name = "kernel32")]
-extern "system" {
+unsafe extern "system" {
     fn GetLogicalDriveStringsW(nBufferLength: u32, lpBuffer: *mut u16) -> u32;
 }
 
 /// Retrieves disk free space.
 #[link(name = "kernel32")]
-extern "system" {
+unsafe extern "system" {
     fn GetDiskFreeSpaceExW(
         lpDirectoryName: *const u16,
         lpFreeBytesAvailableToCaller: *mut u64,
@@ -517,7 +517,7 @@ extern "system" {
 
 /// Retrieves the type of drive.
 #[link(name = "kernel32")]
-extern "system" {
+unsafe extern "system" {
     fn GetDriveTypeW(lpRootPathName: *const u16) -> u32;
 }
 
@@ -602,13 +602,13 @@ struct MIB_IF_TABLE2 {
 
 /// Retrieves the MIB II interface table.
 #[link(name = "iphlpapi")]
-extern "system" {
+unsafe extern "system" {
     fn GetIfTable2(Table: *mut *mut MIB_IF_TABLE2) -> u32;
 }
 
 /// Frees MIB table.
 #[link(name = "iphlpapi")]
-extern "system" {
+unsafe extern "system" {
     fn FreeMibTable(Memory: *mut libc::c_void);
 }
 
@@ -673,31 +673,31 @@ struct PROCESS_MEMORY_COUNTERS_EX {
 
 /// Creates a snapshot of the specified processes.
 #[link(name = "kernel32")]
-extern "system" {
+unsafe extern "system" {
     fn CreateToolhelp32Snapshot(dwFlags: u32, th32ProcessID: u32) -> *mut libc::c_void;
 }
 
 /// Retrieves information about the first process in the system.
 #[link(name = "kernel32")]
-extern "system" {
+unsafe extern "system" {
     fn Process32FirstW(hSnapshot: *mut libc::c_void, lppe: *mut PROCESSENTRY32W) -> i32;
 }
 
 /// Retrieves information about the next process in the system.
 #[link(name = "kernel32")]
-extern "system" {
+unsafe extern "system" {
     fn Process32NextW(hSnapshot: *mut libc::c_void, lppe: *mut PROCESSENTRY32W) -> i32;
 }
 
 /// Opens a process object.
 #[link(name = "kernel32")]
-extern "system" {
+unsafe extern "system" {
     fn OpenProcess(dwDesiredAccess: u32, bInheritHandle: i32, dwProcessId: u32) -> *mut libc::c_void;
 }
 
 /// Retrieves timing information for the specified process.
 #[link(name = "kernel32")]
-extern "system" {
+unsafe extern "system" {
     fn GetProcessTimes(
         hProcess: *mut libc::c_void,
         lpCreationTime: *mut libc::c_void,
@@ -709,7 +709,7 @@ extern "system" {
 
 /// Retrieves memory statistics for the specified process.
 #[link(name = "kernel32")]
-extern "system" {
+unsafe extern "system" {
     fn K32GetProcessMemoryInfo(
         Process: *mut libc::c_void,
         ppsmemCounters: *mut PROCESS_MEMORY_COUNTERS,
@@ -719,6 +719,6 @@ extern "system" {
 
 /// Closes an open object handle.
 #[link(name = "kernel32")]
-extern "system" {
+unsafe extern "system" {
     fn CloseHandle(hObject: *mut libc::c_void) -> i32;
 }

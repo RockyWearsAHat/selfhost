@@ -4535,12 +4535,38 @@ impl Api {
             .unwrap_or_default()
             .as_secs();
 
-        // Read samples from the last 10 seconds to get the most recent one
-        match selfhost_insight::read_samples(data_dir, now.saturating_sub(10), now) {
-            Ok(_samples) => {
-                // For now, return empty as we're not capturing process samples yet
-                // The full implementation will populate this from Windows events
-                let json_str = serde_json::to_string(&Vec::<selfhost_insight::ProcessSample>::new())
+        // Read events from the last 5 minutes to get process samples
+        match selfhost_insight::read_events(data_dir, now.saturating_sub(300), now) {
+            Ok(events) => {
+                // Extract process samples from events and deduplicate
+                let mut processes: Vec<selfhost_insight::ProcessSample> = Vec::new();
+                let mut seen_pids: std::collections::HashSet<u32> = std::collections::HashSet::new();
+
+                // Iterate in reverse to get the most recent samples first
+                for event in events.iter().rev() {
+                    if event.kind == "process" {
+                        if let Some(pid) = event.evidence.get("pid").and_then(|v| v.as_u64()) {
+                            let pid = pid as u32;
+                            if !seen_pids.contains(&pid) {
+                                if let (Some(name), Some(cpu_cores), Some(working_set_mb)) = (
+                                    event.evidence.get("name").and_then(|v| v.as_str()),
+                                    event.evidence.get("cpu_cores").and_then(|v| v.as_f64()),
+                                    event.evidence.get("working_set_mb").and_then(|v| v.as_u64()),
+                                ) {
+                                    processes.push(selfhost_insight::ProcessSample {
+                                        pid,
+                                        name: name.to_string(),
+                                        cpu_cores,
+                                        working_set_mb,
+                                    });
+                                    seen_pids.insert(pid);
+                                }
+                            }
+                        }
+                    }
+                }
+
+                let json_str = serde_json::to_string(&processes)
                     .unwrap_or_else(|_| "[]".to_string());
                 if let Ok(json_val) = selfhost_json::parse(&json_str) {
                     json(Status(200), json_val)
