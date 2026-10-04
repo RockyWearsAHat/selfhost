@@ -1,0 +1,16 @@
+# insight/monitor-ui-dns @ cf9692a (wave 3 merged: rui2 timeline+drill-down, wp7 process I/O + flap detection, web I/O column), finished 2026-10-04T03:59:42Z
+# cargo test --offline --locked --workspace
+suites 80 passed 4130 failed 0
+test exit 0
+# cargo check --offline --locked --workspace --all-targets --target x86_64-pc-windows-gnu
+win exit 0
+# cargo clippy --offline --locked --workspace --all-targets --keep-going -- -D warnings
+error: fields `scheme`, `host`, `port`, and `path` are never read	  --> crates/services/orchid-images/src/bin/push-client.rs:80:13
+error: unused import: `std::io::Read`	  --> crates/services/orchid-images/src/bin/push-client.rs:11:5
+error: unused variable: `uri`	  --> crates/services/orchid-images/src/bin/push-client.rs:63:9
+clippy exit 101
+# cargo clippy --offline --locked -p selfhost-insight -p selfhost-dns -p selfhost-cli -p selfhost-admin -p selfhost-console --all-targets --target x86_64-pc-windows-gnu -- -D warnings
+clippy-win exit 0
+# cargo build --release --offline --locked -p selfhost-cli; node --check sites/console/app.js
+release exit 0
+web syntax ok
