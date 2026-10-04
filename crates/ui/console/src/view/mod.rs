@@ -78,6 +78,7 @@ use crate::state::{Command, FileAction, Link, NoticeKind, Screen, Snapshot, Tunn
 use machines::PairForm;
 use files::FilesForm;
 use install::InstallForm;
+use std::collections::BTreeSet;
 use rui::style::Justify;
 use rui::{
     Align, App, Drag, El, Key, KeyStroke, Modifiers, Phase, Point, Pointing, Redraw, Role, Status,
@@ -301,6 +302,10 @@ pub struct Console {
     /// not two, so the layout and the window cannot come to disagree about
     /// whether there is a title bar on screen. See [`desktop::stage`].
     full_screen: bool,
+    /// Which problems have their evidence rows shown in the HEALTH plate.
+    ///
+    /// Toggled by clicking a problem row, persists across polls.
+    open_problems: BTreeSet<String>,
 }
 
 impl Console {
@@ -333,6 +338,7 @@ impl Console {
             proof: Latch::shut(),
             spec: None,
             full_screen: false,
+            open_problems: BTreeSet::new(),
         }
     }
 
@@ -662,6 +668,20 @@ impl Console {
     /// The same field, to be edited by whatever was just typed or pressed.
     pub(crate) fn files_form_mut(&mut self) -> &mut FilesForm {
         &mut self.files_form
+    }
+
+    /// The problems whose evidence is being shown in the HEALTH plate.
+    pub(crate) fn open_problems(&self) -> &BTreeSet<String> {
+        &self.open_problems
+    }
+
+    /// Toggles whether a problem's evidence is shown.
+    pub(crate) fn toggle_problem(&mut self, id: &str) {
+        if self.open_problems.contains(id) {
+            self.open_problems.remove(id);
+        } else {
+            self.open_problems.insert(id.to_owned());
+        }
     }
 
     /// Validates the FILES field and asks for what it describes.
@@ -1173,7 +1193,7 @@ fn services(console: &Console, snapshot: &Snapshot) -> El<Console> {
         // The HEALTH panel: the machine's current condition and metrics, drawn
         // above SYSTEM as another full-width strip that costs nothing before
         // insight is available. See `health::view`.
-        health::view(snapshot.insight.as_ref(), &snapshot.history),
+        health::view(snapshot.insight.as_ref(), &snapshot.history, &snapshot.events, console.open_problems()),
         // The SYSTEM panel: the daemon's own internal parts, drawn the same
         // way and in the same slot — a full-width strip that costs nothing
         // before it has anything to say. See `system::view`.
@@ -3218,7 +3238,7 @@ mod tests {
     /// [`busy`] on a machine with something wrong: the HEALTH plate with a
     /// problem, an hour of sparklines, DNS and a process ranking.
     fn health() -> Snapshot {
-        use crate::state::{DnsWindow, HistorySample, Insight, InsightProblem, InsightProcess};
+        use crate::state::{DnsWindow, HistorySample, Insight, InsightEvent, InsightProblem, InsightProcess};
         let mut snapshot = busy();
         snapshot.insight = Some(Insight {
             at_unix: 1_791_001_862,
@@ -3228,6 +3248,10 @@ mod tests {
                 id: "selfhost_busy:7316".into(),
                 title: "selfhost.exe (pid 7316) has used 1.02 cores for 2 minutes".into(),
                 since_unix: 1_791_001_742,
+                evidence: vec![
+                    ("executable".to_owned(), "/usr/bin/selfhost".to_owned()),
+                    ("cpu_cores".to_owned(), "1.02".to_owned()),
+                ],
             }],
             cpu_pct: Some(31.0),
             mem_pct: Some(62.5),
@@ -3245,6 +3269,26 @@ mod tests {
                 net_bps: 40_000 + (step % 30) * 9_000,
             })
             .collect();
+        snapshot.events = vec![
+            InsightEvent {
+                at_unix: 1_791_001_862,
+                kind: "warning".to_owned(),
+                source: "cpu".to_owned(),
+                title: "CPU usage high".to_owned(),
+            },
+            InsightEvent {
+                at_unix: 1_791_001_800,
+                kind: "repair".to_owned(),
+                source: "disk".to_owned(),
+                title: "Disk cleaned up".to_owned(),
+            },
+            InsightEvent {
+                at_unix: 1_791_001_700,
+                kind: "cleared".to_owned(),
+                source: "memory".to_owned(),
+                title: "Memory pressure resolved".to_owned(),
+            },
+        ];
         snapshot
     }
 
@@ -3417,6 +3461,9 @@ mod tests {
         written("console-alarmed", alarmed, |_| {}, (1000, 660));
         written("console-health", health(), |_| {}, (1000, 660));
         written("console-health-narrow", health(), |_| {}, (560, 420));
+        written("console-health-open", health(), |console| {
+            console.toggle_problem("selfhost_busy:7316");
+        }, (1000, 660));
         written("console-reaching", reaching(), |_| {}, (1000, 660));
 
         // The three screens that bring the native console to parity with the
