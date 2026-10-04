@@ -1,0 +1,21 @@
+new exe sha e92f123f38258db2
+=== B: true handoff between two new instances, port 15356
+A pid 9564 handoff file: 9564
+queries 485, answered 484, unanswered 1 at ms [2307]; event at 1019 ms; first answer after it at 1021 ms; answer latency p50 0 ms max 3 ms
+B pid 5080 alive True; A alive False; handoff file: 5080
+A stdout:
+10-04 04:40:44Z [dns] bound with SO_REUSEADDR
+10-04 04:40:44Z [dns] answered its own forwarded and zone questions; claimed the handoff as PID 9564
+A stderr:
+10-04 04:40:54Z [dns] handoff detected: new DNS process is taking over
+10-04 04:40:54Z [dns] a newer instance took over; exiting
+B stdout:
+Ctrl-C to stop.
+10-04 04:40:54Z [dns] bound with SO_REUSEADDR
+10-04 04:40:54Z [dns] answered its own forwarded and zone questions; claimed the handoff as PID 5080
+B stderr:
+== stragglers
+7316 "C:\Users\Alex\Self-Host\target\release\selfhost.exe"  daemon 
+11812 "C:\Users\Alex\Self-Host\target\release\selfhost.exe" reports serve --accounts --public-ba
+== :53 owners
+0.0.0.0 pid 7316

@@ -1,0 +1,12 @@
+### run 1
+queries 440, answered 439, unanswered 1 at ms [3576]; event at 1018 ms; first answer after it at 1022 ms; answer latency p50 0 ms max 22 ms
+slow or missing (t ms, latency): 2044:ok:22 3576:miss:1506
+A exited at  ms on the stream clock
+B pid 13804 alive True; A alive False; handoff file: 13804
+10-04 04:47:38Z [dns] a newer instance took over; drained, exiting
+### run 2
+queries 442, answered 441, unanswered 1 at ms [3602]; event at 1034 ms; first answer after it at 1037 ms; answer latency p50 0 ms max 22 ms
+slow or missing (t ms, latency): 2059:ok:22 3602:miss:1502
+A exited at  ms on the stream clock
+B pid 12928 alive True; A alive False; handoff file: 12928
+10-04 04:48:05Z [dns] a newer instance took over; drained, exiting

@@ -1,0 +1,32 @@
+old exe sha ea53b34699485d58
+== control before anything: NO ANSWER expected
+     15ms NO ANSWER
+old serve-dns pid 9104 exited: False
+== old alone: 5 queries
+    765ms NOERROR an=2 104.20.23.154,172.66.147.243
+    759ms NOERROR an=2 104.20.23.154,172.66.147.243
+    840ms NOERROR an=2 104.20.23.154,172.66.147.243
+    814ms NOERROR an=2 104.20.23.154,172.66.147.243
+    926ms NOERROR an=2 104.20.23.154,172.66.147.243
+new lan-dns pid 5032 exited: True
+== both bound: 20 queries
+answered 20/20
+== old exits (Stop-Process, like the old daemon going away): 20 queries
+answered 0/20
+old query lines logged: 25
+new stdout:
+Public peers: zone names answer authoritatively; everything else is refused.
+Ctrl-C to stop.
+new stderr:
+ƒo- cannot bind 127.0.0.1:15354 (UDP): An attempt was made to access a socket in a way forbidden by its access permissions. (os error 10013)
+  This usually means port 53 needs privilege or something is already listening.
+  On macOS that is usually a VPN client or Internet Sharing.
+old stderr tail:
+10-04 04:28:58Z [dns] 127.0.0.1 example.com A udp NOERROR answers=2 2ms
+10-04 04:28:58Z [dns] 127.0.0.1 example.com A udp NOERROR answers=2 2ms
+10-04 04:28:58Z [dns] 127.0.0.1 example.com A udp NOERROR answers=2 2ms
+== stragglers
+7316 "C:\Users\Alex\Self-Host\target\release\selfhost.exe"  daemon 
+11812 "C:\Users\Alex\Self-Host\target\release\selfhost.exe" reports serve --accounts --public-base-url https://rockywearsahat.com --verify-from service@rockywearsahat.com --rp-id rockywearsahat.com --
+== :53 owners
+0.0.0.0 pid 7316

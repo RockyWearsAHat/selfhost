@@ -1,0 +1,10 @@
+### run 1
+queries 7018, answered 7017, unanswered 1 at ms [6616]; event at 1007 ms; first answer after it at 1010 ms; answer latency p50 0 ms max 38 ms
+slow or missing (t ms, latency): 2100:ok:38 6616:miss:1515
+B pid 10656 alive True; A alive False; handoff file: 10656
+10-04 04:48:53Z [dns] a newer instance took over; still busy after 3 s, exiting anyway
+### run 2
+queries 7117, answered 7116, unanswered 1 at ms [6591]; event at 1011 ms; first answer after it at 1013 ms; answer latency p50 0 ms max 44 ms
+slow or missing (t ms, latency): 2069:ok:44 6591:miss:1517
+B pid 2620 alive True; A alive False; handoff file: 2620
+10-04 04:49:20Z [dns] a newer instance took over; still busy after 3 s, exiting anyway

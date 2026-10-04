@@ -1,0 +1,8 @@
+new exe sha 6385b71b6539d211
+A pid 14432 handoff: 14432
+sent 3537, answered 3537, lost 0; event at 1007 ms
+B alive True; A alive False; handoff: 748
+A stderr:
+10-04 04:53:26Z [dns] EXPERIMENT sockets dropped; lingering 1 s
+10-04 04:53:27Z [dns] a newer instance took over; still busy after 3 s, exiting anyway
+stragglers: 

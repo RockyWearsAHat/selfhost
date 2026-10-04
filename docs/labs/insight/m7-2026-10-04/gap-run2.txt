@@ -1,0 +1,26 @@
+new exe sha e3b091b7b909e7c9
+=== A: cutover from the old binary (plain bind) to a waiting lan-dns, port 15355
+old alive True, new alive (waiting) True
+queries 87, answered 81, unanswered 6 at ms [232,418,611,803,995,1203]; event at 1037 ms; first answer after it at 1249 ms; answer latency p50 0 ms max 6 ms
+new stdout:
+10-04 04:34:13Z [dns] 127.0.0.1:15355 is free; bound after 6961 ms
+10-04 04:34:13Z [dns] bound with SO_REUSEADDR
+10-04 04:34:14Z [dns] answering real queries; claimed the handoff as PID 13432
+new stderr:
+10-04 04:34:06Z [dns] 127.0.0.1:15355 is held by another server (An attempt was made to access a socket in a way forbidden by its access permissions. (os error 10013)); waiting for it
+=== B: true handoff between two new instances, port 15356
+A pid 14876 handoff file: 14876
+queries 423, answered 423, unanswered 0 at ms []; event at 1026 ms; first answer after it at 1029 ms; answer latency p50 0 ms max 1 ms
+B pid 4488 alive True; A alive True; handoff file: 14876
+A stdout:
+10-04 04:34:17Z [dns] bound with SO_REUSEADDR
+10-04 04:34:23Z [dns] answering real queries; claimed the handoff as PID 14876
+A stderr:
+B stdout:
+10-04 04:34:27Z [dns] bound with SO_REUSEADDR
+B stderr:
+== stragglers
+7316 "C:\Users\Alex\Self-Host\target\release\selfhost.exe"  daemon 
+11812 "C:\Users\Alex\Self-Host\target\release\selfhost.exe" reports serve --accounts --public-ba
+== :53 owners
+0.0.0.0 pid 7316
