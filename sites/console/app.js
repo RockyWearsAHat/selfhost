@@ -4976,6 +4976,13 @@ function boot() {
       wsCell.textContent = typeof proc.working_set_mb === "number" ? proc.working_set_mb.toFixed(0) : "—";
       row.append(wsCell);
 
+      // Any I/O (files, sockets, devices), read plus written: the OS does not split out disk.
+      const ioCell = document.createElement("td");
+      ioCell.className = "numeric";
+      const io = (proc.io_read_bps || 0) + (proc.io_write_bps || 0);
+      ioCell.textContent = typeof proc.io_read_bps === "number" ? byteRate(io) : "—";
+      row.append(ioCell);
+
       tbody.append(row);
     }
   }

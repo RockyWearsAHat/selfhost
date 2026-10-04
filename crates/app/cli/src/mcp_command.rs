@@ -396,7 +396,8 @@ const TOOLS: &[Tool] = &[
     (
         "insight_events",
         "The machine timeline over a window, oldest first: problems raised and cleared (warning, \
-         cleared), self-repairs (repair) and Windows System/Application errors (windows). Default: \
+         cleared; a component repaired 3+ times in 30 minutes raises flapping:<component>), \
+         self-repairs (repair) and Windows System/Application errors (windows). Default: \
          the last day. Kept for 30 days.",
         &[
             ("since", "Start of the range as a unix timestamp (seconds); optional.", false, Kind::Count),
@@ -411,8 +412,9 @@ const TOOLS: &[Tool] = &[
     ),
     (
         "insight_processes",
-        "The newest process ranking (once a minute): the busiest and largest processes plus every \
-         selfhost process, with CPU in cores, memory and handles.",
+        "The newest process ranking (once a minute): the busiest, largest and most I/O-heavy \
+         processes plus every selfhost process, with CPU in cores, memory, handles, and I/O bytes \
+         per second (any I/O: files, sockets, devices).",
         &[],
     ),
     (
