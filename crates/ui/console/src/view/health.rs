@@ -9,8 +9,9 @@
 
 use super::Console;
 use super::style;
-use crate::state::{DnsWindow, HistorySample, Insight};
+use crate::state::{DnsWindow, HistorySample, Insight, InsightEvent};
 use rui::{Align, El, Length, Point, Size, Status, Tone, caption, col, draw, micro, row, text};
+use std::collections::BTreeSet;
 
 /// The label column's share of a row, matching `system::NAME_W`.
 const LABEL_W: f32 = 0.28;
@@ -23,7 +24,12 @@ const PROCESSES: usize = 3;
 
 /// The HEALTH plate, or `None` while nothing has been fetched and on a daemon
 /// without machine insight.
-pub fn view(insight: Option<&Insight>, history: &[HistorySample]) -> Option<El<Console>> {
+pub fn view(
+    insight: Option<&Insight>,
+    history: &[HistorySample],
+    events: &[InsightEvent],
+    open_problems: &BTreeSet<String>,
+) -> Option<El<Console>> {
     let insight = insight?;
     let condition = match insight.condition.as_str() {
         "ok" => Status::Ok,
@@ -41,16 +47,29 @@ pub fn view(insight: Option<&Insight>, history: &[HistorySample]) -> Option<El<C
         .min_h(20.0)
         .align(Align::Center),
     ];
-    rows.extend(insight.problems.iter().map(|problem| {
-        row((
-            row((style::lamp(Status::Warn), caption(format!("SINCE {}", clock(problem.since_unix)))))
-                .gap(6.0)
-                .align(Align::Center)
-                .w(Length::Fraction(LABEL_W)),
-            caption(problem.title.clone()).grow(),
-        ))
-        .min_h(20.0)
-        .align(Align::Center)
+    rows.extend(insight.problems.iter().flat_map(|problem| {
+        let mut problem_rows: Vec<El<Console>> = vec![
+            row((
+                row((style::lamp(Status::Warn), caption(format!("SINCE {}", clock(problem.since_unix)))))
+                    .gap(6.0)
+                    .align(Align::Center)
+                    .w(Length::Fraction(LABEL_W)),
+                caption(problem.title.clone()).grow(),
+            ))
+            .min_h(20.0)
+            .align(Align::Center)
+            .on_click({
+                let id = problem.id.clone();
+                move |console: &mut Console| console.toggle_problem(&id)
+            }),
+        ];
+        problem_rows.extend(shown_evidence(&problem.evidence, open_problems.contains(&problem.id)).iter().map(
+            |(key, value)| {
+                row((caption(format!("{key}  ")).w(Length::Fraction(LABEL_W)), caption(clip(value, 80)).grow()))
+                    .min_h(16.0)
+            },
+        ));
+        problem_rows
     }));
     let cpu: Vec<f64> = history.iter().map(|s| s.cpu_pct.unwrap_or(0.0)).collect();
     let memory: Vec<f64> = history.iter().map(|s| s.mem_pct).collect();
@@ -72,6 +91,30 @@ pub fn view(insight: Option<&Insight>, history: &[HistorySample]) -> Option<El<C
             .map(|p| format!("{} ({}) {:.2} cores {} MB", p.name, p.pid, p.cpu_cores, p.working_set_mb))
             .collect();
         rows.push(row((micro("TOP".to_owned()).w(Length::Fraction(LABEL_W)), micro(top.join("  ·  ")).grow())).min_h(16.0));
+    }
+    if !events.is_empty() {
+        let event_rows: Vec<El<Console>> = events
+            .iter()
+            .map(|event| {
+                let status = match event.kind.as_str() {
+                    "warning" | "repair" => Status::Warn,
+                    "cleared" => Status::Ok,
+                    _ => Status::Idle,
+                };
+                row((
+                    row((style::lamp(status), micro(clock(event.at_unix))))
+                        .gap(6.0)
+                        .align(Align::Center),
+                    micro(clip(&format!("{}: {}", event.source, event.title), 90)).grow(),
+                ))
+                .gap(10.0)
+                .min_h(16.0)
+            })
+            .collect();
+        rows.push(row((
+            micro("RECENT".to_owned()).w(Length::Fraction(LABEL_W)),
+            col(event_rows).gap(0.0).grow(),
+        )).min_h(16.0));
     }
     Some(style::plate((style::section_rule("HEALTH", None), col(rows).gap(3.0))).gap(6.0))
 }
@@ -146,6 +189,22 @@ fn clock(unix: u64) -> String {
     format!("{:02}:{:02} UTC", minutes / 60, minutes % 60)
 }
 
+/// A problem's evidence pairs when its row is open, none when it is shut.
+fn shown_evidence(evidence: &[(String, String)], open: bool) -> &[(String, String)] {
+    if open { evidence } else { &[] }
+}
+
+/// `text` cut to at most `max` characters, the last one an ellipsis when cut.
+/// Counts characters, not bytes: event messages are not always ASCII.
+fn clip(text: &str, max: usize) -> String {
+    if text.chars().count() <= max {
+        return text.to_owned();
+    }
+    let mut clipped: String = text.chars().take(max.saturating_sub(1)).collect();
+    clipped.push('…');
+    clipped
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -156,5 +215,23 @@ mod tests {
         assert_eq!(rate(48_000), "48 KB/s");
         assert_eq!(rate(2_500_000), "2.5 MB/s");
         assert_eq!(clock(1_791_001_862), "04:31 UTC");
+    }
+
+    #[test]
+    fn evidence_is_shown_only_for_an_open_problem() {
+        let evidence = vec![("code".to_owned(), "42".to_owned()), ("message".to_owned(), "broke".to_owned())];
+        assert!(shown_evidence(&evidence, false).is_empty());
+        assert_eq!(shown_evidence(&evidence, true), evidence.as_slice());
+    }
+
+    #[test]
+    fn clipping_counts_characters_not_bytes() {
+        assert_eq!(clip("short", 80), "short");
+        assert_eq!(clip("abcdef", 4), "abc…");
+        let localized = "Die Namensauflösung für den Namen ist abgelaufen ".repeat(3);
+        let clipped = clip(&localized, 90);
+        assert_eq!(clipped.chars().count(), 90);
+        assert!(clipped.ends_with('…'));
+        assert_eq!(clip("ééééé", 3), "éé…");
     }
 }
