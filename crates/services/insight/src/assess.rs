@@ -115,7 +115,7 @@ pub struct Assessor {
     tracks: BTreeMap<String, Track>,
     disk_trend: HashMap<String, VecDeque<(u64, u64)>>,
     private_trend: HashMap<u32, VecDeque<(u64, u64)>>,
-    dns_dropped: Option<(u64, u64)>,
+    dns_dropped: Option<(u64, u64, u64)>,
 }
 
 impl Assessor {
@@ -357,10 +357,22 @@ impl Assessor {
             }
         }
         let counter = |key: &str| stats.get("counters").and_then(|c| c.get(key)).and_then(Json::as_u64).unwrap_or(0);
-        let losses = (counter("dropped"), counter("recv_errors"));
+        let losses = (counter("dropped"), counter("recv_errors"), counter("loops"));
         if let Some(before) = self.dns_dropped.replace(losses) {
             let dropped = losses.0.saturating_sub(before.0);
             let errors = losses.1.saturating_sub(before.1);
+            let loops = losses.2.saturating_sub(before.2);
+            if loops > 0 {
+                found.push(Finding {
+                    id: "dns_loop".into(),
+                    family: Family::Dns,
+                    raise_after: 1,
+                    title: format!(
+                        "An upstream resolver sent {loops} of our own forwarded questions back to us: it forwards to this machine"
+                    ),
+                    evidence: Json::object([("loops", num(loops)), ("upstreams", stats.get("upstreams").cloned().unwrap_or(Json::Null))]),
+                });
+            }
             if dropped + errors > 0 {
                 found.push(Finding {
                     id: "dns_dropping".into(),
