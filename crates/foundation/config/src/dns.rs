@@ -72,6 +72,25 @@ pub struct Dns {
     /// The zones served. A single-domain deployment writes one, often bare.
     #[serde(default, rename = "zone")]
     pub zones: Vec<ZoneConfig>,
+
+    /// Failover resolvers for LAN peers' names outside the served zones, each
+    /// "ip:port". The machine's own system resolver is always tried first; these
+    /// follow in order, each given ~700 ms within a 2 s budget, and an upstream
+    /// answering SERVFAIL or REFUSED counts as failed. Defaults to
+    /// `["1.1.1.1:53", "9.9.9.9:53"]` (Cloudflare and Quad9).
+    #[serde(default = "default_upstreams")]
+    pub upstreams: Vec<String>,
+
+    /// Whether the daemon binds and serves DNS on `:53`. Defaults to true.
+    ///
+    /// When false, the daemon does not bind `:53` at all and instead leaves DNS
+    /// serving to a separate `selfhost lan-dns` process. This enables zero-drop
+    /// handoff: the lan-dns process binds and proves it answers queries before
+    /// the daemon's old instance exits, ensuring uninterrupted DNS service across
+    /// deployments. Keep this true for most deployments; set false only when
+    /// using out-of-process DNS through a scheduled task.
+    #[serde(default = "default_true")]
+    pub serve_in_daemon: bool,
 }
 
 impl Dns {
@@ -109,6 +128,15 @@ impl Dns {
 
         for (i, zone) in self.zones.iter().enumerate() {
             zone.check(&format!("{at}.zone[{i}]"), problems);
+        }
+
+        for (i, upstream) in self.upstreams.iter().enumerate() {
+            if upstream.parse::<SocketAddr>().is_err() {
+                problems.push(Problem {
+                    field: format!("{at}.upstreams[{i}]"),
+                    message: format!("\"{}\" must be a socket address like 1.1.1.1:53", upstream),
+                });
+            }
         }
     }
 }
@@ -392,6 +420,10 @@ pub fn registered_domains(config: &crate::Config) -> BTreeSet<String> {
 
 fn default_dns_bind() -> String {
     "0.0.0.0:53".to_owned()
+}
+
+fn default_upstreams() -> Vec<String> {
+    vec!["1.1.1.1:53".to_owned(), "9.9.9.9:53".to_owned()]
 }
 
 fn default_ttl() -> u32 {
@@ -711,5 +743,81 @@ domain = "example.com"
         let written = toml::to_string(&config).expect("serialise");
         let read = Config::parse(&written).expect("re-parse");
         assert_eq!(read.dns.unwrap().zones[0].records[0].name, "www");
+    }
+
+    #[test]
+    fn upstreams_defaults_to_cloudflare_and_quad9() {
+        let text = config_with_dns(
+            r#"
+[dns]
+
+[[dns.zone]]
+domain = "example.com"
+"#,
+        );
+        let config = Config::parse(&text).expect("valid");
+        let dns = config.dns.expect("dns present");
+        assert_eq!(dns.upstreams, vec!["1.1.1.1:53".to_owned(), "9.9.9.9:53".to_owned()]);
+    }
+
+    #[test]
+    fn upstreams_can_be_overridden() {
+        let text = config_with_dns(
+            r#"
+[dns]
+upstreams = ["8.8.8.8:53", "8.8.4.4:53"]
+
+[[dns.zone]]
+domain = "example.com"
+"#,
+        );
+        let config = Config::parse(&text).expect("valid");
+        let dns = config.dns.expect("dns present");
+        assert_eq!(dns.upstreams, vec!["8.8.8.8:53".to_owned(), "8.8.4.4:53".to_owned()]);
+    }
+
+    #[test]
+    fn rejects_a_malformed_upstream_socket_address() {
+        let problems = problems_of(&config_with_dns(
+            r#"
+[dns]
+upstreams = ["not-an-address"]
+
+[[dns.zone]]
+domain = "example.com"
+"#,
+        ));
+        assert!(problems.iter().any(|p| p.field == "dns.upstreams[0]"), "{problems:?}");
+    }
+
+    #[test]
+    fn serve_in_daemon_defaults_to_true() {
+        let text = config_with_dns(
+            r#"
+[dns]
+
+[[dns.zone]]
+domain = "example.com"
+"#,
+        );
+        let config = Config::parse(&text).expect("valid");
+        let dns = config.dns.expect("dns present");
+        assert!(dns.serve_in_daemon, "serve_in_daemon should default to true");
+    }
+
+    #[test]
+    fn serve_in_daemon_can_be_set_to_false() {
+        let text = config_with_dns(
+            r#"
+[dns]
+serve_in_daemon = false
+
+[[dns.zone]]
+domain = "example.com"
+"#,
+        );
+        let config = Config::parse(&text).expect("valid");
+        let dns = config.dns.expect("dns present");
+        assert!(!dns.serve_in_daemon, "serve_in_daemon should be settable to false");
     }
 }

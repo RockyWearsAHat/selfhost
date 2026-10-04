@@ -702,6 +702,7 @@ dependencies = [
  "selfhost-supervisor",
  "selfhost-vpn",
  "selfhost-ws",
+ "socket2",
  "tokio",
  "tokio-rustls",
  "webpki-roots",
@@ -748,6 +749,7 @@ version = "0.1.0"
 dependencies = [
  "selfhost-config",
  "selfhost-igd",
+ "selfhost-json",
  "tokio",
 ]
 

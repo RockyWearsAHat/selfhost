@@ -274,10 +274,12 @@ pub async fn probe(component: Component, config: &Config, project_dir: &Path) ->
 /// section, production registration — are all testable on a machine that has
 /// none of them.
 pub fn dns_duty(config: &Config, separate_registration: Option<&str>) -> DnsDuty {
-    if config.dns.is_some() {
-        return DnsDuty::Declared(
-            "this deployment has a [dns] section, so the daemon serves :53 itself".to_owned(),
-        );
+    if let Some(dns) = &config.dns {
+        return DnsDuty::Declared(if dns.serve_in_daemon {
+            "this deployment has a [dns] section, so the daemon serves :53 itself".to_owned()
+        } else {
+            "[dns] serve_in_daemon = false: the standalone `selfhost lan-dns` serves :53".to_owned()
+        });
     }
     match separate_registration {
         Some(name) => DnsDuty::Declared(format!(
@@ -1133,6 +1135,8 @@ mod tests {
             dynamic_ip: false,
             lan_ip: None,
             zones: Vec::new(),
+            upstreams: Vec::new(),
+            serve_in_daemon: true,
         });
         assert!(matches!(dns_duty(&with_section, None), DnsDuty::Declared(_)));
 
@@ -1179,6 +1183,8 @@ mod tests {
             dynamic_ip: false,
             lan_ip: None,
             zones: Vec::new(),
+            upstreams: Vec::new(),
+            serve_in_daemon: true,
         });
 
         let probe = probe_dns_declared(&config, None).await;
@@ -1222,6 +1228,8 @@ mod tests {
             dynamic_ip: false,
             lan_ip: None,
             zones: Vec::new(),
+            upstreams: Vec::new(),
+            serve_in_daemon: true,
         });
         let probe = probe_dns_declared(&config, None).await;
         assert_eq!(probe.serving, Serving::Untestable, "{}", probe.detail);

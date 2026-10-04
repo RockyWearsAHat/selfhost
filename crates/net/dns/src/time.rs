@@ -25,7 +25,7 @@ fn format_stamp(secs: u64) -> String {
 }
 
 /// The current moment as a compact UTC log stamp — see [`format_stamp`].
-pub(crate) fn stamp() -> String {
+pub fn stamp() -> String {
     let secs = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
     format_stamp(secs)
 }

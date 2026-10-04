@@ -1153,6 +1153,8 @@ mod tests {
             dynamic_ip: false,
             lan_ip: None,
             zones: Vec::new(),
+            upstreams: Vec::new(),
+            serve_in_daemon: true,
         });
 
         let directory = scratch(line!());
@@ -1190,6 +1192,8 @@ mod tests {
             dynamic_ip: false,
             lan_ip: None,
             zones: Vec::new(),
+            upstreams: Vec::new(),
+            serve_in_daemon: true,
         });
         assert!(matches!(repair_for(Component::Dns, &config), Repair::Unavailable { .. }));
     }
