@@ -52,7 +52,6 @@ use crate::arguments::value_of;
 use selfhost_admin::{Api, Fleet, Store, Token};
 use selfhost_config::{AcmeEnvironment, Config};
 use selfhost_dns::Resolver;
-use serde_json;
 use selfhost_dns::authority::{Authority, DnsError};
 use selfhost_supervisor::Supervisor;
 use selfhost_proxy::{
@@ -1649,6 +1648,11 @@ async fn serve_everything(
         }
     });
 
+    // Watches the machine: samples, judges and records what `/api/insight`
+    // serves. Its own task, every OS read on the blocking pool, so a slow read
+    // or a panic in it can never hold up a listener or :53.
+    tokio::spawn(selfhost_insight::run(data_dir.clone()));
+
     let mut updated_to: Option<String> = None;
     let outcome = tokio::select! {
         result = selfhost_admin::serve(listener, api) => {
@@ -1678,10 +1682,6 @@ async fn serve_everything(
             project_dir.clone(),
             data_dir.clone(),
         ) => Ok(()),
-        // Samples machine metrics (CPU, memory, disk, network) every 10 seconds
-        // and stores them in the insight ring. Errors are logged and sampling
-        // continues; never returns, so it occupies an arm without firing.
-        _ = sample_metrics_forever(data_dir.clone()) => Ok(()),
         // Serves :53 for the configured zones. When DNS is not configured this
         // future pends forever, so the arm exists without ever firing. A bind
         // failure returns here and stops the daemon (see the note above).
@@ -1885,103 +1885,6 @@ async fn track_wan_ip_if_enabled(dns: Option<Authority>, config: &Config) {
         selfhost_dns::updater::DEFAULT_INTERVAL,
     )
     .await;
-}
-
-/// Samples machine metrics every 10 seconds and stores them in the insight ring.
-///
-/// Logs errors and continues sampling; never returns. This arm occupies a slot
-/// in the daemon's tokio::select! so the daemon never stops sampling the machine
-/// even if other subsystems are down or slow.
-async fn sample_metrics_forever(data_dir: PathBuf) {
-    let mut sample_interval = tokio::time::interval(Duration::from_secs(10));
-    let mut process_interval = tokio::time::interval(Duration::from_secs(30));
-    let mut events_interval = tokio::time::interval(Duration::from_secs(300)); // 5 minutes
-
-    loop {
-        tokio::select! {
-            _ = sample_interval.tick() => {
-                // Sample the machine's current state every 10 seconds
-                match selfhost_insight::sample() {
-                    Ok(sample) => {
-                        // Append the sample to the ring
-                        if let Err(e) = selfhost_insight::append_sample(&data_dir, &sample).await {
-                            eprintln!("failed to append insight sample: {e}");
-                        }
-                    }
-                    Err(e) => {
-                        eprintln!("failed to sample machine metrics: {e}");
-                    }
-                }
-            }
-            _ = process_interval.tick() => {
-                // Sample processes every 30 seconds
-                match selfhost_insight::sample_processes() {
-                    Ok(processes) => {
-                        // Store process samples as events
-                        let now = std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .unwrap_or_default()
-                            .as_secs();
-
-                        for process in processes {
-                            let event = selfhost_insight::Event {
-                                at_unix: now,
-                                kind: "process".to_string(),
-                                source: "sampler".to_string(),
-                                title: format!("{}: {:.2} cores, {} MB", process.name, process.cpu_cores, process.working_set_mb),
-                                detail: format!("pid={}", process.pid),
-                                evidence: serde_json::json!({
-                                    "pid": process.pid,
-                                    "name": process.name,
-                                    "cpu_cores": process.cpu_cores,
-                                    "working_set_mb": process.working_set_mb,
-                                }),
-                            };
-                            if let Err(e) = selfhost_insight::append_event(&data_dir, &event).await {
-                                eprintln!("failed to append process event: {e}");
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        eprintln!("failed to sample processes: {e}");
-                    }
-                }
-            }
-            _ = events_interval.tick() => {
-                // Read Windows events every 5 minutes
-                match selfhost_insight::read_windows_events() {
-                    Ok(windows_events) => {
-                        // Store Windows events in the timeline
-                        let now = std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .unwrap_or_default()
-                            .as_secs();
-
-                        for we in windows_events {
-                            let event = selfhost_insight::Event {
-                                at_unix: we.at_unix.max(now), // Use event time or now if invalid
-                                kind: "windows-event".to_string(),
-                                source: we.provider.clone(),
-                                title: we.message.clone(),
-                                detail: format!("Event ID: {}", we.id),
-                                evidence: serde_json::json!({
-                                    "provider": we.provider,
-                                    "id": we.id,
-                                    "message": we.message,
-                                }),
-                            };
-                            if let Err(e) = selfhost_insight::append_event(&data_dir, &event).await {
-                                eprintln!("failed to append windows event: {e}");
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        eprintln!("failed to read windows events: {e}");
-                    }
-                }
-            }
-        }
-    }
 }
 
 /// Turns a DNS bind failure into a message that says what to do about it.
