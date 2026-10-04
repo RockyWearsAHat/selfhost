@@ -63,6 +63,10 @@ pub(crate) struct ProcessRaw {
     pub working_set: u64,
     pub private: u64,
     pub handles: u32,
+    /// Bytes read and written since the process started, through any I/O
+    /// (files, sockets, devices): the OS does not split out disk alone.
+    pub io_read: u64,
+    pub io_write: u64,
 }
 
 /// Whether a process is one of ours, whose handles are worth reading.

@@ -69,8 +69,26 @@ pub(crate) fn processes() -> Vec<ProcessRaw> {
     };
     entries
         .filter_map(|entry| entry.ok()?.file_name().to_str()?.parse::<u32>().ok())
-        .filter_map(|pid| parse_process(pid, &fs::read_to_string(format!("/proc/{pid}/stat")).ok()?))
+        .filter_map(|pid| {
+            let mut process = parse_process(pid, &fs::read_to_string(format!("/proc/{pid}/stat")).ok()?)?;
+            // Another user's `io` is unreadable without privilege: zero, not skipped.
+            if let Ok(io) = fs::read_to_string(format!("/proc/{pid}/io")) {
+                (process.io_read, process.io_write) = parse_io(&io);
+            }
+            Some(process)
+        })
         .collect()
+}
+
+/// `rchar` and `wchar`: bytes through any read or write call, the same
+/// meaning as Windows' transfer counts.
+fn parse_io(io: &str) -> (u64, u64) {
+    let field = |name: &str| {
+        io.lines()
+            .find_map(|line| line.strip_prefix(name)?.strip_prefix(':')?.trim().parse().ok())
+            .unwrap_or(0)
+    };
+    (field("rchar"), field("wchar"))
 }
 
 fn parse_process(pid: u32, stat: &str) -> Option<ProcessRaw> {
@@ -88,6 +106,8 @@ fn parse_process(pid: u32, stat: &str) -> Option<ProcessRaw> {
         working_set: rss_pages * 4096,
         private: rss_pages * 4096,
         handles: 0,
+        io_read: 0,
+        io_write: 0,
     })
 }
 
@@ -115,5 +135,12 @@ mod tests {
         assert_eq!(process.cpu_secs, 5.0);
         assert_eq!(process.start, 5000);
         assert_eq!(process.working_set, 25 * 4096);
+    }
+
+    #[test]
+    fn io_reads_any_read_and_write_bytes() {
+        let io = "rchar: 4096\nwchar: 1024\nsyscr: 3\nsyscw: 1\nread_bytes: 0\nwrite_bytes: 0\n";
+        assert_eq!(parse_io(io), (4096, 1024));
+        assert_eq!(parse_io(""), (0, 0));
     }
 }
