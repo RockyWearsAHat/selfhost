@@ -127,8 +127,8 @@ type Tool = (&'static str, &'static str, &'static [Param]);
 /// services and deploys (`service.control`, with reads under `console.read`),
 /// the deployment's own self-update, `whoami` so an agent can see exactly
 /// which of these its token will open, and — owner-only, the same as the
-/// routes behind them — the registry (`people_*`), the deploy record and
-/// System health (`deploys_*`, `system_health`), the VPN roster
+/// routes behind them — the registry (`people_*`), the deploy record,
+/// System health and insight (`deploys_*`, `system_health`, `insight_*`), the VPN roster
 /// (`vpn_peers_list`) and the firewall (`firewall_show`). This is "STEP 4 —
 /// control parity" from `index.dx`'s goal 4: every mutating
 /// admin route reachable from a keyboard on the box is reachable here too,
@@ -377,6 +377,44 @@ const TOOLS: &[Tool] = &[
         &[],
     ),
     (
+        "insight_now",
+        "Call this FIRST when anything seems wrong, or to prove things are fine: what is wrong on the \
+         machine right now, with evidence (open problems, the newest CPU/memory/disk/network sample, \
+         the top processes, and DNS over the last 5 minutes).",
+        &[],
+    ),
+    (
+        "insight_metrics",
+        "Machine samples (CPU, memory, commit, disks, network; one per 10 s, thinned to at most 720) \
+         over a window. Default: the last hour. Kept for 7 days.",
+        &[
+            ("since", "Start of the range as a unix timestamp (seconds); optional.", false, Kind::Count),
+            ("until", "End of the range as a unix timestamp (seconds); optional.", false, Kind::Count),
+        ],
+    ),
+    (
+        "insight_events",
+        "The machine timeline over a window, oldest first: problems raised and cleared (warning, \
+         cleared), self-repairs (repair) and Windows System/Application errors (windows). Default: \
+         the last day. Kept for 30 days.",
+        &[
+            ("since", "Start of the range as a unix timestamp (seconds); optional.", false, Kind::Count),
+            ("until", "End of the range as a unix timestamp (seconds); optional.", false, Kind::Count),
+        ],
+    ),
+    (
+        "insight_dns",
+        "The LAN DNS resolver's own report: counters (answered, cached, stale, SERVFAIL, dropped, \
+         loops), each upstream's latency and failures, and per-minute history.",
+        &[],
+    ),
+    (
+        "insight_processes",
+        "The newest process ranking (once a minute): the busiest and largest processes plus every \
+         selfhost process, with CPU in cores, memory and handles.",
+        &[],
+    ),
+    (
         "vpn_peers_list",
         "List every peer this deployment's VPN relays know about, static and dynamically enrolled \
          alike, with which Person (if any) each is bound to.",
@@ -580,8 +618,9 @@ fn initialize_result() -> Json {
 const SERVER_INSTRUCTIONS: &str = "\
 This server manages services and sites on one selfhost deployment. Typical workflow:\n\
 \n\
-1. Something looks broken? Call services_show and services_logs BEFORE touching SSH \
-or any credential tooling (gh auth, ssh-add, etc.) — most failures are visible here \
+1. Something looks broken? Call insight_now first to see what is wrong right now with \
+evidence, then services_show and services_logs for more detail. Never touch SSH or any \
+credential tooling (gh auth, ssh-add, etc.) — most failures are visible in these tools \
 (a build step's error, a service left stopped) and none of them are fixed by \
 re-authenticating anything. Never SSH directly to a box's port 22; a box's SSH is only \
 reachable through its own Secure-VPN tunnel, and a direct attempt will simply time out.\n\
@@ -1170,6 +1209,23 @@ async fn call_tool(client: &RemoteClient, name: &str, arguments: &Json) -> Resul
             let answer = client.get("/api/system").await?;
             Ok(answer.to_text())
         }
+        "insight_now" => {
+            let answer = client.get("/api/insight/now").await?;
+            Ok(answer.to_text())
+        }
+        "insight_metrics" | "insight_events" => {
+            let route = if name == "insight_metrics" { "/api/insight/metrics" } else { "/api/insight/events" };
+            let answer = client.get(&insight_window_path(route, arguments)?).await?;
+            Ok(answer.to_text())
+        }
+        "insight_dns" => {
+            let answer = client.get("/api/insight/dns").await?;
+            Ok(answer.to_text())
+        }
+        "insight_processes" => {
+            let answer = client.get("/api/insight/processes").await?;
+            Ok(answer.to_text())
+        }
         "vpn_peers_list" => {
             let answer = client.get("/api/vpn/peers").await?;
             Ok(answer.to_text())
@@ -1394,6 +1450,16 @@ fn decode_base64(text: &str) -> Result<Vec<u8>, String> {
         _ => return Err("\"content\" is not valid base64".to_owned()),
     }
     Ok(out)
+}
+
+/// An insight route with the window the agent asked for, if any:
+/// `/api/insight/metrics?since=1&until=2`.
+fn insight_window_path(route: &str, arguments: &Json) -> Result<String, String> {
+    let bounds: Vec<String> = [("since", count(arguments, "since")?), ("until", count(arguments, "until")?)]
+        .into_iter()
+        .filter_map(|(name, value)| Some(format!("{name}={}", value?)))
+        .collect();
+    Ok(if bounds.is_empty() { route.to_owned() } else { format!("{route}?{}", bounds.join("&")) })
 }
 
 #[cfg(test)]
@@ -1660,5 +1726,27 @@ mod tests {
         // Missing "name" is refused before any network call, same as every
         // other name-bearing tool.
         assert_eq!(result.get("isError").and_then(Json::as_bool), Some(true));
+    }
+
+    #[test]
+    fn all_insight_tools_appear_in_tools_list() {
+        let listing = tools_list_result();
+        let tools = listing.get("tools").and_then(Json::as_array).expect("a tools array");
+        let names: Vec<&str> =
+            tools.iter().filter_map(|tool| tool.get("name").and_then(Json::as_str)).collect();
+        assert!(names.contains(&"insight_now"), "{names:?}");
+        assert!(names.contains(&"insight_metrics"), "{names:?}");
+        assert!(names.contains(&"insight_events"), "{names:?}");
+        assert!(names.contains(&"insight_dns"), "{names:?}");
+        assert!(names.contains(&"insight_processes"), "{names:?}");
+    }
+
+    #[test]
+    fn insight_windows_carry_only_the_bounds_given() {
+        let window = |arguments: &str| insight_window_path("/api/insight/metrics", &selfhost_json::parse(arguments).unwrap());
+        assert_eq!(window(r#"{"since":1,"until":2}"#).unwrap(), "/api/insight/metrics?since=1&until=2");
+        assert_eq!(window(r#"{"until":2}"#).unwrap(), "/api/insight/metrics?until=2");
+        assert_eq!(window("{}").unwrap(), "/api/insight/metrics");
+        assert!(window(r#"{"since":"yesterday"}"#).is_err());
     }
 }
