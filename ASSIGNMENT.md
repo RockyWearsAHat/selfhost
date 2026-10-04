@@ -1,5 +1,5 @@
 # Self-Host Insight: see the machine, fix it before it breaks
-Version 2 · Last amended 2026-10-03
+Version 3 · Last amended 2026-10-04
 
 > **This assignment is the source of truth for this project.** Read it in full before any work.
 > Where code, docs or notes conflict with it, the assignment wins: bring the code into line.
@@ -35,7 +35,7 @@ Self-Host runs on ALEX-DESKTOP (Windows, 192.168.1.8), the owner's everyday PC a
 - Branch `insight/monitor-ui-dns`, off `redesign/round-2`.
 - Rule 10: runs healthy on ALEX-DESKTOP from a side folder before `main`. Only the lead agent authorizes the merge (= deploy); worker agents never deploy or touch the live install.
 - Numbers come from run output, never agent prose; report MET/NOT MET with evidence location.
-- **The house internet must never drop, not even for a second** (owner, 2026-10-03). DNS outages take down every device, the TV and the agents themselves. During development, nothing on ALEX-DESKTOP is restarted, stopped or rebound; side-folder runs never bind :53. Any change that touches the live DNS path ships only through a zero-drop handoff: the new resolver binds and proves it answers real queries before the old one exits, with automatic rollback if the proof fails. Old code and processes are deleted only after the replacement is proven live.
+- **The house internet must never drop, not even for a second** (owner, 2026-10-03). DNS outages take down every device, the TV and the agents themselves. During development, nothing on ALEX-DESKTOP is restarted, stopped or rebound; side-folder runs never bind :53. Any change that touches the live DNS path ships only through a zero-drop handoff: the new resolver binds and proves it answers real queries before the old one exits, with automatic rollback if the proof fails. One exception, approved by the owner: the single first move of :53 from the old daemon to `selfhost lan-dns`, whose socket Windows will not let a second server share (measured cost: one query, about 210 ms). Old code and processes are deleted only after the replacement is proven live.
 
 ## 4. Non-Goals
 - No paging, email or push alerts; no automatic remediation beyond what exists.
@@ -65,3 +65,4 @@ The branch is merged and live on ALEX-DESKTOP, `index.dx` gates are green, and t
 ## Amendments
 - v1 (2026-10-03): initial assignment.
 - v2 (2026-10-03): owner added the never-drop-the-internet constraint (§3).
+- v3 (2026-10-04): owner approved a one-time exception in §3 for the first move of :53 off the old daemon.
