@@ -447,7 +447,9 @@ fn answer(raw: &[u8]) -> Result<Json, String> {
         .as_ref()
         .and_then(|value| value.get("error"))
         .and_then(Json::as_str)
-        .unwrap_or(status.reason());
+        .map(str::to_owned)
+        .or_else(|| problems_said(value.as_ref()))
+        .unwrap_or_else(|| status.reason().to_owned());
     Err(match status.0 {
         401 | 403 => format!(
             "{} {said} — the far side refused this token. Check SELFHOST_TOKEN (or ~/{TOKEN_FILE}) \
@@ -466,6 +468,33 @@ fn answer(raw: &[u8]) -> Result<Json, String> {
         404 => format!("{} {said}", status.0),
         _ => format!("{} {said}", status.0),
     })
+}
+
+/// Renders a validation refusal's `{"problems": [{"field", "message"}, …]}`
+/// body as one line per field, or `None` when the body carries no such array.
+///
+/// A 422 never sets `"error"` — it sets `"problems"` instead (see
+/// `crates/app/admin/src/lib.rs`'s `install`) — so without this, `answer`
+/// fell through to `status.reason()`, which this crate's `Status` table does
+/// not name for 422 and answers "Unknown" for. The daemon had already said
+/// exactly which field was wrong and why; this is what stopped that from
+/// being thrown away between the admin API and the operator.
+fn problems_said(value: Option<&Json>) -> Option<String> {
+    let problems = value?.get("problems")?.as_array()?;
+    if problems.is_empty() {
+        return None;
+    }
+    Some(
+        problems
+            .iter()
+            .filter_map(|problem| {
+                let field = problem.get("field").and_then(Json::as_str)?;
+                let message = problem.get("message").and_then(Json::as_str)?;
+                Some(format!("{field}: {message}"))
+            })
+            .collect::<Vec<_>>()
+            .join("; "),
+    )
 }
 
 /// What a `--remote` run has been asked to do.
@@ -833,5 +862,43 @@ mod tests {
         let missing = b"HTTP/1.1 404 Not Found\r\nContent-Length: 2\r\n\r\n{}";
         let error = answer(missing).expect_err("a 404 is an error");
         assert!(error.contains("404") && error.contains("route"), "{error}");
+    }
+
+    #[test]
+    fn a_422_names_the_rejected_field_and_reason_instead_of_saying_unknown() {
+        // The admin API's `install` never sets "error" on a validation refusal —
+        // it sets "problems" (crates/app/admin/src/lib.rs) — and 422 has no entry
+        // in `Status::reason`'s table, so before this fix `said` fell through to
+        // "Unknown" and the field-named explanation the daemon sent was thrown
+        // away on the way to the operator.
+        let body = br#"{"problems":[{"field":"service.git.repository","message":"\"file:///P:/onebit/git/onebit-core.git\" does not use a transport this daemon will run"}]}"#;
+        let head = format!("HTTP/1.1 422 Unprocessable Entity\r\nContent-Length: {}\r\n\r\n", body.len());
+        let response = [head.as_bytes(), body].concat();
+
+        let error = answer(&response).expect_err("a 422 is an error");
+        assert!(!error.contains("Unknown"), "{error}");
+        assert!(error.contains("service.git.repository"), "{error}");
+        assert!(error.contains("does not use a transport"), "{error}");
+    }
+
+    #[test]
+    fn a_422_with_more_than_one_problem_names_every_field() {
+        let body = br#"{"problems":[
+            {"field":"service.git.repository","message":"name the repository to pull from"},
+            {"field":"service.git.branch","message":"name the branch to follow"}
+        ]}"#;
+        let head = format!("HTTP/1.1 422 Unprocessable Entity\r\nContent-Length: {}\r\n\r\n", body.len());
+        let response = [head.as_bytes(), body.as_slice()].concat();
+
+        let error = answer(&response).expect_err("a 422 is an error");
+        assert!(error.contains("service.git.repository"), "{error}");
+        assert!(error.contains("service.git.branch"), "{error}");
+    }
+
+    #[test]
+    fn a_refusal_with_neither_error_nor_problems_still_falls_back_to_the_reason() {
+        let unauthorised = b"HTTP/1.1 401 Unauthorized\r\nContent-Length: 2\r\n\r\n{}";
+        let error = answer(unauthorised).expect_err("a 401 is an error");
+        assert!(error.contains("401") && error.contains("Unauthorized"), "{error}");
     }
 }
