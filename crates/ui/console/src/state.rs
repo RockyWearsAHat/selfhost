@@ -124,10 +124,50 @@ impl SystemPart {
 impl InsightProblem {
     /// Reads one problem from the wire.
     pub fn from_json(value: &Json) -> Option<Self> {
+        let evidence = match value.get("evidence") {
+            Some(Json::Object(map)) => map
+                .iter()
+                .map(|(k, v)| {
+                    let v_str = match v {
+                        Json::String(s) => s.clone(),
+                        Json::Number(n) => n.to_string(),
+                        other => other.to_text(),
+                    };
+                    (k.clone(), v_str)
+                })
+                .collect(),
+            _ => Vec::new(),
+        };
         Some(Self {
             id: value.get("id")?.as_str()?.to_owned(),
             title: value.get("title")?.as_str()?.to_owned(),
             since_unix: value.get("since_unix")?.as_u64()?,
+            evidence,
+        })
+    }
+}
+
+/// One machine event reported by the insight service.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InsightEvent {
+    /// Unix seconds when the event occurred.
+    pub at_unix: u64,
+    /// The kind of event: `warning`, `cleared`, `repair`, or `windows`.
+    pub kind: String,
+    /// The source of the event.
+    pub source: String,
+    /// A title or description of the event.
+    pub title: String,
+}
+
+impl InsightEvent {
+    /// Reads one event from the wire.
+    pub fn from_json(value: &Json) -> Option<Self> {
+        Some(Self {
+            at_unix: value.get("at_unix")?.as_u64()?,
+            kind: value.get("kind")?.as_str()?.to_owned(),
+            source: value.get("source")?.as_str()?.to_owned(),
+            title: value.get("title")?.as_str()?.to_owned(),
         })
     }
 }
@@ -230,6 +270,8 @@ pub struct InsightProblem {
     pub title: String,
     /// Unix seconds when it started.
     pub since_unix: u64,
+    /// Supporting evidence as key-value pairs.
+    pub evidence: Vec<(String, String)>,
 }
 
 /// What `GET /api/insight/now` says about the machine.
@@ -891,6 +933,9 @@ pub struct Snapshot {
     /// The last hour of samples behind the HEALTH sparklines, oldest first,
     /// replaced whole by each `GET /api/insight/metrics`.
     pub history: Vec<HistorySample>,
+    /// Recent machine events from `GET /api/insight/events`, newest first,
+    /// capped at 8.
+    pub events: Vec<InsightEvent>,
     /// Which screen is open, and so what the poller fetches.
     pub screen: Screen,
     /// Where the FILES plate is looking, and what it found.
@@ -1295,6 +1340,42 @@ mod tests {
             vec![InsightProcess { name: "mongodb".into(), pid: 7, cpu_cores: 1.5, working_set_mb: 2048 }]
         );
         assert_eq!(insight.dns, Some(DnsWindow { queries: 120, failures: 2, slow: 1 }));
+    }
+
+    #[test]
+    fn evidence_is_parsed_from_problem_objects() {
+        let value = selfhost_json::parse(
+            r#"{"id":"test","title":"Problem","since_unix":100,"evidence":{"msg":"error text","code":42,"nested":{"inner":"val"}}}"#,
+        )
+        .expect("legal JSON");
+        let problem = InsightProblem::from_json(&value).expect("a problem");
+        assert_eq!(problem.id, "test");
+        assert_eq!(problem.evidence.len(), 3);
+        let evidence: std::collections::BTreeMap<_, _> = problem.evidence.iter().cloned().collect();
+        assert_eq!(evidence.get("msg").map(|s| s.as_str()), Some("error text"));
+        assert_eq!(evidence.get("code").map(|s| s.as_str()), Some("42"));
+        assert!(evidence.contains_key("nested"));
+    }
+
+    #[test]
+    fn missing_evidence_is_an_empty_list() {
+        let value = selfhost_json::parse(r#"{"id":"test","title":"Problem","since_unix":100}"#)
+            .expect("legal JSON");
+        let problem = InsightProblem::from_json(&value).expect("a problem");
+        assert!(problem.evidence.is_empty());
+    }
+
+    #[test]
+    fn insight_event_is_read_from_the_wire() {
+        let value = selfhost_json::parse(
+            r#"{"at_unix":1000,"kind":"warning","source":"disk","title":"Disk usage high"}"#,
+        )
+        .expect("legal JSON");
+        let event = InsightEvent::from_json(&value).expect("an event");
+        assert_eq!(event.at_unix, 1000);
+        assert_eq!(event.kind, "warning");
+        assert_eq!(event.source, "disk");
+        assert_eq!(event.title, "Disk usage high");
     }
 
     #[test]

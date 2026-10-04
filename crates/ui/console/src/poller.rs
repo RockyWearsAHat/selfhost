@@ -21,7 +21,7 @@ use crate::client::{Client, ClientError};
 use crate::nas::{self, Listing, Share};
 use crate::registry::{Person, Trail};
 use crate::remote::{Agent, Node, Settings};
-use crate::state::{Command, FileAction, HistorySample, Insight, Link, LogLine, Screen, Snapshot, Viewer};
+use crate::state::{Command, FileAction, HistorySample, Insight, InsightEvent, Link, LogLine, Screen, Snapshot, Viewer};
 use crate::view::sites::Site;
 use selfhost_firewall::FirewallState;
 use selfhost_json::Json;
@@ -149,6 +149,7 @@ fn run(connect: impl Connect, shared: Arc<Mutex<Snapshot>>, running: Arc<AtomicB
                         if last_history.is_none_or(|at| at.elapsed() >= HISTORY_INTERVAL) {
                             last_history = Some(Instant::now());
                             refresh_history(ready, &shared);
+                            refresh_events(ready, &shared);
                         }
                     }
                     Screen::Files => {
@@ -739,6 +740,23 @@ fn refresh_history(client: &Client, shared: &Arc<Mutex<Snapshot>>) {
     let samples = value.get("samples").and_then(Json::as_array).unwrap_or_default();
     shared.lock().expect("the snapshot lock was poisoned").history =
         samples.iter().filter_map(HistorySample::from_json).collect();
+}
+
+/// Fetches recent machine events, keeping the newest 8, newest first: the daemon's
+/// answer is already sorted and this replaces what was there.
+fn refresh_events(client: &Client, shared: &Arc<Mutex<Snapshot>>) {
+    let Ok(value) = client.get("/api/insight/events") else {
+        return;
+    };
+    let mut events: Vec<InsightEvent> = value
+        .get("events")
+        .and_then(Json::as_array)
+        .unwrap_or_default()
+        .iter()
+        .filter_map(InsightEvent::from_json)
+        .collect();
+    events.truncate(8);
+    shared.lock().expect("the snapshot lock was poisoned").events = events;
 }
 
 /// Reads one log line from the wire.
