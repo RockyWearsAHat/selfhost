@@ -60,8 +60,14 @@ const DEFAULT_A_TTL: u32 = 3600;
 const MAX_IN_FLIGHT_FORWARDS: usize = 256;
 
 /// Timeout per upstream attempt. If an upstream doesn't answer within this time,
-/// the next upstream in the list is tried (hedged).
+/// the next upstream in the list is tried.
 const UPSTREAM_ATTEMPT_TIMEOUT: Duration = Duration::from_millis(700);
+
+/// How long an upstream caught sending this server's own forwards back to it
+/// is skipped. Long enough that a loop costs one SERVFAIL per quarantine, not
+/// one per query; short enough that a router fixed in its settings is used
+/// again without a restart.
+const LOOP_QUARANTINE: Duration = Duration::from_secs(600);
 
 /// Total budget for forwarding a query across all upstreams.
 const UPSTREAM_TOTAL_TIMEOUT: Duration = Duration::from_secs(2);
@@ -76,10 +82,9 @@ const UPSTREAM_TOTAL_TIMEOUT: Duration = Duration::from_secs(2);
 pub struct LanView {
     /// The address LAN peers should reach this machine at.
     pub lan_ip: Ipv4Addr,
-    /// The list of upstream resolvers. Forwarding tries them in order,
-    /// with hedging: if the first doesn't answer within ~700ms, the next is
-    /// tried while still listening to the first. An upstream that answers with
-    /// SERVFAIL or REFUSED counts as failed and the next is tried.
+    /// The upstream resolvers, tried one after another: each gets
+    /// [`UPSTREAM_ATTEMPT_TIMEOUT`] within [`UPSTREAM_TOTAL_TIMEOUT`] overall.
+    /// One that answers SERVFAIL or REFUSED counts as failed and the next is tried.
     pub upstreams: Vec<SocketAddr>,
 }
 
@@ -104,10 +109,14 @@ struct Inner {
     /// configured. Absent means every peer gets the public answers and nothing
     /// is ever forwarded.
     lan: OnceLock<LanView>,
-    /// Count of total receive/accept errors encountered. Incremented on every
-    /// Semaphore bounding in-flight forwards to MAX_IN_FLIGHT_FORWARDS.
-    /// When at capacity, new forwards answer SERVFAIL immediately.
+    /// Bounds in-flight forwards to [`MAX_IN_FLIGHT_FORWARDS`], and so the
+    /// sockets they hold; at capacity a forward answers SERVFAIL at once.
     forward_limit: Semaphore,
+    /// The questions being forwarded right now, by upstream address: see
+    /// [`Authority::loop_from`].
+    forwarding: std::sync::Mutex<Vec<InFlight>>,
+    /// Upstreams caught looping, and when they may be tried again.
+    quarantined: std::sync::Mutex<Vec<(SocketAddr, Instant)>>,
     /// Cache for upstream DNS answers on the LAN forward path.
     forward_cache: DnsCache,
     /// Telemetry: DNS query statistics and upstream tracking.
@@ -121,6 +130,8 @@ impl Inner {
             public_ip: Mutex::new(public_ip),
             lan: OnceLock::new(),
             forward_limit: Semaphore::new(MAX_IN_FLIGHT_FORWARDS),
+            forwarding: std::sync::Mutex::new(Vec::new()),
+            quarantined: std::sync::Mutex::new(Vec::new()),
             forward_cache: DnsCache::new(),
             telemetry: Telemetry::new(),
         }
@@ -429,11 +440,20 @@ impl Authority {
             // this box out as the network's one resolver. SERVFAIL when the
             // upstream gives nothing usable — honest, and the client retries.
             (None, Some(view)) => {
+                // Our own forward, come back from an upstream that forwards to
+                // us: answering it by forwarding again would spin until every
+                // permit is taken. Fail it now and stop asking that upstream.
+                if let Some(upstream) = self.loop_from(peer, &query, &view.upstreams) {
+                    self.quarantine(upstream);
+                    self.0.telemetry.record_loop();
+                    self.0.telemetry.record_servfail();
+                    return wire::encode_response(&query, ResponseCode::ServerFailure, plain_flags(), &[], &[], &[]);
+                }
                 // Try to acquire a permit for this forward. If the semaphore is at
                 // capacity, immediately answer SERVFAIL and count it as dropped.
                 match self.0.forward_limit.try_acquire() {
                     Ok(permit) => {
-                        let answer = forward(raw, &view.upstreams, over_tcp).await;
+                        let answer = self.forward(raw, &query, &view.upstreams, over_tcp).await;
                         drop(permit); // Release the semaphore permit.
 
                         // Cache successful answers; serve stale if all fail.
@@ -819,68 +839,150 @@ fn receive_backoff(consecutive: u32) -> Option<Duration> {
     (consecutive >= 32).then_some(Duration::from_millis(10))
 }
 
-/// Failover forwarding to a list of upstreams, in order.
-///
-/// Each upstream gets [`UPSTREAM_ATTEMPT_TIMEOUT`], or whatever is left of
-/// [`UPSTREAM_TOTAL_TIMEOUT`] if that is less; an upstream that times out,
-/// errors, or answers SERVFAIL/REFUSED hands the question to the next. The
-/// whole exchange stays under the total so the client gets an answer (or our
-/// SERVFAIL, or a stale answer) before its own retry fires and its port closes
-/// — a reply that arrives after that is what produced the ICMP unreachable
-/// behind `os error 10054` (insight lab F13). Attempts run one at a time on
-/// this task: nothing is spawned, so nothing outlives the answer, and the
-/// socket count is bounded by the in-flight semaphore alone.
-/// Returns `Some(answer)` on success, or `None` if every upstream failed.
-async fn forward(raw: &[u8], upstreams: &[SocketAddr], over_tcp: bool) -> Option<Vec<u8>> {
-    let start = Instant::now();
-    for upstream in upstreams {
-        let remaining = UPSTREAM_TOTAL_TIMEOUT.saturating_sub(start.elapsed());
-        if remaining.is_zero() {
-            break;
-        }
-        let attempt = remaining.min(UPSTREAM_ATTEMPT_TIMEOUT);
-        if let Some(answer) = try_upstream(raw, *upstream, over_tcp, attempt).await {
-            if !is_failure_response(&answer) {
-                return Some(answer);
-            }
-        }
-    }
-    None
+/// A question being forwarded: to which upstream, and what was asked.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct InFlight {
+    upstream: IpAddr,
+    name: String,
+    record_type: RecordType,
 }
 
-/// Attempts to reach one upstream resolver.
-///
-/// Returns the raw answer on success, or `None` if the connection failed,
-/// the query timed out, or the response could not be read.
-async fn try_upstream(
-    raw: &[u8],
-    upstream: SocketAddr,
-    over_tcp: bool,
-    deadline: Duration,
-) -> Option<Vec<u8>> {
+/// Takes an [`InFlight`] back out of the list when its attempt ends, however
+/// it ends: a forward dropped mid-flight (a handoff closing the listener)
+/// must not leave a question that makes a later honest query look like a loop.
+struct Forwarding<'a> {
+    list: &'a std::sync::Mutex<Vec<InFlight>>,
+    entry: InFlight,
+}
+
+impl<'a> Forwarding<'a> {
+    fn start(list: &'a std::sync::Mutex<Vec<InFlight>>, entry: InFlight) -> Self {
+        list.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).push(entry.clone());
+        Self { list, entry }
+    }
+}
+
+impl Drop for Forwarding<'_> {
+    fn drop(&mut self) {
+        let mut list = self.list.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(at) = list.iter().position(|entry| *entry == self.entry) {
+            list.swap_remove(at);
+        }
+    }
+}
+
+/// Why one upstream attempt gave nothing.
+enum Miss {
+    /// No answer within the attempt's deadline.
+    Timeout,
+    /// Could not connect, send or read.
+    Error,
+}
+
+impl Authority {
+    /// Failover forwarding to a list of upstreams, in order.
+    ///
+    /// Each upstream gets [`UPSTREAM_ATTEMPT_TIMEOUT`], or whatever is left of
+    /// [`UPSTREAM_TOTAL_TIMEOUT`] if that is less; an upstream that times out,
+    /// errors, or answers SERVFAIL/REFUSED hands the question to the next. The
+    /// whole exchange stays under the total so the client gets an answer (or our
+    /// SERVFAIL, or a stale answer) before its own retry fires and its port closes
+    /// — a reply that arrives after that is what produced the ICMP unreachable
+    /// behind `os error 10054` (insight lab F13). Attempts run one at a time on
+    /// this task: nothing is spawned, so nothing outlives the answer, and the
+    /// socket count is bounded by the in-flight semaphore alone.
+    ///
+    /// Each attempt is recorded against its upstream (latency, timeout, error),
+    /// so `dns-stats.json` names the slow or failing resolver. Quarantined
+    /// upstreams are skipped. `None` when every upstream failed.
+    async fn forward(&self, raw: &[u8], query: &Query, upstreams: &[SocketAddr], over_tcp: bool) -> Option<Vec<u8>> {
+        let start = Instant::now();
+        let telemetry = &self.0.telemetry;
+        for upstream in upstreams {
+            let remaining = UPSTREAM_TOTAL_TIMEOUT.saturating_sub(start.elapsed());
+            if remaining.is_zero() {
+                break;
+            }
+            if self.is_quarantined(*upstream) {
+                continue;
+            }
+            let _asking = Forwarding::start(
+                &self.0.forwarding,
+                InFlight { upstream: upstream.ip(), name: query.name.to_ascii_lowercase(), record_type: query.record_type },
+            );
+            let attempt = Instant::now();
+            match try_upstream(raw, *upstream, over_tcp, remaining.min(UPSTREAM_ATTEMPT_TIMEOUT)).await {
+                Ok(answer) if !is_failure_response(&answer) => {
+                    telemetry.record_upstream_response(upstream, attempt.elapsed().as_millis() as u64);
+                    return Some(answer);
+                }
+                Ok(_) | Err(Miss::Error) => telemetry.record_upstream_error(upstream),
+                Err(Miss::Timeout) => telemetry.record_upstream_timeout(upstream),
+            }
+        }
+        None
+    }
+
+    /// The upstream a LAN query is a looped-back forward from, if it is one:
+    /// it arrived from that upstream's address asking exactly a question this
+    /// server is forwarding to it right now. Matched on the question, not the
+    /// message id, because a forwarding router (dnsmasq) picks its own ids.
+    fn loop_from(&self, peer: IpAddr, query: &Query, upstreams: &[SocketAddr]) -> Option<SocketAddr> {
+        let upstream = *upstreams.iter().find(|upstream| upstream.ip() == peer)?;
+        let asked = InFlight { upstream: peer, name: query.name.to_ascii_lowercase(), record_type: query.record_type };
+        let forwarding = self.0.forwarding.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        forwarding.contains(&asked).then_some(upstream)
+    }
+
+    /// Skips `upstream` for [`LOOP_QUARANTINE`], saying so once per quarantine.
+    fn quarantine(&self, upstream: SocketAddr) {
+        let mut quarantined = self.0.quarantined.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let now = Instant::now();
+        quarantined.retain(|(_, until)| *until > now);
+        if !quarantined.iter().any(|(known, _)| *known == upstream) {
+            eprintln!(
+                "{} [dns] upstream {upstream} forwards our questions back to us (a loop); skipping it for {} minutes. \
+                 Point that resolver somewhere other than this machine.",
+                crate::time::stamp(),
+                LOOP_QUARANTINE.as_secs() / 60,
+            );
+            quarantined.push((upstream, now + LOOP_QUARANTINE));
+        }
+    }
+
+    fn is_quarantined(&self, upstream: SocketAddr) -> bool {
+        let quarantined = self.0.quarantined.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        quarantined.iter().any(|(known, until)| *known == upstream && *until > Instant::now())
+    }
+}
+
+/// One attempt at one upstream. Over UDP, only a reply carrying the query's
+/// own id is taken: a stray datagram on the ephemeral port is not an answer.
+async fn try_upstream(raw: &[u8], upstream: SocketAddr, over_tcp: bool, deadline: Duration) -> Result<Vec<u8>, Miss> {
     let exchange = async {
         if over_tcp {
             let mut server = TcpStream::connect(upstream).await.ok()?;
             write_message(&mut server, raw).await.ok()?;
             read_message(&mut server).await.ok().flatten()
         } else {
-            let bind = if upstream.is_ipv4() {
-                "0.0.0.0:0"
-            } else {
-                "[::]:0"
-            };
+            let bind = if upstream.is_ipv4() { "0.0.0.0:0" } else { "[::]:0" };
             let socket = UdpSocket::bind(bind).await.ok()?;
             socket.send_to(raw, upstream).await.ok()?;
             let mut buffer = vec![0_u8; MAX_UDP];
-            let read = socket.recv(&mut buffer).await.ok()?;
-            buffer.truncate(read);
-            Some(buffer)
+            loop {
+                let read = socket.recv(&mut buffer).await.ok()?;
+                if read >= 2 && buffer[..2] == raw[..2] {
+                    buffer.truncate(read);
+                    return Some(buffer);
+                }
+            }
         }
     };
-    tokio::time::timeout(deadline, exchange)
-        .await
-        .ok()
-        .flatten()
+    match tokio::time::timeout(deadline, exchange).await {
+        Ok(Some(answer)) => Ok(answer),
+        Ok(None) => Err(Miss::Error),
+        Err(_) => Err(Miss::Timeout),
+    }
 }
 
 /// Checks if a response is a failure code (SERVFAIL or REFUSED).
@@ -1914,6 +2016,67 @@ domains = ["example.com", "hand.example"]
         let response = wire::decode_response(&message).unwrap();
         assert_eq!(response.code, ResponseCode::ServerFailure);
         assert_eq!(authority.telemetry_snapshot("test").counters.dropped, 1);
+    }
+
+    #[tokio::test]
+    async fn an_upstream_asking_back_what_we_are_forwarding_it_is_a_loop() {
+        // The router forwards our question back to us: fail it at once,
+        // quarantine the router, and count it, rather than forward it again.
+        let router: SocketAddr = "192.168.1.1:53".parse().unwrap();
+        let authority = Authority(Arc::new(Inner::new(vec![example_zone()], None)));
+        authority.set_lan(LanView { lan_ip: LAN_IP, upstreams: vec![router] });
+        let asking = Forwarding::start(
+            &authority.0.forwarding,
+            InFlight { upstream: router.ip(), name: "elsewhere.net".into(), record_type: RecordType::A },
+        );
+
+        let echoed = wire::encode_query(0x0bad, "ElseWhere.net", RecordType::A).unwrap();
+        let message = authority.handle_query(&echoed, false, router.ip()).await;
+        assert_eq!(wire::decode_response(&message).unwrap().code, ResponseCode::ServerFailure);
+        assert_eq!(authority.telemetry_snapshot("test").counters.loops, 1);
+        assert!(authority.is_quarantined(router));
+
+        // A different question from the router, or this one from anyone else,
+        // is not a loop.
+        let other = wire::decode_query(&wire::encode_query(1, "other.net", RecordType::A).unwrap()).unwrap();
+        assert_eq!(authority.loop_from(router.ip(), &other, &[router]), None);
+        let same = wire::decode_query(&echoed).unwrap();
+        assert_eq!(authority.loop_from(LAN_PEER, &same, &[router]), None);
+
+        // Once the forward ends, nothing is left that could match.
+        drop(asking);
+        assert!(authority.0.forwarding.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn each_upstream_attempt_is_recorded_and_a_stray_reply_is_ignored() {
+        let upstream = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let address = upstream.local_addr().unwrap();
+        tokio::spawn(async move {
+            let mut buffer = vec![0_u8; MAX_UDP];
+            let (read, from) = upstream.recv_from(&mut buffer).await.unwrap();
+            let query = wire::decode_query(&buffer[..read]).unwrap();
+            // A reply to somebody else's question first, then the real one.
+            let mut stray = wire::encode_response(&query, ResponseCode::NoError, plain_flags(), &[], &[], &[]);
+            stray[0] ^= 0xff;
+            upstream.send_to(&stray, from).await.unwrap();
+            let real = wire::encode_response(&query, ResponseCode::NoError, plain_flags(), &[], &[], &[]);
+            upstream.send_to(&real, from).await.unwrap();
+        });
+        let silent = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let silent_address = silent.local_addr().unwrap();
+
+        let authority = Authority(Arc::new(Inner::new(vec![example_zone()], None)));
+        let raw = wire::encode_query(0x4242, "elsewhere.net", RecordType::A).unwrap();
+        let query = wire::decode_query(&raw).unwrap();
+        let answer = authority.forward(&raw, &query, &[silent_address, address], false).await.unwrap();
+        assert_eq!(answer[..2], [0x42, 0x42]);
+
+        let upstreams = authority.telemetry_snapshot("test").upstreams;
+        let stats = |at: SocketAddr| upstreams.iter().find(|u| u.addr == at.to_string()).unwrap().clone();
+        assert_eq!((stats(silent_address).timeout, stats(silent_address).ok), (1, 0));
+        assert_eq!((stats(address).ok, stats(address).error), (1, 0));
+        drop(silent);
     }
 
     #[tokio::test]
