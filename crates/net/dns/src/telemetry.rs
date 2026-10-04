@@ -50,6 +50,9 @@ pub struct GlobalCounters {
     pub dropped: u64,
     /// Socket receive/accept errors.
     pub recv_errors: u64,
+    /// LAN queries that were this server's own forwards coming back from an
+    /// upstream: a forwarding loop, answered SERVFAIL at once.
+    pub loops: u64,
 }
 
 /// Per-upstream statistics.
@@ -105,6 +108,7 @@ struct Inner {
     servfail: AtomicU64,
     dropped: AtomicU64,
     recv_errors: AtomicU64,
+    loops: AtomicU64,
     /// Per-upstream counters. Entry structure: addr, ok, timeout, error, buckets...
     /// We'll use a Vec of (String, Arc<UpstreamInner>).
     upstreams: std::sync::Mutex<Vec<(String, Arc<UpstreamInner>)>>,
@@ -131,7 +135,8 @@ struct MinuteRing {
 impl MinuteRing {
     fn new() -> Self {
         let now = current_unix_time();
-        let slots = std::array::from_fn::<_, 1440, _>(|_| MinuteStats::default());
+        let mut slots = std::array::from_fn::<_, 1440, _>(|_| MinuteStats::default());
+        slots[0].at_unix = now / 60 * 60;
         Self {
             current_index: 0,
             current_minute: now / 60,
@@ -185,6 +190,7 @@ impl Telemetry {
                 servfail: AtomicU64::new(0),
                 dropped: AtomicU64::new(0),
                 recv_errors: AtomicU64::new(0),
+                loops: AtomicU64::new(0),
                 upstreams: std::sync::Mutex::new(Vec::new()),
                 minute_ring: std::sync::Mutex::new(MinuteRing::new()),
                 start_time,
@@ -236,11 +242,16 @@ impl Telemetry {
         ring.record_failure();
     }
 
-    /// Records a dropped query.
+    /// Records a query dropped for capacity. Not a minute-ring failure of its
+    /// own: the SERVFAIL it is answered with already counts as one.
     pub fn record_dropped(&self) {
         self.inner.dropped.fetch_add(1, Ordering::Relaxed);
-        let mut ring = self.inner.minute_ring.lock().unwrap();
-        ring.record_failure();
+    }
+
+    /// Records a forwarding loop caught. Like a drop, its SERVFAIL is the
+    /// minute-ring failure.
+    pub fn record_loop(&self) {
+        self.inner.loops.fetch_add(1, Ordering::Relaxed);
     }
 
     /// Records a receive error.
@@ -254,30 +265,11 @@ impl Telemetry {
         ring.record_slow();
     }
 
-    /// Records an upstream response.
+    /// Records an upstream's answer and how long it took.
     pub fn record_upstream_response(&self, addr: &SocketAddr, latency_ms: u64) {
-        let mut upstreams = self.inner.upstreams.lock().unwrap();
-        let addr_str = addr.to_string();
-
-        let upstream = upstreams
-            .iter_mut()
-            .find(|(a, _)| a == &addr_str)
-            .map(|(_, u)| Arc::clone(u))
-            .unwrap_or_else(|| {
-                let u = Arc::new(UpstreamInner {
-                    ok: AtomicU64::new(0),
-                    timeout: AtomicU64::new(0),
-                    error: AtomicU64::new(0),
-                    buckets: [const { AtomicU64::new(0) }; 9],
-                });
-                upstreams.push((addr_str, Arc::clone(&u)));
-                u
-            });
-
+        let upstream = self.upstream(addr);
         upstream.ok.fetch_add(1, Ordering::Relaxed);
-
-        // Record latency bucket.
-        let bucket_idx = match latency_ms {
+        let bucket = match latency_ms {
             0..=4 => 0,
             5..=19 => 1,
             20..=49 => 2,
@@ -288,53 +280,34 @@ impl Telemetry {
             1000..=1999 => 7,
             _ => 8,
         };
-        upstream.buckets[bucket_idx].fetch_add(1, Ordering::Relaxed);
+        upstream.buckets[bucket].fetch_add(1, Ordering::Relaxed);
     }
 
-    /// Records an upstream timeout.
+    /// Records an upstream that did not answer within its attempt.
     pub fn record_upstream_timeout(&self, addr: &SocketAddr) {
-        let mut upstreams = self.inner.upstreams.lock().unwrap();
-        let addr_str = addr.to_string();
-
-        let upstream = upstreams
-            .iter_mut()
-            .find(|(a, _)| a == &addr_str)
-            .map(|(_, u)| Arc::clone(u))
-            .unwrap_or_else(|| {
-                let u = Arc::new(UpstreamInner {
-                    ok: AtomicU64::new(0),
-                    timeout: AtomicU64::new(0),
-                    error: AtomicU64::new(0),
-                    buckets: [const { AtomicU64::new(0) }; 9],
-                });
-                upstreams.push((addr_str, Arc::clone(&u)));
-                u
-            });
-
-        upstream.timeout.fetch_add(1, Ordering::Relaxed);
+        self.upstream(addr).timeout.fetch_add(1, Ordering::Relaxed);
     }
 
-    /// Records an upstream error.
+    /// Records an upstream that could not be reached, or answered SERVFAIL/REFUSED.
     pub fn record_upstream_error(&self, addr: &SocketAddr) {
+        self.upstream(addr).error.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// One upstream's counters, created on first use.
+    fn upstream(&self, addr: &SocketAddr) -> Arc<UpstreamInner> {
         let mut upstreams = self.inner.upstreams.lock().unwrap();
-        let addr_str = addr.to_string();
-
-        let upstream = upstreams
-            .iter_mut()
-            .find(|(a, _)| a == &addr_str)
-            .map(|(_, u)| Arc::clone(u))
-            .unwrap_or_else(|| {
-                let u = Arc::new(UpstreamInner {
-                    ok: AtomicU64::new(0),
-                    timeout: AtomicU64::new(0),
-                    error: AtomicU64::new(0),
-                    buckets: [const { AtomicU64::new(0) }; 9],
-                });
-                upstreams.push((addr_str, Arc::clone(&u)));
-                u
-            });
-
-        upstream.error.fetch_add(1, Ordering::Relaxed);
+        let addr = addr.to_string();
+        if let Some((_, found)) = upstreams.iter().find(|(known, _)| *known == addr) {
+            return Arc::clone(found);
+        }
+        let fresh = Arc::new(UpstreamInner {
+            ok: AtomicU64::new(0),
+            timeout: AtomicU64::new(0),
+            error: AtomicU64::new(0),
+            buckets: [const { AtomicU64::new(0) }; 9],
+        });
+        upstreams.push((addr, Arc::clone(&fresh)));
+        fresh
     }
 
     /// Takes a snapshot of all telemetry.
@@ -352,6 +325,7 @@ impl Telemetry {
             servfail: self.inner.servfail.load(Ordering::Relaxed),
             dropped: self.inner.dropped.load(Ordering::Relaxed),
             recv_errors: self.inner.recv_errors.load(Ordering::Relaxed),
+            loops: self.inner.loops.load(Ordering::Relaxed),
         };
 
         let upstreams = {
@@ -378,16 +352,14 @@ impl Telemetry {
                 .collect()
         };
 
+        // Only minutes that have happened: an unused slot is not a quiet minute.
         let minutes = {
             let ring = self.inner.minute_ring.lock().unwrap();
-            let mut result = Vec::with_capacity(1440);
-            for i in 0..1440 {
-                let idx = (ring.current_index + i) % 1440;
-                if ring.slots[idx].at_unix > 0 || i > 0 {
-                    result.push(ring.slots[idx].clone());
-                }
-            }
-            result
+            (1..=1440)
+                .map(|step| &ring.slots[(ring.current_index + step) % 1440])
+                .filter(|slot| slot.at_unix > 0)
+                .cloned()
+                .collect()
         };
 
         Snapshot {
@@ -464,6 +436,7 @@ pub fn snapshot_to_json(snapshot: &Snapshot) -> Json {
                 ("servfail", Json::Number(snapshot.counters.servfail as f64)),
                 ("dropped", Json::Number(snapshot.counters.dropped as f64)),
                 ("recv_errors", Json::Number(snapshot.counters.recv_errors as f64)),
+                ("loops", Json::Number(snapshot.counters.loops as f64)),
             ]),
         ),
         ("upstreams", Json::Array(upstreams)),

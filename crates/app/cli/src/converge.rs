@@ -359,6 +359,27 @@ impl Entry {
         )
     }
 
+    /// This entry as a machine-timeline event: kind `repair`, from its component.
+    pub fn timeline_event(&self) -> selfhost_insight::Event {
+        let first_line = self.detail.lines().map(str::trim).find(|line| !line.is_empty()).unwrap_or_default();
+        let summary: String = first_line.chars().take(200).collect();
+        let title = if summary.is_empty() {
+            format!("{} {}", self.component, self.event.as_str())
+        } else {
+            format!("{} {}: {summary}", self.component, self.event.as_str())
+        };
+        selfhost_insight::Event {
+            at_unix: self.at_unix,
+            kind: "repair".to_owned(),
+            source: self.component.clone(),
+            title,
+            evidence: selfhost_json::Json::object([
+                ("event", selfhost_json::Json::string(self.event.as_str())),
+                ("detail", selfhost_json::Json::string(&self.detail)),
+            ]),
+        }
+    }
+
     /// Reads a line back, or `None` if it is not one of ours.
     ///
     /// Tolerant of an unknown event word and of extra fields, so a ledger
@@ -457,7 +478,14 @@ impl Ledger {
             std::fs::create_dir_all(parent)?;
         }
         let mut file = std::fs::OpenOptions::new().create(true).append(true).open(&self.path)?;
-        writeln!(file, "{}", entry.line())
+        writeln!(file, "{}", entry.line())?;
+        // The same transition on the machine timeline, beside the samples and
+        // Windows events, so `/api/insight/events` tells the whole story in one
+        // place. After the ledger line: the ledger is the record.
+        match self.path.parent() {
+            Some(data_dir) => selfhost_insight::store::Store::new(data_dir).append_event(&entry.timeline_event()),
+            None => Ok(()),
+        }
     }
 
     /// Every entry in the file, oldest first.
@@ -1016,6 +1044,30 @@ mod tests {
         assert_eq!(Entry::parse("selfhost-audit/1 id=abc at=1"), None);
         // Ours, but with no event word this build knows.
         assert_eq!(Entry::parse("selfhost-repair/1 at=1 component=dns event=danced"), None);
+    }
+
+    #[test]
+    fn every_ledger_line_is_also_on_the_machine_timeline() {
+        let directory = std::env::temp_dir().join(format!(
+            "selfhost-converge-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        let ledger = Ledger::in_dir(&directory);
+        let entry = Entry {
+            at_unix: 1_791_000_000,
+            component: "dns".into(),
+            event: Event::StillFailing,
+            detail: "schtasks said:\nERROR: access denied".into(),
+        };
+        ledger.append(&entry).expect("the ledger is writable");
+
+        let events = selfhost_insight::store::read_events(&directory, 1_791_000_000, 1_791_000_001).expect("readable");
+        assert_eq!(events.len(), 1);
+        assert_eq!((events[0].kind.as_str(), events[0].source.as_str()), ("repair", "dns"));
+        assert_eq!(events[0].title, "dns still-failing: schtasks said:");
+        assert_eq!(ledger.entries(), vec![entry]);
+        let _ = std::fs::remove_dir_all(&directory);
     }
 
     #[test]
