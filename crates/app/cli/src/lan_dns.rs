@@ -320,21 +320,12 @@ pub async fn lan_dns_command(
     println!("Ctrl-C to stop.\n");
 
     // Bind UDP and TCP with SO_REUSEADDR set so new instances can bind alongside
-    // old ones during zero-drop handoff.
-    let udp = bind_udp_shared(bind).map_err(|e| {
-        format!(
-            "cannot bind {bind} (UDP): {e}\n  \
-         This usually means port 53 needs privilege or something is already listening.\n  \
-         On macOS that is usually a VPN client or Internet Sharing."
-        )
-    })?;
-    let tcp = bind_tcp_shared(bind).map_err(|e| {
-        format!(
-            "cannot bind {bind} (TCP): {e}\n  \
-         This usually means port 53 needs privilege or something is already listening.\n  \
-         On macOS that is usually a VPN client or Internet Sharing."
-        )
-    })?;
+    // old ones during zero-drop handoff; wait while a server that cannot be
+    // joined still holds the port.
+    let (udp, tcp) = tokio::select! {
+        sockets = bind_when_free(bind) => sockets?,
+        _ = tokio::signal::ctrl_c() => return Ok(()),
+    };
 
     println!("{} [dns] bound with SO_REUSEADDR", selfhost_dns::stamp());
 
@@ -457,6 +448,74 @@ fn bind_hint(bind: SocketAddr, error: selfhost_dns::authority::DnsError) -> Stri
         }
         _ => format!("LAN DNS stopped: {error}"),
     }
+}
+
+/// How often a held port is retried at first, while a cutover is most likely
+/// under way, and for how long before slowing to [`BIND_RETRY_SLOW`].
+const BIND_RETRY_FAST: std::time::Duration = std::time::Duration::from_millis(50);
+const BIND_FAST_FOR: std::time::Duration = std::time::Duration::from_secs(30);
+/// How often a port still held after the first 30 s is retried.
+const BIND_RETRY_SLOW: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Binds UDP and TCP on `bind`, waiting while another server holds the port.
+///
+/// Windows refuses a shared bind over a socket bound without SO_REUSEADDR
+/// (WSAEACCES; measured on the box 2026-10-04 against the daemon's own
+/// binary), so a daemon serving :53 itself cannot be joined, only replaced.
+/// While the port is held this retries, every 50 ms for the first 30 s and
+/// every 2 s after, and takes the port the moment its holder lets go. Any
+/// other bind error is fatal.
+async fn bind_when_free(
+    bind: SocketAddr,
+) -> Result<(tokio::net::UdpSocket, tokio::net::TcpListener), String> {
+    let started = tokio::time::Instant::now();
+    let mut waiting = false;
+    loop {
+        // A UDP socket bound before the TCP bind fails is dropped here, so a
+        // waiting instance never holds half the port.
+        match bind_udp_shared(bind).and_then(|udp| Ok((udp, bind_tcp_shared(bind)?))) {
+            Ok(sockets) => {
+                if waiting {
+                    println!(
+                        "{} [dns] {bind} is free; bound after {} ms",
+                        selfhost_dns::stamp(),
+                        started.elapsed().as_millis()
+                    );
+                }
+                return Ok(sockets);
+            }
+            Err(error) if is_held(&error) => {
+                if !waiting {
+                    eprintln!(
+                        "{} [dns] {bind} is held by another server ({error}); waiting for it",
+                        selfhost_dns::stamp()
+                    );
+                    waiting = true;
+                }
+                let pause = if started.elapsed() < BIND_FAST_FOR {
+                    BIND_RETRY_FAST
+                } else {
+                    BIND_RETRY_SLOW
+                };
+                tokio::time::sleep(pause).await;
+            }
+            Err(error) => {
+                return Err(format!(
+                    "cannot bind {bind}: {error}\n  \
+                     This usually means port 53 needs privilege.\n  \
+                     On macOS that is usually a VPN client or Internet Sharing."
+                ));
+            }
+        }
+    }
+}
+
+/// Whether a bind failed because another socket holds the port. Windows says
+/// so with WSAEACCES, which Rust reads as permission denied; elsewhere that
+/// means a privileged port, which waiting never fixes.
+fn is_held(error: &std::io::Error) -> bool {
+    error.kind() == std::io::ErrorKind::AddrInUse
+        || (cfg!(windows) && error.kind() == std::io::ErrorKind::PermissionDenied)
 }
 
 /// Path to the handoff coordination file, where the current DNS process PID is
@@ -776,6 +835,25 @@ mod tests {
             read_pid, None,
             "should return None for missing handoff file"
         );
+    }
+
+    #[tokio::test]
+    async fn a_held_port_is_taken_the_moment_it_is_freed() {
+        use std::time::Duration;
+
+        // A plain socket, like the daemon's own :53, cannot be joined.
+        let holder = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let bind = holder.local_addr().unwrap();
+        let started = std::time::Instant::now();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            drop(holder);
+        });
+        let (udp, _tcp) = bind_when_free(bind).await.expect("binds once the holder lets go");
+        let waited = started.elapsed();
+        assert_eq!(udp.local_addr().unwrap(), bind);
+        assert!(waited >= Duration::from_millis(300), "bound while still held: {waited:?}");
+        assert!(waited < Duration::from_millis(300) + 4 * BIND_RETRY_FAST, "slow to take the port: {waited:?}");
     }
 
     /// WP0's swap, on loopback: an old server answers, a new one binds the
