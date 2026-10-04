@@ -337,8 +337,7 @@ pub async fn lan_dns_command(
     // failing new instance leaves while the old one, which never stopped,
     // keeps serving: rollback is simply not taking over.
     let data_dir = project_dir.join(&config.server.data_dir);
-    let serving = authority.serve_with_sockets(udp, tcp);
-    tokio::pin!(serving);
+    let mut serving = Box::pin(authority.serve_with_sockets(udp, tcp));
     tokio::select! {
         result = &mut serving => return result.map_err(|error| bind_hint(bind, error)),
         _ = tokio::signal::ctrl_c() => return Ok(()),
@@ -370,6 +369,10 @@ pub async fn lan_dns_command(
                 result = &mut serving => return result.map_err(|error| bind_hint(bind, error)),
                 drained = authority.quiesce(DRAIN_FOR) => drained,
             };
+            // Close the sockets now, not at process exit: the replacement
+            // receives nothing until they close, and on the box teardown kept
+            // them open about 110 ms, losing every query in that window.
+            drop(serving);
             if drained {
                 eprintln!("{} [dns] a newer instance took over; drained, exiting", selfhost_dns::stamp());
             } else {
