@@ -2759,7 +2759,6 @@ function boot() {
   let streamTimer = null;
   let streamAttempt = 0;
   let logTimer = null;
-  let healthTimer = null;
   const streamStats = { snapshots: 0, bytes: 0, reconnects: 0, lastAt: 0, openedAt: 0 };
   /* Whether the log view is pinned to its newest line, and what arrived while
      the reader was scrolled back. */
@@ -2779,9 +2778,11 @@ function boot() {
   let healthMetricsDrawn = "";
   /* Last rendered health events JSON, to rebuild events only on change. */
   let healthEventsDrawn = "";
-  /* Last timestamp for health metrics fetch (for 60s refresh rate). */
+  /* When the HEALTH plate last asked, per route: it rides the main poll, but
+     the machine is only sampled every 10 s, so asking more often re-reads the
+     same answer. Nothing is asked while the tab is hidden. */
+  let healthLastFetch = 0;
   let healthMetricsLastFetch = 0;
-  /* Last timestamp for health events fetch (for 60s refresh rate). */
   let healthEventsLastFetch = 0;
   /* Last rendered fleet strip, to rebuild those chips only on change. */
   let stripDrawn = "";
@@ -3953,7 +3954,6 @@ function boot() {
 
     await Promise.all([refreshDefinition(), refreshLogs(), refreshFirewall(), refreshSystem(), refreshHealth(), refreshHealthMetrics(), refreshHealthEvents(), refreshDesktop()]);
     render();
-    scheduleHealth();
   }
 
   /** Fetches the selected service's definition; a reply for a service that is
@@ -4017,6 +4017,9 @@ function boot() {
    *  processes, and DNS info. A 404 means insight is not enabled on this
    *  deployment and the panel hides with a message. */
   async function refreshHealth() {
+    const now = Date.now();
+    if (document.hidden || (healthLastFetch && now - healthLastFetch < 10000)) return;
+    healthLastFetch = now;
     let reply;
     try { reply = await api("/api/insight/now"); }
     catch { return; }
@@ -4024,8 +4027,8 @@ function boot() {
       state.health = "not-enabled";
       return;
     }
-    if (reply.status === 500) {
-      state.health = { error: reply.body && reply.body.error ? reply.body.error : "server error" };
+    if (reply.status >= 500) {
+      state.health = { error: reply.body && reply.body.error ? reply.body.error : `the daemon answered ${reply.status}` };
       return;
     }
     if (reply.status === 200 && reply.body) {
@@ -4036,7 +4039,7 @@ function boot() {
   /** Fetches the last hour of metrics: CPU, memory, network samples. */
   async function refreshHealthMetrics() {
     const now = Date.now();
-    if (healthMetricsLastFetch && now - healthMetricsLastFetch < 60000) return;
+    if (document.hidden || (healthMetricsLastFetch && now - healthMetricsLastFetch < 60000)) return;
     healthMetricsLastFetch = now;
     let reply;
     try { reply = await api("/api/insight/metrics"); }
@@ -4049,7 +4052,7 @@ function boot() {
   /** Fetches the last day of events: problems, state changes, etc. */
   async function refreshHealthEvents() {
     const now = Date.now();
-    if (healthEventsLastFetch && now - healthEventsLastFetch < 60000) return;
+    if (document.hidden || (healthEventsLastFetch && now - healthEventsLastFetch < 60000)) return;
     healthEventsLastFetch = now;
     let reply;
     try { reply = await api("/api/insight/events"); }
@@ -4629,6 +4632,9 @@ function boot() {
 
   /* ── the health panel ─────────────────────────────────────────────── */
 
+  /** How many timeline events the plate draws. */
+  const HEALTH_EVENTS_SHOWN = 100;
+
   function renderHealth() {
     const health = state.health;
     const panel = $("health");
@@ -4740,9 +4746,6 @@ function boot() {
 
     // Events
     renderHealthEvents();
-
-    // Schedule next health poll
-    scheduleHealth();
   }
 
   function renderHealthMetrics() {
@@ -4798,7 +4801,7 @@ function boot() {
     netItem.className = "metric-item";
     const netLabel = document.createElement("div");
     netLabel.className = "fieldlabel";
-    netLabel.textContent = "Network (bytes/s)";
+    netLabel.textContent = "Network";
     const netValue = document.createElement("div");
     netValue.className = "metric-value";
     let latestNet = "—";
@@ -4809,11 +4812,19 @@ function boot() {
         if (typeof n.rx_bps === "number") totalRx += n.rx_bps;
         if (typeof n.tx_bps === "number") totalTx += n.tx_bps;
       }
-      latestNet = (totalRx + totalTx).toFixed(0);
+      latestNet = byteRate(totalRx + totalTx);
     }
     netValue.textContent = latestNet;
     netItem.append(netLabel, netValue, createNetworkSparkline(samples));
     container.append(netItem);
+  }
+
+  /** Bytes a second in the unit a person reads; matches `rate` in the native
+   *  console's `view/health.rs`. */
+  function byteRate(bytes) {
+    if (bytes >= 1e6) return `${(bytes / 1e6).toFixed(1)} MB/s`;
+    if (bytes >= 1e3) return `${(bytes / 1e3).toFixed(0)} KB/s`;
+    return `${bytes} B/s`;
   }
 
   function createSparkline(samples, field, max, divisor) {
@@ -4980,8 +4991,10 @@ function boot() {
     wrap.hidden = false;
     list.textContent = "";
 
-    // Render events newest first
-    const events = state.healthEvents.events.slice().reverse();
+    // Newest first, and only the newest 100: the MCP tool and the API hold
+    // the rest, and a timeline of thousands of rows is one nobody reads.
+    const all = state.healthEvents.events;
+    const events = all.slice(-HEALTH_EVENTS_SHOWN).reverse();
     for (const event of events) {
       if (!event) continue;
       const li = document.createElement("li");
@@ -5012,18 +5025,13 @@ function boot() {
       li.append(content);
       list.append(li);
     }
-  }
-
-  function scheduleHealth() {
-    clearTimeout(healthTimer);
-    if (state.view !== "console" || document.hidden || !state.health || state.health === "not-enabled") return;
-    healthTimer = setTimeout(async () => {
-      await refreshHealth();
-      await refreshHealthMetrics();
-      await refreshHealthEvents();
-      render();
-      scheduleHealth();
-    }, 10000);
+    const older = all.length - events.length + (state.healthEvents.omitted_older || 0);
+    if (older > 0) {
+      const li = document.createElement("li");
+      li.className = "event-more";
+      li.textContent = `${older} older events not shown`;
+      list.append(li);
+    }
   }
 
   /* ── notices ──────────────────────────────────────────────────────── */
@@ -9350,7 +9358,6 @@ function boot() {
     if (document.hidden) onDeskBlur();
     if (!document.hidden && state.view === "console") poll();
     scheduleLogs();
-    scheduleHealth();
   });
 
   $("invite-start").addEventListener("click", redeemInvite);
