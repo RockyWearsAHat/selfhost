@@ -476,21 +476,18 @@ fn bind_hint(bind: SocketAddr, error: selfhost_dns::authority::DnsError) -> Stri
     }
 }
 
-/// How often a held port is retried at first, while a cutover is most likely
-/// under way, and for how long before slowing to [`BIND_RETRY_SLOW`].
-const BIND_RETRY_FAST: std::time::Duration = std::time::Duration::from_millis(50);
-const BIND_FAST_FOR: std::time::Duration = std::time::Duration::from_secs(30);
-/// How often a port still held after the first 30 s is retried.
-const BIND_RETRY_SLOW: std::time::Duration = std::time::Duration::from_secs(2);
+/// How often a held port is retried. Constant, because a cutover waits out
+/// a whole daemon build before its holder exits, and the house has no DNS
+/// between that exit and this bind. A refused bind costs microseconds.
+const BIND_RETRY: std::time::Duration = std::time::Duration::from_millis(50);
 
 /// Binds UDP and TCP on `bind`, waiting while another server holds the port.
 ///
 /// Windows refuses a shared bind over a socket bound without SO_REUSEADDR
 /// (WSAEACCES; measured on the box 2026-10-04 against the daemon's own
 /// binary), so a daemon serving :53 itself cannot be joined, only replaced.
-/// While the port is held this retries, every 50 ms for the first 30 s and
-/// every 2 s after, and takes the port the moment its holder lets go. Any
-/// other bind error is fatal.
+/// While the port is held this retries every [`BIND_RETRY`] and takes the
+/// port the moment its holder lets go. Any other bind error is fatal.
 async fn bind_when_free(
     bind: SocketAddr,
 ) -> Result<(tokio::net::UdpSocket, tokio::net::TcpListener), String> {
@@ -518,12 +515,7 @@ async fn bind_when_free(
                     );
                     waiting = true;
                 }
-                let pause = if started.elapsed() < BIND_FAST_FOR {
-                    BIND_RETRY_FAST
-                } else {
-                    BIND_RETRY_SLOW
-                };
-                tokio::time::sleep(pause).await;
+                tokio::time::sleep(BIND_RETRY).await;
             }
             Err(error) => {
                 return Err(format!(
@@ -879,7 +871,7 @@ mod tests {
         let waited = started.elapsed();
         assert_eq!(udp.local_addr().unwrap(), bind);
         assert!(waited >= Duration::from_millis(300), "bound while still held: {waited:?}");
-        assert!(waited < Duration::from_millis(300) + 4 * BIND_RETRY_FAST, "slow to take the port: {waited:?}");
+        assert!(waited < Duration::from_millis(300) + 4 * BIND_RETRY, "slow to take the port: {waited:?}");
     }
 
     /// WP0's swap, on loopback: an old server answers, a new one binds the
