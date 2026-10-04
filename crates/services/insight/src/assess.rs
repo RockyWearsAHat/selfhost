@@ -46,6 +46,11 @@ const DNS_MIN_QUERIES: u64 = 20;
 const DNS_STALE_SECS: u64 = 60;
 /// A sampler that has not written for this long has stopped.
 const SAMPLER_STALE_SECS: u64 = 60;
+/// A component repaired this many times within [`FLAP_WINDOW_SECS`] is
+/// flapping: each repair works, briefly, and the cause is still there.
+pub const FLAP_REPAIRS: usize = 3;
+/// The window [`FLAP_REPAIRS`] is counted over.
+pub const FLAP_WINDOW_SECS: u64 = 1800;
 /// Trend history: one point per this many seconds, this many points.
 const TREND_STEP_SECS: u64 = 300;
 const TREND_POINTS: usize = 25;
@@ -91,6 +96,7 @@ enum Family {
     Machine,
     Processes,
     Dns,
+    Repairs,
 }
 
 struct Finding {
@@ -125,8 +131,10 @@ impl Assessor {
     }
 
     /// Judges one sample, with the resolver's `dns-stats.json` when it writes
-    /// one. Returns the timeline entries for problems raised or cleared.
-    pub fn observe(&mut self, sample: &Sample, dns: Option<&Json>) -> Vec<Event> {
+    /// one, and the timeline's repairs of the last [`FLAP_WINDOW_SECS`] when
+    /// they were read (`None` leaves flapping unjudged this time). Returns the
+    /// timeline entries for problems raised or cleared.
+    pub fn observe(&mut self, sample: &Sample, dns: Option<&Json>, repairs: Option<&[Event]>) -> Vec<Event> {
         let at = sample.at_unix;
         let mut findings = self.machine(sample);
         let mut judged = vec![Family::Machine, Family::Dns];
@@ -135,6 +143,10 @@ impl Assessor {
             findings.extend(self.processes(at, &sample.processes));
         }
         findings.extend(self.dns(at, dns));
+        if let Some(repairs) = repairs {
+            judged.push(Family::Repairs);
+            findings.extend(flapping(at, repairs));
+        }
 
         let mut timeline = Vec::new();
         let found: Vec<String> = findings.iter().map(|finding| finding.id.clone()).collect();
@@ -423,6 +435,35 @@ impl DnsWindow {
     }
 }
 
+/// One finding per component repaired [`FLAP_REPAIRS`] or more times in the
+/// window ending at `at`.
+fn flapping(at: u64, events: &[Event]) -> Vec<Finding> {
+    let mut by_source: BTreeMap<&str, Vec<&Event>> = BTreeMap::new();
+    for event in events {
+        if event.kind == "repair" && event.at_unix + FLAP_WINDOW_SECS > at && event.at_unix <= at {
+            by_source.entry(&event.source).or_default().push(event);
+        }
+    }
+    by_source
+        .into_iter()
+        .filter(|(_, repairs)| repairs.len() >= FLAP_REPAIRS)
+        .map(|(source, repairs)| {
+            let last = repairs.iter().max_by_key(|event| event.at_unix).expect("at least FLAP_REPAIRS");
+            Finding {
+                id: format!("flapping:{source}"),
+                family: Family::Repairs,
+                raise_after: 1,
+                title: format!("{source} was repaired {} times in {} minutes: the cause is still there", repairs.len(), FLAP_WINDOW_SECS / 60),
+                evidence: Json::object([
+                    ("repairs", num(repairs.len() as u64)),
+                    ("window_secs", num(FLAP_WINDOW_SECS)),
+                    ("last", text(&last.title)),
+                ]),
+            }
+        })
+        .collect()
+}
+
 fn dns_window(stats: &Json, now: u64) -> DnsWindow {
     let mut window = DnsWindow::default();
     for minute in stats.get("minutes").and_then(Json::as_array).unwrap_or_default() {
@@ -580,17 +621,17 @@ mod tests {
     #[test]
     fn a_problem_needs_its_streak_to_raise_and_quiet_to_clear() {
         let mut assessor = Assessor::new();
-        assert!(assessor.observe(&sample(10, 950), None).is_empty());
-        assert!(assessor.observe(&sample(20, 950), None).is_empty());
-        assert_eq!(kinds(&assessor.observe(&sample(30, 950), None)), vec![("warning", "memory_high")]);
+        assert!(assessor.observe(&sample(10, 950), None, None).is_empty());
+        assert!(assessor.observe(&sample(20, 950), None, None).is_empty());
+        assert_eq!(kinds(&assessor.observe(&sample(30, 950), None, None)), vec![("warning", "memory_high")]);
         let problem = assessor.problems().remove(0);
         assert_eq!(problem.since_unix, 10, "since is when it was first seen, not when it was raised");
 
-        assert!(assessor.observe(&sample(40, 100), None).is_empty());
-        assert!(assessor.observe(&sample(50, 950), None).is_empty(), "a relapse continues the same problem");
-        assert!(assessor.observe(&sample(60, 100), None).is_empty());
-        assert!(assessor.observe(&sample(70, 100), None).is_empty());
-        let cleared = assessor.observe(&sample(80, 100), None);
+        assert!(assessor.observe(&sample(40, 100), None, None).is_empty());
+        assert!(assessor.observe(&sample(50, 950), None, None).is_empty(), "a relapse continues the same problem");
+        assert!(assessor.observe(&sample(60, 100), None, None).is_empty());
+        assert!(assessor.observe(&sample(70, 100), None, None).is_empty());
+        let cleared = assessor.observe(&sample(80, 100), None, None);
         assert_eq!(kinds(&cleared), vec![("cleared", "memory_high")]);
         assert_eq!(cleared[0].evidence.get("lasted_secs").and_then(Json::as_u64), Some(70));
         assert!(assessor.problems().is_empty());
@@ -599,10 +640,10 @@ mod tests {
     #[test]
     fn a_blip_shorter_than_the_streak_is_forgotten() {
         let mut assessor = Assessor::new();
-        assessor.observe(&sample(10, 950), None);
-        assessor.observe(&sample(20, 100), None);
-        assessor.observe(&sample(30, 950), None);
-        assessor.observe(&sample(40, 950), None);
+        assessor.observe(&sample(10, 950), None, None);
+        assessor.observe(&sample(20, 100), None, None);
+        assessor.observe(&sample(30, 950), None, None);
+        assessor.observe(&sample(40, 950), None, None);
         assert!(assessor.problems().is_empty(), "the streak restarted after the healthy sample");
     }
 
@@ -614,13 +655,13 @@ mod tests {
             ..Sample::default()
         };
         let mut assessor = Assessor::new();
-        assessor.observe(&busy(60), None);
-        assessor.observe(&Sample { at_unix: 70, ..Sample::default() }, None);
-        let raised = assessor.observe(&busy(120), None);
+        assessor.observe(&busy(60), None, None);
+        assessor.observe(&Sample { at_unix: 70, ..Sample::default() }, None, None);
+        let raised = assessor.observe(&busy(120), None, None);
         assert_eq!(kinds(&raised), vec![("warning", "selfhost_busy:7316")]);
         assert!(raised[0].title.contains("1.00 cores"));
         for at in [130, 140, 150, 160] {
-            assessor.observe(&Sample { at_unix: at, ..Sample::default() }, None);
+            assessor.observe(&Sample { at_unix: at, ..Sample::default() }, None, None);
         }
         assert_eq!(assessor.problems().len(), 1, "samples without a ranking say nothing about processes");
     }
@@ -645,17 +686,17 @@ mod tests {
     #[test]
     fn dns_failures_drops_and_silence_are_problems() {
         let mut assessor = Assessor::new();
-        let raised = assessor.observe(&sample(1000, 0), Some(&dns_stats(995, 1000, 30, 0)));
+        let raised = assessor.observe(&sample(1000, 0), Some(&dns_stats(995, 1000, 30, 0)), None);
         assert_eq!(kinds(&raised), vec![("warning", "dns_failing")]);
 
         let mut assessor = Assessor::new();
-        assessor.observe(&sample(1000, 0), Some(&dns_stats(995, 1000, 0, 5)));
-        let raised = assessor.observe(&sample(1010, 0), Some(&dns_stats(1005, 1000, 0, 9)));
+        assessor.observe(&sample(1000, 0), Some(&dns_stats(995, 1000, 0, 5)), None);
+        let raised = assessor.observe(&sample(1010, 0), Some(&dns_stats(1005, 1000, 0, 9)), None);
         assert_eq!(kinds(&raised), vec![("warning", "dns_dropping")]);
         assert_eq!(raised[0].evidence.get("dropped").and_then(Json::as_u64), Some(4));
 
         let mut assessor = Assessor::new();
-        let raised = assessor.observe(&sample(1000, 0), Some(&dns_stats(900, 1000, 0, 0)));
+        let raised = assessor.observe(&sample(1000, 0), Some(&dns_stats(900, 1000, 0, 0)), None);
         assert_eq!(kinds(&raised), vec![("warning", "dns_stopped")]);
     }
 
@@ -668,9 +709,9 @@ mod tests {
             ..Sample::default()
         };
         // 10 GB lost per hour with 100 GB left: about ten hours.
-        assessor.observe(&disk(0, 110_000), None);
-        assessor.observe(&disk(1200, 106_667), None);
-        let raised = assessor.observe(&disk(3600, 100_000), None);
+        assessor.observe(&disk(0, 110_000), None, None);
+        assessor.observe(&disk(1200, 106_667), None, None);
+        let raised = assessor.observe(&disk(3600, 100_000), None, None);
         assert_eq!(kinds(&raised), vec![("warning", "disk_filling:C:\\")]);
         assert!(raised[0].title.contains("about 10 h"), "{}", raised[0].title);
     }
@@ -695,5 +736,33 @@ mod tests {
         assert_eq!((report.condition.as_str(), report.problems.len()), ("warning", 1));
         assert_eq!(now(&data, 2000).unwrap().condition, "unknown", "an old sample is not a current one");
         std::fs::remove_dir_all(&data).unwrap();
+    }
+
+    #[test]
+    fn a_component_repaired_three_times_in_half_an_hour_is_flapping() {
+        let repair = |at_unix: u64, source: &str| Event {
+            at_unix,
+            kind: "repair".into(),
+            source: source.into(),
+            title: format!("{source} repaired: restarted"),
+            evidence: Json::Null,
+        };
+        let mut assessor = Assessor::new();
+        let two = [repair(100, "dns"), repair(700, "dns"), repair(800, "https")];
+        assert!(assessor.observe(&sample(1000, 0), None, Some(&two)).is_empty());
+
+        let three = [repair(100, "dns"), repair(700, "dns"), repair(900, "dns"), repair(800, "https")];
+        let raised = assessor.observe(&sample(1060, 0), None, Some(&three));
+        assert_eq!(kinds(&raised), vec![("warning", "flapping:dns")]);
+        assert_eq!(raised[0].evidence.get("repairs").and_then(Json::as_u64), Some(3));
+
+        assert!(assessor.observe(&sample(1070, 0), None, None).is_empty(), "unjudged, so not cleared");
+        assert_eq!(assessor.problems().len(), 1);
+        let later = 100 + FLAP_WINDOW_SECS;
+        for at in [later, later + 60] {
+            assert!(assessor.observe(&sample(at, 0), None, Some(&three)).is_empty());
+        }
+        let cleared = assessor.observe(&sample(later + 120, 0), None, Some(&three));
+        assert_eq!(kinds(&cleared), vec![("cleared", "flapping:dns")]);
     }
 }
