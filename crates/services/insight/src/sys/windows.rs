@@ -73,6 +73,17 @@ struct PROCESS_MEMORY_COUNTERS_EX {
 #[cfg(target_pointer_width = "64")]
 const _: () = assert!(size_of::<PROCESS_MEMORY_COUNTERS_EX>() == 80);
 
+#[repr(C)]
+struct IO_COUNTERS {
+    ReadOperationCount: u64,
+    WriteOperationCount: u64,
+    OtherOperationCount: u64,
+    ReadTransferCount: u64,
+    WriteTransferCount: u64,
+    OtherTransferCount: u64,
+}
+const _: () = assert!(size_of::<IO_COUNTERS>() == 48 && offset_of!(IO_COUNTERS, ReadTransferCount) == 24);
+
 /// `netioapi.h`. `IF_MAX_STRING_SIZE + 1` is 257, `IF_MAX_PHYS_ADDRESS_LENGTH` 32.
 #[repr(C)]
 struct MIB_IF_ROW2 {
@@ -147,6 +158,7 @@ unsafe extern "system" {
     fn GetProcessTimes(process: HANDLE, creation: *mut u64, exit: *mut u64, kernel: *mut u64, user: *mut u64) -> i32;
     fn K32GetProcessMemoryInfo(process: HANDLE, counters: *mut PROCESS_MEMORY_COUNTERS_EX, size: u32) -> i32;
     fn GetProcessHandleCount(process: HANDLE, count: *mut u32) -> i32;
+    fn GetProcessIoCounters(process: HANDLE, counters: *mut IO_COUNTERS) -> i32;
     fn CloseHandle(handle: HANDLE) -> i32;
 }
 
@@ -299,6 +311,14 @@ fn open(pid: u32, name: String) -> Option<ProcessRaw> {
         PrivateUsage: 0,
     };
     let mut handles = 0_u32;
+    let mut io = IO_COUNTERS {
+        ReadOperationCount: 0,
+        WriteOperationCount: 0,
+        OtherOperationCount: 0,
+        ReadTransferCount: 0,
+        WriteTransferCount: 0,
+        OtherTransferCount: 0,
+    };
     // SAFETY: `handle` is open until the CloseHandle below; every out-pointer
     // is a live local of the size the call expects.
     let ok = unsafe {
@@ -307,6 +327,8 @@ fn open(pid: u32, name: String) -> Option<ProcessRaw> {
         if is_selfhost(&name) {
             GetProcessHandleCount(handle, &mut handles);
         }
+        // Optional: a refusal leaves the counters at zero, which reads as idle.
+        GetProcessIoCounters(handle, &mut io);
         CloseHandle(handle);
         timed && sized
     };
@@ -318,6 +340,8 @@ fn open(pid: u32, name: String) -> Option<ProcessRaw> {
         working_set: memory.WorkingSetSize as u64,
         private: memory.PrivateUsage as u64,
         handles,
+        io_read: io.ReadTransferCount,
+        io_write: io.WriteTransferCount,
     })
 }
 

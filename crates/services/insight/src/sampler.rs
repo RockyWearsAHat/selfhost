@@ -5,12 +5,15 @@ use crate::{DiskSample, NetSample, PROCESSES_EVERY, ProcessSample, Sample};
 use std::collections::HashMap;
 use std::time::Instant;
 
-/// How many processes each ranking keeps, by CPU and by memory. Every selfhost
-/// process is kept on top of these.
+/// How many processes each ranking keeps, by CPU, by memory and by I/O. Every
+/// selfhost process is kept on top of these.
 const RANK: usize = 5;
 
 /// A process busier than this (in cores) is worth naming in the CPU ranking.
 const NOTICEABLE_CORES: f64 = 0.01;
+
+/// A process moving more than this (read plus write) is worth naming in the I/O ranking.
+const NOTICEABLE_IO_BPS: u64 = 256 * 1024;
 
 const MB: u64 = 1024 * 1024;
 
@@ -20,11 +23,19 @@ const MB: u64 = 1024 * 1024;
 pub struct Sampler {
     count: u64,
     previous: Option<Previous>,
-    previous_processes: Option<(Instant, CpuByProcess)>,
+    previous_processes: Option<(Instant, CountersByProcess)>,
 }
 
-/// CPU seconds so far, keyed by (pid, start time) so a reused PID is a new process.
-type CpuByProcess = HashMap<(u32, u64), f64>;
+/// CPU seconds and I/O bytes so far, keyed by (pid, start time) so a reused
+/// PID is a new process.
+type CountersByProcess = HashMap<(u32, u64), Counters>;
+
+#[derive(Clone, Copy, Default)]
+struct Counters {
+    cpu_secs: f64,
+    io_read: u64,
+    io_write: u64,
+}
 
 struct Previous {
     at: Instant,
@@ -101,13 +112,21 @@ impl Sampler {
         }
     }
 
-    /// The busiest and largest processes plus every selfhost one, with CPU as
-    /// cores used since the previous ranking. The first ranking only sets the
-    /// baseline: a lifetime CPU total is not a rate.
+    /// The busiest, largest and most I/O-heavy processes plus every selfhost
+    /// one, with CPU as cores and I/O as bytes per second since the previous
+    /// ranking. The first ranking only sets the baseline: a lifetime total is
+    /// not a rate.
     fn rank(&mut self, now: Instant, found: Vec<ProcessRaw>) -> Vec<ProcessSample> {
         let previous = self.previous_processes.replace((
             now,
-            found.iter().map(|process| ((process.pid, process.start), process.cpu_secs)).collect(),
+            found
+                .iter()
+                .map(|process| {
+                    let counters =
+                        Counters { cpu_secs: process.cpu_secs, io_read: process.io_read, io_write: process.io_write };
+                    ((process.pid, process.start), counters)
+                })
+                .collect(),
         ));
         let Some((then, before)) = previous else {
             return Vec::new();
@@ -119,15 +138,18 @@ impl Sampler {
         let mut all: Vec<ProcessSample> = found
             .into_iter()
             .map(|process| {
-                // A process born since the last ranking used all its CPU time in the window.
-                let used = process.cpu_secs - before.get(&(process.pid, process.start)).copied().unwrap_or(0.0);
+                // A process born since the last ranking did all its work in the window.
+                let then = before.get(&(process.pid, process.start)).copied().unwrap_or_default();
+                let per_sec = |now: u64, then: u64| (now.saturating_sub(then) as f64 / window).round() as u64;
                 ProcessSample {
                     pid: process.pid,
                     name: process.name,
-                    cpu_cores: (used / window).max(0.0),
+                    cpu_cores: ((process.cpu_secs - then.cpu_secs) / window).max(0.0),
                     working_set_mb: process.working_set / MB,
                     private_mb: process.private / MB,
                     handles: process.handles,
+                    io_read_bps: per_sec(process.io_read, then.io_read),
+                    io_write_bps: per_sec(process.io_write, then.io_write),
                 }
             })
             .collect();
@@ -136,6 +158,9 @@ impl Sampler {
         keep.extend(all.iter().take(RANK).filter(|p| p.cpu_cores >= NOTICEABLE_CORES).map(|p| p.pid));
         all.sort_by_key(|p| std::cmp::Reverse(p.working_set_mb));
         keep.extend(all.iter().take(RANK).map(|p| p.pid));
+        let io = |p: &ProcessSample| p.io_read_bps + p.io_write_bps;
+        all.sort_by_key(|p| std::cmp::Reverse(io(p)));
+        keep.extend(all.iter().take(RANK).filter(|p| io(p) >= NOTICEABLE_IO_BPS).map(|p| p.pid));
         all.retain(|process| keep.contains(&process.pid));
         all.sort_by(|a, b| b.cpu_cores.total_cmp(&a.cpu_cores));
         all
@@ -180,7 +205,17 @@ mod tests {
     }
 
     fn process(pid: u32, name: &str, cpu_secs: f64, working_set_mb: u64) -> ProcessRaw {
-        ProcessRaw { pid, start: 1, name: name.into(), cpu_secs, working_set: working_set_mb * MB, private: working_set_mb * MB, handles: 0 }
+        ProcessRaw {
+            pid,
+            start: 1,
+            name: name.into(),
+            cpu_secs,
+            working_set: working_set_mb * MB,
+            private: working_set_mb * MB,
+            handles: 0,
+            io_read: 0,
+            io_write: 0,
+        }
     }
 
     #[test]
@@ -233,5 +268,20 @@ mod tests {
         let ranked = sampler.derive(160, start + Duration::from_secs(60), reading(0, 0, 0, Some(idle))).processes;
         assert!(ranked.iter().any(|p| p.pid == 7316));
         assert_eq!(ranked.len(), 1 + RANK, "selfhost plus the top memory five; nobody is busy");
+    }
+
+    #[test]
+    fn a_small_process_moving_a_lot_of_data_is_ranked_by_its_io_rate() {
+        let mut sampler = Sampler::new();
+        let start = Instant::now();
+        let mut found: Vec<ProcessRaw> = (10..30).map(|pid| process(pid, "big.exe", 1.0, 100)).collect();
+        found.push(process(99, "copier.exe", 1.0, 1));
+        sampler.derive(100, start, reading(0, 0, 0, Some(found.clone())));
+        let copier = found.last_mut().unwrap();
+        (copier.io_read, copier.io_write) = (60 * MB, 30 * MB);
+        let ranked = sampler.derive(160, start + Duration::from_secs(60), reading(0, 0, 0, Some(found))).processes;
+        let copier = ranked.iter().find(|p| p.pid == 99).expect("the I/O-heavy process is kept");
+        assert_eq!((copier.io_read_bps, copier.io_write_bps), (MB, MB / 2));
+        assert_eq!(ranked.len(), 1 + RANK, "the top memory five plus the copier");
     }
 }

@@ -110,6 +110,11 @@ pub struct ProcessSample {
     pub private_mb: u64,
     /// Open handles, read for selfhost processes only (0 for others).
     pub handles: u32,
+    /// Bytes per second read through any I/O (files, sockets, devices) since
+    /// the previous ranking.
+    pub io_read_bps: u64,
+    /// Bytes per second written, likewise.
+    pub io_write_bps: u64,
 }
 
 /// One entry in the event timeline.
