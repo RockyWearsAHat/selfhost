@@ -3215,6 +3215,39 @@ mod tests {
         snapshot
     }
 
+    /// [`busy`] on a machine with something wrong: the HEALTH plate with a
+    /// problem, an hour of sparklines, DNS and a process ranking.
+    fn health() -> Snapshot {
+        use crate::state::{DnsWindow, HistorySample, Insight, InsightProblem, InsightProcess};
+        let mut snapshot = busy();
+        snapshot.insight = Some(Insight {
+            at_unix: 1_791_001_862,
+            condition: "warning".into(),
+            summary: "CPU 31%, memory 62%, commit 48%, C:\\ 412 GB free, DNS 412 queries, 0 failed in 5 min, 1 problem".into(),
+            problems: vec![InsightProblem {
+                id: "selfhost_busy:7316".into(),
+                title: "selfhost.exe (pid 7316) has used 1.02 cores for 2 minutes".into(),
+                since_unix: 1_791_001_742,
+            }],
+            cpu_pct: Some(31.0),
+            mem_pct: Some(62.5),
+            processes: vec![
+                InsightProcess { name: "selfhost.exe".into(), pid: 7316, cpu_cores: 1.02, working_set_mb: 23 },
+                InsightProcess { name: "game.exe".into(), pid: 9120, cpu_cores: 0.81, working_set_mb: 6144 },
+            ],
+            dns: Some(DnsWindow { queries: 412, failures: 0, slow: 3 }),
+        });
+        snapshot.history = (0..360)
+            .map(|step| HistorySample {
+                at_unix: 1_790_998_262 + step * 10,
+                cpu_pct: Some(20.0 + (step as f64 / 9.0).sin() * 12.0),
+                mem_pct: 60.0 + step as f64 / 180.0,
+                net_bps: 40_000 + (step % 30) * 9_000,
+            })
+            .collect();
+        snapshot
+    }
+
     /// A console that has been connected for a while.
     ///
     /// Everything the panes can show at once: a definition that has arrived,
@@ -3382,6 +3415,8 @@ mod tests {
         written("console-narrow", busy(), |_| {}, (560, 420));
         written("console-empty", Snapshot::default(), |_| {}, (1000, 660));
         written("console-alarmed", alarmed, |_| {}, (1000, 660));
+        written("console-health", health(), |_| {}, (1000, 660));
+        written("console-health-narrow", health(), |_| {}, (560, 420));
         written("console-reaching", reaching(), |_| {}, (1000, 660));
 
         // The three screens that bring the native console to parity with the
