@@ -378,13 +378,15 @@ const TOOLS: &[Tool] = &[
     ),
     (
         "insight_now",
-        "Call this FIRST when anything seems wrong; it answers what is wrong right now with evidence \
-         (problems, newest sample, top processes, DNS last 5 minutes).",
+        "Call this FIRST when anything seems wrong, or to prove things are fine: what is wrong on the \
+         machine right now, with evidence (open problems, the newest CPU/memory/disk/network sample, \
+         the top processes, and DNS over the last 5 minutes).",
         &[],
     ),
     (
         "insight_metrics",
-        "Show metrics over a time range: CPU, memory, disk, and network sampled at regular intervals.",
+        "Machine samples (CPU, memory, commit, disks, network; one per 10 s, thinned to at most 720) \
+         over a window. Default: the last hour. Kept for 7 days.",
         &[
             ("since", "Start of the range as a unix timestamp (seconds); optional.", false, Kind::Count),
             ("until", "End of the range as a unix timestamp (seconds); optional.", false, Kind::Count),
@@ -392,7 +394,9 @@ const TOOLS: &[Tool] = &[
     ),
     (
         "insight_events",
-        "Show events (alerts, changes, anomalies) over a time range.",
+        "The machine timeline over a window, oldest first: problems raised and cleared (warning, \
+         cleared), self-repairs (repair) and Windows System/Application errors (windows). Default: \
+         the last day. Kept for 30 days.",
         &[
             ("since", "Start of the range as a unix timestamp (seconds); optional.", false, Kind::Count),
             ("until", "End of the range as a unix timestamp (seconds); optional.", false, Kind::Count),
@@ -400,12 +404,14 @@ const TOOLS: &[Tool] = &[
     ),
     (
         "insight_dns",
-        "Show the resolver's statistics: queries, failures, and upstream performance.",
+        "The LAN DNS resolver's own report: counters (answered, cached, stale, SERVFAIL, dropped, \
+         loops), each upstream's latency and failures, and per-minute history.",
         &[],
     ),
     (
         "insight_processes",
-        "Show the top processes by CPU and memory right now.",
+        "The newest process ranking (once a minute): the busiest and largest processes plus every \
+         selfhost process, with CPU in cores, memory and handles.",
         &[],
     ),
     (
@@ -1207,14 +1213,9 @@ async fn call_tool(client: &RemoteClient, name: &str, arguments: &Json) -> Resul
             let answer = client.get("/api/insight/now").await?;
             Ok(answer.to_text())
         }
-        "insight_metrics" => {
-            let path = build_insight_metrics_path(arguments)?;
-            let answer = client.get(&path).await?;
-            Ok(answer.to_text())
-        }
-        "insight_events" => {
-            let path = build_insight_events_path(arguments)?;
-            let answer = client.get(&path).await?;
+        "insight_metrics" | "insight_events" => {
+            let route = if name == "insight_metrics" { "/api/insight/metrics" } else { "/api/insight/events" };
+            let answer = client.get(&insight_window_path(route, arguments)?).await?;
             Ok(answer.to_text())
         }
         "insight_dns" => {
@@ -1451,44 +1452,14 @@ fn decode_base64(text: &str) -> Result<Vec<u8>, String> {
     Ok(out)
 }
 
-/// Builds the path for insight_metrics with optional since and until query parameters.
-fn build_insight_metrics_path(arguments: &Json) -> Result<String, String> {
-    let mut path = String::from("/api/insight/metrics");
-    let since = count(arguments, "since")?;
-    let until = count(arguments, "until")?;
-    if since.is_some() || until.is_some() {
-        path.push('?');
-        if let Some(since_val) = since {
-            path.push_str(&format!("since={since_val}"));
-        }
-        if let Some(until_val) = until {
-            if since.is_some() {
-                path.push('&');
-            }
-            path.push_str(&format!("until={until_val}"));
-        }
-    }
-    Ok(path)
-}
-
-/// Builds the path for insight_events with optional since and until query parameters.
-fn build_insight_events_path(arguments: &Json) -> Result<String, String> {
-    let mut path = String::from("/api/insight/events");
-    let since = count(arguments, "since")?;
-    let until = count(arguments, "until")?;
-    if since.is_some() || until.is_some() {
-        path.push('?');
-        if let Some(since_val) = since {
-            path.push_str(&format!("since={since_val}"));
-        }
-        if let Some(until_val) = until {
-            if since.is_some() {
-                path.push('&');
-            }
-            path.push_str(&format!("until={until_val}"));
-        }
-    }
-    Ok(path)
+/// An insight route with the window the agent asked for, if any:
+/// `/api/insight/metrics?since=1&until=2`.
+fn insight_window_path(route: &str, arguments: &Json) -> Result<String, String> {
+    let bounds: Vec<String> = [("since", count(arguments, "since")?), ("until", count(arguments, "until")?)]
+        .into_iter()
+        .filter_map(|(name, value)| Some(format!("{name}={}", value?)))
+        .collect();
+    Ok(if bounds.is_empty() { route.to_owned() } else { format!("{route}?{}", bounds.join("&")) })
 }
 
 #[cfg(test)]
@@ -1771,37 +1742,11 @@ mod tests {
     }
 
     #[test]
-    fn insight_metrics_builds_query_string_with_since_and_until() {
-        let arguments = selfhost_json::parse(r#"{"since":1,"until":2}"#).unwrap();
-        let path = build_insight_metrics_path(&arguments).unwrap();
-        assert_eq!(path, "/api/insight/metrics?since=1&until=2");
-    }
-
-    #[test]
-    fn insight_metrics_builds_path_with_only_since() {
-        let arguments = selfhost_json::parse(r#"{"since":1}"#).unwrap();
-        let path = build_insight_metrics_path(&arguments).unwrap();
-        assert_eq!(path, "/api/insight/metrics?since=1");
-    }
-
-    #[test]
-    fn insight_metrics_builds_path_with_only_until() {
-        let arguments = selfhost_json::parse(r#"{"until":2}"#).unwrap();
-        let path = build_insight_metrics_path(&arguments).unwrap();
-        assert_eq!(path, "/api/insight/metrics?until=2");
-    }
-
-    #[test]
-    fn insight_metrics_builds_path_without_params() {
-        let arguments = selfhost_json::parse(r#"{}"#).unwrap();
-        let path = build_insight_metrics_path(&arguments).unwrap();
-        assert_eq!(path, "/api/insight/metrics");
-    }
-
-    #[test]
-    fn insight_events_builds_query_string_with_since_and_until() {
-        let arguments = selfhost_json::parse(r#"{"since":1,"until":2}"#).unwrap();
-        let path = build_insight_events_path(&arguments).unwrap();
-        assert_eq!(path, "/api/insight/events?since=1&until=2");
+    fn insight_windows_carry_only_the_bounds_given() {
+        let window = |arguments: &str| insight_window_path("/api/insight/metrics", &selfhost_json::parse(arguments).unwrap());
+        assert_eq!(window(r#"{"since":1,"until":2}"#).unwrap(), "/api/insight/metrics?since=1&until=2");
+        assert_eq!(window(r#"{"until":2}"#).unwrap(), "/api/insight/metrics?until=2");
+        assert_eq!(window("{}").unwrap(), "/api/insight/metrics");
+        assert!(window(r#"{"since":"yesterday"}"#).is_err());
     }
 }
