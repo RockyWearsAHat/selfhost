@@ -34,10 +34,11 @@
 
 use selfhost_config::{Config, Dns, RecordConfig, ZoneConfig, psl};
 use selfhost_dns::Resolver;
-use selfhost_mail::Dkim;
 use selfhost_dns::authority::{Authority, LanView};
+use selfhost_mail::Dkim;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use tokio::net::{TcpListener, UdpSocket};
 
 /// Builds the authority every DNS-serving path shares.
 ///
@@ -61,7 +62,10 @@ pub fn build_authority(
                 .iter()
                 .map(|domain| {
                     let pacc = pacc_digest(config, domain);
-                    (domain.clone(), mail.dns_records(domain, dkim.as_deref(), pacc.as_deref()))
+                    (
+                        domain.clone(),
+                        mail.dns_records(domain, dkim.as_deref(), pacc.as_deref()),
+                    )
                 })
                 .collect()
         }
@@ -95,7 +99,9 @@ fn pacc_digest(config: &Config, domain: &str) -> Option<String> {
 fn dkim_public(config: &Config, project_dir: &Path) -> Option<String> {
     let mail = config.mail.as_ref()?;
     let dkim = mail.dkim.as_ref()?;
-    let key_path = project_dir.join(&config.server.data_dir).join(&dkim.private_key);
+    let key_path = project_dir
+        .join(&config.server.data_dir)
+        .join(&dkim.private_key);
     match Dkim::load(&key_path) {
         Ok(key) => Some(key.public_txt()),
         Err(error) => {
@@ -150,7 +156,12 @@ fn with_synthesised_zones(config: &Config) -> Config {
     let mut augmented = config.clone();
     let zones = origins
         .into_iter()
-        .map(|domain| ZoneConfig { domain, soa: None, nameservers: Vec::new(), records: Vec::new() })
+        .map(|domain| ZoneConfig {
+            domain,
+            soa: None,
+            nameservers: Vec::new(),
+            records: Vec::new(),
+        })
         .collect();
     match &mut augmented.dns {
         Some(dns) => dns.zones = zones,
@@ -161,6 +172,8 @@ fn with_synthesised_zones(config: &Config) -> Config {
                 dynamic_ip: false,
                 lan_ip: None,
                 zones,
+                upstreams: vec!["1.1.1.1:53".into(), "9.9.9.9:53".into()],
+                serve_in_daemon: true,
             });
         }
     }
@@ -183,11 +196,67 @@ pub fn served_origins(config: &Config) -> Vec<String> {
         .map(|dns| {
             dns.zones
                 .into_iter()
-                .map(|zone| zone.domain.trim().trim_end_matches('.').to_ascii_lowercase())
+                .map(|zone| {
+                    zone.domain
+                        .trim()
+                        .trim_end_matches('.')
+                        .to_ascii_lowercase()
+                })
                 .filter(|origin| !origin.is_empty())
                 .collect()
         })
         .unwrap_or_default()
+}
+
+/// The upstreams a LAN peer's foreign question is forwarded to, in order.
+///
+/// The system resolver comes first: on this network it is the router, which
+/// answers from its own cache in single-digit milliseconds and was measured
+/// (2026-10-03, `docs/labs/insight-lab.dx`) not to forward the box's own
+/// questions back here. The configured `[dns] upstreams` follow, so a router
+/// hiccup fails over instead of becoming a SERVFAIL. Any address that is this
+/// machine is left out — forwarding to ourselves would answer every question
+/// with the question — and an empty list is refused rather than served.
+pub fn forward_upstreams(
+    config: &Config,
+    lan_ip: Ipv4Addr,
+    bind: SocketAddr,
+) -> Result<Vec<SocketAddr>, String> {
+    let is_this_machine = |upstream: &SocketAddr| {
+        upstream.port() == bind.port()
+            && (upstream.ip() == bind.ip()
+                || upstream.ip() == IpAddr::V4(lan_ip)
+                || upstream.ip().is_loopback())
+    };
+    let configured = config
+        .dns
+        .as_ref()
+        .map(|dns| dns.upstreams.clone())
+        .unwrap_or_default();
+    let mut upstreams = vec![Resolver::system().address()];
+    for text in &configured {
+        let upstream: SocketAddr = text
+            .parse()
+            .map_err(|error| format!("[dns] upstreams: {text:?} is not ip:port ({error})"))?;
+        upstreams.push(upstream);
+    }
+    let mut kept: Vec<SocketAddr> = Vec::new();
+    for upstream in upstreams {
+        if is_this_machine(&upstream) {
+            eprintln!("warning: dns upstream {upstream} is this machine; leaving it out");
+        } else if !kept.contains(&upstream) {
+            kept.push(upstream);
+        }
+    }
+    if kept.is_empty() {
+        return Err(
+            "no usable DNS upstream: every candidate is this machine.\n  Point this \
+                    machine's own network adapter at the router or a public resolver (for \
+                    example 1.1.1.1), or list one in [dns] upstreams, then re-run."
+                .to_owned(),
+        );
+    }
+    Ok(kept)
 }
 
 /// Serves split-horizon DNS for the LAN until interrupted.
@@ -197,27 +266,20 @@ pub fn served_origins(config: &Config) -> Vec<String> {
 /// enables the LAN view at `lan_ip` with the system resolver as upstream, and
 /// serves UDP and TCP on `bind`. Runs until a listener fails or Ctrl-C; the
 /// scheduled task restarts it on the next trigger.
+///
+/// Uses SO_REUSEADDR on the sockets to allow zero-drop handoff: a new instance
+/// can bind and prove it answers before the old one exits. After binding, writes
+/// this process's PID to a handoff file, then monitors it; if a different PID
+/// appears, stops accepting new packets and exits cleanly.
 pub async fn lan_dns_command(
     config: &Config,
     project_dir: &Path,
     lan_ip: Ipv4Addr,
     bind: SocketAddr,
 ) -> Result<(), String> {
-    let upstream = Resolver::system().address();
+    let augmented = with_synthesised_zones(config);
 
-    // Forwarding to ourselves would answer every question with the question.
-    if upstream.port() == bind.port()
-        && (upstream.ip() == bind.ip()
-            || upstream.ip() == IpAddr::V4(lan_ip)
-            || upstream.ip().is_loopback())
-    {
-        return Err(format!(
-            "the system resolver is {upstream}, which is this machine, so every query would \
-             be forwarded back here.\n  \
-             Point this machine's own network adapter at a public resolver (for example \
-             1.1.1.1), then re-run."
-        ));
-    }
+    let upstreams = forward_upstreams(&augmented, lan_ip, bind)?;
 
     // The public address the zones' records point at. Discovery can fail on a
     // flaky uplink; an explicit apex A in the config is the fallback, and the
@@ -228,13 +290,21 @@ pub async fn lan_dns_command(
         None => config_apex_a(config).unwrap_or(lan_ip),
     };
 
-    let augmented = with_synthesised_zones(config);
     let authority = build_authority(&augmented, project_dir, Some(public_ip));
-    authority.set_lan(LanView { lan_ip, upstream });
+    authority.set_lan(LanView {
+        lan_ip,
+        upstreams: upstreams.clone(),
+    });
 
     println!("selfhost split-horizon DNS");
     println!("  bind      {bind}");
-    println!("  upstream  {upstream}");
+    for (i, upstream) in upstreams.iter().enumerate() {
+        if i == 0 {
+            println!("  upstream  {upstream}");
+        } else {
+            println!("  upstream  {upstream} (failover)");
+        }
+    }
     println!("  lan ip    {lan_ip} (answers for LAN peers)");
     println!("  public ip {public_ip} (answers for everyone else)");
     let origins = authority.origins().await;
@@ -249,9 +319,109 @@ pub async fn lan_dns_command(
     println!("Public peers: zone names answer authoritatively; everything else is refused.");
     println!("Ctrl-C to stop.\n");
 
+    // Bind UDP and TCP with SO_REUSEADDR set so new instances can bind alongside
+    // old ones during zero-drop handoff.
+    let udp = bind_udp_with_reuse(bind).map_err(|e| {
+        format!(
+            "cannot bind {bind} (UDP): {e}\n  \
+         This usually means port 53 needs privilege or something is already listening.\n  \
+         On macOS that is usually a VPN client or Internet Sharing."
+        )
+    })?;
+    let tcp = bind_tcp_with_reuse(bind).map_err(|e| {
+        format!(
+            "cannot bind {bind} (TCP): {e}\n  \
+         This usually means port 53 needs privilege or something is already listening.\n  \
+         On macOS that is usually a VPN client or Internet Sharing."
+        )
+    })?;
+
+    println!("{} [dns] bound with SO_REUSEADDR", selfhost_dns::stamp());
+
+    // Serve first, then prove. Port 53 is shared with any instance being
+    // replaced, so a query sent from here could be answered by either process;
+    // this process's own counters are the only honest proof. The handoff is
+    // claimed once they show real answers, and the old instance drains only
+    // then. A failing new instance leaves while the old one, which never
+    // stopped, keeps serving: rollback is simply not taking over.
+    let data_dir = project_dir.join(&config.server.data_dir);
+    let serving = authority.serve_with_sockets(udp, tcp);
+    tokio::pin!(serving);
     tokio::select! {
-        result = authority.serve(bind) => result.map_err(|error| bind_hint(bind, error)),
+        result = &mut serving => return result.map_err(|error| bind_hint(bind, error)),
+        _ = tokio::signal::ctrl_c() => return Ok(()),
+        verdict = await_proof(&authority, &data_dir) => {
+            if let Proof::Failing { lan, answered } = verdict {
+                return Err(format!(
+                    "{answered} of {lan} LAN queries answered; leaving DNS to the running instance"
+                ));
+            }
+        }
+    }
+
+    let this_pid =
+        write_handoff(&data_dir).map_err(|e| format!("could not write handoff file: {e}"))?;
+    println!(
+        "{} [dns] answering real queries; claimed the handoff as PID {this_pid}",
+        selfhost_dns::stamp()
+    );
+    selfhost_dns::writer::spawn_stats_writer(authority.clone(), &data_dir, "lan-dns").await;
+
+    // Serve until interrupted, or until a newer instance proves itself and claims the handoff.
+    tokio::select! {
+        result = &mut serving => result.map_err(|error| bind_hint(bind, error)),
         _ = tokio::signal::ctrl_c() => Ok(()),
+        _ = watch_handoff(this_pid, &data_dir) => {
+            eprintln!("{} [dns] a newer instance took over; exiting", selfhost_dns::stamp());
+            Ok(())
+        }
+    }
+}
+
+/// Answers this process must give before it claims the handoff.
+const PROOF_ANSWERS: u64 = 3;
+
+/// LAN queries seen before a mostly-failing instance gives up.
+const PROOF_SAMPLE: u64 = 20;
+
+/// What this process's own counters say about whether it serves correctly.
+#[derive(Debug, PartialEq, Eq)]
+enum Proof {
+    /// Not enough traffic yet to tell.
+    Pending,
+    /// Enough real answers: safe to take over.
+    Proven,
+    /// Most LAN queries failed: do not take over.
+    Failing { lan: u64, answered: u64 },
+}
+
+fn judge(counters: &selfhost_dns::telemetry::GlobalCounters) -> Proof {
+    let answered = counters.zone + counters.cache_hit + counters.forwarded + counters.stale;
+    if answered >= PROOF_ANSWERS {
+        Proof::Proven
+    } else if counters.lan >= PROOF_SAMPLE && answered * 2 < counters.lan {
+        Proof::Failing {
+            lan: counters.lan,
+            answered,
+        }
+    } else {
+        Proof::Pending
+    }
+}
+
+/// Waits until this process has proven itself, or has shown it is failing
+/// while another instance holds the handoff. With no other instance (a fresh
+/// boot) a failing verdict keeps waiting: leaving would take DNS away entirely.
+async fn await_proof(authority: &Authority, data_dir: &Path) -> Proof {
+    let this_pid = std::process::id();
+    let mut tick = tokio::time::interval(std::time::Duration::from_secs(1));
+    loop {
+        tick.tick().await;
+        match judge(&authority.telemetry_snapshot("lan-dns").counters) {
+            Proof::Pending => {}
+            Proof::Failing { .. } if should_keep_serving(this_pid, read_handoff(data_dir)) => {}
+            verdict => return verdict,
+        }
     }
 }
 
@@ -286,6 +456,119 @@ fn bind_hint(bind: SocketAddr, error: selfhost_dns::authority::DnsError) -> Stri
             )
         }
         _ => format!("LAN DNS stopped: {error}"),
+    }
+}
+
+/// Binds a UDP socket with SO_REUSEADDR set so multiple instances can bind the
+/// same address on Windows; on Unix also sets SO_REUSEPORT so multiple
+/// processes can bind the same address.
+fn bind_udp_with_reuse(bind: SocketAddr) -> std::io::Result<UdpSocket> {
+    use socket2::Socket;
+
+    let socket = match bind {
+        SocketAddr::V4(_) => Socket::new(socket2::Domain::IPV4, socket2::Type::DGRAM, None)?,
+        SocketAddr::V6(_) => Socket::new(socket2::Domain::IPV6, socket2::Type::DGRAM, None)?,
+    };
+
+    // Enable SO_REUSEADDR so a new instance can bind alongside a running one on Windows;
+    // on Unix also set SO_REUSEPORT so multiple processes can bind the same address.
+    socket.set_reuse_address(true)?;
+    #[cfg(unix)]
+    socket.set_reuse_port(true)?;
+
+    // Bind the socket, then set it to non-blocking so tokio can use it.
+    socket.bind(&bind.into())?;
+    socket.set_nonblocking(true)?;
+
+    // Convert the socket2::Socket into a std::net::UdpSocket, then into tokio's.
+    let std_socket = std::net::UdpSocket::from(socket);
+    UdpSocket::from_std(std_socket)
+}
+
+/// Binds a TCP listener with SO_REUSEADDR set so multiple instances can bind
+/// the same address on Windows; on Unix also sets SO_REUSEPORT so multiple
+/// processes can bind the same address. Uses socket2 to configure the socket
+/// before binding, then converts it to a tokio TcpListener.
+fn bind_tcp_with_reuse(bind: SocketAddr) -> std::io::Result<TcpListener> {
+    use socket2::Socket;
+
+    let socket = match bind {
+        SocketAddr::V4(_) => Socket::new(socket2::Domain::IPV4, socket2::Type::STREAM, None)?,
+        SocketAddr::V6(_) => Socket::new(socket2::Domain::IPV6, socket2::Type::STREAM, None)?,
+    };
+
+    // Enable SO_REUSEADDR so a new instance can bind alongside a running one on Windows;
+    // on Unix also set SO_REUSEPORT so multiple processes can bind the same address.
+    socket.set_reuse_address(true)?;
+    #[cfg(unix)]
+    socket.set_reuse_port(true)?;
+
+    // Bind the socket, then set it to non-blocking so tokio can use it.
+    socket.bind(&bind.into())?;
+    socket.listen(128)?;
+    socket.set_nonblocking(true)?;
+
+    // Convert the socket2::Socket into a std::net::TcpListener, then into tokio's.
+    let std_socket = std::net::TcpListener::from(socket);
+    TcpListener::from_std(std_socket)
+}
+
+/// Path to the handoff coordination file, where the current DNS process PID is
+/// stored for other instances to detect when a new process has taken over.
+fn handoff_file(data_dir: &Path) -> PathBuf {
+    data_dir.join("dns-handoff")
+}
+
+/// Writes this process's PID to the handoff file, signaling that this instance
+/// is now serving DNS. Returns the written PID for verification.
+fn write_handoff(data_dir: &Path) -> std::io::Result<u32> {
+    use std::fs;
+
+    let pid = std::process::id();
+    let content = pid.to_string();
+    fs::write(handoff_file(data_dir), &content)?;
+    Ok(pid)
+}
+
+/// Reads the current PID from the handoff file. Returns None if the file doesn't
+/// exist or is unreadable, and None if the contents are not a valid PID.
+fn read_handoff(data_dir: &Path) -> Option<u32> {
+    use std::fs;
+
+    fs::read_to_string(handoff_file(data_dir))
+        .ok()?
+        .trim()
+        .parse()
+        .ok()
+}
+
+/// Decides whether this process should keep serving DNS or hand off to a new
+/// instance. Pure function: given this process's PID and the PID in the handoff
+/// file, returns true if serving should continue, false if this instance should
+/// drain and exit.
+fn should_keep_serving(this_pid: u32, file_pid: Option<u32>) -> bool {
+    match file_pid {
+        None => true,                         // File missing: no handoff yet, keep serving.
+        Some(pid) if pid == this_pid => true, // Same PID: keep serving.
+        Some(_) => false,                     // Different PID: hand off.
+    }
+}
+
+/// Monitors the handoff file every 2 seconds and signals when a new DNS process
+/// has taken over. Returns immediately if the handoff is detected, otherwise
+/// returns when interrupted.
+async fn watch_handoff(this_pid: u32, data_dir: &Path) {
+    let mut interval = tokio::time::interval(std::time::Duration::from_secs(2));
+    loop {
+        interval.tick().await;
+        let file_pid = read_handoff(data_dir);
+        if !should_keep_serving(this_pid, file_pid) {
+            eprintln!(
+                "{} [dns] handoff detected: new DNS process is taking over",
+                selfhost_dns::stamp()
+            );
+            break;
+        }
     }
 }
 
@@ -326,7 +609,11 @@ mod tests {
                 admin_bind: "127.0.0.1:9191".into(),
                 firewall: Firewall::default(),
             },
-            nodes: vec![Node { name: "home".into(), role: Role::Owner, mesh_ip: None }],
+            nodes: vec![Node {
+                name: "home".into(),
+                role: Role::Owner,
+                mesh_ip: None,
+            }],
             sites,
             dns,
             mail: None,
@@ -349,6 +636,40 @@ mod tests {
             .into_iter()
             .map(|zone| zone.domain)
             .collect()
+    }
+
+    fn counters(
+        lan: u64,
+        forwarded: u64,
+        servfail: u64,
+    ) -> selfhost_dns::telemetry::GlobalCounters {
+        selfhost_dns::telemetry::GlobalCounters {
+            queries: lan,
+            lan,
+            forwarded,
+            servfail,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn the_handoff_waits_for_real_answers() {
+        assert_eq!(judge(&counters(0, 0, 0)), Proof::Pending);
+        assert_eq!(judge(&counters(2, 2, 0)), Proof::Pending);
+        assert_eq!(judge(&counters(3, 3, 0)), Proof::Proven);
+        // A trickle of failures is not yet a verdict either way.
+        assert_eq!(judge(&counters(19, 0, 19)), Proof::Pending);
+    }
+
+    #[test]
+    fn a_mostly_failing_instance_does_not_take_over() {
+        assert_eq!(
+            judge(&counters(20, 2, 18)),
+            Proof::Failing {
+                lan: 20,
+                answered: 2
+            }
+        );
     }
 
     #[test]
@@ -381,7 +702,10 @@ mod tests {
     fn ip_literals_and_localhost_synthesise_no_zone() {
         // An IP needs no resolving and `localhost` has no registrable domain;
         // both would be config typos amplified into a LAN-wide fault.
-        let config = config_with(vec![site(&["192.168.1.8", "localhost", "real.example.com"])], None);
+        let config = config_with(
+            vec![site(&["192.168.1.8", "localhost", "real.example.com"])],
+            None,
+        );
         assert_eq!(zone_origins(&config), vec!["example.com"]);
     }
 
@@ -398,9 +722,113 @@ mod tests {
                 nameservers: vec![],
                 records: vec![],
             }],
+            upstreams: vec!["1.1.1.1:53".into(), "9.9.9.9:53".into()],
+            serve_in_daemon: true,
         };
         // The site domain does NOT grow a zone: the operator's [dns] wins.
         let config = config_with(vec![site(&["other.net"])], Some(dns));
         assert_eq!(zone_origins(&config), vec!["chosen.example"]);
+    }
+
+    #[test]
+    fn handoff_decision_fn_keeps_serving_with_same_pid() {
+        let this_pid = 1234;
+        assert!(
+            should_keep_serving(this_pid, Some(1234)),
+            "should keep serving with same PID"
+        );
+    }
+
+    #[test]
+    fn handoff_decision_fn_stops_serving_with_different_pid() {
+        let this_pid = 1234;
+        assert!(
+            !should_keep_serving(this_pid, Some(5678)),
+            "should stop serving with different PID"
+        );
+    }
+
+    #[test]
+    fn handoff_decision_fn_keeps_serving_with_missing_file() {
+        let this_pid = 1234;
+        assert!(
+            should_keep_serving(this_pid, None),
+            "should keep serving when file is missing"
+        );
+    }
+
+    #[tokio::test]
+    async fn reuse_address_allows_binding_same_port_twice() {
+        use std::net::IpAddr;
+
+        let addr = SocketAddr::new(IpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 1)), 0);
+
+        // First bind: the OS gives us an ephemeral port
+        let first_socket = bind_udp_with_reuse(addr).expect("first bind");
+        let bound_addr = first_socket.local_addr().expect("get local addr");
+
+        // Second bind: with SO_REUSEADDR, we can bind to the same port immediately
+        // (this would fail without SO_REUSEADDR on most systems, or take 60+ seconds)
+        let second_socket = bind_udp_with_reuse(bound_addr).expect("second bind to same port");
+        let second_bound_addr = second_socket.local_addr().expect("get second local addr");
+
+        // Both sockets bound to the same address
+        assert_eq!(bound_addr, second_bound_addr);
+    }
+
+    #[tokio::test]
+    async fn tcp_reuse_address_allows_binding_same_port_twice() {
+        use std::net::IpAddr;
+
+        let addr = SocketAddr::new(IpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 1)), 0);
+
+        // First bind: the OS gives us an ephemeral port
+        let first_listener = bind_tcp_with_reuse(addr).expect("first bind");
+        let bound_addr = first_listener.local_addr().expect("get local addr");
+
+        // Second bind: with SO_REUSEADDR, we can bind to the same port immediately
+        let second_listener = bind_tcp_with_reuse(bound_addr).expect("second bind to same port");
+        let second_bound_addr = second_listener.local_addr().expect("get second local addr");
+
+        // Both listeners bound to the same address
+        assert_eq!(bound_addr, second_bound_addr);
+    }
+
+    #[tokio::test]
+    async fn handoff_file_can_be_written_and_read() {
+        use std::fs;
+
+        // Use a temporary directory path without actually creating tempfile crate dependency
+        let base_dir =
+            std::path::PathBuf::from(format!("/tmp/selfhost-dns-test-{}", std::process::id()));
+        let _ = fs::create_dir_all(&base_dir);
+
+        let this_pid = std::process::id();
+        let written_pid = write_handoff(&base_dir).expect("write handoff");
+        assert_eq!(written_pid, this_pid);
+
+        let read_pid = read_handoff(&base_dir);
+        assert_eq!(read_pid, Some(this_pid));
+
+        // Cleanup
+        let _ = fs::remove_dir_all(&base_dir);
+    }
+
+    #[tokio::test]
+    async fn handoff_file_returns_none_when_missing() {
+        use std::fs;
+
+        // Use a non-existent temporary directory path
+        let base_dir = std::path::PathBuf::from(format!(
+            "/tmp/selfhost-dns-test-missing-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&base_dir); // Ensure it doesn't exist
+
+        let read_pid = read_handoff(&base_dir);
+        assert_eq!(
+            read_pid, None,
+            "should return None for missing handoff file"
+        );
     }
 }

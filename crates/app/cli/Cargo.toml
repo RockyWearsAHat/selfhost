@@ -52,6 +52,8 @@ tokio-rustls = { workspace = true }
 webpki-roots = { workspace = true }
 # `selfhost init-owner`'s password prompt, no echo, on a real terminal.
 rpassword = { workspace = true }
+# SO_REUSEADDR for the zero-drop LAN DNS handoff.
+socket2 = { workspace = true }
 
 [dev-dependencies]
 # `test-util` only, and only for tests: the kill switch's requirement is that an

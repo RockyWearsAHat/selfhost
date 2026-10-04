@@ -1278,17 +1278,19 @@ async fn serve_everything(
     // silently not listening, so the domain and its mail stop resolving with no
     // sign why. Better to fail loudly at startup than to look healthy and be deaf.
     let dns = match config.dns.as_ref() {
-        Some(_) => {
+        Some(dns_config) if dns_config.serve_in_daemon => {
             let public_ip = doctor::discover_public_ip().await;
             let authority = lan_dns::build_authority(&config, &project_dir, public_ip);
             enable_lan_view_if_configured(&authority, &config);
             Some(authority)
         }
-        None => None,
+        _ => None,
     };
     let dns_bind: Option<SocketAddr> = match config.dns.as_ref() {
-        Some(dns) => Some(dns.bind.parse().map_err(|e| format!("dns.bind {}: {e}", dns.bind))?),
-        None => None,
+        Some(dns) if dns.serve_in_daemon => {
+            Some(dns.bind.parse().map_err(|e| format!("dns.bind {}: {e}", dns.bind))?)
+        }
+        _ => None,
     };
     if let (Some(authority), Some(bind), Some(dns_config)) =
         (dns.as_ref(), dns_bind, config.dns.as_ref())
@@ -1514,7 +1516,13 @@ async fn serve_everything(
         config_now,
     ));
     if let Some(authority) = dns.clone() {
-        tokio::spawn(readopt_zones(authority, config_changes.clone(), project_dir.clone()));
+        tokio::spawn(readopt_zones(authority.clone(), config_changes.clone(), project_dir.clone()));
+        // Spawn the telemetry writer task for the daemon.
+        let authority_for_telemetry = authority.clone();
+        let data_dir_for_telemetry = data_dir.clone();
+        tokio::spawn(async move {
+            selfhost_dns::writer::spawn_stats_writer(authority_for_telemetry, &data_dir_for_telemetry, "daemon").await;
+        });
     }
 
     let certificates = CertificateStore::open(&data_dir).map_err(|e| e.to_string())?;
@@ -1868,7 +1876,7 @@ async fn track_wan_ip_if_enabled(dns: Option<Authority>, config: &Config) {
     let Some(authority) = dns else {
         return std::future::pending().await;
     };
-    let dynamic = config.dns.as_ref().is_some_and(|dns| dns.dynamic_ip);
+    let dynamic = config.dns.as_ref().is_some_and(|dns| dns.serve_in_daemon && dns.dynamic_ip);
     if !dynamic {
         return std::future::pending().await;
     }
@@ -2117,10 +2125,17 @@ fn enable_lan_view_if_configured(authority: &Authority, config: &Config) {
         return;
     };
     match lan_ip.parse() {
-        Ok(lan_ip) => authority.set_lan(selfhost_dns::authority::LanView {
-            lan_ip,
-            upstream: selfhost_dns::Resolver::system().address(),
-        }),
+        Ok(lan_ip) => {
+            let bind = config
+                .dns
+                .as_ref()
+                .and_then(|dns| dns.bind.parse().ok())
+                .unwrap_or_else(|| SocketAddr::from(([0, 0, 0, 0], 53)));
+            match lan_dns::forward_upstreams(config, lan_ip, bind) {
+                Ok(upstreams) => authority.set_lan(selfhost_dns::authority::LanView { lan_ip, upstreams }),
+                Err(error) => eprintln!("warning: {error}; serving the public view to every peer"),
+            }
+        }
         Err(error) => eprintln!(
             "warning: [dns].lan_ip {lan_ip} is not an IPv4 address ({error}); \
              serving the public view to every peer"
