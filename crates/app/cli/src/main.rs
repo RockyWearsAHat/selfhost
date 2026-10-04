@@ -2125,10 +2125,17 @@ fn enable_lan_view_if_configured(authority: &Authority, config: &Config) {
         return;
     };
     match lan_ip.parse() {
-        Ok(lan_ip) => authority.set_lan(selfhost_dns::authority::LanView {
-            lan_ip,
-            upstreams: vec![selfhost_dns::Resolver::system().address()],
-        }),
+        Ok(lan_ip) => {
+            let bind = config
+                .dns
+                .as_ref()
+                .and_then(|dns| dns.bind.parse().ok())
+                .unwrap_or_else(|| SocketAddr::from(([0, 0, 0, 0], 53)));
+            match lan_dns::forward_upstreams(config, lan_ip, bind) {
+                Ok(upstreams) => authority.set_lan(selfhost_dns::authority::LanView { lan_ip, upstreams }),
+                Err(error) => eprintln!("warning: {error}; serving the public view to every peer"),
+            }
+        }
         Err(error) => eprintln!(
             "warning: [dns].lan_ip {lan_ip} is not an IPv4 address ({error}); \
              serving the public view to every peer"

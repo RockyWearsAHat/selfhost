@@ -184,10 +184,7 @@ pub fn decide(fault: bool, consecutive: u32, escalated: bool) -> Response {
     if consecutive >= MAX_ATTEMPTS {
         return Response::Escalate { after: consecutive };
     }
-    Response::Repair {
-        attempt: consecutive + 1,
-        settle: backoff(SETTLE_BASE, consecutive),
-    }
+    Response::Repair { attempt: consecutive + 1, settle: backoff(SETTLE_BASE, consecutive) }
 }
 
 /// What one component's history looks like to the loop.
@@ -244,17 +241,11 @@ impl Supervision {
             let since = *watch.serving_since.get_or_insert(now);
             // The budget refills only after a real stretch of service. A repair
             // that appeared to work is not evidence — see the module docs.
-            watch
-                .failures
-                .note_uptime(now.saturating_duration_since(since), HEALTHY_WINDOW);
+            watch.failures.note_uptime(now.saturating_duration_since(since), HEALTHY_WINDOW);
             if watch.failures.consecutive() == 0 {
                 watch.escalated = false;
             }
-            return Observed {
-                response: Response::Rest,
-                newly_faulted: false,
-                recovered,
-            };
+            return Observed { response: Response::Rest, newly_faulted: false, recovered };
         }
 
         let newly_faulted = !watch.faulted;
@@ -267,11 +258,7 @@ impl Supervision {
             Response::Escalate { .. } => watch.escalated = true,
             Response::Rest | Response::Silent => {}
         }
-        Observed {
-            response,
-            newly_faulted,
-            recovered: false,
-        }
+        Observed { response, newly_faulted, recovered: false }
     }
 }
 
@@ -311,6 +298,7 @@ impl Event {
             Self::DriftRepaired => "drift-repaired",
         }
     }
+
 }
 
 /// One line of the repair record.
@@ -404,12 +392,7 @@ impl Entry {
                 _ => {}
             }
         }
-        Some(Self {
-            at_unix,
-            component,
-            event: event?,
-            detail,
-        })
+        Some(Self { at_unix, component, event: event?, detail })
     }
 }
 
@@ -426,10 +409,8 @@ fn unescape_field(raw: &str) -> String {
     while index < bytes.len() {
         let byte = bytes[index];
         let hex = bytes.get(index + 1..index + 3);
-        match (
-            byte,
-            hex.and_then(|hex| u8::from_str_radix(&String::from_utf8_lossy(hex), 16).ok()),
-        ) {
+        match (byte, hex.and_then(|hex| u8::from_str_radix(&String::from_utf8_lossy(hex), 16).ok()))
+        {
             (b'%', Some(decoded)) => {
                 out.push(decoded);
                 index += 3;
@@ -456,9 +437,7 @@ pub struct Ledger {
 impl Ledger {
     /// The ledger inside a deployment's data directory.
     pub fn in_dir(data_dir: &Path) -> Self {
-        Self {
-            path: data_dir.join(LEDGER_FILENAME),
-        }
+        Self { path: data_dir.join(LEDGER_FILENAME) }
     }
 
     /// Where it is, so an operator can be told rather than made to guess.
@@ -477,10 +456,7 @@ impl Ledger {
         if let Some(parent) = self.path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        let mut file = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&self.path)?;
+        let mut file = std::fs::OpenOptions::new().create(true).append(true).open(&self.path)?;
         writeln!(file, "{}", entry.line())
     }
 
@@ -583,14 +559,7 @@ impl ConvergeLoop {
         }
 
         for probe in health::probe_all(config, project_dir).await {
-            handle(
-                &mut self.supervision,
-                &self.ledger,
-                config,
-                project_dir,
-                probe,
-            )
-            .await;
+            handle(&mut self.supervision, &self.ledger, config, project_dir, probe).await;
         }
     }
 }
@@ -608,16 +577,10 @@ async fn handle(
     let observed = supervision.observe(component, probe.serving.is_fault(), Instant::now());
 
     if observed.recovered {
-        record(
-            ledger,
-            Entry::now(component, Event::Recovered, probe.detail.clone()),
-        );
+        record(ledger, Entry::now(component, Event::Recovered, probe.detail.clone()));
     }
     if observed.newly_faulted {
-        record(
-            ledger,
-            Entry::now(component, Event::Fault, probe.detail.clone()),
-        );
+        record(ledger, Entry::now(component, Event::Fault, probe.detail.clone()));
     }
 
     match observed.response {
@@ -658,9 +621,7 @@ async fn handle(
                         (Err(error), _) => Entry::now(
                             component,
                             Event::StillFailing,
-                            format!(
-                                "attempt {attempt} of {MAX_ATTEMPTS}: restarting {what} failed: {error}"
-                            ),
+                            format!("attempt {attempt} of {MAX_ATTEMPTS}: restarting {what} failed: {error}"),
                         ),
                         (Ok(()), Serving::Yes) => Entry::now(
                             component,
@@ -697,17 +658,9 @@ fn record(ledger: &Ledger, entry: Entry) {
     // appended to `data/selfhost-daemon.log` by the keep-alive wrapper — so a
     // repair appears both in the ledger a tool reads and in the log a person
     // tails during an incident.
-    println!(
-        "converge: {} {} — {}",
-        entry.component,
-        entry.event.as_str(),
-        entry.detail
-    );
+    println!("converge: {} {} — {}", entry.component, entry.event.as_str(), entry.detail);
     if let Err(error) = ledger.append(&entry) {
-        eprintln!(
-            "warning: could not write {}: {error}",
-            ledger.path().display()
-        );
+        eprintln!("warning: could not write {}: {error}", ledger.path().display());
     }
 }
 
@@ -774,9 +727,9 @@ pub fn repair_for(component: Component, config: &Config) -> Repair {
                 },
             }
         }
-        Component::Http | Component::Https | Component::ControlApi => Repair::Unavailable {
-            because: "handled above".to_owned(),
-        },
+        Component::Http | Component::Https | Component::ControlApi => {
+            Repair::Unavailable { because: "handled above".to_owned() }
+        }
     }
 }
 
@@ -816,10 +769,9 @@ async fn check_registration_drift(ledger: &Ledger) {
             // Not `StillFailing`: on launchd and systemd this refusal is
             // deliberate — see `repair_settings` — and recording it as a failed
             // repair would read as something having been tried and gone wrong.
-            Err(error) => record(
-                ledger,
-                Entry::about(&audit.label, Event::Drift, format!("not repaired: {error}")),
-            ),
+            Err(error) => {
+                record(ledger, Entry::about(&audit.label, Event::Drift, format!("not repaired: {error}")))
+            }
         }
     }
 }
@@ -847,11 +799,7 @@ mod tests {
                 admin_bind: "127.0.0.1:9191".into(),
                 firewall: Firewall::default(),
             },
-            nodes: vec![Node {
-                name: "home".into(),
-                role: Role::Owner,
-                mesh_ip: None,
-            }],
+            nodes: vec![Node { name: "home".into(), role: Role::Owner, mesh_ip: None }],
             sites: Vec::new(),
             dns: None,
             mail: None,
@@ -884,12 +832,7 @@ mod tests {
                 "attempt {attempt} should still be tried"
             );
         }
-        assert_eq!(
-            decide(true, MAX_ATTEMPTS, false),
-            Response::Escalate {
-                after: MAX_ATTEMPTS
-            }
-        );
+        assert_eq!(decide(true, MAX_ATTEMPTS, false), Response::Escalate { after: MAX_ATTEMPTS });
         assert_eq!(decide(true, 400, false), Response::Escalate { after: 400 });
     }
 
@@ -931,14 +874,8 @@ mod tests {
                 Response::Rest => panic!("a dead component must not be rested on"),
             }
         }
-        assert_eq!(
-            repairs, MAX_ATTEMPTS,
-            "the repair budget is spent exactly once"
-        );
-        assert_eq!(
-            escalations, 1,
-            "and the escalation is recorded exactly once"
-        );
+        assert_eq!(repairs, MAX_ATTEMPTS, "the repair budget is spent exactly once");
+        assert_eq!(escalations, 1, "and the escalation is recorded exactly once");
     }
 
     #[test]
@@ -964,16 +901,12 @@ mod tests {
             // Alternating: broken, then serving briefly, then broken again.
             let now = start + PASS_INTERVAL * pass;
             let fault = pass % 2 == 0;
-            if let Response::Repair { .. } =
-                supervision.observe(Component::Dns, fault, now).response
+            if let Response::Repair { .. } = supervision.observe(Component::Dns, fault, now).response
             {
                 repairs += 1;
             }
         }
-        assert_eq!(
-            repairs, MAX_ATTEMPTS,
-            "flapping must escalate, not restart forever"
-        );
+        assert_eq!(repairs, MAX_ATTEMPTS, "flapping must escalate, not restart forever");
     }
 
     #[test]
@@ -988,9 +921,7 @@ mod tests {
         supervision.observe(Component::Dns, false, start + PASS_INTERVAL * 3);
         assert!(
             matches!(
-                supervision
-                    .observe(Component::Dns, true, start + PASS_INTERVAL * 4)
-                    .response,
+                supervision.observe(Component::Dns, true, start + PASS_INTERVAL * 4).response,
                 Response::Repair { attempt: 3, .. }
             ),
             "two minutes of service must not wipe two failures"
@@ -1001,9 +932,7 @@ mod tests {
         supervision.observe(Component::Dns, false, later);
         supervision.observe(Component::Dns, false, later + HEALTHY_WINDOW);
         assert!(matches!(
-            supervision
-                .observe(Component::Dns, true, later + HEALTHY_WINDOW * 2)
-                .response,
+            supervision.observe(Component::Dns, true, later + HEALTHY_WINDOW * 2).response,
             Response::Repair { attempt: 1, .. }
         ));
     }
@@ -1018,24 +947,17 @@ mod tests {
             supervision.observe(Component::Dns, true, start + PASS_INTERVAL * pass);
         }
         assert_eq!(
-            supervision
-                .observe(Component::Dns, true, start + PASS_INTERVAL * 9)
-                .response,
+            supervision.observe(Component::Dns, true, start + PASS_INTERVAL * 9).response,
             Response::Silent,
             "it has been given up on"
         );
 
         let base = start + PASS_INTERVAL * 10;
         let recovery = supervision.observe(Component::Dns, false, base);
-        assert!(
-            recovery.recovered,
-            "the moment it came back is worth a line"
-        );
+        assert!(recovery.recovered, "the moment it came back is worth a line");
         supervision.observe(Component::Dns, false, base + HEALTHY_WINDOW);
         assert!(matches!(
-            supervision
-                .observe(Component::Dns, true, base + HEALTHY_WINDOW * 2)
-                .response,
+            supervision.observe(Component::Dns, true, base + HEALTHY_WINDOW * 2).response,
             Response::Repair { attempt: 1, .. }
         ));
     }
@@ -1050,9 +972,7 @@ mod tests {
             supervision.observe(Component::Dns, true, start + PASS_INTERVAL * pass);
         }
         assert_eq!(
-            supervision
-                .observe(Component::Dns, true, start + PASS_INTERVAL * 9)
-                .response,
+            supervision.observe(Component::Dns, true, start + PASS_INTERVAL * 9).response,
             Response::Silent
         );
         assert!(matches!(
@@ -1087,10 +1007,7 @@ mod tests {
         };
         let line = entry.line();
         assert_eq!(line.lines().count(), 1, "{line}");
-        assert_eq!(
-            Entry::parse(&line).map(|parsed| parsed.detail),
-            Some(entry.detail)
-        );
+        assert_eq!(Entry::parse(&line).map(|parsed| parsed.detail), Some(entry.detail));
     }
 
     #[test]
@@ -1098,10 +1015,7 @@ mod tests {
         assert_eq!(Entry::parse(""), None);
         assert_eq!(Entry::parse("selfhost-audit/1 id=abc at=1"), None);
         // Ours, but with no event word this build knows.
-        assert_eq!(
-            Entry::parse("selfhost-repair/1 at=1 component=dns event=danced"),
-            None
-        );
+        assert_eq!(Entry::parse("selfhost-repair/1 at=1 component=dns event=danced"), None);
     }
 
     #[test]
@@ -1117,18 +1031,10 @@ mod tests {
         ledger
             .append(&Entry::now(Component::Dns, Event::Escalated, "gave up"))
             .expect("the ledger is writable");
-        assert_eq!(
-            ledger.outstanding().len(),
-            1,
-            "an unresolved escalation is reported"
-        );
+        assert_eq!(ledger.outstanding().len(), 1, "an unresolved escalation is reported");
 
         ledger
-            .append(&Entry::now(
-                Component::Dns,
-                Event::Recovered,
-                "answering again",
-            ))
+            .append(&Entry::now(Component::Dns, Event::Recovered, "answering again"))
             .expect("the ledger is writable");
         assert!(
             ledger.outstanding().is_empty(),
@@ -1210,30 +1116,16 @@ mod tests {
             probe.detail
         );
         for _ in 0..200 {
-            handle(
-                &mut supervision,
-                &ledger,
-                &config,
-                Path::new("."),
-                probe.clone(),
-            )
-            .await;
+            handle(&mut supervision, &ledger, &config, Path::new("."), probe.clone()).await;
         }
 
         assert!(
             ledger.entries().is_empty(),
             "supervision must have nothing to say about a component this deployment never \
              declared, and said: {:?}",
-            ledger
-                .entries()
-                .iter()
-                .map(|entry| entry.line())
-                .collect::<Vec<_>>()
+            ledger.entries().iter().map(|entry| entry.line()).collect::<Vec<_>>()
         );
-        assert!(
-            ledger.outstanding().is_empty(),
-            "and must never escalate one"
-        );
+        assert!(ledger.outstanding().is_empty(), "and must never escalate one");
         let _ = std::fs::remove_dir_all(&directory);
     }
 
@@ -1248,9 +1140,8 @@ mod tests {
         // DNS in-process, and there is no separate task to restart — so what is
         // being asserted is the *bound and the record*, with no service manager
         // touched, which is exactly what makes this runnable on any machine.
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("an ephemeral loopback port");
+        let listener =
+            tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("an ephemeral loopback port");
         let silent = listener.local_addr().expect("a bound address").port();
         drop(listener);
 
@@ -1262,7 +1153,7 @@ mod tests {
             dynamic_ip: false,
             lan_ip: None,
             zones: Vec::new(),
-            upstreams: vec!["1.1.1.1:53".into(), "9.9.9.9:53".into()],
+            upstreams: Vec::new(),
             serve_in_daemon: true,
         });
 
@@ -1273,22 +1164,11 @@ mod tests {
         let probe = health::probe(Component::Dns, &config, Path::new(".")).await;
         assert_eq!(probe.serving, Serving::No, "{}", probe.detail);
         for _ in 0..20 {
-            handle(
-                &mut supervision,
-                &ledger,
-                &config,
-                Path::new("."),
-                probe.clone(),
-            )
-            .await;
+            handle(&mut supervision, &ledger, &config, Path::new("."), probe.clone()).await;
         }
 
         let count = |event: Event| {
-            ledger
-                .entries()
-                .into_iter()
-                .filter(|entry| entry.event == event)
-                .count()
+            ledger.entries().into_iter().filter(|entry| entry.event == event).count()
         };
         assert_eq!(count(Event::Fault), 1, "the moment it broke, once");
         assert_eq!(
@@ -1296,16 +1176,8 @@ mod tests {
             MAX_ATTEMPTS as usize,
             "the repair budget is spent, and only once"
         );
-        assert_eq!(
-            count(Event::Escalated),
-            1,
-            "and the giving-up is recorded, loudly and once"
-        );
-        assert_eq!(
-            ledger.outstanding().len(),
-            1,
-            "`doctor` must report this as a failure"
-        );
+        assert_eq!(count(Event::Escalated), 1, "and the giving-up is recorded, loudly and once");
+        assert_eq!(ledger.outstanding().len(), 1, "`doctor` must report this as a failure");
         let _ = std::fs::remove_dir_all(&directory);
     }
 
@@ -1320,12 +1192,9 @@ mod tests {
             dynamic_ip: false,
             lan_ip: None,
             zones: Vec::new(),
-            upstreams: vec!["1.1.1.1:53".into(), "9.9.9.9:53".into()],
+            upstreams: Vec::new(),
             serve_in_daemon: true,
         });
-        assert!(matches!(
-            repair_for(Component::Dns, &config),
-            Repair::Unavailable { .. }
-        ));
+        assert!(matches!(repair_for(Component::Dns, &config), Repair::Unavailable { .. }));
     }
 }

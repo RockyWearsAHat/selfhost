@@ -38,7 +38,6 @@ use crate::zone::Zone;
 use selfhost_config::{Config, RecordConfig};
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -106,13 +105,9 @@ struct Inner {
     /// is ever forwarded.
     lan: OnceLock<LanView>,
     /// Count of total receive/accept errors encountered. Incremented on every
-    /// error; the server continues regardless so DNS is never interrupted.
-    recv_error_count: AtomicU64,
     /// Semaphore bounding in-flight forwards to MAX_IN_FLIGHT_FORWARDS.
     /// When at capacity, new forwards answer SERVFAIL immediately.
     forward_limit: Semaphore,
-    /// Count of forwards dropped due to semaphore being at capacity.
-    dropped_forwards: AtomicU64,
     /// Cache for upstream DNS answers on the LAN forward path.
     forward_cache: DnsCache,
     /// Telemetry: DNS query statistics and upstream tracking.
@@ -125,9 +120,7 @@ impl Inner {
             zones: Mutex::new(zones),
             public_ip: Mutex::new(public_ip),
             lan: OnceLock::new(),
-            recv_error_count: AtomicU64::new(0),
             forward_limit: Semaphore::new(MAX_IN_FLIGHT_FORWARDS),
-            dropped_forwards: AtomicU64::new(0),
             forward_cache: DnsCache::new(),
             telemetry: Telemetry::new(),
         }
@@ -200,8 +193,7 @@ impl Authority {
                 dns.zones
                     .iter()
                     .map(|zone_config| {
-                        let mut zone =
-                            Zone::from_config(zone_config, &dns.secondaries, public_ip);
+                        let mut zone = Zone::from_config(zone_config, &dns.secondaries, public_ip);
                         if zone_config.records.is_empty() {
                             if let Some((_, records)) = mail_records
                                 .iter()
@@ -237,11 +229,17 @@ impl Authority {
         let datagram = Arc::new(
             UdpSocket::bind(bind)
                 .await
-                .map_err(|source| DnsError::Bind { address: bind, source })?,
+                .map_err(|source| DnsError::Bind {
+                    address: bind,
+                    source,
+                })?,
         );
         let stream = TcpListener::bind(bind)
             .await
-            .map_err(|source| DnsError::Bind { address: bind, source })?;
+            .map_err(|source| DnsError::Bind {
+                address: bind,
+                source,
+            })?;
 
         tokio::try_join!(self.serve_udp(datagram), self.serve_tcp(stream))?;
         Ok(())
@@ -276,7 +274,10 @@ impl Authority {
                         // delivered is indistinguishable, from a client's side, from
                         // one we never received. Log the failure so that gap closes.
                         if let Err(error) = socket.send_to(&answer, from).await {
-                            eprintln!("{} [dns] {from}: reply send failed: {error}", crate::time::stamp());
+                            eprintln!(
+                                "{} [dns] {from}: reply send failed: {error}",
+                                crate::time::stamp()
+                            );
                         }
                     });
                 }
@@ -284,15 +285,11 @@ impl Authority {
                     // Receive error: count it, log it, continue. Every error is
                     // per-packet; the server must never stop answering because of
                     // a client disconnect or kernel error.
-                    self.0.recv_error_count.fetch_add(1, Ordering::Relaxed);
                     self.0.telemetry.record_recv_error();
                     eprintln!("{} [dns] udp recv error: {error}", crate::time::stamp());
-                    consecutive_errors += 1;
-
-                    // After 32 consecutive errors, backoff briefly to avoid spinning
-                    // the CPU on a persistent error.
-                    if consecutive_errors >= 32 {
-                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    consecutive_errors = consecutive_errors.saturating_add(1);
+                    if let Some(pause) = receive_backoff(consecutive_errors) {
+                        tokio::time::sleep(pause).await;
                     }
                 }
             }
@@ -315,15 +312,11 @@ impl Authority {
                     // Accept error: count it, log it, continue. Every error is
                     // per-connection; the server must never stop accepting because of
                     // a client disconnect or kernel error.
-                    self.0.recv_error_count.fetch_add(1, Ordering::Relaxed);
                     self.0.telemetry.record_recv_error();
                     eprintln!("{} [dns] tcp accept error: {error}", crate::time::stamp());
-                    consecutive_errors += 1;
-
-                    // After 32 consecutive errors, backoff briefly to avoid spinning
-                    // the CPU on a persistent error.
-                    if consecutive_errors >= 32 {
-                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    consecutive_errors = consecutive_errors.saturating_add(1);
+                    if let Some(pause) = receive_backoff(consecutive_errors) {
+                        tokio::time::sleep(pause).await;
                     }
                 }
             }
@@ -333,10 +326,15 @@ impl Authority {
     /// Serves one TCP connection, message by message, until the client hangs up.
     async fn serve_connection(&self, mut client: TcpStream, peer: IpAddr) -> io::Result<()> {
         loop {
-            let Some(raw) = read_message(&mut client).await? else { return Ok(()) };
+            let Some(raw) = read_message(&mut client).await? else {
+                return Ok(());
+            };
             let answer = self.handle_query(&raw, true, peer).await;
             if let Err(error) = write_message(&mut client, &answer).await {
-                eprintln!("{} [dns] {peer}: reply write failed: {error}", crate::time::stamp());
+                eprintln!(
+                    "{} [dns] {peer}: reply write failed: {error}",
+                    crate::time::stamp()
+                );
                 return Err(error);
             }
         }
@@ -383,15 +381,32 @@ impl Authority {
         // without holding it — the updater must be able to write meanwhile.
         let zone = {
             let zones = self.0.zones.lock().await;
-            zones.iter().find(|zone| zone.contains(&query.name)).cloned()
+            zones
+                .iter()
+                .find(|zone| zone.contains(&query.name))
+                .cloned()
         };
 
-        // Check cache for LAN forward queries before the main dispatch.
+        // A LAN peer's foreign question is answered from the cache when it holds
+        // a fresh answer that fits the asker's UDP buffer; anything larger goes
+        // upstream with the asker's own EDNS size.
         if let (None, Some(_view)) = (&zone, &lan) {
-            if let Some(cached) = self.0.forward_cache.lookup(&query.name, query.record_type, query.id)
+            if let Some(cached) = self
+                .0
+                .forward_cache
+                .lookup(&query.name, query.record_type, query.id)
+                .filter(|cached| over_tcp || cached.len() <= crate::cache::udp_payload_limit(raw))
             {
                 self.0.telemetry.record_cache_hit();
-                log_query(peer, &query.name, query.record_type, over_tcp, started.elapsed(), &cached, &self.0.telemetry);
+                log_query(
+                    peer,
+                    &query.name,
+                    query.record_type,
+                    over_tcp,
+                    started.elapsed(),
+                    &cached,
+                    &self.0.telemetry,
+                );
                 return cached;
             }
         }
@@ -400,7 +415,11 @@ impl Authority {
             (Some(_), Some(view)) => {
                 self.0.telemetry.record_zone();
                 let public = *self.0.public_ip.lock().await;
-                respond(&query, Some(&lan_horizon(zone.clone().unwrap(), public, view.lan_ip)), over_tcp)
+                respond(
+                    &query,
+                    Some(&lan_horizon(zone.clone().unwrap(), public, view.lan_ip)),
+                    over_tcp,
+                )
             }
             (Some(_), None) => {
                 self.0.telemetry.record_zone();
@@ -420,12 +439,17 @@ impl Authority {
                         // Cache successful answers; serve stale if all fail.
                         if let Some(ref resp) = answer {
                             self.0.telemetry.record_forwarded();
-                            self.0.forward_cache.insert(&query.name, query.record_type, resp);
+                            self.0
+                                .forward_cache
+                                .insert(&query.name, query.record_type, resp);
                             resp.clone()
                         } else {
                             // All upstreams failed. Try to serve stale.
-                            if let Some(stale) = self.0.forward_cache.lookup_stale(&query.name, query.record_type, query.id)
-                            {
+                            if let Some(stale) = self.0.forward_cache.lookup_stale(
+                                &query.name,
+                                query.record_type,
+                                query.id,
+                            ) {
                                 self.0.telemetry.record_stale();
                                 stale
                             } else {
@@ -444,7 +468,6 @@ impl Authority {
                     }
                     Err(_) => {
                         // Semaphore at capacity: count as dropped and answer SERVFAIL.
-                        self.0.dropped_forwards.fetch_add(1, Ordering::Relaxed);
                         self.0.telemetry.record_dropped();
                         self.0.telemetry.record_servfail();
                         wire::encode_response(
@@ -466,7 +489,15 @@ impl Authority {
             self.0.telemetry.record_slow();
         }
 
-        log_query(peer, &query.name, query.record_type, over_tcp, elapsed, &answer, &self.0.telemetry);
+        log_query(
+            peer,
+            &query.name,
+            query.record_type,
+            over_tcp,
+            elapsed,
+            &answer,
+            &self.0.telemetry,
+        );
         answer
     }
 
@@ -505,8 +536,9 @@ impl Authority {
         let carried: Vec<Zone> = fresh
             .into_iter()
             .map(|mut zone| {
-                if let Some(running) =
-                    zones.iter().find(|old| old.origin.eq_ignore_ascii_case(&zone.origin))
+                if let Some(running) = zones
+                    .iter()
+                    .find(|old| old.origin.eq_ignore_ascii_case(&zone.origin))
                 {
                     zone.soa.serial = zone.soa.serial.max(running.soa.serial).saturating_add(1);
                 }
@@ -525,15 +557,26 @@ impl Authority {
     /// a secondary ignore the change. Called by the dynamic-IP updater.
     pub async fn set_apex_a(&self, origin: &str, address: Ipv4Addr) -> Option<u32> {
         let mut zones = self.0.zones.lock().await;
-        let zone = zones.iter_mut().find(|zone| zone.origin.eq_ignore_ascii_case(origin))?;
+        let zone = zones
+            .iter_mut()
+            .find(|zone| zone.origin.eq_ignore_ascii_case(origin))?;
 
         let apex = zone.origin.clone();
-        let is_apex_a =
-            |record: &Record| record.name.eq_ignore_ascii_case(&apex) && matches!(record.data, RecordData::A(_));
-        let ttl = zone.records.iter().find(|record| is_apex_a(record)).map_or(DEFAULT_A_TTL, |record| record.ttl);
+        let is_apex_a = |record: &Record| {
+            record.name.eq_ignore_ascii_case(&apex) && matches!(record.data, RecordData::A(_))
+        };
+        let ttl = zone
+            .records
+            .iter()
+            .find(|record| is_apex_a(record))
+            .map_or(DEFAULT_A_TTL, |record| record.ttl);
 
         zone.records.retain(|record| !is_apex_a(record));
-        zone.records.push(Record { name: apex, ttl, data: RecordData::A(address) });
+        zone.records.push(Record {
+            name: apex,
+            ttl,
+            data: RecordData::A(address),
+        });
         // Saturating, never wrapping: a serial that wrapped past u32::MAX to 0
         // would go *backwards*, and a secondary silently ignores a zone whose
         // serial decreased — the exact failure this whole design guards against.
@@ -569,11 +612,21 @@ impl Authority {
         let mut zones = self.0.zones.lock().await;
         let zone = zones.iter_mut().find(|zone| zone.contains(&owner))?;
 
-        let matches = |record: &Record| record.name.eq_ignore_ascii_case(&owner) && record_kind(&record.data) == kind;
-        let ttl = zone.records.iter().find(|record| matches(record)).map_or(DEFAULT_A_TTL, |record| record.ttl);
+        let matches = |record: &Record| {
+            record.name.eq_ignore_ascii_case(&owner) && record_kind(&record.data) == kind
+        };
+        let ttl = zone
+            .records
+            .iter()
+            .find(|record| matches(record))
+            .map_or(DEFAULT_A_TTL, |record| record.ttl);
 
         zone.records.retain(|record| !matches(record));
-        zone.records.push(Record { name: owner, ttl, data });
+        zone.records.push(Record {
+            name: owner,
+            ttl,
+            data,
+        });
         zone.soa.serial = zone.soa.serial.saturating_add(1);
         Some(zone.soa.serial)
     }
@@ -592,7 +645,9 @@ impl Authority {
         let zone = zones.iter_mut().find(|zone| zone.contains(&owner))?;
 
         let before = zone.records.len();
-        zone.records.retain(|record| !(record.name.eq_ignore_ascii_case(&owner) && record_kind(&record.data) == rtype));
+        zone.records.retain(|record| {
+            !(record.name.eq_ignore_ascii_case(&owner) && record_kind(&record.data) == rtype)
+        });
         if zone.records.len() == before {
             return None;
         }
@@ -609,14 +664,19 @@ impl Authority {
     pub async fn zone_for(&self, name: &str) -> Option<String> {
         let owner = normalize_name(name);
         let zones = self.0.zones.lock().await;
-        zones.iter().find(|zone| zone.contains(&owner)).map(|zone| zone.origin.clone())
+        zones
+            .iter()
+            .find(|zone| zone.contains(&owner))
+            .map(|zone| zone.origin.clone())
     }
 
     /// A snapshot of one zone as wire records — SOA, NS, then the rest — for a
     /// secondary bootstrap and for the doctor. `None` if the zone is not served.
     pub async fn export(&self, origin: &str) -> Option<Vec<Record>> {
         let zones = self.0.zones.lock().await;
-        let zone = zones.iter().find(|zone| zone.origin.eq_ignore_ascii_case(origin))?;
+        let zone = zones
+            .iter()
+            .find(|zone| zone.origin.eq_ignore_ascii_case(origin))?;
         let mut out = Vec::with_capacity(zone.records.len() + zone.nameservers.len() + 1);
         out.push(zone.soa_record());
         out.extend(zone.ns_records());
@@ -635,7 +695,13 @@ impl Authority {
 
     /// The origins served, for startup logging and the doctor.
     pub async fn origins(&self) -> Vec<String> {
-        self.0.zones.lock().await.iter().map(|zone| zone.origin.clone()).collect()
+        self.0
+            .zones
+            .lock()
+            .await
+            .iter()
+            .map(|zone| zone.origin.clone())
+            .collect()
     }
 
     /// Returns a telemetry snapshot of DNS statistics.
@@ -690,7 +756,11 @@ fn populate_claimed_hosts(zone: &mut Zone, config: &Config, public_ip: Option<Ip
             }
         }
     }
-    if mail.domains.iter().any(|domain| domain.eq_ignore_ascii_case(&zone.origin)) {
+    if mail
+        .domains
+        .iter()
+        .any(|domain| domain.eq_ignore_ascii_case(&zone.origin))
+    {
         let origin = zone.origin.clone();
         for (service, port, target) in [
             ("_imaps._tcp", 993, format!("imap.{origin}")),
@@ -700,7 +770,12 @@ fn populate_claimed_hosts(zone: &mut Zone, config: &Config, public_ip: Option<Ip
             zone.records.push(Record {
                 name: format!("{service}.{origin}"),
                 ttl: DEFAULT_A_TTL,
-                data: RecordData::Srv { priority: 0, weight: 1, port, target },
+                data: RecordData::Srv {
+                    priority: 0,
+                    weight: 1,
+                    port,
+                    target,
+                },
             });
         }
     }
@@ -734,76 +809,66 @@ fn is_lan_peer(peer: IpAddr) -> bool {
     }
 }
 
-/// Hedged failover forwarding to a list of upstreams.
+/// How long a serve loop pauses after its `consecutive`-th receive error in a row.
 ///
-/// Tries upstreams in order: the first is given UPSTREAM_ATTEMPT_TIMEOUT, and
-/// if it doesn't answer by then, the next is tried (while still listening to the
-/// first). Takes whichever answers first. An upstream that answers with SERVFAIL
-/// or REFUSED is considered failed and the next is tried. Total timeout is
-/// UPSTREAM_TOTAL_TIMEOUT regardless of how many upstreams are tried.
-/// Returns `Some(answer)` on success, or `None` if all fail or timeout.
+/// A receive error is per-packet — on Windows a client that gave up before our
+/// reply arrived turns into `os error 10054` on the *next* receive — so the loop
+/// never stops for one. But an error that repeats without end (a dead adapter)
+/// would otherwise spin a core, so after 32 in a row each further one pauses.
+fn receive_backoff(consecutive: u32) -> Option<Duration> {
+    (consecutive >= 32).then_some(Duration::from_millis(10))
+}
+
+/// Failover forwarding to a list of upstreams, in order.
+///
+/// Each upstream gets [`UPSTREAM_ATTEMPT_TIMEOUT`], or whatever is left of
+/// [`UPSTREAM_TOTAL_TIMEOUT`] if that is less; an upstream that times out,
+/// errors, or answers SERVFAIL/REFUSED hands the question to the next. The
+/// whole exchange stays under the total so the client gets an answer (or our
+/// SERVFAIL, or a stale answer) before its own retry fires and its port closes
+/// — a reply that arrives after that is what produced the ICMP unreachable
+/// behind `os error 10054` (insight lab F13). Attempts run one at a time on
+/// this task: nothing is spawned, so nothing outlives the answer, and the
+/// socket count is bounded by the in-flight semaphore alone.
+/// Returns `Some(answer)` on success, or `None` if every upstream failed.
 async fn forward(raw: &[u8], upstreams: &[SocketAddr], over_tcp: bool) -> Option<Vec<u8>> {
-    if upstreams.is_empty() {
-        return None;
-    }
-
     let start = Instant::now();
-    let mut pending_tasks = Vec::new();
-
-    for (idx, upstream) in upstreams.iter().enumerate() {
-        // Calculate delay before starting this upstream's attempt.
-        // The first starts immediately, the second after ~700ms, etc.
-        let delay = Duration::from_millis(700 * idx as u64);
-        if start.elapsed() + delay >= UPSTREAM_TOTAL_TIMEOUT {
-            // Already out of time for this upstream.
+    for upstream in upstreams {
+        let remaining = UPSTREAM_TOTAL_TIMEOUT.saturating_sub(start.elapsed());
+        if remaining.is_zero() {
             break;
         }
-
-        let raw_copy = raw.to_vec();
-        let upstream = *upstream;
-        let task = tokio::spawn(async move {
-            // Wait before attempting (for hedging).
-            if delay > Duration::ZERO {
-                tokio::time::sleep(delay).await;
-            }
-
-            // Attempt to reach this upstream with per-attempt timeout.
-            try_upstream(&raw_copy, upstream, over_tcp).await
-        });
-        pending_tasks.push(task);
-    }
-
-    // Wait for the first successful answer or total timeout.
-    let remaining = UPSTREAM_TOTAL_TIMEOUT.saturating_sub(start.elapsed());
-    let mut result = None;
-    let _ = tokio::time::timeout(remaining, async {
-        for task in pending_tasks {
-            if let Ok(Some(answer)) = task.await {
-                // Check if this is a failure response code.
-                if !is_failure_response(&answer) {
-                    result = Some(answer);
-                    break;
-                }
+        let attempt = remaining.min(UPSTREAM_ATTEMPT_TIMEOUT);
+        if let Some(answer) = try_upstream(raw, *upstream, over_tcp, attempt).await {
+            if !is_failure_response(&answer) {
+                return Some(answer);
             }
         }
-    })
-    .await;
-
-    result
+    }
+    None
 }
 
 /// Attempts to reach one upstream resolver.
 ///
 /// Returns the raw answer on success, or `None` if the connection failed,
 /// the query timed out, or the response could not be read.
-async fn try_upstream(raw: &[u8], upstream: SocketAddr, over_tcp: bool) -> Option<Vec<u8>> {
+async fn try_upstream(
+    raw: &[u8],
+    upstream: SocketAddr,
+    over_tcp: bool,
+    deadline: Duration,
+) -> Option<Vec<u8>> {
     let exchange = async {
         if over_tcp {
             let mut server = TcpStream::connect(upstream).await.ok()?;
             write_message(&mut server, raw).await.ok()?;
             read_message(&mut server).await.ok().flatten()
         } else {
-            let bind = if upstream.is_ipv4() { "0.0.0.0:0" } else { "[::]:0" };
+            let bind = if upstream.is_ipv4() {
+                "0.0.0.0:0"
+            } else {
+                "[::]:0"
+            };
             let socket = UdpSocket::bind(bind).await.ok()?;
             socket.send_to(raw, upstream).await.ok()?;
             let mut buffer = vec![0_u8; MAX_UDP];
@@ -812,7 +877,7 @@ async fn try_upstream(raw: &[u8], upstream: SocketAddr, over_tcp: bool) -> Optio
             Some(buffer)
         }
     };
-    tokio::time::timeout(UPSTREAM_ATTEMPT_TIMEOUT, exchange)
+    tokio::time::timeout(deadline, exchange)
         .await
         .ok()
         .flatten()
@@ -843,7 +908,10 @@ fn respond(query: &Query, zone: Option<&Zone>, over_tcp: bool) -> Vec<u8> {
     };
 
     let (code, answers, authority, additional) = resolve(zone, query);
-    let flags = ResponseFlags { authoritative: true, truncated: false };
+    let flags = ResponseFlags {
+        authoritative: true,
+        truncated: false,
+    };
     let message = wire::encode_response(query, code, flags, &answers, &authority, &additional);
 
     if over_tcp || message.len() <= MAX_UDP_RESPONSE {
@@ -853,7 +921,10 @@ fn respond(query: &Query, zone: Option<&Zone>, over_tcp: bool) -> Vec<u8> {
     // Too large for UDP: drop the answers and set TC so the client retries over
     // TCP. If the remaining sections still overflow, clear them too — a truncated
     // datagram must be guaranteed to fit.
-    let truncated = ResponseFlags { authoritative: true, truncated: true };
+    let truncated = ResponseFlags {
+        authoritative: true,
+        truncated: true,
+    };
     let cut = wire::encode_response(query, code, truncated, &[], &authority, &additional);
     if cut.len() <= MAX_UDP_RESPONSE {
         cut
@@ -909,7 +980,11 @@ fn resolve(zone: &Zone, query: &Query) -> (ResponseCode, Vec<Record>, Vec<Record
 
     // Empty answer: name exists → NODATA; name absent → NXDOMAIN. Both carry the
     // SOA so the negative answer caches for the zone's minimum TTL.
-    let code = if zone.name_exists(name) { ResponseCode::NoError } else { ResponseCode::NameError };
+    let code = if zone.name_exists(name) {
+        ResponseCode::NoError
+    } else {
+        ResponseCode::NameError
+    };
     (code, Vec::new(), vec![zone.soa_record()], Vec::new())
 }
 
@@ -930,8 +1005,10 @@ fn glue(zone: &Zone, records: &[Record]) -> Vec<Record> {
         if !zone.contains(target) {
             continue;
         }
-        let addresses =
-            zone.answer(target, RecordType::A).into_iter().chain(zone.answer(target, RecordType::Aaaa));
+        let addresses = zone
+            .answer(target, RecordType::A)
+            .into_iter()
+            .chain(zone.answer(target, RecordType::Aaaa));
         for address in addresses {
             if !out.contains(&address) {
                 out.push(address);
@@ -959,7 +1036,15 @@ fn glue(zone: &Zone, records: &[Record]) -> Vec<Record> {
 /// it simply took too long for a caller with a tight inline timeout — the
 /// live case this was added for was a DKIM lookup Gmail marked "no key" in
 /// the same second this line recorded a correct answer.
-fn log_query(peer: IpAddr, name: &str, qtype: RecordType, over_tcp: bool, elapsed: Duration, answer: &[u8], _telemetry: &Telemetry) {
+fn log_query(
+    peer: IpAddr,
+    name: &str,
+    qtype: RecordType,
+    over_tcp: bool,
+    elapsed: Duration,
+    answer: &[u8],
+    _telemetry: &Telemetry,
+) {
     let transport = transport_label(over_tcp);
     let ms = elapsed.as_millis();
 
@@ -995,7 +1080,10 @@ fn transport_label(over_tcp: bool) -> &'static str {
 
 /// Flags for a reply that is not authoritative and not truncated (REFUSED, FORMERR).
 fn plain_flags() -> ResponseFlags {
-    ResponseFlags { authoritative: false, truncated: false }
+    ResponseFlags {
+        authoritative: false,
+        truncated: false,
+    }
 }
 
 /// An owner name in the form the zone stores: lowercased, no trailing dot.
@@ -1029,9 +1117,25 @@ fn record_kind(data: &RecordData) -> RecordType {
 /// Echoes the id if the first two bytes are readable so the client can match the
 /// reply to its query; falls back to id 0 when even that is missing.
 fn format_error(raw: &[u8]) -> Vec<u8> {
-    let id = if raw.len() >= 2 { u16::from_be_bytes([raw[0], raw[1]]) } else { 0 };
-    let query = Query { id, name: String::new(), record_type: RecordType::A, recursion_desired: false };
-    wire::encode_response(&query, ResponseCode::FormatError, plain_flags(), &[], &[], &[])
+    let id = if raw.len() >= 2 {
+        u16::from_be_bytes([raw[0], raw[1]])
+    } else {
+        0
+    };
+    let query = Query {
+        id,
+        name: String::new(),
+        record_type: RecordType::A,
+        recursion_desired: false,
+    };
+    wire::encode_response(
+        &query,
+        ResponseCode::FormatError,
+        plain_flags(),
+        &[],
+        &[],
+        &[],
+    )
 }
 
 /// Reads one length-prefixed DNS message, or `None` at a clean end of stream.
@@ -1049,8 +1153,12 @@ async fn read_message(stream: &mut TcpStream) -> io::Result<Option<Vec<u8>>> {
 
 /// Writes one length-prefixed DNS message.
 async fn write_message(stream: &mut TcpStream, message: &[u8]) -> io::Result<()> {
-    let length = u16::try_from(message.len())
-        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "DNS message exceeds 65535 bytes"))?;
+    let length = u16::try_from(message.len()).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "DNS message exceeds 65535 bytes",
+        )
+    })?;
     stream.write_all(&length.to_be_bytes()).await?;
     stream.write_all(message).await
 }
@@ -1087,18 +1195,33 @@ mod tests {
             records: vec![
                 record("example.com", RecordData::A(PUBLIC)),
                 record("www.example.com", RecordData::A(PUBLIC)),
-                record("example.com", RecordData::Mx { preference: 10, exchange: "mail.example.com".to_owned() }),
+                record(
+                    "example.com",
+                    RecordData::Mx {
+                        preference: 10,
+                        exchange: "mail.example.com".to_owned(),
+                    },
+                ),
                 record("ns1.example.com", RecordData::A(PUBLIC)),
             ],
         }
     }
 
     fn record(name: &str, data: RecordData) -> Record {
-        Record { name: name.to_owned(), ttl: 3600, data }
+        Record {
+            name: name.to_owned(),
+            ttl: 3600,
+            data,
+        }
     }
 
     fn ask(name: &str, record_type: RecordType) -> Query {
-        Query { id: 0x1234, name: name.to_owned(), record_type, recursion_desired: true }
+        Query {
+            id: 0x1234,
+            name: name.to_owned(),
+            record_type,
+            recursion_desired: true,
+        }
     }
 
     /// The AA bit out of a raw response's flags byte.
@@ -1122,15 +1245,24 @@ mod tests {
         // proxy within seconds and was unknown to DNS until a restart.
         let running = serving(vec![example_zone()]);
         let mut grown = example_zone();
-        grown.records.push(record("new.example.com", RecordData::A(PUBLIC)));
+        grown
+            .records
+            .push(record("new.example.com", RecordData::A(PUBLIC)));
 
-        assert_eq!(running.adopt(&serving(vec![grown])).await, vec!["example.com".to_owned()]);
+        assert_eq!(
+            running.adopt(&serving(vec![grown])).await,
+            vec!["example.com".to_owned()]
+        );
 
         let raw = wire::encode_query(0x1234, "new.example.com", RecordType::A).unwrap();
         let message = running.handle_query(&raw, false, WAN_PEER).await;
         let response = wire::decode_response(&message).unwrap();
         assert_eq!(response.code, ResponseCode::NoError);
-        assert_eq!(response.first_a(), Some(PUBLIC), "the new host resolves without a restart");
+        assert_eq!(
+            response.first_a(),
+            Some(PUBLIC),
+            "the new host resolves without a restart"
+        );
     }
 
     #[tokio::test]
@@ -1141,7 +1273,9 @@ mod tests {
         // ignores a zone whose serial decreased, so the change would publish to
         // nobody and say nothing about it.
         let running = serving(vec![example_zone()]);
-        let climbed = running.set_apex_a("example.com", Ipv4Addr::new(203, 0, 113, 99)).await;
+        let climbed = running
+            .set_apex_a("example.com", Ipv4Addr::new(203, 0, 113, 99))
+            .await;
         let climbed = climbed.expect("the zone is served");
 
         let mut rebuilt = example_zone();
@@ -1149,7 +1283,10 @@ mod tests {
         running.adopt(&serving(vec![rebuilt])).await;
 
         let serial = running.0.zones.lock().await[0].soa.serial;
-        assert!(serial > climbed, "adopted serial {serial} must exceed the running {climbed}");
+        assert!(
+            serial > climbed,
+            "adopted serial {serial} must exceed the running {climbed}"
+        );
     }
 
     #[tokio::test]
@@ -1158,7 +1295,10 @@ mod tests {
         assert!(running.adopt(&serving(Vec::new())).await.is_empty());
         let raw = wire::encode_query(0x1234, "example.com", RecordType::A).unwrap();
         let message = running.handle_query(&raw, false, WAN_PEER).await;
-        assert_eq!(wire::decode_response(&message).unwrap().code, ResponseCode::Refused);
+        assert_eq!(
+            wire::decode_response(&message).unwrap().code,
+            ResponseCode::Refused
+        );
     }
 
     #[test]
@@ -1166,13 +1306,18 @@ mod tests {
         let zone = example_zone();
         let message = respond(&ask("example.com", RecordType::A), Some(&zone), false);
 
-        assert!(is_authoritative(&message), "an answer from our own zone sets AA");
+        assert!(
+            is_authoritative(&message),
+            "an answer from our own zone sets AA"
+        );
         assert_eq!(message[..2], [0x12, 0x34], "the id is echoed");
         let response = wire::decode_response(&message).unwrap();
         assert_eq!(response.code, ResponseCode::NoError);
         assert_eq!(response.first_a(), Some(PUBLIC));
         // The apex NS belongs in the authority section.
-        assert!(response.authority.iter().any(|record| matches!(&record.data, RecordData::Name(name) if name == "ns1.example.com")));
+        assert!(response.authority.iter().any(
+            |record| matches!(&record.data, RecordData::Name(name) if name == "ns1.example.com")
+        ));
     }
 
     #[test]
@@ -1181,7 +1326,10 @@ mod tests {
         let message = respond(&ask("example.com", RecordType::Mx), Some(&zone), false);
         let response = wire::decode_response(&message).unwrap();
         assert_eq!(response.code, ResponseCode::NoError);
-        assert_eq!(response.mail_exchangers(), vec![(10, "mail.example.com".to_owned())]);
+        assert_eq!(
+            response.mail_exchangers(),
+            vec![(10, "mail.example.com".to_owned())]
+        );
     }
 
     #[test]
@@ -1206,7 +1354,9 @@ mod tests {
             .answers
             .iter()
             .find_map(|record| match &record.data {
-                RecordData::Soa { serial, minimum, .. } => Some((*serial, *minimum)),
+                RecordData::Soa {
+                    serial, minimum, ..
+                } => Some((*serial, *minimum)),
                 _ => None,
             })
             .expect("an SOA in the answer");
@@ -1223,7 +1373,12 @@ mod tests {
         assert_eq!(response.code, ResponseCode::NameError);
         assert!(response.answers.is_empty());
         assert!(is_authoritative(&message));
-        assert!(response.authority.iter().any(|record| matches!(record.data, RecordData::Soa { .. })));
+        assert!(
+            response
+                .authority
+                .iter()
+                .any(|record| matches!(record.data, RecordData::Soa { .. }))
+        );
     }
 
     #[test]
@@ -1235,7 +1390,12 @@ mod tests {
         let response = wire::decode_response(&message).unwrap();
         assert_eq!(response.code, ResponseCode::NoError);
         assert!(response.answers.is_empty());
-        assert!(response.authority.iter().any(|record| matches!(record.data, RecordData::Soa { .. })));
+        assert!(
+            response
+                .authority
+                .iter()
+                .any(|record| matches!(record.data, RecordData::Soa { .. }))
+        );
     }
 
     #[test]
@@ -1253,8 +1413,15 @@ mod tests {
     fn a_zone_transfer_is_refused_without_a_verified_peer() {
         // AXFR is authorised by peer identity, which respond() is not given.
         let zone = example_zone();
-        let message = respond(&ask("example.com", RecordType::Other(252)), Some(&zone), true);
-        assert_eq!(wire::decode_response(&message).unwrap().code, ResponseCode::Refused);
+        let message = respond(
+            &ask("example.com", RecordType::Other(252)),
+            Some(&zone),
+            true,
+        );
+        assert_eq!(
+            wire::decode_response(&message).unwrap().code,
+            ResponseCode::Refused
+        );
     }
 
     #[test]
@@ -1263,12 +1430,21 @@ mod tests {
         // over TCP, rather than being sent as an oversized (amplifiable) datagram.
         let mut zone = example_zone();
         for octet in 0..40_u8 {
-            zone.records.push(record("example.com", RecordData::A(Ipv4Addr::new(203, 0, 113, octet))));
+            zone.records.push(record(
+                "example.com",
+                RecordData::A(Ipv4Addr::new(203, 0, 113, octet)),
+            ));
         }
 
         let over_udp = respond(&ask("example.com", RecordType::A), Some(&zone), false);
-        assert!(over_udp.len() <= MAX_UDP_RESPONSE, "a UDP reply must fit the 512-byte floor");
-        assert!(is_truncated(&over_udp), "TC tells the client to retry over TCP");
+        assert!(
+            over_udp.len() <= MAX_UDP_RESPONSE,
+            "a UDP reply must fit the 512-byte floor"
+        );
+        assert!(
+            is_truncated(&over_udp),
+            "TC tells the client to retry over TCP"
+        );
         assert!(wire::decode_response(&over_udp).unwrap().answers.is_empty());
 
         // The same query over TCP is not truncated and carries the full set.
@@ -1283,7 +1459,12 @@ mod tests {
         // A nameserver a single bad packet can crash is a nameserver one packet
         // can take offline. Every hostile shape decodes to FORMERR.
         let authority = Authority(Arc::new(Inner::new(vec![example_zone()], None)));
-        for raw in [&[][..], &[0x00][..], &[0x12, 0x34, 0x00][..], &[0xff; 5][..]] {
+        for raw in [
+            &[][..],
+            &[0x00][..],
+            &[0x12, 0x34, 0x00][..],
+            &[0xff; 5][..],
+        ] {
             let message = authority.handle_query(raw, false, WAN_PEER).await;
             let response = wire::decode_response(&message).unwrap();
             assert_eq!(response.code, ResponseCode::FormatError, "raw {raw:?}");
@@ -1298,7 +1479,10 @@ mod tests {
         let raw = wire::encode_query(0x2222, "example.com", RecordType::A).unwrap();
         let message = authority.handle_query(&raw, false, WAN_PEER).await;
         assert_eq!(message[..2], [0x22, 0x22]);
-        assert_eq!(wire::decode_response(&message).unwrap().first_a(), Some(PUBLIC));
+        assert_eq!(
+            wire::decode_response(&message).unwrap().first_a(),
+            Some(PUBLIC)
+        );
     }
 
     #[tokio::test]
@@ -1307,13 +1491,24 @@ mod tests {
         // secondary sees a newer zone and refreshes.
         let authority = Authority(Arc::new(Inner::new(vec![example_zone()], None)));
         let moved = Ipv4Addr::new(198, 51, 100, 7);
-        let serial = authority.set_apex_a("example.com", moved).await.expect("the zone is served");
+        let serial = authority
+            .set_apex_a("example.com", moved)
+            .await
+            .expect("the zone is served");
         assert_eq!(serial, 2_026_080_701, "the serial only ever increases");
 
         let raw = wire::encode_query(1, "example.com", RecordType::A).unwrap();
         let message = authority.handle_query(&raw, false, WAN_PEER).await;
-        assert_eq!(wire::decode_response(&message).unwrap().first_a(), Some(moved));
-        assert!(authority.set_apex_a("absent.example", moved).await.is_none());
+        assert_eq!(
+            wire::decode_response(&message).unwrap().first_a(),
+            Some(moved)
+        );
+        assert!(
+            authority
+                .set_apex_a("absent.example", moved)
+                .await
+                .is_none()
+        );
     }
 
     #[tokio::test]
@@ -1321,15 +1516,24 @@ mod tests {
         // The split horizon: a record pointing at the public IP answers with
         // the LAN address for a private peer, because the NAT does not hairpin.
         let authority = Authority(Arc::new(Inner::new(vec![example_zone()], Some(PUBLIC))));
-        authority.set_lan(LanView { lan_ip: LAN_IP, upstreams: vec!["203.0.113.53:53".parse().unwrap()] });
+        authority.set_lan(LanView {
+            lan_ip: LAN_IP,
+            upstreams: vec!["203.0.113.53:53".parse().unwrap()],
+        });
 
         let raw = wire::encode_query(1, "www.example.com", RecordType::A).unwrap();
         let from_lan = authority.handle_query(&raw, false, LAN_PEER).await;
-        assert_eq!(wire::decode_response(&from_lan).unwrap().first_a(), Some(LAN_IP));
+        assert_eq!(
+            wire::decode_response(&from_lan).unwrap().first_a(),
+            Some(LAN_IP)
+        );
 
         // The same question from the internet gets the public address.
         let from_wan = authority.handle_query(&raw, false, WAN_PEER).await;
-        assert_eq!(wire::decode_response(&from_wan).unwrap().first_a(), Some(PUBLIC));
+        assert_eq!(
+            wire::decode_response(&from_wan).unwrap().first_a(),
+            Some(PUBLIC)
+        );
     }
 
     #[tokio::test]
@@ -1337,11 +1541,17 @@ mod tests {
         // The forwarding path must never open to the internet: even with the
         // LAN view configured, a public peer asking a foreign name is REFUSED.
         let authority = Authority(Arc::new(Inner::new(vec![example_zone()], Some(PUBLIC))));
-        authority.set_lan(LanView { lan_ip: LAN_IP, upstreams: vec!["203.0.113.53:53".parse().unwrap()] });
+        authority.set_lan(LanView {
+            lan_ip: LAN_IP,
+            upstreams: vec!["203.0.113.53:53".parse().unwrap()],
+        });
 
         let raw = wire::encode_query(2, "elsewhere.net", RecordType::A).unwrap();
         let message = authority.handle_query(&raw, false, WAN_PEER).await;
-        assert_eq!(wire::decode_response(&message).unwrap().code, ResponseCode::Refused);
+        assert_eq!(
+            wire::decode_response(&message).unwrap().code,
+            ResponseCode::Refused
+        );
     }
 
     #[tokio::test]
@@ -1352,11 +1562,17 @@ mod tests {
 
         let owned = wire::encode_query(3, "www.example.com", RecordType::A).unwrap();
         let answer = authority.handle_query(&owned, false, LAN_PEER).await;
-        assert_eq!(wire::decode_response(&answer).unwrap().first_a(), Some(PUBLIC));
+        assert_eq!(
+            wire::decode_response(&answer).unwrap().first_a(),
+            Some(PUBLIC)
+        );
 
         let foreign = wire::encode_query(4, "elsewhere.net", RecordType::A).unwrap();
         let refused = authority.handle_query(&foreign, false, LAN_PEER).await;
-        assert_eq!(wire::decode_response(&refused).unwrap().code, ResponseCode::Refused);
+        assert_eq!(
+            wire::decode_response(&refused).unwrap().code,
+            ResponseCode::Refused
+        );
     }
 
     #[test]
@@ -1377,8 +1593,14 @@ mod tests {
     async fn origins_and_export_report_the_served_zone() {
         let authority = Authority(Arc::new(Inner::new(vec![example_zone()], None)));
         assert_eq!(authority.origins().await, vec!["example.com".to_owned()]);
-        let export = authority.export("example.com").await.expect("a served zone");
-        assert!(matches!(export.first().map(|record| &record.data), Some(RecordData::Soa { .. })));
+        let export = authority
+            .export("example.com")
+            .await
+            .expect("a served zone");
+        assert!(matches!(
+            export.first().map(|record| &record.data),
+            Some(RecordData::Soa { .. })
+        ));
         assert!(authority.export("nowhere.test").await.is_none());
     }
 
@@ -1389,12 +1611,18 @@ mod tests {
         let authority = Authority(Arc::new(Inner::new(vec![example_zone()], None)));
         let addr = Ipv4Addr::new(198, 51, 100, 9);
 
-        let serial = authority.upsert_record("BLOG.example.com.", RecordData::A(addr)).await.expect("owned");
+        let serial = authority
+            .upsert_record("BLOG.example.com.", RecordData::A(addr))
+            .await
+            .expect("owned");
         assert_eq!(serial, 2_026_080_701, "the serial only ever increases");
 
         let raw = wire::encode_query(7, "blog.example.com", RecordType::A).unwrap();
         let message = authority.handle_query(&raw, false, WAN_PEER).await;
-        assert_eq!(wire::decode_response(&message).unwrap().first_a(), Some(addr));
+        assert_eq!(
+            wire::decode_response(&message).unwrap().first_a(),
+            Some(addr)
+        );
     }
 
     #[tokio::test]
@@ -1403,36 +1631,76 @@ mod tests {
         let first = Ipv4Addr::new(198, 51, 100, 1);
         let second = Ipv4Addr::new(198, 51, 100, 2);
 
-        authority.upsert_record("www.example.com", RecordData::A(first)).await;
-        authority.upsert_record("www.example.com", RecordData::A(second)).await;
+        authority
+            .upsert_record("www.example.com", RecordData::A(first))
+            .await;
+        authority
+            .upsert_record("www.example.com", RecordData::A(second))
+            .await;
 
         let raw = wire::encode_query(1, "www.example.com", RecordType::A).unwrap();
-        let answers = wire::decode_response(&authority.handle_query(&raw, false, WAN_PEER).await).unwrap().answers;
-        let a_records = answers.iter().filter(|r| matches!(r.data, RecordData::A(_))).count();
+        let answers = wire::decode_response(&authority.handle_query(&raw, false, WAN_PEER).await)
+            .unwrap()
+            .answers;
+        let a_records = answers
+            .iter()
+            .filter(|r| matches!(r.data, RecordData::A(_)))
+            .count();
         assert_eq!(a_records, 1, "an upsert replaces the RRset, never grows it");
     }
 
     #[tokio::test]
     async fn a_name_in_no_owned_zone_cannot_be_upserted() {
         let authority = Authority(Arc::new(Inner::new(vec![example_zone()], None)));
-        assert!(authority.upsert_record("blog.elsewhere.test", RecordData::A(Ipv4Addr::LOCALHOST)).await.is_none());
+        assert!(
+            authority
+                .upsert_record("blog.elsewhere.test", RecordData::A(Ipv4Addr::LOCALHOST))
+                .await
+                .is_none()
+        );
         assert!(authority.zone_for("blog.elsewhere.test").await.is_none());
-        assert_eq!(authority.zone_for("blog.example.com").await.as_deref(), Some("example.com"));
+        assert_eq!(
+            authority.zone_for("blog.example.com").await.as_deref(),
+            Some("example.com")
+        );
     }
 
     #[tokio::test]
     async fn remove_record_drops_the_name_and_bumps_only_on_a_change() {
         let authority = Authority(Arc::new(Inner::new(vec![example_zone()], None)));
         let addr = Ipv4Addr::new(198, 51, 100, 9);
-        authority.upsert_record("blog.example.com", RecordData::A(addr)).await;
+        authority
+            .upsert_record("blog.example.com", RecordData::A(addr))
+            .await;
 
-        assert!(authority.remove_record("blog.example.com", RecordType::A).await.is_some(), "a real removal bumps");
+        assert!(
+            authority
+                .remove_record("blog.example.com", RecordType::A)
+                .await
+                .is_some(),
+            "a real removal bumps"
+        );
         let raw = wire::encode_query(1, "blog.example.com", RecordType::A).unwrap();
-        assert_eq!(wire::decode_response(&authority.handle_query(&raw, false, WAN_PEER).await).unwrap().code, ResponseCode::NameError);
+        assert_eq!(
+            wire::decode_response(&authority.handle_query(&raw, false, WAN_PEER).await)
+                .unwrap()
+                .code,
+            ResponseCode::NameError
+        );
 
         // A second removal changes nothing, so no serial is spent.
-        assert!(authority.remove_record("blog.example.com", RecordType::A).await.is_none());
-        assert!(authority.remove_record("blog.elsewhere.test", RecordType::A).await.is_none());
+        assert!(
+            authority
+                .remove_record("blog.example.com", RecordType::A)
+                .await
+                .is_none()
+        );
+        assert!(
+            authority
+                .remove_record("blog.elsewhere.test", RecordType::A)
+                .await
+                .is_none()
+        );
     }
 
     #[tokio::test]
@@ -1489,20 +1757,29 @@ domains = ["example.com", "hand.example"]
         let authority = Authority::for_config_with_mail(&config, Some(PUBLIC), &mail_records);
 
         // The bare zone now answers MX with the configured mail host.
-        let mx = authority.export("example.com").await.expect("bare zone served");
+        let mx = authority
+            .export("example.com")
+            .await
+            .expect("bare zone served");
         assert!(
             mx.iter().any(|r| matches!(&r.data, RecordData::Mx { exchange, .. } if exchange == "mail.example.com")),
             "the bare zone publishes the mail MX"
         );
         assert!(
-            mx.iter().any(|r| matches!(&r.data, RecordData::Txt(t) if t == "v=spf1 mx -all")),
+            mx.iter()
+                .any(|r| matches!(&r.data, RecordData::Txt(t) if t == "v=spf1 mx -all")),
             "and SPF"
         );
 
         // The hand-written zone is untouched: only its listed A, no injected MX.
-        let hand = authority.export("hand.example").await.expect("hand zone served");
+        let hand = authority
+            .export("hand.example")
+            .await
+            .expect("hand zone served");
         assert!(
-            !hand.iter().any(|r| matches!(&r.data, RecordData::Mx { .. })),
+            !hand
+                .iter()
+                .any(|r| matches!(&r.data, RecordData::Mx { .. })),
             "an explicit zone is served exactly as written, mail records excluded"
         );
 
@@ -1513,7 +1790,12 @@ domains = ["example.com", "hand.example"]
             let raw = wire::encode_query(9, name, qtype).unwrap();
             async move { authority.handle_query(&raw, false, WAN_PEER).await }
         };
-        for host in ["mail.example.com", "imap.example.com", "smtp.example.com", "autodiscover.example.com"] {
+        for host in [
+            "mail.example.com",
+            "imap.example.com",
+            "smtp.example.com",
+            "autodiscover.example.com",
+        ] {
             let message = served(host, RecordType::A).await;
             assert_eq!(
                 wire::decode_response(&message).unwrap().first_a(),
@@ -1545,57 +1827,47 @@ domains = ["example.com", "hand.example"]
 
         // The hand zone is a mail domain but wrote its own records: no SRVs.
         assert!(
-            !hand.iter().any(|r| matches!(&r.data, RecordData::Srv { .. })),
+            !hand
+                .iter()
+                .any(|r| matches!(&r.data, RecordData::Srv { .. })),
             "an explicit zone gets no injected SRVs"
         );
     }
 
-    #[tokio::test]
-    async fn recv_errors_are_counted_and_logged_not_fatal() {
-        // Verify that receive errors on UDP increment the counter and the
-        // server continues serving despite them. We test the counter increments
-        // because the actual socket errors are hard to trigger in a test
-        // environment.
-        let authority = Authority(Arc::new(Inner::new(vec![example_zone()], None)));
-        assert_eq!(authority.0.recv_error_count.load(Ordering::Relaxed), 0);
-
-        // A query completes successfully and the error counter stays at 0.
-        let raw = wire::encode_query(0x5555, "example.com", RecordType::A).unwrap();
-        let message = authority.handle_query(&raw, false, WAN_PEER).await;
-        assert_eq!(wire::decode_response(&message).unwrap().first_a(), Some(PUBLIC));
-        assert_eq!(authority.0.recv_error_count.load(Ordering::Relaxed), 0, "no error, counter unchanged");
+    #[test]
+    fn receive_errors_pause_only_once_they_repeat() {
+        // One error, or a burst shorter than 32, is handled at full speed: a
+        // single 10054 from a client that gave up must not slow the next answer.
+        assert_eq!(receive_backoff(1), None);
+        assert_eq!(receive_backoff(31), None);
+        // An error that will not stop pauses each round, so it cannot spin a core.
+        assert_eq!(receive_backoff(32), Some(Duration::from_millis(10)));
+        assert_eq!(receive_backoff(u32::MAX), Some(Duration::from_millis(10)));
     }
 
     #[tokio::test]
-    async fn error_counter_can_be_read_by_calling_code() {
-        // The counter exists and is accessible for diagnostics/monitoring.
+    async fn serve_udp_answers_over_a_real_socket() {
+        // The serve loop itself, on a real loopback socket: the question goes
+        // in as a datagram and the answer comes back as one.
         let authority = Authority(Arc::new(Inner::new(vec![example_zone()], None)));
+        let socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let address = socket.local_addr().unwrap();
+        let server = tokio::spawn({
+            let authority = authority.clone();
+            async move { authority.serve_udp(socket).await }
+        });
 
-        // Manually increment the counter (as the serve loops would on error).
-        authority.0.recv_error_count.fetch_add(5, Ordering::Relaxed);
-        assert_eq!(authority.0.recv_error_count.load(Ordering::Relaxed), 5);
-    }
-
-    #[tokio::test]
-    async fn serve_continues_to_answer_after_injected_error() {
-        // A query answers successfully; if an error had occurred in the recv
-        // loop between this and the previous query, the server would still
-        // answer the next one because the error is caught and logged.
-        let authority = Authority(Arc::new(Inner::new(vec![example_zone()], None)));
-
-        // Query 1
-        let raw1 = wire::encode_query(0x6666, "www.example.com", RecordType::A).unwrap();
-        let answer1 = authority.handle_query(&raw1, false, WAN_PEER).await;
-        assert_eq!(wire::decode_response(&answer1).unwrap().first_a(), Some(PUBLIC));
-
-        // Simulate an error being counted (as if recv failed).
-        authority.0.recv_error_count.fetch_add(1, Ordering::Relaxed);
-
-        // Query 2: should still succeed, proving the server continues after error.
-        let raw2 = wire::encode_query(0x7777, "example.com", RecordType::A).unwrap();
-        let answer2 = authority.handle_query(&raw2, false, WAN_PEER).await;
-        assert_eq!(wire::decode_response(&answer2).unwrap().first_a(), Some(PUBLIC));
-        assert_eq!(authority.0.recv_error_count.load(Ordering::Relaxed), 1);
+        let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let raw = wire::encode_query(0x5151, "www.example.com", RecordType::A).unwrap();
+        client.send_to(&raw, address).await.unwrap();
+        let mut buffer = vec![0_u8; MAX_UDP];
+        let read = tokio::time::timeout(Duration::from_secs(2), client.recv(&mut buffer))
+            .await
+            .expect("an answer within two seconds")
+            .unwrap();
+        let answer = wire::decode_response(&buffer[..read]).unwrap();
+        assert_eq!(answer.first_a(), Some(PUBLIC));
+        server.abort();
     }
 
     #[tokio::test]
@@ -1641,7 +1913,7 @@ domains = ["example.com", "hand.example"]
         let message = authority.handle_query(&raw, false, LAN_PEER).await;
         let response = wire::decode_response(&message).unwrap();
         assert_eq!(response.code, ResponseCode::ServerFailure);
-        assert_eq!(authority.0.dropped_forwards.load(Ordering::Relaxed), 1);
+        assert_eq!(authority.telemetry_snapshot("test").counters.dropped, 1);
     }
 
     #[tokio::test]

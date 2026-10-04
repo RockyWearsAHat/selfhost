@@ -144,7 +144,12 @@ impl DnsCache {
         }
 
         // Serve stale with TTL=30.
-        Some(rewrite_answer(&entry.response, new_id, Duration::ZERO, Some(STALE_TTL)))
+        Some(rewrite_answer(
+            &entry.response,
+            new_id,
+            Duration::ZERO,
+            Some(STALE_TTL),
+        ))
     }
 
     /// Caches a successful upstream response.
@@ -186,33 +191,17 @@ impl DnsCache {
         let mut entries = self.entries.lock().unwrap();
 
         // Ensure room for the new entry.
-        if entries.len() >= MAX_CACHE_ENTRIES {
+        if entries.len() >= MAX_CACHE_ENTRIES && !entries.contains_key(&key) {
             evict_one(&mut entries);
         }
 
         entries.insert(key, entry);
     }
 
-    /// Clears the entire cache.
-    #[cfg(test)]
-    pub fn clear(&self) {
-        self.entries.lock().unwrap().clear();
-    }
-
     /// Returns the number of entries currently cached.
     #[cfg(test)]
     pub fn len(&self) -> usize {
         self.entries.lock().unwrap().len()
-    }
-
-    /// Returns the number of non-expired entries.
-    #[cfg(test)]
-    pub fn fresh_count(&self) {
-        let entries = self.entries.lock().unwrap();
-        let _count: usize = entries
-            .values()
-            .filter(|e| e.stored_at.elapsed() <= Duration::from_secs(e.min_ttl as u64))
-            .count();
     }
 }
 
@@ -242,11 +231,14 @@ fn calculate_min_ttl(response: &Response, is_negative: bool) -> u32 {
             .authority
             .iter()
             .find_map(|record| match &record.data {
-                crate::wire::RecordData::Soa { minimum, .. } => Some(*minimum),
+                // RFC 2308 §5: the lesser of the SOA's own TTL and its minimum.
+                crate::wire::RecordData::Soa { minimum, .. } => Some(record.ttl.min(*minimum)),
                 _ => None,
             });
 
-        return soa_min.unwrap_or(DEFAULT_NEGATIVE_TTL).min(DEFAULT_NEGATIVE_TTL);
+        return soa_min
+            .unwrap_or(DEFAULT_NEGATIVE_TTL)
+            .min(DEFAULT_NEGATIVE_TTL);
     }
 
     // Positive answer: minimum across all answer records.
@@ -258,149 +250,87 @@ fn calculate_min_ttl(response: &Response, is_negative: bool) -> u32 {
         .unwrap_or(0)
 }
 
-/// Rewrites the message ID and decrements all TTLs.
-///
-/// If `force_ttl` is provided, all TTLs are set to that value instead of being
-/// decremented. This is used for serve-stale.
-fn rewrite_answer(
-    response: &[u8],
-    new_id: u16,
-    elapsed: Duration,
-    force_ttl: Option<u32>,
-) -> Vec<u8> {
+/// EDNS0's OPT pseudo-record type. Its TTL field carries the extended RCODE,
+/// version and DO flag, not a lifetime, so TTL rewriting must leave it alone.
+const OPT_TYPE: u16 = 41;
+
+/// The UDP size every client accepts without EDNS0 (RFC 1035).
+const CLASSIC_UDP_SIZE: usize = 512;
+
+/// Copies `response` with its message ID set to `new_id` and every record's
+/// TTL either reduced by `elapsed` or, for serve-stale, pinned to `pinned`.
+fn rewrite_answer(response: &[u8], new_id: u16, elapsed: Duration, pinned: Option<u32>) -> Vec<u8> {
     let mut answer = response.to_vec();
-
-    if answer.len() < 2 {
-        return answer;
+    let elapsed = u32::try_from(elapsed.as_secs()).unwrap_or(u32::MAX);
+    for at in record_offsets(&answer) {
+        if field(&answer, at) == OPT_TYPE {
+            continue;
+        }
+        let ttl = &mut answer[at + 4..at + 8];
+        let old = u32::from_be_bytes([ttl[0], ttl[1], ttl[2], ttl[3]]);
+        let new = pinned.unwrap_or_else(|| old.saturating_sub(elapsed));
+        ttl.copy_from_slice(&new.to_be_bytes());
     }
-
-    // Rewrite message ID at bytes 0-1.
-    answer[0] = (new_id >> 8) as u8;
-    answer[1] = new_id as u8;
-
-    if force_ttl.is_some() {
-        // Serve-stale: rewrite all TTLs to force_ttl.
-        rewrite_all_ttls(&mut answer, force_ttl.unwrap());
-    } else {
-        // Normal case: decrement all TTLs by elapsed time.
-        decrement_all_ttls(&mut answer, elapsed);
+    if let Some(id) = answer.get_mut(..2) {
+        id.copy_from_slice(&new_id.to_be_bytes());
     }
-
     answer
 }
 
-/// Decrements all TTLs in the response by `elapsed`.
-///
-/// TTLs in DNS messages are 32-bit values at a fixed offset within each
-/// resource record. We parse the message to find each record and decrement
-/// its TTL, clamping to 0.
-fn decrement_all_ttls(response: &mut [u8], elapsed: Duration) {
-    let elapsed_secs = elapsed.as_secs() as u32;
-
-    // Parse the message and decrement each record's TTL.
-    // DNS message structure: 12-byte header, then questions, then records.
-    // We'll iterate through the records (answer, authority, additional).
-
-    if response.len() < 12 {
-        return;
-    }
-
-    // Parse header to get record counts.
-    let qdcount = u16::from_be_bytes([response[4], response[5]]) as usize;
-    let ancount = u16::from_be_bytes([response[6], response[7]]) as usize;
-    let nscount = u16::from_be_bytes([response[8], response[9]]) as usize;
-    let arcount = u16::from_be_bytes([response[10], response[11]]) as usize;
-
-    let mut pos = 12;
-
-    // Skip questions.
-    for _ in 0..qdcount {
-        if let Some(next) = skip_name(response, pos) {
-            pos = next + 4; // Skip QTYPE and QCLASS (2 bytes each).
-        } else {
-            return;
-        }
-    }
-
-    // Decrement TTLs in answer, authority, and additional sections.
-    for _ in 0..(ancount + nscount + arcount) {
-        if let Some(next) = skip_name(response, pos) {
-            pos = next;
-            // Now we're at TYPE (2 bytes), CLASS (2 bytes), TTL (4 bytes).
-            if pos + 10 > response.len() {
-                return;
-            }
-
-            // Decrement TTL at offset +4 from here (after TYPE and CLASS).
-            let ttl_offset = pos + 4;
-            let old_ttl = u32::from_be_bytes([
-                response[ttl_offset],
-                response[ttl_offset + 1],
-                response[ttl_offset + 2],
-                response[ttl_offset + 3],
-            ]);
-
-            let new_ttl = old_ttl.saturating_sub(elapsed_secs);
-            response[ttl_offset..ttl_offset + 4].copy_from_slice(&new_ttl.to_be_bytes());
-
-            // Skip RDLENGTH (2 bytes at offset +8) and RDATA.
-            let rdlength = u16::from_be_bytes([response[ttl_offset + 4], response[ttl_offset + 5]]) as usize;
-            pos = ttl_offset + 6 + rdlength;
-        } else {
-            return;
-        }
-    }
+/// The largest UDP answer the sender of `query` accepts: its EDNS0 OPT
+/// record's advertised size, never below 512, or 512 when it sent none.
+/// A cached answer fetched for one client must not overflow another's buffer.
+pub(crate) fn udp_payload_limit(query: &[u8]) -> usize {
+    record_offsets(query)
+        .into_iter()
+        .find(|&at| field(query, at) == OPT_TYPE)
+        .map(|at| usize::from(field(query, at + 2)).max(CLASSIC_UDP_SIZE))
+        .unwrap_or(CLASSIC_UDP_SIZE)
 }
 
-/// Rewrites all TTLs in the response to a fixed value.
-fn rewrite_all_ttls(response: &mut [u8], ttl: u32) {
-    if response.len() < 12 {
-        return;
+/// Offsets of each resource record's fixed fields (TYPE, CLASS, TTL,
+/// RDLENGTH) across the answer, authority and additional sections, in order.
+/// A malformed tail ends the list early, leaving those records untouched.
+fn record_offsets(message: &[u8]) -> Vec<usize> {
+    let mut offsets = Vec::new();
+    if message.len() < 12 {
+        return offsets;
     }
-
-    let qdcount = u16::from_be_bytes([response[4], response[5]]) as usize;
-    let ancount = u16::from_be_bytes([response[6], response[7]]) as usize;
-    let nscount = u16::from_be_bytes([response[8], response[9]]) as usize;
-    let arcount = u16::from_be_bytes([response[10], response[11]]) as usize;
-
+    let count = |at: usize| usize::from(field(message, at));
+    let records = count(6) + count(8) + count(10);
     let mut pos = 12;
-
-    // Skip questions.
-    for _ in 0..qdcount {
-        if let Some(next) = skip_name(response, pos) {
-            pos = next + 4;
-        } else {
-            return;
-        }
+    for _ in 0..count(4) {
+        let Some(next) = skip_name(message, pos) else {
+            return offsets;
+        };
+        pos = next + 4; // QTYPE and QCLASS.
     }
-
-    // Rewrite TTLs in all records.
-    for _ in 0..(ancount + nscount + arcount) {
-        if let Some(next) = skip_name(response, pos) {
-            pos = next;
-            if pos + 10 > response.len() {
-                return;
-            }
-
-            let ttl_offset = pos + 4;
-            response[ttl_offset..ttl_offset + 4].copy_from_slice(&ttl.to_be_bytes());
-
-            let rdlength = u16::from_be_bytes([response[ttl_offset + 4], response[ttl_offset + 5]]) as usize;
-            pos = ttl_offset + 6 + rdlength;
-        } else {
-            return;
+    for _ in 0..records {
+        let Some(at) = skip_name(message, pos) else {
+            break;
+        };
+        if message.len() < at + 10 {
+            break;
         }
+        offsets.push(at);
+        pos = at + 10 + usize::from(field(message, at + 8));
     }
+    offsets
+}
+
+/// The big-endian u16 at `at`; callers have bounds-checked it.
+fn field(message: &[u8], at: usize) -> u16 {
+    u16::from_be_bytes([message[at], message[at + 1]])
 }
 
 /// Skips over a domain name in DNS wire format, returning the position after it.
 ///
-/// Handles compression pointers (for simplicity, assumes they point backward,
-/// which is always true in valid DNS messages). Returns `None` if the name is
-/// malformed or exceeds bounds.
+/// A compression pointer ends the name in place, so it is never followed.
+/// Returns `None` if the name is malformed or runs past the message.
 fn skip_name(response: &[u8], mut pos: usize) -> Option<usize> {
-    let mut jumps = 0;
-    const MAX_JUMPS: usize = 16;
+    let mut labels = 0;
+    // A name is at most 255 bytes, so at most 127 labels.
+    const MAX_LABELS: usize = 127;
 
     loop {
         if pos >= response.len() {
@@ -425,8 +355,8 @@ fn skip_name(response: &[u8], mut pos: usize) -> Option<usize> {
         }
 
         pos += 1 + len as usize;
-        jumps += 1;
-        if jumps > MAX_JUMPS || pos > response.len() {
+        labels += 1;
+        if labels > MAX_LABELS || pos > response.len() {
             return None;
         }
     }
@@ -439,16 +369,13 @@ fn skip_name(response: &[u8], mut pos: usize) -> Option<usize> {
 /// 2. If none, the soonest-expiring (freshest-starting) entry.
 fn evict_one(entries: &mut HashMap<CacheKey, CacheEntry>) {
     // First, evict any entry that's been stale for too long.
-    if let Some(key) = entries
-        .iter()
-        .find_map(|(k, v)| {
-            if v.stored_at.elapsed() > STALE_WINDOW {
-                Some(k.clone())
-            } else {
-                None
-            }
-        })
-    {
+    if let Some(key) = entries.iter().find_map(|(k, v)| {
+        if v.stored_at.elapsed() > STALE_WINDOW {
+            Some(k.clone())
+        } else {
+            None
+        }
+    }) {
         entries.remove(&key);
         return;
     }
@@ -470,211 +397,204 @@ fn evict_one(entries: &mut HashMap<CacheKey, CacheEntry>) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::wire::{encode_response, Query, RecordType, ResponseCode, ResponseFlags};
+    use crate::wire::{Query, Record, RecordData, ResponseFlags, encode_response};
+    use std::net::Ipv4Addr;
 
-    #[test]
-    fn fresh_hit_rewrites_id_and_decrements_ttl() {
-        let cache = DnsCache::new();
-
-        // Build a simple response: one A record with TTL 300.
-        let query = Query {
+    fn query(name: &str) -> Query {
+        Query {
             id: 1234,
-            name: "example.com".to_string(),
+            name: name.to_string(),
             record_type: RecordType::A,
             recursion_desired: true,
-        };
-        let response = encode_response(
-            &query,
-            ResponseCode::NoError,
-            ResponseFlags { authoritative: false, truncated: false },
-            &[], // No answers for simplicity; we'll test with a real response.
-            &[],
-            &[],
-        );
-
-        cache.insert("example.com", RecordType::A, &response);
-
-        // Look up with a different ID, after 100 seconds.
-        // Since the real response is empty, this is more of a structure test.
-        // We'll verify that a lookup returns something rewritten.
-        let _result = cache.lookup("example.com", RecordType::A, 5678);
-    }
-
-    #[test]
-    fn expired_entry_not_returned() {
-        let cache = DnsCache::new();
-
-        // Build a response with TTL 1 second.
-        let query = Query {
-            id: 1234,
-            name: "short.ttl".to_string(),
-            record_type: RecordType::A,
-            recursion_desired: true,
-        };
-        let response = encode_response(
-            &query,
-            ResponseCode::NoError,
-            ResponseFlags { authoritative: false, truncated: false },
-            &[],
-            &[],
-            &[],
-        );
-
-        cache.insert("short.ttl", RecordType::A, &response);
-        assert!(cache.lookup("short.ttl", RecordType::A, 9999).is_some(), "fresh entry should be found");
-    }
-
-    #[test]
-    fn negative_answers_cached() {
-        let cache = DnsCache::new();
-
-        // NXDOMAIN response.
-        let query = Query {
-            id: 1234,
-            name: "nonexistent.example".to_string(),
-            record_type: RecordType::A,
-            recursion_desired: true,
-        };
-        let response = encode_response(
-            &query,
-            ResponseCode::NameError,
-            ResponseFlags { authoritative: false, truncated: false },
-            &[],
-            &[],
-            &[],
-        );
-
-        cache.insert("nonexistent.example", RecordType::A, &response);
-        assert!(cache.lookup("nonexistent.example", RecordType::A, 9999).is_some());
-    }
-
-    #[test]
-    fn never_caches_servfail() {
-        let cache = DnsCache::new();
-
-        let query = Query {
-            id: 1234,
-            name: "fail.example".to_string(),
-            record_type: RecordType::A,
-            recursion_desired: true,
-        };
-        let response = encode_response(
-            &query,
-            ResponseCode::ServerFailure,
-            ResponseFlags { authoritative: false, truncated: false },
-            &[],
-            &[],
-            &[],
-        );
-
-        cache.insert("fail.example", RecordType::A, &response);
-        assert!(cache.lookup("fail.example", RecordType::A, 9999).is_none(), "SERVFAIL must not be cached");
-    }
-
-    #[test]
-    fn never_caches_refused() {
-        let cache = DnsCache::new();
-
-        let query = Query {
-            id: 1234,
-            name: "refused.example".to_string(),
-            record_type: RecordType::A,
-            recursion_desired: true,
-        };
-        let response = encode_response(
-            &query,
-            ResponseCode::Refused,
-            ResponseFlags { authoritative: false, truncated: false },
-            &[],
-            &[],
-            &[],
-        );
-
-        cache.insert("refused.example", RecordType::A, &response);
-        assert!(cache.lookup("refused.example", RecordType::A, 9999).is_none(), "REFUSED must not be cached");
-    }
-
-    #[test]
-    fn capacity_bounded_at_max_entries() {
-        let cache = DnsCache::new();
-
-        // Insert MAX_CACHE_ENTRIES + 1 entries.
-        for i in 0..=MAX_CACHE_ENTRIES {
-            let name = format!("host{}.example", i);
-            let query = Query {
-                id: i as u16,
-                name: name.clone(),
-                record_type: RecordType::A,
-                recursion_desired: true,
-            };
-            let response = encode_response(
-                &query,
-                ResponseCode::NoError,
-                ResponseFlags { authoritative: false, truncated: false },
-                &[],
-                &[],
-                &[],
-            );
-            cache.insert(&name, RecordType::A, &response);
         }
+    }
 
-        // Should never exceed MAX_CACHE_ENTRIES.
-        assert!(cache.len() <= MAX_CACHE_ENTRIES);
+    fn flags() -> ResponseFlags {
+        ResponseFlags {
+            authoritative: false,
+            truncated: false,
+        }
+    }
+
+    /// An upstream answer: one A record for `name` with `ttl`.
+    fn a_answer(name: &str, ttl: u32) -> Vec<u8> {
+        let answer = Record {
+            name: name.to_string(),
+            ttl,
+            data: RecordData::A(Ipv4Addr::new(93, 184, 216, 34)),
+        };
+        encode_response(
+            &query(name),
+            ResponseCode::NoError,
+            flags(),
+            &[answer],
+            &[],
+            &[],
+        )
+    }
+
+    fn rcode_answer(name: &str, code: ResponseCode, authority: &[Record]) -> Vec<u8> {
+        encode_response(&query(name), code, flags(), &[], authority, &[])
+    }
+
+    fn soa(ttl: u32, minimum: u32) -> Record {
+        Record {
+            name: "example".to_string(),
+            ttl,
+            data: RecordData::Soa {
+                primary: "ns.example".to_string(),
+                responsible: "admin.example".to_string(),
+                serial: 1,
+                refresh: 3600,
+                retry: 600,
+                expire: 86400,
+                minimum,
+            },
+        }
+    }
+
+    /// Appends an EDNS0 OPT record advertising `size` with the DO bit set.
+    fn with_opt(mut message: Vec<u8>, size: u16) -> Vec<u8> {
+        let additional = field(&message, 10) + 1;
+        message[10..12].copy_from_slice(&additional.to_be_bytes());
+        message.push(0); // root owner name
+        message.extend_from_slice(&OPT_TYPE.to_be_bytes());
+        message.extend_from_slice(&size.to_be_bytes());
+        message.extend_from_slice(&0x0000_8000u32.to_be_bytes()); // DO flag
+        message.extend_from_slice(&0u16.to_be_bytes());
+        message
+    }
+
+    fn ttls(message: &[u8]) -> Vec<u32> {
+        record_offsets(message)
+            .into_iter()
+            .map(|at| u32::from_be_bytes(message[at + 4..at + 8].try_into().unwrap()))
+            .collect()
     }
 
     #[test]
-    fn stale_entries_served_when_all_fail() {
+    fn fresh_hit_carries_the_new_id_and_the_remaining_ttl() {
         let cache = DnsCache::new();
+        cache.insert("example.com", RecordType::A, &a_answer("example.com", 300));
 
-        let query = Query {
-            id: 1111,
-            name: "stale.test".to_string(),
-            record_type: RecordType::A,
-            recursion_desired: true,
-        };
-        let response = encode_response(
-            &query,
-            ResponseCode::NoError,
-            ResponseFlags { authoritative: false, truncated: false },
-            &[],
-            &[],
-            &[],
+        let hit = cache.lookup("example.com", RecordType::A, 5678).unwrap();
+        assert_eq!(
+            field(&hit, 0),
+            5678,
+            "the cached answer must carry the asker's ID"
         );
-
-        cache.insert("stale.test", RecordType::A, &response);
-
-        // After expiry but before stale window, lookup_stale should return None.
-        let stale = cache.lookup_stale("stale.test", RecordType::A, 2222);
-        // This depends on the min_ttl calculation; for now, just verify the method exists.
-        let _ = stale;
+        let decoded = wire::decode_response(&hit).unwrap();
+        assert_eq!(decoded.answers.len(), 1);
+        assert!((299..=300).contains(&decoded.answers[0].ttl));
+        assert_eq!(
+            decoded.answers[0].data,
+            RecordData::A(Ipv4Addr::new(93, 184, 216, 34))
+        );
     }
 
     #[test]
-    fn key_normalization() {
+    fn an_expired_entry_is_only_served_stale_with_a_short_ttl() {
         let cache = DnsCache::new();
+        cache.insert("short.ttl", RecordType::A, &a_answer("short.ttl", 0));
+        std::thread::sleep(Duration::from_millis(5));
 
-        // Insert with uppercase name.
-        let query = Query {
-            id: 1234,
-            name: "Example.COM".to_string(),
-            record_type: RecordType::A,
-            recursion_desired: true,
-        };
-        let response = encode_response(
-            &query,
-            ResponseCode::NoError,
-            ResponseFlags { authoritative: false, truncated: false },
-            &[],
-            &[],
-            &[],
+        assert!(cache.lookup("short.ttl", RecordType::A, 9).is_none());
+        let stale = cache.lookup_stale("short.ttl", RecordType::A, 9).unwrap();
+        assert_eq!(field(&stale, 0), 9);
+        assert_eq!(ttls(&stale), vec![STALE_TTL]);
+    }
+
+    #[test]
+    fn a_fresh_entry_is_never_served_as_stale() {
+        let cache = DnsCache::new();
+        cache.insert("fresh.test", RecordType::A, &a_answer("fresh.test", 300));
+        assert!(cache.lookup_stale("fresh.test", RecordType::A, 9).is_none());
+    }
+
+    #[test]
+    fn rewriting_ttls_leaves_the_edns_opt_record_alone() {
+        let cached = with_opt(a_answer("opt.test", 300), 1232);
+        let stale = rewrite_answer(&cached, 7, Duration::ZERO, Some(STALE_TTL));
+        assert_eq!(ttls(&stale), vec![STALE_TTL, 0x0000_8000]);
+        let aged = rewrite_answer(&cached, 7, Duration::from_secs(100), None);
+        assert_eq!(ttls(&aged), vec![200, 0x0000_8000]);
+    }
+
+    #[test]
+    fn negative_answers_use_the_lesser_soa_ttl_capped_at_300() {
+        let cache = DnsCache::new();
+        let nx = rcode_answer("gone.example", ResponseCode::NameError, &[soa(60, 900)]);
+        cache.insert("gone.example", RecordType::A, &nx);
+        let entries = cache.entries.lock().unwrap();
+        assert_eq!(
+            entries[&CacheKey::new("gone.example", RecordType::A)].min_ttl,
+            60
         );
+        drop(entries);
+        assert!(cache.lookup("gone.example", RecordType::A, 9).is_some());
 
-        cache.insert("Example.COM", RecordType::A, &response);
+        let bare = rcode_answer("bare.example", ResponseCode::NameError, &[]);
+        cache.insert("bare.example", RecordType::A, &bare);
+        let entries = cache.entries.lock().unwrap();
+        assert_eq!(
+            entries[&CacheKey::new("bare.example", RecordType::A)].min_ttl,
+            DEFAULT_NEGATIVE_TTL
+        );
+    }
 
-        // Look up with lowercase — should find it.
+    #[test]
+    fn failures_and_truncated_answers_are_never_cached() {
+        let cache = DnsCache::new();
+        for code in [ResponseCode::ServerFailure, ResponseCode::Refused] {
+            cache.insert(
+                "fail.example",
+                RecordType::A,
+                &rcode_answer("fail.example", code, &[]),
+            );
+        }
+        let mut truncated = a_answer("fail.example", 300);
+        truncated[2] |= 0x02;
+        cache.insert("fail.example", RecordType::A, &truncated);
+        cache.insert("fail.example", RecordType::A, b"garbage");
+        assert_eq!(cache.len(), 0);
+    }
+
+    #[test]
+    fn capacity_is_bounded_and_eviction_takes_the_soonest_to_expire() {
+        let cache = DnsCache::new();
+        cache.insert(
+            "short.example",
+            RecordType::A,
+            &a_answer("short.example", 1),
+        );
+        for i in 0..MAX_CACHE_ENTRIES {
+            let name = format!("host{i}.example");
+            cache.insert(&name, RecordType::A, &a_answer(&name, 3600));
+        }
+        assert_eq!(cache.len(), MAX_CACHE_ENTRIES);
+        assert!(cache.lookup("short.example", RecordType::A, 9).is_none());
+        assert!(cache.lookup("host0.example", RecordType::A, 9).is_some());
+    }
+
+    #[test]
+    fn names_match_case_insensitively() {
+        let cache = DnsCache::new();
+        cache.insert("Example.COM", RecordType::A, &a_answer("Example.COM", 300));
         assert!(cache.lookup("example.com", RecordType::A, 5678).is_some());
-
-        // Different case in lookup should still match.
         assert!(cache.lookup("EXAMPLE.COM", RecordType::A, 5678).is_some());
+        assert!(
+            cache
+                .lookup("example.com", RecordType::Aaaa, 5678)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn udp_payload_limit_reads_the_askers_edns_size() {
+        let plain = wire::encode_query(1, "example.com", RecordType::A).unwrap();
+        assert_eq!(udp_payload_limit(&plain), 512);
+        assert_eq!(udp_payload_limit(&with_opt(plain.clone(), 1232)), 1232);
+        assert_eq!(udp_payload_limit(&with_opt(plain, 100)), 512);
+        assert_eq!(udp_payload_limit(b"short"), 512);
     }
 }
