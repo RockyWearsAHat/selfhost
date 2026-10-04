@@ -1,80 +1,160 @@
-//! The HEALTH panel: the machine's current condition from the insight service.
+//! The HEALTH plate: what is wrong on the machine the daemon runs on, read
+//! from `GET /api/insight/now`, with the last hour behind it as sparklines from
+//! `GET /api/insight/metrics`.
 //!
-//! Shows a lamp with the condition word, a summary line, active problems, and
-//! the latest metrics. The history is kept but not shown on screen to avoid
-//! cluttering the interface; it is available for future use by any monitoring
-//! agent.
+//! The order is the order an owner asks in: is it fine; if not, what is wrong
+//! and since when; what has the machine been doing; is DNS answering; who is
+//! using it. Every line is named, so a problem can be pointed at by what it
+//! says rather than by where it sits.
 
-use super::style;
 use super::Console;
-use crate::state::{HistorySample, Insight};
-use rui::{Align, El, Status, caption, col, micro, row, text};
+use super::style;
+use crate::state::{DnsWindow, HistorySample, Insight};
+use rui::{Align, El, Length, Point, Size, Status, Tone, caption, col, draw, micro, row, text};
 
-/// The HEALTH panel when insight is available, or `None` while fetching or if
-/// insight is not enabled.
-pub fn view(insight: Option<&Insight>, _history: &[HistorySample]) -> Option<El<Console>> {
+/// The label column's share of a row, matching `system::NAME_W`.
+const LABEL_W: f32 = 0.28;
+
+/// How tall a sparkline is drawn.
+const SPARK_H: f32 = 18.0;
+
+/// How many ranked processes the plate names; the MCP tool has the rest.
+const PROCESSES: usize = 3;
+
+/// The HEALTH plate, or `None` while nothing has been fetched and on a daemon
+/// without machine insight.
+pub fn view(insight: Option<&Insight>, history: &[HistorySample]) -> Option<El<Console>> {
     let insight = insight?;
-
-    let condition_status = match insight.condition.as_str() {
+    let condition = match insight.condition.as_str() {
         "ok" => Status::Ok,
         "warning" => Status::Warn,
         _ => Status::Idle,
     };
-
-    let problem_rows: Vec<El<Console>> = insight
-        .problems
-        .iter()
-        .map(|p| {
-            row((
-                style::lamp(Status::Warn),
-                caption(p.title.clone()),
-                caption(format_since(p.since_unix)),
-            ))
-            .gap(6.0)
-            .align(Align::Center)
-            .min_h(20.0)
-        })
-        .collect();
-
-    let mut children: Vec<El<Console>> = vec![
+    let mut rows: Vec<El<Console>> = vec![
         row((
-            style::lamp(condition_status),
-            caption(insight.condition.to_uppercase()),
+            row((style::lamp(condition), caption(insight.condition.to_uppercase())))
+                .gap(6.0)
+                .align(Align::Center)
+                .w(Length::Fraction(LABEL_W)),
             text(insight.summary.clone()).grow(),
         ))
-        .gap(6.0)
-        .align(Align::Center)
-        .min_h(20.0),
+        .min_h(20.0)
+        .align(Align::Center),
     ];
-
-    children.extend(problem_rows);
-
-    // Show latest metrics if available.
-    if let Some((cpu_pct, mem_used, mem_total, _commit)) = insight.latest {
-        let mem_pct = if mem_total == 0 { 0.0 } else { (mem_used as f64 / mem_total as f64) * 100.0 };
-        let metrics_line = if let Some(cpu) = cpu_pct {
-            format!("CPU {:.1}% · Memory {:.1}%", cpu, mem_pct)
-        } else {
-            format!("Memory {:.1}%", mem_pct)
-        };
-        children.push(row((micro(metrics_line),)).min_h(16.0));
+    rows.extend(insight.problems.iter().map(|problem| {
+        row((
+            row((style::lamp(Status::Warn), caption(format!("SINCE {}", clock(problem.since_unix)))))
+                .gap(6.0)
+                .align(Align::Center)
+                .w(Length::Fraction(LABEL_W)),
+            caption(problem.title.clone()).grow(),
+        ))
+        .min_h(20.0)
+        .align(Align::Center)
+    }));
+    let cpu: Vec<f64> = history.iter().map(|s| s.cpu_pct.unwrap_or(0.0)).collect();
+    let memory: Vec<f64> = history.iter().map(|s| s.mem_pct).collect();
+    let network: Vec<f64> = history.iter().map(|s| s.net_bps as f64).collect();
+    rows.push(
+        row((
+            spark("CPU", insight.cpu_pct.map(|pct| format!("{pct:.0}%")), cpu, Some(100.0)),
+            spark("MEMORY", insight.mem_pct.map(|pct| format!("{pct:.0}%")), memory, Some(100.0)),
+            spark("NETWORK", history.last().map(|s| rate(s.net_bps)), network, None),
+            dns(insight.dns),
+        ))
+        .gap(16.0),
+    );
+    if !insight.processes.is_empty() {
+        let top: Vec<String> = insight
+            .processes
+            .iter()
+            .take(PROCESSES)
+            .map(|p| format!("{} ({}) {:.2} cores {} MB", p.name, p.pid, p.cpu_cores, p.working_set_mb))
+            .collect();
+        rows.push(row((micro("TOP".to_owned()).w(Length::Fraction(LABEL_W)), micro(top.join("  ·  ")).grow())).min_h(16.0));
     }
-
-    Some(style::plate((style::section_rule("HEALTH", None), col(children).gap(3.0))).gap(6.0))
+    Some(style::plate((style::section_rule("HEALTH", None), col(rows).gap(3.0))).gap(6.0))
 }
 
-/// Formats a unix timestamp relative to now.
-fn format_since(since_unix: u64) -> String {
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
-    let secs_ago = now.saturating_sub(since_unix);
-    if secs_ago < 60 {
-        "now".into()
-    } else if secs_ago < 3600 {
-        format!("{}m ago", secs_ago / 60)
+/// A named metric with its newest value over its last hour as a line.
+fn spark(label: &str, now: Option<String>, values: Vec<f64>, ceiling: Option<f64>) -> El<Console> {
+    col((
+        row((caption(label.to_owned()), caption(now.unwrap_or_else(|| "—".to_owned()))))
+            .gap(8.0)
+            .align(Align::Center),
+        sparkline(values, ceiling),
+    ))
+    .gap(2.0)
+    .grow()
+}
+
+/// `values` as one line across the space it is given: oldest at the left,
+/// scaled to `ceiling` (a percentage's 100) or, for a rate, to its own peak.
+/// Fewer than two points draw nothing rather than a misleading flat line.
+fn sparkline(values: Vec<f64>, ceiling: Option<f64>) -> El<Console> {
+    draw(Size::new(0.0, SPARK_H), move |painter, rect| {
+        if values.len() < 2 {
+            return;
+        }
+        let top = ceiling.unwrap_or_else(|| values.iter().copied().fold(0.0, f64::max)).max(f64::EPSILON);
+        let color = painter.color(Tone::AccentLight);
+        let step = rect.w / (values.len() - 1) as f32;
+        let point = |index: usize, value: f64| {
+            let share = (value / top).clamp(0.0, 1.0) as f32;
+            Point::new(rect.x + step * index as f32, rect.y + rect.h - share * rect.h)
+        };
+        for (index, pair) in values.windows(2).enumerate() {
+            painter.canvas().line(point(index, pair[0]), point(index + 1, pair[1]), 1.0, color);
+        }
+    })
+    .h(SPARK_H)
+}
+
+/// The resolver's last five minutes, lit by how it went; dark where no
+/// resolver reports on this machine.
+fn dns(window: Option<DnsWindow>) -> El<Console> {
+    let Some(dns) = window else {
+        return col((row((style::lamp(Status::Idle), caption("DNS".to_owned()))).gap(6.0).align(Align::Center), micro("not on this machine".to_owned()))).gap(2.0).grow();
+    };
+    let status = if dns.queries > 0 && dns.failures * 100 > dns.queries {
+        Status::Bad
+    } else if dns.queries > 0 && dns.slow * 20 > dns.queries {
+        Status::Warn
     } else {
-        format!("{}h ago", secs_ago / 3600)
+        Status::Ok
+    };
+    col((
+        row((style::lamp(status), caption("DNS".to_owned()))).gap(6.0).align(Align::Center),
+        micro(format!("{} in 5 min · {} failed · {} slow", dns.queries, dns.failures, dns.slow)),
+    ))
+    .gap(2.0)
+    .grow()
+}
+
+/// Bytes a second, in the unit a person reads.
+fn rate(bytes_per_second: u64) -> String {
+    match bytes_per_second {
+        rate if rate >= 1_000_000 => format!("{:.1} MB/s", rate as f64 / 1_000_000.0),
+        rate if rate >= 1_000 => format!("{:.0} KB/s", rate as f64 / 1_000.0),
+        rate => format!("{rate} B/s"),
+    }
+}
+
+/// `HH:MM` UTC, for "since when": the daemon's clock, not this machine's zone.
+fn clock(unix: u64) -> String {
+    let minutes = unix / 60 % (24 * 60);
+    format!("{:02}:{:02} UTC", minutes / 60, minutes % 60)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rates_and_clocks_read_as_a_person_would_say_them() {
+        assert_eq!(rate(512), "512 B/s");
+        assert_eq!(rate(48_000), "48 KB/s");
+        assert_eq!(rate(2_500_000), "2.5 MB/s");
+        assert_eq!(clock(1_791_001_862), "04:31 UTC");
     }
 }
