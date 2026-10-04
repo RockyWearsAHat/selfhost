@@ -38,6 +38,7 @@ use crate::zone::Zone;
 use selfhost_config::{Config, RecordConfig};
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -71,6 +72,10 @@ const LOOP_QUARANTINE: Duration = Duration::from_secs(600);
 
 /// Total budget for forwarding a query across all upstreams.
 const UPSTREAM_TOTAL_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// How long the sockets must stay idle, with nothing received and nothing in
+/// hand, before [`Authority::quiesce`] calls them drained.
+const QUIET: Duration = Duration::from_millis(5);
 
 /// The split-horizon view LAN peers are answered from.
 ///
@@ -121,6 +126,27 @@ struct Inner {
     forward_cache: DnsCache,
     /// Telemetry: DNS query statistics and upstream tracking.
     telemetry: Telemetry,
+    /// Datagrams and connections taken off the sockets, ever.
+    received: AtomicU64,
+    /// Queries and connections taken off the sockets and not yet answered.
+    in_hand: AtomicUsize,
+}
+
+/// One received query or connection, counted in hand until it is dropped.
+struct InHand(Authority);
+
+impl InHand {
+    fn take(authority: &Authority) -> Self {
+        authority.0.received.fetch_add(1, Ordering::SeqCst);
+        authority.0.in_hand.fetch_add(1, Ordering::SeqCst);
+        Self(authority.clone())
+    }
+}
+
+impl Drop for InHand {
+    fn drop(&mut self) {
+        self.0.0.in_hand.fetch_sub(1, Ordering::SeqCst);
+    }
 }
 
 impl Inner {
@@ -134,6 +160,8 @@ impl Inner {
             quarantined: std::sync::Mutex::new(Vec::new()),
             forward_cache: DnsCache::new(),
             telemetry: Telemetry::new(),
+            received: AtomicU64::new(0),
+            in_hand: AtomicUsize::new(0),
         }
     }
 }
@@ -279,9 +307,10 @@ impl Authority {
                 Ok((read, from)) => {
                     consecutive_errors = 0;
                     let raw = buffer[..read].to_vec();
-                    let authority = self.clone();
+                    let in_hand = InHand::take(self);
                     let socket = Arc::clone(&socket);
                     tokio::spawn(async move {
+                        let authority = &in_hand.0;
                         let answer = authority.handle_query(&raw, false, from.ip()).await;
                         // Fire-and-forget looked identical in the log to a reply that
                         // actually left the box — an answer built here and never
@@ -317,9 +346,9 @@ impl Authority {
             match listener.accept().await {
                 Ok((client, from)) => {
                     consecutive_errors = 0;
-                    let authority = self.clone();
+                    let in_hand = InHand::take(self);
                     tokio::spawn(async move {
-                        let _ = authority.serve_connection(client, from.ip()).await;
+                        let _ = in_hand.0.serve_connection(client, from.ip()).await;
                     });
                 }
                 Err(error) => {
@@ -740,6 +769,31 @@ impl Authority {
             }
         }
         true
+    }
+
+    /// Waits until every query taken off the sockets has been answered and
+    /// nothing new has arrived for [`QUIET`], then true; false if that has not
+    /// happened within `deadline`. The serve loops must keep running meanwhile.
+    ///
+    /// How an instance that has been replaced leaves without losing a query.
+    /// On Windows the first socket on a shared port receives everything until
+    /// it closes, and what is still queued in it, or still being answered,
+    /// when it closes is lost. So it closes only once it is idle, and the
+    /// replacement's socket takes the next datagram.
+    pub async fn quiesce(&self, deadline: Duration) -> bool {
+        let started = Instant::now();
+        let mut seen = self.0.received.load(Ordering::SeqCst);
+        loop {
+            tokio::time::sleep(QUIET).await;
+            let received = self.0.received.load(Ordering::SeqCst);
+            if received == seen && self.0.in_hand.load(Ordering::SeqCst) == 0 {
+                return true;
+            }
+            if started.elapsed() >= deadline {
+                return false;
+            }
+            seen = received;
+        }
     }
 
     /// The origins served, for startup logging and the doctor.
@@ -2106,6 +2160,36 @@ domains = ["example.com", "hand.example"]
         assert_eq!((stats(silent_address).timeout, stats(silent_address).ok), (1, 0));
         assert_eq!((stats(address).ok, stats(address).error), (1, 0));
         drop(silent);
+    }
+
+    #[tokio::test]
+    async fn quiesce_waits_for_every_query_in_hand() {
+        let authority = Authority(Arc::new(Inner::new(vec![example_zone()], None)));
+        assert!(authority.quiesce(Duration::from_millis(50)).await, "nothing in hand is drained");
+
+        let in_hand = InHand::take(&authority);
+        assert!(!authority.quiesce(Duration::from_millis(30)).await, "an unanswered query is not drained");
+        let answering = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            drop(in_hand);
+        });
+        assert!(authority.quiesce(Duration::from_secs(2)).await);
+        answering.await.unwrap();
+
+        // Steady arrivals keep it open even though each is answered at once.
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let arrivals = tokio::spawn({
+            let (busy, stop) = (authority.clone(), Arc::clone(&stop));
+            async move {
+                while !stop.load(Ordering::SeqCst) {
+                    drop(InHand::take(&busy));
+                    tokio::task::yield_now().await;
+                }
+            }
+        });
+        assert!(!authority.quiesce(Duration::from_millis(30)).await, "a busy socket is not drained");
+        stop.store(true, Ordering::SeqCst);
+        arrivals.await.unwrap();
     }
 
     #[tokio::test]

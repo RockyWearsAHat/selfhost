@@ -364,11 +364,28 @@ pub async fn lan_dns_command(
         result = &mut serving => result.map_err(|error| bind_hint(bind, error)),
         _ = tokio::signal::ctrl_c() => Ok(()),
         _ = watch_handoff(this_pid, &data_dir) => {
-            eprintln!("{} [dns] a newer instance took over; exiting", selfhost_dns::stamp());
+            // Keep serving until idle: closing with a query queued or still
+            // being answered would lose it.
+            let drained = tokio::select! {
+                result = &mut serving => return result.map_err(|error| bind_hint(bind, error)),
+                drained = authority.quiesce(DRAIN_FOR) => drained,
+            };
+            if drained {
+                eprintln!("{} [dns] a newer instance took over; drained, exiting", selfhost_dns::stamp());
+            } else {
+                eprintln!(
+                    "{} [dns] a newer instance took over; still busy after {} s, exiting anyway",
+                    selfhost_dns::stamp(),
+                    DRAIN_FOR.as_secs()
+                );
+            }
             Ok(())
         }
     }
 }
+
+/// How long a replaced instance waits to fall idle before it exits regardless.
+const DRAIN_FOR: std::time::Duration = std::time::Duration::from_secs(3);
 
 /// Answers this process must give before it claims the handoff.
 const PROOF_ANSWERS: u64 = 3;
