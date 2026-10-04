@@ -5,7 +5,7 @@
 //! Failures are logged when they change, not on every tick: a full disk must
 //! not turn the watcher into the log flood it exists to catch.
 
-use crate::assess::{problems_path, read_dns_stats};
+use crate::assess::{FLAP_WINDOW_SECS, problems_path, read_dns_stats};
 use crate::store::{self, Store};
 use crate::{Assessor, SAMPLE_EVERY, Sampler, unix_now};
 use selfhost_json::Json;
@@ -44,7 +44,12 @@ impl Watch {
 
     fn tick(&mut self, at: u64) {
         let sample = self.sampler.sample(at);
-        let timeline = self.assessor.observe(&sample, read_dns_stats(&self.data_dir).as_ref());
+        // Repairs are judged once a minute, with the process ranking: a store
+        // read every ten seconds would cost more than flapping is worth.
+        let repairs = (!sample.processes.is_empty())
+            .then(|| store::read_events(&self.data_dir, at.saturating_sub(FLAP_WINDOW_SECS), at + 1).ok())
+            .flatten();
+        let timeline = self.assessor.observe(&sample, read_dns_stats(&self.data_dir).as_ref(), repairs.as_deref());
         let mut recorded = self.store.append_sample(&sample);
         for event in &timeline {
             recorded = recorded.and_then(|()| self.store.append_event(event));

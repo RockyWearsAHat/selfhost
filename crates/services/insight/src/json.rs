@@ -120,6 +120,8 @@ impl ProcessSample {
             ("working_set_mb", num(self.working_set_mb)),
             ("private_mb", num(self.private_mb)),
             ("handles", num(u64::from(self.handles))),
+            ("io_read_bps", num(self.io_read_bps)),
+            ("io_write_bps", num(self.io_write_bps)),
         ])
     }
 
@@ -131,6 +133,8 @@ impl ProcessSample {
             working_set_mb: u64_of(json, "working_set_mb"),
             private_mb: u64_of(json, "private_mb"),
             handles: u32::try_from(u64_of(json, "handles")).unwrap_or(u32::MAX),
+            io_read_bps: u64_of(json, "io_read_bps"),
+            io_write_bps: u64_of(json, "io_write_bps"),
         })
     }
 }
@@ -181,6 +185,8 @@ mod tests {
                 working_set_mb: 23,
                 private_mb: 30,
                 handles: 512,
+                io_read_bps: 4096,
+                io_write_bps: 1024,
             }],
         };
         let line = sample.to_json().to_text();
