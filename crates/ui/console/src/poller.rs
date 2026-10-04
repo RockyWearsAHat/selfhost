@@ -21,7 +21,7 @@ use crate::client::{Client, ClientError};
 use crate::nas::{self, Listing, Share};
 use crate::registry::{Person, Trail};
 use crate::remote::{Agent, Node, Settings};
-use crate::state::{Command, FileAction, Link, LogLine, Screen, Snapshot, Viewer};
+use crate::state::{Command, FileAction, HistorySample, Insight, Link, LogLine, Screen, Snapshot, Viewer};
 use crate::view::sites::Site;
 use selfhost_firewall::FirewallState;
 use selfhost_json::Json;
@@ -39,6 +39,9 @@ const TICK: Duration = Duration::from_millis(60);
 
 /// How often the daemon is asked for the state of things.
 const POLL_INTERVAL: Duration = Duration::from_millis(500);
+
+/// How often to fetch metrics history.
+const METRICS_INTERVAL: Duration = Duration::from_secs(60);
 
 /// How many log lines to fetch at once.
 ///
@@ -78,6 +81,7 @@ impl<F: Fn() -> Result<Client, String> + Send + 'static> Connect for F {}
 /// The loop itself.
 fn run(connect: impl Connect, shared: Arc<Mutex<Snapshot>>, running: Arc<AtomicBool>) {
     let mut last_poll: Option<Instant> = None;
+    let mut last_metrics: Option<Instant> = None;
     let mut client: Option<Client> = None;
 
     while running.load(Ordering::Relaxed) {
@@ -117,12 +121,15 @@ fn run(connect: impl Connect, shared: Arc<Mutex<Snapshot>>, running: Arc<AtomicB
             carry_out(ready, &shared, command);
         }
 
+        let metrics_due = last_metrics.is_none_or(|at| at.elapsed() >= METRICS_INTERVAL);
+
         let mut answered = Answered::No;
         if acted || due {
             last_poll = Some(Instant::now());
             answered = refresh_services(ready, &shared);
             if answered == Answered::Yes {
                 refresh_viewer(ready, &shared);
+                refresh_insight(ready, &shared);
                 // The service list is fetched whatever is on screen: the
                 // masthead's own condition is read off it, and every screen
                 // carries the masthead. Everything below is per-screen — see
@@ -143,6 +150,11 @@ fn run(connect: impl Connect, shared: Arc<Mutex<Snapshot>>, running: Arc<AtomicB
                     Screen::Sites => refresh_sites(ready, &shared),
                 }
             }
+        }
+
+        if metrics_due && client.is_some() {
+            last_metrics = Some(Instant::now());
+            refresh_metrics(ready, &shared);
         }
 
         // A refused credential is thrown away rather than retried for ever. The
@@ -697,6 +709,45 @@ fn refresh_sites(client: &Client, shared: &Arc<Mutex<Snapshot>>) {
     let mut snapshot = shared.lock().expect("the snapshot lock was poisoned");
     snapshot.sites.sites = sites;
     snapshot.sites.trouble = trouble;
+}
+
+/// Fetches the machine's current health assessment.
+///
+/// A 404 is not a failure and does not become a notice: a daemon with insight
+/// disabled simply does not serve this route, and the plate draws its absence
+/// as a sentence. The last good insight is left in place until a fetch succeeds.
+fn refresh_insight(client: &Client, shared: &Arc<Mutex<Snapshot>>) {
+    if let Ok(value) = client.get("/api/insight/now") {
+        if let Some(insight) = Insight::from_json(&value) {
+            shared.lock().expect("the snapshot lock was poisoned").insight = Some(insight);
+        }
+    }
+}
+
+/// Fetches a minute of metric history.
+///
+/// Silent on a 404 (a daemon with insight disabled), and the last good history
+/// is left in place until a fetch succeeds. The history is replaced rather than
+/// appended: the metrics cover a rolling window.
+fn refresh_metrics(client: &Client, shared: &Arc<Mutex<Snapshot>>) {
+    if let Ok(value) = client.get("/api/insight/metrics") {
+        if let Some(arr) = value.get("samples").and_then(Json::as_array) {
+            let samples: Vec<HistorySample> = arr
+                .iter()
+                .filter_map(HistorySample::from_json)
+                .collect();
+            if !samples.is_empty() {
+                let mut snapshot = shared.lock().expect("the snapshot lock was poisoned");
+                // Keep up to an hour of samples; discard older ones as new arrive.
+                // Assume samples are roughly 10 seconds apart; 6 per minute = 360 per hour.
+                snapshot.history.extend(samples);
+                if snapshot.history.len() > 360 {
+                    let excess = snapshot.history.len() - 360;
+                    snapshot.history.drain(0..excess);
+                }
+            }
+        }
+    }
 }
 
 /// Reads one log line from the wire.

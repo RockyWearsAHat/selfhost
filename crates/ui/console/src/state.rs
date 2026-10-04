@@ -121,6 +121,85 @@ impl SystemPart {
     }
 }
 
+impl InsightProblem {
+    /// Reads one problem from the wire.
+    pub fn from_json(value: &Json) -> Option<Self> {
+        Some(Self {
+            id: value.get("id")?.as_str()?.to_owned(),
+            title: value.get("title")?.as_str()?.to_owned(),
+            since_unix: value.get("since_unix")?.as_u64()?,
+        })
+    }
+}
+
+impl Insight {
+    /// Reads the answer to `GET /api/insight/now`, or returns `None` if insight
+    /// is not enabled (the daemon answered `404`).
+    pub fn from_json(value: &Json) -> Option<Self> {
+        let latest = value.get("latest").and_then(|s| {
+            let cpu_pct = s.get("cpu_pct").and_then(Json::as_f64);
+            let mem_used = s.get("mem_used_mb")?.as_u64()?;
+            let mem_total = s.get("mem_total_mb")?.as_u64()?;
+            let commit = s.get("commit_used_mb")?.as_u64()?;
+            Some((cpu_pct, mem_used, mem_total, commit))
+        });
+
+        let processes = value
+            .get("processes")
+            .and_then(Json::as_array)
+            .unwrap_or(&[])
+            .iter()
+            .filter_map(|p| {
+                let name = p.get("name")?.as_str()?.to_owned();
+                let cpu_cores = p.get("cpu_cores")?.as_f64()?;
+                let working_set = p.get("working_set_mb")?.as_u64()?;
+                Some((name, cpu_cores, working_set))
+            })
+            .collect();
+
+        Some(Self {
+            at_unix: value.get("at_unix")?.as_u64()?,
+            condition: value.get("condition")?.as_str()?.to_owned(),
+            summary: value.get("summary")?.as_str()?.to_owned(),
+            problems: value
+                .get("problems")
+                .and_then(Json::as_array)
+                .unwrap_or(&[])
+                .iter()
+                .filter_map(InsightProblem::from_json)
+                .collect(),
+            latest,
+            processes,
+            dns: value.get("dns").cloned(),
+        })
+    }
+}
+
+impl HistorySample {
+    /// Reads one sample from `/api/insight/metrics`.
+    pub fn from_json(value: &Json) -> Option<Self> {
+        let at_unix = value.get("at_unix")?.as_u64()?;
+        let cpu_pct = value.get("cpu_pct").and_then(Json::as_f64);
+        let mem_total = value.get("mem_total_mb")?.as_u64()?;
+        let mem_used = value.get("mem_used_mb")?.as_u64()?;
+        let mem_pct = if mem_total == 0 { 0.0 } else { (mem_used as f64 / mem_total as f64) * 100.0 };
+
+        let net = value
+            .get("net")
+            .and_then(Json::as_array)
+            .unwrap_or(&[])
+            .iter()
+            .filter_map(|n| {
+                let rx = n.get("rx_bps")?.as_u64()?;
+                let tx = n.get("tx_bps")?.as_u64()?;
+                Some(rx + tx)
+            })
+            .sum();
+
+        Some(Self { at_unix, cpu_pct, mem_pct, net_bps: net })
+    }
+}
+
 /// One captured line of a service's output.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LogLine {
@@ -152,6 +231,49 @@ pub struct Logs {
     /// lines and no reply yet both leave [`Logs::lines`] empty, and the pane
     /// must not claim the first while the truth is the second.
     pub answered: bool,
+}
+
+/// One problem reported by the insight service.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InsightProblem {
+    /// The problem's id.
+    pub id: String,
+    /// One line describing it.
+    pub title: String,
+    /// Unix seconds when it started.
+    pub since_unix: u64,
+}
+
+/// The machine's current health and a sample of history.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Insight {
+    /// When the health was assessed.
+    pub at_unix: u64,
+    /// `ok`, `warning`, or `unknown`.
+    pub condition: String,
+    /// One sentence covering the machine.
+    pub summary: String,
+    /// Current problems, oldest first.
+    pub problems: Vec<InsightProblem>,
+    /// The newest sample if any: cpu_pct, mem_used_mb, mem_total_mb, commit_used_mb.
+    pub latest: Option<(Option<f64>, u64, u64, u64)>,
+    /// Top processes: name, cpu_cores, working_set_mb.
+    pub processes: Vec<(String, f64, u64)>,
+    /// DNS resolver stats: last_5_minutes field if present.
+    pub dns: Option<Json>,
+}
+
+/// One metric sample in the history.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct HistorySample {
+    /// Unix seconds.
+    pub at_unix: u64,
+    /// CPU usage percent, or None.
+    pub cpu_pct: Option<f64>,
+    /// Memory usage percent.
+    pub mem_pct: f64,
+    /// Network throughput: rx_bps + tx_bps.
+    pub net_bps: u64,
 }
 
 impl Logs {
@@ -748,6 +870,12 @@ pub struct Snapshot {
     /// each other. Never the hosted [`Snapshot::services`] list — see `is_system`
     /// in `crates/app/admin/src/lib.rs`, which this mirrors.
     pub system: Option<Vec<SystemPart>>,
+    /// The machine's current health assessment from the insight service, or `None`
+    /// until first fetched. A missing field rather than a `Result` because `404`
+    /// means "insight is not enabled", which is a normal state, not an error.
+    pub insight: Option<Insight>,
+    /// Historical health metrics for the last hour, updated once per minute.
+    pub history: Vec<HistorySample>,
     /// Which screen is open, and so what the poller fetches.
     pub screen: Screen,
     /// Where the FILES plate is looking, and what it found.
@@ -1113,5 +1241,106 @@ mod tests {
     #[test]
     fn a_body_with_no_system_array_reads_as_nothing_rather_than_an_empty_list() {
         assert!(SystemPart::list_from_json(&selfhost_json::parse(r#"{}"#).unwrap()).is_none());
+    }
+
+    #[test]
+    fn insight_now_is_read_from_the_wire() {
+        let value = selfhost_json::parse(
+            r#"{
+                "at_unix":1000,
+                "condition":"warning",
+                "summary":"Memory at 75%",
+                "problems":[
+                    {"id":"mem_high","title":"High memory use","since_unix":950}
+                ],
+                "latest":{
+                    "cpu_pct":42.5,
+                    "mem_used_mb":4096,
+                    "mem_total_mb":8192,
+                    "commit_used_mb":5000
+                },
+                "processes":[
+                    {"name":"mongodb","cpu_cores":1.5,"working_set_mb":2048}
+                ],
+                "dns":{"last_5_minutes":{}}
+            }"#,
+        )
+        .expect("legal JSON");
+        let insight = Insight::from_json(&value).expect("an insight");
+        assert_eq!(insight.at_unix, 1000);
+        assert_eq!(insight.condition, "warning");
+        assert_eq!(insight.summary, "Memory at 75%");
+        assert_eq!(insight.problems.len(), 1);
+        assert_eq!(insight.problems[0].id, "mem_high");
+        assert_eq!(insight.problems[0].title, "High memory use");
+        assert_eq!(insight.problems[0].since_unix, 950);
+        assert_eq!(insight.latest, Some((Some(42.5), 4096, 8192, 5000)));
+        assert_eq!(insight.processes.len(), 1);
+        assert_eq!(insight.processes[0].0, "mongodb");
+        assert_eq!(insight.processes[0].1, 1.5);
+        assert_eq!(insight.processes[0].2, 2048);
+        assert!(insight.dns.is_some());
+    }
+
+    #[test]
+    fn insight_now_with_missing_fields_reads_as_nothing() {
+        // No at_unix: cannot parse
+        assert!(Insight::from_json(&selfhost_json::parse(r#"{"condition":"ok"}"#).unwrap()).is_none());
+    }
+
+    #[test]
+    fn insight_now_with_no_latest_sample_is_ok() {
+        let value = selfhost_json::parse(
+            r#"{
+                "at_unix":1000,
+                "condition":"ok",
+                "summary":"All good",
+                "problems":[],
+                "processes":[]
+            }"#,
+        )
+        .expect("legal JSON");
+        let insight = Insight::from_json(&value).expect("an insight");
+        assert_eq!(insight.latest, None);
+        assert_eq!(insight.problems.len(), 0);
+    }
+
+    #[test]
+    fn history_sample_is_read_from_metrics() {
+        let value = selfhost_json::parse(
+            r#"{
+                "at_unix":2000,
+                "cpu_pct":33.5,
+                "mem_total_mb":8192,
+                "mem_used_mb":6144,
+                "net":[
+                    {"rx_bps":1000000,"tx_bps":500000},
+                    {"rx_bps":200000,"tx_bps":300000}
+                ]
+            }"#,
+        )
+        .expect("legal JSON");
+        let sample = HistorySample::from_json(&value).expect("a sample");
+        assert_eq!(sample.at_unix, 2000);
+        assert_eq!(sample.cpu_pct, Some(33.5));
+        assert!((sample.mem_pct - 75.0).abs() < 0.01);
+        assert_eq!(sample.net_bps, 2000000);
+    }
+
+    #[test]
+    fn history_sample_without_cpu_is_ok() {
+        let value = selfhost_json::parse(
+            r#"{
+                "at_unix":2000,
+                "mem_total_mb":8192,
+                "mem_used_mb":2048,
+                "net":[]
+            }"#,
+        )
+        .expect("legal JSON");
+        let sample = HistorySample::from_json(&value).expect("a sample");
+        assert_eq!(sample.cpu_pct, None);
+        assert!((sample.mem_pct - 25.0).abs() < 0.01);
+        assert_eq!(sample.net_bps, 0);
     }
 }
