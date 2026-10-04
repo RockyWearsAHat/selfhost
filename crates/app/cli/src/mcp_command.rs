@@ -127,8 +127,8 @@ type Tool = (&'static str, &'static str, &'static [Param]);
 /// services and deploys (`service.control`, with reads under `console.read`),
 /// the deployment's own self-update, `whoami` so an agent can see exactly
 /// which of these its token will open, and — owner-only, the same as the
-/// routes behind them — the registry (`people_*`), the deploy record and
-/// System health (`deploys_*`, `system_health`), the VPN roster
+/// routes behind them — the registry (`people_*`), the deploy record,
+/// System health and insight (`deploys_*`, `system_health`, `insight_*`), the VPN roster
 /// (`vpn_peers_list`) and the firewall (`firewall_show`). This is "STEP 4 —
 /// control parity" from `index.dx`'s goal 4: every mutating
 /// admin route reachable from a keyboard on the box is reachable here too,
@@ -377,6 +377,38 @@ const TOOLS: &[Tool] = &[
         &[],
     ),
     (
+        "insight_now",
+        "Call this FIRST when anything seems wrong; it answers what is wrong right now with evidence \
+         (problems, newest sample, top processes, DNS last 5 minutes).",
+        &[],
+    ),
+    (
+        "insight_metrics",
+        "Show metrics over a time range: CPU, memory, disk, and network sampled at regular intervals.",
+        &[
+            ("since", "Start of the range as a unix timestamp (seconds); optional.", false, Kind::Count),
+            ("until", "End of the range as a unix timestamp (seconds); optional.", false, Kind::Count),
+        ],
+    ),
+    (
+        "insight_events",
+        "Show events (alerts, changes, anomalies) over a time range.",
+        &[
+            ("since", "Start of the range as a unix timestamp (seconds); optional.", false, Kind::Count),
+            ("until", "End of the range as a unix timestamp (seconds); optional.", false, Kind::Count),
+        ],
+    ),
+    (
+        "insight_dns",
+        "Show the resolver's statistics: queries, failures, and upstream performance.",
+        &[],
+    ),
+    (
+        "insight_processes",
+        "Show the top processes by CPU and memory right now.",
+        &[],
+    ),
+    (
         "vpn_peers_list",
         "List every peer this deployment's VPN relays know about, static and dynamically enrolled \
          alike, with which Person (if any) each is bound to.",
@@ -580,8 +612,9 @@ fn initialize_result() -> Json {
 const SERVER_INSTRUCTIONS: &str = "\
 This server manages services and sites on one selfhost deployment. Typical workflow:\n\
 \n\
-1. Something looks broken? Call services_show and services_logs BEFORE touching SSH \
-or any credential tooling (gh auth, ssh-add, etc.) — most failures are visible here \
+1. Something looks broken? Call insight_now first to see what is wrong right now with \
+evidence, then services_show and services_logs for more detail. Never touch SSH or any \
+credential tooling (gh auth, ssh-add, etc.) — most failures are visible in these tools \
 (a build step's error, a service left stopped) and none of them are fixed by \
 re-authenticating anything. Never SSH directly to a box's port 22; a box's SSH is only \
 reachable through its own Secure-VPN tunnel, and a direct attempt will simply time out.\n\
@@ -1170,6 +1203,28 @@ async fn call_tool(client: &RemoteClient, name: &str, arguments: &Json) -> Resul
             let answer = client.get("/api/system").await?;
             Ok(answer.to_text())
         }
+        "insight_now" => {
+            let answer = client.get("/api/insight/now").await?;
+            Ok(answer.to_text())
+        }
+        "insight_metrics" => {
+            let path = build_insight_metrics_path(arguments)?;
+            let answer = client.get(&path).await?;
+            Ok(answer.to_text())
+        }
+        "insight_events" => {
+            let path = build_insight_events_path(arguments)?;
+            let answer = client.get(&path).await?;
+            Ok(answer.to_text())
+        }
+        "insight_dns" => {
+            let answer = client.get("/api/insight/dns").await?;
+            Ok(answer.to_text())
+        }
+        "insight_processes" => {
+            let answer = client.get("/api/insight/processes").await?;
+            Ok(answer.to_text())
+        }
         "vpn_peers_list" => {
             let answer = client.get("/api/vpn/peers").await?;
             Ok(answer.to_text())
@@ -1394,6 +1449,46 @@ fn decode_base64(text: &str) -> Result<Vec<u8>, String> {
         _ => return Err("\"content\" is not valid base64".to_owned()),
     }
     Ok(out)
+}
+
+/// Builds the path for insight_metrics with optional since and until query parameters.
+fn build_insight_metrics_path(arguments: &Json) -> Result<String, String> {
+    let mut path = String::from("/api/insight/metrics");
+    let since = count(arguments, "since")?;
+    let until = count(arguments, "until")?;
+    if since.is_some() || until.is_some() {
+        path.push('?');
+        if let Some(since_val) = since {
+            path.push_str(&format!("since={since_val}"));
+        }
+        if let Some(until_val) = until {
+            if since.is_some() {
+                path.push('&');
+            }
+            path.push_str(&format!("until={until_val}"));
+        }
+    }
+    Ok(path)
+}
+
+/// Builds the path for insight_events with optional since and until query parameters.
+fn build_insight_events_path(arguments: &Json) -> Result<String, String> {
+    let mut path = String::from("/api/insight/events");
+    let since = count(arguments, "since")?;
+    let until = count(arguments, "until")?;
+    if since.is_some() || until.is_some() {
+        path.push('?');
+        if let Some(since_val) = since {
+            path.push_str(&format!("since={since_val}"));
+        }
+        if let Some(until_val) = until {
+            if since.is_some() {
+                path.push('&');
+            }
+            path.push_str(&format!("until={until_val}"));
+        }
+    }
+    Ok(path)
 }
 
 #[cfg(test)]
@@ -1660,5 +1755,53 @@ mod tests {
         // Missing "name" is refused before any network call, same as every
         // other name-bearing tool.
         assert_eq!(result.get("isError").and_then(Json::as_bool), Some(true));
+    }
+
+    #[test]
+    fn all_insight_tools_appear_in_tools_list() {
+        let listing = tools_list_result();
+        let tools = listing.get("tools").and_then(Json::as_array).expect("a tools array");
+        let names: Vec<&str> =
+            tools.iter().filter_map(|tool| tool.get("name").and_then(Json::as_str)).collect();
+        assert!(names.contains(&"insight_now"), "{names:?}");
+        assert!(names.contains(&"insight_metrics"), "{names:?}");
+        assert!(names.contains(&"insight_events"), "{names:?}");
+        assert!(names.contains(&"insight_dns"), "{names:?}");
+        assert!(names.contains(&"insight_processes"), "{names:?}");
+    }
+
+    #[test]
+    fn insight_metrics_builds_query_string_with_since_and_until() {
+        let arguments = selfhost_json::parse(r#"{"since":1,"until":2}"#).unwrap();
+        let path = build_insight_metrics_path(&arguments).unwrap();
+        assert_eq!(path, "/api/insight/metrics?since=1&until=2");
+    }
+
+    #[test]
+    fn insight_metrics_builds_path_with_only_since() {
+        let arguments = selfhost_json::parse(r#"{"since":1}"#).unwrap();
+        let path = build_insight_metrics_path(&arguments).unwrap();
+        assert_eq!(path, "/api/insight/metrics?since=1");
+    }
+
+    #[test]
+    fn insight_metrics_builds_path_with_only_until() {
+        let arguments = selfhost_json::parse(r#"{"until":2}"#).unwrap();
+        let path = build_insight_metrics_path(&arguments).unwrap();
+        assert_eq!(path, "/api/insight/metrics?until=2");
+    }
+
+    #[test]
+    fn insight_metrics_builds_path_without_params() {
+        let arguments = selfhost_json::parse(r#"{}"#).unwrap();
+        let path = build_insight_metrics_path(&arguments).unwrap();
+        assert_eq!(path, "/api/insight/metrics");
+    }
+
+    #[test]
+    fn insight_events_builds_query_string_with_since_and_until() {
+        let arguments = selfhost_json::parse(r#"{"since":1,"until":2}"#).unwrap();
+        let path = build_insight_events_path(&arguments).unwrap();
+        assert_eq!(path, "/api/insight/events?since=1&until=2");
     }
 }
