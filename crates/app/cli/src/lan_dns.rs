@@ -330,11 +330,12 @@ pub async fn lan_dns_command(
     println!("{} [dns] bound with SO_REUSEADDR", selfhost_dns::stamp());
 
     // Serve first, then prove. Port 53 is shared with any instance being
-    // replaced, so a query sent from here could be answered by either process;
-    // this process's own counters are the only honest proof. The handoff is
-    // claimed once they show real answers, and the old instance drains only
-    // then. A failing new instance leaves while the old one, which never
-    // stopped, keeps serving: rollback is simply not taking over.
+    // replaced, and on Windows the first socket on a shared port receives all
+    // of it, so live traffic cannot prove a newcomer: it asks its own query
+    // path a forwarded question and a zone question instead. The handoff is
+    // claimed once that passes, and the old instance drains only then. A
+    // failing new instance leaves while the old one, which never stopped,
+    // keeps serving: rollback is simply not taking over.
     let data_dir = project_dir.join(&config.server.data_dir);
     let serving = authority.serve_with_sockets(udp, tcp);
     tokio::pin!(serving);
@@ -353,7 +354,7 @@ pub async fn lan_dns_command(
     let this_pid =
         write_handoff(&data_dir).map_err(|e| format!("could not write handoff file: {e}"))?;
     println!(
-        "{} [dns] answering real queries; claimed the handoff as PID {this_pid}",
+        "{} [dns] answered its own forwarded and zone questions; claimed the handoff as PID {this_pid}",
         selfhost_dns::stamp()
     );
     selfhost_dns::writer::spawn_stats_writer(authority.clone(), &data_dir, "lan-dns").await;
@@ -401,13 +402,18 @@ fn judge(counters: &selfhost_dns::telemetry::GlobalCounters) -> Proof {
 }
 
 /// Waits until this process has proven itself, or has shown it is failing
-/// while another instance holds the handoff. With no other instance (a fresh
-/// boot) a failing verdict keeps waiting: leaving would take DNS away entirely.
+/// while another instance holds the handoff. Each failed self-test counts as
+/// unanswered LAN queries, so about ten in a row read as failing. With no
+/// other instance (a fresh boot) a failing verdict keeps waiting: leaving
+/// would take DNS away entirely.
 async fn await_proof(authority: &Authority, data_dir: &Path) -> Proof {
     let this_pid = std::process::id();
     let mut tick = tokio::time::interval(std::time::Duration::from_secs(1));
     loop {
         tick.tick().await;
+        if authority.answers_itself().await {
+            return Proof::Proven;
+        }
         match judge(&authority.telemetry_snapshot("lan-dns").counters) {
             Proof::Pending => {}
             Proof::Failing { .. } if should_keep_serving(this_pid, read_handoff(data_dir)) => {}
