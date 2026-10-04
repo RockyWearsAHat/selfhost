@@ -21,7 +21,7 @@ use crate::client::{Client, ClientError};
 use crate::nas::{self, Listing, Share};
 use crate::registry::{Person, Trail};
 use crate::remote::{Agent, Node, Settings};
-use crate::state::{Command, FileAction, Link, LogLine, Screen, Snapshot, Viewer};
+use crate::state::{Command, FileAction, HistorySample, Insight, Link, LogLine, Screen, Snapshot, Viewer};
 use crate::view::sites::Site;
 use selfhost_firewall::FirewallState;
 use selfhost_json::Json;
@@ -39,6 +39,13 @@ const TICK: Duration = Duration::from_millis(60);
 
 /// How often the daemon is asked for the state of things.
 const POLL_INTERVAL: Duration = Duration::from_millis(500);
+
+/// How often the HEALTH plate asks what is wrong: the machine is sampled every
+/// ten seconds, so asking more often would only re-read the same answer.
+const INSIGHT_INTERVAL: Duration = Duration::from_secs(10);
+
+/// How often the HEALTH sparklines' hour of history is fetched.
+const HISTORY_INTERVAL: Duration = Duration::from_secs(60);
 
 /// How many log lines to fetch at once.
 ///
@@ -78,6 +85,8 @@ impl<F: Fn() -> Result<Client, String> + Send + 'static> Connect for F {}
 /// The loop itself.
 fn run(connect: impl Connect, shared: Arc<Mutex<Snapshot>>, running: Arc<AtomicBool>) {
     let mut last_poll: Option<Instant> = None;
+    let mut last_insight: Option<Instant> = None;
+    let mut last_history: Option<Instant> = None;
     let mut client: Option<Client> = None;
 
     while running.load(Ordering::Relaxed) {
@@ -133,6 +142,14 @@ fn run(connect: impl Connect, shared: Arc<Mutex<Snapshot>>, running: Arc<AtomicB
                         refresh_logs(ready, &shared);
                         refresh_firewall(ready, &shared);
                         refresh_system(ready, &shared);
+                        if last_insight.is_none_or(|at| at.elapsed() >= INSIGHT_INTERVAL) {
+                            last_insight = Some(Instant::now());
+                            refresh_insight(ready, &shared);
+                        }
+                        if last_history.is_none_or(|at| at.elapsed() >= HISTORY_INTERVAL) {
+                            last_history = Some(Instant::now());
+                            refresh_history(ready, &shared);
+                        }
                     }
                     Screen::Files => {
                         refresh_shares(ready, &shared);
@@ -697,6 +714,31 @@ fn refresh_sites(client: &Client, shared: &Arc<Mutex<Snapshot>>) {
     let mut snapshot = shared.lock().expect("the snapshot lock was poisoned");
     snapshot.sites.sites = sites;
     snapshot.sites.trouble = trouble;
+}
+
+/// Fetches what is wrong on the machine right now for the HEALTH plate.
+///
+/// A daemon without machine insight answers 404, and the plate is then simply
+/// absent: `None`, not a notice. Any other failure keeps the last answer, which
+/// carries its own `at_unix`, rather than blanking the plate on one lost poll.
+fn refresh_insight(client: &Client, shared: &Arc<Mutex<Snapshot>>) {
+    let fetched = match client.get("/api/insight/now") {
+        Ok(value) => Insight::from_json(&value),
+        Err(ClientError::Refused { status: selfhost_http::Status(404), .. }) => None,
+        Err(_) => return,
+    };
+    shared.lock().expect("the snapshot lock was poisoned").insight = fetched;
+}
+
+/// Fetches the last hour of samples behind the HEALTH sparklines, replacing
+/// what was there: the daemon's answer is already the whole window.
+fn refresh_history(client: &Client, shared: &Arc<Mutex<Snapshot>>) {
+    let Ok(value) = client.get("/api/insight/metrics") else {
+        return;
+    };
+    let samples = value.get("samples").and_then(Json::as_array).unwrap_or_default();
+    shared.lock().expect("the snapshot lock was poisoned").history =
+        samples.iter().filter_map(HistorySample::from_json).collect();
 }
 
 /// Reads one log line from the wire.

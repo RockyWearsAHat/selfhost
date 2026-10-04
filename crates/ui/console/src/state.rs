@@ -121,6 +121,73 @@ impl SystemPart {
     }
 }
 
+impl InsightProblem {
+    /// Reads one problem from the wire.
+    pub fn from_json(value: &Json) -> Option<Self> {
+        Some(Self {
+            id: value.get("id")?.as_str()?.to_owned(),
+            title: value.get("title")?.as_str()?.to_owned(),
+            since_unix: value.get("since_unix")?.as_u64()?,
+        })
+    }
+}
+
+impl Insight {
+    /// Reads the answer to `GET /api/insight/now`; `None` for a body that is
+    /// not one.
+    pub fn from_json(value: &Json) -> Option<Self> {
+        let list = |key: &str| value.get(key).and_then(Json::as_array).unwrap_or_default();
+        let latest = value.get("latest");
+        let used = latest.and_then(|s| s.get("mem_used_mb")).and_then(Json::as_f64);
+        let total = latest.and_then(|s| s.get("mem_total_mb")).and_then(Json::as_f64).filter(|t| *t > 0.0);
+        let window = value.get("dns").and_then(|dns| dns.get("last_5_minutes"));
+        let field = |key: &str| window.and_then(|w| w.get(key)).and_then(Json::as_u64);
+        Some(Self {
+            at_unix: value.get("at_unix")?.as_u64()?,
+            condition: value.get("condition")?.as_str()?.to_owned(),
+            summary: value.get("summary")?.as_str()?.to_owned(),
+            problems: list("problems").iter().filter_map(InsightProblem::from_json).collect(),
+            cpu_pct: latest.and_then(|s| s.get("cpu_pct")).and_then(Json::as_f64),
+            mem_pct: used.zip(total).map(|(used, total)| used * 100.0 / total),
+            processes: list("processes")
+                .iter()
+                .filter_map(|p| {
+                    Some(InsightProcess {
+                        name: p.get("name")?.as_str()?.to_owned(),
+                        pid: p.get("pid")?.as_u64()?,
+                        cpu_cores: p.get("cpu_cores")?.as_f64()?,
+                        working_set_mb: p.get("working_set_mb")?.as_u64()?,
+                    })
+                })
+                .collect(),
+            dns: field("queries").map(|queries| DnsWindow {
+                queries,
+                failures: field("failures").unwrap_or(0),
+                slow: field("slow").unwrap_or(0),
+            }),
+        })
+    }
+}
+
+impl HistorySample {
+    /// Reads one sample from `/api/insight/metrics`.
+    pub fn from_json(value: &Json) -> Option<Self> {
+        let at_unix = value.get("at_unix")?.as_u64()?;
+        let cpu_pct = value.get("cpu_pct").and_then(Json::as_f64);
+        let mem_total = value.get("mem_total_mb")?.as_u64()?;
+        let mem_used = value.get("mem_used_mb")?.as_u64()?;
+        let mem_pct = if mem_total == 0 { 0.0 } else { mem_used as f64 * 100.0 / mem_total as f64 };
+        let net = value
+            .get("net")
+            .and_then(Json::as_array)
+            .unwrap_or(&[])
+            .iter()
+            .filter_map(|n| Some(n.get("rx_bps")?.as_u64()? + n.get("tx_bps")?.as_u64()?))
+            .sum();
+        Some(Self { at_unix, cpu_pct, mem_pct, net_bps: net })
+    }
+}
+
 /// One captured line of a service's output.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LogLine {
@@ -152,6 +219,75 @@ pub struct Logs {
     /// lines and no reply yet both leave [`Logs::lines`] empty, and the pane
     /// must not claim the first while the truth is the second.
     pub answered: bool,
+}
+
+/// One problem reported by the insight service.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InsightProblem {
+    /// The problem's id.
+    pub id: String,
+    /// One line describing it.
+    pub title: String,
+    /// Unix seconds when it started.
+    pub since_unix: u64,
+}
+
+/// What `GET /api/insight/now` says about the machine.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Insight {
+    /// When the daemon answered.
+    pub at_unix: u64,
+    /// `ok`, `warning`, or `unknown`.
+    pub condition: String,
+    /// One sentence covering the machine.
+    pub summary: String,
+    /// Open problems, oldest first.
+    pub problems: Vec<InsightProblem>,
+    /// CPU busy in the newest sample; `None` before there are two samples.
+    pub cpu_pct: Option<f64>,
+    /// Memory in use in the newest sample.
+    pub mem_pct: Option<f64>,
+    /// The newest process ranking.
+    pub processes: Vec<InsightProcess>,
+    /// The resolver's last five minutes; `None` where no resolver reports.
+    pub dns: Option<DnsWindow>,
+}
+
+/// One ranked process.
+#[derive(Debug, Clone, PartialEq)]
+pub struct InsightProcess {
+    /// Its executable's name.
+    pub name: String,
+    /// Its process id.
+    pub pid: u64,
+    /// CPU used over the ranking window, in cores.
+    pub cpu_cores: f64,
+    /// Its working set.
+    pub working_set_mb: u64,
+}
+
+/// The resolver's last five minutes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DnsWindow {
+    /// Queries answered or failed.
+    pub queries: u64,
+    /// SERVFAILs among them.
+    pub failures: u64,
+    /// Answers that took over 500 ms.
+    pub slow: u64,
+}
+
+/// One metric sample in the history.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct HistorySample {
+    /// Unix seconds.
+    pub at_unix: u64,
+    /// CPU usage percent, or None.
+    pub cpu_pct: Option<f64>,
+    /// Memory usage percent.
+    pub mem_pct: f64,
+    /// Network throughput: rx_bps + tx_bps.
+    pub net_bps: u64,
 }
 
 impl Logs {
@@ -748,6 +884,13 @@ pub struct Snapshot {
     /// each other. Never the hosted [`Snapshot::services`] list — see `is_system`
     /// in `crates/app/admin/src/lib.rs`, which this mirrors.
     pub system: Option<Vec<SystemPart>>,
+    /// The HEALTH plate's answer from `GET /api/insight/now`: `None` until
+    /// fetched, and for a daemon without machine insight (it answers 404), so
+    /// the plate is simply absent there.
+    pub insight: Option<Insight>,
+    /// The last hour of samples behind the HEALTH sparklines, oldest first,
+    /// replaced whole by each `GET /api/insight/metrics`.
+    pub history: Vec<HistorySample>,
     /// Which screen is open, and so what the poller fetches.
     pub screen: Screen,
     /// Where the FILES plate is looking, and what it found.
@@ -1113,5 +1256,106 @@ mod tests {
     #[test]
     fn a_body_with_no_system_array_reads_as_nothing_rather_than_an_empty_list() {
         assert!(SystemPart::list_from_json(&selfhost_json::parse(r#"{}"#).unwrap()).is_none());
+    }
+
+    #[test]
+    fn insight_now_is_read_from_the_wire() {
+        let value = selfhost_json::parse(
+            r#"{
+                "at_unix":1000,
+                "condition":"warning",
+                "summary":"Memory at 75%",
+                "problems":[
+                    {"id":"mem_high","title":"High memory use","since_unix":950}
+                ],
+                "latest":{
+                    "cpu_pct":42.5,
+                    "mem_used_mb":4096,
+                    "mem_total_mb":8192,
+                    "commit_used_mb":5000
+                },
+                "processes":[
+                    {"pid":7,"name":"mongodb","cpu_cores":1.5,"working_set_mb":2048}
+                ],
+                "dns":{"last_5_minutes":{"queries":120,"failures":2,"slow":1}}
+            }"#,
+        )
+        .expect("legal JSON");
+        let insight = Insight::from_json(&value).expect("an insight");
+        assert_eq!(insight.at_unix, 1000);
+        assert_eq!(insight.condition, "warning");
+        assert_eq!(insight.summary, "Memory at 75%");
+        assert_eq!(insight.problems.len(), 1);
+        assert_eq!(insight.problems[0].id, "mem_high");
+        assert_eq!(insight.problems[0].title, "High memory use");
+        assert_eq!(insight.problems[0].since_unix, 950);
+        assert_eq!((insight.cpu_pct, insight.mem_pct), (Some(42.5), Some(50.0)));
+        assert_eq!(
+            insight.processes,
+            vec![InsightProcess { name: "mongodb".into(), pid: 7, cpu_cores: 1.5, working_set_mb: 2048 }]
+        );
+        assert_eq!(insight.dns, Some(DnsWindow { queries: 120, failures: 2, slow: 1 }));
+    }
+
+    #[test]
+    fn insight_now_with_missing_fields_reads_as_nothing() {
+        // No at_unix: cannot parse
+        assert!(Insight::from_json(&selfhost_json::parse(r#"{"condition":"ok"}"#).unwrap()).is_none());
+    }
+
+    #[test]
+    fn insight_now_with_no_latest_sample_is_ok() {
+        let value = selfhost_json::parse(
+            r#"{
+                "at_unix":1000,
+                "condition":"ok",
+                "summary":"All good",
+                "problems":[],
+                "processes":[]
+            }"#,
+        )
+        .expect("legal JSON");
+        let insight = Insight::from_json(&value).expect("an insight");
+        assert_eq!((insight.cpu_pct, insight.mem_pct, insight.dns), (None, None, None));
+        assert_eq!(insight.problems.len(), 0);
+    }
+
+    #[test]
+    fn history_sample_is_read_from_metrics() {
+        let value = selfhost_json::parse(
+            r#"{
+                "at_unix":2000,
+                "cpu_pct":33.5,
+                "mem_total_mb":8192,
+                "mem_used_mb":6144,
+                "net":[
+                    {"rx_bps":1000000,"tx_bps":500000},
+                    {"rx_bps":200000,"tx_bps":300000}
+                ]
+            }"#,
+        )
+        .expect("legal JSON");
+        let sample = HistorySample::from_json(&value).expect("a sample");
+        assert_eq!(sample.at_unix, 2000);
+        assert_eq!(sample.cpu_pct, Some(33.5));
+        assert!((sample.mem_pct - 75.0).abs() < 0.01);
+        assert_eq!(sample.net_bps, 2000000);
+    }
+
+    #[test]
+    fn history_sample_without_cpu_is_ok() {
+        let value = selfhost_json::parse(
+            r#"{
+                "at_unix":2000,
+                "mem_total_mb":8192,
+                "mem_used_mb":2048,
+                "net":[]
+            }"#,
+        )
+        .expect("legal JSON");
+        let sample = HistorySample::from_json(&value).expect("a sample");
+        assert_eq!(sample.cpu_pct, None);
+        assert!((sample.mem_pct - 25.0).abs() < 0.01);
+        assert_eq!(sample.net_bps, 0);
     }
 }
