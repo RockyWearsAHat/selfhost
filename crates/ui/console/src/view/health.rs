@@ -63,20 +63,12 @@ pub fn view(
                 move |console: &mut Console| console.toggle_problem(&id)
             }),
         ];
-        if open_problems.contains(&problem.id) {
-            problem_rows.extend(problem.evidence.iter().map(|(key, value)| {
-                let truncated = if value.len() > 80 {
-                    format!("{}…", &value[..77])
-                } else {
-                    value.clone()
-                };
-                row((
-                    caption(format!("{key}  ")).w(Length::Fraction(LABEL_W)),
-                    caption(truncated).grow(),
-                ))
-                .min_h(16.0)
-            }));
-        }
+        problem_rows.extend(shown_evidence(&problem.evidence, open_problems.contains(&problem.id)).iter().map(
+            |(key, value)| {
+                row((caption(format!("{key}  ")).w(Length::Fraction(LABEL_W)), caption(clip(value, 80)).grow()))
+                    .min_h(16.0)
+            },
+        ));
         problem_rows
     }));
     let cpu: Vec<f64> = history.iter().map(|s| s.cpu_pct.unwrap_or(0.0)).collect();
@@ -105,24 +97,17 @@ pub fn view(
             .iter()
             .map(|event| {
                 let status = match event.kind.as_str() {
-                    "warning" => Status::Warn,
+                    "warning" | "repair" => Status::Warn,
                     "cleared" => Status::Ok,
-                    "repair" => Status::Warn,
-                    "windows" => Status::Idle,
                     _ => Status::Idle,
-                };
-                let event_text = format!("{}: {}", event.source, event.title);
-                let truncated = if event_text.len() > 90 {
-                    format!("{}…", &event_text[..87])
-                } else {
-                    event_text
                 };
                 row((
                     row((style::lamp(status), micro(clock(event.at_unix))))
                         .gap(6.0)
                         .align(Align::Center),
-                    micro(truncated).grow(),
+                    micro(clip(&format!("{}: {}", event.source, event.title), 90)).grow(),
                 ))
+                .gap(10.0)
                 .min_h(16.0)
             })
             .collect();
@@ -204,6 +189,22 @@ fn clock(unix: u64) -> String {
     format!("{:02}:{:02} UTC", minutes / 60, minutes % 60)
 }
 
+/// A problem's evidence pairs when its row is open, none when it is shut.
+fn shown_evidence(evidence: &[(String, String)], open: bool) -> &[(String, String)] {
+    if open { evidence } else { &[] }
+}
+
+/// `text` cut to at most `max` characters, the last one an ellipsis when cut.
+/// Counts characters, not bytes: event messages are not always ASCII.
+fn clip(text: &str, max: usize) -> String {
+    if text.chars().count() <= max {
+        return text.to_owned();
+    }
+    let mut clipped: String = text.chars().take(max.saturating_sub(1)).collect();
+    clipped.push('…');
+    clipped
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -217,72 +218,20 @@ mod tests {
     }
 
     #[test]
-    fn evidence_rows_are_shown_only_when_problem_is_open() {
-        use crate::state::InsightProblem;
-        use std::collections::BTreeSet;
-
-        let insight = crate::state::Insight {
-            at_unix: 1000,
-            condition: "warning".into(),
-            summary: "Test".into(),
-            problems: vec![InsightProblem {
-                id: "test_prob".into(),
-                title: "Test problem".into(),
-                since_unix: 900,
-                evidence: vec![
-                    ("code".to_owned(), "42".to_owned()),
-                    ("message".to_owned(), "something broke".to_owned()),
-                ],
-            }],
-            cpu_pct: None,
-            mem_pct: None,
-            processes: vec![],
-            dns: None,
-        };
-
-        let mut open = BTreeSet::new();
-        let result = view(Some(&insight), &[], &[], &open);
-        assert!(result.is_some(), "health view should render");
-
-        open.insert("test_prob".to_owned());
-        let result = view(Some(&insight), &[], &[], &open);
-        assert!(result.is_some(), "health view should render with open problem");
+    fn evidence_is_shown_only_for_an_open_problem() {
+        let evidence = vec![("code".to_owned(), "42".to_owned()), ("message".to_owned(), "broke".to_owned())];
+        assert!(shown_evidence(&evidence, false).is_empty());
+        assert_eq!(shown_evidence(&evidence, true), evidence.as_slice());
     }
 
     #[test]
-    fn recent_events_are_capped_at_eight() {
-        use crate::state::Insight;
-        use std::collections::BTreeSet;
-
-        let events: Vec<InsightEvent> = (0..10)
-            .map(|i| InsightEvent {
-                at_unix: 1000 + i,
-                kind: "warning".to_owned(),
-                source: format!("source{i}"),
-                title: format!("event{i}"),
-            })
-            .collect();
-        assert_eq!(events.len(), 10);
-
-        let insight = Insight {
-            at_unix: 1000,
-            condition: "ok".into(),
-            summary: "Test".into(),
-            problems: vec![],
-            cpu_pct: None,
-            mem_pct: None,
-            processes: vec![],
-            dns: None,
-        };
-
-        let open = BTreeSet::new();
-        let result = view(Some(&insight), &[], &events[..8], &open);
-        assert!(result.is_some());
-
-        // Verify the cap: the refresh_events function in poller truncates at 8
-        let all_events = events;
-        let mut capped = all_events;
-        capped.truncate(8);
-        assert_eq!(capped.len(), 8);
+    fn clipping_counts_characters_not_bytes() {
+        assert_eq!(clip("short", 80), "short");
+        assert_eq!(clip("abcdef", 4), "abc…");
+        let localized = "Die Namensauflösung für den Namen ist abgelaufen ".repeat(3);
+        let clipped = clip(&localized, 90);
+        assert_eq!(clipped.chars().count(), 90);
+        assert!(clipped.ends_with('…'));
+        assert_eq!(clip("ééééé", 3), "éé…");
     }
 }

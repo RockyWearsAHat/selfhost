@@ -933,8 +933,8 @@ pub struct Snapshot {
     /// The last hour of samples behind the HEALTH sparklines, oldest first,
     /// replaced whole by each `GET /api/insight/metrics`.
     pub history: Vec<HistorySample>,
-    /// Recent machine events from `GET /api/insight/events`, newest first,
-    /// capped at 8.
+    /// The newest machine events from `GET /api/insight/events`, newest
+    /// first, as many as the HEALTH plate's RECENT rows show.
     pub events: Vec<InsightEvent>,
     /// Which screen is open, and so what the poller fetches.
     pub screen: Screen,
