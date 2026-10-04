@@ -9,11 +9,7 @@ use tokio::time::interval;
 /// Spawns a background task that writes DNS statistics every 10 seconds.
 ///
 /// Writes to `<data_dir>/insight/dns-stats.json` atomically (temp file + rename).
-pub async fn spawn_stats_writer(
-    authority: Authority,
-    data_dir: &Path,
-    process: &str,
-) {
+pub async fn spawn_stats_writer(authority: Authority, data_dir: &Path, process: &str) {
     let data_dir = data_dir.to_path_buf();
     let process_name = process.to_string();
     let insight_dir = data_dir.join("insight");
@@ -38,7 +34,8 @@ pub async fn spawn_stats_writer(
             let json_str = json.to_text();
 
             let stats_file = insight_dir.join("dns-stats.json");
-            let temp_file = insight_dir.join("dns-stats.json.tmp");
+            // Per process: during a handoff two instances write side by side.
+            let temp_file = insight_dir.join(format!("dns-stats.json.{}.tmp", std::process::id()));
 
             // Write to temp file first.
             if let Err(e) = tokio::fs::write(&temp_file, json_str.as_bytes()).await {
