@@ -180,6 +180,66 @@
     <ul id="system-rows"></ul>
   </section>
 
+  <!-- HEALTH: machine insight — condition, problems, metrics sparklines, DNS,
+       top processes, and event timeline. Hidden until the daemon reports
+       insight is enabled; shown as a single view, not a plate in the layout. -->
+  <section id="health" class="plate" hidden>
+    <div class="section-rule">
+      <h2>HEALTH</h2><span class="rule"></span>
+      <span id="h-lamp" class="lamp idle"></span>
+      <span id="h-status" class="stateword"></span>
+    </div>
+    <p id="h-summary" class="caption"></p>
+
+    <!-- Problems list, collapsed by default. -->
+    <div id="h-problems-wrap" hidden>
+      <div class="section-rule">
+        <h2>PROBLEMS</h2><span class="rule"></span>
+      </div>
+      <ul id="h-problems"></ul>
+    </div>
+
+    <!-- Inline sparklines: CPU, Memory, Network. -->
+    <div id="h-metrics-wrap" hidden>
+      <div class="section-rule">
+        <h2>METRICS (LAST HOUR)</h2><span class="rule"></span>
+      </div>
+      <div id="h-metrics" class="metrics-row"></div>
+    </div>
+
+    <!-- DNS block. -->
+    <div id="h-dns-wrap" hidden>
+      <div class="section-rule">
+        <h2>DNS</h2><span class="rule"></span>
+      </div>
+      <dl id="h-dns"></dl>
+    </div>
+
+    <!-- Top processes table. -->
+    <div id="h-processes-wrap" hidden>
+      <div class="section-rule">
+        <h2>TOP PROCESSES</h2><span class="rule"></span>
+      </div>
+      <table id="h-processes-table">
+        <thead><tr>
+          <th>NAME</th><th class="numeric">PID</th><th class="numeric">CORES</th><th class="numeric">WORKING SET (MB)</th>
+        </tr></thead>
+        <tbody id="h-processes"></tbody>
+      </table>
+    </div>
+
+    <!-- Event timeline. -->
+    <div id="h-events-wrap" hidden>
+      <div class="section-rule">
+        <h2>EVENTS</h2><span class="rule"></span>
+      </div>
+      <ul id="h-events"></ul>
+    </div>
+
+    <!-- Error message for when insight is not enabled. -->
+    <p id="h-error" class="caption centered" hidden></p>
+  </section>
+
   <div id="panes">
 
     <!-- SERVICE RAIL -->

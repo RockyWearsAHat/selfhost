@@ -342,6 +342,106 @@ textarea { resize: vertical; }
 #system-rows .sys-name { font-family: var(--mono); font-size: 12.5px; min-width: 110px; }
 #system-rows .sys-reason { color: var(--muted); font-size: 12px; }
 
+/* ── the health panel ─────────────────────────────────────────────── */
+
+#health { display: flex; flex-direction: column; gap: 6px; }
+#h-status { margin-left: 2px; }
+#h-summary { margin: 4px 0 0 0; }
+
+.metrics-row {
+  display: flex; gap: 12px; flex-wrap: wrap;
+  padding: 8px 0;
+}
+.metric-item {
+  display: flex; flex-direction: column; gap: 4px;
+  padding: 6px 12px; background: var(--sunken); border: 1px solid var(--border);
+  flex: 1 1 140px; min-width: 130px;
+}
+.metric-item .fieldlabel {
+  font-size: 10px; letter-spacing: 0.12em; color: var(--muted);
+}
+.metric-item .metric-value {
+  font-family: var(--mono); font-size: 13px; font-weight: 600;
+}
+.metric-item svg {
+  height: 40px; margin: 2px -4px;
+}
+
+#h-problems {
+  list-style: none; display: flex; flex-direction: column; gap: 4px;
+}
+#h-problems li {
+  padding: 6px; background: var(--bad-tint); border: 1px solid var(--bad);
+  display: flex; flex-direction: column; gap: 3px;
+}
+#h-problems li .problem-title {
+  font-size: 12.5px; color: var(--text);
+}
+#h-problems li .problem-since {
+  font-size: 11px; color: var(--muted);
+}
+#h-problems li .problem-details {
+  font-size: 11px; color: var(--muted); font-family: var(--mono);
+}
+#h-problems li .problem-details-toggle {
+  background: none; border: none; padding: 2px 0; cursor: pointer;
+  font-size: 10px; color: var(--ok); text-decoration: underline;
+}
+
+#h-dns {
+  display: grid; grid-template-columns: max-content 1fr;
+  gap: 8px 12px; font-size: 12.5px;
+}
+#h-dns dt {
+  font-family: var(--mono); color: var(--muted); text-align: right;
+}
+#h-dns dd {
+  font-family: var(--mono); margin: 0;
+}
+
+#h-processes-table {
+  width: 100%; border-collapse: collapse;
+}
+#h-processes-table th {
+  text-align: left; font-size: 10px; font-weight: 400; letter-spacing: 0.12em;
+  color: var(--muted); padding: 2px 8px 4px 0;
+  border-bottom: 1px solid var(--border);
+}
+#h-processes-table th.numeric { text-align: right; padding-right: 14px; }
+#h-processes-table td {
+  padding: 4px 8px 4px 0; font-size: 12.5px; vertical-align: middle;
+}
+#h-processes-table td.numeric { text-align: right; padding-right: 14px; }
+#h-processes-table tbody tr + tr td { border-top: 1px solid rgba(36, 39, 43, 0.55); }
+#h-processes-table .proc-name { font-family: var(--mono); }
+
+#h-events {
+  list-style: none; display: flex; flex-direction: column; gap: 4px;
+}
+#h-events li {
+  display: flex; gap: 8px; align-items: flex-start;
+  padding: 4px 0;
+  font-size: 12.5px;
+}
+#h-events li + li { border-top: 1px solid rgba(36, 39, 43, 0.55); }
+#h-events .event-time {
+  flex: 0 0 auto; font-family: var(--mono); font-size: 11px;
+  color: var(--muted); white-space: nowrap;
+}
+#h-events .event-content {
+  flex: 1; display: flex; flex-direction: column; gap: 1px;
+}
+#h-events .event-kind {
+  font-size: 10px; letter-spacing: 0.06em; text-transform: uppercase;
+  color: var(--muted);
+}
+#h-events .event-title {
+  color: var(--text);
+}
+#h-events .event-source {
+  font-size: 11px; color: var(--muted);
+}
+
 /* ── panes ────────────────────────────────────────────────────────── */
 
 #panes { display: flex; gap: 8px; align-items: stretch; flex: 1; }
