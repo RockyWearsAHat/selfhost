@@ -4635,6 +4635,9 @@ function boot() {
   /** How many timeline events the plate draws. */
   const HEALTH_EVENTS_SHOWN = 100;
 
+  /** Ids of the problems whose evidence the operator has opened. */
+  const openProblems = new Set();
+
   function renderHealth() {
     const health = state.health;
     const panel = $("health");
@@ -4707,24 +4710,26 @@ function boot() {
         li.append(sinceEl);
 
         if (problem.evidence && typeof problem.evidence === "object") {
+          // Open details stay open across the 10 s re-render, keyed by problem id.
+          const shown = () => openProblems.has(problem.id);
           const toggle = document.createElement("button");
           toggle.className = "problem-details-toggle";
-          toggle.textContent = "show details";
-          let detailsShown = false;
+          toggle.textContent = shown() ? "hide details" : "show details";
           toggle.addEventListener("click", (e) => {
             e.preventDefault();
-            detailsShown = !detailsShown;
-            details.hidden = !detailsShown;
-            toggle.textContent = detailsShown ? "hide details" : "show details";
+            if (shown()) openProblems.delete(problem.id);
+            else openProblems.add(problem.id);
+            details.hidden = !shown();
+            toggle.textContent = shown() ? "hide details" : "show details";
           });
           li.append(toggle);
 
           const details = document.createElement("div");
           details.className = "problem-details";
-          details.hidden = true;
+          details.hidden = !shown();
           for (const [key, val] of Object.entries(problem.evidence)) {
             const line = document.createElement("div");
-            line.textContent = `${key}: ${val}`;
+            line.textContent = `${key}: ${val !== null && typeof val === "object" ? JSON.stringify(val) : val}`;
             details.append(line);
           }
           li.append(details);
