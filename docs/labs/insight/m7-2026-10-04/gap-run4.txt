@@ -1,0 +1,66 @@
+### run 1
+new exe sha c3365ac78c4050e1
+=== B: true handoff between two new instances, port 15356
+A pid 8340 handoff file: 8340
+queries 484, answered 483, unanswered 1 at ms [2317]; event at 1033 ms; first answer after it at 1035 ms; answer latency p50 0 ms max 69 ms
+B pid 5480 alive True; A alive False; handoff file: 5480
+A stdout:
+10-04 04:45:30Z [dns] bound with SO_REUSEADDR
+10-04 04:45:30Z [dns] answered its own forwarded and zone questions; claimed the handoff as PID 8340
+A stderr:
+10-04 04:45:40Z [dns] handoff detected: new DNS process is taking over
+10-04 04:45:40Z [dns] a newer instance took over; drained, exiting
+B stdout:
+Ctrl-C to stop.
+10-04 04:45:39Z [dns] bound with SO_REUSEADDR
+10-04 04:45:39Z [dns] answered its own forwarded and zone questions; claimed the handoff as PID 5480
+B stderr:
+== stragglers
+7316 "C:\Users\Alex\Self-Host\target\release\selfhost.exe"  daemon 
+11812 "C:\Users\Alex\Self-Host\target\release\selfhost.exe" reports serve --accounts --public-ba
+== :53 owners
+0.0.0.0 pid 7316
+### run 2
+new exe sha c3365ac78c4050e1
+=== B: true handoff between two new instances, port 15356
+A pid 13608 handoff file: 13608
+queries 482, answered 481, unanswered 1 at ms [2258]; event at 1035 ms; first answer after it at 1036 ms; answer latency p50 0 ms max 36 ms
+B pid 12740 alive True; A alive False; handoff file: 12740
+A stdout:
+10-04 04:45:57Z [dns] bound with SO_REUSEADDR
+10-04 04:45:57Z [dns] answered its own forwarded and zone questions; claimed the handoff as PID 13608
+A stderr:
+10-04 04:46:07Z [dns] handoff detected: new DNS process is taking over
+10-04 04:46:07Z [dns] a newer instance took over; drained, exiting
+B stdout:
+Ctrl-C to stop.
+10-04 04:46:06Z [dns] bound with SO_REUSEADDR
+10-04 04:46:06Z [dns] answered its own forwarded and zone questions; claimed the handoff as PID 12740
+B stderr:
+== stragglers
+7316 "C:\Users\Alex\Self-Host\target\release\selfhost.exe"  daemon 
+11812 "C:\Users\Alex\Self-Host\target\release\selfhost.exe" reports serve --accounts --public-ba
+== :53 owners
+0.0.0.0 pid 7316
+### run 3
+new exe sha c3365ac78c4050e1
+=== B: true handoff between two new instances, port 15356
+A pid 8368 handoff file: 8368
+queries 481, answered 480, unanswered 1 at ms [2282]; event at 1016 ms; first answer after it at 1019 ms; answer latency p50 0 ms max 34 ms
+B pid 9156 alive True; A alive False; handoff file: 9156
+A stdout:
+10-04 04:46:24Z [dns] bound with SO_REUSEADDR
+10-04 04:46:24Z [dns] answered its own forwarded and zone questions; claimed the handoff as PID 8368
+A stderr:
+10-04 04:46:34Z [dns] handoff detected: new DNS process is taking over
+10-04 04:46:34Z [dns] a newer instance took over; drained, exiting
+B stdout:
+Ctrl-C to stop.
+10-04 04:46:33Z [dns] bound with SO_REUSEADDR
+10-04 04:46:33Z [dns] answered its own forwarded and zone questions; claimed the handoff as PID 9156
+B stderr:
+== stragglers
+7316 "C:\Users\Alex\Self-Host\target\release\selfhost.exe"  daemon 
+11812 "C:\Users\Alex\Self-Host\target\release\selfhost.exe" reports serve --accounts --public-ba
+== :53 owners
+0.0.0.0 pid 7316

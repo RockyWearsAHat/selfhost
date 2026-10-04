@@ -1,0 +1,69 @@
+source: 9b5c675 lan-dns: close the sockets the moment the drain ends
+build exit 0 in 72 s
+exe 11723776 10/03/2026 22:55:09 sha cb39deed7bf68a32
+### burst 1
+new exe sha cb39deed7bf68a32
+A pid 1388 handoff: 1388
+sent 3539, answered 3539, lost 0; event at 1008 ms
+B alive True; A alive False; handoff: 7772
+A stderr:
+10-04 04:55:34Z [dns] handoff detected: new DNS process is taking over
+10-04 04:55:37Z [dns] a newer instance took over; still busy after 3 s, exiting anyway
+stragglers: 
+### burst 2
+new exe sha cb39deed7bf68a32
+A pid 9476 handoff: 9476
+sent 3550, answered 3550, lost 0; event at 1008 ms
+B alive True; A alive False; handoff: 2760
+A stderr:
+10-04 04:55:53Z [dns] handoff detected: new DNS process is taking over
+10-04 04:55:57Z [dns] a newer instance took over; still busy after 3 s, exiting anyway
+stragglers: 
+### paced 1
+new exe sha cb39deed7bf68a32
+=== B: true handoff between two new instances, port 15356
+A pid 7704 handoff file: 7704
+queries 487, answered 487, unanswered 0 at ms []; event at 1033 ms; first answer after it at 1035 ms; answer latency p50 0 ms max 21 ms
+slow or missing (t ms, latency): 2120:ok:21
+A exited at  ms on the stream clock
+B pid 9928 alive True; A alive False; handoff file: 9928
+A stdout:
+10-04 04:56:05Z [dns] bound with SO_REUSEADDR
+10-04 04:56:05Z [dns] answered its own forwarded and zone questions; claimed the handoff as PID 7704
+A stderr:
+10-04 04:56:15Z [dns] handoff detected: new DNS process is taking over
+10-04 04:56:15Z [dns] a newer instance took over; drained, exiting
+B stdout:
+Ctrl-C to stop.
+10-04 04:56:14Z [dns] bound with SO_REUSEADDR
+10-04 04:56:14Z [dns] answered its own forwarded and zone questions; claimed the handoff as PID 9928
+B stderr:
+== stragglers
+7316 "C:\Users\Alex\Self-Host\target\release\selfhost.exe"  daemon 
+11812 "C:\Users\Alex\Self-Host\target\release\selfhost.exe" reports serve --accounts --public-ba
+== :53 owners
+0.0.0.0 pid 7316
+### paced 2
+new exe sha cb39deed7bf68a32
+=== B: true handoff between two new instances, port 15356
+A pid 3768 handoff file: 3768
+queries 490, answered 490, unanswered 0 at ms []; event at 1033 ms; first answer after it at 1035 ms; answer latency p50 0 ms max 18 ms
+slow or missing (t ms, latency): 
+A exited at  ms on the stream clock
+B pid 1296 alive True; A alive False; handoff file: 1296
+A stdout:
+10-04 04:56:32Z [dns] bound with SO_REUSEADDR
+10-04 04:56:32Z [dns] answered its own forwarded and zone questions; claimed the handoff as PID 3768
+A stderr:
+10-04 04:56:42Z [dns] handoff detected: new DNS process is taking over
+10-04 04:56:42Z [dns] a newer instance took over; drained, exiting
+B stdout:
+Ctrl-C to stop.
+10-04 04:56:41Z [dns] bound with SO_REUSEADDR
+10-04 04:56:41Z [dns] answered its own forwarded and zone questions; claimed the handoff as PID 1296
+B stderr:
+== stragglers
+7316 "C:\Users\Alex\Self-Host\target\release\selfhost.exe"  daemon 
+11812 "C:\Users\Alex\Self-Host\target\release\selfhost.exe" reports serve --accounts --public-ba
+== :53 owners
+0.0.0.0 pid 7316

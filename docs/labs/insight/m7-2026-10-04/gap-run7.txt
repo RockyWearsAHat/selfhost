@@ -1,0 +1,10 @@
+new exe sha c3365ac78c4050e1
+A pid 10368 handoff: 10368
+sent 3530, answered 3484, lost 46; event at 1018 ms
+lost send times ms: 5510,5512,5515,5517,5520,5522,5525,5527,5530,5532,5534,5537,5540,5542,5545,5548,5550,5553,5555,5558,5560,5563,5565,5568,5570,5572,5575,5577,5580,5582,5585,5587,5590,5592,5595,5597,5599,5602,5604,5607,5609,5612,5614,5617,5619,5622
+lost window ms: 112
+B alive True; A alive False; handoff: 4792
+A stderr:
+10-04 04:50:16Z [dns] handoff detected: new DNS process is taking over
+10-04 04:50:19Z [dns] a newer instance took over; still busy after 3 s, exiting anyway
+stragglers: 

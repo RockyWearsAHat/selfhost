@@ -1,0 +1,58 @@
+exe sha 2faebcc15936f217
+== control: 127.0.0.1:15353 before the side starts (must be NO ANSWER)
+     15ms NO ANSWER
+== control: live 192.168.1.8:53 (must answer)
+      4ms NOERROR an=2 104.20.23.154,172.66.147.243
+side pid 13384 exited: False
+== A rockywearsahat.com
+  live     0ms NOERROR an=1 192.168.1.8
+  side     0ms NOERROR an=1 192.168.1.8
+== A git.rockywearsahat.com
+  live     0ms NOERROR an=1 192.168.1.8
+  side     0ms NOERROR an=1 192.168.1.8
+== A admin.rockywearsahat.com
+  live     0ms NOERROR an=1 192.168.1.8
+  side     0ms NOERROR an=1 192.168.1.8
+== MX rockywearsahat.com
+  live     0ms NOERROR an=1 type15/22
+  side     0ms NOERROR an=1 type15/22
+== NS rockywearsahat.com
+  live     0ms NOERROR an=2 type2/24,type2/24
+  side     0ms NOERROR an=2 type2/24,type2/24
+== TXT rockywearsahat.com
+  live     0ms NOERROR an=1 type16/15
+  side     0ms NOERROR an=1 type16/15
+== A nosuchname-zz9.rockywearsahat.com
+  live     0ms NXDOMAIN an=0 
+  side     0ms NXDOMAIN an=0 
+== A example.com
+  live     3ms NOERROR an=2 104.20.23.154,172.66.147.243
+  side     2ms NOERROR an=2 104.20.23.154,172.66.147.243
+== A www.google.com
+  live     2ms NOERROR an=8 142.251.150.119,142.251.151.119,142.251.152.119,142.251.153.119,142.251.154.119,142.251.155.119,142.251.156.119,142.251.157.119
+  side     2ms NOERROR an=8 142.251.150.119,142.251.151.119,142.251.152.119,142.251.153.119,142.251.154.119,142.251.155.119,142.251.156.119,142.251.157.119
+== AAAA www.cloudflare.com
+  live     2ms NOERROR an=2 2606:4700::6810:7b60,2606:4700::6810:7c60
+  side     2ms NOERROR an=2 2606:4700::6810:7b60,2606:4700::6810:7c60
+== A nxdomain-zz9-selfhost.com
+  live    17ms NXDOMAIN an=0 
+  side     3ms NXDOMAIN an=0 
+== A leveluplongboarding.surf
+  live     5ms SERVFAIL an=0 
+  side   738ms SERVFAIL an=0 
+== side burst: 30 distinct-ish names, then repeats (cache)
+  cold: 6/NOERROR 2/NOERROR 3/NOERROR 8/NOERROR 2/NOERROR 2/NOERROR 2/NOERROR 2/NOERROR 2/NOERROR 2/NOERROR
+  cold raw:     6ms NOERROR an=1 1 |     2ms NOERROR an=1 1 |     3ms NOERROR an=1 1 |     8ms NOERROR an=3 9 |     2ms NOERROR an=3 4 |     2ms NOERROR an=1 1 |     2ms NOERROR an=4 1 |     2ms NOERROR an=4 1 |     2ms NOERROR an=4 1 |     2ms NOERROR an=1 3
+  warm raw:     0ms NOERROR an=1 1 |     0ms NOERROR an=1 1 |     0ms NOERROR an=1 1 |     0ms NOERROR an=3 9 |     0ms NOERROR an=3 4 |     0ms NOERROR an=1 1 |     0ms NOERROR an=4 1 |     0ms NOERROR an=4 1 |     0ms NOERROR an=4 1 |     2ms NOERROR an=1 3
+side footprint: working set 17.8 MB, private 2.2 MB, cpu 0.05 s, threads 18, handles 177
+side stopped: True
+== control after stop: 127.0.0.1:15353 (must be NO ANSWER)
+      0ms NO ANSWER
+== :53 owners after
+0.0.0.0:53 pid 7316
+== side stderr
+10-04 04:27:13Z [dns] 127.0.0.1 leveluplongboarding.surf A udp SERVFAIL 111ms
+== side stdout tail
+Ctrl-C to stop.
+10-04 04:27:05Z [dns] bound with SO_REUSEADDR
+10-04 04:27:14Z [dns] answering real queries; claimed the handoff as PID 13384
