@@ -716,6 +716,32 @@ impl Authority {
         *self.0.public_ip.lock().await
     }
 
+    /// Asks this server, through its own query path and as a LAN peer would,
+    /// one question it must forward (the root's NS) and one it answers from a
+    /// zone (the first origin's SOA). True when every one comes back NOERROR.
+    ///
+    /// How a replacement proves itself before taking over. On Windows a second
+    /// socket on a shared port receives nothing while the first stays open
+    /// (measured on the box 2026-10-04), so live traffic cannot be its proof.
+    pub async fn answers_itself(&self) -> bool {
+        let mut questions = vec![(".".to_owned(), RecordType::Ns)];
+        if let Some(origin) = self.origins().await.into_iter().next() {
+            questions.push((origin, RecordType::Soa));
+        }
+        let peer = IpAddr::V4(Ipv4Addr::LOCALHOST);
+        for (id, (name, record_type)) in (1_u16..).zip(questions) {
+            let Ok(query) = wire::encode_query(id, &name, record_type) else {
+                return false;
+            };
+            let answer = self.handle_query(&query, false, peer).await;
+            match wire::decode_response(&answer) {
+                Ok(response) if response.code == ResponseCode::NoError => {}
+                _ => return false,
+            }
+        }
+        true
+    }
+
     /// The origins served, for startup logging and the doctor.
     pub async fn origins(&self) -> Vec<String> {
         self.0
@@ -2080,6 +2106,32 @@ domains = ["example.com", "hand.example"]
         assert_eq!((stats(silent_address).timeout, stats(silent_address).ok), (1, 0));
         assert_eq!((stats(address).ok, stats(address).error), (1, 0));
         drop(silent);
+    }
+
+    #[tokio::test]
+    async fn a_replacement_proves_itself_only_when_it_forwards_and_answers_its_zone() {
+        // An upstream that answers every question NOERROR.
+        let upstream = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let address = upstream.local_addr().unwrap();
+        tokio::spawn(async move {
+            let mut buffer = vec![0_u8; MAX_UDP];
+            while let Ok((read, from)) = upstream.recv_from(&mut buffer).await {
+                let query = wire::decode_query(&buffer[..read]).unwrap();
+                let reply = wire::encode_response(&query, ResponseCode::NoError, plain_flags(), &[], &[], &[]);
+                upstream.send_to(&reply, from).await.unwrap();
+            }
+        });
+        let authority = Authority(Arc::new(Inner::new(vec![example_zone()], None)));
+        authority.set_lan(LanView { lan_ip: LAN_IP, upstreams: vec![address] });
+        assert!(authority.answers_itself().await);
+
+        // No upstream answers: the forwarded question fails, so no proof.
+        let gone = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let gone_address = gone.local_addr().unwrap();
+        drop(gone);
+        let unreachable = Authority(Arc::new(Inner::new(vec![example_zone()], None)));
+        unreachable.set_lan(LanView { lan_ip: LAN_IP, upstreams: vec![gone_address] });
+        assert!(!unreachable.answers_itself().await);
     }
 
     #[tokio::test]
