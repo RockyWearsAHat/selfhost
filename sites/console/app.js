@@ -2706,6 +2706,9 @@ function boot() {
     spec: null,                 // fetched definition for the selected service
     firewall: null,             // last firewall state, or null → panel hidden
     system: null,                // last GET /api/system answer, or null → panel hidden
+    health: null,               // last GET /api/insight/now answer, or null → panel hidden
+    healthMetrics: null,        // last GET /api/insight/metrics answer
+    healthEvents: null,         // last GET /api/insight/events answer
     logs: { service: "", nextSeq: 0, missed: 0, count: 0 },
     notice: null,               // { kind: "done"|"problem", text }
     formOpen: false,
@@ -2769,6 +2772,18 @@ function boot() {
   let firewallDrawn = "";
   /* Last rendered system JSON, to rebuild that list only on change. */
   let systemDrawn = "";
+  /* Last rendered health JSON, to rebuild the health view only on change. */
+  let healthDrawn = "";
+  /* Last rendered health metrics JSON, to rebuild metrics only on change. */
+  let healthMetricsDrawn = "";
+  /* Last rendered health events JSON, to rebuild events only on change. */
+  let healthEventsDrawn = "";
+  /* When the HEALTH plate last asked, per route: it rides the main poll, but
+     the machine is only sampled every 10 s, so asking more often re-reads the
+     same answer. Nothing is asked while the tab is hidden. */
+  let healthLastFetch = 0;
+  let healthMetricsLastFetch = 0;
+  let healthEventsLastFetch = 0;
   /* Last rendered fleet strip, to rebuild those chips only on change. */
   let stripDrawn = "";
   /* Rail rows by service name, updated in place so focus survives a poll. */
@@ -3937,7 +3952,7 @@ function boot() {
       hideConfirm();
     }
 
-    await Promise.all([refreshDefinition(), refreshLogs(), refreshFirewall(), refreshSystem(), refreshDesktop()]);
+    await Promise.all([refreshDefinition(), refreshLogs(), refreshFirewall(), refreshSystem(), refreshHealth(), refreshHealthMetrics(), refreshHealthEvents(), refreshDesktop()]);
     render();
   }
 
@@ -3995,6 +4010,55 @@ function boot() {
     if (reply.status === 404) { state.system = null; return; }
     if (reply.status === 200 && reply.body && Array.isArray(reply.body.system)) {
       state.system = reply.body.system;
+    }
+  }
+
+  /** Fetches the machine's health insight: condition, problems, latest sample,
+   *  processes, and DNS info. A 404 means insight is not enabled on this
+   *  deployment and the panel hides with a message. */
+  async function refreshHealth() {
+    const now = Date.now();
+    if (document.hidden || (healthLastFetch && now - healthLastFetch < 10000)) return;
+    healthLastFetch = now;
+    let reply;
+    try { reply = await api("/api/insight/now"); }
+    catch { return; }
+    if (reply.status === 404) {
+      state.health = "not-enabled";
+      return;
+    }
+    if (reply.status >= 500) {
+      state.health = { error: reply.body && reply.body.error ? reply.body.error : `the daemon answered ${reply.status}` };
+      return;
+    }
+    if (reply.status === 200 && reply.body) {
+      state.health = reply.body;
+    }
+  }
+
+  /** Fetches the last hour of metrics: CPU, memory, network samples. */
+  async function refreshHealthMetrics() {
+    const now = Date.now();
+    if (document.hidden || (healthMetricsLastFetch && now - healthMetricsLastFetch < 60000)) return;
+    healthMetricsLastFetch = now;
+    let reply;
+    try { reply = await api("/api/insight/metrics"); }
+    catch { return; }
+    if (reply.status === 200 && reply.body) {
+      state.healthMetrics = reply.body;
+    }
+  }
+
+  /** Fetches the last day of events: problems, state changes, etc. */
+  async function refreshHealthEvents() {
+    const now = Date.now();
+    if (document.hidden || (healthEventsLastFetch && now - healthEventsLastFetch < 60000)) return;
+    healthEventsLastFetch = now;
+    let reply;
+    try { reply = await api("/api/insight/events"); }
+    catch { return; }
+    if (reply.status === 200 && reply.body) {
+      state.healthEvents = reply.body;
     }
   }
 
@@ -4172,6 +4236,7 @@ function boot() {
     renderDetail();
     renderFirewall();
     renderSystem();
+    renderHealth();
     renderDiagnostics();
     renderStorage();
     renderDesktop();
@@ -4562,6 +4627,410 @@ function boot() {
         row.append(why);
       }
       rows.append(row);
+    }
+  }
+
+  /* ── the health panel ─────────────────────────────────────────────── */
+
+  /** How many timeline events the plate draws. */
+  const HEALTH_EVENTS_SHOWN = 100;
+
+  function renderHealth() {
+    const health = state.health;
+    const panel = $("health");
+    const errorPanel = $("h-error");
+    const summaryEl = $("h-summary");
+
+    // Handle "not enabled" state
+    if (health === "not-enabled") {
+      panel.hidden = false;
+      errorPanel.hidden = false;
+      errorPanel.textContent = "Machine insight is not enabled on this deployment.";
+      $("h-lamp").hidden = true;
+      $("h-status").hidden = true;
+      return;
+    }
+
+    // Handle error object with .error property
+    if (health && typeof health === "object" && health.error) {
+      panel.hidden = false;
+      errorPanel.hidden = false;
+      errorPanel.textContent = health.error;
+      $("h-lamp").hidden = true;
+      $("h-status").hidden = true;
+      return;
+    }
+
+    panel.hidden = !health;
+    errorPanel.hidden = true;
+    $("h-lamp").hidden = false;
+    $("h-status").hidden = false;
+
+    if (!health) {
+      healthDrawn = "";
+      return;
+    }
+
+    const drawn = JSON.stringify(health) + JSON.stringify(state.healthMetrics) + JSON.stringify(state.healthEvents);
+    if (drawn === healthDrawn) return;
+    healthDrawn = drawn;
+
+    // Status lamp and condition
+    const condition = typeof health.condition === "string" ? health.condition : "unknown";
+    const statusMap = { ok: "ok", warning: "warn", unknown: "idle" };
+    const statusClass = statusMap[condition] || "idle";
+    setLamp($("h-lamp"), statusClass);
+    const conditionText = condition === "ok" ? "OK" : condition === "warning" ? "WARNING" : "UNKNOWN";
+    setStateWord($("h-status"), statusClass, conditionText);
+
+    // Summary
+    summaryEl.textContent = typeof health.summary === "string" ? health.summary : "";
+
+    // Problems
+    const problemsWrap = $("h-problems-wrap");
+    const problemsList = $("h-problems");
+    if (health.problems && Array.isArray(health.problems) && health.problems.length > 0) {
+      problemsWrap.hidden = false;
+      problemsList.textContent = "";
+      for (const problem of health.problems) {
+        if (!problem || typeof problem.title !== "string") continue;
+        const li = document.createElement("li");
+        const title = document.createElement("div");
+        title.className = "problem-title";
+        title.textContent = problem.title;
+        li.append(title);
+
+        const since = problem.since_unix ? new Date(problem.since_unix * 1000).toLocaleString() : "unknown";
+        const sinceEl = document.createElement("div");
+        sinceEl.className = "problem-since";
+        sinceEl.textContent = `since ${since}`;
+        li.append(sinceEl);
+
+        if (problem.evidence && typeof problem.evidence === "object") {
+          const toggle = document.createElement("button");
+          toggle.className = "problem-details-toggle";
+          toggle.textContent = "show details";
+          let detailsShown = false;
+          toggle.addEventListener("click", (e) => {
+            e.preventDefault();
+            detailsShown = !detailsShown;
+            details.hidden = !detailsShown;
+            toggle.textContent = detailsShown ? "hide details" : "show details";
+          });
+          li.append(toggle);
+
+          const details = document.createElement("div");
+          details.className = "problem-details";
+          details.hidden = true;
+          for (const [key, val] of Object.entries(problem.evidence)) {
+            const line = document.createElement("div");
+            line.textContent = `${key}: ${val}`;
+            details.append(line);
+          }
+          li.append(details);
+        }
+        problemsList.append(li);
+      }
+    } else {
+      problemsWrap.hidden = true;
+    }
+
+    // Metrics sparklines
+    renderHealthMetrics();
+
+    // DNS
+    renderHealthDNS(health);
+
+    // Processes
+    renderHealthProcesses(health);
+
+    // Events
+    renderHealthEvents();
+  }
+
+  function renderHealthMetrics() {
+    const wrap = $("h-metrics-wrap");
+    const container = $("h-metrics");
+
+    if (!state.healthMetrics || !state.healthMetrics.samples || state.healthMetrics.samples.length === 0) {
+      wrap.hidden = true;
+      return;
+    }
+
+    const metricsDrawn = JSON.stringify(state.healthMetrics);
+    if (metricsDrawn === healthMetricsDrawn) return;
+    healthMetricsDrawn = metricsDrawn;
+
+    wrap.hidden = false;
+    container.textContent = "";
+
+    const samples = state.healthMetrics.samples;
+
+    // CPU metric
+    const cpuItem = document.createElement("div");
+    cpuItem.className = "metric-item";
+    const cpuLabel = document.createElement("div");
+    cpuLabel.className = "fieldlabel";
+    cpuLabel.textContent = "CPU (%)";
+    const cpuValue = document.createElement("div");
+    cpuValue.className = "metric-value";
+    const latestCpu = samples[samples.length - 1] && typeof samples[samples.length - 1].cpu_pct === "number"
+      ? samples[samples.length - 1].cpu_pct.toFixed(1)
+      : "—";
+    cpuValue.textContent = latestCpu;
+    cpuItem.append(cpuLabel, cpuValue, createSparkline(samples, "cpu_pct", 100));
+    container.append(cpuItem);
+
+    // Memory metric
+    const memItem = document.createElement("div");
+    memItem.className = "metric-item";
+    const memLabel = document.createElement("div");
+    memLabel.className = "fieldlabel";
+    memLabel.textContent = "Memory (%)";
+    const memValue = document.createElement("div");
+    memValue.className = "metric-value";
+    const latestMem = samples[samples.length - 1]
+      ? ((samples[samples.length - 1].mem_used_mb / samples[samples.length - 1].mem_total_mb) * 100).toFixed(1)
+      : "—";
+    memValue.textContent = latestMem;
+    memItem.append(memLabel, memValue, createSparkline(samples, "mem_used_mb", null, "mem_total_mb"));
+    container.append(memItem);
+
+    // Network metric (rx + tx bytes/s)
+    const netItem = document.createElement("div");
+    netItem.className = "metric-item";
+    const netLabel = document.createElement("div");
+    netLabel.className = "fieldlabel";
+    netLabel.textContent = "Network";
+    const netValue = document.createElement("div");
+    netValue.className = "metric-value";
+    let latestNet = "—";
+    if (samples[samples.length - 1] && Array.isArray(samples[samples.length - 1].net)) {
+      const nets = samples[samples.length - 1].net;
+      let totalRx = 0, totalTx = 0;
+      for (const n of nets) {
+        if (typeof n.rx_bps === "number") totalRx += n.rx_bps;
+        if (typeof n.tx_bps === "number") totalTx += n.tx_bps;
+      }
+      latestNet = byteRate(totalRx + totalTx);
+    }
+    netValue.textContent = latestNet;
+    netItem.append(netLabel, netValue, createNetworkSparkline(samples));
+    container.append(netItem);
+  }
+
+  /** Bytes a second in the unit a person reads; matches `rate` in the native
+   *  console's `view/health.rs`. */
+  function byteRate(bytes) {
+    if (bytes >= 1e6) return `${(bytes / 1e6).toFixed(1)} MB/s`;
+    if (bytes >= 1e3) return `${(bytes / 1e3).toFixed(0)} KB/s`;
+    return `${bytes} B/s`;
+  }
+
+  function createSparkline(samples, field, max, divisor) {
+    const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+    svg.setAttribute("viewBox", "0 0 100 40");
+    svg.setAttribute("preserveAspectRatio", "none");
+
+    const values = [];
+    for (const sample of samples) {
+      if (typeof sample[field] === "number") {
+        let val = sample[field];
+        if (divisor && typeof sample[divisor] === "number") {
+          val = (val / sample[divisor]) * 100;
+        }
+        values.push(Math.max(0, Math.min(100, val / (max || 100) * 100)));
+      } else {
+        values.push(null);
+      }
+    }
+
+    if (values.length === 0) return svg;
+
+    const points = [];
+    const width = 100;
+    const height = 40;
+    for (let i = 0; i < values.length; i++) {
+      const x = (i / (values.length - 1)) * width;
+      const y = values[i] !== null ? height - (values[i] / 100) * height : null;
+      if (y !== null) points.push(`${x},${y}`);
+    }
+
+    const polyline = document.createElementNS("http://www.w3.org/2000/svg", "polyline");
+    polyline.setAttribute("points", points.join(" "));
+    polyline.setAttribute("fill", "none");
+    polyline.setAttribute("stroke", "currentColor");
+    polyline.setAttribute("stroke-width", "1.5");
+    polyline.setAttribute("vector-effect", "non-scaling-stroke");
+    svg.append(polyline);
+
+    return svg;
+  }
+
+  function createNetworkSparkline(samples) {
+    const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+    svg.setAttribute("viewBox", "0 0 100 40");
+    svg.setAttribute("preserveAspectRatio", "none");
+
+    const values = [];
+    let maxBytes = 1;
+    for (const sample of samples) {
+      if (Array.isArray(sample.net)) {
+        let total = 0;
+        for (const n of sample.net) {
+          if (typeof n.rx_bps === "number") total += n.rx_bps;
+          if (typeof n.tx_bps === "number") total += n.tx_bps;
+        }
+        values.push(total);
+        maxBytes = Math.max(maxBytes, total);
+      } else {
+        values.push(null);
+      }
+    }
+
+    if (values.length === 0) return svg;
+
+    const points = [];
+    const width = 100;
+    const height = 40;
+    for (let i = 0; i < values.length; i++) {
+      const x = (i / (values.length - 1)) * width;
+      const y = values[i] !== null ? height - (values[i] / maxBytes) * height : null;
+      if (y !== null) points.push(`${x},${y}`);
+    }
+
+    const polyline = document.createElementNS("http://www.w3.org/2000/svg", "polyline");
+    polyline.setAttribute("points", points.join(" "));
+    polyline.setAttribute("fill", "none");
+    polyline.setAttribute("stroke", "currentColor");
+    polyline.setAttribute("stroke-width", "1.5");
+    polyline.setAttribute("vector-effect", "non-scaling-stroke");
+    svg.append(polyline);
+
+    return svg;
+  }
+
+  function renderHealthDNS(health) {
+    const wrap = $("h-dns-wrap");
+    const dns = $("h-dns");
+
+    if (!health.dns) {
+      wrap.hidden = true;
+      return;
+    }
+
+    wrap.hidden = false;
+    dns.textContent = "";
+
+    // Render dns.last_5_minutes as key/value pairs
+    if (health.dns.last_5_minutes && typeof health.dns.last_5_minutes === "object") {
+      for (const [key, val] of Object.entries(health.dns.last_5_minutes)) {
+        const dt = document.createElement("dt");
+        dt.textContent = key;
+        dns.append(dt);
+        const dd = document.createElement("dd");
+        dd.textContent = String(val);
+        dns.append(dd);
+      }
+    }
+  }
+
+  function renderHealthProcesses(health) {
+    const wrap = $("h-processes-wrap");
+    const tbody = $("h-processes");
+
+    if (!health.processes || !Array.isArray(health.processes) || health.processes.length === 0) {
+      wrap.hidden = true;
+      return;
+    }
+
+    wrap.hidden = false;
+    tbody.textContent = "";
+
+    for (const proc of health.processes) {
+      if (!proc || typeof proc.name !== "string") continue;
+      const row = document.createElement("tr");
+
+      const nameCell = document.createElement("td");
+      nameCell.className = "proc-name";
+      nameCell.textContent = proc.name;
+      row.append(nameCell);
+
+      const pidCell = document.createElement("td");
+      pidCell.className = "numeric";
+      pidCell.textContent = String(proc.pid || "");
+      row.append(pidCell);
+
+      const coresCell = document.createElement("td");
+      coresCell.className = "numeric";
+      coresCell.textContent = typeof proc.cpu_cores === "number" ? proc.cpu_cores.toFixed(2) : "—";
+      row.append(coresCell);
+
+      const wsCell = document.createElement("td");
+      wsCell.className = "numeric";
+      wsCell.textContent = typeof proc.working_set_mb === "number" ? proc.working_set_mb.toFixed(0) : "—";
+      row.append(wsCell);
+
+      tbody.append(row);
+    }
+  }
+
+  function renderHealthEvents() {
+    const wrap = $("h-events-wrap");
+    const list = $("h-events");
+
+    if (!state.healthEvents || !state.healthEvents.events || state.healthEvents.events.length === 0) {
+      wrap.hidden = true;
+      return;
+    }
+
+    const eventsDrawn = JSON.stringify(state.healthEvents);
+    if (eventsDrawn === healthEventsDrawn) return;
+    healthEventsDrawn = eventsDrawn;
+
+    wrap.hidden = false;
+    list.textContent = "";
+
+    // Newest first, and only the newest 100: the MCP tool and the API hold
+    // the rest, and a timeline of thousands of rows is one nobody reads.
+    const all = state.healthEvents.events;
+    const events = all.slice(-HEALTH_EVENTS_SHOWN).reverse();
+    for (const event of events) {
+      if (!event) continue;
+      const li = document.createElement("li");
+
+      const time = document.createElement("div");
+      time.className = "event-time";
+      time.textContent = event.at_unix ? new Date(event.at_unix * 1000).toLocaleString() : "—";
+      li.append(time);
+
+      const content = document.createElement("div");
+      content.className = "event-content";
+
+      const kind = document.createElement("div");
+      kind.className = "event-kind";
+      kind.textContent = (typeof event.kind === "string" ? event.kind : "unknown").toUpperCase();
+      content.append(kind);
+
+      const title = document.createElement("div");
+      title.className = "event-title";
+      title.textContent = typeof event.title === "string" ? event.title : "";
+      content.append(title);
+
+      const source = document.createElement("div");
+      source.className = "event-source";
+      source.textContent = `from ${typeof event.source === "string" ? event.source : "unknown"}`;
+      content.append(source);
+
+      li.append(content);
+      list.append(li);
+    }
+    const older = all.length - events.length + (state.healthEvents.omitted_older || 0);
+    if (older > 0) {
+      const li = document.createElement("li");
+      li.className = "event-more";
+      li.textContent = `${older} older events not shown`;
+      list.append(li);
     }
   }
 
