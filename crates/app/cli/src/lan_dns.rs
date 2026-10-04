@@ -35,10 +35,10 @@
 use selfhost_config::{Config, Dns, RecordConfig, ZoneConfig, psl};
 use selfhost_dns::Resolver;
 use selfhost_dns::authority::{Authority, LanView};
+use selfhost_dns::socket::{bind_tcp_shared, bind_udp_shared};
 use selfhost_mail::Dkim;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
-use tokio::net::{TcpListener, UdpSocket};
 
 /// Builds the authority every DNS-serving path shares.
 ///
@@ -321,14 +321,14 @@ pub async fn lan_dns_command(
 
     // Bind UDP and TCP with SO_REUSEADDR set so new instances can bind alongside
     // old ones during zero-drop handoff.
-    let udp = bind_udp_with_reuse(bind).map_err(|e| {
+    let udp = bind_udp_shared(bind).map_err(|e| {
         format!(
             "cannot bind {bind} (UDP): {e}\n  \
          This usually means port 53 needs privilege or something is already listening.\n  \
          On macOS that is usually a VPN client or Internet Sharing."
         )
     })?;
-    let tcp = bind_tcp_with_reuse(bind).map_err(|e| {
+    let tcp = bind_tcp_shared(bind).map_err(|e| {
         format!(
             "cannot bind {bind} (TCP): {e}\n  \
          This usually means port 53 needs privilege or something is already listening.\n  \
@@ -457,60 +457,6 @@ fn bind_hint(bind: SocketAddr, error: selfhost_dns::authority::DnsError) -> Stri
         }
         _ => format!("LAN DNS stopped: {error}"),
     }
-}
-
-/// Binds a UDP socket with SO_REUSEADDR set so multiple instances can bind the
-/// same address on Windows; on Unix also sets SO_REUSEPORT so multiple
-/// processes can bind the same address.
-fn bind_udp_with_reuse(bind: SocketAddr) -> std::io::Result<UdpSocket> {
-    use socket2::Socket;
-
-    let socket = match bind {
-        SocketAddr::V4(_) => Socket::new(socket2::Domain::IPV4, socket2::Type::DGRAM, None)?,
-        SocketAddr::V6(_) => Socket::new(socket2::Domain::IPV6, socket2::Type::DGRAM, None)?,
-    };
-
-    // Enable SO_REUSEADDR so a new instance can bind alongside a running one on Windows;
-    // on Unix also set SO_REUSEPORT so multiple processes can bind the same address.
-    socket.set_reuse_address(true)?;
-    #[cfg(unix)]
-    socket.set_reuse_port(true)?;
-
-    // Bind the socket, then set it to non-blocking so tokio can use it.
-    socket.bind(&bind.into())?;
-    socket.set_nonblocking(true)?;
-
-    // Convert the socket2::Socket into a std::net::UdpSocket, then into tokio's.
-    let std_socket = std::net::UdpSocket::from(socket);
-    UdpSocket::from_std(std_socket)
-}
-
-/// Binds a TCP listener with SO_REUSEADDR set so multiple instances can bind
-/// the same address on Windows; on Unix also sets SO_REUSEPORT so multiple
-/// processes can bind the same address. Uses socket2 to configure the socket
-/// before binding, then converts it to a tokio TcpListener.
-fn bind_tcp_with_reuse(bind: SocketAddr) -> std::io::Result<TcpListener> {
-    use socket2::Socket;
-
-    let socket = match bind {
-        SocketAddr::V4(_) => Socket::new(socket2::Domain::IPV4, socket2::Type::STREAM, None)?,
-        SocketAddr::V6(_) => Socket::new(socket2::Domain::IPV6, socket2::Type::STREAM, None)?,
-    };
-
-    // Enable SO_REUSEADDR so a new instance can bind alongside a running one on Windows;
-    // on Unix also set SO_REUSEPORT so multiple processes can bind the same address.
-    socket.set_reuse_address(true)?;
-    #[cfg(unix)]
-    socket.set_reuse_port(true)?;
-
-    // Bind the socket, then set it to non-blocking so tokio can use it.
-    socket.bind(&bind.into())?;
-    socket.listen(128)?;
-    socket.set_nonblocking(true)?;
-
-    // Convert the socket2::Socket into a std::net::TcpListener, then into tokio's.
-    let std_socket = std::net::TcpListener::from(socket);
-    TcpListener::from_std(std_socket)
 }
 
 /// Path to the handoff coordination file, where the current DNS process PID is
@@ -764,12 +710,12 @@ mod tests {
         let addr = SocketAddr::new(IpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 1)), 0);
 
         // First bind: the OS gives us an ephemeral port
-        let first_socket = bind_udp_with_reuse(addr).expect("first bind");
+        let first_socket = bind_udp_shared(addr).expect("first bind");
         let bound_addr = first_socket.local_addr().expect("get local addr");
 
         // Second bind: with SO_REUSEADDR, we can bind to the same port immediately
         // (this would fail without SO_REUSEADDR on most systems, or take 60+ seconds)
-        let second_socket = bind_udp_with_reuse(bound_addr).expect("second bind to same port");
+        let second_socket = bind_udp_shared(bound_addr).expect("second bind to same port");
         let second_bound_addr = second_socket.local_addr().expect("get second local addr");
 
         // Both sockets bound to the same address
@@ -783,11 +729,11 @@ mod tests {
         let addr = SocketAddr::new(IpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 1)), 0);
 
         // First bind: the OS gives us an ephemeral port
-        let first_listener = bind_tcp_with_reuse(addr).expect("first bind");
+        let first_listener = bind_tcp_shared(addr).expect("first bind");
         let bound_addr = first_listener.local_addr().expect("get local addr");
 
         // Second bind: with SO_REUSEADDR, we can bind to the same port immediately
-        let second_listener = bind_tcp_with_reuse(bound_addr).expect("second bind to same port");
+        let second_listener = bind_tcp_shared(bound_addr).expect("second bind to same port");
         let second_bound_addr = second_listener.local_addr().expect("get second local addr");
 
         // Both listeners bound to the same address
@@ -830,5 +776,61 @@ mod tests {
             read_pid, None,
             "should return None for missing handoff file"
         );
+    }
+
+    /// WP0's swap, on loopback: an old server answers, a new one binds the
+    /// same port beside it, the old one exits, and a client asking all along
+    /// never goes unanswered. One retry is allowed, as every stub resolver
+    /// makes one; a query that needs it is counted and reported.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_swap_on_a_shared_port_leaves_no_query_unanswered() {
+        use selfhost_dns::wire::{RecordType, encode_query};
+        use std::sync::Arc;
+        use std::time::Duration;
+
+        let config = with_synthesised_zones(&config_with(vec![site(&["swap.test"])], None));
+        let public = Some(Ipv4Addr::new(203, 0, 113, 7));
+        let old = build_authority(&config, &std::env::temp_dir(), public);
+        let new = build_authority(&config, &std::env::temp_dir(), public);
+
+        let first = bind_udp_shared("127.0.0.1:0".parse().unwrap()).expect("old binds");
+        let port = first.local_addr().unwrap();
+        let mut old_server = tokio::spawn(async move { old.serve_udp(Arc::new(first)).await });
+        let mut new_server = None;
+
+        let client = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        client.connect(port).await.unwrap();
+        let mut retried = Vec::new();
+        for id in 0..300_u16 {
+            if id == 100 {
+                let second = bind_udp_shared(port).expect("new binds beside the old");
+                let new = new.clone();
+                new_server = Some(tokio::spawn(async move { new.serve_udp(Arc::new(second)).await }));
+            }
+            if id == 200 {
+                // The old instance exits: its socket is closed once the task is gone.
+                old_server.abort();
+                assert!((&mut old_server).await.unwrap_err().is_cancelled());
+            }
+            let query = encode_query(id, "swap.test", RecordType::A).unwrap();
+            let mut answered = false;
+            for attempt in 0..2 {
+                client.send(&query).await.unwrap();
+                let mut reply = [0_u8; 512];
+                if let Ok(Ok(read)) = tokio::time::timeout(Duration::from_millis(500), client.recv(&mut reply)).await {
+                    assert!(read >= 12 && reply[..2] == id.to_be_bytes() && reply[2] & 0x80 != 0, "query {id}: not its reply");
+                    answered = true;
+                    if attempt > 0 {
+                        retried.push(id);
+                    }
+                    break;
+                }
+            }
+            assert!(answered, "query {id} went unanswered across the swap (retried so far: {retried:?})");
+        }
+        assert!(retried.len() <= 1, "queries needing a retry: {retried:?}");
+        let taken_over = new.telemetry_snapshot("new").counters.queries;
+        assert!(taken_over >= 100, "the new instance answered only {taken_over} queries after the old one left");
+        new_server.unwrap().abort();
     }
 }
