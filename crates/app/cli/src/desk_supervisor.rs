@@ -903,7 +903,7 @@ fn observed_console(
 /// tighter loop would spend the machine's power watching a login screen. The
 /// waits inside one turn are shorter than this, so an agent's `Hello` is seen
 /// within a fraction of a turn rather than at the end of one.
-#[cfg(any(windows, test))]
+#[cfg(windows)]
 const TURN: Duration = Duration::from_secs(1);
 
 /// How long one turn waits for an agent to connect to the pipe.
@@ -1843,46 +1843,12 @@ mod tests {
 
     #[test]
     fn with_no_pipe_carry_returns_false_and_does_not_spin() {
-        // F1: When there's no pipe and nothing to carry (production session 0
-        // before the first agent, or no user logged in), carry() must return
-        // false so the loop knows to sleep rather than spinning.
-        //
-        // Drive one TURN of the loop logic with no pipe: call carry() repeatedly
-        // until TURN expires. Verify that carry() is invoked a small bounded
-        // number of times (the test timing is approximate, so we check <=100
-        // as a reasonable bound).
-        let (mut supervised, machine) = driver(InputPolicy::ViewOnly, 5);
-        // console remains Attaching (no user), so channel.open_for remains None
-        let now = Instant::now();
-        supervised.turn(now, quiet());
-        assert!(
-            supervised.channel.session().is_none(),
-            "no pipe exists when there is no user"
-        );
-
-        // Simulate the production loop: call carry() repeatedly, counting
-        // iterations. With FakeChannel, pump() returns instantly, so without
-        // the fix, this would loop thousands of times. With the fix, carry()
-        // returns false on the first call (no pipe, no data), so the loop would
-        // exit immediately and sleep.
-        //
-        // In a test with FakeChannel, we see the true return value without
-        // needing the sleep to happen, so this test verifies that carry()
-        // reports the condition correctly.
-        let mut iterations = 0;
-        let max_iterations = 100;
-        let mut turn_start = Instant::now();
-        while turn_start.elapsed() < TURN && iterations < max_iterations {
-            if !supervised.carry(Instant::now()) {
-                // carry() correctly reported that there's nothing to do and no
-                // pipe to wait on. The production loop would sleep here.
-                break;
-            }
-            iterations += 1;
-        }
-
-        assert!(iterations < max_iterations, "carry() returned false quickly, not spinning");
-        assert!(iterations <= 2, "with no pipe and no data, carry() does minimal work: {iterations}");
+        // F1: with no user there is no pipe, and `carry` must say "nothing to
+        // carry" so the loop sleeps out the turn instead of spinning a core.
+        let (mut supervised, _machine) = driver(InputPolicy::ViewOnly, 5);
+        supervised.turn(Instant::now(), quiet());
+        assert!(supervised.channel.session().is_none(), "no pipe exists when there is no user");
+        assert!(!supervised.carry(Instant::now()));
     }
 
     #[test]
