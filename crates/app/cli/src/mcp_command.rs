@@ -128,8 +128,9 @@ type Tool = (&'static str, &'static str, &'static [Param]);
 /// the deployment's own self-update, `whoami` so an agent can see exactly
 /// which of these its token will open, and — owner-only, the same as the
 /// routes behind them — the registry (`people_*`), the deploy record,
-/// System health and insight (`deploys_*`, `system_health`, `insight_*`), the VPN roster
-/// (`vpn_peers_list`) and the firewall (`firewall_show`). This is "STEP 4 —
+/// System health (`deploys_*`, `system_health`), the audit trail (`audit`),
+/// the VPN roster (`vpn_peers_list`) and the firewall (`firewall_show`).
+/// Machine insight (`insight_*`) needs only `console.read`. This is "STEP 4 —
 /// control parity" from `index.dx`'s goal 4: every mutating
 /// admin route reachable from a keyboard on the box is reachable here too,
 /// gated by the calling token's grants exactly as the HTTP route is — see
@@ -413,6 +414,12 @@ const TOOLS: &[Tool] = &[
         "The newest process ranking (once a minute): the busiest and largest processes plus every \
          selfhost process, with CPU in cores, memory and handles.",
         &[],
+    ),
+    (
+        "audit",
+        "The newest entries of the audit trail, newest first: who signed in, was refused, or changed \
+         what. Owner-only, like the console's own audit view.",
+        &[("limit", "How many entries, at most 500; default 100.", false, Kind::Count)],
     ),
     (
         "vpn_peers_list",
@@ -1226,6 +1233,14 @@ async fn call_tool(client: &RemoteClient, name: &str, arguments: &Json) -> Resul
             let answer = client.get("/api/insight/processes").await?;
             Ok(answer.to_text())
         }
+        "audit" => {
+            let path = match count(arguments, "limit")? {
+                Some(limit) => format!("/api/audit?limit={limit}"),
+                None => "/api/audit".to_owned(),
+            };
+            let answer = client.get(&path).await?;
+            Ok(answer.to_text())
+        }
         "vpn_peers_list" => {
             let answer = client.get("/api/vpn/peers").await?;
             Ok(answer.to_text())
@@ -1739,6 +1754,7 @@ mod tests {
         assert!(names.contains(&"insight_events"), "{names:?}");
         assert!(names.contains(&"insight_dns"), "{names:?}");
         assert!(names.contains(&"insight_processes"), "{names:?}");
+        assert!(names.contains(&"audit"), "{names:?}");
     }
 
     #[test]

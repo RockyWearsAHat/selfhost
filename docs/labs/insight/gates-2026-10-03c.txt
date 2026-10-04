@@ -1,0 +1,16 @@
+# insight/monitor-ui-dns @ 7e99114 + working tree (audit MCP tool, workspace clippy fixes), 2026-10-04T03:46:28Z
+# cargo test --offline --locked --workspace
+suites 80 passed 4122 failed 0
+test exit 0
+# cargo check --offline --locked --workspace --all-targets --target x86_64-pc-windows-gnu
+win exit 0
+# cargo clippy --offline --locked --workspace --all-targets --keep-going -- -D warnings
+error: unused import: `std::io::Read`	  --> crates/services/orchid-images/src/bin/push-client.rs:11:5
+error: unused variable: `uri`	  --> crates/services/orchid-images/src/bin/push-client.rs:63:9
+error: fields `scheme`, `host`, `port`, and `path` are never read	  --> crates/services/orchid-images/src/bin/push-client.rs:80:13
+clippy exit 101
+# cargo clippy --offline --locked -p selfhost-insight -p selfhost-dns -p selfhost-cli -p selfhost-admin --target x86_64-pc-windows-gnu -- -D warnings
+clippy-win exit 0
+# cargo build --release --offline --locked -p selfhost-cli; node --check sites/console/app.js
+release exit 0
+web syntax ok

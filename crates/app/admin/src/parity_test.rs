@@ -193,7 +193,7 @@ mod tests {
 
         for (route, reason) in HUMAN_ONLY_ROUTES {
             assert!(
-                route_set.contains(&route.to_string()),
+                route_set.contains(*route),
                 "HUMAN_ONLY route {} with reason \"{}\" is not a known mutating route. \
                  Check for typos or if it has been removed.",
                 route, reason

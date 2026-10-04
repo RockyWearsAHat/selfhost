@@ -836,6 +836,7 @@ fn set(
 }
 
 /// Adds to or takes from what a person already holds.
+#[allow(clippy::too_many_arguments)]
 fn amend(
     people: &People,
     data_dir: &Path,
@@ -867,6 +868,7 @@ fn amend(
 ///
 /// Writes through the admin API when the daemon is running, falls back to
 /// direct file write only when the daemon is absent (bootstrap case).
+#[allow(clippy::too_many_arguments)]
 fn write(
     people: &People,
     data_dir: &Path,

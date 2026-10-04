@@ -512,6 +512,6 @@ mod tests {
 
         let snapshot = tel.snapshot("test");
         assert_eq!(snapshot.counters.queries, 10);
-        assert!(snapshot.minutes.len() > 0);
+        assert!(!snapshot.minutes.is_empty());
     }
 }

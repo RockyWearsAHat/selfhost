@@ -725,7 +725,7 @@ mod exposure_tests {
         site.allowed_cidrs = vec!["10.66.0.0/24".into()];
         assert!(site.requires_pass() && site.is_network_gated());
         assert!(!site.permits("8.8.8.8".parse().unwrap()), "private keeps the network check");
-        assert_eq!(parsed("owner = \"mom\"").unwrap().owner.as_ref().map(|o| o.as_str()), Some("mom"));
+        assert_eq!(parsed("owner = \"mom\"").unwrap().owner.as_deref(), Some("mom"));
     }
 }
 

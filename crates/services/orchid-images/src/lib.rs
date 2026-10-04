@@ -16,6 +16,7 @@ impl Frame {
     }
 }
 
+#[derive(Default)]
 pub struct FrameStore {
     current: Arc<RwLock<Option<Frame>>>,
 }

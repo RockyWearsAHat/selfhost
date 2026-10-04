@@ -401,14 +401,14 @@ fn challenge_for(verifier: &str) -> String {
 
 async fn authorize(box_: &Deployment, person: &str, verifier: &str) -> Response {
     // No `location`: the deployment's own relay is the default.
-    let body = Json::object([("codeChallenge", Json::string(&challenge_for(verifier)))]).to_text();
+    let body = Json::object([("codeChallenge", Json::string(challenge_for(verifier)))]).to_text();
     box_.call_as(person, "POST", "/api/vpn/authorize", &body).await
 }
 
 async fn authorize_for(box_: &Deployment, person: &str, verifier: &str, location: &str) -> Response {
     let body = Json::object([
         ("location", Json::string(location)),
-        ("codeChallenge", Json::string(&challenge_for(verifier))),
+        ("codeChallenge", Json::string(challenge_for(verifier))),
     ])
     .to_text();
     box_.call_as(person, "POST", "/api/vpn/authorize", &body).await
