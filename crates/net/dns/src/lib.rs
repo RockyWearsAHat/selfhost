@@ -19,12 +19,13 @@
 //! through a large public resolver, which Spamhaus rejects — not that the
 //! address is listed. See [`resolver::is_real_listing`].
 
-#![forbid(unsafe_code)]
+#![deny(unsafe_code)]
 #![warn(missing_docs)]
 
 pub mod authority;
 pub mod cache;
 pub mod resolver;
+pub mod socket;
 pub mod time;
 pub mod telemetry;
 pub mod updater;

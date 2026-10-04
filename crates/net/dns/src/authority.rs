@@ -237,14 +237,17 @@ impl Authority {
     /// whole server; `Ctrl-C`/SIGTERM handling belongs to the caller (the daemon's
     /// `select!`). TCP messages are length-prefixed, one task per connection.
     pub async fn serve(&self, bind: SocketAddr) -> Result<(), DnsError> {
-        let datagram = Arc::new(
-            UdpSocket::bind(bind)
-                .await
-                .map_err(|source| DnsError::Bind {
-                    address: bind,
-                    source,
-                })?,
-        );
+        let datagram = UdpSocket::bind(bind)
+            .await
+            .map_err(|source| DnsError::Bind {
+                address: bind,
+                source,
+            })?;
+        crate::socket::ignore_connection_resets(&datagram).map_err(|source| DnsError::Bind {
+            address: bind,
+            source,
+        })?;
+        let datagram = Arc::new(datagram);
         let stream = TcpListener::bind(bind)
             .await
             .map_err(|source| DnsError::Bind {

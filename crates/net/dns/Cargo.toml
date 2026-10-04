@@ -12,7 +12,9 @@ tokio = { workspace = true }
 selfhost-config = { workspace = true }
 selfhost-igd = { workspace = true }
 selfhost-json = { workspace = true }
+socket2 = { workspace = true }
 
 [lints.rust]
-unsafe_code = "forbid"
+# One Windows socket ioctl in `socket.rs` needs it; that module alone allows it.
+unsafe_code = "deny"
 missing_docs = "warn"
