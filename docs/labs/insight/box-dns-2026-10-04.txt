@@ -1,0 +1,74 @@
+# ALEX-DESKTOP read-only probe, 2026-10-04T04:08:29Z. Scripts: probe4.ps1 + probe5.ps1 (last 40000 lines of data/selfhost-daemon.log), run via ssh pc powershell -EncodedCommand.
+# Live daemon = f146597 (pre-WP3/WP4): one upstream (system resolver = router 192.168.1.1), 5 s timeout, no cache.
+lines 40000 dns 33577 first 10-03 15:03:54Z last 10-04 04:08:23Z
+== by peer
+Count Name         
+----- ----         
+23168 192.168.1.1  
+  784 127.0.0.1    
+  217 172.69.40.68 
+  123 104.22.19.62 
+  116 104.22.19.61 
+  108 144.202.24.50
+== by rcode
+Count Name    
+----- ----    
+ 4492 REFUSED 
+28508 NOERROR 
+  324 SERVFAIL
+  251 NXDOMAIN
+    2 FORMERR 
+== slow (>=1000ms)
+72
+== non-dns lines sample
+10-04 04:08:21Z [imap] 192.168.1.31:60848 << 4.15529 OK STATUS completed
+10-04 04:08:21Z [imap] 192.168.1.31:60848 >> 5.15529 STATUS
+10-04 04:08:21Z [imap] 192.168.1.31:60848 << 5.15529 OK STATUS completed
+10-04 04:08:21Z [imap] 192.168.1.31:60848 >> 6.15529 STATUS
+10-04 04:08:21Z [imap] 192.168.1.31:60848 << 6.15529 OK STATUS completed
+10-04 04:08:21Z [imap] 192.168.1.31:60848 >> 7.15529 STATUS
+10-04 04:08:21Z [imap] 192.168.1.31:60848 << 7.15529 OK STATUS completed
+10-04 04:08:21Z [imap] 192.168.1.31:60846 << 9.15525 OK [READ-WRITE] SELECT completed
+10-04 04:08:21Z [imap] 192.168.1.31:60846 >> 10.15525 FETCH
+10-04 04:08:22Z [imap] 192.168.1.31:60846 << 10.15525 OK FETCH completed
+== SERVFAIL by 10-minute bucket (top 12)
+Count Name       
+----- ----       
+   16 10-04 02:40
+    9 10-03 21:00
+    9 10-03 18:20
+    8 10-03 21:10
+    7 10-04 02:50
+    7 10-03 21:20
+    7 10-03 15:20
+    6 10-03 17:00
+    6 10-03 17:30
+    6 10-03 20:50
+    6 10-03 19:10
+    6 10-03 18:40
+== SERVFAIL by peer
+Count Name       
+----- ----       
+  324 192.168.1.1
+== SERVFAIL latency
+Count   : 324
+Minimum : 1
+Maximum : 5015
+Average : 1134.16975308642
+== sample SERVFAIL
+10-04 03:43:21Z [dns] 192.168.1.1 mail.leveluplongboarding.surf A udp SERVFAIL answers=0 31ms
+10-04 03:48:21Z [dns] 192.168.1.1 mail.leveluplongboarding.surf A udp SERVFAIL answers=0 3ms
+10-04 03:53:21Z [dns] 192.168.1.1 mail.leveluplongboarding.surf A udp SERVFAIL answers=0 4ms
+10-04 03:58:21Z [dns] 192.168.1.1 mail.leveluplongboarding.surf A udp SERVFAIL answers=0 4ms
+10-04 04:03:21Z [dns] 192.168.1.1 mail.leveluplongboarding.surf A udp SERVFAIL answers=0 18ms
+10-04 04:08:21Z [dns] 192.168.1.1 mail.leveluplongboarding.surf A udp SERVFAIL answers=0 5ms
+== slow sample
+10-04 03:13:17Z [dns] 192.168.1.1 haproxy-ingress-portcullis.life360.com.cdn.cloudflare.net TYPE65 udp SERVFAIL answers=0 5003ms
+10-04 03:20:13Z [dns] 192.168.1.1 main.vscode-cdn.net A udp SERVFAIL answers=0 5005ms
+10-04 03:20:40Z [dns] 192.168.1.1 sessions.bugsnag.com TYPE65 udp SERVFAIL answers=0 5014ms
+10-04 03:22:50Z [dns] 192.168.1.1 bag-cdn-lb.itunes-apple.com.akadns.net A udp SERVFAIL answers=0 5004ms
+10-04 03:28:44Z [dns] 192.168.1.1 varnish24-c20-lax1-dss-vod-dssc-shield.tr.na.prod.dssedge.com A udp SERVFAIL answers=0 5012ms
+10-04 03:43:12Z [dns] 192.168.1.1 unagi-na.amazon.com AAAA udp SERVFAIL answers=0 5012ms
+== non-query dns lines
+10-04 00:12:44Z [dns] 151.243.11.230 malformed query (37 bytes, udp) FORMERR 0ms
+10-04 01:00:52Z [dns] 45.205.1.231 malformed query (37 bytes, udp) FORMERR 0ms
