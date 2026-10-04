@@ -19,6 +19,7 @@ selfhost-desk = { workspace = true }
 selfhost-firewall = { workspace = true }
 selfhost-git = { workspace = true }
 selfhost-http = { workspace = true }
+selfhost-insight = { workspace = true }
 # Who the caller is and what they may do. Every route here answers a capability
 # question rather than a boolean, and the answer comes from one pure function in
 # a crate that sits below this one — so the storage and desktop subsystems can

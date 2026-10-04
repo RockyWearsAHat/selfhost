@@ -1361,7 +1361,8 @@ async fn serve_everything(
         // `Api::with_deploys`'s documentation for why this is not built from
         // a `data_dir` the way `with_agents` is.
         .with_deploys(Arc::clone(&deploys))
-        .with_mail_configured(config.mail.is_some());
+        .with_mail_configured(config.mail.is_some())
+        .with_insight(data_dir.clone());
     // Only when the section is live: a route that answers 202 and pokes a
     // watcher that is not running would report a deployment nobody is doing.
     if config.self_update.as_ref().is_some_and(|update| update.enabled) {
@@ -1654,6 +1655,11 @@ async fn serve_everything(
             }
         }
     });
+
+    // Watches the machine: samples, judges and records what `/api/insight`
+    // serves. Its own task, every OS read on the blocking pool, so a slow read
+    // or a panic in it can never hold up a listener or :53.
+    tokio::spawn(selfhost_insight::run(data_dir.clone()));
 
     let mut updated_to: Option<String> = None;
     let outcome = tokio::select! {
