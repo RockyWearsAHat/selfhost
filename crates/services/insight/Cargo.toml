@@ -1,0 +1,19 @@
+[package]
+name = "selfhost-insight"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Machine insight: cheap sampling of CPU, memory, disk, network and processes, recorded with the events and problems that explain them."
+
+[dependencies]
+selfhost-json = { workspace = true }
+tokio = { workspace = true }
+
+[lints.rust]
+# `deny`, not `forbid`: the Windows sampler reads counters the standard library
+# has no route to, and each of those calls carries its own allow. No other
+# module contains `unsafe`.
+unsafe_code = "deny"
+missing_docs = "warn"

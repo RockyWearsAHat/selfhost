@@ -650,6 +650,7 @@ dependencies = [
  "selfhost-git",
  "selfhost-http",
  "selfhost-identity",
+ "selfhost-insight",
  "selfhost-json",
  "selfhost-login",
  "selfhost-maintenance",
@@ -691,6 +692,7 @@ dependencies = [
  "selfhost-home",
  "selfhost-http",
  "selfhost-identity",
+ "selfhost-insight",
  "selfhost-json",
  "selfhost-mail",
  "selfhost-maintenance",
@@ -815,6 +817,14 @@ dependencies = [
 name = "selfhost-igd"
 version = "0.1.0"
 dependencies = [
+ "tokio",
+]
+
+[[package]]
+name = "selfhost-insight"
+version = "0.1.0"
+dependencies = [
+ "selfhost-json",
  "tokio",
 ]
 
