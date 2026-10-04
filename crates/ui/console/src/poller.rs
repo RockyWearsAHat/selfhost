@@ -47,6 +47,9 @@ const INSIGHT_INTERVAL: Duration = Duration::from_secs(10);
 /// How often the HEALTH sparklines' hour of history is fetched.
 const HISTORY_INTERVAL: Duration = Duration::from_secs(60);
 
+/// How many timeline events the HEALTH plate's RECENT rows show.
+const RECENT_EVENTS: usize = 5;
+
 /// How many log lines to fetch at once.
 ///
 /// The API caps this itself; asking for a bounded number keeps a service that
@@ -742,21 +745,20 @@ fn refresh_history(client: &Client, shared: &Arc<Mutex<Snapshot>>) {
         samples.iter().filter_map(HistorySample::from_json).collect();
 }
 
-/// Fetches recent machine events, keeping the newest 8, newest first: the daemon's
-/// answer is already sorted and this replaces what was there.
+/// Fetches the last day's machine events and keeps the newest few for the
+/// HEALTH plate's RECENT rows, replacing what was there.
 fn refresh_events(client: &Client, shared: &Arc<Mutex<Snapshot>>) {
     let Ok(value) = client.get("/api/insight/events") else {
         return;
     };
-    let mut events: Vec<InsightEvent> = value
-        .get("events")
-        .and_then(Json::as_array)
-        .unwrap_or_default()
-        .iter()
-        .filter_map(InsightEvent::from_json)
-        .collect();
-    events.truncate(8);
-    shared.lock().expect("the snapshot lock was poisoned").events = events;
+    shared.lock().expect("the snapshot lock was poisoned").events = newest_events(&value);
+}
+
+/// The newest [`RECENT_EVENTS`] of an events answer, newest first. The daemon
+/// sends them oldest first.
+fn newest_events(value: &Json) -> Vec<InsightEvent> {
+    let wire = value.get("events").and_then(Json::as_array).unwrap_or_default();
+    wire.iter().rev().filter_map(InsightEvent::from_json).take(RECENT_EVENTS).collect()
 }
 
 /// Reads one log line from the wire.
@@ -800,6 +802,18 @@ fn describe(error: &ClientError) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn recent_events_are_the_newest_few_newest_first() {
+        let wire: String = (0..12)
+            .map(|at| format!(r#"{{"at_unix":{at},"kind":"warning","source":"s","title":"t{at}","evidence":{{}}}}"#))
+            .collect::<Vec<_>>()
+            .join(",");
+        let value = selfhost_json::parse(&format!(r#"{{"events":[{wire}]}}"#)).expect("legal JSON");
+        let times: Vec<u64> = newest_events(&value).iter().map(|event| event.at_unix).collect();
+        assert_eq!(times, vec![11, 10, 9, 8, 7]);
+        assert!(newest_events(&Json::Null).is_empty());
+    }
 
     #[test]
     fn ordinary_service_names_become_paths() {

@@ -3288,6 +3288,18 @@ mod tests {
                 source: "memory".to_owned(),
                 title: "Memory pressure resolved".to_owned(),
             },
+            InsightEvent {
+                at_unix: 1_791_001_600,
+                kind: "windows".to_owned(),
+                source: "Microsoft-Windows-DNS-Client".to_owned(),
+                title: "Name resolution for the name wpad timed out after none of the configured DNS servers responded.".to_owned(),
+            },
+            InsightEvent {
+                at_unix: 1_791_001_500,
+                kind: "repair".to_owned(),
+                source: "dns".to_owned(),
+                title: "dns repaired: restarted selfhost-lan-dns".to_owned(),
+            },
         ];
         snapshot
     }
