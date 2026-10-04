@@ -174,7 +174,7 @@ impl MaintenanceScheduler {
 
         // If the candidate is in the past, use tomorrow
         if candidate <= local_now {
-            candidate = candidate + chrono::Duration::days(1);
+            candidate += chrono::Duration::days(1);
         }
 
         // Convert to UNIX timestamp

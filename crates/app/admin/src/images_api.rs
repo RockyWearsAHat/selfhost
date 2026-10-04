@@ -130,7 +130,7 @@ pub fn push_image(
     let mut obj = BTreeMap::new();
     obj.insert("status".to_string(), Json::string("ok"));
     obj.insert("timestamp".to_string(), Json::Number(timestamp as f64));
-    obj.insert("image_hash".to_string(), Json::string(&hex_encode(&entropy_hash)));
+    obj.insert("image_hash".to_string(), Json::string(hex_encode(&entropy_hash)));
 
     json(Status(200), Json::Object(obj))
 }
@@ -146,7 +146,7 @@ pub fn get_latest_image(store: &ImageStore) -> Response {
             obj.insert("status".to_string(), Json::string("ok"));
             obj.insert("image".to_string(), Json::string(&image_b64));
             obj.insert("timestamp".to_string(), Json::Number(entry.timestamp_secs as f64));
-            obj.insert("image_hash".to_string(), Json::string(&hex_encode(&entry.entropy_hash)));
+            obj.insert("image_hash".to_string(), Json::string(hex_encode(&entry.entropy_hash)));
             obj.insert("push_count".to_string(), Json::Number(entry.push_count as f64));
 
             json(Status(200), Json::Object(obj))

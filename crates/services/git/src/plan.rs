@@ -104,17 +104,9 @@ pub fn fetch_args(watch: &GitWatch, at: &Path, authenticated: Option<&str>) -> V
 /// useful for a `github.com` remote.
 pub fn parse_github_owner_repo(repository: &str) -> Option<(String, String)> {
     let repository = repository.trim();
-    let path = if let Some(rest) = repository.strip_prefix("git@github.com:") {
-        rest
-    } else if let Some(rest) = repository.strip_prefix("ssh://git@github.com/") {
-        rest
-    } else if let Some(rest) = repository.strip_prefix("https://github.com/") {
-        rest
-    } else if let Some(rest) = repository.strip_prefix("http://github.com/") {
-        rest
-    } else {
-        return None;
-    };
+    let path = ["git@github.com:", "ssh://git@github.com/", "https://github.com/", "http://github.com/"]
+        .iter()
+        .find_map(|prefix| repository.strip_prefix(prefix))?;
 
     let path = path.trim_end_matches('/').strip_suffix(".git").unwrap_or(path.trim_end_matches('/'));
     let (owner, repo) = path.split_once('/')?;

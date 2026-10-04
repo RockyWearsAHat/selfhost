@@ -1618,16 +1618,12 @@ async fn serve_everything(
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs();
-        let secs_until_next = if status.next_reboot > now {
-            status.next_reboot - now
-        } else {
-            0
-        };
+        let secs_until_next = status.next_reboot.saturating_sub(now);
         println!(
             "\nmaintenance scheduler enabled, next reboot in {} seconds (at unix {})",
             secs_until_next, status.next_reboot
         );
-        let _ = scheduler.spawn_task();
+        scheduler.spawn_task();
     }
 
     // If this boot followed a self-update's restart, prove the new build is

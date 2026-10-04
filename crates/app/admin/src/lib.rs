@@ -75,7 +75,6 @@ use selfhost_http::{Body, Method, Request, Response, Status};
 use selfhost_identity::{
     Caller, Capability, Grants, Identity, Opening, People, PersonName, Policy, VpnLocationId,
 };
-use selfhost_maintenance;
 
 /// What a deployment with no permission registry answers on every people route.
 ///
@@ -1996,7 +1995,7 @@ impl Api {
     /// Whether `caller` may open `site`: the owner, the Site's own `owner`, or
     /// a holder of `site.access:<site>` (which `site.admin:<site>` implies).
     fn may_reach_site(&self, caller: &Caller, site: &selfhost_config::Site) -> bool {
-        if Self::is_site_owner(caller, site.owner.as_ref().map(|o| o.as_str())) {
+        if Self::is_site_owner(caller, site.owner.as_deref()) {
             return true;
         }
         selfhost_identity::SiteName::parse(&site.name).is_ok_and(|name| {
@@ -2010,7 +2009,7 @@ impl Api {
             || self
                 .configured_sites()
                 .iter()
-                .any(|entry| entry.name == site.as_str() && Self::is_site_owner(caller, entry.owner.as_ref().map(|o| o.as_str())))
+                .any(|entry| entry.name == site.as_str() && Self::is_site_owner(caller, entry.owner.as_deref()))
     }
 
     /// `PUT /api/people/<name>` from somebody who is not the owner.

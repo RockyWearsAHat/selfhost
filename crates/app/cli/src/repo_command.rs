@@ -474,6 +474,7 @@ const DEFAULT_MANIFEST_BRANCH: &str = selfhost_config::git::DEFAULT_BRANCH;
 /// nothing for the proxy to forward to. `serve` is the same: empty on both
 /// sides refuses rather than installing a service that starts and immediately
 /// exits.
+#[allow(clippy::too_many_arguments)]
 pub fn compose_with_manifest(
     owner: &str,
     repo: &str,

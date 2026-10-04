@@ -1,0 +1,11 @@
+# merged insight/monitor-ui-dns @ 7e99114, 2026-10-04T03:36:22Z
+# cargo test --offline --locked --workspace
+suites 80 passed 4122 failed 0
+test exit 0
+# cargo check --offline --locked --workspace --target x86_64-pc-windows-gnu
+win exit 0
+# cargo clippy --offline --locked -p selfhost-insight -p selfhost-dns --target x86_64-pc-windows-gnu -- -D warnings
+clippy exit 0
+# cargo build --release --offline --locked -p selfhost-cli; node --check sites/console/app.js
+release exit 0
+web syntax ok
