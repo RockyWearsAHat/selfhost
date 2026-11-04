@@ -43,6 +43,14 @@
 # Usage: mac-auto-update.sh [--repo <url>] [--branch <name>]
 set -euo pipefail
 
+# launchd starts this with PATH=/usr/bin:/bin:/usr/sbin:/sbin, which holds none
+# of the toolchain the gate needs. Add the places it is installed: rustup's
+# cargo, Homebrew, and the python.org framework (python3, maturin).
+for dir in /Library/Frameworks/Python.framework/Versions/Current/bin /usr/local/bin /opt/homebrew/bin "$HOME/.cargo/bin"; do
+  if [ -d "$dir" ]; then PATH="$dir:$PATH"; fi
+done
+export PATH
+
 REPO="${SECUREVPN_REPO:-https://github.com/RockyWearsAHat/Secure-VPN.git}"
 BRANCH="${SECUREVPN_BRANCH:-main}"
 VPN_HOME="${SECUREVPN_HOME:-$HOME/.securevpn}"
