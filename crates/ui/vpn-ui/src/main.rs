@@ -33,12 +33,6 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tunnel::{Endpoint, Link, Phase};
 
-/// How often the auto-rotation thread wakes to check whether a week has passed.
-const ROTATE_CHECK: Duration = Duration::from_secs(3600);
-
-/// How old the identity key may get before automatic rotation replaces it.
-const ROTATE_AFTER: Duration = Duration::from_secs(7 * 24 * 3600);
-
 /// How often the KEYS panel's on-disk reading is refreshed, independent of
 /// whether this app itself is the one rotating. A rotation triggered any
 /// other way — `rotate-keys.sh` run by hand, a script, another instance —
@@ -110,79 +104,41 @@ fn open() -> Result<(), String> {
     Ok(())
 }
 
-/// The real on-disk key age, as an `Instant` an hour, a day, or five weeks in
-/// the past — so `Instant::elapsed()` from process start reads the key's true
-/// staleness instead of resetting to zero every time this app relaunches.
-/// Falls back to "now" (treats the key as freshly rotated) when there is no
-/// recorded rotation yet, or it cannot be parsed — the same as before this
-/// fix, which is the safe default: never rotate unexpectedly on faith in an
-/// unreadable timestamp.
-fn last_rotation_instant() -> Instant {
-    let now = Instant::now();
-    let Some(recorded) = keys::last_rotation() else {
-        return now;
-    };
-    let Some(recorded_epoch) = keys::parse_epoch(&recorded) else {
-        return now;
-    };
-    let Ok(now_epoch) = SystemTime::now().duration_since(UNIX_EPOCH) else {
-        return now;
-    };
-    let age_secs = now_epoch.as_secs().saturating_sub(recorded_epoch.max(0) as u64);
-    now.checked_sub(Duration::from_secs(age_secs)).unwrap_or(now)
+/// Wall-clock now, in epoch seconds. Unlike `Instant`, it keeps counting while
+/// the Mac sleeps, so a key's age is its real age.
+fn epoch_now() -> i64 {
+    SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |since| since.as_secs() as i64)
 }
 
 /// The background thread that keeps the identity key fresh.
 ///
-/// It rotates when the key is older than a week and the switch is on. A rotation
-/// is lock-out-proof on its own, so the worst a failure does is leave the
-/// current key in place until the next check.
+/// Every `DISPLAY_REFRESH` it re-reads the rotation record and, with the switch
+/// on, rotates when `keys::rotation_due` says so. A rotation is lock-out-proof
+/// on its own, so a failure leaves the current key in place and the next try
+/// comes an hour later.
 fn spawn_auto_rotation(
     auto: Arc<AtomicBool>,
     activity: Arc<std::sync::Mutex<app::Activity>>,
     running: Arc<AtomicBool>,
 ) -> std::thread::JoinHandle<()> {
     std::thread::spawn(move || {
-        let mut last = last_rotation_instant();
-        refresh_activity_from_disk(&activity);
-        let mut since_refresh = Duration::ZERO;
+        let mut last_attempt = None;
         while running.load(Ordering::Relaxed) {
-            // Checked first, before the hour-long wait below: `last` is
-            // already backdated to the key's real age, so a key that is
-            // already overdue when this thread starts (the common case —
-            // this only runs while the app is open, not continuously) must
-            // rotate now rather than sit overdue for up to another hour
-            // before the loop first looks.
-            if auto.load(Ordering::Relaxed) && last.elapsed() >= ROTATE_AFTER {
+            refresh_activity_from_disk(&activity);
+            let recorded = keys::last_rotation().as_deref().and_then(keys::parse_epoch);
+            let now = epoch_now();
+            if auto.load(Ordering::Relaxed) && keys::rotation_due(recorded, last_attempt, now) {
+                last_attempt = Some(now);
                 actions::rotate(Arc::clone(&activity));
-                last = Instant::now();
             }
-            // Sleep in short steps so closing the window does not wait an hour.
-            let mut waited = Duration::ZERO;
-            while waited < ROTATE_CHECK && running.load(Ordering::Relaxed) {
-                std::thread::sleep(Duration::from_millis(500));
-                waited += Duration::from_millis(500);
-                since_refresh += Duration::from_millis(500);
-                if since_refresh >= DISPLAY_REFRESH {
-                    since_refresh = Duration::ZERO;
-                    if refresh_activity_from_disk(&activity) {
-                        // Someone else already rotated since this thread's
-                        // own `last` baseline was set — re-derive it from
-                        // the record that just changed, so this thread does
-                        // not also fire its own redundant rotation on top.
-                        last = last_rotation_instant();
-                    }
-                }
-            }
+            std::thread::sleep(DISPLAY_REFRESH);
         }
     })
 }
 
 /// Re-reads the identities and rotation record from disk and, if either
-/// changed, writes them into `activity` for the window to redraw. Returns
-/// whether anything changed — the caller uses that to know its own idea of
-/// the key's age just went stale.
-fn refresh_activity_from_disk(activity: &Arc<std::sync::Mutex<app::Activity>>) -> bool {
+/// changed, writes them into `activity` for the window to redraw.
+fn refresh_activity_from_disk(activity: &Arc<std::sync::Mutex<app::Activity>>) {
     let account = keys::account();
     let (client, server) = keys::identities(account.as_deref());
     let last_rotation = keys::last_rotation();
@@ -190,13 +146,11 @@ fn refresh_activity_from_disk(activity: &Arc<std::sync::Mutex<app::Activity>>) -
         Ok(guard) => guard,
         Err(poisoned) => poisoned.into_inner(),
     };
-    let changed = guard.client != client || guard.server != server || guard.last_rotation != last_rotation;
-    if changed {
+    if guard.client != client || guard.server != server || guard.last_rotation != last_rotation {
         guard.client = client;
         guard.server = server;
         guard.last_rotation = last_rotation;
     }
-    changed
 }
 
 /// Draws the window in each of its states to PNGs, with no window open.

@@ -24,7 +24,10 @@ pub struct Identity {
 /// fingerprint shown actually matches what the tunnel dials with instead of
 /// always reading the generic, unbound `client.pub`.
 pub fn identities(account: Option<&str>) -> (Option<Identity>, Option<Identity>) {
-    (read_identity(account.unwrap_or("client")), read_identity("server"))
+    (
+        read_identity(account.unwrap_or("client")),
+        read_identity("server"),
+    )
 }
 
 /// Reads one `<name>.pub` from the key directory and fingerprints it.
@@ -33,7 +36,10 @@ fn read_identity(name: &str) -> Option<Identity> {
     let path = format!("{home}/.securevpn/keys/{name}.pub");
     let text = std::fs::read_to_string(path).ok()?;
     let base64 = text.split_whitespace().nth(1)?;
-    Some(Identity { name: name.to_string(), fingerprint: fingerprint(base64) })
+    Some(Identity {
+        name: name.to_string(),
+        fingerprint: fingerprint(base64),
+    })
 }
 
 /// A short fingerprint from a base64 public key: the head and tail of the key
@@ -45,7 +51,14 @@ pub(crate) fn fingerprint(base64: &str) -> String {
         return trimmed.to_string();
     }
     let head: String = trimmed.chars().take(8).collect();
-    let tail: String = trimmed.chars().rev().take(6).collect::<Vec<_>>().into_iter().rev().collect();
+    let tail: String = trimmed
+        .chars()
+        .rev()
+        .take(6)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect();
     format!("{head}…{tail}")
 }
 
@@ -92,7 +105,8 @@ pub(crate) fn parse_epoch(text: &str) -> Option<i64> {
     if !in_range {
         return None;
     }
-    let mut epoch = days_from_civil(year, month, day) * 86_400 + hour * 3_600 + minute * 60 + second;
+    let mut epoch =
+        days_from_civil(year, month, day) * 86_400 + hour * 3_600 + minute * 60 + second;
     if let Some(offset) = fields.get(6) {
         // A seventh field is a "+0700"-style offset; the sign is whichever
         // sign character follows the clock, and west of UTC adds to the epoch.
@@ -140,6 +154,25 @@ pub(crate) fn rotation_age(then: i64, now: i64) -> String {
 /// is the cause for the age reading to turn amber.
 pub(crate) fn rotation_stale(then: i64, now: i64) -> bool {
     now - then >= 7 * 86_400
+}
+
+/// How long after an attempt that did not move the record before the next try.
+const RETRY_AFTER: i64 = 3_600;
+
+/// Whether the automatic rotation should run now. All three are wall-clock
+/// epoch seconds, so time the Mac spent asleep counts and a key older than the
+/// machine's uptime still reads its true age.
+///
+/// Due when the recorded rotation is stale and no attempt was made in the last
+/// hour. A failed rotation leaves the record where it was, so it comes due
+/// again an hour later instead of a week later. No record means never rotated
+/// by the script: not due, never rotate on faith in a missing timestamp.
+pub(crate) fn rotation_due(recorded: Option<i64>, last_attempt: Option<i64>, now: i64) -> bool {
+    let Some(recorded) = recorded else {
+        return false;
+    };
+    let retry_ready = last_attempt.is_none_or(|attempt| now - attempt >= RETRY_AFTER);
+    rotation_stale(recorded, now) && retry_ready
 }
 
 /// Where the peer identity is recorded — unchanged path from when this held a
@@ -208,7 +241,11 @@ pub(crate) fn generate_peer_name() -> String {
         }
     }
     let sanitized = sanitized.trim_end_matches('-');
-    let base = if sanitized.is_empty() { "mac" } else { sanitized };
+    let base = if sanitized.is_empty() {
+        "mac"
+    } else {
+        sanitized
+    };
     // The suffix below adds 7 characters ("-" + 6 hex); truncated here so the
     // combined name never trips `peer_name_problem`'s 32-character ceiling —
     // a long hostname must not turn a sign-in into an opaque 400 from the
@@ -259,12 +296,19 @@ pub(crate) fn adopt_peer_name(label: &str, peer: &str) -> Result<(), String> {
         return Ok(());
     }
     // The server's word becomes a file name here; hold it to its own grammar.
-    if peer.is_empty() || !peer.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-') {
-        return Err(format!("the server named this device \"{peer}\", which is not a usable name"));
+    if peer.is_empty()
+        || !peer
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+    {
+        return Err(format!(
+            "the server named this device \"{peer}\", which is not a usable name"
+        ));
     }
     let home = std::env::var("HOME").map_err(|_| "no HOME".to_string())?;
     let dir = format!("{home}/.securevpn/keys");
-    let public = std::fs::read_to_string(format!("{dir}/{label}.pub")).map_err(|error| error.to_string())?;
+    let public =
+        std::fs::read_to_string(format!("{dir}/{label}.pub")).map_err(|error| error.to_string())?;
     let mut fields = public.split_whitespace();
     let (Some(tag), Some(key)) = (fields.next(), fields.next()) else {
         return Err(format!("{dir}/{label}.pub is not a public key file"));
@@ -279,8 +323,11 @@ pub(crate) fn adopt_peer_name(label: &str, peer: &str) -> Result<(), String> {
 /// Pins the relay's public key as `keys/server.pub`, as the server sent it.
 pub(crate) fn write_server_key(line: &str) -> Result<(), String> {
     let home = std::env::var("HOME").map_err(|_| "no HOME".to_string())?;
-    std::fs::write(format!("{home}/.securevpn/keys/server.pub"), format!("{}\n", line.trim()))
-        .map_err(|error| error.to_string())
+    std::fs::write(
+        format!("{home}/.securevpn/keys/server.pub"),
+        format!("{}\n", line.trim()),
+    )
+    .map_err(|error| error.to_string())
 }
 
 /// Clears a completed sign-in: the inverse of [`set_signed_in`], for "My
@@ -358,7 +405,9 @@ pub fn rotate() -> Result<(), String> {
     if let Some(name) = account() {
         command.arg("--identity").arg(name);
     }
-    let output = command.output().map_err(|error| format!("could not run rotation: {error}"))?;
+    let output = command
+        .output()
+        .map_err(|error| format!("could not run rotation: {error}"))?;
     if output.status.success() {
         Ok(())
     } else {
@@ -417,6 +466,38 @@ mod tests {
         assert!(!rotation_stale(now - (7 * DAY - 1), now));
         assert!(rotation_stale(now - 7 * DAY, now));
         assert_eq!(rotation_age(now - 6 * DAY, now), "6d ago");
+    }
+
+    #[test]
+    fn a_key_older_than_the_machine_has_been_up_is_due() {
+        // 52 days overdue: older than any uptime since boot, and the Mac slept
+        // through much of it. Wall-clock age alone decides.
+        let now = 20_000 * DAY;
+        assert!(rotation_due(Some(now - 59 * DAY), None, now));
+    }
+
+    #[test]
+    fn a_fresh_key_or_no_record_is_not_due() {
+        let now = 20_000 * DAY;
+        assert!(!rotation_due(Some(now - 6 * DAY), None, now));
+        assert!(
+            !rotation_due(None, None, now),
+            "never rotate on faith in a missing record"
+        );
+    }
+
+    #[test]
+    fn a_failed_rotation_is_retried_after_an_hour_not_a_week() {
+        let now = 20_000 * DAY;
+        let recorded = Some(now - 30 * DAY);
+        assert!(
+            !rotation_due(recorded, Some(now - 3_599), now),
+            "too soon after the last try"
+        );
+        assert!(
+            rotation_due(recorded, Some(now - 3_600), now),
+            "the record did not move: try again"
+        );
     }
 
     #[test]
