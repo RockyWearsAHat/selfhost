@@ -18,8 +18,18 @@
 #      of — see protocol.py's `PacketType.ROTATE_REQUEST` docstring for the
 #      full argument for why this is safe to expose to every peer, not just
 #      whoever holds admin/SSH access.
-#   3. Switch the Mac to the new key and prove a full handshake succeeds.
-#   4. On success, drop the backup.
+#   3. Switch the Mac to the new key (atomically: a relay reading it mid-swap
+#      sees the old file or the new one, never half of either).
+#   4. Prove the server ADMITS the new key (client.py --check: a full session
+#      judged by the server's answer, not our own half of the handshake).
+#   5. On success, drop the backup and record the time.
+#
+# No lock-out window: the box keeps the key that asked for the rotation valid
+# beside the new one until the new key completes an admitted handshake
+# (server.py `Roster.rotate`/`Roster.confirm`), and the Mac's running relays
+# re-read the identity file on every session. So a relay still holding the
+# old key keeps working through steps 2-4, and step 4's own check is the
+# handshake that retires the old key on the box.
 #
 # Rollback only ever covers step 1-2: if generating the new identity fails,
 # or the server refuses the rotate request, nothing on either end has
@@ -39,8 +49,8 @@
 # which worked but meant only whoever held admin SSH access to the box could
 # ever rotate a key — wrong for a VPN other people (e.g. "dad") are also
 # meant to use themselves. Neither restarts anything either way: the box's
-# `Roster.current()` (server.py) watches each pinned name's own `.pub` file
-# mtime, so a rotated key is authoritative from its very next handshake.
+# `Roster.current()` (server.py) watches every roster name's `.pub` and
+# `.retiring.pub` files, so a rotation is seen from the very next handshake.
 #
 # Usage:  rotate-keys.sh [--server <host>] [--port <p>] [--identity <name>]
 set -euo pipefail
@@ -86,10 +96,10 @@ NEWDIR="$(mktemp -d)"
 # `generate_identity` itself prints its own "✓ Identity ... saved" lines
 # (key_manager.py's `save_identity`), so the base64 key this needs is only
 # ever the LAST line of output -- never the whole captured stdout.
-NEW_PUB_B64="$(SECUREVPN_KEY_DIR="$NEWDIR" "$PY" - "$NEWDIR" "$IDENTITY" <<'PYEOF' | tail -n 1
+NEW_PUB_B64="$(SECUREVPN_KEY_DIR="$NEWDIR" "$PY" - "$NEWDIR" "$IDENTITY" "$APP" <<'PYEOF' | tail -n 1
 import sys
 from pathlib import Path
-sys.path.insert(0, str(Path.home() / ".securevpn" / "app"))
+sys.path.insert(0, sys.argv[3])
 from key_manager import KeyManager
 km = KeyManager(Path(sys.argv[1]))
 km.generate_identity(sys.argv[2])
@@ -110,32 +120,21 @@ log "the server accepted the new key"
 # the Mac's old key would create the very mismatch this trap exists to
 # prevent, not undo one. See the header for the full argument.
 trap - ERR
-cp "$NEWDIR/$IDENTITY.key" "$KEYDIR/$IDENTITY.key"
-cp "$NEWDIR/$IDENTITY.pub" "$KEYDIR/$IDENTITY.pub"
-chmod 600 "$KEYDIR/$IDENTITY.key"
+for part in key pub; do
+  cp "$NEWDIR/$IDENTITY.$part" "$KEYDIR/.$IDENTITY.$part.new"
+done
+chmod 600 "$KEYDIR/.$IDENTITY.key.new"
+mv -f "$KEYDIR/.$IDENTITY.pub.new" "$KEYDIR/$IDENTITY.pub"
+mv -f "$KEYDIR/.$IDENTITY.key.new" "$KEYDIR/$IDENTITY.key"
 rm -rf "$NEWDIR"
 
-# --- 4. Prove a handshake with the new key -----------------------------------
-log "verifying a handshake with the new key…"
-VERIFY_LOG="$(mktemp)"
-SECUREVPN_KEY_DIR="$KEYDIR" "$PY" -u "$APP/client.py" "$SERVER" --port "$PORT" \
-  --local-host 127.0.0.1 --local-port 18443 --identity "$IDENTITY" --peer server >"$VERIFY_LOG" 2>&1 &
-VPID=$!
-ok=""
-for _ in $(seq 1 20); do
-  if grep -q "server authenticated" "$VERIFY_LOG"; then ok=1; break; fi
-  if grep -qiE "Handshake (error|failed)|Connection (failed|refused)" "$VERIFY_LOG"; then break; fi
-  sleep 0.5
-done
-kill "$VPID" 2>/dev/null || true
-rm -f "$VERIFY_LOG"
-if [ -z "$ok" ]; then
-  echo "verification handshake with the new key FAILED, but the server already" >&2
-  echo "switched to it in step 2 and so has this Mac (step 3) -- both ends agree," >&2
-  echo "so the old key was deliberately NOT restored (that would create a" >&2
-  echo "mismatch, not fix one). This looks like a connectivity problem, not a" >&2
-  echo "key problem: check the network/server, or run rotate-keys.sh again to" >&2
-  echo "issue a fresh key once connectivity is confirmed." >&2
+# --- 4. Prove the server admits the new key ---------------------------------
+log "verifying the server admits the new key…"
+if ! SECUREVPN_KEY_DIR="$KEYDIR" "$PY" -u "$APP/client.py" "$SERVER" --port "$PORT" \
+     --identity "$IDENTITY" --peer server --check; then
+  echo "the server did not admit the new key. It still holds the old one beside" >&2
+  echo "it, so nothing is locked out; the old key is in $BACKUP. Run" >&2
+  echo "rotate-keys.sh again once the box answers." >&2
   exit 1
 fi
 
