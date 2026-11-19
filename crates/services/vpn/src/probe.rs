@@ -175,7 +175,9 @@ mod tests {
     async fn a_closed_port_is_unreachable() {
         let (listener, address) = listener().await;
         drop(listener);
-        assert!(matches!(hello(address, QUICK).await, Err(ProbeFailure::Unreachable(_))));
+        // Windows retries a refused connect for about a second before it says
+        // so, longer than QUICK; the probe's own deadline covers that.
+        assert!(matches!(hello(address, PROBE_TIMEOUT).await, Err(ProbeFailure::Unreachable(_))));
     }
 
     #[test]
