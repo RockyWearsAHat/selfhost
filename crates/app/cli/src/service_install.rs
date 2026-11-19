@@ -2015,8 +2015,9 @@ mod tests {
 
     #[test]
     fn the_watchdog_and_daemon_exe_paths_round_trip() {
-        let daemon = Path::new("/opt/selfhost/selfhost");
-        let watchdog = watchdog_exe_path(daemon);
+        let daemon =
+            Path::new("/opt/selfhost").join(format!("selfhost{}", std::env::consts::EXE_SUFFIX));
+        let watchdog = watchdog_exe_path(&daemon);
         assert_eq!(daemon_exe_from_watchdog(&watchdog), daemon);
     }
 

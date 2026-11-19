@@ -538,10 +538,11 @@ mod tests {
 
     #[test]
     fn the_daemon_and_watchdog_exe_helper_agree_with_service_install() {
-        let watchdog_exe = Path::new("/opt/selfhost/selfhost-watchdog");
+        let suffix = std::env::consts::EXE_SUFFIX;
+        let watchdog_exe = Path::new("/opt/selfhost").join(format!("selfhost-watchdog{suffix}"));
         assert_eq!(
-            service_install::daemon_exe_from_watchdog(watchdog_exe),
-            PathBuf::from("/opt/selfhost/selfhost")
+            service_install::daemon_exe_from_watchdog(&watchdog_exe),
+            Path::new("/opt/selfhost").join(format!("selfhost{suffix}"))
         );
     }
 }

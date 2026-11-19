@@ -813,6 +813,18 @@ pub fn console_gate_refusal(entry: &str) -> Option<String> {
     None
 }
 
+/// Whether a path names a place on its own rather than one under the
+/// directory it is joined to.
+///
+/// `Path::is_absolute` is not that test on Windows: `\etc\keys` (rooted, no
+/// drive) and `C:keys` (a drive, no root) are both "relative" there, and joining
+/// either onto `server.data_dir` lands outside it. Any root or drive prefix
+/// counts, on every platform.
+pub(crate) fn names_its_own_place(path: &std::path::Path) -> bool {
+    path.has_root()
+        || path.components().any(|component| matches!(component, std::path::Component::Prefix(_)))
+}
+
 /// An entry's address and prefix length, or `None` if it does not parse.
 ///
 /// Deliberately thin: [`Cidr::parse`] has already decided what a well-formed

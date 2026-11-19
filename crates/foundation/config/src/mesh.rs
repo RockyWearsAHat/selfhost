@@ -260,7 +260,7 @@ fn token_file_problem(path: &std::path::Path) -> Option<String> {
              (\"{DEFAULT_TOKEN_FILE}\" is the default); omit the line to use it"
         ));
     }
-    if path.is_absolute() {
+    if crate::validate::names_its_own_place(path) {
         return Some(format!(
             "\"{}\" is absolute. The token is resolved inside server.data_dir so that a \
              deployment's secrets stay in the one directory whose permissions, backups and \
