@@ -52,9 +52,11 @@
 //! # What is not proven by any test here
 //!
 //! Said plainly, because a green suite is easy to read for more than it is worth.
-//! No relay in this deployment has been started by this code on the production
-//! box; the tunnel carrying the operator's console traffic today is still the
-//! scheduled task described in `docs/VPN.md`.
+//! The tests drive stand-in programs, never the real tunnel: that an enrolled
+//! device completes a handshake and is admitted is proven only on the box,
+//! where the daemon has run `vpn-console` and `vpn-ssh` since the 2026-09-09
+//! cutover. [`heal`] restarting a killed or wedged relay was proven there on
+//! 2026-11-18 (`index.dx`, journal).
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
