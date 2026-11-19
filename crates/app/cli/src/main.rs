@@ -1167,7 +1167,13 @@ async fn serve_everything(
         );
         for (name, outcome) in vpn_relays.start_enabled().await {
             match outcome {
-                Ok(state) => println!("\nvpn relay \"{name}\": {}", state.label()),
+                // Not the state `up` read back: that is taken before the
+                // supervisor has acted on the start, and printed "Down" for a
+                // relay that came up a moment later.
+                Ok(_) => println!(
+                    "\nvpn relay \"{name}\": starting; checked every {}s from here on",
+                    selfhost_vpn::heal::HEAL_INTERVAL.as_secs()
+                ),
                 Err(error) => eprintln!(
                     "\nwarning: vpn relay \"{name}\" did not start: {error}\n  the daemon \
                      retries it every {}s until it starts",
