@@ -1753,6 +1753,14 @@ mod tests {
         assert!(SUPERSEDED_TASK_NAMES.contains(&"selfhost"), "the old proxy task");
     }
 
+    #[test]
+    fn installing_removes_the_retired_ssh_relay_task_that_raced_the_daemon_for_8444() {
+        // The daemon has owned the `ssh` relay since the 2026-09-09 cutover. The
+        // old boot-triggered task stayed registered and raced it for 8444 at
+        // every boot; whichever lost left the port to the wrong keys.
+        assert!(SUPERSEDED_TASK_NAMES.contains(&"selfhost-vpn-ssh"), "{SUPERSEDED_TASK_NAMES:?}");
+    }
+
     /// `selfhost-vpn` runs the box's own `server.py`, and `selfhost-lan-dns`
     /// runs `selfhost lan-dns --lan-ip <ip>` — the only thing that serves DNS
     /// with no `[dns]` section written (`crate::lan_dns::with_synthesised_zones`).

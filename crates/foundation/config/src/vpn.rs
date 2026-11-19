@@ -1075,6 +1075,32 @@ static_root = "./public"
     }
 
     #[test]
+    fn two_armed_relays_on_one_port_are_refused_when_the_config_loads() {
+        // One owner per port: two relays on 8444 would race for it at every
+        // boot, and the loser's sessions would close right after connect.
+        let document = format!(
+            "{}\n{}",
+            crate::BASE_DOCUMENT,
+            r#"
+[[vpn]]
+name = "ssh"
+enabled = true
+public = true
+listen = "0.0.0.0:8444"
+forward = "127.0.0.1:22"
+
+[[vpn]]
+name = "ssh-two"
+enabled = true
+listen = "127.0.0.1:8444"
+forward = "127.0.0.1:22"
+"#
+        );
+        let error = crate::Config::parse(&document).expect_err("two owners of 8444");
+        assert!(error.to_string().contains("vpn[1].listen"), "{error}");
+    }
+
+    #[test]
     fn the_shipped_example_arms_nothing() {
         let document = format!("{}\n{}", crate::BASE_DOCUMENT, crate::commented(EXAMPLE));
         let config = crate::Config::parse(&document).expect("valid");

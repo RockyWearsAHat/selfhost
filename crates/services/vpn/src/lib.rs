@@ -39,6 +39,8 @@
 //! | [`peer_binding`] | impure | which Person each Peer belongs to |
 //! | [`runner`] | **pure** | the argument vector, and the refusal for a backend with no runner |
 //! | [`state`] | **pure** | declared, down, up, failed — named states rather than errors |
+//! | [`probe`] | impure | whether a relay answers the first step of its handshake |
+//! | [`heal`] | **pure** | what to do about a relay that is dead or not answering |
 //! | [`keys`] | impure | reads the key directory; never writes it, never generates a key |
 //! | [`enrol`] | impure | writes a peer's `.pub` file and the roster file; never generates a key |
 //! | this module | impure | the supervisor, and the four verbs a caller drives |
@@ -58,9 +60,11 @@
 #![warn(missing_docs)]
 
 pub mod enrol;
+pub mod heal;
 pub mod image_auth;
 pub mod keys;
 pub mod peer_binding;
+pub mod probe;
 pub mod roster;
 pub mod runner;
 pub mod state;
@@ -74,11 +78,14 @@ pub use runner::{Install, Launch, service_name};
 pub use updater::Updater;
 pub use state::{RelayState, RelaySummary};
 
+use heal::{Memory, Remedy, STARTUP_GRACE, Seen};
 use selfhost_config::vpn::Relay;
 use selfhost_supervisor::Supervisor;
 use selfhost_supervisor::state::ServiceState;
+use std::collections::HashMap;
 use std::fmt;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 /// Why a relay could not be run, or could not be found.
 ///
@@ -428,6 +435,45 @@ impl Relays {
         Ok(self.state_of(relay).await)
     }
 
+    /// Looks at every armed relay once and applies what [`Memory::judge`]
+    /// decides: a dead relay is brought up again, a running one that stopped
+    /// answering its handshake is restarted. Every remedy is also noted in the
+    /// relay's own service log, with its reason.
+    ///
+    /// `memory` is the caller's, kept between calls; the daemon calls this every
+    /// [`heal::HEAL_INTERVAL`] for as long as it runs.
+    pub async fn heal(&self, _memory: &mut HashMap<String, Memory>) -> Vec<Healing> {
+        Vec::new() // RED stage: nothing heals a relay today
+    }
+
+    /// What one relay is doing right now, probing it when it claims to run.
+    async fn look(&self, relay: &Relay) -> Seen {
+        let state = self.supervisor.status(&service_name(&relay.name)).await.map(|s| s.state);
+        match state {
+            None => Seen::Dead("it is not running in this daemon: it never started".to_owned()),
+            Some(ServiceState::Stopped | ServiceState::Disabled) => Seen::Stopped,
+            Some(ServiceState::Starting | ServiceState::Stopping | ServiceState::Backoff { .. }) => {
+                Seen::Settling
+            }
+            Some(ServiceState::Running { uptime_secs, .. })
+                if Duration::from_secs(uptime_secs) < STARTUP_GRACE =>
+            {
+                Seen::Settling
+            }
+            Some(ServiceState::Running { .. }) => match relay.listen_addr() {
+                Some(listen) => match probe::hello(listen, probe::PROBE_TIMEOUT).await {
+                    Ok(()) => Seen::Answering,
+                    Err(failure) => Seen::Unanswered(failure),
+                },
+                None => Seen::Settling,
+            },
+            Some(stopped) => match RelayState::of(relay, Some(&stopped)) {
+                RelayState::Failed { reason } => Seen::Dead(reason),
+                _ => Seen::Settling,
+            },
+        }
+    }
+
     /// The block for a name, or the refusal that names it.
     fn find(&self, name: &str) -> Result<&Relay, VpnError> {
         self.relay(name).ok_or_else(|| VpnError::UnknownRelay { name: name.to_owned() })
@@ -444,6 +490,31 @@ impl Relays {
     async fn state_of(&self, relay: &Relay) -> RelayState {
         let service = self.supervisor.status(&service_name(&relay.name)).await.map(|s| s.state);
         RelayState::of(relay, service.as_ref())
+    }
+}
+
+/// One remedy [`Relays::heal`] applied, and where the relay got to.
+#[derive(Debug)]
+pub struct Healing {
+    /// The relay.
+    pub relay: String,
+    /// What was done, and why.
+    pub remedy: Remedy,
+    /// The relay's state afterwards, or why it could not be brought up.
+    pub outcome: Result<RelayState, VpnError>,
+}
+
+impl fmt::Display for Healing {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let verb = match self.remedy {
+            Remedy::Restart(_) => "restarted",
+            Remedy::Start(_) => "started",
+        };
+        write!(formatter, "vpn relay \"{}\" {verb} because {}: ", self.relay, self.remedy.reason())?;
+        match &self.outcome {
+            Ok(state) => write!(formatter, "now {}", state.label()),
+            Err(error) => write!(formatter, "still down: {error}"),
+        }
     }
 }
 
@@ -735,6 +806,74 @@ pub(crate) mod tests {
             subject.supervisor().status(&service_name("down-one")).await.is_none(),
             "a disabled relay must not be installed by the boot-time sweep"
         );
+
+        subject.supervisor().shutdown().await;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A loopback socket nothing listens on, so a probe of it cannot answer.
+    fn unused_listen() -> String {
+        let socket = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        socket.local_addr().expect("address").to_string()
+    }
+
+    #[tokio::test]
+    async fn a_relay_that_could_not_start_at_boot_is_started_by_heal_once_it_can() {
+        let dir = scratch("heal-boot");
+        let relay = armed_relay(&dir);
+        let install = fake_install(&dir);
+        std::fs::remove_file(&install.server).expect("the implementation is missing at boot");
+        let subject = relays(&dir, install, vec![relay]);
+        let outcomes = subject.start_enabled().await;
+        assert!(
+            matches!(outcomes[0].1, Err(VpnError::ImplementationMissing { .. })),
+            "{outcomes:?}"
+        );
+
+        fake_install(&dir);
+        let healings = subject.heal(&mut HashMap::new()).await;
+        assert_eq!(healings.len(), 1, "{healings:?}");
+        assert!(matches!(healings[0].remedy, Remedy::Start(_)), "{healings:?}");
+        let up = await_state(subject.supervisor(), &service_name("console"), Duration::from_secs(5), |state| {
+            state.is_live()
+        })
+        .await;
+        assert!(matches!(up, Some(ServiceState::Running { .. })), "{up:?}");
+
+        subject.supervisor().shutdown().await;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn a_running_relay_that_never_answers_its_handshake_is_restarted_by_heal() {
+        let dir = scratch("heal-silent");
+        let mut relay = armed_relay(&dir);
+        relay.listen = unused_listen();
+        let subject = relays(&dir, fake_install(&dir), vec![relay]);
+        subject.up("console").await.expect("starts");
+        let service = service_name("console");
+        let grace = STARTUP_GRACE.as_secs();
+        let first = await_state(subject.supervisor(), &service, Duration::from_secs(20), |state| {
+            matches!(state, ServiceState::Running { uptime_secs, .. } if *uptime_secs >= grace)
+        })
+        .await;
+        let Some(ServiceState::Running { pid: first_pid, .. }) = first else {
+            panic!("the stand-in runs past its grace: {first:?}");
+        };
+
+        let mut memory = HashMap::new();
+        let mut healings = Vec::new();
+        for _ in 0..heal::MISSES_BEFORE_RESTART {
+            healings.extend(subject.heal(&mut memory).await);
+        }
+        assert_eq!(healings.len(), 1, "restarted on the third miss, not before: {healings:?}");
+        assert!(matches!(healings[0].remedy, Remedy::Restart(_)), "{healings:?}");
+        assert!(healings[0].to_string().contains("nothing accepts"), "{}", healings[0]);
+        let again = await_state(subject.supervisor(), &service, Duration::from_secs(10), |state| {
+            matches!(state, ServiceState::Running { pid, .. } if *pid != first_pid)
+        })
+        .await;
+        assert!(again.is_some(), "a new process holds the relay");
 
         subject.supervisor().shutdown().await;
         let _ = std::fs::remove_dir_all(&dir);

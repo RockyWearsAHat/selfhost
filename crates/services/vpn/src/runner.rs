@@ -431,6 +431,27 @@ mod tests {
     }
 
     #[test]
+    fn a_relay_that_keeps_dying_is_restarted_every_time_and_never_given_up_on() {
+        // The 2026-11-18 outage: the relay died five times in a row, the
+        // supervisor's default budget gave up, and 8444 stayed closed until the
+        // box rebooted. The only door is restarted after any number of deaths.
+        use selfhost_supervisor::policy::{Exit, Outcome, decide};
+        let relay = forwarding_relay();
+        let launch = plan(&relay, &install(), &keys(), &admin_bind(), &admin_token_path()).expect("runnable");
+        let spec = service(&relay, &launch);
+        for deaths in [0, 4, 5, 6, 50, 10_000] {
+            let outcome = decide(
+                spec.restart,
+                Exit::Failed,
+                deaths,
+                spec.max_restarts,
+                std::time::Duration::from_secs(spec.restart_delay_secs),
+            );
+            assert!(matches!(outcome, Outcome::RestartAfter(_)), "after {deaths} deaths: {outcome:?}");
+        }
+    }
+
+    #[test]
     fn a_server_path_with_no_directory_component_leaves_the_working_directory_alone() {
         // `""` as a working directory fails to spawn with a message nobody would
         // trace back to a path that had no parent.
