@@ -151,5 +151,58 @@ if (-not (Get-NetFirewallRule -DisplayName $fwName -ErrorAction SilentlyContinue
 # $listening = Get-NetTCPConnection -State Listen -LocalPort $ListenPort -ErrorAction SilentlyContinue
 # if ($listening) { Write-Output "Listening on ${ListenPort}: OK" } else { Write-Output "WARNING: nothing listening on $ListenPort yet - check the task's last run" }
 
+# --- 5. One owner per port ----------------------------------------------------
+# The daemon supervises this relay. A task an older version of this script
+# registered races it for $ListenPort at every boot, and whichever loses leaves
+# the port to the wrong process, so it is removed, never left 'Ready'.
+if (Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue) {
+  Unregister-ScheduledTask -TaskName $taskName -Confirm:$false
+  Write-Output "Removed scheduled task '$taskName': it raced the daemon's relay for $ListenPort"
+}
+
+# --- 6. sshd behind the relay --------------------------------------------------
+# Every relayed session reaches sshd from 127.0.0.1, so to sshd all of them are
+# one source. OpenSSH 9.8+ penalises a source whose connections linger
+# unauthenticated (PerSourcePenalties) and drops new ones past MaxStartups
+# (default 10): one slow client then shuts every device out with "Not allowed
+# at this time", which a device sees as a session closed right after connect
+# (seen 2026-11-18). sshd listens on loopback only and the relay has already
+# proved each device's key, so loopback is exempt and the start-up limit is
+# sized for many devices behind one address.
+if ($TargetPort -eq 22) {
+  $sshdConfig = Join-Path $env:ProgramData 'ssh\sshd_config'
+  $wanted = [ordered]@{
+    'PerSourcePenaltyExemptList' = 'PerSourcePenaltyExemptList 127.0.0.1,::1'
+    'MaxStartups'                = 'MaxStartups 100:30:200'
+  }
+  $lines = @(Get-Content $sshdConfig)
+  $current = $lines | Where-Object { $wanted.Values -contains $_.Trim() }
+  if (@($current).Count -ne $wanted.Count) {
+    $backup = "$sshdConfig.bak-$(Get-Date -Format yyyyMMdd-HHmmss)"
+    Copy-Item $sshdConfig $backup
+    $kept = $lines | Where-Object { $line = $_.Trim(); -not ($wanted.Keys | Where-Object { $line -match "^$_\s" }) }
+    $firstMatch = [Array]::FindIndex([string[]]$kept, [Predicate[string]]{ param($l) $l -match '^\s*Match\s' })
+    if ($firstMatch -lt 0) { $firstMatch = $kept.Count }
+    $updated = @($kept | Select-Object -First $firstMatch) + @($wanted.Values) + @($kept | Select-Object -Skip $firstMatch)
+    Set-Content -Path $sshdConfig -Value $updated -Encoding ascii
+    $sshd = Join-Path $env:SystemRoot 'System32\OpenSSH\sshd.exe'
+    & $sshd -t -f $sshdConfig
+    if ($LASTEXITCODE -ne 0) {
+      Copy-Item $backup $sshdConfig -Force
+      throw "sshd rejected the new settings; restored $backup"
+    }
+    Restart-Service sshd
+    Start-Sleep -Seconds 2
+    if ((Get-Service sshd).Status -ne 'Running') {
+      Copy-Item $backup $sshdConfig -Force
+      Start-Service sshd
+      throw "sshd did not come back with the new settings; restored $backup"
+    }
+    Write-Output "sshd: loopback exempt from per-source penalties, MaxStartups 100:30:200 (backup $backup)"
+  } else {
+    Write-Output "sshd: relay settings present"
+  }
+}
+
 Write-Output "Python and keys verified; firewall rule ensured for port $ListenPort."
 Write-Output "Start this relay with the supervisor, not this script: 'selfhost vpn up $(if ($Name) { $Name } else { 'console' })'"
