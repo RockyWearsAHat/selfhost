@@ -460,7 +460,18 @@ impl Relays {
                 reports.push(Report::Restarted { relay: relay.name.clone(), times, last_exit });
             }
 
-            let seen = self.look(relay, status.map(|status| status.state)).await;
+            let state = status.map(|status| status.state);
+            let probed = match &state {
+                Some(ServiceState::Running { pid, .. }) => Some(*pid),
+                _ => None,
+            };
+            let seen = match (self.look(relay, state).await, probed) {
+                (unanswered @ Seen::Unanswered(_), Some(pid)) => {
+                    let now = self.supervisor.status(&service).await.map(|status| status.state);
+                    heal::after_probe(unanswered, pid, now.as_ref())
+                }
+                (seen, _) => seen,
+            };
             if let Some(remedy) = memory.judge(seen, Instant::now()) {
                 let outcome = self.apply(relay, &remedy).await;
                 reports.push(Report::Healed(Healing { relay: relay.name.clone(), remedy, outcome }));
@@ -484,6 +495,13 @@ impl Relays {
                 self.supervisor.note(&service, format!("[heal] started: {reason}")).await;
                 outcome
             }
+            Remedy::Retry(reason) => {
+                // A start during the supervisor's backoff spawns at once and
+                // clears its failure count, so its next waits are short again.
+                self.supervisor.note(&service, format!("[heal] retrying now: {reason}")).await;
+                self.supervisor.start(&service).await;
+                Ok(self.state_of(relay).await)
+            }
         }
     }
 
@@ -505,9 +523,10 @@ impl Relays {
         match state {
             None => Seen::Dead("it is not running in this daemon: it never started".to_owned()),
             Some(ServiceState::Stopped | ServiceState::Disabled) => Seen::Stopped,
-            Some(ServiceState::Starting | ServiceState::Stopping | ServiceState::Backoff { .. }) => {
-                Seen::Settling
+            Some(ServiceState::Backoff { retry_in_secs, .. }) => {
+                Seen::Waiting(Duration::from_secs(retry_in_secs))
             }
+            Some(ServiceState::Starting | ServiceState::Stopping) => Seen::Settling,
             Some(ServiceState::Running { uptime_secs, .. })
                 if Duration::from_secs(uptime_secs) < STARTUP_GRACE =>
             {
@@ -596,6 +615,7 @@ impl fmt::Display for Healing {
         let verb = match self.remedy {
             Remedy::Restart(_) => "restarted",
             Remedy::Start(_) => "started",
+            Remedy::Retry(_) => "started early",
         };
         write!(formatter, "vpn relay \"{}\" {verb} because {}: ", self.relay, self.remedy.reason())?;
         match &self.outcome {
@@ -1012,6 +1032,40 @@ pub(crate) mod tests {
             "{said:?}"
         );
         assert!(said.iter().any(|line| line.contains("exited with code 1")), "{said:?}");
+
+        subject.supervisor().shutdown().await;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn a_relay_failing_to_start_is_retried_every_heal_interval_never_less_often() {
+        // A port held by another program fails every start; the supervisor's
+        // backoff would grow to five minutes, so the door would stay shut that
+        // long after the port came free. heal cuts any wait longer than its own
+        // interval short.
+        let dir = scratch("heal-retry");
+        let subject = relays(&dir, failing_install(&dir), vec![armed_relay(&dir)]);
+        subject.up("console").await.expect("starts, and fails at once");
+        let service = service_name("console");
+        let mut memory = HashMap::new();
+        let mut retried = None;
+        for _ in 0..400 {
+            let reports = subject.heal(&mut memory).await;
+            if let Some(report) = reports.into_iter().find(|report| {
+                matches!(report, Report::Healed(Healing { remedy: Remedy::Retry(_), .. }))
+            }) {
+                retried = Some(report);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        let retried = retried.expect("a wait longer than the heal interval is cut short");
+        assert!(retried.to_string().contains("backoff"), "{retried}");
+        let short_again = await_state(subject.supervisor(), &service, Duration::from_secs(5), |state| {
+            matches!(state, ServiceState::Backoff { retry_in_secs, .. } if *retry_in_secs <= 5)
+        })
+        .await;
+        assert!(short_again.is_some(), "the start cleared the supervisor's count");
 
         subject.supervisor().shutdown().await;
         let _ = std::fs::remove_dir_all(&dir);

@@ -16,6 +16,7 @@
 
 use crate::probe::ProbeFailure;
 use selfhost_supervisor::policy::backoff;
+use selfhost_supervisor::state::ServiceState;
 use std::time::{Duration, Instant};
 
 /// How often the daemon looks at every relay.
@@ -41,8 +42,10 @@ pub enum Seen {
     Answering,
     /// Running past its start-up grace and it did not answer.
     Unanswered(ProbeFailure),
-    /// Starting, stopping, waiting out the supervisor's backoff, or too young
-    /// to probe: the supervisor is already acting.
+    /// Down, and the supervisor starts it again after this long.
+    Waiting(Duration),
+    /// Starting, stopping, or too young to probe: the supervisor is already
+    /// acting.
     Settling,
     /// Stopped by an operator.
     Stopped,
@@ -57,13 +60,15 @@ pub enum Remedy {
     Restart(String),
     /// Bring the relay up from nothing: preflight, install, start.
     Start(String),
+    /// Start now what the supervisor would only start after a long wait.
+    Retry(String),
 }
 
 impl Remedy {
     /// Why this remedy was chosen.
     pub fn reason(&self) -> &str {
         match self {
-            Self::Restart(reason) | Self::Start(reason) => reason,
+            Self::Restart(reason) | Self::Start(reason) | Self::Retry(reason) => reason,
         }
     }
 }
@@ -91,7 +96,7 @@ impl Memory {
                 self.quiet_until = None;
                 return None;
             }
-            Seen::Settling | Seen::Stopped => return None,
+            Seen::Settling | Seen::Stopped | Seen::Waiting(_) => return None, // RED stage
             Seen::Unanswered(failure) => {
                 self.misses += 1;
                 if self.misses < MISSES_BEFORE_RESTART {
@@ -128,6 +133,16 @@ impl Memory {
     }
 }
 
+/// What an unanswered probe means once the relay's state is read again after
+/// it: a probe the supervisor outran — it replaced or stopped the process
+/// while the probe waited — says nothing about the process there now.
+///
+/// `probed` is the pid that was running when the probe went out.
+pub fn after_probe(seen: Seen, probed: u32, now: Option<&ServiceState>) -> Seen {
+    let _ = (probed, now);
+    seen // RED stage
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -150,7 +165,10 @@ mod tests {
         assert_eq!(memory.judge(silent(), now), None);
         let remedy = memory.judge(silent(), now).expect("restarted");
         assert!(matches!(remedy, Remedy::Restart(_)), "{remedy:?}");
-        assert!(remedy.reason().contains("never answers"), "the log names why: {remedy:?}");
+        assert!(
+            remedy.reason().contains(&ProbeFailure::Silent.to_string()),
+            "the log names why: {remedy:?}"
+        );
     }
 
     #[test]
@@ -195,6 +213,40 @@ mod tests {
         assert_eq!(memory.restarts_since_last_look(6), 1, "a good answer keeps the count");
         assert_eq!(memory.restarts_since_last_look(1), 0, "reinstalled: a new baseline");
         assert_eq!(memory.restarts_since_last_look(2), 1);
+    }
+
+    #[test]
+    fn misses_count_only_while_the_same_process_keeps_running() {
+        let mut memory = Memory::default();
+        let now = Instant::now();
+        for between in [Seen::Settling, Seen::Stopped, Seen::Waiting(Duration::from_secs(5))] {
+            assert_eq!(memory.judge(silent(), now), None);
+            assert_eq!(memory.judge(silent(), now), None);
+            assert_eq!(memory.judge(between.clone(), now), None);
+            assert_eq!(memory.judge(silent(), now), None, "the count started over after {between:?}");
+            memory.judge(Seen::Answering, now);
+        }
+    }
+
+    #[test]
+    fn a_long_wait_by_the_supervisor_is_cut_short_every_time() {
+        let mut memory = Memory::default();
+        let now = Instant::now();
+        assert_eq!(memory.judge(Seen::Waiting(HEAL_INTERVAL), now), None, "the next look is as soon");
+        for _ in 0..20 {
+            let remedy = memory.judge(Seen::Waiting(Duration::from_secs(40)), now);
+            assert!(matches!(remedy, Some(Remedy::Retry(_))), "never paced out: {remedy:?}");
+        }
+    }
+
+    #[test]
+    fn an_unanswered_probe_of_a_process_replaced_or_stopped_meanwhile_counts_for_nothing() {
+        let running = |pid| ServiceState::Running { pid, uptime_secs: 60 };
+        assert_eq!(after_probe(silent(), 7, Some(&running(7))), silent(), "the same process");
+        assert_eq!(after_probe(silent(), 7, Some(&running(8))), Seen::Settling);
+        assert_eq!(after_probe(silent(), 7, Some(&ServiceState::Stopped)), Seen::Settling);
+        assert_eq!(after_probe(silent(), 7, None), Seen::Settling);
+        assert_eq!(after_probe(Seen::Answering, 7, Some(&ServiceState::Stopped)), Seen::Answering);
     }
 
     #[test]
