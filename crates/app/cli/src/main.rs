@@ -1186,8 +1186,8 @@ async fn serve_everything(
             ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             loop {
                 ticks.tick().await;
-                for healing in healer.heal(&mut memory).await {
-                    eprintln!("{} {healing}", selfhost_mail::stamp());
+                for report in healer.heal(&mut memory).await {
+                    eprintln!("{} {report}", selfhost_mail::stamp());
                 }
             }
         });

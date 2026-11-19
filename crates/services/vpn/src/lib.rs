@@ -435,44 +435,71 @@ impl Relays {
         Ok(self.state_of(relay).await)
     }
 
-    /// Looks at every armed relay once and applies what [`Memory::judge`]
-    /// decides: a dead relay is brought up again, a running one that stopped
+    /// Looks at every armed relay once: reports the restarts the supervisor
+    /// made on its own since the last look, and applies what [`Memory::judge`]
+    /// decides — a dead relay is brought up again, a running one that stopped
     /// answering its handshake is restarted. Every remedy is also noted in the
     /// relay's own service log, with its reason.
     ///
     /// `memory` is the caller's, kept between calls; the daemon calls this every
-    /// [`heal::HEAL_INTERVAL`] for as long as it runs.
-    pub async fn heal(&self, memory: &mut HashMap<String, Memory>) -> Vec<Healing> {
-        let mut healings = Vec::new();
+    /// [`heal::HEAL_INTERVAL`] for as long as it runs and writes each report to
+    /// its log.
+    pub async fn heal(&self, memory: &mut HashMap<String, Memory>) -> Vec<Report> {
+        let mut reports = Vec::new();
         for relay in self.relays.iter().filter(|relay| relay.enabled) {
-            let seen = self.look(relay).await;
-            let Some(remedy) =
-                memory.entry(relay.name.clone()).or_default().judge(seen, Instant::now())
-            else {
-                continue;
-            };
             let service = service_name(&relay.name);
-            let outcome = match &remedy {
-                Remedy::Restart(reason) => {
-                    self.supervisor.note(&service, format!("[heal] restarting: {reason}")).await;
-                    self.supervisor.restart(&service).await;
-                    Ok(self.state_of(relay).await)
-                }
-                Remedy::Start(reason) => {
-                    // After `up`, which installs the service the note lands in.
-                    let outcome = self.up(&relay.name).await;
-                    self.supervisor.note(&service, format!("[heal] started: {reason}")).await;
-                    outcome
-                }
-            };
-            healings.push(Healing { relay: relay.name.clone(), remedy, outcome });
+            let status = self.supervisor.status(&service).await;
+            let memory = memory.entry(relay.name.clone()).or_default();
+
+            let total = status.as_ref().map_or(0, |status| status.total_restarts);
+            let times = memory.restarts_since_last_look(total);
+            if times > 0 {
+                let last_exit = self.last_exit(&service).await;
+                reports.push(Report::Restarted { relay: relay.name.clone(), times, last_exit });
+            }
+
+            let seen = self.look(relay, status.map(|status| status.state)).await;
+            if let Some(remedy) = memory.judge(seen, Instant::now()) {
+                let outcome = self.apply(relay, &remedy).await;
+                reports.push(Report::Healed(Healing { relay: relay.name.clone(), remedy, outcome }));
+            }
         }
-        healings
+        reports
     }
 
-    /// What one relay is doing right now, probing it when it claims to run.
-    async fn look(&self, relay: &Relay) -> Seen {
-        let state = self.supervisor.status(&service_name(&relay.name)).await.map(|s| s.state);
+    /// Carries out one remedy and reports where the relay got to.
+    async fn apply(&self, relay: &Relay, remedy: &Remedy) -> Result<RelayState, VpnError> {
+        let service = service_name(&relay.name);
+        match remedy {
+            Remedy::Restart(reason) => {
+                self.supervisor.note(&service, format!("[heal] restarting: {reason}")).await;
+                self.supervisor.restart(&service).await;
+                Ok(self.state_of(relay).await)
+            }
+            Remedy::Start(reason) => {
+                // After `up`, which installs the service the note lands in.
+                let outcome = self.up(&relay.name).await;
+                self.supervisor.note(&service, format!("[heal] started: {reason}")).await;
+                outcome
+            }
+        }
+    }
+
+    /// The supervisor's last word on why the relay's process ended, read back
+    /// from the relay's own service log.
+    async fn last_exit(&self, service: &str) -> Option<String> {
+        let status = self.supervisor.status(service).await?;
+        let from = status.log_seq.saturating_sub(EXIT_LOOKBACK as u64);
+        let slice = self.supervisor.logs(service, from, EXIT_LOOKBACK).await?;
+        slice.lines.iter().rev().find_map(|line| {
+            let said = line.text.strip_prefix("[supervisor] ")?;
+            (said.starts_with("exited") || said.starts_with("was killed")).then(|| said.to_owned())
+        })
+    }
+
+    /// What one relay is doing, given its supervised state, probing it when
+    /// it claims to run.
+    async fn look(&self, relay: &Relay, state: Option<ServiceState>) -> Seen {
         match state {
             None => Seen::Dead("it is not running in this daemon: it never started".to_owned()),
             Some(ServiceState::Stopped | ServiceState::Disabled) => Seen::Stopped,
@@ -514,6 +541,40 @@ impl Relays {
     async fn state_of(&self, relay: &Relay) -> RelayState {
         let service = self.supervisor.status(&service_name(&relay.name)).await.map(|s| s.state);
         RelayState::of(relay, service.as_ref())
+    }
+}
+
+/// How many of a relay's newest log lines are searched for its last exit.
+const EXIT_LOOKBACK: usize = 500;
+
+/// One thing [`Relays::heal`] saw or did, for the daemon's log.
+#[derive(Debug)]
+pub enum Report {
+    /// The relay's process ended and the supervisor restarted it on its own.
+    Restarted {
+        /// The relay.
+        relay: String,
+        /// How many restarts since the last look.
+        times: u64,
+        /// The supervisor's note on the last exit, while its log still has it.
+        last_exit: Option<String>,
+    },
+    /// A remedy was applied.
+    Healed(Healing),
+}
+
+impl fmt::Display for Report {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Restarted { relay, times, last_exit } => {
+                write!(formatter, "vpn relay \"{relay}\" died and was restarted {times} time(s)")?;
+                match last_exit {
+                    Some(exit) => write!(formatter, "; last it {exit}"),
+                    None => Ok(()),
+                }
+            }
+            Self::Healed(healing) => healing.fmt(formatter),
+        }
     }
 }
 
@@ -622,15 +683,28 @@ pub(crate) mod tests {
     /// installed on a machine running these tests, so a stand-in is what makes the
     /// supervision path testable at all.
     fn fake_install(dir: &Path) -> Install {
+        stand_in(
+            dir,
+            ":loop\r\nping -n 2 127.0.0.1 >NUL\r\ngoto loop\r\n",
+            "#!/bin/sh\nwhile true; do sleep 0.05; done\n",
+        )
+    }
+
+    /// A stand-in for the tunnel that exits with code 1 as soon as it starts.
+    fn failing_install(dir: &Path) -> Install {
+        stand_in(dir, "exit /b 1\r\n", "#!/bin/sh\nexit 1\n")
+    }
+
+    /// A stand-in tunnel: a script for the platform's own shell, which
+    /// ignores the relay's arguments.
+    fn stand_in(dir: &Path, windows: &str, unix: &str) -> Install {
         if cfg!(windows) {
             let server = dir.join("server.cmd");
-            std::fs::write(&server, ":loop\r\nping -n 2 127.0.0.1 >NUL\r\ngoto loop\r\n")
-                .expect("write");
+            std::fs::write(&server, windows).expect("write");
             Install::new("cmd", vec!["/c".to_owned()], server)
         } else {
             let server = dir.join("server.sh");
-            std::fs::write(&server, "#!/bin/sh\nwhile true; do sleep 0.05; done\n")
-                .expect("write");
+            std::fs::write(&server, unix).expect("write");
             Install::new("/bin/sh", Vec::new(), server)
         }
     }
@@ -855,9 +929,11 @@ pub(crate) mod tests {
         );
 
         fake_install(&dir);
-        let healings = subject.heal(&mut HashMap::new()).await;
-        assert_eq!(healings.len(), 1, "{healings:?}");
-        assert!(matches!(healings[0].remedy, Remedy::Start(_)), "{healings:?}");
+        let reports = subject.heal(&mut HashMap::new()).await;
+        assert!(
+            matches!(&reports[..], [Report::Healed(Healing { remedy: Remedy::Start(_), .. })]),
+            "{reports:?}"
+        );
         let up = await_state(subject.supervisor(), &service_name("console"), Duration::from_secs(5), |state| {
             state.is_live()
         })
@@ -886,18 +962,54 @@ pub(crate) mod tests {
         };
 
         let mut memory = HashMap::new();
-        let mut healings = Vec::new();
+        let mut reports = Vec::new();
         for _ in 0..heal::MISSES_BEFORE_RESTART {
-            healings.extend(subject.heal(&mut memory).await);
+            reports.extend(subject.heal(&mut memory).await);
         }
-        assert_eq!(healings.len(), 1, "restarted on the third miss, not before: {healings:?}");
-        assert!(matches!(healings[0].remedy, Remedy::Restart(_)), "{healings:?}");
-        assert!(healings[0].to_string().contains("nothing accepts"), "{}", healings[0]);
+        assert!(
+            matches!(&reports[..], [Report::Healed(Healing { remedy: Remedy::Restart(_), .. })]),
+            "restarted on the third miss, not before: {reports:?}"
+        );
+        assert!(reports[0].to_string().contains("nothing accepts"), "{}", reports[0]);
         let again = await_state(subject.supervisor(), &service, Duration::from_secs(10), |state| {
             matches!(state, ServiceState::Running { pid, .. } if *pid != first_pid)
         })
         .await;
         assert!(again.is_some(), "a new process holds the relay");
+
+        subject.supervisor().shutdown().await;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn a_relay_the_supervisor_restarted_is_reported_with_how_it_died() {
+        let dir = scratch("heal-restarted");
+        let subject = relays(&dir, failing_install(&dir), vec![armed_relay(&dir)]);
+        let mut memory = HashMap::new();
+        let first = subject.heal(&mut memory).await;
+        assert!(
+            matches!(&first[..], [Report::Healed(Healing { remedy: Remedy::Start(_), .. })]),
+            "{first:?}"
+        );
+        let service = service_name("console");
+        let mut restarted = false;
+        for _ in 0..500 {
+            let total = subject.supervisor().status(&service).await.map_or(0, |s| s.total_restarts);
+            if total > 0 {
+                restarted = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(restarted, "the stand-in exits and the supervisor restarts it");
+
+        let reports = subject.heal(&mut memory).await;
+        let said: Vec<String> = reports.iter().map(ToString::to_string).collect();
+        assert!(
+            reports.iter().any(|report| matches!(report, Report::Restarted { times, .. } if *times >= 1)),
+            "{said:?}"
+        );
+        assert!(said.iter().any(|line| line.contains("exited with code 1")), "{said:?}");
 
         subject.supervisor().shutdown().await;
         let _ = std::fs::remove_dir_all(&dir);

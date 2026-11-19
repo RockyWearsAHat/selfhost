@@ -74,6 +74,7 @@ pub struct Memory {
     misses: u32,
     remedies: u32,
     quiet_until: Option<Instant>,
+    restarts: Option<u64>,
 }
 
 impl Memory {
@@ -85,7 +86,9 @@ impl Memory {
     pub fn judge(&mut self, seen: Seen, now: Instant) -> Option<Remedy> {
         let remedy = match seen {
             Seen::Answering => {
-                *self = Self::default();
+                self.misses = 0;
+                self.remedies = 0;
+                self.quiet_until = None;
                 return None;
             }
             Seen::Settling | Seen::Stopped => return None,
@@ -108,6 +111,16 @@ impl Memory {
         self.quiet_until = Some(now + backoff(REMEDY_BACKOFF, self.remedies));
         self.remedies += 1;
         Some(remedy)
+    }
+
+    /// How many times the supervisor restarted the relay on its own since the
+    /// last look, given the running total it reports now.
+    ///
+    /// The first look takes the baseline. A total lower than the last one means
+    /// the relay was installed afresh, and starts a new baseline.
+    pub fn restarts_since_last_look(&mut self, total: u64) -> u64 {
+        let _ = total;
+        0 // RED stage
     }
 }
 
@@ -166,6 +179,18 @@ mod tests {
             assert!(memory.judge(dead(), now).is_some(), "retried once the backoff ends");
             wait = (wait * 2).min(selfhost_supervisor::policy::MAX_BACKOFF);
         }
+    }
+
+    #[test]
+    fn restarts_the_supervisor_made_are_counted_from_one_look_to_the_next() {
+        let mut memory = Memory::default();
+        assert_eq!(memory.restarts_since_last_look(2), 0, "the first look is the baseline");
+        assert_eq!(memory.restarts_since_last_look(2), 0);
+        assert_eq!(memory.restarts_since_last_look(5), 3);
+        memory.judge(Seen::Answering, Instant::now());
+        assert_eq!(memory.restarts_since_last_look(6), 1, "a good answer keeps the count");
+        assert_eq!(memory.restarts_since_last_look(1), 0, "reinstalled: a new baseline");
+        assert_eq!(memory.restarts_since_last_look(2), 1);
     }
 
     #[test]
