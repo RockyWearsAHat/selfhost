@@ -168,7 +168,9 @@ if (Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue) {
 # at this time", which a device sees as a session closed right after connect
 # (seen 2026-11-18). sshd listens on loopback only and the relay has already
 # proved each device's key, so loopback is exempt and the start-up limit is
-# sized for many devices behind one address.
+# sized for many devices behind one address. Restarting sshd cuts every SSH
+# session, including one carrying this script over the relay, before the check
+# below can run: run the script from the console or as a one-shot task.
 if ($TargetPort -eq 22) {
   $sshdConfig = Join-Path $env:ProgramData 'ssh\sshd_config'
   $wanted = [ordered]@{

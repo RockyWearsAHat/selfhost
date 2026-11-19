@@ -3,9 +3,10 @@
 //!
 //! An open port proves only that the kernel accepted a connection. A tunnel
 //! whose event loop is wedged still accepts (the backlog does that for it), and
-//! so does any other program that happens to hold the port: a stray copy of the
-//! relay started by an old scheduled task, or sshd itself. Each of those looks
-//! "up" to a connect and drops every real session right after connect.
+//! so does any other program that holds the port and speaks something else,
+//! sshd for one. Each of those looks "up" to a connect and fails every real
+//! session right after connect. (A second copy of the relay itself answers like
+//! the relay; that race is stopped by having one owner per port, not here.)
 //!
 //! So the probe speaks the relay's protocol: one length-framed `CLIENT_HELLO`
 //! header (type `0x01`, version `0x02`) carrying no keys. The vetted server reads

@@ -1,14 +1,15 @@
 //! Keeping every armed relay answering, for as long as the daemon runs.
 //!
-//! The supervisor restarts a relay whose process exits. That alone left three
-//! ways for the only door to stay shut with nobody acting, all seen live on
-//! the box:
+//! The supervisor restarts a relay whose process exits. That alone left four
+//! ways for the only door to stay shut with nobody acting:
 //!
 //! - a relay that could not start at boot (its preflight refused, or another
 //!   program held the port) was never tried again;
 //! - a relay in any stopped-with-a-reason state stayed there until somebody
 //!   restarted the whole daemon;
-//! - a relay whose process lived on but stopped answering looked `Up`.
+//! - a relay whose process lived on but stopped answering looked `Up`;
+//! - a relay failing to start waited out the supervisor's backoff, which
+//!   grows to five minutes, after the cause had already cleared.
 //!
 //! [`Memory::judge`] is the whole decision, pure over what was seen and when;
 //! [`crate::Relays::heal`] observes, asks it, and acts. A relay an operator
@@ -85,9 +86,10 @@ pub struct Memory {
 impl Memory {
     /// Decides what, if anything, to do about what was just seen at `now`.
     ///
-    /// Remedies for one relay back off ([`REMEDY_BACKOFF`], doubling) so a
-    /// cause that has not cleared is retried, never hammered and never given
-    /// up on. One good answer clears the slate.
+    /// Restarts and starts back off ([`REMEDY_BACKOFF`], doubling) so a cause
+    /// that has not cleared is retried, never hammered and never given up on.
+    /// One good answer clears the slate. A miss counts only against the
+    /// process that missed: any other look means the supervisor has moved on.
     pub fn judge(&mut self, seen: Seen, now: Instant) -> Option<Remedy> {
         let remedy = match seen {
             Seen::Answering => {
@@ -96,7 +98,6 @@ impl Memory {
                 self.quiet_until = None;
                 return None;
             }
-            Seen::Settling | Seen::Stopped | Seen::Waiting(_) => return None, // RED stage
             Seen::Unanswered(failure) => {
                 self.misses += 1;
                 if self.misses < MISSES_BEFORE_RESTART {
@@ -107,7 +108,26 @@ impl Memory {
                     self.misses
                 ))
             }
-            Seen::Dead(reason) => Remedy::Start(reason),
+            Seen::Waiting(wait) => {
+                self.misses = 0;
+                // Paced by the supervisor, not by the remedy backoff: the start
+                // clears its count, so its next waits are short and this fires
+                // again only once a wait outgrows a look.
+                return (wait > HEAL_INTERVAL).then(|| {
+                    Remedy::Retry(format!(
+                        "the supervisor's backoff is {}s, longer than a look",
+                        wait.as_secs()
+                    ))
+                });
+            }
+            Seen::Settling | Seen::Stopped => {
+                self.misses = 0;
+                return None;
+            }
+            Seen::Dead(reason) => {
+                self.misses = 0;
+                Remedy::Start(reason)
+            }
         };
         if self.quiet_until.is_some_and(|until| now < until) {
             return None;
@@ -139,8 +159,13 @@ impl Memory {
 ///
 /// `probed` is the pid that was running when the probe went out.
 pub fn after_probe(seen: Seen, probed: u32, now: Option<&ServiceState>) -> Seen {
-    let _ = (probed, now);
-    seen // RED stage
+    match (seen, now) {
+        (Seen::Unanswered(failure), Some(ServiceState::Running { pid, .. })) if *pid == probed => {
+            Seen::Unanswered(failure)
+        }
+        (Seen::Unanswered(_), _) => Seen::Settling,
+        (seen, _) => seen,
+    }
 }
 
 #[cfg(test)]

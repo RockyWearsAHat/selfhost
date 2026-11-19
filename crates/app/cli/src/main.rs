@@ -1185,6 +1185,8 @@ async fn serve_everything(
         // From here on every armed relay is kept answering: a dead one is
         // started again, one that stops answering its handshake is restarted,
         // each with its reason on a stamped line of this log.
+        // A panic here cannot end the loop quietly: release builds abort on
+        // panic, and the keep-alive loop starts the daemon again.
         let healer = vpn_relays.clone();
         tokio::spawn(async move {
             let mut memory = std::collections::HashMap::new();
