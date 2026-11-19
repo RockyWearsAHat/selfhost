@@ -860,7 +860,11 @@ mod tests {
         std::fs::write(&exe, b"currently running").expect("a fake exe");
 
         let mut update = selfhost_config::SelfUpdate::new("https://127.0.0.1:1/none.git");
-        let (program, args) = selfhost_supervisor::shell_command("sleep 30");
+        // `sleep` is not a Windows command: there `cmd` failed at once, the
+        // "build" finished inside the 50 ms timeout, and the test passed or
+        // failed on how fast cmd started.
+        let long_build = if cfg!(windows) { "ping -n 31 127.0.0.1 >NUL" } else { "sleep 30" };
+        let (program, args) = selfhost_supervisor::shell_command(long_build);
         let mut command = vec![program.display().to_string()];
         command.extend(args);
         update.build = Some(command);
