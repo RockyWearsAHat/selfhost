@@ -119,8 +119,12 @@ impl Memory {
     /// The first look takes the baseline. A total lower than the last one means
     /// the relay was installed afresh, and starts a new baseline.
     pub fn restarts_since_last_look(&mut self, total: u64) -> u64 {
-        let _ = total;
-        0 // RED stage
+        let since = match self.restarts {
+            Some(seen) if total >= seen => total - seen,
+            _ => 0,
+        };
+        self.restarts = Some(total);
+        since
     }
 }
 
