@@ -23,6 +23,7 @@
 use std::fmt;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::time::Duration;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
 /// How long the relay has to answer, connect included.
@@ -81,13 +82,23 @@ pub async fn hello(listen: SocketAddr, timeout: Duration) -> Result<(), ProbeFai
     }
 }
 
-/// RED stage: today's check — a plain connect, as the watchdog does it.
+/// Connect, send the frame, and read until the relay's verdict.
 async fn exchange(target: SocketAddr) -> Result<(), ProbeFailure> {
-    TcpStream::connect(target)
+    let mut stream = TcpStream::connect(target)
         .await
-        .map(|_| ())
-        .map_err(|error| ProbeFailure::Unreachable(error.to_string()))
+        .map_err(|error| ProbeFailure::Unreachable(error.to_string()))?;
+    // A peer that closed before the frame landed has refused it just the same;
+    // only the read below decides.
+    let _ = stream.write_all(&HELLO_FRAME).await;
+    let mut first = [0u8; 64];
+    match stream.read(&mut first).await {
+        Ok(0) => Ok(()),
+        Ok(read) => Err(ProbeFailure::NotTheRelay { said: printable(&first[..read]) }),
+        // A reset is the relay closing on a refused hello with bytes in flight.
+        Err(_) => Ok(()),
+    }
 }
+
 /// The address a probe dials for a configured listening socket.
 fn loopback(listen: SocketAddr) -> SocketAddr {
     let host = match listen.ip() {
@@ -111,7 +122,6 @@ fn printable(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
 
     const QUICK: Duration = Duration::from_millis(500);

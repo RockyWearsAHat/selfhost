@@ -183,12 +183,14 @@ pub const MANAGED_TASK_NAMES: &[&str] =
 /// Removed on both install and uninstall. An upgraded box that kept `selfhost`
 /// registered would start a second proxy racing the unified process for
 /// `:443` — the exact half-running state the merge into one process exists to
-/// make impossible. Removal tolerates absence, so this is a no-op on a machine
+/// make impossible. `selfhost-vpn-ssh` is the same race on `:8444`: the daemon
+/// has supervised the `ssh` relay since the 2026-09-09 cutover, and the old
+/// boot-triggered task left registered fought it for the port. Removal tolerates absence, so this is a no-op on a machine
 /// that never had it.
 ///
 /// Deliberately excludes `selfhost-vpn` and `selfhost-lan-dns` — see the
 /// module docs above for why neither is actually superseded.
-const SUPERSEDED_TASK_NAMES: &[&str] = &["selfhost"];
+const SUPERSEDED_TASK_NAMES: &[&str] = &["selfhost", "selfhost-vpn-ssh"];
 
 /// The launchd label an earlier version registered the proxy under, separately
 /// from the daemon. Removed for the reason [`SUPERSEDED_TASK_NAMES`] gives.

@@ -277,10 +277,11 @@ pub fn plan(
 /// The relay is the only door to the console — the console site is gated to the
 /// loopback address the tunnel exits on, so a relay that is down is an operator
 /// locked out of their own machine, with no second way in short of physical
-/// access. A clean exit is therefore not a reason to leave it down. The crash
-/// loop is still bounded: `max_restarts` is the supervisor's own default, and it
-/// reports `GaveUp` rather than restarting for ever, which [`crate::state`] shows
-/// as a state needing attention.
+/// access. A clean exit is therefore not a reason to leave it down, and neither
+/// is a run of crashes: `max_restarts` is `0`, an unlimited budget, because a
+/// relay given up on is a door shut until somebody restarts the daemon — the
+/// 2026-11-18 outage. The loop is paced instead of bounded: the supervisor's
+/// backoff doubles to its ceiling and clears once the relay stays up.
 ///
 /// # Why it starts manually
 ///
@@ -305,6 +306,7 @@ pub fn service(relay: &Relay, launch: &Launch) -> ServiceSpec {
     spec.cwd = launch.cwd.clone();
     spec.start_mode = StartMode::Manual;
     spec.restart = RestartPolicy::Always;
+    spec.max_restarts = 0;
     spec.env.insert(PINNED_PEERS_ENV.to_owned(), NOBODY_PINNED.to_owned());
     // No `stop_command`: the tunnel has no documented graceful-shutdown
     // invocation, so the supervisor's own ladder applies — a signal on Unix, a

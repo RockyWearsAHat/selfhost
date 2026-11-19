@@ -1169,11 +1169,28 @@ async fn serve_everything(
             match outcome {
                 Ok(state) => println!("\nvpn relay \"{name}\": {}", state.label()),
                 Err(error) => eprintln!(
-                    "\nwarning: vpn relay \"{name}\" did not start: {error}\n  fix it and run \
-                     `selfhost vpn up {name}` by hand, or restart the daemon once it is fixed"
+                    "\nwarning: vpn relay \"{name}\" did not start: {error}\n  the daemon \
+                     retries it every {}s until it starts",
+                    selfhost_vpn::heal::HEAL_INTERVAL.as_secs()
                 ),
             }
         }
+
+        // From here on every armed relay is kept answering: a dead one is
+        // started again, one that stops answering its handshake is restarted,
+        // each with its reason on a stamped line of this log.
+        let healer = vpn_relays.clone();
+        tokio::spawn(async move {
+            let mut memory = std::collections::HashMap::new();
+            let mut ticks = tokio::time::interval(selfhost_vpn::heal::HEAL_INTERVAL);
+            ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                ticks.tick().await;
+                for healing in healer.heal(&mut memory).await {
+                    eprintln!("{} {healing}", selfhost_mail::stamp());
+                }
+            }
+        });
 
         // `vpn-updater` owns the Secure-VPN GitWatch (see
         // `crates/services/vpn/src/updater.rs`) and is a fixed, one-shot

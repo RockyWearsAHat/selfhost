@@ -34,8 +34,8 @@
 //! Every tick, [`observe`] answers two questions with no daemon involvement at
 //! all — a set of HTTP/HTTPS/control-API probes
 //! ([`crate::health::probe_all`], already careful to distinguish "genuinely
-//! down" from "not deployed here") and a loopback TCP connect to each enabled
-//! relay's own port, never the box's public interface. [`Machine::step`] is
+//! down" from "not deployed here") and a loopback hello to each enabled relay's
+//! own port ([`selfhost_vpn::probe::hello`]), never the box's public interface. [`Machine::step`] is
 //! pure: given that observation and its own small amount of memory (a
 //! consecutive-failure count and a stage), it decides one [`Action`] and
 //! nothing else — no I/O, so the whole ladder is provable with fabricated
@@ -75,7 +75,6 @@ use crate::service_install;
 use selfhost_config::Config;
 use selfhost_git::plan;
 use selfhost_git::run::{self, BUILD_TIMEOUT, LS_REMOTE_TIMEOUT, TRANSFER_TIMEOUT};
-use std::net::{Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -104,11 +103,6 @@ pub const DEFAULT_INTERVAL: Duration = Duration::from_secs(30);
 /// How many consecutive unhealthy observations [`run`] tolerates before
 /// escalating, absent `--failure-threshold`.
 pub const DEFAULT_THRESHOLD: u32 = 3;
-
-/// How long a single loopback connect attempt may take before counting as
-/// unreachable — short, because a relay that is actually up answers a local
-/// connect in microseconds; this is a liveness probe, not a load test.
-const RELAY_PROBE_TIMEOUT: Duration = Duration::from_millis(500);
 
 /// One tick's worth of fact, gathered with no daemon involvement.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -226,7 +220,7 @@ fn daemon_exe() -> Result<PathBuf, String> {
 }
 
 /// Gathers one [`Observation`] with no daemon involvement: [`crate::health::probe_all`]
-/// for the daemon itself, and a loopback connect for each enabled relay.
+/// for the daemon itself, and a loopback hello for each enabled relay.
 async fn observe(config: &Config, project_dir: &Path, daemon_exe: &Path) -> Observation {
     let daemon_ok = if daemon_exe.exists() {
         let probes = crate::health::probe_all(config, project_dir).await;
@@ -242,19 +236,13 @@ async fn observe(config: &Config, project_dir: &Path, daemon_exe: &Path) -> Obse
     }
 }
 
-/// Whether every *enabled* relay accepts a plain TCP connect on its own port,
-/// reached over loopback — never the relay's own (possibly public) `listen`
-/// host. A connect, never a bind: this is the one place this module touches
-/// the network at all, and it only ever originates a client connection.
+/// Whether every *enabled* relay answers the hello its handshake starts with,
+/// over loopback — [`selfhost_vpn::probe::hello`], the same judgement the
+/// daemon heals by. It only ever originates a client connection.
 async fn relays_reachable(config: &Config) -> bool {
     for relay in config.vpn.iter().filter(|relay| relay.enabled) {
-        let Some(configured) = relay.listen_addr() else { continue };
-        let loopback = SocketAddr::from((Ipv4Addr::LOCALHOST, configured.port()));
-        let reachable = tokio::time::timeout(RELAY_PROBE_TIMEOUT, tokio::net::TcpStream::connect(loopback))
-            .await
-            .map(|connected| connected.is_ok())
-            .unwrap_or(false);
-        if !reachable {
+        let Some(listen) = relay.listen_addr() else { continue };
+        if selfhost_vpn::probe::hello(listen, selfhost_vpn::probe::PROBE_TIMEOUT).await.is_err() {
             return false;
         }
     }

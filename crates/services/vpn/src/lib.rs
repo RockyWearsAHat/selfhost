@@ -442,8 +442,32 @@ impl Relays {
     ///
     /// `memory` is the caller's, kept between calls; the daemon calls this every
     /// [`heal::HEAL_INTERVAL`] for as long as it runs.
-    pub async fn heal(&self, _memory: &mut HashMap<String, Memory>) -> Vec<Healing> {
-        Vec::new() // RED stage: nothing heals a relay today
+    pub async fn heal(&self, memory: &mut HashMap<String, Memory>) -> Vec<Healing> {
+        let mut healings = Vec::new();
+        for relay in self.relays.iter().filter(|relay| relay.enabled) {
+            let seen = self.look(relay).await;
+            let Some(remedy) =
+                memory.entry(relay.name.clone()).or_default().judge(seen, Instant::now())
+            else {
+                continue;
+            };
+            let service = service_name(&relay.name);
+            let outcome = match &remedy {
+                Remedy::Restart(reason) => {
+                    self.supervisor.note(&service, format!("[heal] restarting: {reason}")).await;
+                    self.supervisor.restart(&service).await;
+                    Ok(self.state_of(relay).await)
+                }
+                Remedy::Start(reason) => {
+                    // After `up`, which installs the service the note lands in.
+                    let outcome = self.up(&relay.name).await;
+                    self.supervisor.note(&service, format!("[heal] started: {reason}")).await;
+                    outcome
+                }
+            };
+            healings.push(Healing { relay: relay.name.clone(), remedy, outcome });
+        }
+        healings
     }
 
     /// What one relay is doing right now, probing it when it claims to run.
